@@ -289,3 +289,109 @@ func itoa(i int) string {
 	}
 	return string(b)
 }
+
+// ── webhook 校验 ────────────────────────────────────────────────────────────
+
+func TestWebhookDisabledByDefault(t *testing.T) {
+	path := writeConfig(t, minimalPrefix+`
+certificates:
+  - name: t
+    domains: ["example.com"]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.Webhook.Listen != "" {
+		t.Errorf("默认不该启用 webhook，实际 listen=%q", cfg.Webhook.Listen)
+	}
+}
+
+// 这个端点会触发真实签发、消耗速率限制配额，所以缺 token 必须直接拒绝。
+func TestWebhookRequiresToken(t *testing.T) {
+	body := minimalPrefix + `
+webhook:
+  listen: "127.0.0.1:9801"
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("启用 webhook 但没给 token 时应当报错")
+	}
+	if !strings.Contains(err.Error(), "token") {
+		t.Errorf("报错应当点明缺 token，得到: %v", err)
+	}
+}
+
+// 弱 token 在这个端点上等于没有鉴权。
+func TestWebhookRejectsShortToken(t *testing.T) {
+	body := minimalPrefix + `
+webhook:
+  listen: "127.0.0.1:9801"
+  token: "short"
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("过短的 token 应当报错")
+	}
+	if !strings.Contains(err.Error(), "太短") {
+		t.Errorf("报错应当说明太短，得到: %v", err)
+	}
+}
+
+// 有 token 却没监听地址，是配置写反了 —— 端点根本不存在，token 无从生效。
+func TestWebhookTokenWithoutListenIsRejected(t *testing.T) {
+	body := minimalPrefix + `
+webhook:
+  token: "0123456789abcdef0123"
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("只给 token 不给 listen 时应当报错")
+	}
+}
+
+// NotifyURL 是出站通知，不依赖监听端点，可以单独用。
+func TestWebhookNotifyURLAloneIsAllowed(t *testing.T) {
+	body := minimalPrefix + `
+webhook:
+  notifyURL: "https://example.com/hook"
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("只配 notifyURL 应当允许: %v", err)
+	}
+	if cfg.Webhook.NotifyURL == "" {
+		t.Error("notifyURL 未被保留")
+	}
+}
+
+func TestWebhookValidConfig(t *testing.T) {
+	body := minimalPrefix + `
+webhook:
+  listen: "127.0.0.1:9801"
+  token: "0123456789abcdef0123456789abcdef"
+  notifyURL: "https://example.com/hook"
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("合法配置不该报错: %v", err)
+	}
+	if cfg.Webhook.Listen != "127.0.0.1:9801" || cfg.Webhook.Token == "" {
+		t.Errorf("webhook 配置未被正确解析: %+v", cfg.Webhook)
+	}
+}

@@ -96,6 +96,27 @@ lego 高层的 `certificate.Obtain` 是刻意不用的：它在内部自己 `new
 
 完整论证见[域名随时会改](README.reference.zh-CN.md#域名随时会改)与[实测踩过的坑](README.reference.zh-CN.md#实测踩过的坑)。
 
+## 事件驱动
+
+默认情况下 wecert 按定时器收敛。配上 `webhook` 之后也可以按需触发 ——
+比如域名刚加完由 CI 直接调一次，不必等下一个整点：
+
+```bash
+curl -X POST https://wecert.internal:9801/hook/reconcile \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"cert":"example-com"}'
+```
+
+它返回 `202 Accepted`，收敛在后台跑；结果靠 `GET /hook/status` 轮询。
+定时器和事件触发可能在同一时刻落到同一张证书上，所以占位是**同步**做的，
+第二个调用方拿到的是 `skipped`，而不是下一个重复订单 ——
+那会直接撞上"每 7 天、每个 identifier 集合 5 张"的限制。
+
+这个端点会真实签发并消耗速率限制配额，所以 token 是必填的，且至少 16 字符；
+更短会在配置加载阶段被拒。
+
+详见[配置参考 → `webhook`](README.reference.zh-CN.md#webhook)。
+
 ## Profile
 
 "每个 SAN 最多 100 个域名"是 profile 相关的，不是固定值：

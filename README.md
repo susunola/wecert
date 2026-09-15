@@ -96,6 +96,22 @@ lego's high-level `certificate.Obtain` is deliberately not used: it calls `newOr
 
 Full rationale in [Domains that change often](README.reference.md#domains-that-change-often) and [Field notes and pitfalls](README.reference.md#field-notes-and-pitfalls).
 
+## Event-driven
+
+By default wecert converges on a timer. Configure `webhook` and it can also be triggered on demand — by CI right after a domain is added, say, instead of waiting for the next tick:
+
+```bash
+curl -X POST https://wecert.internal:9801/hook/reconcile \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"cert":"example-com"}'
+```
+
+It answers `202 Accepted` and converges in the background; poll `GET /hook/status` for the outcome. The timer and an event trigger can land on the same certificate at the same moment, so the slot is reserved **synchronously** and the second caller is told `skipped` rather than placing a duplicate order — which would run straight into the 5-per-7-days limit for that identifier set.
+
+The endpoint performs real issuance and consumes rate-limit quota, so the token is mandatory and must be at least 16 characters; a shorter one is rejected when the config is loaded.
+
+Details in [Configuration reference → `webhook`](README.reference.md#webhook).
+
 ## Profiles
 
 "100 domains per SAN" is profile-dependent, not fixed:

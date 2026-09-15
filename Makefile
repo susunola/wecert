@@ -13,21 +13,13 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 
 .PHONY: build tools release test vet cover clean fmt validate-cloudinit fmt-check check
 
-build: $(BIN)
-
-$(BIN):
+build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
 
 # 构建辅助工具（preflight 前置检查、clbverify 监听器绑定取证）。
-tools: $(PREFLIGHT) $(CLBVERIFY) $(TATRUN)
-
-$(PREFLIGHT):
+tools:
 	$(GO) build -trimpath -ldflags "-s -w" -o $(PREFLIGHT) ./cmd/preflight
-
-$(CLBVERIFY):
 	$(GO) build -trimpath -ldflags "-s -w" -o $(CLBVERIFY) ./cmd/clbverify
-
-$(TATRUN):
 	$(GO) build -trimpath -ldflags "-s -w" -o $(TATRUN) ./cmd/tatrun
 
 # 产出可直接扔到 CVM 上的静态二进制。
