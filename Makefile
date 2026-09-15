@@ -11,7 +11,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1
 # ARM 实例用 linux/arm64；darwin/arm64 供本机调试。
 PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 
-.PHONY: build tools release test vet cover clean fmt fmt-check check
+.PHONY: build tools release test vet cover clean fmt validate-cloudinit fmt-check check
 
 build: $(BIN)
 
@@ -45,6 +45,11 @@ release:
 	done
 	@cd dist && (command -v sha256sum >/dev/null 2>&1 && sha256sum wecert_* || shasum -a 256 wecert_*) > SHA256SUMS
 	@echo && echo "=== 产物 ===" && ls -lh dist/ && echo && cat dist/SHA256SUMS
+
+# apply 之前查 cloud-init user_data 里的脚本语法。
+# 这类错误只有机器启动后才暴露，现象是 CLB 502，很容易误判成网络问题。
+validate-cloudinit:
+	python3 scripts/validate-cloudinit.py
 
 test:
 	$(GO) test ./...

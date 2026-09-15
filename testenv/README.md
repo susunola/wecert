@@ -268,3 +268,61 @@ resource "tencentcloud_clb_listener_rule" "wildcard" {
 **推广开来：任何"Terraform 管基础设施 + 另一个系统管证书/密钥轮转"的组合都有这个问题。**
 要么让 Terraform 管绑定（那 wecert 就不该调 `UpdateCertificateInstance`），
 要么让 wecert 管绑定（那就必须 `ignore_changes`）。不能两个都管。
+
+---
+
+## 阶段 B3：按域名分流 + 本机可测
+
+在 B2 基础上加了：后端按 Host 返回不同页面、CLB 安全组、以及 DNS 记录。
+
+### 后端按 Host 分流
+
+CVM 上的 python 后端读 `Host` 头返回不同页面：
+
+| 访问 | 页面 |
+|---|---|
+| `https://test.alpha.<域>/` | 大写的 **ALPHA** |
+| `https://test.beta.<域>/` | 大写的 **BETA** |
+| 其它 Host | **UNKNOWN**（红色） |
+
+这样"CLB 的域名路由到底生效没有"一眼就能看出来 —— 两个域名显示同一个页面就是没生效。
+
+页面映射在 `var.backend_pages` 里改，不用动脚本。
+
+### 为什么要建 DNS 记录
+
+之前只能用 `curl --resolve` 或 `openssl -connect` 加 IP 来测，
+因为 `test.alpha` / `test.beta` 根本没有解析记录。
+建了 A 记录之后浏览器直接就能打开。
+
+注意 `alpha` / `beta` **不是独立 zone**，只是 `atomwangnus.com` 下的子域，
+所以记录建在 `atomwangnus.com` 里，`sub_domain` 写成 `test.alpha`。
+
+### CLB 安全组：默认放开，是有意的
+
+```hcl
+clb_allowed_cidrs = ["0.0.0.0/0"]   # 默认
+```
+
+试过按 IP 白名单收紧，但**出口 IP 不稳定**：会话期间本机出口从
+`121.35.103.225` 变成了 `14.153.66.173`，而且不同探测服务还报出第三个地址。
+再加上浏览器所在网络的出口无从得知，白名单一旦写错就会把自己关在门外。
+
+而"被安全组挡住"的表现是 **TLS 握手直接被重置**（`SSL_ERROR_SYSCALL`），
+不直观，排查成本高。所以在测试环境默认放开，等你确认固定出口 IP 后
+改成 `["x.x.x.x/32"]` 重新 apply 即可收紧。
+
+### 新增：cloud-init 本地校验
+
+```bash
+make validate-cloudinit
+```
+
+从 `.tf` 源码里抽出 `write_files`，对嵌入的 Python / shell 做语法检查。
+
+**这是被一次真实事故逼出来的**：user_data 里的 Python 有个字符串引号不匹配
+（`'...\n"`），CVM 建出来了、cloud-init 也"成功"了，但后端一直不监听 80，
+现象是 CLB 返回 502 —— 很容易误判成网络或安全组问题，白排查很久。
+
+`user_data` 里的脚本只有机器启动后才执行，语法错误在那之前完全不可见，
+所以在 apply 之前先查一遍。加 `--from-state` 可以校验已 apply 的版本。
