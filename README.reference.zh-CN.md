@@ -471,6 +471,77 @@ retired_certificates          -- 已上传、等待回收的证书
 | `resourceTypes` | 否 | `[clb]` | `UpdateCertificateInstance` 的资源类型。`clb` 最常用，`cdn`、`waf`、`tke`、`apigateway` 也支持。 |
 | `regions` | 是 | — | **CLB 是分地域资源，必须列出所有有 CLB 的地域。** 漏掉的地域会静默不更新，那边的证书会过期。 |
 
+### `webhook`
+
+可选。不配就只按定时器收敛。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `listen` | *（空 = 不启用）* | 触发端点的监听地址 |
+| `token` | — | 设置 `listen` 时**必填**，至少 16 字符 |
+| `notifyURL` | *（空）* | 可选的出站事件目标 |
+
+触发端点会执行**真实签发**并消耗 Let's Encrypt 的速率限制配额，所以不允许无鉴权运行。token 短于 16 字符会在配置加载阶段被拒 —— 在这个端点上，弱 token 等于没有 token。
+
+#### 端点
+
+| 方法 | 路径 | 鉴权 | 用途 |
+|---|---|---|---|
+| `POST` | `/hook/reconcile` | 是 | 触发收敛 |
+| `GET` | `/hook/status` | 是 | 每张证书的状态，供触发后轮询 |
+| `GET` | `/healthz` | 否 | 探活（不泄漏任何信息，所以放开） |
+
+鉴权支持两种头：
+
+```
+Authorization: Bearer <token>
+X-Wecert-Token: <token>
+```
+
+触发请求体可以省略。不带 body 就是全量收敛：
+
+```jsonc
+{}                                  // 全部证书
+{"cert": "example-com"}             // 一张
+{"certs": ["a-com", "b-com"]}       // 多张
+```
+
+它返回 `202 Accepted` 而不是 `200` —— 收敛被交给后台，可能要几分钟（DNS 传播）。让调用方等着只会把它的超时拖爆。
+
+```json
+{ "accepted": ["a-com"], "skipped": ["b-com"], "unknown": ["typo-com"] }
+```
+
+- `accepted` —— 已开始处理
+- `skipped` —— 已经在处理中，**没有**二次启动
+- `unknown` —— 配置里没有这个名字
+
+结果靠轮询 `/hook/status`：
+
+```json
+{
+  "time": "2026-09-15T18:00:00Z",
+  "certificates": [
+    { "name": "a-com", "notAfter": "2026-12-14T16:41:58Z", "daysLeft": 89,
+      "deployed": true, "deployConfirmed": true, "consecutiveFailures": 0 }
+  ]
+}
+```
+
+#### 为什么 `skipped` 比看上去重要
+
+定时器和事件触发可能在同一时刻落到同一张证书上。两边各下一单，就会直接撞上**每 7 天、每个精确 identifier 集合 5 张**——这条限制没有 override。所以 `StartCert` 会在把任务交给后台**之前同步占位**，第二个调用方拿到的是"已在处理中"，而不是启动一个重复的订单。
+
+#### 出站通知
+
+设置 `notifyURL` 后，每次续期尝试都会推送：
+
+```json
+{ "event": "renewal", "cert": "a-com", "result": "ok", "timestamp": "2026-09-15T18:00:00Z" }
+```
+
+`result` 为 `ok` 或 `error`（后者带 `error` 字段）。投递是**异步且尽力而为**的：通知目标慢或挂掉绝不能拖慢续期 —— 那和"一张证书失败拖住其它证书"是同一类耦合错误。
+
 ### `certificates[]`
 
 | 字段 | 必填 | 默认 | 说明 |

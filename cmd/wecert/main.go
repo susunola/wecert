@@ -27,6 +27,7 @@ import (
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/state"
+	"github.com/susunola/wecert/internal/webhook"
 )
 
 // version 可通过 -ldflags "-X main.version=..." 注入。
@@ -102,14 +103,29 @@ func run() error {
 		return err
 	}
 
-	manager := acme.NewManager(store, core, solver, deployer, log)
-	reconciler := reconcile.New(cfg, store, manager, log)
-
+	// 先建进程级上下文：webhook 触发的收敛要在后台跑几分钟，
+	// 必须挂在进程上下文上，而不是某个请求的 context 上。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 注意这里的写法：接口值为 nil 和"持有一个 nil 指针的接口"是两回事，
+	// 直接把 (*webhook.Notifier)(nil) 塞进接口会让下面的 != nil 判断失效。
+	var notifier reconcile.Notifier
+	if n := webhook.NewNotifier(cfg.Webhook.NotifyURL, log); n != nil {
+		notifier = n
+		log.Info("续期结果会推送出去", "url", cfg.Webhook.NotifyURL)
+	}
+
+	manager := acme.NewManager(store, core, solver, deployer, log)
+	reconciler := reconcile.New(cfg, store, manager, notifier, log)
+
 	// 指标服务。先同步绑定端口，失败就直接退出 —— 见下面的注释。
 	if err := startMetricsServer(ctx, cfg.Metrics.Listen, log); err != nil {
+		return err
+	}
+
+	// 事件触发端点。同理：端口绑定失败必须硬失败。
+	if err := startWebhookServer(ctx, cfg, reconciler, store, log); err != nil {
 		return err
 	}
 
@@ -197,6 +213,55 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) erro
 	}()
 
 	log.Info("指标服务已启动", "addr", ln.Addr().String(), "metrics", "/metrics")
+	return nil
+}
+
+// startWebhookServer 启动事件触发端点。
+//
+// 和指标服务一样**同步**绑定端口，失败就退出。理由也一样：
+// 这是"事件驱动"这条路径的唯一入口，端口被占却只打一行日志，
+// 会让人以为配好了、实际所有事件都丢了 —— 而证书会照常走向过期。
+func startWebhookServer(
+	ctx context.Context, cfg *config.Config,
+	rec *reconcile.Reconciler, store *state.Store, log *slog.Logger,
+) error {
+	if cfg.Webhook.Listen == "" {
+		log.Info("webhook 未启用（webhook.listen 为空），只按定时器收敛")
+		return nil
+	}
+
+	ln, err := net.Listen("tcp", cfg.Webhook.Listen)
+	if err != nil {
+		return fmt.Errorf(
+			"监听 webhook 端口 %s 失败: %w（端口被占用？）", cfg.Webhook.Listen, err)
+	}
+
+	api := webhook.New(rec, store, cfg.Webhook.Token, ctx, log)
+
+	srv := &http.Server{
+		Handler:           api.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("webhook 服务异常退出", "err", err)
+		}
+	}()
+
+	log.Info("webhook 已启动",
+		"addr", ln.Addr().String(),
+		"trigger", "POST /hook/reconcile",
+		"status", "GET /hook/status")
 	return nil
 }
 
