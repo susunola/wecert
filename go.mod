@@ -1,4 +1,4 @@
-module github.com/atom/wecert
+module github.com/susunola/wecert
 
 go 1.26.5
 

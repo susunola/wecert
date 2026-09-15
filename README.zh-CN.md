@@ -46,7 +46,7 @@ make release        # → dist/ + SHA256SUMS
 sudo ./install.sh ./dist/wecert_linux_amd64
 ```
 
-> `go.mod` 里声明的 module 路径是 `github.com/atom/wecert`，而仓库是 `susunola/wecert`，所以 `go install github.com/susunola/wecert/cmd/wecert@latest` 用不了。从 clone 构建不受影响。
+> module 路径与仓库地址一致，`git clone` 后 `make build` 和 `go install github.com/susunola/wecert/cmd/wecert@latest` 都可以用。
 
 ## 快速开始
 

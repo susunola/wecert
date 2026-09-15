@@ -11,7 +11,7 @@ import (
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 
-	"github.com/atom/wecert/internal/config"
+	"github.com/susunola/wecert/internal/config"
 )
 
 // cvmMetadataURL 是 CVM 实例元数据服务里读取 CAM 角色临时凭证的地址。
