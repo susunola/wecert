@@ -78,6 +78,7 @@ type Config struct {
 	DNS          DNS           `yaml:"dns"`
 	Tencent      Tencent       `yaml:"tencent"`
 	Metrics      Metrics       `yaml:"metrics"`
+	Webhook      Webhook       `yaml:"webhook"`
 	Certificates []Certificate `yaml:"certificates"`
 }
 
@@ -123,6 +124,30 @@ type Tencent struct {
 type Metrics struct {
 	Listen string `yaml:"listen"`
 }
+
+// Webhook 让 wecert 可以被外部事件触发，而不是只靠定时轮询。
+//
+// 典型用法：域名新增后由 CI/事件总线调一次，不用等下一个整点。
+type Webhook struct {
+	// Listen 是触发端点的监听地址。留空表示不启用 webhook。
+	Listen string `yaml:"listen"`
+
+	// Token 是共享密钥，必填。
+	//
+	// 这个端点会触发真实签发、消耗 Let's Encrypt 的速率限制配额，
+	// 所以绝不能裸奔。支持两种带法：
+	//   Authorization: Bearer <token>
+	//   X-Wecert-Token: <token>
+	Token string `yaml:"token"`
+
+	// NotifyURL 可选。设置后，每次续期尝试结束都会向它 POST 一条 JSON 事件。
+	// 用来把"证书已续期"接进下游流程（比如触发一次配置重载）。
+	NotifyURL string `yaml:"notifyURL"`
+}
+
+// WebhookTokenMinLen 是 token 的最小长度。
+// 太短的 token 在这个端点上等于没有鉴权 —— 攻击者触发签发就能烧掉速率配额。
+const WebhookTokenMinLen = 16
 
 // Certificate 是一张证书的期望状态。
 type Certificate struct {
@@ -218,6 +243,10 @@ func (c *Config) normalize() error {
 		c.Metrics.Listen = "127.0.0.1:9800"
 	}
 
+	if err := c.Webhook.normalize(); err != nil {
+		return err
+	}
+
 	switch c.Tencent.CredentialMode {
 	case "":
 		c.Tencent.CredentialMode = CredentialCVMRole
@@ -249,6 +278,32 @@ func (c *Config) normalize() error {
 		if err := c.Certificates[i].normalize(seen); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (w *Webhook) normalize() error {
+	// 留空 Listen 表示不启用，此时 Token 也不必设置。
+	if w.Listen == "" {
+		if w.Token != "" {
+			return fmt.Errorf("webhook.token 设置了但 webhook.listen 为空：" +
+				"没有监听地址就不会有端点，token 无从生效")
+		}
+		if w.NotifyURL != "" {
+			// NotifyURL 独立于监听端点，允许单独使用。
+			return nil
+		}
+		return nil
+	}
+
+	if w.Token == "" {
+		return fmt.Errorf("webhook.listen 已设置但缺少 webhook.token：" +
+			"这个端点会触发真实签发并消耗速率限制配额，必须鉴权")
+	}
+	if len(w.Token) < WebhookTokenMinLen {
+		return fmt.Errorf("webhook.token 太短（%d 字符，至少 %d）："+
+			"这个端点能触发真实签发，弱 token 等于没有鉴权",
+			len(w.Token), WebhookTokenMinLen)
 	}
 	return nil
 }
