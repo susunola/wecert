@@ -456,6 +456,77 @@ This is fully supported: `GetChallengeInfo` follows the CNAME and reports the re
 | `resourceTypes` | no | `[clb]` | Resource types for `UpdateCertificateInstance`. `clb` is the common one; `cdn`, `waf`, `tke` and `apigateway` are also supported. |
 | `regions` | yes | — | **CLB is a regional resource. List every region that has a CLB.** A missing region is silently not updated and the certificate there expires. |
 
+### `webhook`
+
+Optional. Omit it and wecert only converges on the timer.
+
+| Field | Default | Notes |
+|---|---|---|
+| `listen` | *(empty — disabled)* | Address for the trigger endpoint |
+| `token` | — | **Required when `listen` is set**, minimum 16 characters |
+| `notifyURL` | *(empty)* | Optional outbound event target |
+
+The trigger endpoint performs **real issuance** and consumes Let's Encrypt rate-limit quota, so it is never allowed to run unauthenticated. A token shorter than 16 characters is rejected at config load: on this endpoint a weak token is the same as no token.
+
+#### Endpoints
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/hook/reconcile` | yes | Trigger convergence |
+| `GET` | `/hook/status` | yes | Per-certificate state, for polling after a trigger |
+| `GET` | `/healthz` | no | Liveness (leaks nothing, so probes can reach it) |
+
+Authenticate with either header:
+
+```
+Authorization: Bearer <token>
+X-Wecert-Token: <token>
+```
+
+The trigger body is optional. Omit it to converge everything:
+
+```jsonc
+{}                                  // every certificate
+{"cert": "example-com"}             // one
+{"certs": ["a-com", "b-com"]}       // several
+```
+
+It answers `202 Accepted` — not `200` — because convergence is handed to the background and can take minutes (DNS propagation). Waiting would blow up the caller's timeout.
+
+```json
+{ "accepted": ["a-com"], "skipped": ["b-com"], "unknown": ["typo-com"] }
+```
+
+- `accepted` — now running
+- `skipped` — already running, **not** started a second time
+- `unknown` — not in the configuration
+
+Poll `/hook/status` for the outcome:
+
+```json
+{
+  "time": "2026-09-15T18:00:00Z",
+  "certificates": [
+    { "name": "a-com", "notAfter": "2026-12-14T16:41:58Z", "daysLeft": 89,
+      "deployed": true, "deployConfirmed": true, "consecutiveFailures": 0 }
+  ]
+}
+```
+
+#### Why `skipped` matters more than it looks
+
+The timer and an event trigger can land on the same certificate at the same moment. Both would place an order, and that runs straight into **5 certificates per exact set of identifiers per 7 days** — a limit with no override. `StartCert` therefore reserves the slot **synchronously** before handing the work to the background, so the second caller is told "already running" rather than starting a duplicate.
+
+#### Outbound notifications
+
+With `notifyURL` set, every renewal attempt emits:
+
+```json
+{ "event": "renewal", "cert": "a-com", "result": "ok", "timestamp": "2026-09-15T18:00:00Z" }
+```
+
+`result` is `ok` or `error` (with an `error` field). Delivery is **asynchronous and best-effort**: a slow or dead notification target must never slow down renewal — that is the same class of coupling error as one certificate's failure blocking the others.
+
 ### `certificates[]`
 
 | Field | Required | Default | Description |
