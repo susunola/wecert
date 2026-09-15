@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	legoacme "github.com/go-acme/lego/v4/acme"
@@ -11,6 +12,15 @@ import (
 	"github.com/atom/wecert/internal/config"
 	"github.com/atom/wecert/internal/state"
 )
+
+// authzFetchConcurrency 限制同时在飞的授权查询数量。
+//
+// SAN 多的证书上这一步必须并发：100 个授权串行拉一遍就是 100 次往返，
+// 3 分钟的等待预算撑不了几轮。上限取 8 是为了不给 CA 造成突发压力。
+//
+// 并发的安全性来自 lego 的实现：api.Core 在构造完成后只有 nonce 管理器
+// 这类可变状态，而它是带 mutex 的；JWS 与 Doer 都是只读。
+const authzFetchConcurrency = 8
 
 // advance 推进订单状态机。
 func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.CertState, o *state.Order) error {
@@ -27,7 +37,7 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 	case "invalid":
 		// 订单废了。清理掉，让下一轮从头决策（此时会走退避）。
 		err := fmt.Errorf("订单已失效: %v", order.Err())
-		if derr := m.discardOrder(c.Name); derr != nil {
+		if derr := m.discardOrder(ctx, c.Name); derr != nil {
 			return errors.Join(err, derr)
 		}
 		return m.recordFailure(st, err)
@@ -58,11 +68,68 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 	return m.finalize(ctx, c, st, o, ready)
 }
 
+// fetchAuthzs 并发拉取多个授权的当前状态，结果顺序与入参一致。
+//
+// 串行拉取在 SAN 很多的证书上是真的会超时的：100 个授权、每个一次往返，
+// 一轮就要十几秒到几十秒，3 分钟的等待预算撑不了几轮，
+// 而且每次都白等在那儿。并发是这里唯一可行的做法。
+//
+// goroutine 里只写自己那一格、不碰 store，所以不需要额外加锁；
+// 对 api.Core 的并发调用是安全的（nonce 管理器带 mutex）。
+func (m *Manager) fetchAuthzs(ctx context.Context, authzs []*state.Authorization) ([]legoacme.Authorization, error) {
+	out := make([]legoacme.Authorization, len(authzs))
+	errs := make([]error, len(authzs))
+	if len(authzs) == 0 {
+		return out, nil
+	}
+
+	limit := authzFetchConcurrency
+	if len(authzs) < limit {
+		limit = len(authzs)
+	}
+
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+
+	for i, a := range authzs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, authzURL string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if err := ctx.Err(); err != nil {
+				errs[i] = err
+				return
+			}
+			cur, err := m.core.Authorizations.Get(authzURL)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			out[i] = cur
+		}(i, a.AuthzURL)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			return nil, fmt.Errorf("查询授权 %s: %w", authzs[i].AuthzURL, err)
+		}
+	}
+	return out, nil
+}
+
 // solveChallenges 返回 allValid=true 表示订单的所有授权都已通过验证。
 func (m *Manager) solveChallenges(
 	ctx context.Context, c *config.Certificate, st *state.CertState, order legoacme.ExtendedOrder,
 ) (bool, error) {
 	authzs, err := m.loadAuthorizations(c.Name, order.Authorizations)
+	if err != nil {
+		return false, m.recordFailure(st, err)
+	}
+
+	current, err := m.fetchAuthzs(ctx, authzs)
 	if err != nil {
 		return false, m.recordFailure(st, err)
 	}
@@ -73,11 +140,8 @@ func (m *Manager) solveChallenges(
 	var pending []*state.Authorization
 	var records []DNSRecord
 
-	for _, a := range authzs {
-		cur, err := m.core.Authorizations.Get(a.AuthzURL)
-		if err != nil {
-			return false, m.recordFailure(st, fmt.Errorf("查询授权 %s: %w", a.AuthzURL, err))
-		}
+	for i, a := range authzs {
+		cur := current[i]
 		a.Status = cur.Status
 		a.Identifier = cur.Identifier.Value
 
@@ -98,12 +162,14 @@ func (m *Manager) solveChallenges(
 			if err != nil {
 				return false, m.recordFailure(st, err)
 			}
-			keyAuth, err := m.core.GetKeyAuthorization(chlg.Token)
+			keyAuth, err := m.keyAuth.GetKeyAuthorization(chlg.Token)
 			if err != nil {
 				return false, m.recordFailure(st, fmt.Errorf("计算 key authorization: %w", err))
 			}
 
 			// 只写入，不等待传播 —— 等所有 TXT 都写完之后统一等一次。
+			// 逐条等待会让 wildcard 和 apex 在同一个 TXT 名字上白等两遍
+			// （DNSPod 免费套餐一轮传播要 2 分钟以上，这一下就是几分钟）。
 			rec, err := m.dns.Present(ctx, a.Identifier, chlg.Token, keyAuth)
 			if err != nil {
 				return false, m.recordFailure(st, fmt.Errorf("写入 TXT (%s): %w", a.Identifier, err))
@@ -128,14 +194,17 @@ func (m *Manager) solveChallenges(
 	if len(pending) == 0 {
 		// 授权已全部 valid（例如上次等到 valid 后、cleanup 前崩溃）。
 		// 仍然尝试清掉可能残留的 TXT，避免 DNSPod 记录配额被慢慢占满。
-		m.cleanup(c.Name, authzs)
+		m.cleanup(ctx, c.Name, authzs)
 		return true, nil
 	}
 
+	// 阶段 2：所有 TXT 都写完之后，统一等一次权威 NS 传播。
+	// WaitAll 内部按 zone 去重，同一个 zone 只解析一次 NS 列表。
 	if err := m.dns.WaitAll(ctx, records); err != nil {
 		return false, m.recordFailure(st, fmt.Errorf("等待 TXT 传播: %w", err))
 	}
 
+	// 阶段 3：传播确认之后，才逐个通知 CA 开始验证。
 	for _, a := range pending {
 		if a.ChallengeSent {
 			continue
@@ -149,11 +218,13 @@ func (m *Manager) solveChallenges(
 		}
 	}
 
+	// 阶段 4：轮询直到全部 valid。
 	if err := m.awaitAuthorizations(ctx, pending); err != nil {
 		return false, m.recordFailure(st, err)
 	}
 
-	m.cleanup(c.Name, pending)
+	// 阶段 5：全部验证通过后才统一清理 TXT。
+	m.cleanup(ctx, c.Name, pending)
 	return true, nil
 }
 
@@ -185,12 +256,14 @@ func (m *Manager) loadAuthorizations(certName string, urls []string) ([]*state.A
 func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Authorization) error {
 	deadline := m.now().Add(authzWaitTimeout)
 	for {
+		current, err := m.fetchAuthzs(ctx, authzs)
+		if err != nil {
+			return err
+		}
+
 		allValid := true
-		for _, a := range authzs {
-			cur, err := m.core.Authorizations.Get(a.AuthzURL)
-			if err != nil {
-				return fmt.Errorf("轮询授权 %s: %w", a.AuthzURL, err)
-			}
+		for i, a := range authzs {
+			cur := current[i]
 			a.Status = cur.Status
 			if perr := m.store.PutAuthorization(a); perr != nil {
 				return perr
@@ -218,26 +291,101 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 	}
 }
 
-// cleanup 删除本次写入的所有 TXT。
-func (m *Manager) cleanup(_ string, authzs []*state.Authorization) {
+// cleanup 删除本次写入的所有 TXT。只在全部授权通过后调用。
+func (m *Manager) cleanup(ctx context.Context, certName string, authzs []*state.Authorization) {
 	for _, a := range authzs {
-		if !a.Presented {
-			continue
-		}
-		keyAuth, err := m.core.GetKeyAuthorization(a.ChallengeToken)
+		cleaned, err := m.removeAuthzTXT(ctx, a)
 		if err != nil {
-			m.log.Warn("计算 key authorization 失败，跳过清理", "identifier", a.Identifier, "err", err)
+			// 保留 Presented=true，下一轮（或收尾时的 cleanupOrphanTXT）还会再试一次。
+			m.log.Warn("清理 TXT 失败",
+				"cert", certName, "identifier", a.Identifier, "name", a.TxtName, "err", err)
 			continue
 		}
-		if err := m.dns.CleanUp(a.Identifier, a.ChallengeToken, keyAuth); err != nil {
-			m.log.Warn("清理 TXT 失败", "identifier", a.Identifier, "name", a.TxtName, "err", err)
+		if !cleaned {
+			// 连记录都定位不到，Presented 必须留着，别把唯一的线索擦掉。
 			continue
 		}
 		a.Presented = false
 		if err := m.store.PutAuthorization(a); err != nil {
-			m.log.Warn("更新授权状态失败", "identifier", a.Identifier, "err", err)
+			m.log.Warn("更新授权状态失败", "cert", certName, "identifier", a.Identifier, "err", err)
 		}
 	}
+}
+
+// removeAuthzTXT 删掉一条授权写进 DNS 的那条 TXT。
+//
+// 返回值 cleaned 表示"DNS 上已经没有这条记录了"，可以是本来就没写、
+// 也可以是这次删掉了。cleaned=false 且 err=nil 表示这条记录定位不到
+// （缺 token），调用方**必须保留授权行** —— 行里的 TxtName 是唯一还能
+// 拿来人工排查的线索。
+func (m *Manager) removeAuthzTXT(ctx context.Context, a *state.Authorization) (cleaned bool, err error) {
+	if a == nil || !a.Presented {
+		return true, nil
+	}
+	if a.ChallengeToken == "" || a.Identifier == "" {
+		m.log.Warn("授权缺少 token，无法定位要清理的 TXT（保留记录以便人工排查）",
+			"cert", a.CertName, "identifier", a.Identifier, "name", a.TxtName)
+		return false, nil
+	}
+	keyAuth, err := m.keyAuth.GetKeyAuthorization(a.ChallengeToken)
+	if err != nil {
+		return false, fmt.Errorf("计算 key authorization: %w", err)
+	}
+	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
+		return false, fmt.Errorf("清理 TXT %s: %w", a.TxtName, err)
+	}
+	return true, nil
+}
+
+// cleanupOrphanTXT 回收"已经写进 DNS、但已不属于任何进行中订单"的 TXT 记录。
+//
+// 两类来源：
+//   - 丢弃订单时的正常清理（discardOrder 会先调它）；
+//   - 上一次收尾只成功了一半（删订单成功、删授权失败），或进程被 kill。
+//
+// 第二类正是这个函数存在的意义：幂等、能自愈，不需要人去 DNSPod 后台翻。
+func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
+	authzs, err := m.store.ListAuthorizations(certName)
+	if err != nil {
+		return err
+	}
+
+	var cleaned, stuck int
+	for _, a := range authzs {
+		if !a.Presented {
+			// 没写进 DNS 的行直接清掉，不留垃圾。
+			if err := m.store.DeleteAuthorization(certName, a.AuthzURL); err != nil {
+				m.log.Warn("删除授权行失败", "cert", certName, "authz", a.AuthzURL, "err", err)
+			}
+			continue
+		}
+
+		ok, err := m.removeAuthzTXT(ctx, a)
+		if err != nil {
+			m.log.Warn("回收残留 TXT 失败",
+				"cert", certName, "identifier", a.Identifier, "name", a.TxtName, "err", err)
+			continue
+		}
+		if !ok {
+			// 定位不到那条记录：保留授权行，别把 TxtName 这条线索也丢了。
+			stuck++
+			continue
+		}
+		cleaned++
+		if err := m.store.DeleteAuthorization(certName, a.AuthzURL); err != nil {
+			m.log.Warn("删除授权行失败", "cert", certName, "authz", a.AuthzURL, "err", err)
+		}
+	}
+
+	if cleaned > 0 {
+		m.log.Info("已回收残留的 _acme-challenge TXT", "cert", certName, "count", cleaned)
+	}
+	if stuck > 0 {
+		m.log.Warn("有残留 TXT 无法自动清理，需要人工去 DNS 后台处理",
+			"cert", certName, "count", stuck,
+			"hint", "缺少 challenge token，程序定位不到具体记录")
+	}
+	return nil
 }
 
 func (m *Manager) finalize(
@@ -258,7 +406,10 @@ func (m *Manager) finalize(
 	}
 
 	// RFC 8555 §7.4：CSR 必须 POST 到 order 的 finalize URL。
+	//
 	// lego 那个参数名叫 orderURL 是误导 —— UpdateForCSR 直接往你给的 URL POST。
+	// 传 order URL 会被 LE 当成 POST-as-GET 并报
+	// "POST-as-GET requests must have an empty payload"。
 	if _, err := m.core.Orders.UpdateForCSR(o.FinalizeURL, csr); err != nil {
 		return m.recordFailure(st, fmt.Errorf("提交 CSR (finalize): %w", err))
 	}

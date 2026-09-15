@@ -30,7 +30,7 @@ func run() error {
 	var (
 		region     = flag.String("region", "", "地域，例如 ap-guangzhou")
 		lbID       = flag.String("clb", "", "CLB 实例 ID")
-		listenerID = flag.String("listener", "", "监听器 ID")
+		listenerID = flag.String("listener", "", "监听器 ID；省略则取该 CLB 下的第一个监听器")
 		expect     = flag.String("expect", "", "期望的主证书 ID；提供则断言必须相等")
 		notExpect  = flag.String("not-expect", "", "不应出现的证书 ID；提供则断言必须不等")
 		raw        = flag.Bool("raw", false, "原样打印 DescribeListeners 的 JSON 响应，用于排障")
@@ -113,19 +113,37 @@ func run() error {
 	// UpdateCertificateInstance 是异步 API：调用返回只代表任务创建成功，
 	// 真正的重绑定要等后台跑完（实测约 15 秒）。所以断言必须带等待。
 	if *expect != "" && *wait > 0 && certID != *expect {
+		// 等待循环必须用自己的、足够长的 ctx。
+		//
+		// 复用上面那个 30 秒的 ctx 会让 -wait 超过 30s 时每次请求都立刻
+		// 返回 deadline exceeded，而下面的 continue 又把错误吞掉 ——
+		// 结果就是空转到超时，然后报"仍未变成期望值"的假失败。
+		// 而那恰好是这个工具唯一存在的场景。
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), *wait+30*time.Second)
+		defer cancelWait()
+
 		deadline := time.Now().Add(*wait)
+		var lastErr error
 		for time.Now().Before(deadline) {
 			time.Sleep(5 * time.Second)
-			cur, err := fetchCertID(ctx, client, *lbID, *listenerID)
+			cur, err := fetchCertID(waitCtx, client, *lbID, *listenerID)
 			if err != nil {
+				// 不能再静默 continue：查询本身失败和"还没换过来"
+				// 是两件完全不同的事，必须让人看得见。
+				lastErr = err
+				fmt.Printf("  ...查询失败，稍后重试: %v\n", err)
 				continue
 			}
+			lastErr = nil
 			fmt.Printf("  ...等待中，当前绑定 %s\n", cur)
 			if cur == *expect {
 				certID = cur
 				break
 			}
 			certID = cur
+		}
+		if certID != *expect && lastErr != nil {
+			fmt.Printf("  ...注意：最后一次查询仍然失败，上面的断言结果可能不可信: %v\n", lastErr)
 		}
 		fmt.Println()
 	}
@@ -143,10 +161,15 @@ func run() error {
 }
 
 // fetchCertID 单独查一次监听器当前绑定的主证书 ID。
+//
+// listenerID 为空时按主流程一致的方式取第一个监听器 —— 传一个空的
+// ListenerIds 进去会让 API 直接报错，然后被等待循环当成"网络抖动"重试。
 func fetchCertID(ctx context.Context, client *clb.Client, lbID, listenerID string) (string, error) {
 	req := clb.NewDescribeListenersRequest()
 	req.LoadBalancerId = common.StringPtr(lbID)
-	req.ListenerIds = []*string{common.StringPtr(listenerID)}
+	if listenerID != "" {
+		req.ListenerIds = []*string{common.StringPtr(listenerID)}
+	}
 
 	resp, err := client.DescribeListenersWithContext(ctx, req)
 	if err != nil {
