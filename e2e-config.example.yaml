@@ -1,0 +1,57 @@
+# 端到端测试专用配置（L1）
+#
+# 只做两件事：
+#   1. 用 Let's Encrypt staging 真实签一张证书（不占生产配额）
+#   2. 把证书上传到腾讯云 SSL 证书服务
+#
+# 刻意不绑定任何 CLB —— 首次签发时 OldCertificateId 为空，
+# 所以 UpdateCertificateInstance 根本不会被调用，不会动到线上流量。
+#
+# 凭证不写在这个文件里，走环境变量：
+#   source /Users/atom/Documents/dsh/.secrets/tencent.env
+#   export TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY
+
+statePath: /tmp/wecert-e2e/state.db
+
+acme:
+  # 端到端测试必须用 staging。e2e-test.sh 会强制检查这一行。
+  directory: https://acme-staging-v02.api.letsencrypt.org/directory
+  # 填一个你真实能收信的邮箱；LE 不接受 example.com 这类保留域。
+  email: REPLACE_ME
+
+dns:
+  # 用腾讯云 CAM 凭证做 DNS-01，和证书部署共用同一套凭证。
+  provider: tencentcloud
+
+tencent:
+  # static：从环境变量读 AK/SK，不落进这个文件。
+  credentialMode: static
+  # cvm-role（生产推荐）：
+  # credentialMode: cvm-role
+  # roleName: wecert-role
+
+  resourceTypes:
+    - clb
+
+  # 你的测试域名所在的地域。L1 阶段其实不会用到，
+  # 但要通过配置校验（CLB 是分地域资源）。
+  regions:
+    - ap-guangzhou
+
+metrics:
+  listen: 127.0.0.1:9800
+
+certificates:
+  - name: e2e-test
+    # classic：90 天、Max Names 100，先确认基础流程。
+    # 跑通之后可以改成 tlsserver（45 天、Max Names 25）再验一遍。
+    profile: classic
+    keyType: ecdsa-p256
+    domains:
+      # 换成你的测试域名。建议就用单域名先跑通，
+      # 再加通配符验证 wildcard + apex 共用同一个 TXT 名字的路径。
+      - REPLACE_ME
+    deploy:
+      # L1 要验证"上传到腾讯云"这一步，所以开着。
+      # 首次签发只会 UploadCertificate，不会更新任何已有资源。
+      enabled: true

@@ -1,0 +1,29 @@
+[Unit]
+Description=wecert — ACME 证书自动续期（腾讯云 CLB）
+Documentation=https://github.com/atom/wecert
+After=network-online.target time-sync.target systemd-time-wait-sync.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wecert
+Group=wecert
+
+# 自动创建 /var/lib/wecert 并保证属主正确；state.db 必须持久化，
+# 丢了它就会重复下单并撞上速率限制。
+StateDirectory=wecert
+StateDirectoryMode=0700
+
+ExecStart=/usr/local/bin/wecert -config /etc/wecert/config.yaml
+Restart=on-failure
+RestartSec=30s
+
+# 配置文件里有 DNSPod token，用 ProtectSystem=strict 限制可写范围。
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadOnlyPaths=/etc/wecert
+
+[Install]
+WantedBy=multi-user.target

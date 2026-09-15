@@ -1,0 +1,29 @@
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "sid": "wecertTestSsl",
+      "effect": "allow",
+      "action": [
+        "ssl:UploadCertificate",
+        "ssl:DescribeCertificate",
+        "ssl:DescribeCertificates",
+        "ssl:DeleteCertificate",
+        "ssl:UpdateCertificateInstance"
+      ],
+      "resource": ["*"]
+    },
+    {
+      "sid": "wecertTestDns",
+      "effect": "allow",
+      "action": [
+        "dnspod:DescribeDomainList",
+        "dnspod:DescribeRecordList",
+        "dnspod:CreateRecord",
+        "dnspod:ModifyRecord",
+        "dnspod:DeleteRecord"
+      ],
+      "resource": ["*"]
+    }
+  ]
+}

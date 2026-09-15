@@ -1,0 +1,16 @@
+bin/
+dist/
+coverage.out
+*.db
+*.db-wal
+*.db-shm
+
+# terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+terraform.tfvars
+
+# 本机沙箱的 Go 缓存重定向（含绝对路径，不该进仓库）
+.goenv

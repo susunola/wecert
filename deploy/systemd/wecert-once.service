@@ -1,0 +1,28 @@
+# 备选方案：用 systemd timer 代替常驻守护进程。
+# 适合不想跑长驻进程、或者偏好"每次执行完就退出"的场景。
+#
+# 启用方式：
+#   systemctl disable --now wecert.service
+#   systemctl enable --now wecert-once.timer
+
+[Unit]
+Description=wecert 单轮收敛（配合 wecert-once.timer）
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=wecert
+Group=wecert
+
+StateDirectory=wecert
+StateDirectoryMode=0700
+
+ExecStart=/usr/local/bin/wecert -config /etc/wecert/config.yaml -once
+TimeoutStartSec=15min
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadOnlyPaths=/etc/wecert

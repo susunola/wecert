@@ -1,0 +1,93 @@
+# wecert 配置示例
+#
+# 安全提示：这份文件包含 DNSPod token，务必 chmod 600 并确保属主是运行 wecert 的用户。
+# 腾讯云凭证默认走 CVM 角色（临时凭证，不落盘），不需要在这里写 SecretId/SecretKey。
+
+statePath: /var/lib/wecert/state.db
+
+acme:
+  # ⚠️ 强烈建议先用 staging 跑通全流程，再切生产：
+  #    https://acme-staging-v02.api.letsencrypt.org/directory
+  # 生产环境失败重试会消耗真实配额，而 ARI 之外的续期是限额敏感的。
+  directory: https://acme-v02.api.letsencrypt.org/directory
+  email: ops@example.com
+
+dns:
+  # ── 二选一，两者的凭证体系完全不同，别搞混 ───────────────────────
+  #
+  #   tencentcloud  用腾讯云 CAM 凭证（下面的 tencent 段），
+  #                 调 dnspod.tencentcloudapi.com。推荐：能和证书部署
+  #                 共用一套凭证，且支持 SessionToken，可以走 CVM 角色。
+  #
+  #   dnspod        用 DNSPod 自有的 API Token（dnspod.cn → 密钥管理），
+  #                 调 dnsapi.cn。注意这**不是**腾讯云的 SecretId/SecretKey。
+  provider: tencentcloud
+
+  # provider=dnspod 时必填。形如 "12345,abcdef0123456789..."
+  # loginToken: ""
+
+  # TXT 记录的 TTL。
+  # ⚠️ DNSPod 免费套餐的 TTL 下限是 600，写 60 会被 API 拒绝
+  #    (LimitExceeded.RecordTtlLimit)。付费套餐可调低。
+  ttl: 600
+  # 写完 TXT 后，等待全部权威 NS 可见的上限。LE 会从多个 vantage point 校验，
+  # 全部一致才算通过，所以这一步不能省。
+  propagationTimeout: 5m
+  pollingInterval: 5s
+
+tencent:
+  # cvm-role：从实例元数据服务取临时凭证（推荐，密钥不落盘）
+  # static  ：在下面填 secretId / secretKey（本地调试或 dns.provider=tencentcloud 时用）
+  credentialMode: cvm-role
+  roleName: wecert-role
+
+  # credentialMode: static
+  # secretId: "REPLACE_ME"
+  # secretKey: "REPLACE_ME"
+
+  # UpdateCertificateInstance 支持的资源类型。
+  # clb 是最常用的；cdn、waf、tke、apigateway 等也支持。
+  resourceTypes:
+    - clb
+
+  # CLB 是分地域的资源，这里必须列出你所有有 CLB 的地域，
+  # 漏掉的地域不会被更新，那边的证书会静默过期。
+  regions:
+    - ap-guangzhou
+    - ap-shanghai
+
+metrics:
+  listen: 127.0.0.1:9800
+
+certificates:
+  # ── 一组证书 = 一组"生死与共"的域名 ──────────────────────────────
+  # 同一张证书里的域名会一起成功、一起失败、一起过期。
+  # 不要把无关业务塞进同一张证书，否则一个域名的 DNS 故障会拖垮全部。
+  #
+  # 建议每张证书不超过 25 个域名：既留出余量，也对齐 tlsserver profile
+  # 的 Max Names（25），将来切 profile 不用改架构。
+
+  - name: example-com
+    # profile 决定 Max Names：classic=100（90天），tlsserver=25（45天）
+    # 长期方向是 tlsserver —— BR 已排期 2029-03-15 起所有证书 ≤47 天。
+    profile: classic
+    keyType: ecdsa-p256
+    # 可选，默认按 profile 推导：classic=30d，tlsserver=15d。
+    # 仅在 ARI 不可用时作为兜底。
+    # renewBefore: 30d
+    domains:
+      - example.com
+      - "*.example.com"
+    deploy:
+      enabled: true
+
+  # 通配符只覆盖一层标签：*.example.com 不包含 a.b.example.com。
+  # 多层命名需要为每个子区单独申请。
+  - name: api-example-com
+    profile: tlsserver
+    keyType: ecdsa-p256
+    domains:
+      - api.example.com
+      - "*.api.example.com"
+    deploy:
+      enabled: true

@@ -1,0 +1,73 @@
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "sid": "StageA_WecertRuntime",
+      "effect": "allow",
+      "action": [
+        "ssl:UploadCertificate",
+        "ssl:DescribeCertificate",
+        "ssl:DescribeCertificates",
+        "ssl:DeleteCertificate",
+        "dnspod:DescribeDomainList",
+        "dnspod:DescribeRecordList",
+        "dnspod:CreateRecord",
+        "dnspod:ModifyRecord",
+        "dnspod:DeleteRecord"
+      ],
+      "resource": ["*"]
+    },
+    {
+      "sid": "StageB_WecertRebindClb",
+      "effect": "allow",
+      "action": [
+        "ssl:UpdateCertificateInstance"
+      ],
+      "resource": ["*"]
+    },
+    {
+      "sid": "StageB_TerraformClb",
+      "effect": "allow",
+      "action": [
+        "clb:CreateLoadBalancer",
+        "clb:DescribeLoadBalancers",
+        "clb:DescribeLoadBalancerDetail",
+        "clb:DeleteLoadBalancer",
+        "clb:CreateListener",
+        "clb:DescribeListeners",
+        "clb:DescribeLoadBalancerListeners",
+        "clb:ModifyListener",
+        "clb:DeleteListener",
+        "clb:DescribeResources",
+        "clb:DescribeQuota"
+      ],
+      "resource": ["*"]
+    },
+    {
+      "sid": "StageB_TerraformVpc",
+      "effect": "allow",
+      "action": [
+        "vpc:CreateVpc",
+        "vpc:DescribeVpcs",
+        "vpc:DeleteVpc",
+        "vpc:ModifyVpcAttribute",
+        "vpc:CreateSubnet",
+        "vpc:DescribeSubnets",
+        "vpc:DeleteSubnet",
+        "vpc:ModifySubnetAttribute"
+      ],
+      "resource": ["*"]
+    },
+    {
+      "sid": "StageB_TerraformTag",
+      "effect": "allow",
+      "action": [
+        "tag:AddResourceTag",
+        "tag:DescribeResourceTags",
+        "tag:DescribeTagKeys",
+        "tag:DescribeTagValues"
+      ],
+      "resource": ["*"]
+    }
+  ]
+}

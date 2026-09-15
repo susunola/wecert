@@ -1,0 +1,18 @@
+# 复制成 terraform.tfvars 后按需修改。
+# 凭证不写在这里 —— 用环境变量 TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY。
+
+region            = "ap-guangzhou"
+availability_zone = "ap-guangzhou-3"
+name_prefix       = "wecert-test"
+
+# 阶段 B：VPC + CLB + HTTPS 监听器 + 占位证书
+create_clb         = true
+clb_network_type   = "INTERNAL" # 内网型，省掉 EIP 费用
+clb_sni_domain     = "placeholder.wecert-test.invalid"
+
+# 阶段 C：再加一台 CVM（默认关闭，最贵的部分）
+create_cvm        = false
+enable_cvm_role   = false
+cam_role_name     = "wecert-test-role"
+cvm_instance_type = "S5.MEDIUM2"
+cvm_image_id      = "img-487zeit5" # Ubuntu 22.04 LTS (ap-guangzhou)

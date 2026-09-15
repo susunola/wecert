@@ -1,0 +1,14 @@
+[Unit]
+Description=定时触发 wecert 单轮收敛
+
+[Timer]
+# 每小时跑一次。续期是否真的发生由 ARI 窗口决定，
+# 跑得勤只是让"窗口一到就动"，不会因此多下单。
+OnBootSec=2min
+OnUnitActiveSec=1h
+# 加抖动，避免多实例同时敲 CA 的门。
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
