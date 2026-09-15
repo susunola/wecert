@@ -58,6 +58,28 @@ output "cvm_cam_role" {
   value       = var.create_cvm ? var.enable_cvm_role ? var.cam_role_name : "" : null
 }
 
+output "cvm_private_ip" {
+  description = "CVM 内网 IP。目标组就是按它注册后端的。"
+  value       = var.create_cvm ? tencentcloud_instance.test[0].private_ip : null
+}
+
+# ── 端到端 TLS 验证所需 ─────────────────────────────────────────────────────
+
+output "clb_vip" {
+  description = "CLB 的 VIP。从 CVM 内部 curl 这个地址就能读到实际服务的证书。"
+  value       = var.create_clb ? tencentcloud_clb_instance.test[0].vip : null
+}
+
+output "verify_command" {
+  description = "从 CVM 内部做端到端 TLS 验证的命令模板（把 <域名> 换成实际域名）。"
+  value = var.create_clb && var.create_cvm ? join(" ", [
+    "./bin/wecert-tatrun",
+    "-region", var.region,
+    "-instance", tencentcloud_instance.test[0].id,
+    "-cmd", "'echo | openssl s_client -connect <域名>:443 -servername <域名> -showcerts 2>/dev/null | openssl x509 -noout -subject -dates'",
+  ]) : null
+}
+
 # ── 清理提醒 ────────────────────────────────────────────────────────────────
 
 output "teardown_command" {

@@ -289,16 +289,33 @@ DNSPod 有 9 台权威 NS。要求 9 台全部响应且一致，只要有一台�
 - `UpdateForCSR` 会自己对传入字节做 base64url，所以要给 **DER** 不是 PEM。
   给 PEM 会让 LE 报 asn1 `tags don't match`。
 
-### `UpdateCertificateInstance` 是异步的
+### `UpdateCertificateInstance` 是异步的，而且**不是原子的**
 
-调用返回只代表任务创建成功，真正重绑定要等后台跑完（实测约 15 秒）。
-断言必须带轮询，否则会误判成失败。
+调用返回只代表任务创建成功，真正重绑定要等后台跑完。
 
-### `DescribeListeners` 不回读证书绑定
+更关键的是：一次调用会重绑定所有绑了旧证书的资源，但**各资源生效时间不同**。
+实测一张 2-SAN 证书绑在两条 CLB 转发规则上：
 
-所以不能只靠它验证部署结果。可靠的独立信号是 `UpdateCertificateInstance`
-返回里的 `UpdateSyncProgress.TotalCount`（"这张旧证书绑了几个资源"），
-以及 `CreateCertificateBindResourceSyncTask`。
+| 时刻 | test.alpha | test.beta |
+|---|---|---|
+| 调用返回后 30s | 新证书 | **旧证书** |
+| 60s 后 | 新证书 | 新证书 |
+
+存在 30~60 秒的窗口，期间不同端点服务的证书版本不一致。
+
+续期场景下无害（新旧证书都有效），但**任何验证都必须带轮询**，
+不能只测一次就下结论 —— 我们第一次就是这么误判成"只重绑定了一半"的。
+首次签发全新域名时这个窗口更值得注意：那段时间内该域名可能还拿不到证书。
+
+### 不要用"没有漂移"推断"证书已生效"
+
+`DescribeListeners` **不回读**证书绑定，Terraform provider 也不回读
+`certificate_id`。所以 `terraform plan` 会一直报 `No changes`，
+哪怕实际一个证都没绑上。
+
+唯一的权威证据是**直接做一次 TLS 握手读证书**：从外部
+`openssl s_client -servername <域名>` 打 CLB，看实际服务的
+`notBefore/notAfter`。这不依赖任何一方的自述。
 
 ---
 

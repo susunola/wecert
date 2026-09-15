@@ -162,3 +162,109 @@ cam:PassRole                       # 把角色关联给 CVM
 ```
 
 `deploy/cam-policy-test.json` 只覆盖了阶段 A。要跑 B/C 需要额外加权限。
+
+---
+
+## 阶段 B2：2-SAN wildcard + SNI + CVM 后端（实测记录）
+
+比阶段 B 更严格的一组场景：**一张证书带 2 个 wildcard SAN**，
+绑在**开了 SNI 的监听器**上，后面挂**真实 CVM 后端**，
+从公网做端到端 TLS 验证。
+
+```bash
+terraform apply -var create_cvm=true
+```
+
+搭出来的东西：
+
+```
+CLB（公网型）
+└── 监听器 HTTPS:443（SniSwitch=1）
+    ├── 规则 test.alpha.<域名>  → 证书 + CVM
+    └── 规则 test.beta.<域名>   → 证书 + CVM（同一个）
+```
+
+### 结论（全部通过）
+
+- 一张证书覆盖 `*.alpha` + `*.beta`，SAN 完全正确
+- 从公网做 TLS 握手，两个 SNI 域名都读到新证书
+- 两个域名都能通过 CLB 走到同一个 CVM 后端（HTTP 200）
+- **`UpdateCertificateInstance` 确实重绑定了两条规则**
+
+### 一个重要的产品级发现：重绑定不是原子的
+
+实测时间线：
+
+| 时刻 | test.alpha | test.beta |
+|---|---|---|
+| 调用返回后 30s | 新证书 ✅ | **旧占位证书** ❌ |
+| 60s 后 | 新证书 ✅ | 新证书 ✅ |
+| 90s / 120s | 稳定 | 稳定 |
+
+一次调用会重绑定所有资源，但**各资源生效时间不同**，存在
+30~60 秒的窗口，期间不同端点服务的证书版本不一致。
+
+续期场景下无害（新旧证书都有效），但如果依赖"重绑定瞬间完成"
+就会出错 —— 比如首次签发一个全新域名时，那个窗口内该域名
+可能还拿不到证书。
+
+**做外部黑盒探测时必须带轮询，不能只测一次。**
+
+### 踩过的 8 个坑（全部是真跑才暴露的）
+
+| # | 现象 | 原因 / 修法 |
+|---|---|---|
+| 1 | `InvalidZone.MismatchRegion` | 可用区硬编码错了。`ap-guangzhou-3` 该账号下 CVM 不可售，实际是 `-5/-6/-7`。**子网能建出来不代表 CVM 能在那里开机**。用 `data.tencentcloud_availability_zones_by_product` 查 |
+| 2 | `InvalidUserDataFormat` | `user_data` 要求 base64，明文要用 `user_data_raw` |
+| 3 | `do not support to create v1 target group` | 该账号不支持目标组，改用经典的 `tencentcloud_clb_attachment` |
+| 4 | `Lack of parameter Certificate or MultiCertInfo` | 建**规则**时也要带证书 —— CLB 的 SNI 多证书是在规则层配置的 |
+| 5 | `HttpCheckDomain:*.alpha... can't be wildcards` | 规则域名不能是通配符（会被当作健康检查 Host）。用具体主机名，它仍被证书的 wildcard 覆盖 |
+| 6 | `health_check_http_code cannot be higher than 31` | 这个字段是**位掩码**不是 HTTP 状态码，别填 200 |
+| 7 | `uin don't support set L7 custom port for health check` | 该账号不允许给七层规则设自定义健康检查端口 |
+| 8 | `You can't specify SubnetId when create open loadbalancer` | 公网型 CLB 不能指定子网；内网型必须指定 |
+
+### 还有一个：公网 CLB 的健康检查源不在 VPC 网段
+
+只放通 VPC 网段和 `100.64.0.0/10` 时，健康检查一直失败，
+CLB 对所有请求返回 **504**。
+
+迷惑点：**TLS 握手是正常的**（`curl` 报 504 而不是连接错误，
+`ssl_verify_result=20` 说明有证书送出），所以很容易误判成"后端挂了"。
+实际后端好好的 —— 直连 CVM 公网 IP 返回 200。
+
+排查方式：临时放开 `0.0.0.0/0 → 80`，504 立刻消失，从而定位到是安全组。
+
+### 最重要的一个：不要让 Terraform 和 wecert 抢同一个字段
+
+调试安全组时我跑了几次 `terraform apply`，结果**两条规则的证书被悄悄改回了占位证书**，
+而 wecert 状态库还以为部署的是新证书 —— 两边认知完全不一致。
+
+原因：Terraform 的 `certificate_id` 是**期望状态**，每次 apply 都会强制刷成配置里的值；
+而 wecert 是通过 `UpdateCertificateInstance` 在**带外**改这个字段的。
+两者管理同一个字段，必然打架。
+
+修法是让 Terraform 不要碰这个字段：
+
+```hcl
+resource "tencentcloud_clb_listener" "https" {
+  # ...
+  lifecycle {
+    ignore_changes = [multi_cert_info, certificate_id, certificate_ssl_mode]
+  }
+}
+
+resource "tencentcloud_clb_listener_rule" "wildcard" {
+  # ...
+  lifecycle {
+    ignore_changes = [certificate_id, certificate_ssl_mode, certificate_ca_id]
+  }
+}
+```
+
+代价：Terraform state 里这个字段会**长期停留在旧值**（本项目里就一直是占位证书的 ID），
+`terraform plan` 也不会再报漂移。这是有意为之 —— 这个字段的真相在 wecert 的状态库里，
+不在 Terraform 里。
+
+**推广开来：任何"Terraform 管基础设施 + 另一个系统管证书/密钥轮转"的组合都有这个问题。**
+要么让 Terraform 管绑定（那 wecert 就不该调 `UpdateCertificateInstance`），
+要么让 wecert 管绑定（那就必须 `ignore_changes`）。不能两个都管。

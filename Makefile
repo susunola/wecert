@@ -4,6 +4,7 @@ BIN := bin/wecert
 # 加 wecert- 前缀是为了安装到 /usr/local/bin 后不会和其它工具撞名。
 PREFLIGHT := bin/wecert-preflight
 CLBVERIFY := bin/wecert-clbverify
+TATRUN := bin/wecert-tatrun
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1.0)
 
 # 交叉编译目标。腾讯云 CVM 绝大多数是 linux/amd64；
@@ -18,13 +19,16 @@ $(BIN):
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
 
 # 构建辅助工具（preflight 前置检查、clbverify 监听器绑定取证）。
-tools: $(PREFLIGHT) $(CLBVERIFY)
+tools: $(PREFLIGHT) $(CLBVERIFY) $(TATRUN)
 
 $(PREFLIGHT):
 	$(GO) build -trimpath -ldflags "-s -w" -o $(PREFLIGHT) ./cmd/preflight
 
 $(CLBVERIFY):
 	$(GO) build -trimpath -ldflags "-s -w" -o $(CLBVERIFY) ./cmd/clbverify
+
+$(TATRUN):
+	$(GO) build -trimpath -ldflags "-s -w" -o $(TATRUN) ./cmd/tatrun
 
 # 产出可直接扔到 CVM 上的静态二进制。
 # CGO_ENABLED=0 是必须的：一是交叉编译，二是让产物不依赖 glibc，
