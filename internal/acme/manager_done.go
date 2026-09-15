@@ -1,0 +1,231 @@
+package acme
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	legoacme "github.com/go-acme/lego/v4/acme"
+
+	"github.com/atom/wecert/internal/config"
+	"github.com/atom/wecert/internal/state"
+)
+
+// download 下载证书、校验，然后部署并推进状态。
+//
+// 这里的顺序是刻意的：在部署成功之前，绝不覆盖 CertState 里当前生效的
+// 证书与私钥。否则部署失败就会连回滚的资本都没有。
+func (m *Manager) download(
+	ctx context.Context, c *config.Certificate, st *state.CertState,
+	o *state.Order, order legoacme.ExtendedOrder,
+) error {
+	if order.Certificate == "" {
+		return m.recordFailure(st, errors.New("订单已 valid 但没有证书 URL"))
+	}
+
+	fullchain, _, err := m.core.Certificates.Get(order.Certificate, true)
+	if err != nil {
+		return m.recordFailure(st, fmt.Errorf("下载证书: %w", err))
+	}
+
+	leaf, err := ParseLeaf(fullchain)
+	if err != nil {
+		return m.recordFailure(st, err)
+	}
+
+	if err := VerifyCoverage(leaf, c.Domains); err != nil {
+		return m.recordFailure(st, err)
+	}
+	if !st.NotAfter.IsZero() && !leaf.NotAfter.After(st.NotAfter) {
+		return m.recordFailure(st, fmt.Errorf(
+			"新证书 notAfter (%s) 不晚于当前证书 (%s)，拒绝部署", leaf.NotAfter, st.NotAfter))
+	}
+	if len(o.KeyPEM) == 0 {
+		return m.recordFailure(st, errors.New("订单缺少私钥，无法部署"))
+	}
+
+	// 部署。首次签发时 DeployedCertID 为空，此时只上传，等人工在 CLB 绑一次。
+	// 上传成功不等于已经绑到监听器：DeployConfirmed 要等一键更新真正换完才置位。
+	oldDeployedID := st.DeployedCertID
+	deployedID := oldDeployedID
+	rebound := false
+	if c.Deploy.Enabled {
+		id, derr := m.deployer.Deploy(ctx, c.Name, oldDeployedID, fullchain, o.KeyPEM)
+		if derr != nil {
+			return m.recordFailure(st, fmt.Errorf("部署到腾讯云: %w", derr))
+		}
+		deployedID = id
+		rebound = oldDeployedID != ""
+	}
+
+	ariCertID, err := CertID(leaf)
+	if err != nil {
+		m.log.Warn("无法构造 ARI certID，本次续期将不带 replaces", "cert", c.Name, "err", err)
+	}
+
+	st.NotAfter = leaf.NotAfter
+	st.CertURL = order.Certificate
+	st.CertPEM = fullchain
+	st.KeyPEM = o.KeyPEM
+	st.IssuedAt = m.now()
+	st.DeployedCertID = deployedID
+	if rebound {
+		st.DeployConfirmed = true
+	} else if oldDeployedID == "" {
+		// 首次上传：CertId 要记下来给人手绑定，但指标仍应显示未部署。
+		st.DeployConfirmed = false
+	}
+	st.ARICertID = ariCertID
+	st.ARIWindowStart = time.Time{}
+	st.ARIWindowEnd = time.Time{}
+	st.ARICheckedAt = time.Time{}
+	st.ARIRetryAfter = 0
+	st.ConsecutiveFailures = 0
+	st.NextAttemptAt = time.Time{}
+	st.LastError = ""
+
+	if err := m.store.PutCert(st); err != nil {
+		return err
+	}
+
+	// 只有确认已经从旧证换到新证之后，才把旧证挂到待回收列表。
+	// 首次上传还没绑监听器时绝不能退休，否则 7 天后会把人手刚绑上的证删掉。
+	if rebound && oldDeployedID != "" && oldDeployedID != deployedID {
+		if err := m.store.AddRetiredCert(oldDeployedID, c.Name); err != nil {
+			m.log.Warn("记录待回收证书失败", "cert", c.Name, "certId", oldDeployedID, "err", err)
+		}
+	}
+
+	if err := m.discardOrder(c.Name); err != nil {
+		return err
+	}
+
+	if !c.Deploy.Enabled {
+		m.log.Info("证书已签发并写入本地状态（未开启云端部署）",
+			"cert", c.Name, "notAfter", st.NotAfter,
+			"daysLeft", int(time.Until(st.NotAfter).Hours()/24))
+	} else if !st.DeployConfirmed {
+		m.log.Info("证书已上传，等待在 CLB 上手动绑定一次",
+			"cert", c.Name, "notAfter", st.NotAfter,
+			"uploadedCertId", deployedID,
+			"hint", "绑定完成后，后续续期会走 UpdateCertificateInstance 自动换证")
+	} else {
+		m.log.Info("证书已续期并生效",
+			"cert", c.Name, "notAfter", st.NotAfter,
+			"daysLeft", int(time.Until(st.NotAfter).Hours()/24),
+			"deployedCertId", deployedID, "ariCertId", ariCertID != "")
+	}
+	return nil
+}
+
+// ReapRetired 回收超过保留期的退役证书。
+func (m *Manager) ReapRetired(ctx context.Context) {
+	retired, err := m.store.ListRetiredCertsBefore(m.now().Add(-m.retention))
+	if err != nil {
+		m.log.Warn("查询待回收证书失败", "err", err)
+		return
+	}
+	for _, r := range retired {
+		if err := m.deployer.Delete(ctx, r.CertID); err != nil {
+			m.log.Warn("回收退役证书失败", "certId", r.CertID, "cert", r.CertName, "err", err)
+			continue
+		}
+		m.log.Info("已回收退役证书",
+			"certId", r.CertID, "cert", r.CertName, "retiredAt", r.RetiredAt)
+		if err := m.store.DeleteRetiredCert(r.CertID); err != nil {
+			m.log.Warn("清理回收记录失败", "certId", r.CertID, "err", err)
+		}
+	}
+}
+
+// recordFailure 记录失败并安排指数退避。
+func (m *Manager) recordFailure(st *state.CertState, err error) error {
+	// 停进程 / 父 context 取消不是业务失败。记进去会拉长退避，
+	// 重启后本该立刻续推同一张订单，结果被挡在窗口外。
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		m.log.Warn("本轮被取消，不记失败、不进入退避", "cert", st.Name, "err", err)
+		return err
+	}
+
+	st.ConsecutiveFailures++
+	st.LastError = err.Error()
+
+	shift := st.ConsecutiveFailures - 1
+	if shift > 10 {
+		shift = 10
+	}
+	backoff := time.Minute << shift
+	if backoff > 6*time.Hour || backoff <= 0 {
+		backoff = 6 * time.Hour
+	}
+	st.NextAttemptAt = m.now().Add(backoff)
+
+	if perr := m.store.PutCert(st); perr != nil {
+		return errors.Join(err, perr)
+	}
+
+	m.log.Error("处理失败，已安排重试",
+		"cert", st.Name, "err", err,
+		"consecutiveFailures", st.ConsecutiveFailures, "nextAttemptAt", st.NextAttemptAt)
+	return err
+}
+
+func (m *Manager) discardOrder(certName string) error {
+	if authzs, err := m.store.ListAuthorizations(certName); err != nil {
+		m.log.Warn("列出授权失败，跳过 TXT 清理", "cert", certName, "err", err)
+	} else {
+		m.cleanup(certName, authzs)
+	}
+	if err := m.store.DeleteOrder(certName); err != nil {
+		return err
+	}
+	return m.store.DeleteAuthorizations(certName)
+}
+
+// parseOrderExpires 解析 ACME 订单的 expires。空值或无法解析时退回 now+defaultOrderTTL，
+// 保证落盘的 ExpiresAt 永远不是零值。
+func parseOrderExpires(raw string, now time.Time) (time.Time, error) {
+	fallback := now.Add(defaultOrderTTL)
+	if raw == "" {
+		return fallback, nil
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return t, nil
+	}
+	return fallback, fmt.Errorf("无法解析 expires %q", raw)
+}
+
+func (m *Manager) persistOrder(o *state.Order, order legoacme.ExtendedOrder) {
+	o.Status = order.Status
+	// 不要用空值覆盖已持久化的 finalize URL —— 丢掉它会让后续无法提交 CSR。
+	if order.Finalize != "" {
+		o.FinalizeURL = order.Finalize
+	}
+	o.CertURL = order.Certificate
+	if err := m.store.PutOrder(o); err != nil {
+		m.log.Warn("更新订单状态失败", "cert", o.CertName, "err", err)
+	}
+}
+
+func pickDNS01(authz legoacme.Authorization) (legoacme.Challenge, error) {
+	for _, ch := range authz.Challenges {
+		if ch.Type == "dns-01" {
+			return ch, nil
+		}
+	}
+	return legoacme.Challenge{}, fmt.Errorf(
+		"identifier %s 的授权未提供 dns-01 挑战（通配符只能走 DNS-01）", authz.Identifier.Value)
+}
+
+func authzError(authz legoacme.Authorization) string {
+	for _, ch := range authz.Challenges {
+		if ch.Error != nil {
+			return ch.Error.Detail
+		}
+	}
+	return "CA 未给出具体原因"
+}
