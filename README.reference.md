@@ -139,7 +139,7 @@ Two further deliberate choices:
 
 Optional: `terraform` and `sqlite3` for the end-to-end harness under `testenv/` and `scripts/`.
 
-> **Note on the module path.** `go.mod` declares `github.com/atom/wecert` while the repository is `github.com/susunola/wecert`. A local `git clone` plus `make build` works fine, but `go install github.com/susunola/wecert/cmd/wecert@latest` will fail with a module-path mismatch. Renaming the module touches every import, so it has been left alone.
+> **Note on the module path.** `go.mod` declares `github.com/susunola/wecert`, matching the repository, so `go install github.com/susunola/wecert/cmd/wecert@latest` resolves correctly.
 
 ## Quick start
 

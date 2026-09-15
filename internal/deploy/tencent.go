@@ -13,7 +13,7 @@ import (
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
 
-	"github.com/atom/wecert/internal/config"
+	"github.com/susunola/wecert/internal/config"
 )
 
 // TencentCLB 通过腾讯云 SSL 证书服务把证书一键更新到绑定的 CLB 资源上。

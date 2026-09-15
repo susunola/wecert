@@ -22,9 +22,9 @@ import (
 
 	legoapi "github.com/go-acme/lego/v4/acme/api"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/deploy"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // fakeACME 起一个最小的 ACME 目录（TLS）。

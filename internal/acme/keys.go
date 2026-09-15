@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/atom/wecert/internal/config"
+	"github.com/susunola/wecert/internal/config"
 )
 
 // GenerateKey 按配置生成证书私钥。默认 ECDSA P-256。
