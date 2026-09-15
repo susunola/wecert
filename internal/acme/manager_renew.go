@@ -12,6 +12,10 @@ import (
 	"github.com/atom/wecert/internal/state"
 )
 
+// renewalDecision 返回"什么时候续期"和"下单时该带哪个 replaces"。
+//
+// ARI 优先：走 ARI 并带 replaces 的续期豁免 Let's Encrypt 的全部速率限制。
+// ARI 不可用时退化到 notAfter - renewBefore，并叠加确定性抖动。
 func (m *Manager) renewalDecision(
 	ctx context.Context, c *config.Certificate, st *state.CertState,
 ) (renewAt time.Time, replaces string, ariErr error) {
@@ -32,6 +36,7 @@ func (m *Manager) renewalDecision(
 			m.log.Info("已刷新 ARI 窗口",
 				"cert", c.Name, "start", st.ARIWindowStart, "end", st.ARIWindowEnd, "retryAfter", retryAfter)
 		case errors.Is(err, api.ErrNoARI):
+			// CA 不支持 ARI，永久退化。记一次就够了，不必每轮重试。
 			st.ARICheckedAt = now
 			st.ARIRetryAfter = 0
 			if perr := m.store.PutCert(st); perr != nil {
@@ -39,6 +44,17 @@ func (m *Manager) renewalDecision(
 			}
 			ariErr = err
 		default:
+			// 失败也必须记账。
+			//
+			// 节流判据 ariCheckDue 完全基于 ARICheckedAt，如果这里不写，
+			// 每一轮 reconcile（默认 1 小时）都会重打一次 ARI；
+			// 而且服务端给的 Retry-After 会被丢掉 —— FetchRenewalInfo
+			// 明明已经替我们解析好了，连非 200 响应的情况都覆盖了。
+			st.ARICheckedAt = now
+			st.ARIRetryAfter = retryAfter
+			if perr := m.store.PutCert(st); perr != nil {
+				return time.Time{}, "", perr
+			}
 			ariErr = err
 		}
 	}
@@ -47,6 +63,8 @@ func (m *Manager) renewalDecision(
 		return RenewalTime(c.Name, st.ARIWindowStart, st.ARIWindowEnd), st.ARICertID, ariErr
 	}
 
+	// 兜底：不用 ARI，但仍把 identifier 集合保持不变，
+	// 这样至少还能享受"非 ARI 续期"对订单数与每域名证书数的豁免。
 	base := st.NotAfter.Add(-c.RenewBeforeDur)
 	return DeterministicTime(c.Name, base, c.RenewBeforeDur/8), st.ARICertID, ariErr
 }
@@ -55,15 +73,18 @@ func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
 	if st.ARICheckedAt.IsZero() {
 		return true
 	}
+	// Let's Encrypt 建议最多 6 小时查一次 renewalInfo。
 	if now.Before(st.ARICheckedAt.Add(m.ariInterval)) {
 		return false
 	}
+	// 并遵守服务端给的 Retry-After。
 	if st.ARIRetryAfter > 0 && now.Before(st.ARICheckedAt.Add(st.ARIRetryAfter)) {
 		return false
 	}
 	return true
 }
 
+// issue 创建订单。注意顺序：先把订单（含本次生成的私钥）落盘，再推进它。
 func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.CertState, replaces string) error {
 	key, err := GenerateKey(c.KeyType)
 	if err != nil {
@@ -99,6 +120,9 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		ExpiresAt:   expiresAt,
 		Status:      order.Status,
 		KeyPEM:      keyPEM,
+		// 记下这张订单的 identifier 集合。之后配置里改了域名，
+		// Reconcile 就能立刻发现并丢弃它，而不是推进到过期。
+		Identifiers: c.DomainKey(),
 	}
 	if err := m.store.PutOrder(o); err != nil {
 		return err
@@ -106,6 +130,6 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 
 	m.log.Info("已创建 ACME 订单",
 		"cert", c.Name, "status", order.Status, "expiresAt", expiresAt,
-		"profile", order.Profile, "replaces", replaces != "")
+		"names", len(c.Domains), "profile", order.Profile, "replaces", replaces != "")
 	return m.advance(ctx, c, st, o)
 }

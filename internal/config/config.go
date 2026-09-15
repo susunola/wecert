@@ -6,8 +6,10 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,11 +43,12 @@ const (
 
 // DNS-01 solver 的实现。两者的凭证体系完全不同，别搞混：
 //
-//   - dnspod       用 DNSPod 自有的 API Token（dnspod.cn 控制台 → 密钥管理），
-//                  调 dnsapi.cn。它和腾讯云 CAM 的 SecretId/SecretKey 是两套东西。
-//   - tencentcloud 用腾讯云 CAM 凭证（AK/SK 或 CVM 角色临时凭证），
-//                  调 dnspod.tencentcloudapi.com。好处是能和证书部署共用同一套凭证，
-//                  而且支持 SessionToken，可以走 role。
+// dnspod 用 DNSPod 自有的 API Token（dnspod.cn 控制台 → 密钥管理），调
+// dnsapi.cn。它和腾讯云 CAM 的 SecretId/SecretKey 是两套东西。
+//
+// tencentcloud 用腾讯云 CAM 凭证（AK/SK 或 CVM 角色临时凭证），调
+// dnspod.tencentcloudapi.com。好处是能和证书部署共用同一套凭证，而且支持
+// SessionToken，可以走 role。
 const (
 	DNSProviderDNSPod       = "dnspod"
 	DNSProviderTencentCloud = "tencentcloud"
@@ -157,7 +160,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := &Config{}
-	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	// 未知字段直接报错，避免配置写错了却静默生效。
 	dec.KnownFields(true)
 	if err := dec.Decode(cfg); err != nil {
@@ -280,19 +283,25 @@ func (c *Certificate) normalize(seen map[string]bool) error {
 	if len(c.Domains) == 0 {
 		return fmt.Errorf("certificate %q: domains is empty", c.Name)
 	}
+
+	// 先把域名规范化（小写、去重、校验），再判上限。
+	//
+	// 顺序很重要：SAN 多的证书，domains 列表往往是从别处整段复制粘贴来的，
+	// 重复和小写混用是常态。如果先判上限，一个 100 个域名 + 1 个手误重复的
+	// 配置会被判成 101 超限而拒掉 —— 但它本该是合法的。
+	normalized, err := normalizeDomains(c.Domains)
+	if err != nil {
+		return fmt.Errorf("certificate %q: %w", c.Name, err)
+	}
+	c.Domains = normalized
+
 	if len(c.Domains) > maxNames {
 		return fmt.Errorf(
 			"certificate %q: %d domains exceeds the %s profile's max of %d identifiers; "+
 				"split it into smaller certificates (and remember every name fails together)",
 			c.Name, len(c.Domains), c.Profile, maxNames)
 	}
-	for _, d := range c.Domains {
-		if err := validateDomain(d); err != nil {
-			return fmt.Errorf("certificate %q: %w", c.Name, err)
-		}
-	}
 
-	var err error
 	c.RenewBeforeDur, err = parseDuration(c.RenewBefore, profileRenewBefore[c.Profile],
 		fmt.Sprintf("certificate %q renewBefore", c.Name))
 	if err != nil {
@@ -301,7 +310,82 @@ func (c *Certificate) normalize(seen map[string]bool) error {
 	return nil
 }
 
+// normalizeDomains 去空白、转小写、按集合去重，并逐个校验。
+//
+// 保留配置里的原始顺序是有意的：classic profile 会把第一个 dNSName 提升为 CN，
+// 顺序一变证书的 Subject CN 就跟着变。
+func normalizeDomains(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+
+	for _, raw := range in {
+		d := strings.ToLower(strings.TrimSpace(raw))
+		if err := validateDomain(d); err != nil {
+			return nil, err
+		}
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// DomainKey 返回这张证书期望的域名集合指纹。
+func (c *Certificate) DomainKey() string { return DomainKey(c.Domains) }
+
+// DomainKey 把一组域名压成与顺序、大小写、重复无关的字符串。
+//
+// 用途是拿"配置里期望的集合"和"证书里实际的 SAN"做相等比较：
+// 直接比 []string 会被顺序和大小写干扰，而这两者对证书语义毫无影响。
+func DomainKey(domains []string) string {
+	seen := make(map[string]bool, len(domains))
+	cp := make([]string, 0, len(domains))
+	for _, d := range domains {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		cp = append(cp, d)
+	}
+	sort.Strings(cp)
+	return strings.Join(cp, ",")
+}
+
+// DiffDomains 返回 want 有而 have 没有的（missing），以及 have 有而 want 没有的（extra）。
+//
+// 两个方向都要看：只查 missing 会漏掉"配置里删了域名"这种情况，
+// 而那种情况下证书里多出来的 SAN 同样是需要收敛的偏差。
+func DiffDomains(want, have []string) (missing, extra []string) {
+	inWant := make(map[string]bool, len(want))
+	inHave := make(map[string]bool, len(have))
+	for _, d := range want {
+		inWant[strings.ToLower(strings.TrimSpace(d))] = true
+	}
+	for _, d := range have {
+		inHave[strings.ToLower(strings.TrimSpace(d))] = true
+	}
+	for d := range inWant {
+		if !inHave[d] {
+			missing = append(missing, d)
+		}
+	}
+	for d := range inHave {
+		if !inWant[d] {
+			extra = append(extra, d)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	return missing, extra
+}
+
 // validateDomain 挡住几种明知会被 CA 拒绝、或者覆盖范围容易被误解的写法。
+//
+// 为什么不交给 CA 报错：每个被拒的订单都要消耗一次订单配额，
+// 而 SAN 多的证书一旦有个手误，代价是整张证书重来一遍。本地拦下更便宜。
 func validateDomain(d string) error {
 	if d == "" {
 		return fmt.Errorf("empty domain")
@@ -309,6 +393,37 @@ func validateDomain(d string) error {
 	if strings.HasSuffix(d, ".") {
 		return fmt.Errorf("domain %q has a trailing dot", d)
 	}
+	if len(d) > 253 {
+		return fmt.Errorf("domain %q is longer than 253 characters", d)
+	}
+	if strings.ContainsAny(d, " \t\r\n/") {
+		return fmt.Errorf("domain %q contains whitespace or a slash", d)
+	}
+
+	// 逐标签检查。空标签（a..example.com）、超长标签、非法字符都会被 CA 拒绝。
+	for _, label := range strings.Split(d, ".") {
+		if label == "*" {
+			// 通配符标签本身合法，位置由下面单独校验。
+			continue
+		}
+		if label == "" {
+			return fmt.Errorf("domain %q has an empty label", d)
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("domain %q: label %q exceeds 63 characters", d, label)
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("domain %q: label %q must not start or end with a hyphen", d, label)
+		}
+		for i := 0; i < len(label); i++ {
+			ch := label[i]
+			if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+				continue
+			}
+			return fmt.Errorf("domain %q: label %q contains an invalid character %q", d, label, string(ch))
+		}
+	}
+
 	if strings.Contains(d, "*") {
 		// LE 只允许最左侧一个通配符标签。
 		if !strings.HasPrefix(d, "*.") {

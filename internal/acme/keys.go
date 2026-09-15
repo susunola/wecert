@@ -97,6 +97,34 @@ func ParseLeaf(fullchainPEM []byte) (*x509.Certificate, error) {
 	return x509.ParseCertificate(block.Bytes)
 }
 
+// CoverageDrift 比较"配置里期望的域名集合"与"证书实际带的 SAN"。
+//
+// 返回是否不一致，以及一句可读的差异说明。
+//
+// 这是声明式收敛的关键一步：VerifyCoverage 只回答"这张新证书够不够用"，
+// 用在部署前的闸门上；而 CoverageDrift 回答的是"当前生效的证书是不是
+// 还符合配置"，用在每轮的决策里。少了后者，配置里加了域名之后程序
+// 会认为无事可做，要等到下一个续期窗口才带上新域名 —— classic profile 下
+// 最长可能等一整个有效期。
+func CoverageDrift(leaf *x509.Certificate, want []string) (bool, string) {
+	if leaf == nil {
+		return false, ""
+	}
+	if config.DomainKey(leaf.DNSNames) == config.DomainKey(want) {
+		return false, ""
+	}
+
+	missing, extra := config.DiffDomains(want, leaf.DNSNames)
+	var parts []string
+	if len(missing) > 0 {
+		parts = append(parts, "配置要求但证书缺失: "+strings.Join(missing, ","))
+	}
+	if len(extra) > 0 {
+		parts = append(parts, "证书多出但配置已移除: "+strings.Join(extra, ","))
+	}
+	return true, strings.Join(parts, "; ")
+}
+
 // VerifyCoverage 确认签回来的证书确实覆盖了我们申请的全部域名。
 //
 // 这是部署前的最后一道闸门：不加这一步，一个不完整的订单结果

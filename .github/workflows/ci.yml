@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt 必须单独设门禁：go vet 不检查格式，
+      # 所以未格式化的文件可以一路通过本地检查。
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化："
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race 对这个项目尤其重要：SAN 多的证书上 DNS 探测与授权轮询都是并发的，
+      # 数据竞争的表现是"某个域名的验证偶尔莫名失败"，人工 review 看不出来。
+      - name: test
+        run: go test -race ./...
+
+      - name: build
+        run: make build
+
+      # 交叉编译校验：release 产物是要直接扔到 CVM 上的，
+      # 别等到发版那天才发现编译不过。
+      - name: cross build
+        run: make release

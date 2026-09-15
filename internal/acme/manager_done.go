@@ -24,6 +24,24 @@ func (m *Manager) download(
 		return m.recordFailure(st, errors.New("订单已 valid 但没有证书 URL"))
 	}
 
+	// 幂等兜底：订单对应的证书已经是当前生效的那一张，说明上一轮
+	// "下载 + 部署"其实成功了，只是收尾（丢弃订单）没做完。
+	//
+	// 这种情况下如果继续往下走，会被下面那道 notAfter 闸门挡下来 ——
+	// 新证书不可能比它自己更新 —— 于是每轮都报一次错、退避到 6 小时，
+	// 把一次成功的续期报成持续故障，consecutive_failures 一路涨到需要人工介入。
+	// 既然结果是已达成状态，直接收尾即可。
+	if st.CertURL != "" && st.CertURL == order.Certificate && !st.NotAfter.IsZero() {
+		m.log.Info("订单对应的证书已是当前生效版本，跳过重复部署",
+			"cert", c.Name, "certUrl", order.Certificate)
+		if !st.DeployConfirmed && c.Deploy.Enabled {
+			m.log.Warn("但该证书尚未确认部署到云资源，请检查 CLB 监听器是否已绑定",
+				"cert", c.Name, "deployedCertId", st.DeployedCertID)
+		}
+		return m.discardOrder(ctx, c.Name)
+	}
+
+	// bundle=true → 返回的是 fullchain（叶子 + 中间证书），正是 CLB 需要的格式。
 	fullchain, _, err := m.core.Certificates.Get(order.Certificate, true)
 	if err != nil {
 		return m.recordFailure(st, fmt.Errorf("下载证书: %w", err))
@@ -53,6 +71,12 @@ func (m *Manager) download(
 	if c.Deploy.Enabled {
 		id, derr := m.deployer.Deploy(ctx, c.Name, oldDeployedID, fullchain, o.KeyPEM)
 		if derr != nil {
+			// Deployer 的约定是：出错时仍然把已经上传成功的证书 ID 返回来
+			// （见 internal/deploy/tencent.go 的 Deploy）。那个 ID 必须记进
+			// 待回收列表 —— 否则它既不在 certificates 表、也不在 retired 表里，
+			// ReapRetired 永远看不到它，一次失败就在腾讯云上漏下一张证书，
+			// 最后撞上账号配额，而回收机制的存在意义正是防这个。
+			m.recordOrphanCert(id, oldDeployedID, c.Name)
 			return m.recordFailure(st, fmt.Errorf("部署到腾讯云: %w", derr))
 		}
 		deployedID = id
@@ -61,9 +85,11 @@ func (m *Manager) download(
 
 	ariCertID, err := CertID(leaf)
 	if err != nil {
+		// ARI 不可用不该阻断签发，只是失去了速率豁免。
 		m.log.Warn("无法构造 ARI certID，本次续期将不带 replaces", "cert", c.Name, "err", err)
 	}
 
+	// 部署成功，此时才把新证书提升为生效版本。
 	st.NotAfter = leaf.NotAfter
 	st.CertURL = order.Certificate
 	st.CertPEM = fullchain
@@ -97,7 +123,7 @@ func (m *Manager) download(
 		}
 	}
 
-	if err := m.discardOrder(c.Name); err != nil {
+	if err := m.discardOrder(ctx, c.Name); err != nil {
 		return err
 	}
 
@@ -140,6 +166,11 @@ func (m *Manager) ReapRetired(ctx context.Context) {
 }
 
 // recordFailure 记录失败并安排指数退避。
+// recordFailure 记录失败并安排指数退避。
+//
+// 上限 6 小时不是随手定的：撞上 "5 authorization failures per identifier per hour"
+// 之后继续猛重试只会让情况更糟，退到 6 小时意味着每天最多 4 次，
+// 远低于限速阈值，同时保证问题修好后能自愈。
 func (m *Manager) recordFailure(st *state.CertState, err error) error {
 	// 停进程 / 父 context 取消不是业务失败。记进去会拉长退避，
 	// 重启后本该立刻续推同一张订单，结果被挡在窗口外。
@@ -171,16 +202,25 @@ func (m *Manager) recordFailure(st *state.CertState, err error) error {
 	return err
 }
 
-func (m *Manager) discardOrder(certName string) error {
-	if authzs, err := m.store.ListAuthorizations(certName); err != nil {
-		m.log.Warn("列出授权失败，跳过 TXT 清理", "cert", certName, "err", err)
-	} else {
-		m.cleanup(certName, authzs)
+// discardOrder 丢弃当前订单，并**在删掉授权行之前先把 TXT 收掉**。
+//
+// 顺序不能反。授权行（TxtName / ChallengeToken / TxtValue）是清理 DNS 的
+// 唯一线索，行一旦删掉，那些 _acme-challenge 记录就永远回收不了了。
+//
+// 这里以前只删行、不清 DNS，于是每走一次"订单已 ready、直接 finalize"
+// 的路径（也就是 solveChallenges 被整个跳过的那条常见路径），
+// DNSPod 上就攒下一条僵尸 TXT —— 而"授权验证跨轮次"在免费套餐
+// 2 分钟以上的传播时间里恰恰是常态。
+//
+// 清理交给 cleanupOrphanTXT：它自己负责删掉已经处理完的行，
+// 并保留那些定位不到 token 的行留给下一轮重试。
+func (m *Manager) discardOrder(ctx context.Context, certName string) error {
+	if err := m.cleanupOrphanTXT(ctx, certName); err != nil {
+		// 清理失败不能阻止丢弃订单 —— 否则会卡在一张签不出结果的订单上，
+		// 那比多留一条 TXT 严重得多。
+		m.log.Warn("丢弃订单前清理 TXT 失败", "cert", certName, "err", err)
 	}
-	if err := m.store.DeleteOrder(certName); err != nil {
-		return err
-	}
-	return m.store.DeleteAuthorizations(certName)
+	return m.store.DeleteOrder(certName)
 }
 
 // parseOrderExpires 解析 ACME 订单的 expires。空值或无法解析时退回 now+defaultOrderTTL，
@@ -205,7 +245,9 @@ func (m *Manager) persistOrder(o *state.Order, order legoacme.ExtendedOrder) {
 	if order.Finalize != "" {
 		o.FinalizeURL = order.Finalize
 	}
-	o.CertURL = order.Certificate
+	if order.Certificate != "" {
+		o.CertURL = order.Certificate
+	}
 	if err := m.store.PutOrder(o); err != nil {
 		m.log.Warn("更新订单状态失败", "cert", o.CertName, "err", err)
 	}
@@ -228,4 +270,22 @@ func authzError(authz legoacme.Authorization) string {
 		}
 	}
 	return "CA 未给出具体原因"
+}
+
+// recordOrphanCert 把一个"云上已经存在、但本地没有归属"的证书记进待回收列表。
+//
+// 场景是 Deploy 上传成功、重绑定失败。不记下来的话，这张证书既不在
+// certificates 表也不在 retired 表里，回收器永远看不到 ——
+// 而腾讯云账号下上传证书是有配额的，漏几张之后就无法续期了。
+func (m *Manager) recordOrphanCert(newID, liveID, certName string) {
+	if newID == "" || newID == liveID {
+		return
+	}
+	if err := m.store.AddRetiredCert(newID, certName); err != nil {
+		m.log.Warn("记录孤儿证书失败（会一直占用腾讯云证书配额）",
+			"cert", certName, "certId", newID, "err", err)
+		return
+	}
+	m.log.Info("部署失败时上传的证书已记入待回收列表，稍后会由回收器删除",
+		"cert", certName, "certId", newID)
 }
