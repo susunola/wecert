@@ -162,3 +162,167 @@ cam:PassRole                       # 把角色关联给 CVM
 ```
 
 `deploy/cam-policy-test.json` 只覆盖了阶段 A。要跑 B/C 需要额外加权限。
+
+---
+
+## 阶段 B2：2-SAN wildcard + SNI + CVM 后端（实测记录）
+
+比阶段 B 更严格的一组场景：**一张证书带 2 个 wildcard SAN**，
+绑在**开了 SNI 的监听器**上，后面挂**真实 CVM 后端**，
+从公网做端到端 TLS 验证。
+
+```bash
+terraform apply -var create_cvm=true
+```
+
+搭出来的东西：
+
+```
+CLB（公网型）
+└── 监听器 HTTPS:443（SniSwitch=1）
+    ├── 规则 test.alpha.<域名>  → 证书 + CVM
+    └── 规则 test.beta.<域名>   → 证书 + CVM（同一个）
+```
+
+### 结论（全部通过）
+
+- 一张证书覆盖 `*.alpha` + `*.beta`，SAN 完全正确
+- 从公网做 TLS 握手，两个 SNI 域名都读到新证书
+- 两个域名都能通过 CLB 走到同一个 CVM 后端（HTTP 200）
+- **`UpdateCertificateInstance` 确实重绑定了两条规则**
+
+### 一个重要的产品级发现：重绑定不是原子的
+
+实测时间线：
+
+| 时刻 | test.alpha | test.beta |
+|---|---|---|
+| 调用返回后 30s | 新证书 ✅ | **旧占位证书** ❌ |
+| 60s 后 | 新证书 ✅ | 新证书 ✅ |
+| 90s / 120s | 稳定 | 稳定 |
+
+一次调用会重绑定所有资源，但**各资源生效时间不同**，存在
+30~60 秒的窗口，期间不同端点服务的证书版本不一致。
+
+续期场景下无害（新旧证书都有效），但如果依赖"重绑定瞬间完成"
+就会出错 —— 比如首次签发一个全新域名时，那个窗口内该域名
+可能还拿不到证书。
+
+**做外部黑盒探测时必须带轮询，不能只测一次。**
+
+### 踩过的 8 个坑（全部是真跑才暴露的）
+
+| # | 现象 | 原因 / 修法 |
+|---|---|---|
+| 1 | `InvalidZone.MismatchRegion` | 可用区硬编码错了。`ap-guangzhou-3` 该账号下 CVM 不可售，实际是 `-5/-6/-7`。**子网能建出来不代表 CVM 能在那里开机**。用 `data.tencentcloud_availability_zones_by_product` 查 |
+| 2 | `InvalidUserDataFormat` | `user_data` 要求 base64，明文要用 `user_data_raw` |
+| 3 | `do not support to create v1 target group` | 该账号不支持目标组，改用经典的 `tencentcloud_clb_attachment` |
+| 4 | `Lack of parameter Certificate or MultiCertInfo` | 建**规则**时也要带证书 —— CLB 的 SNI 多证书是在规则层配置的 |
+| 5 | `HttpCheckDomain:*.alpha... can't be wildcards` | 规则域名不能是通配符（会被当作健康检查 Host）。用具体主机名，它仍被证书的 wildcard 覆盖 |
+| 6 | `health_check_http_code cannot be higher than 31` | 这个字段是**位掩码**不是 HTTP 状态码，别填 200 |
+| 7 | `uin don't support set L7 custom port for health check` | 该账号不允许给七层规则设自定义健康检查端口 |
+| 8 | `You can't specify SubnetId when create open loadbalancer` | 公网型 CLB 不能指定子网；内网型必须指定 |
+
+### 还有一个：公网 CLB 的健康检查源不在 VPC 网段
+
+只放通 VPC 网段和 `100.64.0.0/10` 时，健康检查一直失败，
+CLB 对所有请求返回 **504**。
+
+迷惑点：**TLS 握手是正常的**（`curl` 报 504 而不是连接错误，
+`ssl_verify_result=20` 说明有证书送出），所以很容易误判成"后端挂了"。
+实际后端好好的 —— 直连 CVM 公网 IP 返回 200。
+
+排查方式：临时放开 `0.0.0.0/0 → 80`，504 立刻消失，从而定位到是安全组。
+
+### 最重要的一个：不要让 Terraform 和 wecert 抢同一个字段
+
+调试安全组时我跑了几次 `terraform apply`，结果**两条规则的证书被悄悄改回了占位证书**，
+而 wecert 状态库还以为部署的是新证书 —— 两边认知完全不一致。
+
+原因：Terraform 的 `certificate_id` 是**期望状态**，每次 apply 都会强制刷成配置里的值；
+而 wecert 是通过 `UpdateCertificateInstance` 在**带外**改这个字段的。
+两者管理同一个字段，必然打架。
+
+修法是让 Terraform 不要碰这个字段：
+
+```hcl
+resource "tencentcloud_clb_listener" "https" {
+  # ...
+  lifecycle {
+    ignore_changes = [multi_cert_info, certificate_id, certificate_ssl_mode]
+  }
+}
+
+resource "tencentcloud_clb_listener_rule" "wildcard" {
+  # ...
+  lifecycle {
+    ignore_changes = [certificate_id, certificate_ssl_mode, certificate_ca_id]
+  }
+}
+```
+
+代价：Terraform state 里这个字段会**长期停留在旧值**（本项目里就一直是占位证书的 ID），
+`terraform plan` 也不会再报漂移。这是有意为之 —— 这个字段的真相在 wecert 的状态库里，
+不在 Terraform 里。
+
+**推广开来：任何"Terraform 管基础设施 + 另一个系统管证书/密钥轮转"的组合都有这个问题。**
+要么让 Terraform 管绑定（那 wecert 就不该调 `UpdateCertificateInstance`），
+要么让 wecert 管绑定（那就必须 `ignore_changes`）。不能两个都管。
+
+---
+
+## 阶段 B3：按域名分流 + 本机可测
+
+在 B2 基础上加了：后端按 Host 返回不同页面、CLB 安全组、以及 DNS 记录。
+
+### 后端按 Host 分流
+
+CVM 上的 python 后端读 `Host` 头返回不同页面：
+
+| 访问 | 页面 |
+|---|---|
+| `https://test.alpha.<域>/` | 大写的 **ALPHA** |
+| `https://test.beta.<域>/` | 大写的 **BETA** |
+| 其它 Host | **UNKNOWN**（红色） |
+
+这样"CLB 的域名路由到底生效没有"一眼就能看出来 —— 两个域名显示同一个页面就是没生效。
+
+页面映射在 `var.backend_pages` 里改，不用动脚本。
+
+### 为什么要建 DNS 记录
+
+之前只能用 `curl --resolve` 或 `openssl -connect` 加 IP 来测，
+因为 `test.alpha` / `test.beta` 根本没有解析记录。
+建了 A 记录之后浏览器直接就能打开。
+
+注意 `alpha` / `beta` **不是独立 zone**，只是 `atomwangnus.com` 下的子域，
+所以记录建在 `atomwangnus.com` 里，`sub_domain` 写成 `test.alpha`。
+
+### CLB 安全组：默认放开，是有意的
+
+```hcl
+clb_allowed_cidrs = ["0.0.0.0/0"]   # 默认
+```
+
+试过按 IP 白名单收紧，但**出口 IP 不稳定**：会话期间本机出口从
+`121.35.103.225` 变成了 `14.153.66.173`，而且不同探测服务还报出第三个地址。
+再加上浏览器所在网络的出口无从得知，白名单一旦写错就会把自己关在门外。
+
+而"被安全组挡住"的表现是 **TLS 握手直接被重置**（`SSL_ERROR_SYSCALL`），
+不直观，排查成本高。所以在测试环境默认放开，等你确认固定出口 IP 后
+改成 `["x.x.x.x/32"]` 重新 apply 即可收紧。
+
+### 新增：cloud-init 本地校验
+
+```bash
+make validate-cloudinit
+```
+
+从 `.tf` 源码里抽出 `write_files`，对嵌入的 Python / shell 做语法检查。
+
+**这是被一次真实事故逼出来的**：user_data 里的 Python 有个字符串引号不匹配
+（`'...\n"`），CVM 建出来了、cloud-init 也"成功"了，但后端一直不监听 80，
+现象是 CLB 返回 502 —— 很容易误判成网络或安全组问题，白排查很久。
+
+`user_data` 里的脚本只有机器启动后才执行，语法错误在那之前完全不可见，
+所以在 apply 之前先查一遍。加 `--from-state` 可以校验已 apply 的版本。
