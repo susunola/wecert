@@ -10,7 +10,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1
 # ARM 实例用 linux/arm64；darwin/arm64 供本机调试。
 PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 
-.PHONY: build tools release test vet cover clean fmt
+.PHONY: build tools release test vet cover clean fmt fmt-check check
 
 build: $(BIN)
 
@@ -45,6 +45,12 @@ release:
 test:
 	$(GO) test ./...
 
+# -race 是必要的：SAN 多的证书上，DNS 探测与授权轮询都是并发的，
+# 数据竞争会表现成"偶尔某个域名的验证莫名其妙失败"，
+# 那种 bug 靠人工 review 看不出来。
+test-race:
+	$(GO) test -race ./...
+
 vet:
 	$(GO) vet ./...
 
@@ -54,6 +60,16 @@ cover:
 
 fmt:
 	$(GO) fmt ./...
+
+# 只检查不修改，用于 CI 门禁。
+fmt-check:
+	@out="$$(gofmt -l .)"; \
+	if [ -n "$$out" ]; then \
+		echo "以下文件未格式化，请运行 make fmt:"; echo "$$out"; exit 1; \
+	fi
+
+# 提交前的完整门禁。
+check: fmt-check vet test-race
 
 clean:
 	rm -rf bin dist coverage.out

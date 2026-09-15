@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -107,8 +108,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 指标服务。用独立 goroutine，失败不影响签发。
-	startMetricsServer(ctx, cfg.Metrics.Listen, log)
+	// 指标服务。先同步绑定端口，失败就直接退出 —— 见下面的注释。
+	if err := startMetricsServer(ctx, cfg.Metrics.Listen, log); err != nil {
+		return err
+	}
 
 	if *once {
 		reconciler.RunOnce(ctx)
@@ -149,7 +152,17 @@ func jitter(d time.Duration) time.Duration {
 	return d - time.Duration(delta) + time.Duration(rand.Float64()*2*delta)
 }
 
-func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) {
+// startMetricsServer 启动指标服务。
+//
+// 这里先同步 net.Listen、失败就返回错误，而不是把 ListenAndServe 丢进
+// goroutine、出错只打一行日志了事。
+//
+// 原因：/metrics 是这个系统**唯一**的到期告警通道 —— README 明确要求
+// "到期告警基于 not_after 做，而不要基于续期任务有没有报错"。
+// 端口被占用时如果只是安静地打一条错误，程序看上去一切正常，
+// 但监控侧从此再也收不到任何信号，证书会一路静默过期。
+// 这正是本项目最想避免的那种失效，不该由自己制造一个。
+func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -157,8 +170,14 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf(
+			"监听指标端口 %s 失败: %w（端口被占用？同一台机器上只应跑一个 wecert 实例，"+
+				"daemon 与 timer 两种模式不要同时启用）", addr, err)
+	}
+
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -171,11 +190,14 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) {
 	}()
 
 	go func() {
-		log.Info("指标服务已启动", "addr", addr, "metrics", "/metrics")
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// 走到这里的错误只能是 Shutdown 触发的 ErrServerClosed。
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("指标服务异常退出", "err", err)
 		}
 	}()
+
+	log.Info("指标服务已启动", "addr", ln.Addr().String(), "metrics", "/metrics")
+	return nil
 }
 
 func newDeployer(cfg *config.Config, log *slog.Logger) (deploy.Deployer, error) {

@@ -6,10 +6,15 @@
 statePath: /var/lib/wecert/state.db
 
 acme:
-  # ⚠️ 强烈建议先用 staging 跑通全流程，再切生产：
-  #    https://acme-staging-v02.api.letsencrypt.org/directory
-  # 生产环境失败重试会消耗真实配额，而 ARI 之外的续期是限额敏感的。
-  directory: https://acme-v02.api.letsencrypt.org/directory
+  # ⚠️ 默认指向 staging。install.sh 会把这份文件直接装成
+  #    /etc/wecert/config.yaml，所以默认值必须是安全的那个：
+  #    一旦默认指向生产，用户照着 README 跑一遍 -dry-run 就已经在
+  #    生产环境注册了真实 ACME 账号（配额 10 个 / IP / 3 小时）。
+  #
+  #    先用下面这个跑通全流程，确认 DNS-01、部署、ARI 都正常，
+  #    再显式换成生产目录：
+  #      https://acme-v02.api.letsencrypt.org/directory
+  directory: https://acme-staging-v02.api.letsencrypt.org/directory
   email: ops@example.com
 
 dns:

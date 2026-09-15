@@ -19,7 +19,13 @@ StateDirectory=wecert
 StateDirectoryMode=0700
 
 ExecStart=/usr/local/bin/wecert -config /etc/wecert/config.yaml -once
-TimeoutStartSec=15min
+
+# 单轮的最坏耗时 ≈ 每张证书 (DNS 传播 5m + 授权等待 3m + 订单等待 2m)，
+# 而 reconcile 是**串行**遍历所有证书的，所以这个值要按证书数量留足余量。
+# 被打断本身不致命（订单已落盘，下一轮接着推进），
+# 但每次都会推高 consecutive_failures，制造无谓的告警。
+# 证书多或 SAN 多时请相应上调。
+TimeoutStartSec=45min
 
 ProtectSystem=strict
 ProtectHome=true

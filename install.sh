@@ -66,7 +66,7 @@ else
 fi
 
 echo "==> 安装 systemd unit"
-for unit in wecert.service wecert-once.service wecert.timer; do
+for unit in wecert.service wecert-once.service wecert-once.timer; do
 	if [[ -f "${SCRIPT_DIR}/deploy/systemd/${unit}" ]]; then
 		install -m 0644 "${SCRIPT_DIR}/deploy/systemd/${unit}" "/etc/systemd/system/${unit}"
 		echo "    ${unit}"
@@ -83,10 +83,12 @@ cat <<EOF
 1) 编辑配置（填入 DNSPod token；腾讯云走 CVM 角色则无需填密钥）
      sudo vi ${CONFIG_FILE}
 
-2) 先指向 Let's Encrypt staging 验证一遍：
+   acme.directory 默认就是 Let's Encrypt staging，不用改也能跑通全流程。
+
+2) 先用 staging 验证一遍：
      sudo -u wecert ${INSTALL_PATH} -config ${CONFIG_FILE} -dry-run
 
-   确认无误后，把 acme.directory 改成生产地址：
+   确认无误后，把 acme.directory 显式改成生产地址：
      https://acme-v02.api.letsencrypt.org/directory
 
 3) 启动服务：
