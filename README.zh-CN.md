@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
+    <img src="docs/logo.png" alt="wecert" width="200">
+  </picture>
+</p>
+
 [English](README.md) | **简体中文**
 
 # wecert
@@ -251,6 +258,9 @@ wecert/
 │       ├── wecert.service        # 常驻守护进程
 │       ├── wecert-once.service   # 单轮执行（Type=oneshot）
 │       └── wecert-once.timer     # 每小时触发 oneshot
+├── docs/
+│   ├── logo.png / logo-dark.png        # 品牌资源（浅色 / 暗色主题）
+│   └── logo-mark.png / logo-mark-dark.png
 ├── scripts/
 │   ├── e2e-test.sh           # 对 staging 跑完整签发，用临时状态库
 │   └── run-stage-ab.sh       # Terraform + 签发 + 重绑定断言
