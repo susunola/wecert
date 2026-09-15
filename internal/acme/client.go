@@ -17,7 +17,7 @@ import (
 )
 
 // userAgent 会出现在 ACME 请求里，排障时能对上日志。
-const userAgent = "wecert/0.1 (+https://github.com/atom/wecert)"
+const userAgent = "wecert/0.1 (+https://github.com/susunola/wecert)"
 
 // NewHTTPClient 构造 ACME 用的 HTTP 客户端。
 func NewHTTPClient(timeout time.Duration) *http.Client {
