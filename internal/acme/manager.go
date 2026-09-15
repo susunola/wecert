@@ -2,12 +2,9 @@ package acme
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
-	legoacme "github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/acme/api"
 
 	"github.com/atom/wecert/internal/config"
@@ -65,4 +62,58 @@ func NewManager(
 		retention:   7 * 24 * time.Hour,
 		now:         time.Now,
 	}
+}
+
+// Reconcile 处理单张证书。返回 error 只表示"这一轮没成功"，
+// 失败信息已经落盘并安排了下一次尝试时间。
+func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
+	st, err := m.store.GetCert(c.Name)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		st = &state.CertState{Name: c.Name}
+	}
+
+	// 退避窗口内直接跳过。已经安排了重试时间就别再敲 CA 的门了。
+	if !st.NextAttemptAt.IsZero() && m.now().Before(st.NextAttemptAt) {
+		m.log.Debug("处于退避窗口内，跳过", "cert", c.Name, "nextAttemptAt", st.NextAttemptAt)
+		return nil
+	}
+
+	// 不变量 1：有未过期的进行中订单就继续推进，绝不新建。
+	if o, err := m.store.GetOrder(c.Name); err != nil {
+		return err
+	} else if o != nil {
+		// ExpiresAt 为零值表示服务端没给过期时间：继续推进，让 CA 自己宣布 invalid。
+		if o.ExpiresAt.IsZero() || m.now().Before(o.ExpiresAt) {
+			m.log.Info("继续推进已有订单", "cert", c.Name, "order", o.OrderURL, "status", o.Status)
+			return m.advance(ctx, c, st, o)
+		}
+		m.log.Warn("订单已过期，丢弃后重新决策",
+			"cert", c.Name, "order", o.OrderURL, "expiredAt", o.ExpiresAt)
+		if err := m.discardOrder(c.Name); err != nil {
+			return err
+		}
+	}
+
+	// 还没有证书 → 首次签发。
+	if st.NotAfter.IsZero() {
+		m.log.Info("首次签发", "cert", c.Name, "domains", c.Domains, "profile", c.Profile)
+		return m.issue(ctx, c, st, "")
+	}
+
+	// 已有证书 → 决定是否该续期。
+	renewAt, replaces, ariErr := m.renewalDecision(ctx, c, st)
+	if ariErr != nil {
+		m.log.Warn("ARI 查询失败，改用时间兜底", "cert", c.Name, "err", ariErr)
+	}
+	if m.now().Before(renewAt) {
+		m.log.Debug("尚未到续期时间", "cert", c.Name, "renewAt", renewAt, "notAfter", st.NotAfter)
+		return nil
+	}
+
+	m.log.Info("开始续期",
+		"cert", c.Name, "notAfter", st.NotAfter, "renewAt", renewAt, "ariReplaces", replaces != "")
+	return m.issue(ctx, c, st, replaces)
 }
