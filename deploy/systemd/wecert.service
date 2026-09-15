@@ -1,6 +1,6 @@
 [Unit]
 Description=wecert — ACME 证书自动续期（腾讯云 CLB）
-Documentation=https://github.com/atom/wecert
+Documentation=https://github.com/susunola/wecert
 After=network-online.target time-sync.target systemd-time-wait-sync.service
 Wants=network-online.target
 
