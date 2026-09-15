@@ -9,8 +9,8 @@ import (
 
 	legoacme "github.com/go-acme/lego/v4/acme"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // authzFetchConcurrency 限制同时在飞的授权查询数量。

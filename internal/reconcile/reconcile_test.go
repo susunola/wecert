@@ -11,9 +11,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/metrics"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/metrics"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // fakeManager 用来把收敛循环的编排逻辑单独测出来。

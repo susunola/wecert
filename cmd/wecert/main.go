@@ -22,11 +22,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/atom/wecert/internal/acme"
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/deploy"
-	"github.com/atom/wecert/internal/reconcile"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/acme"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/reconcile"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // version 可通过 -ldflags "-X main.version=..." 注入。

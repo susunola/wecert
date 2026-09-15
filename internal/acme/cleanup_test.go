@@ -11,9 +11,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/deploy"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // ---------- 测试替身 ----------

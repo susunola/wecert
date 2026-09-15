@@ -7,9 +7,9 @@ import (
 
 	"github.com/go-acme/lego/v4/acme/api"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/deploy"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // 授权轮询与订单等待的上限。超过就退避，下一轮接着推进同一个订单 ——
