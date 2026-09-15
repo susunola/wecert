@@ -12,9 +12,16 @@ variable "region" {
 }
 
 variable "availability_zone" {
-  description = "可用区。必须属于上面的 region。"
+  description = <<-EOT
+    可用区。必须属于上面的 region，而且必须是该账号下 CVM 真正可售的可用区
+    （子网能建出来不代表 CVM 能在那里开机）。
+
+    不要硬编码猜：用 `terraform plan` 看 available_zones 输出，
+    或临时查 data.tencentcloud_availability_zones.cvm.zones。
+    ap-guangzhou-3 在这个账号下就会报 InvalidZone.MismatchRegion。
+  EOT
   type        = string
-  default     = "ap-guangzhou-3"
+  default     = "ap-guangzhou-6"
 }
 
 variable "name_prefix" {
@@ -42,9 +49,14 @@ variable "create_cvm" {
 }
 
 variable "clb_network_type" {
-  description = "CLB 网络类型。INTERNAL 不产生公网带宽/EIP 费用，够用即可。"
+  description = <<-EOT
+    CLB 网络类型。
+    INTERNAL：内网型，不产生公网带宽费用，但只能从 VPC 内部验证。
+    OPEN    ：公网型，可以直接从外部做黑盒探测（读实际服务的证书），
+              代价是公网带宽费用。
+  EOT
   type        = string
-  default     = "INTERNAL"
+  default     = "OPEN"
 
   validation {
     condition     = contains(["INTERNAL", "OPEN"], var.clb_network_type)
@@ -56,6 +68,22 @@ variable "clb_sni_domain" {
   description = "绑定到监听器上的占位证书域名。wecert 续期后会替换掉它。"
   type        = string
   default     = "placeholder.atomwangnus.com"
+}
+
+variable "clb_rule_domains" {
+  description = <<-EOT
+    CLB 七层转发规则的域名列表。腾讯云不允许 url 兜底的默认规则，
+    每条规则必须带域名，所以这里一个域名一条规则。
+
+    注意：这里要用**具体主机名**，不能用通配符。
+    provider 会把规则域名当作健康检查的 Host，而健康检查的
+    HttpCheckDomain 明确拒绝通配符：
+      "HttpCheckDomain:*.alpha.example.com can't be regular expression or wildcards"
+    具体主机名同样被证书的 wildcard 覆盖（*.alpha.example.com 含 test.alpha.example.com），
+    对验证没有影响。
+  EOT
+  type        = list(string)
+  default     = ["test.alpha.atomwangnus.com", "test.beta.atomwangnus.com"]
 }
 
 variable "cvm_instance_type" {
