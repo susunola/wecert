@@ -143,7 +143,7 @@ Let's Encrypt 的速率限制里，最要命的不是那 100 个 SAN 上限，�
 
 可选：`terraform` 和 `sqlite3`，用于 `testenv/` 与 `scripts/` 下的端到端测试环境。
 
-> **关于 module 路径。** `go.mod` 声明的是 `github.com/atom/wecert`，而仓库地址是 `github.com/susunola/wecert`。本地 `git clone` 后 `make build` 完全正常，但 `go install github.com/susunola/wecert/cmd/wecert@latest` 会因为 module 路径不匹配而失败。改 module 路径要动全部 import，所以暂时没动。
+> **关于 module 路径。** `go.mod` 声明的是 `github.com/susunola/wecert`，与仓库地址一致，`go install github.com/susunola/wecert/cmd/wecert@latest` 可以正常解析。
 
 ## 快速开始
 

@@ -15,8 +15,8 @@ import (
 	"github.com/go-acme/lego/v4/providers/dns/tencentcloud"
 	"github.com/miekg/dns"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/deploy"
 )
 
 // DNSSolver 在 lego 的 DNS provider 之上补了一步：

@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/metrics"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/metrics"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // CertManager 是 Reconciler 需要的能力。

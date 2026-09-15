@@ -8,8 +8,8 @@ import (
 
 	legoacme "github.com/go-acme/lego/v4/acme"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // download 下载证书、校验，然后部署并推进状态。

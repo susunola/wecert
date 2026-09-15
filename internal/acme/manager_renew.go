@@ -8,8 +8,8 @@ import (
 
 	"github.com/go-acme/lego/v4/acme/api"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // renewalDecision 返回"什么时候续期"和"下单时该带哪个 replaces"。

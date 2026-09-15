@@ -12,8 +12,8 @@ import (
 	legoacme "github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/acme/api"
 
-	"github.com/atom/wecert/internal/config"
-	"github.com/atom/wecert/internal/state"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // userAgent 会出现在 ACME 请求里，排障时能对上日志。

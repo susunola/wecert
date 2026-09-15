@@ -46,7 +46,7 @@ On the target CVM, `install.sh` creates the `wecert` user, installs to `/usr/loc
 sudo ./install.sh ./dist/wecert_linux_amd64
 ```
 
-> `go.mod` currently declares `github.com/atom/wecert` while the repository is `susunola/wecert`, so `go install github.com/susunola/wecert/cmd/wecert@latest` does not work. Building from a clone does.
+> The module path matches the repository, so both `git clone` + `make build` and `go install github.com/susunola/wecert/cmd/wecert@latest` work.
 
 ## Quick start
 
