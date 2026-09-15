@@ -2,7 +2,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
-    <img src="docs/logo.png" alt="wecert" width="220">
+    <img src="docs/logo.png" alt="wecert" width="150">
   </picture>
 </p>
 
