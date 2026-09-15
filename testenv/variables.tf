@@ -86,6 +86,66 @@ variable "clb_rule_domains" {
   default     = ["test.alpha.atomwangnus.com", "test.beta.atomwangnus.com"]
 }
 
+variable "backend_pages" {
+  description = <<-EOT
+    后端按 Host 头返回的测试页。key 是 Host（CLB 转发规则的域名），
+    value 是页面上显示的大字标签。
+    没配到的 Host 会显示 UNKNOWN，方便一眼看出 CLB 是否正确路由。
+  EOT
+  type        = map(string)
+  default = {
+    "test.alpha.atomwangnus.com" = "ALPHA"
+    "test.beta.atomwangnus.com"  = "BETA"
+  }
+}
+
+variable "clb_allowed_cidrs" {
+  description = <<-EOT
+    允许访问 CLB:443 的来源网段。
+
+    留空表示不挂安全组（CLB 对全网开放）—— 测试环境里可以接受，
+    但公网 CLB 挂着真实证书和测试页，收窄一点更稳妥。
+
+    默认放开（0.0.0.0/0）是有原因的，别急着收紧：
+    会话期间本机出口 IP 实测从 121.35.103.225 变成了 14.153.66.173，
+    而且不同探测服务还报出第三个地址 —— 出口地址不稳定。
+    再加上浏览器所在的网络出口我无从得知，一旦白名单写错就会把自己关在门外，
+    而排查这个（TLS 握手直接被重置）并不直观。
+
+    等你确认了固定的出口 IP，把这里改成 ["x.x.x.x/32"] 重新 apply 即可收紧。
+    查询出口 IP：curl -s https://ifconfig.me/ip
+  EOT
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "dns_zone" {
+  description = "测试域名所在的 DNSPod 主域（记录会建在这个 zone 下）。"
+  type        = string
+  default     = "atomwangnus.com"
+}
+
+variable "create_dns" {
+  description = "是否为转发规则的域名创建指向 CLB 的 A 记录，便于直接用浏览器访问。"
+  type        = bool
+  default     = true
+}
+
+variable "clb_public_ip" {
+  description = <<-EOT
+    CLB 的公网 IP，用于 DNS A 记录。
+
+    广州地域的公网 CLB 不给静态 VIP，只给一个 *.clb.gz-tencentclb.net 域名，
+    而该域名在部分解析器上取不到（实测本地路由器返回 NXDOMAIN、
+    但 DNSPod 公共 DNS 能解析）。所以 DNS 记录直接用 A 记录指向 IP，
+    比 CNAME 到那个域名可靠。
+
+    换 CLB 或重建环境后这个值要跟着更新。
+  EOT
+  type        = string
+  default     = "119.91.16.17"
+}
+
 variable "cvm_instance_type" {
   description = "CVM 规格。默认 2C2G 最低配。"
   type        = string

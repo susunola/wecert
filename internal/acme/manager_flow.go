@@ -152,7 +152,13 @@ func (m *Manager) solveChallenges(
 			}
 			continue
 		case "invalid":
-			_ = m.store.PutAuthorization(a)
+			// 先把失效状态落盘再报错。
+			// 写失败不掩盖主因（授权失效才是要报的），但必须留痕 ——
+			// 静默吞掉 DB 错误会让后续排障失去线索。
+			if perr := m.store.PutAuthorization(a); perr != nil {
+				m.log.Warn("记录授权失效状态失败",
+					"cert", c.Name, "identifier", a.Identifier, "err", perr)
+			}
 			return false, m.recordFailure(st, fmt.Errorf(
 				"identifier %s 的授权已失效: %s", a.Identifier, authzError(cur)))
 		}

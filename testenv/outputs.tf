@@ -80,6 +80,25 @@ output "verify_command" {
   ]) : null
 }
 
+# ── 你本机直接访问的 URL ────────────────────────────────────────────────────
+
+output "test_urls" {
+  description = "浏览器直接打开就能看到对应测试页（前提是 DNS 记录已建、且你的出口 IP 在 clb_allowed_cidrs 里）。"
+  value = var.create_clb && var.create_cvm ? {
+    for d in var.clb_rule_domains : d => "https://${d}/  ->  ${lookup(var.backend_pages, d, "UNKNOWN")}"
+  } : null
+}
+
+output "dns_records_created" {
+  description = "为测试建的 A 记录（测试完随 destroy 一起清掉）。"
+  value       = var.create_dns && var.create_clb ? [for r in tencentcloud_dnspod_record.test : "${r.sub_domain}.${var.dns_zone} -> ${r.value}"] : []
+}
+
+output "clb_access_from" {
+  description = "允许访问 CLB:443 的来源网段。为空表示没挂安全组（对全网开放）。"
+  value       = var.clb_allowed_cidrs
+}
+
 # ── 清理提醒 ────────────────────────────────────────────────────────────────
 
 output "teardown_command" {

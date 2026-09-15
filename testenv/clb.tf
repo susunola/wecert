@@ -160,3 +160,53 @@ resource "tencentcloud_clb_attachment" "wildcard" {
     weight      = 10
   }
 }
+
+# ── CLB 安全组 ──────────────────────────────────────────────────────────────
+#
+# 公网型 CLB 默认对全网开放。挂一个安全组把它收窄到只允许你本机访问。
+#
+# 注意这里管的是**到达 CLB 443** 的流量，和后端 CVM 的安全组是两回事：
+# 后者管的是 CLB → CVM 的健康检查与转发。
+#
+# 出口 IP 变了就会把自己关在门外，改 clb_allowed_cidrs 重新 apply 即可。
+
+resource "tencentcloud_security_group" "clb" {
+  count = var.create_clb && length(var.clb_allowed_cidrs) > 0 ? 1 : 0
+
+  name        = "${var.name_prefix}-clb-sg"
+  description = "wecert e2e test - who may reach the public CLB"
+  tags        = local.tags
+}
+
+resource "tencentcloud_security_group_rule_set" "clb" {
+  count = var.create_clb && length(var.clb_allowed_cidrs) > 0 ? 1 : 0
+
+  security_group_id = tencentcloud_security_group.clb[0].id
+
+  dynamic "ingress" {
+    for_each = var.clb_allowed_cidrs
+    content {
+      action      = "ACCEPT"
+      cidr_block  = ingress.value
+      protocol    = "TCP"
+      port        = "443"
+      description = "test access to HTTPS listener"
+    }
+  }
+
+  # 出网不限制：CLB 只是被动接流量。
+  egress {
+    action      = "ACCEPT"
+    cidr_block  = "0.0.0.0/0"
+    protocol    = "ALL"
+    port        = "ALL"
+    description = "egress"
+  }
+}
+
+resource "tencentcloud_clb_security_group_attachment" "clb" {
+  count = var.create_clb && length(var.clb_allowed_cidrs) > 0 ? 1 : 0
+
+  load_balancer_ids = [tencentcloud_clb_instance.test[0].id]
+  security_group    = tencentcloud_security_group.clb[0].id
+}

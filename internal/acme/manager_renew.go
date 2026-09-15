@@ -19,7 +19,12 @@ import (
 func (m *Manager) renewalDecision(
 	ctx context.Context, c *config.Certificate, st *state.CertState,
 ) (renewAt time.Time, replaces string, ariErr error) {
-	_ = ctx
+	// lego 的 ACME API 不接受 context，所以取消没法传进网络调用本身；
+	// 但至少在这里检查一次，避免收到停止信号后还在白跑一轮。
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, "", err
+	}
+
 	now := m.now()
 
 	if st.ARICertID != "" && m.ariCheckDue(st, now) {
