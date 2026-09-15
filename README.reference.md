@@ -623,7 +623,22 @@ The result: an HTTPS listener with nothing bound, while every routine check look
 
 ### Uploading is not binding
 
-`UpdateCertificateInstance` returning success only means the task was created. The actual rebind is asynchronous (measured ~15s). Asserting without polling misreports it as a failure. This is why `DeployConfirmed` is tracked separately from `DeployedCertID`: driving the `deployed` gauge from "did the upload return an ID" would light it up the moment a certificate is uploaded, before anyone has bound it.
+`UpdateCertificateInstance` returning success only means the task was created. The actual rebind is asynchronous — and, as the next section shows, it is not atomic either. Asserting without polling misreports it as a failure. This is why `DeployConfirmed` is tracked separately from `DeployedCertID`: driving the `deployed` gauge from "did the upload return an ID" would light it up the moment a certificate is uploaded, before anyone has bound it.
+
+### The rebind is asynchronous **and not atomic**
+
+`UpdateCertificateInstance` does rebind every resource bound to the old certificate — but not at the same moment. Measured on one 2-SAN certificate bound to two CLB forwarding rules:
+
+| Time after the call returned | test.alpha | test.beta |
+|---|---|---|
+| 30s | new certificate | **old certificate** |
+| 60s | new certificate | new certificate |
+
+Across runs the window ranged from roughly 30 seconds to 2 minutes.
+
+During a renewal this is harmless — both certificates are valid — but **any verification must poll**. We first read a single sample as "only one of the two rules got rebound", and that was wrong. For a first issuance of a brand-new name it matters more: the name may have no certificate at all during that window.
+
+The authoritative check is a TLS handshake from outside: `openssl s_client -servername <domain>` against the CLB, reading the served `notBefore`/`notAfter`. Nothing self-reported comes close.
 
 ### `DescribeListeners` does not read certificate bindings back
 

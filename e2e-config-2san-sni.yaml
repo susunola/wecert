@@ -1,0 +1,51 @@
+# 端到端测试配置 —— 一张证书带 2 个 wildcard SAN + SNI 监听器
+#
+# 这个场景比单域名单监听器严格得多：
+#
+#   1. 一张证书覆盖 2 个 wildcard：*.alpha.<domain> 和 *.beta.<domain>
+#      —— 两条 authorization 各自写自己的 _acme-challenge 记录
+#   2. 证书绑在开了 SNI 的监听器上（走 multi_cert_info，
+#      因为 SniSwitch=true 时服务端会忽略主 certificate_id）
+#   3. 监听器挂真实 CVM 后端，可以从 VPC 内部做端到端 TLS 验证
+#
+# 验证的核心假设：一次 UpdateCertificateInstance 应该同时重绑定
+# 所有绑了这张证书的资源。1 对 1 能过不代表 1 对 N 能过。
+#
+# 用法：把 REPLACE_ME 换成真实域名（例如 atomwangnus.com）。
+
+statePath: /tmp/wecert-e2e/state.db
+
+acme:
+  # 端到端测试必须用 staging，否则失败重试会消耗真实生产配额。
+  directory: https://acme-staging-v02.api.letsencrypt.org/directory
+  email: REPLACE_ME
+
+dns:
+  # 用腾讯云 CAM 凭证做 DNS-01，与证书部署共用同一套凭证。
+  provider: tencentcloud
+
+tencent:
+  # static：从环境变量 TENCENTCLOUD_SECRET_ID / SECRET_KEY 读，不落进本文件。
+  credentialMode: static
+
+  resourceTypes:
+    - clb
+
+  # CLB 是分地域资源，这里必须列出所有有 CLB 的地域。
+  regions:
+    - ap-guangzhou
+
+certificates:
+  - name: two-san-wildcard
+    # classic：90 天、Max Names 100。
+    # 两个 wildcard 只占 2 个 identifier，离上限很远；
+    # 真正的约束是"同一张证书里的域名生死与共"。
+    profile: classic
+    keyType: ecdsa-p256
+    domains:
+      # 两个 wildcard 各自独立验证。
+      # 注意通配符只覆盖一层：*.alpha.<domain> 不含 x.y.alpha.<domain>。
+      - "*.alpha.REPLACE_ME"
+      - "*.beta.REPLACE_ME"
+    deploy:
+      enabled: true

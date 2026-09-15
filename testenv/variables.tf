@@ -12,9 +12,16 @@ variable "region" {
 }
 
 variable "availability_zone" {
-  description = "可用区。必须属于上面的 region。"
+  description = <<-EOT
+    可用区。必须属于上面的 region，而且必须是该账号下 CVM 真正可售的可用区
+    （子网能建出来不代表 CVM 能在那里开机）。
+
+    不要硬编码猜：用 `terraform plan` 看 available_zones 输出，
+    或临时查 data.tencentcloud_availability_zones.cvm.zones。
+    ap-guangzhou-3 在这个账号下就会报 InvalidZone.MismatchRegion。
+  EOT
   type        = string
-  default     = "ap-guangzhou-3"
+  default     = "ap-guangzhou-6"
 }
 
 variable "name_prefix" {
@@ -42,9 +49,14 @@ variable "create_cvm" {
 }
 
 variable "clb_network_type" {
-  description = "CLB 网络类型。INTERNAL 不产生公网带宽/EIP 费用，够用即可。"
+  description = <<-EOT
+    CLB 网络类型。
+    INTERNAL：内网型，不产生公网带宽费用，但只能从 VPC 内部验证。
+    OPEN    ：公网型，可以直接从外部做黑盒探测（读实际服务的证书），
+              代价是公网带宽费用。
+  EOT
   type        = string
-  default     = "INTERNAL"
+  default     = "OPEN"
 
   validation {
     condition     = contains(["INTERNAL", "OPEN"], var.clb_network_type)
@@ -56,6 +68,82 @@ variable "clb_sni_domain" {
   description = "绑定到监听器上的占位证书域名。wecert 续期后会替换掉它。"
   type        = string
   default     = "placeholder.atomwangnus.com"
+}
+
+variable "clb_rule_domains" {
+  description = <<-EOT
+    CLB 七层转发规则的域名列表。腾讯云不允许 url 兜底的默认规则，
+    每条规则必须带域名，所以这里一个域名一条规则。
+
+    注意：这里要用**具体主机名**，不能用通配符。
+    provider 会把规则域名当作健康检查的 Host，而健康检查的
+    HttpCheckDomain 明确拒绝通配符：
+      "HttpCheckDomain:*.alpha.example.com can't be regular expression or wildcards"
+    具体主机名同样被证书的 wildcard 覆盖（*.alpha.example.com 含 test.alpha.example.com），
+    对验证没有影响。
+  EOT
+  type        = list(string)
+  default     = ["test.alpha.atomwangnus.com", "test.beta.atomwangnus.com"]
+}
+
+variable "backend_pages" {
+  description = <<-EOT
+    后端按 Host 头返回的测试页。key 是 Host（CLB 转发规则的域名），
+    value 是页面上显示的大字标签。
+    没配到的 Host 会显示 UNKNOWN，方便一眼看出 CLB 是否正确路由。
+  EOT
+  type        = map(string)
+  default = {
+    "test.alpha.atomwangnus.com" = "ALPHA"
+    "test.beta.atomwangnus.com"  = "BETA"
+  }
+}
+
+variable "clb_allowed_cidrs" {
+  description = <<-EOT
+    允许访问 CLB:443 的来源网段。
+
+    留空表示不挂安全组（CLB 对全网开放）—— 测试环境里可以接受，
+    但公网 CLB 挂着真实证书和测试页，收窄一点更稳妥。
+
+    默认放开（0.0.0.0/0）是有原因的，别急着收紧：
+    会话期间本机出口 IP 实测从 121.35.103.225 变成了 14.153.66.173，
+    而且不同探测服务还报出第三个地址 —— 出口地址不稳定。
+    再加上浏览器所在的网络出口我无从得知，一旦白名单写错就会把自己关在门外，
+    而排查这个（TLS 握手直接被重置）并不直观。
+
+    等你确认了固定的出口 IP，把这里改成 ["x.x.x.x/32"] 重新 apply 即可收紧。
+    查询出口 IP：curl -s https://ifconfig.me/ip
+  EOT
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "dns_zone" {
+  description = "测试域名所在的 DNSPod 主域（记录会建在这个 zone 下）。"
+  type        = string
+  default     = "atomwangnus.com"
+}
+
+variable "create_dns" {
+  description = "是否为转发规则的域名创建指向 CLB 的 A 记录，便于直接用浏览器访问。"
+  type        = bool
+  default     = true
+}
+
+variable "clb_public_ip" {
+  description = <<-EOT
+    CLB 的公网 IP，用于 DNS A 记录。
+
+    广州地域的公网 CLB 不给静态 VIP，只给一个 *.clb.gz-tencentclb.net 域名，
+    而该域名在部分解析器上取不到（实测本地路由器返回 NXDOMAIN、
+    但 DNSPod 公共 DNS 能解析）。所以 DNS 记录直接用 A 记录指向 IP，
+    比 CNAME 到那个域名可靠。
+
+    换 CLB 或重建环境后这个值要跟着更新。
+  EOT
+  type        = string
+  default     = "119.91.16.17"
 }
 
 variable "cvm_instance_type" {

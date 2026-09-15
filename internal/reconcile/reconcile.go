@@ -6,22 +6,31 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/atom/wecert/internal/acme"
 	"github.com/atom/wecert/internal/config"
 	"github.com/atom/wecert/internal/metrics"
 	"github.com/atom/wecert/internal/state"
 )
 
+// CertManager 是 Reconciler 需要的能力。
+//
+// 定义成接口而不是直接依赖 *acme.Manager，是为了让收敛循环可测 ——
+// 直接依赖具体类型的话，"一张证书失败不能拖住其它证书" 这类
+// 编排逻辑就只能靠真跑一遍 ACME 才能验证。
+type CertManager interface {
+	Reconcile(ctx context.Context, c *config.Certificate) error
+	ReapRetired(ctx context.Context)
+}
+
 // Reconciler 遍历所有证书，逐张收敛。
 type Reconciler struct {
 	cfg     *config.Config
 	store   *state.Store
-	manager *acme.Manager
+	manager CertManager
 	log     *slog.Logger
 }
 
-// New 构造收敛器。
-func New(cfg *config.Config, store *state.Store, manager *acme.Manager, log *slog.Logger) *Reconciler {
+// New 构造收敛器。manager 传 *acme.Manager 即可。
+func New(cfg *config.Config, store *state.Store, manager CertManager, log *slog.Logger) *Reconciler {
 	return &Reconciler{cfg: cfg, store: store, manager: manager, log: log}
 }
 
