@@ -90,5 +90,6 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 	return core, nil
 }
 
-// 保证 crypto 与 elliptic 的导入在裁剪依赖时不会被误删。
+// 编译期断言：注册账号用的 ECDSA 私钥必须满足 crypto.PrivateKey，
+// 否则 api.New 在运行时才会报错。
 var _ crypto.PrivateKey = (*ecdsa.PrivateKey)(nil)
