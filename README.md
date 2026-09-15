@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
+    <img src="docs/logo.png" alt="wecert" width="200">
+  </picture>
+</p>
+
 **English** | [简体中文](README.zh-CN.md)
 
 # wecert
@@ -247,6 +254,9 @@ wecert/
 │       ├── wecert.service        # long-running daemon
 │       ├── wecert-once.service   # single pass (Type=oneshot)
 │       └── wecert-once.timer     # hourly trigger for the oneshot unit
+├── docs/
+│   ├── logo.png / logo-dark.png        # brand assets (light / dark theme)
+│   └── logo-mark.png / logo-mark-dark.png
 ├── scripts/
 │   ├── e2e-test.sh           # full issuance against staging, throwaway state DB
 │   └── run-stage-ab.sh       # Terraform + issuance + rebind assertion
