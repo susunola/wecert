@@ -176,6 +176,7 @@ certificates:
 | A2 | SAN 扩张 | 配置加域名立刻重签 | 漂移告警、新 SAN 含新域、`not_after` 前移 |
 | A3 | SAN 收缩 | 配置删域名立刻重签 | 新 SAN 集合与配置**完全相等** |
 | A4 | wildcard+apex | 两条 TXT 同时活在同一名字下 | 中断法直接观测到 2 条 TXT + 2 行同 `txt_name` 的授权 |
+| A4b | 整组换域名 | 与旧证书零重叠也必须能签发 | 签发成功、**不带** `replaces` |
 | A5 | 中断续跑 | 半途失败后复用同一订单 | 恢复时 `order_url` 不变、无新订单 |
 | A6 | 并发双证书 | 同名 TXT 不互删 | 两张证书都签发成功（这正是被修复的缺陷类） |
 | A7 | 续期·ARI | 走 ARI 窗口 + `replaces` | `starting renewal`、`replaces=true`、window 归零 |
@@ -369,13 +370,23 @@ sans lifecycle
 持久化完授权行，然后在传播确认那一步失败退出 ——
 落盘状态和"进程被杀"完全一样，但可复现。
 
+> ⚠️ **必须用一对从未验证过的标识。**
+> Let's Encrypt 会**复用仍然有效的授权**（同账号 + 同 identifier，约 30 天），
+> 所以如果拿 `$APEX` + `*.$APEX` 来跑，而 apex 在 A0 里已经验证过，
+> 这次只会有一个挑战需要写 —— 本阶段"一个名字下两条 TXT"的前提就不成立了。
+> 用一对全新的子域：`wild.$APEX` 和 `*.wild.$APEX`
+> （通配的 `*.` 会被剥掉，两者的挑战名都是 `_acme-challenge.wild.$APEX`）。
+>
+> 同理，`TXT propagated` 里的 `records=N` 是**本轮实际写的挑战数**，不是 SAN 个数 ——
+> 域名多的订单经常只写一两条，那不是缺陷。
+
 **操作（制造中断）**
 
 ```bash
-# 1) 配置改成 apex + 通配
+# 1) 配置改成一对全新的子域 + 它的通配
 #    domains:
-#      - $APEX
-#      - "*.$APEX"
+#      - wild.$APEX
+#      - "*.wild.$APEX"
 
 # 2) 复制一份配置，插入黑洞递归解析器
 sed 's/^dns:/dns:\n  recursiveNameservers: ["192.0.2.1:53"]/' \
@@ -383,7 +394,12 @@ sed 's/^dns:/dns:\n  recursiveNameservers: ["192.0.2.1:53"]/' \
 
 # 3) 这一轮会失败，但会把 TXT 写下去（每个查询 3s 超时，很快返回）
 ./bin/wecert -config /tmp/wecert-lifecycle/a-blackhole.yaml -state "$DB" -once -log-level debug 2>&1 | tee /tmp/a4-interrupt.log
-echo "退出码: $?  （非 0 是预期的）"
+
+# 注意：-once 的退出码是 0，即使这一轮失败了。
+# RunAll 刻意丢弃单张证书的错误（"一张失败不能拖住其它"），所以失败要看这三处：
+grep -c 'pass failed; a retry has been scheduled' /tmp/a4-interrupt.log   # 期望 ≥1
+q "SELECT consecutive_failures FROM certificates WHERE name='lifecycle';"  # 期望 1
+grep -c 'TXT propagated' /tmp/a4-interrupt.log                            # 期望 0
 ```
 
 **期望（中断态）**
@@ -407,7 +423,8 @@ q "SELECT consecutive_failures, datetime(next_attempt_at,'unixepoch') FROM certi
 | `certificates.not_after` | 未变（还停在 A3 的结果） |
 | `consecutive_failures` | 1 |
 | `next_attempt_at` | ≈ 现在 + 1 分钟（`recordFailure` 的 1<<0 退避） |
-| 日志 | `TXT presented` ×2，然后是传播确认失败 |
+| 日志 | `TXT presented` ×2，然后是 `pass failed; a retry has been scheduled` |
+| `-once` 退出码 | **0**（单张证书失败不会让进程退出非 0） |
 
 **这一条是整个 A4 的核心**：直接看到"一个名字下两条 TXT 并存"，
 而不是靠"签发成功"去反推。
@@ -433,6 +450,50 @@ txt "_acme-challenge.$APEX"
   看日志里有没有 `the TXT from the interrupted pass is already up; adopting it instead of
   writing a duplicate`。
 - 如果恢复后 TXT 还在，是清理路径的问题（`cleanup` / `removeAuthzTXT`）。
+
+---
+
+### A4b — 整组域名更换：与旧证书零重叠
+
+**目的**：**本次实跑发现的缺陷的验收回归**。把一张证书换到一组完全不同的域名
+（迁移服务、把名字在证书之间挪动），新订单的标识集合与旧证书**零重叠**。
+
+旧实现在漂移分支无条件把 `st.ARICertID` 当 `replaces` 发出去，而 Let's Encrypt 会拒绝：
+
+```
+malformed :: Could not validate ARI 'replaces' field ::
+identifiers in this order do not match any identifiers in the certificate being replaced
+```
+
+这个错误来自 `newOrder`，**订单根本没建起来**；又因为 `ari_cert_id` 不会变，
+之后每一轮都会发同样的 `replaces`、以同样的方式失败 —— 证书再也换不了域名。
+（ARI 的 `replaces` 只对"同一 identifier 集合的续期"有意义，换过的集合本来也拿不到豁免，
+所以这里不发才是对的。）
+
+**操作**
+
+```bash
+# 把 domains 换成另一组全新的名字（与当前证书 {wild.$APEX, *.wild.$APEX} 零重叠）
+#    domains:
+#      - moving.$APEX
+
+./bin/wecert -config "$A_CFG" -state "$DB" -once -log-level debug 2>&1 | tee /tmp/a4b.log
+```
+
+**判据**
+
+| 检查 | 期望 |
+|---|---|
+| 结果 | **签发成功**（这是本阶段唯一真正重要的一条） |
+| 日志 | `ACME order created` 存在，且其中 **没有** `replaces=true` |
+| 日志 | **没有** `Could not validate ARI 'replaces' field` |
+| 日志 | 没有 `the CA refused the ARI replaces field; retrying the order without it`（走的是"一开始就不发"，不是"发了被拒再重试") |
+| 新 SAN | `{moving.$APEX}` |
+| `consecutive_failures` | 回到 0（这个缺陷的症状就是它一直卡在 ≥1） |
+
+**失败说明**：如果在 `newOrder` 上看到 400 `malformed ... replaces`，
+说明漂移分支又把旧证书的 ARI certID 带上了 —— 后果不是"这一轮失败"，
+而是这张证书**永久无法换域名**，再也不会恢复。
 
 ---
 
@@ -1156,6 +1217,7 @@ staging 签发的证书**不需要**吊销，也不占生产配额。若 `deploy
 5. A6：并发两张共享挑战名的证书都签发成功
 6. A7：`ACME order created` 里 `replaces=true`
 7. A9：`reclaiming it before deleting the row` 出现，且授权行清空
+8. A4b：换到零重叠的域名集合仍能签发（不带 `replaces`）
 
 Part B 单独跑的话，最少确认 B4（宽限期先 carry 后 remove）和 B5a（空期望状态冻结）。
 
