@@ -32,13 +32,14 @@ type RenewalEvent struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// NewNotifier builds a notifier. An empty url returns nil.
-func NewNotifier(url string, log *slog.Logger) *Notifier {
-	return NewSignedNotifier(url, "", log)
-}
-
-// NewSignedNotifier is NewNotifier plus an HMAC secret for X-Wecert-Signature.
-func NewSignedNotifier(url, secret string, log *slog.Logger) *Notifier {
+// NewNotifier builds a notifier. An empty url returns nil; an empty secret
+// simply skips the signature.
+//
+// When secret is set, every POST carries X-Wecert-Signature:
+// sha256=<hex HMAC-SHA256 of the raw body>. The receiver can then tell a genuine
+// renewal event from anything else that can reach its URL — the notify target is
+// often a public endpoint that also accepts other traffic.
+func NewNotifier(url, secret string, log *slog.Logger) *Notifier {
 	if url == "" {
 		return nil
 	}

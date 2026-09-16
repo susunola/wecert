@@ -2,6 +2,87 @@
 
 ## Unreleased
 
+### Security
+
+- The challenge-lease registry is re-seeded from the state store before any
+  cleanup. The registry only knows the TXT values the *current process*
+  wrote, and lego's provider cleanup deletes every TXT at the challenge name,
+  so a row recovered from a process that died mid-pass was invisible: a
+  cleanup for a different certificate sharing the name found "no other live
+  values" and deleted a challenge that was still pending. Every presented
+  authorization row is now registered first, and the two recovery paths
+  (`removeAuthzTXT`, `reclaimUnpresentedTXT`) register their own value before
+  asking for cleanup.
+- `LookupTXT` asks the zone's authoritative nameservers instead of a
+  recursive resolver, and reports three distinct outcomes: confirmed
+  present, authoritatively absent, and "cannot tell". Only authoritative
+  absence licenses deleting the authorization row. A recursive resolver's
+  "no such record" is not evidence of absence -- a cached negative (DNSPod's
+  600s TTL floor applies to the negative entry too) or a cached answer
+  holding only some of the values at a shared challenge name previously read
+  as "the write never happened", and the row carrying the only record of the
+  value was deleted.
+- `webhook.notifySecret` is a real option now. `NewSignedNotifier` existed
+  with no way to set a secret -- `NewNotifier` always passed `""` -- so
+  `X-Wecert-Signature` was dead code and the notify target had no way to tell
+  a genuine event from anything else that could reach its URL. The secret is
+  validated at load time (>= 32 characters, requires `notifyURL`) and each
+  event is signed with HMAC-SHA256 over the raw body.
+
+### Fixed
+
+- A `{"certs": null}` trigger is rejected with 400 instead of escalating to a
+  full-fleet convergence. `json.Unmarshal` leaves both an absent `certs` key
+  and `"certs": null` as a nil pointer, and null is what a Go caller
+  marshalling a nil `[]string` sends -- so a caller that named no
+  certificates consumed issuance quota for every certificate in the fleet.
+  Presence of the key is now decoded separately.
+- One certificate's panic no longer takes the daemon down.
+  `wecert_reconcile_panics_total` was declared, explained and never
+  incremented because no `recover()` existed in production code: a nil map
+  write in one pass killed the process and stopped every other certificate
+  from renewing, and a panic in a probe goroutine did the same. Both
+  boundaries now recover, count, and log a stack.
+- Onboarding reports a sub-threshold declaration drop (`declarationDrop`)
+  instead of accepting it silently. The fuse's baseline is rebased on every
+  round that passes, so it bounds the drop per round and not cumulatively; an
+  upstream that loses a slice just under the threshold every round erodes the
+  set (10 -> 7 -> 5 -> 4 ...). The per-round bound is kept deliberately --
+  every high-water-mark variant also counts a staged decommission's own
+  grace-carried names as lost, re-trips the fuse on each step, and wedges the
+  round (see `TestStagedDecommissionDoesNotWedgeTheFuse`) -- so the erosion is
+  now logged at WARN and exported rather than silent. The limit is documented
+  on `fuse`.
+- Preflight's pruning walk no longer stops after the first 100 certificates
+  when the API omits `TotalCount`. A nil total read as 0 ended the walk and
+  the command reported a complete cleanup over a truncated list. A short page
+  is now the end-of-list signal, a present `TotalCount` only ends the walk
+  earlier, and a listing that never advances is an error instead of an
+  infinite loop.
+- A stale `ChallengeToken` in an authorization row is refreshed when
+  `Present` runs again after an interrupted pass. The row kept the old token
+  while `TxtValue` held the value for the new one, so cleanup derived a value
+  that was never registered, read that as "another challenge is still live at
+  this name", and never fired the provider's delete-all again for the name --
+  stranding every later TXT record there for the lifetime of the process.
+- A local-only renewal logs the cloud certificate ID it leaves behind. The ID
+  was dropped without a trace -- the only local record that a wecert-uploaded
+  certificate exists. Retiring it is deliberately *not* done: it may still be
+  bound to a listener, and the deletion would then rest entirely on
+  `IsCheckResource` refusing a bound certificate. The leak is bounded to one
+  certificate per name, so the conservative direction wins and the ID goes to
+  the journal with a pointer to `wecert-preflight prune`.
+- The webhook auth limiter's sweep is amortized by time. Once the map passed
+  the size threshold, every failed authentication scanned the whole map, so
+  one failed request from each of many source addresses made the total work
+  grow with the square of the request count.
+
+### Changed
+
+- `run-stage-ab.sh` extracts credentials with or without a leading `export`,
+  so a file that is only meant to be sourced interactively is no longer
+  reported as "not set".
+
 ## 0.4.2 - 2026-09-16
 
 ### Security

@@ -417,6 +417,7 @@ webhook:
   listen: "127.0.0.1:9801"
   token: "0123456789abcdef0123456789abcdef"
   notifyURL: "https://example.com/hook"
+  notifySecret: "0123456789abcdef0123456789abcdef"
 certificates:
   - name: t
     domains: ["example.com"]
@@ -427,6 +428,40 @@ certificates:
 	}
 	if cfg.Webhook.Listen != "127.0.0.1:9801" || cfg.Webhook.Token == "" {
 		t.Errorf("webhook config was not parsed correctly: %+v", cfg.Webhook)
+	}
+	if cfg.Webhook.NotifySecret == "" {
+		t.Error("notifySecret was not preserved")
+	}
+}
+
+// A secret with no notifyURL signs nothing: it is a configuration mistake, and
+// silently ignoring it would leave the operator believing events are signed.
+func TestWebhookNotifySecretWithoutURLIsRejected(t *testing.T) {
+	body := minimalPrefix + `
+webhook:
+  notifySecret: "0123456789abcdef0123456789abcdef"
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+	if _, err := Load(writeConfig(t, body)); err == nil {
+		t.Fatal("notifySecret without notifyURL should be rejected")
+	}
+}
+
+// A short HMAC key is recoverable from a single signed event, so it would not
+// actually prove the event came from wecert.
+func TestWebhookNotifySecretTooShortIsRejected(t *testing.T) {
+	body := minimalPrefix + `
+webhook:
+  notifyURL: "https://example.com/hook"
+  notifySecret: "tooshort"
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+	if _, err := Load(writeConfig(t, body)); err == nil {
+		t.Fatal("a short notifySecret should be rejected")
 	}
 }
 
