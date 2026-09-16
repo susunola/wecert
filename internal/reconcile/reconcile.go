@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/metrics"
+	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -39,12 +41,13 @@ type CertManager interface {
 	ReapRetired(ctx context.Context)
 }
 
-// Reconciler 遍历所有证书，逐张收敛。
+// Reconciler 逐张收敛当前期望状态里的证书。
 //
 // 并发安全：定时循环和 webhook 触发的收敛会同时调用它，
 // 靠 running 这张表保证同一张证书不会被并发处理。
 type Reconciler struct {
 	cfg      *config.Config
+	provider spec.Provider
 	store    *state.Store
 	manager  CertManager
 	notifier Notifier
@@ -52,12 +55,21 @@ type Reconciler struct {
 
 	mu      sync.Mutex
 	running map[string]struct{}
+
+	// last 是最近一次成功求值出来的期望状态，供只读诊断端点使用。
+	// 存指针是必要的：诊断端点会在另一个 goroutine 里读它。
+	last atomic.Pointer[spec.Result]
 }
 
-// New 构造收敛器。manager 传 *acme.Manager 即可，notifier 可为 nil。
-func New(cfg *config.Config, store *state.Store, manager CertManager, notifier Notifier, log *slog.Logger) *Reconciler {
+// New 构造收敛器。
+//
+// provider 是期望状态的来源，可以是 spec.Static（配置里的 certificates）、
+// spec.File（onboarding 写出来的文档）或 spec.Observer（前者 + 影子对比）。
+// 收敛逻辑完全不关心是哪一个 —— 这正是切换来源不用动收敛代码的原因。
+func New(cfg *config.Config, provider spec.Provider, store *state.Store, manager CertManager, notifier Notifier, log *slog.Logger) *Reconciler {
 	return &Reconciler{
 		cfg:      cfg,
+		provider: provider,
 		store:    store,
 		manager:  manager,
 		notifier: notifier,
@@ -83,14 +95,120 @@ func (r *Reconciler) release(name string) {
 	delete(r.running, name)
 }
 
-// CertNames 返回配置里所有证书的名字，顺序与配置一致。
-func (r *Reconciler) CertNames() []string {
-	names := make([]string, 0, len(r.cfg.Certificates))
-	for i := range r.cfg.Certificates {
-		names = append(names, r.cfg.Certificates[i].Name)
-	}
-	return names
+// ── 期望状态 ────────────────────────────────────────────────────────────────
+
+// Prime 求值一次期望状态并缓存，不触发任何收敛。
+//
+// 启动时调一次，让只读端点（webhook 的名字解析、诊断端点）在第一次
+// 收敛跑完之前就能给出正确答案。
+func (r *Reconciler) Prime(ctx context.Context) {
+	r.resolve(ctx)
 }
+
+// resolve 求值期望状态。返回 nil 表示这一轮**什么都不该做**。
+//
+// 这是整套设计里最关键的一条失败语义：拿不到期望状态，绝不等于
+// "期望为空"。后者会让 wecert 把域名从每张证书里摘掉，线上立刻握手失败。
+// 跳过一轮的代价只是"这次没续上"，下一轮还有机会。
+func (r *Reconciler) resolve(ctx context.Context) *spec.Result {
+	res, err := spec.Desired(ctx, r.provider)
+	if err != nil {
+		metrics.DesiredStateErrors.Inc()
+		r.log.Error("cannot read the desired state; skipping this pass entirely "+
+			"(an unreadable source is never treated as an empty desired state)",
+			"provider", spec.KindOf(r.provider), "err", err)
+		return nil
+	}
+
+	r.last.Store(res)
+	r.publishDesired(res)
+	return res
+}
+
+// LastResult 返回最近一次成功求值出来的期望状态，可能为 nil。
+func (r *Reconciler) LastResult() *spec.Result { return r.last.Load() }
+
+// CertNames 返回当前期望状态里的证书名，顺序与期望状态一致。
+//
+// 取的是缓存而不是重新求值：这个方法是给只读端点和触发路径用的，
+// 每次都去读一遍来源会让一次 HTTP 请求的延迟取决于云 API 的响应时间。
+func (r *Reconciler) CertNames() []string {
+	res := r.last.Load()
+	if res == nil {
+		return nil
+	}
+	return res.CertNames()
+}
+
+// publishDesired 把期望状态的健康状况同步到指标和日志。
+func (r *Reconciler) publishDesired(res *spec.Result) {
+	metrics.DesiredStateCertificates.Set(float64(len(res.Certificates)))
+
+	if res.Frozen {
+		metrics.DesiredStateFrozen.Set(1)
+		r.log.Warn("the desired state is frozen on the last good revision; "+
+			"renewals still run against it, but nothing new will be picked up until the source recovers",
+			"provider", spec.KindOf(r.provider), "revision", res.Revision, "reason", res.FreezeReason)
+	} else {
+		metrics.DesiredStateFrozen.Set(0)
+	}
+
+	// 文档年龄是这套架构特有的失败信号：onboarding 组件挂掉之后，
+	// wecert 会一直按旧文档正常续期，一切看起来都正常，
+	// 只是新域名再也不会进来。
+	if !res.GeneratedAt.IsZero() {
+		age := time.Since(res.GeneratedAt)
+		metrics.DesiredStateAge.Set(age.Seconds())
+		if max := r.cfg.DesiredState.MaxStalenessDur; max > 0 && age > max {
+			r.log.Error("the desired-state document is stale: the onboarding component has stopped refreshing it; "+
+				"renewals keep working, but newly declared names will never be picked up",
+				"generatedAt", res.GeneratedAt, "age", age.Round(time.Minute), "threshold", max)
+		}
+	}
+
+	if res.Shadow != nil && res.Shadow.Error == "" {
+		metrics.DesiredStateShadowDiff.Set(float64(len(res.Shadow.AddCertificates) +
+			len(res.Shadow.RemoveCertificates) + len(res.Shadow.ChangeCertificates)))
+	}
+}
+
+// publishOrphans 报告"状态库里有、期望状态里已经没有"的证书。
+//
+// 这类证书不会再被续期，最终会安静地过期。期望状态的删除路径本来就有
+// 宽限期和引用检查，这个检查是最后一道兜底 —— 万一还是漏出去了，
+// 至少能在到期之前看见它，而不是等站点握手失败。
+func (r *Reconciler) publishOrphans(res *spec.Result) {
+	names, err := r.store.ListCertNames()
+	if err != nil {
+		r.log.Warn("cannot list certificate names for the orphan check", "err", err)
+		return
+	}
+
+	want := make(map[string]bool, len(res.Certificates))
+	for i := range res.Certificates {
+		want[res.Certificates[i].Name] = true
+	}
+
+	orphans := 0
+	for _, name := range names {
+		if want[name] {
+			continue
+		}
+		orphans++
+
+		attrs := []any{"cert", name}
+		if st, err := r.store.GetCert(name); err == nil && st != nil && !st.NotAfter.IsZero() {
+			attrs = append(attrs, "notAfter", st.NotAfter,
+				"daysLeft", int(time.Until(st.NotAfter).Hours()/24))
+		}
+		r.log.Error("this certificate is no longer in the desired state, so it will not be renewed "+
+			"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard",
+			attrs...)
+	}
+	metrics.OrphanedCertificates.Set(float64(orphans))
+}
+
+// ── 收敛 ────────────────────────────────────────────────────────────────────
 
 // RunAll 跑一轮全部证书。
 //
@@ -99,8 +217,17 @@ func (r *Reconciler) CertNames() []string {
 //
 // 正在被别处处理的证书会被跳过，并在返回值里列出。
 func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
-	for i := range r.cfg.Certificates {
-		c := &r.cfg.Certificates[i]
+	res := r.resolve(ctx)
+	if res == nil {
+		// 即使拿不到期望状态也要回收退役证书：那批证书已经被换掉了，
+		// 回收它们和期望状态无关，而放着不管会把云端证书配额慢慢耗光。
+		r.manager.ReapRetired(ctx)
+		return nil
+	}
+	r.publishOrphans(res)
+
+	for i := range res.Certificates {
+		c := &res.Certificates[i]
 
 		if err := ctx.Err(); err != nil {
 			return skipped
@@ -115,7 +242,6 @@ func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
 		r.release(c.Name)
 	}
 
-	// 回收超过保留期的退役证书，避免云端证书配额被慢慢耗光。
 	r.manager.ReapRetired(ctx)
 	return skipped
 }
@@ -128,15 +254,13 @@ func (r *Reconciler) RunOnce(ctx context.Context) {
 // RunCert 只处理指定的一张证书。未知名字返回错误；
 // 已在处理中返回 ErrAlreadyRunning。
 func (r *Reconciler) RunCert(ctx context.Context, name string) error {
-	var found *config.Certificate
-	for i := range r.cfg.Certificates {
-		if r.cfg.Certificates[i].Name == name {
-			found = &r.cfg.Certificates[i]
-			break
-		}
+	res := r.resolve(ctx)
+	if res == nil {
+		return fmt.Errorf("cannot read the desired state, so %q was not processed", name)
 	}
+	found := res.Find(name)
 	if found == nil {
-		return fmt.Errorf("no certificate named %q in the config", name)
+		return fmt.Errorf("no certificate named %q in the desired state", name)
 	}
 
 	if !r.acquire(name) {
@@ -150,29 +274,27 @@ func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 
 // StartCert 异步处理一张证书。
 //
-// 占位是**同步**做的 —— 所以"这张证书是否已经在处理中"能立刻回答调用方；
-// 真正的收敛丢到后台，因为它可能要几分钟（DNS 传播），
-// 让 HTTP 请求等着会把调用方的超时拖爆。
+// 求值和占位都是**同步**做的 —— 所以"这张证书是否已经在处理中"、
+// "这个名字到底存不存在"都能立刻回答调用方；真正的收敛丢到后台，
+// 因为它可能要几分钟（DNS 传播），让 HTTP 请求等着会把调用方的超时拖爆。
 //
 // ctx 必须是**进程级**上下文，不能用请求的 context：
 // 请求一返回它的 context 就被取消，后台那一轮会被立刻打断。
 func (r *Reconciler) StartCert(ctx context.Context, name string) error {
-	var found *config.Certificate
-	for i := range r.cfg.Certificates {
-		if r.cfg.Certificates[i].Name == name {
-			found = &r.cfg.Certificates[i]
-			break
-		}
+	res := r.resolve(ctx)
+	if res == nil {
+		return fmt.Errorf("cannot read the desired state, so %q was not processed", name)
 	}
+	found := res.Find(name)
 	if found == nil {
-		return fmt.Errorf("no certificate named %q in the config", name)
+		return fmt.Errorf("no certificate named %q in the desired state", name)
 	}
 
 	if !r.acquire(name) {
 		return ErrAlreadyRunning
 	}
 
-	// 配置在启动后不再变更，所以这里直接引用它的元素是安全的。
+	// res 是在堆上分配的，这一轮期间不会被复用，所以引用它的元素是安全的。
 	go func() {
 		defer r.release(name)
 		r.reconcileOne(ctx, found)
@@ -182,9 +304,13 @@ func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 
 // StartAll 异步处理全部证书，同步返回被跳过的（已在处理中的）名字。
 func (r *Reconciler) StartAll(ctx context.Context) []string {
+	res := r.resolve(ctx)
+	if res == nil {
+		return nil
+	}
+
 	var skipped []string
-	for i := range r.cfg.Certificates {
-		name := r.cfg.Certificates[i].Name
+	for _, name := range res.CertNames() {
 		if err := r.StartCert(ctx, name); err != nil {
 			skipped = append(skipped, name)
 		}

@@ -432,6 +432,21 @@ retired_certificates          -- 已上传、等待回收的证书
 > 如果你频繁改 identifier，请留意这条上限。把不相关的业务拆到不同注册域下，
 > 可以避免它们互相挤占同一份预算。这条路径上程序会打一条 warning 日志。
 
+### 动态声明域名
+
+上面说的都是"域名集合写在配置文件里"。当域名是由别人、别的系统加进来的时候，
+`wecert-onboard` 把这份判断整个搬出 wecert：域名声明成 DNS zone 里的
+`_wecert` TXT 记录，这个二进制把它们变成一份可 diff 的期望状态文档，
+wecert 只读那份文档。**wecert 自己永远不推断。**
+
+收益在配额算术上。声明了 `*.example.com` 之后，加 `foo.example.com`
+什么都不用改，**0 次签发** —— 而没有通配符时批量导入 50 个子域就是 50 次重签，
+那是整整一周的配额。
+
+删除刻意比增加保守一个数量级：一个名字只有在**确认缺失**、持续超过宽限期、
+**并且**没有 CLB 规则还在引用它，三个条件同时满足时才离开证书。
+详见 [期望状态](desired-state.md)。
+
 ## 配置参考
 
 配置字段的注释版见 `config.example.yaml`。
@@ -445,7 +460,10 @@ retired_certificates          -- 已上传、等待回收的证书
 | `dns` | 是 | — | 见下 |
 | `tencent` | 是 | — | 见下 |
 | `metrics` | 否 | `127.0.0.1:9800` | Prometheus 监听地址 |
-| `certificates` | 是 | — | 至少一张，见下 |
+| `webhook` | 否 | — | 事件触发与出站通知，见下 |
+| `desiredState` | 否 | `mode: static` | 期望状态从哪里来，见下 |
+| `onboarding` | 否 | — | `wecert-onboard` 的策略。**wecert 自己不读这一节。** |
+| `certificates` | 仅 static/observe | — | 至少一张。`desiredState.mode: enforce` 时必须为空 |
 
 ### `acme`
 
@@ -556,6 +574,57 @@ X-Wecert-Token: <token>
 ```
 
 `result` 为 `ok` 或 `error`（后者带 `error` 字段）。投递是**异步且尽力而为**的：通知目标慢或挂掉绝不能拖慢续期 —— 那和"一张证书失败拖住其它证书"是同一类耦合错误。
+
+### `desiredState`
+
+谁对"应该有什么"有最终解释权。三种模式的差别是**权限**，不是"读几个文件"。
+
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `mode` | 否 | `static` | `static` \| `observe` \| `enforce` |
+| `path` | observe/enforce | — | 期望状态文档。`static` 模式下设置它会被拒绝 —— 留着用不上的路径几乎一定是切了一半 |
+| `maxStaleness` | 否 | `48h` | 文档多久没刷新就告警 |
+
+| 模式 | 收敛依据 | 用途 |
+|---|---|---|
+| `static` | 配置里的 `certificates` | 历史行为，零风险 |
+| `observe` | 仍然按 `certificates`，**额外**报告与文档的差异 | 迁移观察期 |
+| `enforce` | 文档 | 动态签发 |
+
+**不要从 `static` 直接跳到 `enforce`。** `observe` 不签发任何东西，只回答
+"如果按文档来会加什么、会删什么"。它产出的漂移数据才是去抖窗口、分组大小和
+熔断阈值的依据 —— 猜这些参数的代价是账号级的限速。
+
+文档是机器写的，并且刻意拒绝几类东西：空的 `certificates`（与"生成失败"
+无法区分，照做会把每张证书的域名全部摘掉）、`revision` 与内容不符（被手工改过）、
+以及证书名不是由注册域派生的。
+
+> **为什么名字规则要在契约边界上强制。** 如果证书名跟着域名集合跑，加一个域名
+> 就会在状态库里凭空多出一条新记录，而旧那条的 order URL、ARI certID、
+> deployed CertID 全部成为孤儿。"每张证书最多一个进行中的订单"随之失效，
+> 两边的订单会同时飞 —— 直接撞上 *5 certificates per exact set of identifiers / 7 days*，
+> 而这条没有 override。
+
+### `onboarding`
+
+`wecert-onboard` 的策略。这些数字决定配额消耗速度和删除的保守程度，
+所以它们放在配置里而不是代码里 —— 而且它们本来就该从真实漂移数据里调出来。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `zones` | 所有可见 zone | 要枚举 `_wecert` 声明的 DNS zone |
+| `requireCLBRule` | `true` | 守卫 1：声明必须同时有 CLB 规则才生效 |
+| `allowlist` | 不限制 | 允许签发证书的注册域，会归一成 eTLD+1 |
+| `maxNames` | `25` | 单证书 SAN 上限。与 `tlsserver` 对齐，将来切 profile 不用改架构 |
+| `profile` / `keyType` | `classic` / `ecdsa-p256` | 生成证书的默认值 |
+| `deploy` | `true` | 生成证书的默认部署开关 |
+| `gracePeriod` | `24h` | 名字必须被**确认**缺失多久才允许移除 |
+| `budget` / `budgetWindow` | `25` / `168h` | 窗口内允许的集合变更次数。LE 允许每注册域 50 次 / 7 天且跨账号共享，预算取其一半 |
+| `dropThreshold` | `0.30` | 声明集合缩小超过这个比例就冻结 |
+| `statePath` | `<out>.state.json` | 宽限期与预算的账本。必须持久化：内存里的宽限期跨不过进程重启 |
+| `reportPath` | `<out>.report.json` | 逐 hostname 的决策报告 |
+
+`_wecert` 声明语法、五条熔断、systemd 单元和排障表见 [期望状态](desired-state.md)。
 
 ### `certificates[]`
 
@@ -675,6 +744,36 @@ ssl:UpdateCertificateInstance
 | `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `-dry-run` | `false` | 只校验配置并初始化 ACME 账号，不签发也不部署 |
 | `-version` | `false` | 打印版本后退出 |
+
+### `wecert-onboard`（期望状态生成器）
+
+把 DNS 里的 `_wecert` 声明变成 `wecert` 读的那份期望状态文档。
+做成一次性进程，由 systemd timer 驱动，跑完就退出。
+只有 `desiredState.mode` 离开 `static` 之后才需要它。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-config` | — | **必填。** 与 `wecert` 同一份配置；策略在 `onboarding` 那一节 |
+| `-out` | `desiredState.path` | 期望状态文档的写入路径 |
+| `-state` | `<out>.state.json` | 宽限期与配额预算的账本 |
+| `-report` / `-no-report` | `<out>.report.json` | 逐 hostname 的决策报告 |
+| `-zones` | 所有可见 zone | 要枚举的 DNS zone，逗号分隔 |
+| `-require-clb` | `true` | 守卫 1：声明必须同时有 CLB 规则才生效 |
+| `-allow` | — | 允许签发证书的注册域，逗号分隔 |
+| `-max-names` | `25` | 单证书 SAN 上限 |
+| `-grace` | `24h` | 确认缺失多久之后才允许移除 |
+| `-budget` / `-budget-window` | `25` / `168h` | 窗口内允许的集合变更次数 |
+| `-drop-threshold` | `0.30` | 集合缩小超过这个比例就冻结 |
+| `-force` | `false` | 跳过全部熔断；只用于你确认过的那次变更 |
+| `-dry-run` | `false` | 只算不写 |
+| `-json` | `false` | 报告以 JSON 输出 |
+
+退出码：`0` 已写出（或与上一版相同）、`1` 程序自身出错、`2` **有意冻结** —— 去看报告。
+
+```bash
+./bin/wecert-onboard -config /etc/wecert/config.yaml -dry-run   # 先看会改什么
+./bin/wecert-onboard -config /etc/wecert/config.yaml            # 落盘
+```
 
 ### `wecert-preflight`（只读）
 

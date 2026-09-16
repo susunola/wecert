@@ -141,6 +141,7 @@ CA/Browser Forum 已排期 **2027-03-15 起证书 ≤100 天，2029-03-15 起 �
 - [为什么是这么设计的](README.reference.zh-CN.md#为什么是这么设计的) —— 是哪些速率限制决定了这套设计。
 - [配置参考](README.reference.zh-CN.md#配置参考) · [运维](README.reference.zh-CN.md#运维) · [监控与告警](README.reference.zh-CN.md#监控与告警)。
 - [实测踩过的坑](README.reference.zh-CN.md#实测踩过的坑) —— CLB 的 SNI 陷阱、`DescribeListeners` 不回读绑定、DNSPod 的 TTL 下限、lego 的 API 陷阱。
+- [期望状态](docs/desired-state.md) —— 用 `_wecert` DNS 声明域名、生成期望状态文档、以及把 wecert 切过去。设计取舍见 [desired-state-providers.md](docs/desired-state-providers.md)。
 - [现状与下一步](README.reference.zh-CN.md#现状与下一步) · [开发](README.reference.zh-CN.md#开发)。
 
 <details>
@@ -157,6 +158,36 @@ CA/Browser Forum 已排期 **2027-03-15 起证书 ≤100 天，2029-03-15 起 �
 | `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `-dry-run` | `false` | 只校验配置并初始化 ACME 账号，不签发也不部署 |
 | `-version` | `false` | 打印版本后退出 |
+
+### `wecert-onboard`（期望状态生成器）
+
+把 DNS 里的 `_wecert` 声明变成 `wecert` 读的那份期望状态文档。一次性进程，
+由 systemd timer 驱动，跑完就退出。只有 `desiredState.mode` 离开 `static` 之后才需要它。
+完整说明见 [期望状态](docs/desired-state.md)。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-config` | — | **必填。** 与 `wecert` 同一份配置；策略在 `onboarding` 那一节 |
+| `-out` | `desiredState.path` | 期望状态文档的写入路径 |
+| `-state` | `<out>.state.json` | 宽限期与配额预算的账本 |
+| `-report` / `-no-report` | `<out>.report.json` | 逐 hostname 的决策报告 |
+| `-zones` | 所有可见 zone | 要枚举的 DNS zone，逗号分隔 |
+| `-require-clb` | `true` | 守卫 1：声明必须同时有 CLB 规则才生效 |
+| `-allow` | — | 允许签发证书的注册域，逗号分隔 |
+| `-max-names` | `25` | 单证书 SAN 上限 |
+| `-grace` | `24h` | 确认缺失多久之后才允许移除 |
+| `-budget` / `-budget-window` | `25` / `168h` | 窗口内允许的集合变更次数 |
+| `-drop-threshold` | `0.30` | 集合缩小超过这个比例就冻结 |
+| `-force` | `false` | 跳过全部熔断；只用于你确认过的那次变更 |
+| `-dry-run` | `false` | 只算不写 |
+| `-json` | `false` | 报告以 JSON 输出 |
+
+退出码：`0` 已写出（或与上一版相同）、`1` 程序自身出错、`2` **有意冻结** —— 去看报告。
+
+```bash
+./bin/wecert-onboard -config /etc/wecert/config.yaml -dry-run   # 先看会改什么
+./bin/wecert-onboard -config /etc/wecert/config.yaml            # 落盘
+```
 
 ### `wecert-preflight`（只读）
 

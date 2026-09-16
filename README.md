@@ -126,12 +126,21 @@ The CA/Browser Forum has scheduled **≤100 days from 2027-03-15 and ≤47 days 
 
 > Adding or removing a domain makes that issuance a new certificate, so it counts against **Certificates per Registered Domain (50 / 7 days)** instead of enjoying the ARI exemption.
 
+### When domains are declared elsewhere
+
+If domains get added by other people or other systems, `wecert-onboard` takes that judgement out of wecert entirely. Domains are declared as `_wecert` TXT records in the DNS zone, the binary turns them into a reviewable desired-state document, and **wecert only ever reads that document — it never infers anything**.
+
+The payoff is the quota arithmetic above. With `*.example.com` declared, adding `foo.example.com` costs **zero** issuances, against 50 re-issuances for a 50-subdomain import without a wildcard.
+
+Deletion is deliberately an order of magnitude more conservative than addition, and the whole thing can run in a read-only `observe` mode first. Start at [Desired state](docs/desired-state.md).
+
 ## Documentation
 
 - [Full reference](README.reference.md) — architecture, the reconcile state machine, the state schema, every configuration field, operations, and the pitfalls found by running it.
 - [Why this exists](README.reference.md#why-this-exists) — which rate limits shaped the design.
 - [Configuration reference](README.reference.md#configuration-reference) · [Operations](README.reference.md#operations) · [Metrics and alerting](README.reference.md#metrics-and-alerting).
 - [Field notes and pitfalls](README.reference.md#field-notes-and-pitfalls) — the CLB SNI trap, `DescribeListeners` not reading bindings back, the DNSPod TTL floor, the lego API traps.
+- [Desired state](docs/desired-state.md) — declaring domains as `_wecert` DNS records, generating the desired-state document, and switching wecert over to it. Design rationale: [desired-state-providers.md](docs/desired-state-providers.md).
 - [Roadmap](README.reference.md#roadmap) · [Development](README.reference.md#development).
 
 <details>
@@ -148,6 +157,35 @@ The CA/Browser Forum has scheduled **≤100 days from 2027-03-15 and ≤47 days 
 | `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `-dry-run` | `false` | Validate config and initialise the ACME account; sign and deploy nothing |
 | `-version` | `false` | Print version and exit |
+
+### `wecert-onboard` (desired-state generator)
+
+Turns `_wecert` TXT declarations into the desired-state document that `wecert` reads.
+Runs as a systemd timer and exits. Only needed once `desiredState.mode` leaves `static`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-config` | — | **Required.** The same config file `wecert` reads; the `onboarding` section holds the policy |
+| `-out` | `desiredState.path` | Where to write the desired-state document |
+| `-state` | `<out>.state.json` | Where to keep the grace-period and budget bookkeeping |
+| `-report` / `-no-report` | `<out>.report.json` | Per-hostname decision report |
+| `-zones` | every visible zone | Comma-separated DNS zones to enumerate |
+| `-require-clb` | `true` | Guard 1: a declaration only counts when a CLB rule serves the name |
+| `-allow` | — | Comma-separated registered domains that may be issued for |
+| `-max-names` | `25` | Max SAN entries per certificate |
+| `-grace` | `24h` | How long a name must be confirmed absent before removal |
+| `-budget` / `-budget-window` | `25` / `168h` | Name-set changes allowed per window |
+| `-drop-threshold` | `0.30` | Freeze when the declared set shrinks by more than this |
+| `-force` | `false` | Skip the fuses; only for a change you made on purpose |
+| `-dry-run` | `false` | Compute everything, write nothing |
+| `-json` | `false` | Print the report as JSON |
+
+Exit codes: `0` written (or unchanged), `1` the program failed, `2` **deliberately frozen** — read the report.
+
+```bash
+./bin/wecert-onboard -config /etc/wecert/config.yaml -dry-run   # see what would change
+./bin/wecert-onboard -config /etc/wecert/config.yaml            # write it
+```
 
 ### `wecert-preflight` (read-only)
 

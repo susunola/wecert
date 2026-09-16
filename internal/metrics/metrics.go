@@ -40,4 +40,53 @@ var (
 		Name: "wecert_reconcile_total",
 		Help: "Reconcile passes, with result being ok or error.",
 	}, []string{"cert", "result"})
+
+	// DesiredStateErrors 统计"这一轮根本没拿到期望状态"的次数。
+	//
+	// 它一涨就说明整轮被跳过了：没有任何证书被处理，但也没有任何证书
+	// 被误删 —— 那正是"来源失败 ≠ 期望为空"这条不变量的表现。
+	DesiredStateErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "wecert_desired_state_errors_total",
+		Help: "Passes skipped because the desired state could not be read. Skipping is deliberate: an unreadable source is never treated as an empty desired state.",
+	})
+
+	// DesiredStateFrozen 表示期望状态是否冻结在上一版。
+	//
+	// 冻结时续期照常，但新域名不会被纳入。持续为 1 说明来源一直没恢复。
+	DesiredStateFrozen = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_desired_state_frozen",
+		Help: "1 when the desired state is frozen on the last good revision (renewals continue, new names do not).",
+	})
+
+	// DesiredStateCertificates 是当前期望状态里的证书数量。
+	DesiredStateCertificates = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_desired_state_certificates",
+		Help: "Number of certificates in the current desired state.",
+	})
+
+	// DesiredStateAge 是期望状态文档的年龄（秒）。
+	//
+	// 它回答的是这套架构特有的那个问题：onboarding 组件还活着吗？
+	// 它死了之后一切看起来都正常，只是新域名再也不进来。
+	DesiredStateAge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_desired_state_age_seconds",
+		Help: "Age of the desired-state document in seconds. A growing value means the onboarding component stopped refreshing it.",
+	})
+
+	// DesiredStateShadowDiff 是 observe 模式下影子来源与当前执行的差异条数。
+	//
+	// 从 static 切到 enforce 之前，这个指标应该长期为 0。
+	DesiredStateShadowDiff = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_desired_state_shadow_diff",
+		Help: "In observe mode, the number of certificate-level differences between what is enforced and what the shadow source asks for. Should stay at 0 before switching to enforce.",
+	})
+
+	// OrphanedCertificates 统计状态库里有、但期望状态里已经没有的证书。
+	//
+	// 这类证书不会再被续期，最终会过期 —— 一种无声的失败。
+	// 期望状态的删除路径本来就有宽限期和引用检查，这个指标是最后一道兜底。
+	OrphanedCertificates = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_orphaned_certificates",
+		Help: "Certificates present in the state store but absent from the desired state. They will not be renewed and will eventually expire.",
+	})
 )

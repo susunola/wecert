@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/susunola/wecert/internal/reconcile"
+	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -30,6 +31,15 @@ type Reconciler interface {
 	CertNames() []string
 	StartCert(ctx context.Context, name string) error
 	StartAll(ctx context.Context) []string
+}
+
+// DesiredReader 是只读诊断端点需要的能力。
+//
+// 单独定义而不是塞进 Reconciler，是为了让这个端点保持
+// "可有可无的只读附加物"的定位：不实现它就只是不挂载，
+// 不影响触发路径，也不需要每个测试替身都去实现它。
+type DesiredReader interface {
+	LastResult() *spec.Result
 }
 
 // Server 提供触发端点与状态端点。
@@ -66,6 +76,10 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/hook/reconcile", s.auth(s.handleReconcile))
 	mux.HandleFunc("/hook/status", s.auth(s.handleStatus))
+
+	if dr, ok := s.rec.(DesiredReader); ok {
+		mux.HandleFunc("/hook/desired", s.auth(s.handleDesired(dr)))
+	}
 
 	return mux
 }
@@ -270,6 +284,96 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, out)
+}
+
+// ── 诊断端点 ────────────────────────────────────────────────────────────────
+
+// desiredCert 把"期望什么"和"实际上有没有"并排放在一起。
+type desiredCert struct {
+	Name     string   `json:"name"`
+	Domains  []string `json:"domains"`
+	Profile  string   `json:"profile"`
+	KeyType  string   `json:"keyType"`
+	Deploy   bool     `json:"deploy"`
+	Issued   bool     `json:"issued"`
+	NotAfter string   `json:"notAfter,omitempty"`
+	DaysLeft *int     `json:"daysLeft,omitempty"`
+}
+
+type desiredView struct {
+	Revision string `json:"revision,omitempty"`
+	Frozen   bool   `json:"frozen"`
+
+	// FreezeReason 非空说明这一轮来源读不到，收敛在上一版可用状态上。
+	FreezeReason string `json:"freezeReason,omitempty"`
+
+	GeneratedAt string             `json:"generatedAt,omitempty"`
+	Shadow      *spec.ShadowReport `json:"shadow,omitempty"`
+
+	Certificates []desiredCert   `json:"certificates"`
+	Decisions    []spec.Decision `json:"decisions"`
+}
+
+// handleDesired 回答这套系统上线后最常被问的那几个问题：
+//
+//	期望状态是什么？        certificates
+//	某个域名为什么没进去？   decisions[].reason
+//	和另一份来源差在哪？     shadow（observe 模式下）
+//	期望了但实际有没有？     certificates[].issued
+//
+// 没有它，这几个问题都只能靠翻日志，而日志会被轮转掉。
+func (s *Server) handleDesired(dr DesiredReader) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			writeJSON(w, http.StatusMethodNotAllowed,
+				map[string]string{"error": "use GET"})
+			return
+		}
+
+		res := dr.LastResult()
+		if res == nil {
+			// 还没成功读过一次期望状态。这不是"期望为空"，
+			// 所以绝不能返回一份空的证书列表 —— 那会被读成"什么都没有"。
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error": "no desired state has been read yet; this is not the same as an empty desired state",
+			})
+			return
+		}
+
+		now := s.now()
+		out := desiredView{
+			Revision:     res.Revision,
+			Frozen:       res.Frozen,
+			FreezeReason: res.FreezeReason,
+			Shadow:       res.Shadow,
+			Decisions:    res.Decisions,
+			Certificates: make([]desiredCert, 0, len(res.Certificates)),
+		}
+		if !res.GeneratedAt.IsZero() {
+			out.GeneratedAt = res.GeneratedAt.UTC().Format(time.RFC3339)
+		}
+
+		for i := range res.Certificates {
+			c := &res.Certificates[i]
+			dc := desiredCert{
+				Name:    c.Name,
+				Domains: c.Domains,
+				Profile: c.Profile,
+				KeyType: c.KeyType,
+				Deploy:  c.Deploy.Enabled,
+			}
+			if st, err := s.store.GetCert(c.Name); err == nil && st != nil && !st.NotAfter.IsZero() {
+				dc.Issued = true
+				dc.NotAfter = st.NotAfter.UTC().Format(time.RFC3339)
+				days := int(st.NotAfter.Sub(now).Hours() / 24)
+				dc.DaysLeft = &days
+			}
+			out.Certificates = append(out.Certificates, dc)
+		}
+
+		writeJSON(w, http.StatusOK, out)
+	}
 }
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────
