@@ -199,6 +199,30 @@ Exit codes: `0` written (or unchanged), `1` the program failed, `2` **deliberate
 
 > `-prune-certs` matches on the alias prefix `wecert/`, which wecert applies to **every** certificate it uploads — including the one currently serving. It prints the list and requires confirmation; non-interactive stdin is treated as "no".
 
+### `wecert-probe` (network-side evidence)
+
+Dials a real TLS connection and reports the certificate the far end actually serves. This is the part of wecert that does **not** trust the cloud control plane: a rebind is asynchronous and another certificate can be winning SNI, and neither is visible through the API.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-host` | — | **Required.** Comma-separated names to probe |
+| `-port` | `443` | TCP port to dial |
+| `-timeout` | `10s` | Per-attempt timeout |
+| `-min-valid` | `0` | Fail if the served certificate has less than this left, e.g. `168h` |
+| `-expect-san` | — | SAN set that was deployed; the served set must match exactly |
+| `-expect-not-after` | — | RFC3339 `notAfter` of the deployed certificate; catches a rebind that did not take effect |
+| `-wait` | `0` | Poll until the verdict is ok or this long elapses (e.g. `90s`) — useful right after a rebind |
+| `-json` | `false` | Print the raw result as JSON |
+
+Exit codes: `0` served as expected · `1` could not complete a probe · `2` probed successfully but the certificate served was not the expected one.
+
+```bash
+./bin/wecert-probe -host www.example.com -min-valid 168h
+./bin/wecert-probe -host www.example.com -wait 90s        # just rebound
+```
+
+> It cannot probe a wildcard — `*.example.com` has no address of its own. Probe a concrete name the same certificate covers.
+
 ### `wecert-clbverify` (independent evidence)
 
 | Flag | Description |

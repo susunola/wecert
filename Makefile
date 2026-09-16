@@ -8,6 +8,7 @@ ONBOARD := bin/wecert-onboard
 PREFLIGHT := bin/wecert-preflight
 CLBVERIFY := bin/wecert-clbverify
 TATRUN := bin/wecert-tatrun
+PROBE := bin/wecert-probe
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1.0)
 
 # 交叉编译目标。腾讯云 CVM 绝大多数是 linux/amd64；
@@ -22,9 +23,10 @@ CMDS := wecert wecert-onboard
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
 
-# 构建辅助工具（preflight 前置检查、clbverify 监听器绑定取证）。
+# 构建辅助工具（preflight 前置检查、clbverify 监听器绑定取证、probe 网络侧取证）。
 tools:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(ONBOARD) ./cmd/wecert-onboard
+	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(PROBE) ./cmd/wecert-probe
 	$(GO) build -trimpath -ldflags "-s -w" -o $(PREFLIGHT) ./cmd/preflight
 	$(GO) build -trimpath -ldflags "-s -w" -o $(CLBVERIFY) ./cmd/clbverify
 	$(GO) build -trimpath -ldflags "-s -w" -o $(TATRUN) ./cmd/tatrun

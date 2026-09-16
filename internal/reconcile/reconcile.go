@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/metrics"
+	"github.com/susunola/wecert/internal/probe"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
@@ -56,10 +58,21 @@ type Reconciler struct {
 	mu      sync.Mutex
 	running map[string]struct{}
 
+	// prober 是可选的网络侧探测器。为 nil 表示不探测。
+	//
+	// 用 SetProber 挂上来而不是塞进 New 的参数表：它是一层纯粹的附加观测，
+	// 不该让每一个测试替身都去构造它。
+	prober *probe.Runner
+
 	// last 是最近一次成功求值出来的期望状态，供只读诊断端点使用。
 	// 存指针是必要的：诊断端点会在另一个 goroutine 里读它。
 	last atomic.Pointer[spec.Result]
 }
+
+// SetProber 挂上网络侧探测器。必须在第一次收敛之前调用。
+//
+// 传 nil 时整条探测路径都是空操作，收敛行为与不挂时完全一致。
+func (r *Reconciler) SetProber(p *probe.Runner) { r.prober = p }
 
 // New 构造收敛器。
 //
@@ -330,10 +343,82 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) {
 	}
 
 	r.publish(c.Name)
+	r.probeCert(ctx, c)
 
 	if r.notifier != nil {
 		r.notifier.Renewal(ctx, c.Name, err)
 	}
+}
+
+// probeCert 拨一个真实的 TLS 连接，确认线上服务的确实是刚部署的那张证书。
+//
+// 这是整套系统里唯一不信任云控制面的证据。控制面说"绑定成功"和浏览器
+// 真的能拿到这张证书是两件事，而这两件事之间的差距 —— 换绑是异步的、
+// SNI 上可能有另一张证书在赢 —— 恰好是 CLB 上最容易出问题的地方。
+//
+// 拿不到结论**不会**影响这一轮的结果：一个拨不出去的探测不该让一次
+// 成功的续期看起来像失败。它只影响指标和告警。
+func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
+	if r.prober == nil {
+		return
+	}
+
+	// 还没确认部署的东西拨了也只会报错 —— 首次上传之后要人工绑一次，
+	// 在那之前线上服务的本来就还是旧证书。
+	st, err := r.store.GetCert(c.Name)
+	if err != nil || st == nil || !st.DeployConfirmed {
+		return
+	}
+
+	hosts := probeHosts(c.Domains, r.cfg.Probe.MaxHostsPerCert)
+	if len(hosts) == 0 {
+		// 整张证书都是通配符：没有具体名字可以拨。
+		r.log.Debug("nothing to probe: every name in this certificate is a wildcard",
+			"cert", c.Name, "domains", c.Domains)
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
+
+	e := probe.Expectation{
+		Domains:     c.Domains,
+		NotAfter:    st.NotAfter,
+		MinValidFor: r.cfg.Probe.MinValidDur,
+	}
+
+	// 同一张证书的几个名字并发拨。串行的话，一张 3 个名字的证书在
+	// 全部超时的情况下要占 30 秒，而这是每一轮都要跑的东西。
+	var wg sync.WaitGroup
+	for _, host := range hosts {
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			r.prober.Check(ctx, h, e)
+		}(host)
+	}
+	wg.Wait()
+}
+
+// probeHosts 从一张证书的域名里挑出可以拨的名字。
+//
+// 通配符没有自己的地址，所以跳过；其余按声明顺序取前 max 个 ——
+// 声明顺序把注册域放在最前面，而那通常是最该被验的那个。
+func probeHosts(domains []string, max int) []string {
+	if max <= 0 {
+		return nil
+	}
+	out := make([]string, 0, max)
+	for _, d := range domains {
+		if strings.HasPrefix(d, "*.") {
+			continue
+		}
+		out = append(out, d)
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
 }
 
 // publish 把状态库里的现状同步到 Prometheus。
