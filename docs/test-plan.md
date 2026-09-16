@@ -34,13 +34,17 @@
 | 层级 | 目标 | 现有资产 | 运行位置 | 频率 |
 |---|---|---|---|---|
 | **L0 静态门禁** | 格式、静态错误、已知 CVE、英文源码、图表不过期 | `gofmt`、`go vet`、`govulncheck`、`scripts/check-english.py`、`scripts/check-diagram-fit.py` | CI | 每次 push / PR |
-| **L1 单元** | 纯逻辑：集合运算、状态迁移、解析、退避 | 39 个测试文件、384 个用例 | CI（`-race`） | 每次 push / PR |
+| **L1 单元** | 纯逻辑：集合运算、状态迁移、解析、退避 | 60 个测试文件、633 个测试函数 | CI（`-race`） | 每次 push / PR |
 | **L2 集成（注入替身）** | 跨组件编排：订单状态机、DNS 传播、清理、收敛循环 | 注入式 exchange 函数、假状态库、`httptest` | CI | 每次 push / PR |
+| **L2.5 真实 DNS-01 端到端（本地，无需云凭证）** | 真 ACME 服务端 + 真权威 DNS（53 端口）+ 真 solver 写记录 + 真传播检查回读 + 真签发 | `internal/acme/e2e_dns_test.go`、`make e2e`、[实跑报告](e2e-run-2026-09-17.html) | 本地 / CI（Linux 需 `CAP_NET_BIND_SERVICE`） | 改动触及签发、DNS 或状态机时 |
 | **L3 端到端（staging）** | 真实 ACME + 真实 DNSPod 的全流程 | `docs/lifecycle-acceptance.md`、`scripts/e2e-test.sh` | 本地，人工 | 发版前 / 改动触及状态机时 |
+| **L3 端到端（staging，自动化）** | 同上，但由 `wecert-onboard` 驱动声明、`wecert-probe` 独立佐证 | `scripts/e2e.sh` 输出的 [实跑报告](e2e-run-2026-09-17.html) | 本地，人工 | 同上 |
 | **L4 部署验收** | 真实 CLB 绑定、SNI、TLS 实际握手、CVM 角色 | `testenv/`（Terraform）、`scripts/run-stage-ab.sh`、`scripts/validate-cloudinit.py` | 腾讯云测试账号，人工 | 发版前 / 改动触及部署时 |
 | **L5 线上巡检** | 生产上"证书真的在服务" | `wecert-probe`、`tatrun`、Prometheus 指标 | 生产 | 持续 |
 
 **L3/L4 是人工的，这不是偷懒，是结构性的** —— 见第 6 节。
+
+**L2.5 是这一层里唯一"真到 DNS 线路上"的自动化层级**：它用一个真实的权威 DNS 服务器（0.0.0.0:53）、pebble 的真实校验、以及生产同一条 solver→传播检查代码路径，把"记录真的写进去了、真的能读回来、CA 真的签了"三件事分开断言。它不需要任何云凭证，所以能进 CI；跑不了的部分（云部署、staging）在报告里逐条列出并给出命令，而不是当作通过。
 
 ---
 

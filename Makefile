@@ -26,7 +26,7 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # yet; keep this list in sync when it lands.
 CMDS := wecert wecert-onboard
 
-.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-repeat vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
+.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-repeat e2e vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
@@ -216,6 +216,18 @@ check-alerts:
 #	go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
 test-pebble:
 	$(GO) test -tags pebble -count=1 -timeout 5m ./internal/acme/ -run TestPebble -v
+
+# The end-to-end run and its HTML report: three suites (the real DNS-01 lifecycle, the ACME order
+# protocol, the wildcard/apex shared-name logic) plus a report that states what is real and what
+# needed credentials this environment does not have. Needs the same pebble binary as test-pebble.
+#
+# Port 53 is required by the first suite: a DNS delegation carries no port, so wecert's propagation
+# probe and the CA's validator both need the authority there. On Linux that means
+# CAP_NET_BIND_SERVICE (docker run --cap-add=NET_BIND_SERVICE ...); the suite skips with that
+# instruction rather than pretending to have run.
+E2E_OUT ?= docs/e2e-run-$(shell date +%Y-%m-%d).html
+e2e:
+	@bash scripts/e2e.sh --out $(E2E_OUT)
 
 # Property and fuzz testing. Separate from `check` because each target runs for a bounded
 # wall-clock budget rather than to completion, so it belongs in a scheduled job as well as a
