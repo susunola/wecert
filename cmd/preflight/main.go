@@ -144,10 +144,13 @@ func checkDelegation(ctx context.Context, domain string) error {
 	// delegation some resolvers land on the other host and never see the TXT record,
 	// so validation fails intermittently -- the hardest kind to diagnose.
 	if !allOnDNSPod {
+		// No trailing newline: this is an error value first and a printed message
+		// second, and a wrapping caller should decide the spacing. The internal
+		// newlines are the multi-line diagnosis itself, which is the point.
 		return fmt.Errorf(
 			"%s's nameservers are not all DNSPod: %s\n"+
 				"     TXT records written at DNSPod will never be resolved, so CA validation is guaranteed to fail.\n"+
-				"     point the domain's NS at DNSPod first, or switch to the dns.provider for that host\n",
+				"     point the domain's NS at DNSPod first, or switch to the dns.provider for that host",
 			domain, strings.Join(hosts, ", "))
 	}
 
