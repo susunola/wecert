@@ -149,14 +149,6 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 	return Verdict{OK: true}
 }
 
-// LastState returns the previous state for a name, mainly for diagnostics.
-// An empty string means it has never been probed.
-func (r *Runner) LastState(host string) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.last[host]
-}
-
 func (r *Runner) transition(host, state, msg string, attrs ...any) {
 	r.mu.Lock()
 	prev, seen := r.last[host]
