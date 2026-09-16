@@ -241,6 +241,11 @@ func (m *Manager) solveChallenges(
 			// says "this certificate will not issue", while pre-expiry degradation has to
 			// answer "which name will not issue" -- without that we could only drop names at
 			// random, and that sacrifices the good names too.
+			// Start the name's cooldown as well as recording the ledger row: the ledger
+			// answers "who has been broken lately" for the fallback, while the cooldown
+			// stops this process from spending the identifier's hourly failure budget on
+			// retries inside the same window (see identifierCooldown).
+			m.noteIdentifierFailure(targeted)
 			if rerr := m.store.RecordIdentifierFailure(
 				c.Name, targeted, authzError(cur), m.now()); rerr != nil {
 				m.log.Warn("failed to record the identifier failure",
@@ -450,6 +455,12 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 
 			// Persist a transition only. The row is what the next pass reads to decide
 			// where to resume, so rewriting an unchanged status is pure fsync.
+			if cur.Status == "valid" {
+				// It validated, so the name is not in trouble: forget any cooldown so a later
+				// failure starts a fresh window rather than inheriting this one. The ledger
+				// row is pruned separately, by applyFallback, once the name is healthy.
+				m.clearIdentifierCooldown(challenge.GetTargetedDomain(cur))
+			}
 			if a.Status != cur.Status {
 				a.Status = cur.Status
 				if perr := m.store.PutAuthorization(a); perr != nil {
@@ -464,6 +475,7 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 				// then the CA later marks the authorization invalid. Keep the
 				// ledger key wildcard-aware, just as solveChallenges does.
 				targeted := challenge.GetTargetedDomain(cur)
+				m.noteIdentifierFailure(targeted)
 				if rerr := m.store.RecordIdentifierFailure(a.CertName, targeted, authzError(cur), m.now()); rerr != nil {
 					m.log.Warn("failed to record the identifier failure", "cert", a.CertName, "identifier", targeted, "err", rerr)
 				}

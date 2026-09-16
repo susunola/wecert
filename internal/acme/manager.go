@@ -130,6 +130,24 @@ type Manager struct {
 	orderFetchMu    sync.Mutex
 	orderFetchFails map[string]int
 
+	// identifierCooldown remembers identifiers whose authorizations just failed, so a
+	// certificate is not ordered again while one of its names is known to be failing.
+	//
+	// Why per-identifier and not just per-certificate: the certificate backoff starts at a
+	// minute and doubles, so the first hour of a persistently failing name costs six attempts
+	// (1+2+4+8+16+32 minutes) against "5 authorization failures per identifier per hour".
+	// Worse, the budget belongs to the IDENTIFIER, so N certificates that share the name
+	// attack the same budget -- at ten certificates the first hour costs sixty failures
+	// against five. Past that hour the limit blocks every new order for the name, so the
+	// extra attempts bought nothing at all; and the consecutive-failure counter (1152, +1/day)
+	// counts toward an account pause that needs manual portal action.
+	//
+	// The cooldown is deliberately in memory: it guards a rate-limit budget that is itself
+	// time-based and cheap to relearn, and persisting it would mean another column for state
+	// that a restart may reasonably forget.
+	identifierMu       sync.Mutex
+	identifierCooldown map[string]time.Time
+
 	// bindingCheckEvery throttles the "is this certificate bound yet?" lookup, and
 	// bindingChecked remembers when each certificate was last asked.
 	//
@@ -206,6 +224,54 @@ func (m *Manager) clearOrderFetchFailures(orderURL string) {
 	delete(m.orderFetchFails, orderURL)
 }
 
+// identifierCooldownFor is how long a name is left alone after one of its authorizations fails.
+//
+// An hour matches the window of "5 authorization failures per identifier per hour": retrying
+// inside it cannot help, because the limit that would reject the attempt is measured over the
+// same period. After the window the identifier's own budget has partially refilled, which is
+// the earliest point at which another attempt is informative.
+const identifierCooldownFor = time.Hour
+
+// coolingDown returns the identifier among these names that is inside its cooldown, if any.
+func (m *Manager) coolingDown(domains []string) (string, time.Time, bool) {
+	now := m.now()
+	m.identifierMu.Lock()
+	defer m.identifierMu.Unlock()
+	for _, d := range domains {
+		until, ok := m.identifierCooldown[d]
+		if !ok {
+			continue
+		}
+		if !now.Before(until) {
+			delete(m.identifierCooldown, d)
+			continue
+		}
+		return d, until, true
+	}
+	return "", time.Time{}, false
+}
+
+// noteIdentifierFailure starts (or extends) the cooldown for a name whose authorization failed.
+func (m *Manager) noteIdentifierFailure(identifier string) {
+	if identifier == "" {
+		return
+	}
+	m.identifierMu.Lock()
+	defer m.identifierMu.Unlock()
+	m.identifierCooldown[identifier] = m.now().Add(identifierCooldownFor)
+}
+
+// clearIdentifierCooldown forgets a name that validated successfully, so the next failure
+// starts a fresh window rather than inheriting one.
+func (m *Manager) clearIdentifierCooldown(identifier string) {
+	if identifier == "" {
+		return
+	}
+	m.identifierMu.Lock()
+	defer m.identifierMu.Unlock()
+	delete(m.identifierCooldown, identifier)
+}
+
 // round is the per-pass intent of ONE certificate: which domain set this pass decided to
 // order for, and whether a degradation was in force when it decided.
 //
@@ -266,21 +332,22 @@ func newManager(
 	log *slog.Logger,
 ) *Manager {
 	return &Manager{
-		store:             store,
-		core:              core,
-		dns:               dns,
-		keyAuth:           keyAuth,
-		deployer:          deployer,
-		log:               log,
-		ariInterval:       6 * time.Hour,
-		retention:         7 * 24 * time.Hour,
-		authzWait:         authzWaitTimeout,
-		pollInterval:      pollInterval,
-		bindingCheckEvery: bindingCheckInterval,
-		bindingChecked:    make(map[string]time.Time),
-		transientBackoff:  make(map[string]time.Time),
-		orderFetchFails:   make(map[string]int),
-		now:               time.Now,
+		store:              store,
+		core:               core,
+		dns:                dns,
+		keyAuth:            keyAuth,
+		deployer:           deployer,
+		log:                log,
+		ariInterval:        6 * time.Hour,
+		retention:          7 * 24 * time.Hour,
+		authzWait:          authzWaitTimeout,
+		pollInterval:       pollInterval,
+		bindingCheckEvery:  bindingCheckInterval,
+		bindingChecked:     make(map[string]time.Time),
+		transientBackoff:   make(map[string]time.Time),
+		orderFetchFails:    make(map[string]int),
+		identifierCooldown: make(map[string]time.Time),
+		now:                time.Now,
 	}
 }
 

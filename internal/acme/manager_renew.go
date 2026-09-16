@@ -95,6 +95,31 @@ func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
 // issue creates an order. Mind the order of operations: persist the order (including the
 // private key generated here) first, and only then advance it.
 func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.CertState, replaces string, rd round) error {
+	// Do not spend an order on a name that just failed validation.
+	//
+	// The certificate backoff starts at a minute and doubles, so the first hour of a
+	// persistently failing name costs six attempts against "5 authorization failures per
+	// identifier per hour" -- and that budget belongs to the IDENTIFIER, so N certificates
+	// sharing the name attack the same five. At ten certificates the first hour costs sixty
+	// failures, of which at most five could ever have produced a different answer; past the
+	// limit every further order for that name is rejected outright, so the attempts bought
+	// nothing and the consecutive-failure counter (which feeds an account pause needing
+	// manual intervention) kept climbing.
+	//
+	// Checked here, at the point an order would be created, so resuming an order that is
+	// already in flight is unaffected -- that costs no new order and is how a pass that was
+	// interrupted mid-validation finishes.
+	if name, until, cooling := m.coolingDown(c.Domains); cooling {
+		m.log.Warn("an identifier's authorizations failed recently, so no new order is placed until its "+
+			"failure budget refills; retrying inside the window cannot succeed and spends the budget "+
+			"that other certificates for this name also depend on",
+			"cert", c.Name, "identifier", name, "cooldownUntil", until,
+			"remaining", until.Sub(m.now()).Round(time.Minute))
+		return m.recordFailure(st, fmt.Errorf(
+			"identifier %s is in its authorization-failure cooldown until %s; not placing an order",
+			name, until.UTC().Format(time.RFC3339)))
+	}
+
 	key, err := GenerateKey(c.KeyType)
 	if err != nil {
 		return m.recordFailure(st, err)
