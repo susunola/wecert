@@ -138,7 +138,7 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 	rec := DNSRecord{
-		FQDN:  dns01.ToFqdn(info.EffectiveFQDN),
+		FQDN:  dns.Fqdn(info.EffectiveFQDN),
 		Value: info.Value,
 	}
 
@@ -353,14 +353,6 @@ func probeTXTWithExchange(servers []string, fqdn, want string, exchange func(*dn
 	return results
 }
 
-func probeTXT(servers []string, fqdn, want string) []nsProbe {
-	return probeTXTWithExchange(servers, fqdn, want, func(msg *dns.Msg, server string) (*dns.Msg, error) {
-		client := &dns.Client{Timeout: 3 * time.Second}
-		resp, _, err := client.Exchange(msg, server)
-		return resp, err
-	})
-}
-
 // probeReady decides whether a record can count as propagated, and returns a
 // plain-language summary.
 //
@@ -504,7 +496,7 @@ func (l *txtLeases) remove(fqdn, value string) (othersLive bool) {
 // cleanupOrphanTXT.
 func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) error {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
-	fqdn := dns01.ToFqdn(info.EffectiveFQDN)
+	fqdn := dns.Fqdn(info.EffectiveFQDN)
 
 	mu := challengeLeases.lock(fqdn)
 	mu.Lock()
@@ -534,7 +526,7 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 func (s *DNSSolver) LookupTXT(ctx context.Context, domain, keyAuth string) (DNSRecord, bool, error) {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 	rec := DNSRecord{
-		FQDN:  dns01.ToFqdn(info.EffectiveFQDN),
+		FQDN:  dns.Fqdn(info.EffectiveFQDN),
 		Value: info.Value,
 	}
 
