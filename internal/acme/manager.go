@@ -66,7 +66,15 @@ type Manager struct {
 
 	ariInterval time.Duration
 	retention   time.Duration
-	now         func() time.Time
+
+	// authzWait and pollInterval bound the two wait loops (authorization validation
+	// and order status). Fields rather than constants only so tests can drive several
+	// rounds without real minutes passing -- the lack of that knob is part of why the
+	// amplification in awaitAuthorizations went unnoticed.
+	authzWait    time.Duration
+	pollInterval time.Duration
+
+	now func() time.Time
 
 	// fallback is the "split off a subset and issue it before expiry" policy. nil means
 	// off, which is the default. See SetFallbackPolicy and applyFallback.
@@ -94,15 +102,17 @@ func newManager(
 	log *slog.Logger,
 ) *Manager {
 	return &Manager{
-		store:       store,
-		core:        core,
-		dns:         dns,
-		keyAuth:     keyAuth,
-		deployer:    deployer,
-		log:         log,
-		ariInterval: 6 * time.Hour,
-		retention:   7 * 24 * time.Hour,
-		now:         time.Now,
+		store:        store,
+		core:         core,
+		dns:          dns,
+		keyAuth:      keyAuth,
+		deployer:     deployer,
+		log:          log,
+		ariInterval:  6 * time.Hour,
+		retention:    7 * 24 * time.Hour,
+		authzWait:    authzWaitTimeout,
+		pollInterval: pollInterval,
+		now:          time.Now,
 	}
 }
 

@@ -52,6 +52,14 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 
 	switch dnsCfg.Provider {
 	case config.DNSProviderDNSPod:
+		// Hazard: lego wraps this provider's HTTP client in its debug dumper, which is
+		// enabled by LEGO_DEBUG_DNS_API_HTTP_CLIENT. It redacts Authorization/Token/
+		// Api-Key *headers*, but dnspod-go puts the credential in the POST *body* as
+		// `login_token=...`, which no redaction rule matches -- so setting that variable
+		// on the service writes a never-expiring DNSPod token (record write over every
+		// zone in the account) into stdout, which under systemd means the journal.
+		//
+		// Keep it out of the unit and out of any drop-in; debug DNS locally instead.
 		p, err := dnspod.NewDNSProviderConfig(&dnspod.Config{
 			LoginToken:         dnsCfg.LoginToken,
 			TTL:                dnsCfg.TTL,

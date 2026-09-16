@@ -747,3 +747,28 @@ func TestGroupSettingsComeFromDeclarations(t *testing.T) {
 		t.Errorf("keyType must come from the declaration, got %q", c.KeyType)
 	}
 }
+
+// Guard 1 must accept a name that a wildcard rule domain serves.
+//
+// CLB layer-7 rules support `*.example.com` as a rule domain, and the deletion-side
+// check (referenced) already understood that -- while guard 1 did a flat map lookup.
+// So one rule could be simultaneously "not serving" a name (rejecting the
+// declaration, and freezing the round when it was the only one) and "still
+// referencing" it (blocking deletion).
+func TestGuardOneAcceptsANameServedByAWildcardRule(t *testing.T) {
+	h := newHarness(t, Options{RequireRule: true})
+
+	h.decls.raw = []RawDeclaration{
+		{Zone: "example.com", Record: DeclarationPrefix + "www.example.com", Values: []string{""}},
+	}
+	h.rules.domains = []string{"*.example.com"}
+
+	rep := h.run(t)
+
+	if d, ok := decisionFor(rep, "www.example.com"); ok && !d.Included {
+		t.Fatalf("www.example.com is served by the *.example.com rule but was rejected: %s", d.Reason)
+	}
+	if got := h.domains(t); len(got) != 1 || got[0] != "www.example.com" {
+		t.Fatalf("domain set = %v, want [www.example.com]", got)
+	}
+}

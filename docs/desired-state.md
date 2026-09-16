@@ -183,8 +183,11 @@ DNS zone 本来就是这个系统的信任根：谁能写这个 zone，谁本来
 **冻结是安全的方向，不是故障。** 冻结期间：文档不动、`wecert` 继续按上一版
 正常续期、没有任何证书会断。唯一的代价是新声明的域名要等到解冻之后才会进来。
 
-`-force` 会跳过 1/2/3/4 全部闸门，直接按这一轮算出来的结果写。它必须是由人
-敲出来的显式动作 —— 自动化流程里绝不能带上它，否则这些闸门就等于不存在。
+`-force` 会跳过闸门 2（骤变保险丝）、闸门 3（删除宽限期）和闸门 4（配额预算），
+直接按这一轮算出来的结果写。它**跳过不了闸门 1**：来源读不出来时仍然冻结 ——
+那正是「读不到」和「确实没有了」必须区分开的场合，`-force` 也变不出没读到的数据。
+
+它必须是由人敲出来的显式动作 —— 自动化流程里绝不能带上它，否则这几道闸门就等于不存在。
 
 > 空期望状态**永远**被拒绝，`-force` 也不行。"合法的空"和"生成失败导致的空"
 > 在文件里长得一模一样，而后者一旦被写出去，后果是每张证书的每个域名都被摘掉。
@@ -316,8 +319,7 @@ curl -s -H "X-Wecert-Token: $TOKEN" localhost:9801/hook/desired \
 报告文件里有完整的 `freezeReasons`：
 
 ```bash
-jq .reportPath /var/lib/wecert/desired-state.report.json 2>/dev/null || \
-  jq '.mode, .freezeReasons' /var/lib/wecert/desired-state.report.json
+jq '.mode, .freezeReasons' /var/lib/wecert/desired-state.report.json
 ```
 
 冻结期间**没有任何东西在坏**，只是期望状态停在上一版。先判断这次变化是不是
