@@ -159,6 +159,22 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		return m.issue(ctx, c, st, "")
 	}
 
+	// 已有证书，但还没确认绑到云资源 → 补一次只读确认。
+	//
+	// 首次签发只上传、不绑定（腾讯云侧还没有“旧证书 → 资源”的关系可查），
+	// 所以 DeployConfirmed 是 false，要等人工在控制台绑一次。
+	// 但在此之前没有任何路径回来把它置位 —— deployed 指标会在整个证书
+	// 周期（classic 最长 90 天）里报“未部署”，而证书其实一直在正常服务。
+	//
+	// 放在域名比对之前：这只是记账，不影响是否续期的决策。
+	if c.Deploy.Enabled && st.DeployedCertID != "" && !st.DeployConfirmed {
+		if err := m.confirmBinding(ctx, c, st); err != nil {
+			// 查询故障不等于绑定失败。续期才是主线，不能被一个确认动作拖住。
+			m.log.Warn("could not confirm the certificate binding (renewal is unaffected)",
+				"cert", c.Name, "certId", st.DeployedCertID, "err", err)
+		}
+	}
+
 	// 已有证书 → 先看域名集合对不对，再看时间。
 	//
 	// 顺序不能反：只依赖 ARI 窗口的话，配置里新增的域名要等到下一个续期
@@ -201,4 +217,32 @@ func orderMatchesConfig(o *state.Order, c *config.Certificate) bool {
 		return true
 	}
 	return o.Identifiers == c.DomainKey()
+}
+
+// confirmBinding 查一次这张证书绑了哪些云资源，绑上了就把 DeployConfirmed 置位。
+//
+// 幂等：已确认的证书不会走到这里（调用方判过）。查不到绑定时保持 false，
+// 并打一条带指引的日志 —— 这个状态是“等人去 CLB 控制台绑一次”，
+// 不是错误，所以不记失败、不进退避。
+func (m *Manager) confirmBinding(ctx context.Context, c *config.Certificate, st *state.CertState) error {
+	n, err := m.deployer.Bindings(ctx, st.DeployedCertID)
+	if err != nil {
+		return err
+	}
+
+	if n == 0 {
+		m.log.Info("certificate uploaded but not bound to any cloud resource yet",
+			"cert", c.Name, "certId", st.DeployedCertID,
+			"hint", "bind it once in the CLB console; renewals switch it automatically afterwards")
+		return nil
+	}
+
+	st.DeployConfirmed = true
+	if err := m.store.PutCert(st); err != nil {
+		return err
+	}
+
+	m.log.Info("confirmed the certificate is bound to cloud resources",
+		"cert", c.Name, "certId", st.DeployedCertID, "resources", n)
+	return nil
 }

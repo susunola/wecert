@@ -14,6 +14,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -34,7 +35,16 @@ func main() {
 	listCerts := flag.Bool("list-certs", false, "list SSL certificates in the account (ID / alias / domain / status)")
 	pruneCerts := flag.Bool("prune-certs", false, "delete the certificates wecert uploaded (alias starting with wecert/)")
 	yes := flag.Bool("yes", false, "use with -prune-certs to skip the interactive confirmation")
+	bindings := flag.String("bindings", "", "dump the raw bind-resource result for a certificate ID (debugging)")
 	flag.Parse()
+
+	if *bindings != "" {
+		if err := dumpBindings(*bindings); err != nil {
+			fmt.Fprintf(os.Stderr, "\nFAILED: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	switch {
 	case *pruneCerts:
@@ -423,4 +433,69 @@ func confirm(prompt string) bool {
 	default:
 		return false
 	}
+}
+
+// dumpBindings 原样打出“这张证书绑了哪些云资源”的 API 返回。
+//
+// 排障用：确认绑定关系时，服务端的字段语义（Status 的取值、
+// 结果何时填充）不能靠猜，把原始响应打出来最快。
+func dumpBindings(certID string) error {
+	secretID := os.Getenv("TENCENTCLOUD_SECRET_ID")
+	secretKey := os.Getenv("TENCENTCLOUD_SECRET_KEY")
+	if secretID == "" || secretKey == "" {
+		return fmt.Errorf("missing credentials: set TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY")
+	}
+
+	cpf := profile.NewClientProfile()
+	cpf.HttpProfile.Endpoint = "ssl.tencentcloudapi.com"
+	client, err := ssl.NewClient(common.NewCredential(secretID, secretKey), "", cpf)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	createReq := ssl.NewCreateCertificateBindResourceSyncTaskRequest()
+	createReq.CertificateIds = []*string{common.StringPtr(certID)}
+	createReq.IsCache = common.Uint64Ptr(1)
+
+	createResp, err := client.CreateCertificateBindResourceSyncTaskWithContext(ctx, createReq)
+	if err != nil {
+		return fmt.Errorf("CreateCertificateBindResourceSyncTask: %w", err)
+	}
+	b1, _ := json.MarshalIndent(createResp.Response, "", "  ")
+	fmt.Printf("=== CreateCertificateBindResourceSyncTask ===\n%s\n\n", b1)
+
+	var taskID string
+	if createResp.Response != nil {
+		for _, t := range createResp.Response.CertTaskIds {
+			if t != nil && t.CertId != nil && *t.CertId == certID && t.TaskId != nil {
+				taskID = *t.TaskId
+			}
+		}
+	}
+	if taskID == "" {
+		return fmt.Errorf("no task id returned for %s", certID)
+	}
+	fmt.Printf("taskId = %s\n\n", taskID)
+
+	for i := 1; i <= 6; i++ {
+		queryReq := ssl.NewDescribeCertificateBindResourceTaskResultRequest()
+		queryReq.TaskIds = []*string{common.StringPtr(taskID)}
+
+		queryResp, err := client.DescribeCertificateBindResourceTaskResultWithContext(ctx, queryReq)
+		if err != nil {
+			return fmt.Errorf("DescribeCertificateBindResourceTaskResult: %w", err)
+		}
+		b2, _ := json.MarshalIndent(queryResp.Response, "", "  ")
+		fmt.Printf("=== DescribeCertificateBindResourceTaskResult (poll %d) ===\n%s\n", i, b2)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(4 * time.Second):
+		}
+	}
+	return nil
 }
