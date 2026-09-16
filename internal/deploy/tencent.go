@@ -287,7 +287,7 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 			//
 			// progressReady is the precise form of "populated": it is a null TotalCount,
 			// not an empty progress list, that carries the ambiguity -- a response can list
-			// regions and still have no count for any of them.
+			// regions and still have no count for any of them, or for only some of them.
 			if bound == 0 && progressReady {
 				return noResourceBoundError(oldID, d.regions)
 			}
@@ -331,9 +331,18 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 	// the full three minutes.
 	graceUntil := d.now().Add(deployRecordGrace)
 	for {
-		s, f, r, p, err := d.describeDeployRecord(ctx, client, recordID)
+		s, f, r, p, instrumented, err := d.describeDeployRecord(ctx, client, recordID)
 		if err != nil {
 			d.log.Warn("failed to query the deploy record; retrying shortly", "deployRecordId", recordID, "err", err)
+		} else if !instrumented {
+			// The record detail has the same async-population hazard as the sync
+			// progress: the counter fields are pointers in the SDK and are null until
+			// the server instruments the task, and null is not zero. Reading nulls as
+			// zeros would let the zero-resource verdict fire against a task that has
+			// not even been measured yet, so an uninstrumented answer is no answer:
+			// keep waiting (the deadline below still bounds the wait).
+			d.log.Info("the deploy record carries no counters yet; waiting for the server to instrument the task",
+				"deployRecordId", recordID)
 		} else {
 			success, failed, running, pending = s, f, r, p
 			d.log.Info("one-click update progress",
@@ -369,21 +378,28 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 }
 
 // describeDeployRecord queries the resource-level detail of a deploy record once.
-func (d *TencentCLB) describeDeployRecord(ctx context.Context, client sslAPI, recordID uint64) (success, failed, running, pending int64, err error) {
+//
+// instrumented reports whether the server has populated the counters at all: the SDK
+// exposes every TotalCount field as a pointer, and they are null until the task is
+// instrumented server-side -- the same async-population behavior as the sync progress.
+// A null counter must not be dereferenced into a zero that the zero-resource verdict
+// would then mistake for a real answer; when any counter is null the whole response is
+// reported as not instrumented and the caller keeps waiting.
+func (d *TencentCLB) describeDeployRecord(ctx context.Context, client sslAPI, recordID uint64) (success, failed, running, pending int64, instrumented bool, err error) {
 	req := ssl.NewDescribeHostUpdateRecordDetailRequest()
 	req.DeployRecordId = common.StringPtr(strconv.FormatUint(recordID, 10))
 	resp, err := client.DescribeHostUpdateRecordDetailWithContext(ctx, req)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, false, err
 	}
 	if resp.Response == nil {
-		return 0, 0, 0, 0, errors.New("DescribeHostUpdateRecordDetail returned an empty response")
+		return 0, 0, 0, 0, false, errors.New("DescribeHostUpdateRecordDetail returned an empty response")
 	}
-	return derefI64(resp.Response.SuccessTotalCount),
-		derefI64(resp.Response.FailedTotalCount),
-		derefI64(resp.Response.RunningTotalCount),
-		derefI64(resp.Response.PendingTotalCount),
-		nil
+	r := resp.Response
+	if r.SuccessTotalCount == nil || r.FailedTotalCount == nil || r.RunningTotalCount == nil || r.PendingTotalCount == nil {
+		return 0, 0, 0, 0, false, nil
+	}
+	return *r.SuccessTotalCount, *r.FailedTotalCount, *r.RunningTotalCount, *r.PendingTotalCount, true, nil
 }
 
 // resourceTypeRegions expands the region list per resource type.
@@ -446,20 +462,28 @@ func toPtrSlice(in []string) []*string {
 // easily overlooked. But `UpdateSyncProgressRegions[].TotalCount` is filled in
 // asynchronously, so on the response that first carries a DeployRecordId it can still be
 // **null**, and null is not zero: the task was created and may well be switching the
-// listener right now. `ready` separates the two -- at least one region carrying a real
-// TotalCount means the server has answered, and a zero from an answered response is the
+// listener right now.
+//
+// `ready` separates the two, and it demands the *whole* answer: every listed region must
+// carry a real TotalCount. A partially populated response (region A counted, region B
+// still null) is no more authoritative than an empty one -- the new task may be
+// switching region B at that very moment, and summing only the populated regions would
+// report a zero that is not real. Only when every region has answered is a zero the
 // genuine no-binding case.
 func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready bool) {
 	var n int64
+	listed := 0
+	answered := 0
 	for _, p := range progress {
 		for _, r := range p.UpdateSyncProgressRegions {
+			listed++
 			if r.TotalCount != nil {
-				ready = true
+				answered++
+				n += *r.TotalCount
 			}
-			n += derefI64(r.TotalCount)
 		}
 	}
-	return n, ready
+	return n, listed > 0 && answered == listed
 }
 
 // noResourceBoundError is the diagnosis shared by the two places that can conclude the

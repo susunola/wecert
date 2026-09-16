@@ -49,12 +49,62 @@ func TestRecordFailureResetsAfterBlockExpires(t *testing.T) {
 	}
 }
 
-// A success deletes the address state outright, so failures before it no
-// longer count.
-func TestRecordSuccessClearsFailures(t *testing.T) {
+// A success decays the failure count instead of wiping it: one interleaved
+// legit call must not forgive a shared-egress-IP attacker outright.
+func TestRecordSuccessDecaysFailures(t *testing.T) {
 	l := newAuthLimiter()
 
+	// 8 failures -> success halves to 4 -> 5 more failures reach 9, still below
+	// the limit; the 6th reaches 10 and locks the address out.
+	for i := 0; i < 8; i++ {
+		l.recordFailure("1.2.3.4", limiterT0)
+	}
+	l.recordSuccess("1.2.3.4")
+
+	t1 := limiterT0.Add(time.Minute)
+	for i := 0; i < 5; i++ {
+		l.recordFailure("1.2.3.4", t1)
+	}
+	if ok, _ := l.allowed("1.2.3.4", t1); !ok {
+		t.Fatal("9 decayed failures should not lock the address out")
+	}
+	l.recordFailure("1.2.3.4", t1)
+	if ok, _ := l.allowed("1.2.3.4", t1); ok {
+		t.Error("the 10th failure after the decay must lock the address out -- " +
+			"a full wipe would never reach this point under an interleaved attack")
+	}
+}
+
+// Sustained brute force from a shared IP must still lock out even with a legit
+// success after every burst: each success only halves the count, so bursts
+// larger than the residual keep accumulating.
+func TestSustainedBruteForceLocksOutDespiteSuccesses(t *testing.T) {
+	l := newAuthLimiter()
+
+	// First burst: one below the limit, then a legit success (halves to 4).
 	for i := 0; i < authMaxFailures-1; i++ {
+		l.recordFailure("1.2.3.4", limiterT0)
+	}
+	l.recordSuccess("1.2.3.4")
+
+	// Second identical burst: the residual carries over, so it locks out well
+	// before the burst ends. With wipe-on-success semantics this loop could
+	// repeat forever without ever locking out.
+	t1 := limiterT0.Add(time.Minute)
+	for i := 0; i < authMaxFailures-1; i++ {
+		l.recordFailure("1.2.3.4", t1)
+	}
+	if ok, _ := l.allowed("1.2.3.4", t1); ok {
+		t.Error("a second full burst after one success must lock the address out")
+	}
+}
+
+// Below the forgive floor the residue is noise (a typo or two), so a success
+// clears it entirely -- a legit caller is not permanently dogged by old slips.
+func TestRecordSuccessForgivesBelowTheFloor(t *testing.T) {
+	l := newAuthLimiter()
+
+	for i := 0; i < 3; i++ {
 		l.recordFailure("1.2.3.4", limiterT0)
 	}
 	l.recordSuccess("1.2.3.4")
@@ -63,6 +113,6 @@ func TestRecordSuccessClearsFailures(t *testing.T) {
 		l.recordFailure("1.2.3.4", limiterT0.Add(time.Minute))
 	}
 	if ok, _ := l.allowed("1.2.3.4", limiterT0.Add(time.Minute)); !ok {
-		t.Error("failures before a success should not count towards the limit")
+		t.Error("three forgiven failures must not count towards the limit")
 	}
 }

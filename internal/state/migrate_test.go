@@ -138,6 +138,65 @@ func TestStateFileIsNotWorldReadable(t *testing.T) {
 	}
 }
 
+// The create/migrate window must run under a restrictive umask and, just as
+// importantly, give the old one back: SQLite derives -wal/-shm permissions from the
+// process umask, and those files are copies of the private keys. If Open forgot to
+// restore it, every file the caller creates afterwards would silently come out
+// owner-only -- so the restored umask is the observable proof the window is scoped.
+func TestOpenRestoresTheProcessUmask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no umask semantics on Windows")
+	}
+
+	old := setUmask(0o022)
+	defer setUmask(old)
+
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer s.Close()
+
+	// Setting 022 again reports the umask Open left behind; it must be 022, not 077.
+	if left := setUmask(0o022); left != 0o022 {
+		t.Errorf("Open left the process umask at %o, want it restored to 022", left)
+	}
+}
+
+// The wrapper itself: a file born inside the window gets no group/other bits even
+// when the creating call asks for 0666 and the process umask masks nothing, and the
+// previous umask comes back afterwards.
+func TestRestrictiveUmaskScopesFileCreation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no umask semantics on Windows")
+	}
+
+	old := setUmask(0)
+	defer setUmask(old)
+
+	restore := restrictiveUmask()
+	p := filepath.Join(t.TempDir(), "born-inside.txt")
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0o666)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restore()
+
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("a file born under restrictiveUmask has mode %o: group/other can access it", perm)
+	}
+	if left := setUmask(0); left != 0 {
+		t.Errorf("restrictiveUmask did not restore the umask: left at %o, want 0", left)
+	}
+}
+
 // A missing parent directory should be created automatically rather than throwing an
 // obscure SQLite error.
 // Non-systemd deployments (running -once by hand, e2e scripts) take this path.

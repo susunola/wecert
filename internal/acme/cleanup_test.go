@@ -28,8 +28,11 @@ type fakeSolver struct {
 	// is still up in DNS", which the idempotent-present and orphan-reclaim paths act on.
 	lookupFound bool
 	lookupErr   error
-	cleaned     []string // "identifier|keyAuth"
-	cleanErr    error
+	// waitErr scripts a WaitAll failure ("the records never confirmed propagated"),
+	// which is what the resumed-row re-verification path in solveChallenges reacts to.
+	waitErr  error
+	cleaned  []string // "identifier|keyAuth"
+	cleanErr error
 }
 
 func (f *fakeSolver) Present(_ context.Context, domain, token, keyAuth string) (DNSRecord, error) {
@@ -41,7 +44,7 @@ func (f *fakeSolver) Present(_ context.Context, domain, token, keyAuth string) (
 	return rec, nil
 }
 
-func (f *fakeSolver) WaitAll(context.Context, []DNSRecord) error { return nil }
+func (f *fakeSolver) WaitAll(context.Context, []DNSRecord) error { return f.waitErr }
 
 func (f *fakeSolver) CleanUp(_ context.Context, domain, token, keyAuth string) error {
 	f.mu.Lock()
@@ -227,7 +230,10 @@ func TestCleanupOrphanTXTDoesNotTouchDNSForUnpresented(t *testing.T) {
 }
 
 // A failed cleanup must not block discarding the order -- getting stuck on an order that
-// can never finalize is far worse than one leftover TXT; drop the rows to avoid endless retries.
+// can never finalize is far worse than one leftover TXT. The order goes away, but the
+// authorization rows whose records could not be reclaimed are **kept**: they carry the
+// only clue (token, TxtName) to the record's value, and cleanupOrphanTXT retries them on
+// the next round.
 func TestDiscardOrderProceedsEvenIfCleanupFails(t *testing.T) {
 	solver := &fakeSolver{cleanErr: errors.New("DNSPod is down")}
 	m, store := newTestManager(t, solver, fakeKeyAuth{})
@@ -243,6 +249,19 @@ func TestDiscardOrderProceedsEvenIfCleanupFails(t *testing.T) {
 	}
 	if o, _ := store.GetOrder("c"); o != nil {
 		t.Error("the order should have been discarded")
+	}
+
+	// The row behind the failed cleanup must survive, still Presented=true: dropping it
+	// would orphan the record for good, because the row is the only clue to its value.
+	as, err := store.ListAuthorizations("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(as) != 1 {
+		t.Fatalf("the row of an unreclaimed TXT must be kept for the next round, %d remain", len(as))
+	}
+	if !as[0].Presented {
+		t.Error("the kept row must stay Presented, otherwise the next round cannot locate the record")
 	}
 }
 

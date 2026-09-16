@@ -145,7 +145,8 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 	// Register the lease under the same per-name lock that CleanUp holds across its
 	// delete call, so a cleanup can never slip a delete-all in between "this name has no
 	// live values" and the write landing. See challengeLeases.
-	mu := challengeLeases.lock(rec.FQDN)
+	mu, release := challengeLeases.lock(rec.FQDN)
+	defer release()
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -447,24 +448,59 @@ func probeReady(servers []string, fqdn, want string) (bool, string) {
 // and its delete-all, and the fresh record would die with the rest.
 var challengeLeases = newTXTLeases()
 
-type txtLeases struct {
-	// guards both maps; the per-name mutexes below order the provider calls
+// txtLease is one challenge name's slot: the mutex that orders the provider calls at
+// the name, the values currently live there, and a count of goroutines that hold (or
+// are about to lock) the mutex.
+type txtLease struct {
 	mu     sync.Mutex
-	locks  map[string]*sync.Mutex
-	values map[string]map[string]bool
+	refs   int
+	values map[string]bool
+}
+
+type txtLeases struct {
+	// guards entries; the per-name mutexes inside order the provider calls
+	mu      sync.Mutex
+	entries map[string]*txtLease
 }
 
 func newTXTLeases() *txtLeases {
-	return &txtLeases{locks: map[string]*sync.Mutex{}, values: map[string]map[string]bool{}}
+	return &txtLeases{entries: map[string]*txtLease{}}
 }
 
-func (l *txtLeases) lock(fqdn string) *sync.Mutex {
+// lock returns the per-name mutex plus a release function; every caller must hold the
+// mutex across its provider call and run release afterwards.
+//
+// The reference count is taken under l.mu **before** the caller locks the per-name
+// mutex, and that is what makes pruning safe: an entry is dropped (in release) only once
+// no goroutine references it, so nobody can be between "got the mutex pointer" and
+// "locked it" when the entry disappears. Pruning without the count would open exactly
+// that window -- the name gets re-created under a **different** mutex while the old one
+// is still in use, and two goroutines then run their provider calls concurrently at the
+// same name, which is the race the mutex exists to prevent.
+func (l *txtLeases) lock(fqdn string) (*sync.Mutex, func()) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.locks[fqdn] == nil {
-		l.locks[fqdn] = &sync.Mutex{}
+	e := l.entries[fqdn]
+	if e == nil {
+		e = &txtLease{values: map[string]bool{}}
+		l.entries[fqdn] = e
 	}
-	return l.locks[fqdn]
+	e.refs++
+	l.mu.Unlock()
+
+	var once sync.Once
+	return &e.mu, func() {
+		once.Do(func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			e.refs--
+			if e.refs == 0 && len(e.values) == 0 {
+				// Nothing live at the name and nobody using the mutex: drop the entry,
+				// so a long-running process does not accumulate one mutex per FQDN
+				// forever.
+				delete(l.entries, fqdn)
+			}
+		})
+	}
 }
 
 // add records that this process relies on the value staying in DNS. Set semantics: a
@@ -473,23 +509,30 @@ func (l *txtLeases) lock(fqdn string) *sync.Mutex {
 func (l *txtLeases) add(fqdn, value string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.values[fqdn] == nil {
-		l.values[fqdn] = map[string]bool{}
+	e := l.entries[fqdn]
+	if e == nil {
+		e = &txtLease{values: map[string]bool{}}
+		l.entries[fqdn] = e
 	}
-	l.values[fqdn][value] = true
+	e.values[value] = true
 }
 
 // remove drops one lease and reports whether any other value is still live at the name.
+//
+// It deliberately does **not** drop the entry itself, even when the last value goes:
+// the caller still holds the per-name mutex across its provider call, and dropping the
+// entry here would let a concurrent Present re-create the name under a different mutex
+// and sneak its write in between this CleanUp's "no live values" check and its
+// delete-all. Pruning is the release function's job (see lock).
 func (l *txtLeases) remove(fqdn, value string) (othersLive bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	values := l.values[fqdn]
-	delete(values, value)
-	if len(values) == 0 {
-		delete(l.values, fqdn)
+	e := l.entries[fqdn]
+	if e == nil {
 		return false
 	}
-	return true
+	delete(e.values, value)
+	return len(e.values) > 0
 }
 
 // CleanUp deletes the TXT record this call wrote -- or defers doing so.
@@ -506,7 +549,8 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 	fqdn := dns01.ToFqdn(info.EffectiveFQDN)
 
-	mu := challengeLeases.lock(fqdn)
+	mu, release := challengeLeases.lock(fqdn)
+	defer release()
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -523,14 +567,21 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	return provider.CleanUp(domain, token, keyAuth)
 }
 
-// LookupTXT reports whether this challenge's TXT record is currently visible through the
-// configured recursive resolvers, returning the record's identity either way so callers
-// can persist it.
+// LookupTXT reports whether this challenge's TXT record is currently in DNS, returning
+// the record's identity either way so callers can persist it.
 //
 // It backs the two crash-recovery probes: a pass that died between the DNS write and the
 // state persist left the record up while the authorization row denies it -- re-Present
 // would duplicate the record, and deleting the row would orphan it. A positive answer
 // lets both paths reconcile instead.
+//
+// The recursive resolvers are only a fast path, and only for **positive** answers: a
+// resolver cannot invent a TXT it was never told, but it can keep serving a cached
+// NXDOMAIN from before the write for the whole SOA negative TTL (~600s on DNSPod).
+// Trusting that negative answer is fatal here: cleanupOrphanTXT would delete the state
+// row -- the only clue to the record's value -- while the TXT itself lives on in DNSPod
+// forever. So a negative (or failed) recursive answer is confirmed against the zone's
+// authoritative nameservers, the same source of truth WaitAll already uses.
 func (s *DNSSolver) LookupTXT(ctx context.Context, domain, keyAuth string) (DNSRecord, bool, error) {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 	rec := DNSRecord{
@@ -541,11 +592,57 @@ func (s *DNSSolver) LookupTXT(ctx context.Context, domain, keyAuth string) (DNSR
 	msg := new(dns.Msg)
 	msg.SetQuestion(rec.FQDN, dns.TypeTXT)
 	msg.RecursionDesired = true
-	resp, err := s.queryRecursive(ctx, msg)
-	if err != nil {
-		return rec, false, err
+	if resp, err := s.queryRecursive(ctx, msg); err == nil && responseHasTXT(resp, rec.Value) {
+		return rec, true, nil
 	}
-	return rec, responseHasTXT(resp, rec.Value), nil
+
+	found, err := s.lookupTXTAuthoritative(ctx, rec)
+	return rec, found, err
+}
+
+// lookupTXTAuthoritative decides "is this record really absent" by asking the zone's
+// authoritative nameservers directly -- the one question a cached NXDOMAIN on a
+// recursive resolver cannot answer (see LookupTXT).
+//
+// The contract is exactly what the crash-recovery callers need:
+//   - any authority returns the value           -> the record is there (true)
+//   - authorities answer and none has the value -> authoritative denial: truly absent
+//     (false, nil); NXDOMAIN and NODATA both count, both are the source of truth
+//     saying "not here"
+//   - nothing authoritative answers at all      -> fate unknown (error, and the callers
+//     treat any error as "keep the row")
+func (s *DNSSolver) lookupTXTAuthoritative(ctx context.Context, rec DNSRecord) (bool, error) {
+	zone, err := s.findZone(ctx, rec.FQDN)
+	if err != nil {
+		return false, err
+	}
+	servers, err := s.authoritativeNS(ctx, zone)
+	if err != nil {
+		return false, err
+	}
+
+	probes := probeTXTWithExchange(servers, rec.FQDN, rec.Value, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		return s.exchange(pctx, msg, server)
+	})
+
+	denied := 0
+	for _, p := range probes {
+		switch {
+		case p.err != nil || !p.authoritative:
+			// Unreachable or non-authoritative: says nothing either way.
+		case p.hasValue:
+			// One authority holding the value is proof enough -- it cannot invent it.
+			return true, nil
+		default:
+			denied++
+		}
+	}
+	if denied == 0 {
+		return false, fmt.Errorf("no authoritative answer for %s from any of %d nameservers", rec.FQDN, len(servers))
+	}
+	return false, nil
 }
 
 func (s *DNSSolver) findZone(ctx context.Context, fqdn string) (string, error) {
