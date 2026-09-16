@@ -100,7 +100,7 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		return m.recordFailure(st, err)
 	}
 
-	order, err := m.core.Orders.NewWithOptions(c.Domains, &api.OrderOptions{
+	order, err := m.core.NewOrder(c.Domains, &api.OrderOptions{
 		Profile:        c.Profile,
 		ReplacesCertID: replaces,
 	})
