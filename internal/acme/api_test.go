@@ -86,6 +86,10 @@ type fakeAPI struct {
 	// assert not only what was sent but that it was retried without it.
 	newOrderReplaces []string
 
+	// revoked records RevokeCertificate calls, and revokeErr makes the next ones fail.
+	revoked   []revokedCall
+	revokeErr error
+
 	// getOrderErr, when set, makes every GetOrder fail. It models an order URL that the CA
 	// will never serve again (a purged order, or a different ACME directory).
 	getOrderErr error
@@ -353,6 +357,24 @@ func (f *fakeAPI) issueForCSR() []byte {
 
 // GetRenewalInfo errors by default: ARI is optional, and an unscripted ARI call usually
 // means the test's throttling is wrong. Failing loudly is easier to debug than an empty response.
+// revoked records every RevokeCertificate call, so a test can assert that a revocation was
+// attempted, with which reason, and how many times.
+func (f *fakeAPI) RevokeCertificate(der []byte, reason int) error {
+	f.enter("RevokeCertificate")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revoked = append(f.revoked, revokedCall{Reason: reason, DERLen: len(der)})
+	if f.revokeErr != nil {
+		return f.revokeErr
+	}
+	return nil
+}
+
+type revokedCall struct {
+	Reason int
+	DERLen int
+}
+
 func (f *fakeAPI) GetRenewalInfo(string) (*http.Response, error) {
 	f.enter("GetRenewalInfo")
 	f.mu.Lock()

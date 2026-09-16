@@ -53,12 +53,20 @@ func run() error {
 		logLevel   = flag.String("log-level", "info", "log level: debug|info|warn|error")
 		dryRun     = flag.Bool("dry-run", false, "validate the config and initialise the account only; issue and deploy nothing")
 		showVer    = flag.Bool("version", false, "print the version and exit")
+		revokeCert = flag.String("revoke", "", "ask the CA to revoke this certificate and exit (see also -yes)")
+		revokeWhy  = flag.String("revoke-reason", "unspecified",
+			"revocation reason: unspecified|keyCompromise|affiliationChanged|superseded|cessationOfOperation")
+		yesFlag = flag.Bool("yes", false, "with -revoke: skip the interactive confirmation")
 	)
 	flag.Parse()
 
 	if *showVer {
 		fmt.Println("wecert", version)
 		return nil
+	}
+
+	if *revokeCert != "" {
+		return runRevoke(*configPath, *statePath, *revokeCert, *revokeWhy, *yesFlag)
 	}
 
 	log := newLogger(*logLevel)

@@ -49,6 +49,11 @@ type fakeManager struct {
 	// quotaScopes records every PublishQuota call.
 	quotaScopes []map[string]string
 
+	// pendingRevocations drives HasPendingRevocations, and revocationRetries counts the
+	// retry calls, so a test can assert the gate is honoured.
+	pendingRevocations int
+	revocationRetries  int
+
 	// onReconcile fires on every Reconcile, so tests can cancel and so on.
 	onReconcile func(name string)
 
@@ -86,6 +91,18 @@ func (f *fakeManager) orphanCleaned() []string {
 
 // PublishQuota records the scopes it was asked about, so a test can assert the loop reports
 // quota at all without depending on the metric registry.
+func (f *fakeManager) HasPendingRevocations() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pendingRevocations > 0
+}
+
+func (f *fakeManager) RetryPendingRevocations(context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revocationRetries++
+}
+
 func (f *fakeManager) PublishQuota(scopes map[string]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1330,4 +1347,49 @@ func counterValue(t *testing.T, metric string, labels map[string]string) float64
 		}
 	}
 	return 0
+}
+
+// Outstanding revocations must be retried on every pass, and the gate must be honoured.
+//
+// Revocation is unbounded in time: a request recorded because a key leaked has to keep being
+// attempted until the CA accepts it, across restarts and CA outages. The gate exists because
+// this runs on every pass and almost every deployment has nothing outstanding.
+func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: "kept"})
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: "kept"}}}
+	mgr := &fakeManager{}
+	r := New(cfg, prov, store, mgr, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// Nothing outstanding: the pass must not even ask the manager to retry.
+	r.RunAll(context.Background())
+	if mgr.revocationRetries != 0 {
+		t.Errorf("with nothing outstanding the pass must skip the retry entirely, got %d calls",
+			mgr.revocationRetries)
+	}
+
+	// Something outstanding: every pass retries it, so a CA that was briefly unavailable does
+	// not leave a compromised certificate alive.
+	mgr.mu.Lock()
+	mgr.pendingRevocations = 1
+	mgr.mu.Unlock()
+
+	r.RunAll(context.Background())
+	if mgr.revocationRetries != 1 {
+		t.Errorf("an outstanding revocation must be retried on the pass, got %d calls",
+			mgr.revocationRetries)
+	}
+
+	r.RunAll(context.Background())
+	if mgr.revocationRetries != 2 {
+		t.Errorf("it must be retried on every pass until it succeeds, got %d calls",
+			mgr.revocationRetries)
+	}
 }
