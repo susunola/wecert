@@ -643,11 +643,41 @@ func (r *run) fuse() {
 		return
 	}
 
+	// A drop the written document already reflects is not upstream data loss: if
+	// every name the previous document covers is still declared, acting on this
+	// round cannot strip anything the document serves. That is exactly the
+	// situation a -force round leaves behind when it wrote the document but crashed
+	// before the state save -- the baseline simply lagged reality. Refresh the
+	// baseline from this round's declarations and let the round proceed: freezing
+	// here wedges, because frozen rounds never persist state, so every unforced
+	// retry would re-trip on the same drop until someone passed -force again.
+	if r.prev != nil && r.documentReflects(now) {
+		r.st.SetLastDeclared(r.declaredNames())
+		r.o.log.Warn("the written document already reflects this declaration set, so the fuse's "+
+			"baseline was stale (a previous round's state save was lost); refreshing the baseline instead of freezing",
+			"baseline", len(prev), "declared", len(now))
+		return
+	}
+
 	r.freeze(fmt.Sprintf(
 		"the declared name set dropped from %d to %d (%.0f%%, threshold %.0f%%): "+
 			"this is almost always an upstream failure rather than a real decommission, "+
 			"so nothing was changed; pass -force if the drop is intentional",
 		len(prev), len(now), ratio*100, r.o.opts.DropThreshold*100))
+}
+
+// documentReflects reports whether every name the previous document covers is in
+// the given declaration set -- i.e. acting on these declarations cannot remove any
+// name the document currently serves.
+func (r *run) documentReflects(declared map[string]bool) bool {
+	for _, c := range r.prev.Certificates {
+		for _, n := range c.Domains {
+			if !declared[n] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // resolve applies the allowlist, guard 1 and the deletion grace period to obtain
@@ -997,7 +1027,26 @@ func (r *run) budget() {
 		prevRev = r.prev.Revision
 	}
 	changed := rev != r.st.LastRevision && rev != prevRev
+
+	// The other direction of the same crash window also counts: the document
+	// carries a revision the state never recorded, and this round recomputed the
+	// state's revision -- a revert X -> Y -> X where Y's state save was lost. The
+	// rewrite is a real name-set change wecert will act on, so it must spend budget
+	// like any other; calling it "unchanged" would let a revert escape accounting.
+	if !changed && prevRev != "" && rev != prevRev {
+		changed = true
+	}
+
 	if !changed {
+		// In the already-written case (the document carries this revision but the
+		// state does not) the state's fuse baseline lags what is actually on disk,
+		// typically because a -force round's state save was lost. Refresh
+		// LastDeclared from this round's declarations before calling the round
+		// unchanged: the fuse must judge later rounds against reality, not against
+		// the pre-force baseline. Commit persists the state on unchanged rounds too.
+		if rev != r.st.LastRevision {
+			r.st.SetLastDeclared(r.declaredNames())
+		}
 		r.rep.Mode = ModeUnchanged
 		return
 	}
@@ -1020,6 +1069,16 @@ func (r *run) budget() {
 	r.st.RecordChange(r.now)
 }
 
+// declaredNames returns this round's expanded declaration set -- what DNS actually
+// asked for, before guards, grace carries and grouping.
+func (r *run) declaredNames() []string {
+	declared := make([]string, 0, len(r.declarations)*2)
+	for _, d := range r.declarations {
+		declared = append(declared, d.Names()...)
+	}
+	return declared
+}
+
 // assemble builds the document and state.
 func (r *run) assemble() {
 	names := make([]string, 0, len(r.eligible))
@@ -1036,11 +1095,7 @@ func (r *run) assemble() {
 	// The fuse's baseline is the pure declaration set, kept apart from LastNames
 	// on purpose -- see State.LastDeclared for why comparing against the covered
 	// set wedges a staged decommission.
-	declared := make([]string, 0, len(r.declarations)*2)
-	for _, d := range r.declarations {
-		declared = append(declared, d.Names()...)
-	}
-	r.st.SetLastDeclared(declared)
+	r.st.SetLastDeclared(r.declaredNames())
 
 	r.rep.Document = &spec.Document{
 		APIVersion:   spec.APIVersionV1,

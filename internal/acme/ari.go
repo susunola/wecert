@@ -34,7 +34,16 @@ func CertID(leaf *x509.Certificate) (string, error) {
 		return "", fmt.Errorf("certificate has no Authority Key Identifier; cannot build an ARI certID")
 	}
 	aki := base64.RawURLEncoding.EncodeToString(leaf.AuthorityKeyId)
-	serial := base64.RawURLEncoding.EncodeToString(leaf.SerialNumber.Bytes())
+	// RFC 9773 section 4.1 wants the serial **as its DER encoding appears in the
+	// certificate**: a positive INTEGER whose top bit is set carries a leading 0x00,
+	// or DER would read the value as negative. big.Int.Bytes() drops that byte, so a
+	// high-bit serial without it builds a certID the CA cannot match -- and the ARI
+	// lookup silently misses, losing the rate-limit exemption.
+	der := leaf.SerialNumber.Bytes()
+	if len(der) > 0 && der[0]&0x80 != 0 {
+		der = append([]byte{0x00}, der...)
+	}
+	serial := base64.RawURLEncoding.EncodeToString(der)
 	return aki + "." + serial, nil
 }
 

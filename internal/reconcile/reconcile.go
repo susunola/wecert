@@ -3,6 +3,8 @@ package reconcile
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,6 +28,19 @@ import (
 // per exact set of identifiers / 7 days" — and that limit has no override.
 var ErrAlreadyRunning = errors.New("this certificate already has a pass in flight")
 
+// ErrDesiredStateUnavailable means the desired state could not be read, so the
+// requested pass did not start.
+//
+// It is a sentinel because callers must tell it apart from "the name is not
+// managed": an unreadable source is transient and worth retrying, while an
+// unknown name will still be unknown next time. The webhook maps the former to
+// 503 and the latter to a plain "unknown" report -- collapsing them misreports
+// an outage as "we do not manage that certificate".
+var ErrDesiredStateUnavailable = errors.New("cannot read the desired state")
+
+// ErrUnknownCert means the requested name is not in the current desired state.
+var ErrUnknownCert = errors.New("no such certificate in the desired state")
+
 // Notifier is notified after each certificate finishes processing. May be nil.
 //
 // It lives on this layer rather than in the webhook layer so the "renewal
@@ -44,6 +59,12 @@ type Notifier interface {
 type CertManager interface {
 	Reconcile(ctx context.Context, c *config.Certificate) error
 	ReapRetired(ctx context.Context)
+	// CleanupOrphan reclaims the in-flight order and the challenge TXT records
+	// of a certificate that has left the desired state. It must exist on this
+	// interface rather than being optional: skipping it leaks _acme-challenge
+	// rows on DNSPod forever, and a stale value poisons every other certificate
+	// that shares the TXT name (a wildcard and its apex always do).
+	CleanupOrphan(ctx context.Context, certName string) error
 }
 
 // Reconciler converges the certificates in the current desired state one by one.
@@ -217,7 +238,7 @@ func (r *Reconciler) publishDesired(res *spec.Result) {
 // path already has a grace period and reference checks; this is the last safety
 // net — if something still slips through, at least it is visible before expiry
 // rather than only when a site fails a handshake.
-func (r *Reconciler) publishOrphans(res *spec.Result) {
+func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 	names, err := r.store.ListCertNames()
 	if err != nil {
 		r.log.Warn("cannot list certificate names for the orphan check", "err", err)
@@ -236,14 +257,38 @@ func (r *Reconciler) publishOrphans(res *spec.Result) {
 		}
 		orphans++
 
+		st, stErr := r.store.GetCert(name)
+
+		// Reclaim whatever an in-flight issuance left behind. Until now nothing
+		// ever tore down an order whose certificate left the desired state
+		// mid-flight: its challenge leases stayed on DNSPod forever, and a stale
+		// TXT value poisons every other certificate that writes the same
+		// _acme-challenge name (a wildcard and its apex always share one).
+		if err := r.manager.CleanupOrphan(ctx, name); err != nil {
+			r.log.Warn("failed to reclaim the orphaned order and its TXT records", "cert", name, "err", err)
+		}
+
 		// Reclaim the per-certificate series. Nothing else ever revisits a name that
 		// has left the desired state, so its gauges would sit at their last value
 		// forever -- and a not_after frozen at its last value trips the documented
 		// expiry rule permanently, for a certificate that no longer exists.
 		metrics.DeleteCertSeries(name)
 
+		// The probe side has the same leak, per host: the served-certificate series
+		// stay at their last value and the prober's transition memory grows with
+		// every host ever seen. The hosts are not in the desired state anymore, so
+		// they are recovered from the last issued certificate's SANs.
+		if stErr == nil && st != nil {
+			for _, host := range r.orphanProbeHosts(st) {
+				metrics.DeleteProbeSeries(host)
+				if r.prober != nil {
+					r.prober.Forget(host)
+				}
+			}
+		}
+
 		attrs := []any{"cert", name}
-		if st, err := r.store.GetCert(name); err == nil && st != nil && !st.NotAfter.IsZero() {
+		if stErr == nil && st != nil && !st.NotAfter.IsZero() {
 			attrs = append(attrs, "notAfter", st.NotAfter,
 				"daysLeft", int(time.Until(st.NotAfter).Hours()/24))
 		}
@@ -252,6 +297,29 @@ func (r *Reconciler) publishOrphans(res *spec.Result) {
 			attrs...)
 	}
 	metrics.OrphanedCertificates.Set(float64(orphans))
+}
+
+// orphanProbeHosts recovers the dialable names of a dropped certificate from the
+// SANs of the last certificate that was issued for it.
+//
+// The desired state no longer carries the domains, and the state store does not
+// persist them separately -- but the issued certificate does. A certificate that
+// was never issued was also never probed (probing requires a confirmed deploy),
+// so there is nothing to reclaim then.
+func (r *Reconciler) orphanProbeHosts(st *state.CertState) []string {
+	if len(st.CertPEM) == 0 {
+		return nil
+	}
+	block, _ := pem.Decode(st.CertPEM)
+	if block == nil {
+		return nil
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		r.log.Warn("cannot parse the stored certificate to reclaim its probe series", "cert", st.Name, "err", err)
+		return nil
+	}
+	return probeHosts(leaf.DNSNames, r.cfg.Probe.MaxHostsPerCert)
 }
 
 // ── Convergence ────────────────────────────────────────────────────────────────────
@@ -272,7 +340,7 @@ func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
 		r.manager.ReapRetired(ctx)
 		return nil
 	}
-	r.publishOrphans(res)
+	r.publishOrphans(ctx, res)
 
 	for i := range res.Certificates {
 		c := &res.Certificates[i]
@@ -310,11 +378,11 @@ func (r *Reconciler) RunOnce(ctx context.Context) {
 func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 	res := r.resolve(ctx)
 	if res == nil {
-		return fmt.Errorf("cannot read the desired state, so %q was not processed", name)
+		return fmt.Errorf("%w, so %q was not processed", ErrDesiredStateUnavailable, name)
 	}
 	found := res.Find(name)
 	if found == nil {
-		return fmt.Errorf("no certificate named %q in the desired state", name)
+		return fmt.Errorf("%w: %q", ErrUnknownCert, name)
 	}
 
 	if !r.acquire(name) {
@@ -359,6 +427,11 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		case r.startSlots <- struct{}{}:
 			defer func() { <-r.startSlots }()
 		case <-ctx.Done():
+			// The process is shutting down while this pass is still parked on a
+			// start slot. The caller was told "accepted", so say plainly that the
+			// pass will never run -- otherwise the 202 is indistinguishable from a
+			// pass that started and failed silently.
+			r.log.Debug("shutdown while waiting for a start slot; the queued pass will not run", "cert", c.Name)
 			return
 		}
 
@@ -370,40 +443,62 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 	res := r.resolve(ctx)
 	if res == nil {
-		return fmt.Errorf("cannot read the desired state, so %q was not processed", name)
+		return fmt.Errorf("%w, so %q was not processed", ErrDesiredStateUnavailable, name)
 	}
 	found := res.Find(name)
 	if found == nil {
-		return fmt.Errorf("no certificate named %q in the desired state", name)
+		return fmt.Errorf("%w: %q", ErrUnknownCert, name)
 	}
 	return r.startCert(ctx, res, found)
 }
 
 // StartAll processes every certificate asynchronously and synchronously returns
-// the skipped (already running) names.
-func (r *Reconciler) StartAll(ctx context.Context) []string {
+// which ones were accepted and which were skipped (already running).
+//
+// The accepted list comes from the same resolution the starts were made from --
+// not from a second, cached read -- so the two can never disagree about what was
+// just triggered. A resolve failure is an error, not an empty result: reporting
+// "accepted: all certificates" (from the last good cache) while nothing started
+// is exactly the lie this return value exists to prevent.
+func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, err error) {
 	res := r.resolve(ctx)
 	if res == nil {
-		return nil
+		return nil, nil, ErrDesiredStateUnavailable
 	}
 
-	var skipped []string
 	// Walk the resolved slice directly: looking each name up with Find over the same
 	// slice would make this O(n^2).
 	for i := range res.Certificates {
 		if err := r.startCert(ctx, res, &res.Certificates[i]); err != nil {
 			skipped = append(skipped, res.Certificates[i].Name)
+		} else {
+			accepted = append(accepted, res.Certificates[i].Name)
 		}
 	}
-	return skipped
+	return accepted, skipped, nil
 }
 
 // reconcileOne processes one certificate and mirrors the result into metrics
 // and notifications. The pass's error is returned for callers that need it
 // (RunCert); RunAll and startCert deliberately discard it -- one failing
 // certificate must not stall the others.
-func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) error {
-	err := r.manager.Reconcile(ctx, c)
+func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (err error) {
+	// A panic inside the manager must not be process-fatal: startCert runs this
+	// on a background goroutine, where an unrecovered panic takes down the whole
+	// daemon and every certificate's renewals with it. Count it, fail this pass,
+	// and let the rest of the fleet carry on.
+	defer func() {
+		if p := recover(); p != nil {
+			metrics.ReconcilePanics.WithLabelValues(c.Name).Inc()
+			metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
+			r.log.Error("the reconcile manager panicked; this pass failed but the process stays up "+
+				"(any nonzero wecert_reconcile_panics_total is a bug -- report it)",
+				"cert", c.Name, "panic", p)
+			err = fmt.Errorf("the reconcile manager panicked: %v", p)
+		}
+	}()
+
+	err = r.manager.Reconcile(ctx, c)
 	if err != nil {
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
 		// manager already logged and scheduled backoff; this is just a summary.

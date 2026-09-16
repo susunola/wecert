@@ -48,7 +48,11 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		// go through backoff).
 		err := fmt.Errorf("order became invalid: %v", order.Err())
 		if derr := m.discardOrder(ctx, c.Name); derr != nil {
-			return errors.Join(err, derr)
+			// The failure must still be recorded even when the discard itself failed:
+			// returning early here skips the backoff, and the next round would place a
+			// fresh order immediately -- burning exact-set quota, which the backoff
+			// exists precisely to prevent.
+			return m.recordFailure(st, errors.Join(err, derr))
 		}
 		return m.recordFailure(st, err)
 
@@ -170,6 +174,10 @@ func (m *Manager) solveChallenges(
 	// example.com + *.example.com both authorizations' challenge values land on
 	// _acme-challenge.example.com and have to exist at the same time.
 	var pending []*state.Authorization
+	// resumed collects the rows this pass did not write itself (Presented was already
+	// true on entry): their records are not re-verified anywhere except by WaitAll
+	// below, and the WaitAll error path needs to know who they are.
+	var resumed []*state.Authorization
 	var records []DNSRecord
 
 	for i, a := range authzs {
@@ -277,6 +285,11 @@ func (m *Manager) solveChallenges(
 				m.log.Info("TXT presented",
 					"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName)
 			}
+		} else {
+			// This pass writes nothing for the row: it resumed a record an earlier pass
+			// wrote. WaitAll below is the only remaining check that the record is
+			// actually still there.
+			resumed = append(resumed, a)
 		}
 
 		if err := m.store.PutAuthorization(a); err != nil {
@@ -297,6 +310,15 @@ func (m *Manager) solveChallenges(
 	// Phase 2: once every TXT is written, wait once for propagation to the authoritative NS.
 	// WaitAll deduplicates by zone internally and resolves each zone's NS list only once.
 	if err := m.dns.WaitAll(ctx, records); err != nil {
+		// A resumed row was never re-verified: if its record was deleted out of band,
+		// leaving Presented=true makes every round burn the whole propagation budget
+		// waiting for a record that will never appear, until the order expires. Flip it
+		// back so the next round probes and re-presents -- a record that is in fact
+		// still up is simply adopted by that probe, so a healthy DNS costs nothing.
+		// Skipped when the round was merely cancelled: a shutdown says nothing about DNS.
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			m.markResumedUnpresented(c.Name, resumed)
+		}
 		return false, m.recordFailure(st, fmt.Errorf("wait for TXT propagation: %w", err))
 	}
 
@@ -322,6 +344,23 @@ func (m *Manager) solveChallenges(
 	// Phase 5: only after every validation passes do we clean up the TXT records together.
 	m.cleanup(ctx, c.Name, pending)
 	return true, nil
+}
+
+// markResumedUnpresented flips resumed rows back to Presented=false after the
+// propagation wait failed, so the next round probes them again instead of trusting a
+// record that may no longer exist. A failed persist only loses one round: the row is
+// retried on the next pass.
+func (m *Manager) markResumedUnpresented(certName string, resumed []*state.Authorization) {
+	for _, a := range resumed {
+		a.Presented = false
+		if err := m.store.PutAuthorization(a); err != nil {
+			m.log.Warn("failed to mark a resumed authorization unpresented",
+				"cert", certName, "identifier", a.Identifier, "err", err)
+			continue
+		}
+		m.log.Info("the resumed TXT never confirmed propagated; it will be probed and re-presented next round",
+			"cert", certName, "identifier", a.Identifier, "name", a.TxtName)
+	}
 }
 
 func (m *Manager) loadAuthorizations(certName string, urls []string) ([]*state.Authorization, error) {

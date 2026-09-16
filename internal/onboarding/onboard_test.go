@@ -934,6 +934,147 @@ func TestThirdDeclarationForAConflictedHostnameIsRejectedToo(t *testing.T) {
 	}
 }
 
+// ── force + crash recovery ─────────────────────────────────────────────────
+
+// forced returns an onboarder over the same sources, paths and clock with Force on,
+// so a test can interleave forced and unforced rounds the way an operator would.
+func (h *harness) forced(t *testing.T) *Onboarder {
+	t.Helper()
+	opts := h.opts
+	opts.Force = true
+	ob, err := New(Sources{Declarations: h.decls, Rules: h.rules}, opts, testLogger())
+	if err != nil {
+		t.Fatalf("constructing the forced onboarder failed: %v", err)
+	}
+	return ob
+}
+
+// crashCommit writes only the document, simulating a crash between Commit's two
+// writes (the document goes first, the state second).
+func (h *harness) crashCommit(t *testing.T, rep *Report) {
+	t.Helper()
+	if err := spec.WriteDocument(h.opts.DocumentPath, rep.Document); err != nil {
+		t.Fatalf("writing the document failed: %v", err)
+	}
+}
+
+// A -force round that writes the document but crashes before the state save leaves
+// the fuse's baseline (LastDeclared) at the pre-force declarations. The unforced
+// retry then re-trips the fuse on the very same drop -- and since a frozen round
+// never persists state, every later retry freezes too, wedging until a human passes
+// -force again. The document on disk already reflects the drop, though, so the drop
+// is not upstream data loss: the retry must refresh the baseline and recover on its
+// own.
+func TestForceCrashUnforcedRetryDoesNotWedge(t *testing.T) {
+	h := newHarness(t, Options{}) // default threshold 0.30, grace 24h
+
+	h.decls.raw = []RawDeclaration{
+		decl("a.example.com"), decl("b.example.com"), decl("c.example.com"), decl("d.example.com"),
+	}
+	h.rules.domains = []string{"a.example.com", "b.example.com", "c.example.com", "d.example.com"}
+	h.run(t)
+
+	// A forced round drops to one name (75% -- would trip the fuse unforced), writes
+	// the document, and "crashes" before the state save.
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	rep, err := h.forced(t).Run(context.Background())
+	if err != nil {
+		t.Fatalf("forced Run failed: %v", err)
+	}
+	h.crashCommit(t, rep)
+
+	// The dropped names' rules are gone too, so the reference check may clear them.
+	h.rules.domains = []string{"a.example.com"}
+
+	// The unforced retry: the document already reflects the drop, so no freeze.
+	rep = h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("the unforced retry must not re-trip the fuse on a drop the document already carries: %v",
+			rep.FreezeReasons)
+	}
+
+	// The fuse's baseline caught up with this round's declarations.
+	st, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.LastDeclared; len(got) != 1 || got[0] != "a.example.com" {
+		t.Fatalf("the fuse baseline must catch up with the written document, got LastDeclared=%v", got)
+	}
+
+	// The crash also lost the absence ledger, so the grace period re-covers the
+	// dropped names for one cycle -- the conservative direction.
+	if got := h.domains(t); len(got) != 4 {
+		t.Fatalf("the grace period must re-cover the dropped names first, got %v", got)
+	}
+
+	// Past the grace period the drop lands on its own, with no second -force.
+	h.clock.advance(25 * time.Hour)
+	rep = h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("the round after the grace period must not freeze: %v", rep.FreezeReasons)
+	}
+	if got := h.domains(t); len(got) != 1 || got[0] != "a.example.com" {
+		t.Fatalf("the drop must land after the grace period without another -force, got %v", got)
+	}
+}
+
+// The other way past the same crash: the operator answers the frozen retry with
+// another -force. That round computes exactly the revision the document already
+// carries, so budget() calls it unchanged -- but it must still refresh the state's
+// declaration baseline, or the fuse keeps judging later rounds against the pre-force
+// set.
+func TestForceCrashForcedRetryHealsTheBaseline(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	h.decls.raw = []RawDeclaration{
+		decl("a.example.com"), decl("b.example.com"), decl("c.example.com"), decl("d.example.com"),
+	}
+	h.rules.domains = []string{"a.example.com", "b.example.com", "c.example.com", "d.example.com"}
+	h.run(t)
+
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	forced := h.forced(t)
+	rep, err := forced.Run(context.Background())
+	if err != nil {
+		t.Fatalf("forced Run failed: %v", err)
+	}
+	h.crashCommit(t, rep)
+
+	// The forced retry recomputes the revision the document already carries.
+	rep, err = forced.Run(context.Background())
+	if err != nil {
+		t.Fatalf("forced retry failed: %v", err)
+	}
+	if rep.Mode != ModeUnchanged {
+		t.Fatalf("the forced retry must see the document's revision as its own, got mode %s", rep.Mode)
+	}
+	if err := forced.Commit(rep); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	st, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.LastDeclared; len(got) != 1 || got[0] != "a.example.com" {
+		t.Errorf("the forced retry must refresh the declaration baseline, got LastDeclared=%v", got)
+	}
+	if st.LastRevision != rep.Revision {
+		t.Errorf("the state revision must catch up with the document: %s, want %s", st.LastRevision, rep.Revision)
+	}
+
+	// And the next unforced round runs clean: no fuse trip, no grace-revert churn.
+	h.rules.domains = []string{"a.example.com"}
+	rep = h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("the round after the forced retry must not freeze: %v", rep.FreezeReasons)
+	}
+	if got := h.domains(t); len(got) != 1 || got[0] != "a.example.com" {
+		t.Fatalf("the dropped names must stay dropped, got %v", got)
+	}
+}
+
 // Commit writes the document before the state. If the state save fails, the
 // document on disk already carries the new revision while the state still holds
 // the old one. The retry must recognise the document's revision as its own --
@@ -985,6 +1126,57 @@ func TestCommitStateSaveFailureDoesNotDoubleCountBudget(t *testing.T) {
 	}
 	if got := h.domains(t); len(got) != 2 {
 		t.Errorf("the document written before the failure must still cover both names, got %v", got)
+	}
+}
+
+// The other direction of the same failed-save window: the document carries a
+// revision the state never recorded, and the next round recomputes the *state's*
+// revision -- a revert X -> Y -> X. The rewrite is a real name-set change wecert
+// will act on, so it must spend budget like any other; recognising only "the
+// document already carries it" would let a revert escape accounting entirely.
+func TestRevertedWriteDoesNotEscapeTheBudget(t *testing.T) {
+	stateDir := t.TempDir()
+	h := newHarness(t, Options{StatePath: filepath.Join(stateDir, "onboard-state.json")})
+
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	h.rules.domains = []string{"a.example.com"}
+	h.run(t) // revision X committed; one change recorded
+
+	// Write revision Y ({a,b}) but lose the state save.
+	h.decls.raw = append(h.decls.raw, decl("b.example.com"))
+	h.rules.domains = append(h.rules.domains, "b.example.com")
+	if err := os.Chmod(stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if err := h.ob.Commit(rep); err == nil {
+		t.Fatal("the state save must fail in an unwritable directory")
+	}
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Revert to X: the document on disk says Y, the state says X, and this round
+	// computes X. That is a change, not an unchanged round.
+	h.decls.raw = h.decls.raw[:1]
+	h.rules.domains = h.rules.domains[:1]
+	rep = h.run(t)
+	if rep.Mode != ModeWritten {
+		t.Errorf("the revert must be counted as a change, got mode %s", rep.Mode)
+	}
+
+	st, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(st.Changes); got != 2 {
+		t.Errorf("the revert must spend budget: %d changes recorded, want 2 (the first write and the revert)", got)
+	}
+	if got := h.domains(t); len(got) != 1 || got[0] != "a.example.com" {
+		t.Errorf("the document must be rewritten back to X, got %v", got)
 	}
 }
 

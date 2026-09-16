@@ -37,12 +37,20 @@ var errBothForms = errors.New("cert and certs are mutually exclusive")
 // convergence the caller never asked for.
 var errEmptyCerts = errors.New("certs must not be empty; omit the body to process everything")
 
+// errEmptyCert rejects an explicit "cert": "". As a plain string it would be
+// indistinguishable from an absent field and widen into a full trigger -- the
+// same silent-widening problem as "certs": [].
+var errEmptyCert = errors.New("cert must not be empty; omit the body to process everything")
+
 // Reconciler is the convergence capability the webhook needs. Defined at the
 // consumer for easy test substitution.
 type Reconciler interface {
 	CertNames() []string
 	StartCert(ctx context.Context, name string) error
-	StartAll(ctx context.Context) []string
+	// StartAll reports the accepted names from the same resolution the starts
+	// were made from; a non-nil error means nothing started at all (the desired
+	// state is unreadable) and must not be reported as "accepted everything".
+	StartAll(ctx context.Context) (accepted, skipped []string, err error)
 }
 
 // DesiredReader is the capability the read-only diagnostic endpoint needs.
@@ -133,8 +141,10 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// A good token proves this address is the legitimate caller rather than
-		// the attacker hammering it, so forgive the accumulated failures.
+		// A good token is evidence this address also carries the legitimate
+		// caller, so the accumulated failures are decayed -- not wiped, or one
+		// interleaved success would forgive a shared-IP attacker indefinitely
+		// (see recordSuccess).
 		s.limiter.recordSuccess(addr)
 		next(w, r)
 	}
@@ -176,10 +186,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // reconcileRequest is the trigger request body. It may be omitted entirely — no
 // body means "process everything".
 //
-// Certs is a pointer so "field absent" (full trigger) is distinguishable from
-// an explicit "certs": [], which asks for nothing and is rejected.
+// Both fields are pointers so "field absent" (full trigger) is distinguishable
+// from an explicit empty value, which asks for nothing and is rejected.
 type reconcileRequest struct {
-	Cert  string    `json:"cert"`
+	Cert  *string   `json:"cert"`
 	Certs *[]string `json:"certs"`
 }
 
@@ -209,9 +219,18 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 
 	// No cert/certs means a full trigger.
 	if len(targets) == 0 && len(unknown) == 0 {
-		resp.Skipped = s.rec.StartAll(s.baseCtx)
-		resp.Accepted = s.rec.CertNames()
-		resp.Accepted = subtract(resp.Accepted, resp.Skipped)
+		accepted, skipped, err := s.rec.StartAll(s.baseCtx)
+		if err != nil {
+			// The desired state is unreadable, so nothing started. Answering 202
+			// with every certificate "accepted" (from the last good cache) would
+			// report a convergence that will never happen.
+			s.log.Warn("full trigger failed: the desired state is unreadable",
+				"err", err, "remote", r.RemoteAddr)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		resp.Accepted = accepted
+		resp.Skipped = skipped
 		s.log.Info("webhook triggered a full convergence",
 			"accepted", len(resp.Accepted), "skipped", len(resp.Skipped), "remote", r.RemoteAddr)
 	} else {
@@ -221,8 +240,17 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 				resp.Accepted = append(resp.Accepted, name)
 			case errors.Is(err, reconcile.ErrAlreadyRunning):
 				resp.Skipped = append(resp.Skipped, name)
-			default:
+			case errors.Is(err, reconcile.ErrUnknownCert):
 				resp.Unknown = append(resp.Unknown, name)
+			default:
+				// Anything else -- above all an unreadable desired state -- is a
+				// transient internal failure, not "not managed". Reporting it in
+				// unknown would tell the caller to give up on a certificate that
+				// may well exist and simply could not be resolved this time.
+				s.log.Warn("trigger failed: cannot resolve the desired state",
+					"cert", name, "err", err, "remote", r.RemoteAddr)
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				return
 			}
 		}
 		s.log.Info("webhook triggered convergence",
@@ -256,8 +284,11 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return req, err
 	}
-	if req.Cert != "" && req.Certs != nil && len(*req.Certs) > 0 {
+	if req.Cert != nil && *req.Cert != "" && req.Certs != nil && len(*req.Certs) > 0 {
 		return req, errBothForms
+	}
+	if req.Cert != nil && *req.Cert == "" {
+		return req, errEmptyCert
 	}
 	if req.Certs != nil && len(*req.Certs) == 0 {
 		return req, errEmptyCerts
@@ -273,13 +304,20 @@ func (s *Server) resolveTargets(req reconcileRequest) (targets, unknown []string
 	}
 
 	var wanted []string
-	if req.Cert != "" {
-		wanted = []string{req.Cert}
+	if req.Cert != nil {
+		wanted = []string{*req.Cert}
 	} else if req.Certs != nil {
 		wanted = *req.Certs
 	}
 
+	// Duplicates in the request would be started twice: the second start lands in
+	// "already running", so one name would show up as both accepted and skipped.
+	seen := make(map[string]struct{}, len(wanted))
 	for _, n := range wanted {
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
 		if _, ok := known[n]; ok {
 			targets = append(targets, n)
 		} else {
@@ -315,12 +353,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := s.now()
+	names := s.rec.CertNames()
 	out := struct {
 		Time         string       `json:"time"`
 		Certificates []certStatus `json:"certificates"`
 	}{Time: now.UTC().Format(time.RFC3339)}
 
-	for _, name := range s.rec.CertNames() {
+	// Preallocate so an empty certificate list serializes as [] rather than
+	// null -- clients that iterate the field treat null as "no answer".
+	out.Certificates = make([]certStatus, 0, len(names))
+
+	for _, name := range names {
 		st := certStatus{Name: name}
 
 		rec, err := s.store.GetCert(name)
@@ -455,21 +498,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
-}
-
-func subtract(all, remove []string) []string {
-	if len(remove) == 0 {
-		return all
-	}
-	drop := make(map[string]struct{}, len(remove))
-	for _, n := range remove {
-		drop[n] = struct{}{}
-	}
-	out := make([]string, 0, len(all))
-	for _, n := range all {
-		if _, ok := drop[n]; !ok {
-			out = append(out, n)
-		}
-	}
-	return out
 }
