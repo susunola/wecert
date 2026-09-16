@@ -368,11 +368,19 @@ Migrations run on `Open` and add missing columns in place (`PRAGMA table_info` +
 
 ## The certificate lifecycle
 
-Six diagrams covering the whole path, from "somebody added a line to a DNS zone" to "the old certificate is deleted from the cloud". They are also available as a single interactive page — with working links between the figures and a print/PDF button — at [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html); the images below are that same page rendered.
+Seven diagrams covering the whole path, from the problem this exists to solve through to "the old certificate is deleted from the cloud". They are also available as a single interactive page — with working links between the figures and a print/PDF button — at [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html); the images below are that same page rendered.
 
 Regenerate them with `make diagrams`. The **Chinese page is the source of truth**; the English page and both sets of images are generated from it through a translation table, and the build fails loudly if anything is left untranslated — so the two languages cannot drift apart silently.
 
 The build also *measures* every label in a real browser, in **both** languages, and refuses to render if any of them overflows its box or if two `<text>` labels collide. English runs longer than Chinese, so "fits in Chinese, overflows in English" is a real failure mode — the first run caught exactly that.
+
+### 0. The problem this solves
+
+![wecert's problem scenario: TLS terminates at the CLB and the business machines hold no certificate](docs/diagrams/en/00-the-problem.png)
+
+TLS terminates at the CLB and the business machines hold no certificate file at all, so the premise every conventional approach rests on does not hold here: certbot on each CVM has nowhere to put a certificate, cert-manager assumes Kubernetes and produces a Secret rather than a listener binding, and copying the file to each node only makes more copies of a private key that nothing reads.
+
+What makes it hard rather than merely awkward is the last row. ARI exempts renewals from every rate limit — but **only for a same-name renewal**, so changing the name set once burns one issuance. "Domains change all the time" is this project's premise, so every other design decision follows from making "add a domain" avoid producing a new issuance.
 
 ### 1. System map — who owns what, who only reads
 
