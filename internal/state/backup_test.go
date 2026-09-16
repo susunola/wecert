@@ -307,3 +307,109 @@ func TestOpenReportsAnUnwritableStateDirectory(t *testing.T) {
 		t.Errorf("the error should name the directory, got: %v", err)
 	}
 }
+
+// Two deployments sharing one backup directory must not delete each other's snapshots.
+//
+// Nothing refuses a shared stateBackup.dir -- it is a reasonable thing to configure, and the
+// config layer cannot see who else writes there -- so the snapshot name has to carry the
+// identity of the store that wrote it. It used to hardcode "state", which meant the two
+// stores produced byte-identical filenames and each one's retention pruned the other's
+// backups: the survivor was whichever happened to run last.
+func TestSnapshotsOfTwoStoresInOneDirectoryDoNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	backups := filepath.Join(dir, "backups")
+
+	open := func(name string) *Store {
+		t.Helper()
+		s, err := Open(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("Open(%s): %v", name, err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		if err := s.PutCert(&CertState{Name: "example-com", KeyPEM: []byte("KEY")}); err != nil {
+			t.Fatalf("PutCert: %v", err)
+		}
+		return s
+	}
+
+	first := open("state.db")
+	second := open("other.db")
+
+	// keep=1 each: with a shared name, the second store's prune deletes the first's only
+	// snapshot.
+	firstPath, err := first.Snapshot(backups, 1)
+	if err != nil {
+		t.Fatalf("first Snapshot: %v", err)
+	}
+	secondPath, err := second.Snapshot(backups, 1)
+	if err != nil {
+		t.Fatalf("second Snapshot: %v", err)
+	}
+
+	if firstPath == secondPath {
+		t.Fatalf("both stores wrote the same snapshot path %s; their retention will delete each other's backups", firstPath)
+	}
+	for _, p := range []string{firstPath, secondPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("snapshot %s was removed by the other store's retention: %v", p, err)
+		}
+	}
+
+	firstSeen, err := first.Snapshots(backups)
+	if err != nil {
+		t.Fatalf("first Snapshots: %v", err)
+	}
+	if len(firstSeen) != 1 || firstSeen[0] != firstPath {
+		t.Errorf("the first store must only ever see its own snapshots, got %v", firstSeen)
+	}
+	secondSeen, err := second.Snapshots(backups)
+	if err != nil {
+		t.Fatalf("second Snapshots: %v", err)
+	}
+	if len(secondSeen) != 1 || secondSeen[0] != secondPath {
+		t.Errorf("the second store must only ever see its own snapshots, got %v", secondSeen)
+	}
+}
+
+// A file wecert did not write must never be counted as a snapshot, because counting it means
+// pruning it.
+//
+// The matcher used to be "the name contains .backup- and ends in .db". An operator keeping
+// state.backup-before-upgrade.db in the same directory then had their own copy deleted --
+// it sorts before every real timestamp and pruning removes from the front -- while the
+// genuine newest snapshot was evicted in the same pass.
+func TestForeignFilesInTheBackupDirectoryAreLeftAlone(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	foreign := filepath.Join(backups, "state.backup-before-upgrade.db")
+	if err := os.WriteFile(foreign, []byte("an operator's own copy"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// A file for a DIFFERENT store in the same directory is also not ours to prune.
+	otherStore := filepath.Join(backups, "other.db.backup-20200101T000000.000Z.db")
+	if err := os.WriteFile(otherStore, []byte("someone else's snapshot"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := s.Snapshot(backups, 1); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	for _, p := range []string{foreign, otherStore} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s was pruned as though it were one of our snapshots: %v", filepath.Base(p), err)
+		}
+	}
+
+	seen, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatalf("Snapshots: %v", err)
+	}
+	if len(seen) != 1 {
+		t.Errorf("only our own snapshots may be listed, got %v", seen)
+	}
+}

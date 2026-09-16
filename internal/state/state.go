@@ -59,6 +59,15 @@ type Store struct {
 	// "5 certificates per exact set of identifiers / 7 days",
 	// a limit with no override: trip it and you wait the full 7 days.
 	lock *fileLock
+
+	// base is the state file's own name, used to prefix snapshot filenames.
+	//
+	// Snapshot names used to hardcode "state", so two deployments sharing one
+	// stateBackup.dir wrote and pruned the SAME files: each one's retention deleted the
+	// other's backups, and the survivor was whichever ran last. Nothing refuses a shared
+	// directory -- it is a reasonable thing to configure, and the config layer cannot see
+	// who else writes there -- so the name has to carry the identity.
+	base string
 }
 
 // ErrLocked means the state database is already held exclusively by another wecert
@@ -216,6 +225,24 @@ func open(path string, exclusive bool) (*Store, error) {
 		}
 	}
 
+	// Sample both facts BEFORE the lock is taken, not after.
+	//
+	// openFiles uses them for one purpose: "the database was here and now it is gone". A
+	// lock file beside a missing database is what that looks like, because some earlier run
+	// must have created one. acquireLock CREATES the lock file, so sampling it afterwards
+	// made lockExisted true on every single call -- including a brand-new deployment on an
+	// empty directory, which then printed the "a state database was probably deleted or
+	// lost ... stop and restore it" warning on its very first run. A warning that fires
+	// when nothing is wrong is worse than no warning, because it teaches the reader to
+	// ignore the one case that matters.
+	//
+	// Did the database itself exist before this call? Also asked before the pre-create
+	// below, because afterwards the answer is always yes.
+	_, statErr := os.Stat(path)
+	existedBefore := statErr == nil
+	_, lockStatErr := os.Stat(path + ".lock")
+	lockExisted := lockStatErr == nil
+
 	// The lock has to be taken before the database file is created: two processes
 	// initializing an empty database at once is harder to diagnose than two writing
 	// an existing one, because they each end up with a different table schema.
@@ -226,19 +253,6 @@ func open(path string, exclusive bool) (*Store, error) {
 			return nil, err
 		}
 	}
-
-	// Did a state database exist before this call? Asked before the pre-create below,
-	// because afterwards the answer is always yes.
-	//
-	// This is the only signal available for "the file vanished": a lock file beside it
-	// means some earlier run created one, and losing the database is the documented
-	// disaster (order URLs, ARI certIDs and the ACME account key all gone, so orders are
-	// re-placed straight into the exact-set rate limit). Starting a fresh one silently
-	// would be the wrong answer.
-	_, statErr := os.Stat(path)
-	existedBefore := statErr == nil
-	_, lockStatErr := os.Stat(path + ".lock")
-	lockExisted := lockStatErr == nil
 
 	s, err := openFiles(path, lock, existedBefore, lockExisted)
 	if err != nil {
@@ -315,7 +329,7 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted bool) (*S
 			realPath, path, realPath)
 	}
 
-	s := &Store{db: db, lock: lock}
+	s := &Store{db: db, lock: lock, base: filepath.Base(path)}
 
 	// Verify the file is a usable database before anything writes to it.
 	//

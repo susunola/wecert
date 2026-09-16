@@ -21,7 +21,7 @@ import (
 // leaves nothing to roll back to.
 func (m *Manager) download(
 	ctx context.Context, c *config.Certificate, st *state.CertState,
-	o *state.Order, order legoacme.ExtendedOrder,
+	o *state.Order, order legoacme.ExtendedOrder, rd round,
 ) error {
 	if order.Certificate == "" {
 		return m.recordFailure(st, errors.New("the order is valid but has no certificate URL"))
@@ -201,7 +201,7 @@ func (m *Manager) download(
 	// The cost of keeping it is nil: the counter feeds the fallback trigger and the
 	// documented backoff, and both are things we want to stay alert while names are
 	// missing.
-	if m.fullSetRound {
+	if rd.fullSet {
 		st.ConsecutiveFailures = 0
 	}
 
@@ -248,11 +248,11 @@ func (m *Manager) download(
 	// applyFallback during the subset round that followed, so the evidence was gone exactly
 	// when it was needed and the next pass re-ordered the broken full set. Keying on what
 	// was actually ordered is the honest question.
-	if m.fullSetRound {
+	if rd.fullSet {
 		if cerr := m.store.ClearIdentifierFailures(c.Name); cerr != nil {
 			m.log.Warn("cannot clear the identifier failure ledger", "cert", c.Name, "err", cerr)
 		}
-	} else if m.degradedRound {
+	} else if rd.degraded {
 		m.log.Warn("issued the degraded name set; keeping the identifier failure ledger so the "+
 			"next pass does not immediately re-order the full set",
 			"cert", c.Name, "dropped", len(c.Domains))
