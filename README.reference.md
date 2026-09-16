@@ -851,6 +851,7 @@ Runs a full issuance against staging with a throwaway state database, refusing t
 
 **Outstanding:**
 
+- [ ] **Desired-state providers: issue when a domain is added, not only on expiry.** A domain added *somewhere* (DNS / CLB rules / an internal registry) should end up in a certificate automatically, safely. Design draft, including why "DNS ∩ CLB" is the right instinct but not the best architecture, the five safety invariants, and the rate-limit arithmetic: [docs/desired-state-providers.md](docs/desired-state-providers.md).
 - [ ] External black-box probe (dial 443 and check the effective `notAfter`)
 - [ ] Read the DNSPod token from a file or systemd `LoadCredential`, so it isn't plaintext in `config.yaml`
 - [ ] Switch to `profile: tlsserver` (45 days) and run a complete renewal cycle fully automatically
