@@ -25,7 +25,10 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "docs" / "certificate-lifecycle.html"
+SOURCES = [
+    ROOT / "docs" / "certificate-lifecycle.html",
+    ROOT / "docs" / "certificate-lifecycle.en.html",
+]
 
 CHROME_CANDIDATES = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -74,6 +77,31 @@ PROBE = """
       });
     }
   });
+  // <text> 没有盒子可比，所以换个判据：两两比外接框，压住了就是问题。
+  // 区域标题这类元素在英文下会变长，而它们不在 foreignObject 里 ——
+  // 不单独量的话，"英文标题挤在一起"永远没人发现。
+  var texts = Array.prototype.slice.call(document.querySelectorAll('svg text'));
+  texts.forEach(function (a, i) {
+    var ra = a.getBoundingClientRect();
+    if (ra.width === 0) { return; }
+    texts.forEach(function (b, j) {
+      if (j <= i) { return; }
+      var rb = b.getBoundingClientRect();
+      if (rb.width === 0) { return; }
+      var ox = Math.min(ra.right, rb.right) - Math.max(ra.left, rb.left);
+      var oy = Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top);
+      if (ox > 1 && oy > 1) {
+        var svg = a.closest('svg');
+        out.push({
+          svg: Array.prototype.indexOf.call(document.querySelectorAll('svg'), svg) + 1,
+          w: 0, h: 0, overTop: 0, overBottom: 0, overRight: Math.round(ox),
+          text: '<text> overlap: ' + (a.textContent || '').trim() +
+                '  ×  ' + (b.textContent || '').trim()
+        });
+      }
+    });
+  });
+
   document.title = 'FIT' + JSON.stringify(out) + 'END';
 })();
 </script>
@@ -90,12 +118,12 @@ def find_chrome() -> str:
     sys.exit("找不到 Chrome / Chromium。")
 
 
-def main() -> None:
-    if not SOURCE.exists():
-        sys.exit(f"找不到源文件 {SOURCE}")
+def check(chrome: str, source: Path, quiet: bool = False) -> int:
+    if not source.exists():
+        print(f"  {source.name}: 跳过（文件不存在）")
+        return 0
 
-    chrome = find_chrome()
-    html = SOURCE.read_text(encoding="utf-8")
+    html = source.read_text(encoding="utf-8")
     if "</body>" not in html:
         sys.exit("源文件结构变了：找不到 </body>，探针注入点失效")
 
@@ -121,11 +149,13 @@ def main() -> None:
                  "多半是页面脚本报错了。")
 
     bad = json.loads(m.group(1))
+    label = source.name
     if not bad:
-        print("✓ 所有 foreignObject 标签都在盒子里")
-        return
+        print(f"  ✓ {label}")
+        return 0
 
-    print(f"✗ {len(bad)} 处标签溢出盒子（超出量按 CSS px，图上还会按比例放大）:\n")
+    print(f"\n✗ {label}: {len(bad)} 处标签溢出盒子"
+          f"（超出量按 CSS px，图上还会按比例放大）:\n")
     for b in bad:
         bits = []
         if b["overTop"] > 0:
@@ -136,8 +166,19 @@ def main() -> None:
             bits.append(f"右溢 {b['overRight']}")
         print(f"  图{b['svg']}  盒 {b['w']}x{b['h']}  {', '.join(bits)}")
         print(f"        {b['text']}")
-    print()
-    sys.exit(1)
+    return 1
+
+
+def main() -> None:
+    chrome = find_chrome()
+    failed = 0
+    for src in SOURCES:
+        if check(chrome, src):
+            failed += 1
+    if failed:
+        print()
+        sys.exit(1)
+    print("\n✓ 所有 foreignObject 标签都在盒子里")
 
 
 if __name__ == "__main__":
