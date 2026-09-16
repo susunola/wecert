@@ -514,6 +514,9 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 	defer func() {
 		if p := recover(); p != nil {
 			metrics.ReconcilePanics.WithLabelValues(c.Name).Inc()
+			// The panic skipped the accounting below, so record the failed pass here --
+			// otherwise reconcile_total under-reports exactly the passes that went worst.
+			metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
 			r.log.Error("recovered from a panic: this certificate's pass was aborted, "+
 				"the other certificates are unaffected; this is a bug, please report it",
 				"cert", c.Name, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
