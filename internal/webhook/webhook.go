@@ -63,7 +63,15 @@ type Server struct {
 }
 
 // New builds the webhook server.
-func New(rec Reconciler, store *state.Store, token string, baseCtx context.Context, log *slog.Logger) *Server {
+//
+// The empty-token check is defence in depth, not redundancy with the config
+// layer: "Authorization: Bearer " would pass a constant-time compare against an
+// empty configured token, so the invariant "an authed endpoint always requires a
+// real token" must hold here rather than being outsourced to every caller.
+func New(rec Reconciler, store *state.Store, token string, baseCtx context.Context, log *slog.Logger) (*Server, error) {
+	if token == "" {
+		return nil, errors.New("webhook: token must not be empty")
+	}
 	return &Server{
 		rec:     rec,
 		store:   store,
@@ -71,7 +79,7 @@ func New(rec Reconciler, store *state.Store, token string, baseCtx context.Conte
 		baseCtx: baseCtx,
 		log:     log,
 		now:     time.Now,
-	}
+	}, nil
 }
 
 // Handler returns the routes.
