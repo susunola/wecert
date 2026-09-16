@@ -36,18 +36,14 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 	kept, dropped, reason := m.fallbackDomains(c, st)
 
 	if len(dropped) == 0 {
-		metrics.CertificateFallbackActive.WithLabelValues(c.Name).Set(0)
-		metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(0)
-
-		// This round uses the full set. If we were degraded before, we have recovered --
-		// that record exists for exactly one reason: to say "a certificate missing names
-		// is serving right now".
 		if fb, err := m.store.GetFallback(c.Name); err == nil && fb != nil {
-			m.log.Info("back on the full name set; clearing the fallback record",
-				"cert", c.Name, "wasDropping", fb.Dropped, "since", fb.Since)
-			if cerr := m.store.ClearFallback(c.Name); cerr != nil {
-				m.log.Warn("cannot clear the fallback record", "cert", c.Name, "err", cerr)
-			}
+			// Trying the full set is not recovery: it becomes recovery only after a
+			// full certificate is successfully issued and deployed.
+			metrics.CertificateFallbackActive.WithLabelValues(c.Name).Set(1)
+			metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(float64(len(fb.Dropped)))
+		} else {
+			metrics.CertificateFallbackActive.WithLabelValues(c.Name).Set(0)
+			metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(0)
 		}
 		// Throw away the stale ledger while we are here: those identifiers are no longer
 		// in the certificate, so their authorizations will never be attempted again and

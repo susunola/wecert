@@ -69,12 +69,16 @@ func TestMigrateAddsIdentifiersToLegacyDB(t *testing.T) {
 	if o.Identifiers != "" {
 		t.Errorf("Identifiers on a legacy order should be empty, got %q", o.Identifiers)
 	}
+	if o.DeploymentCertID != "" {
+		t.Errorf("DeploymentCertID on a legacy order should be empty, got %q", o.DeploymentCertID)
+	}
 	if string(o.KeyPEM) != "\xde\xad\xbe\xef" {
 		t.Errorf("private key not preserved: %x", o.KeyPEM)
 	}
 
 	// After the column is added, new values must write normally.
 	o.Identifiers = "a.example.com,b.example.com"
+	o.DeploymentCertID = "cert-uploaded-before-restart"
 	if err := s.PutOrder(o); err != nil {
 		t.Fatalf("write failed after the column was added: %v", err)
 	}
@@ -84,6 +88,9 @@ func TestMigrateAddsIdentifiersToLegacyDB(t *testing.T) {
 	}
 	if got.Identifiers != "a.example.com,b.example.com" {
 		t.Errorf("Identifiers round-trip failed: %q", got.Identifiers)
+	}
+	if got.DeploymentCertID != "cert-uploaded-before-restart" {
+		t.Errorf("DeploymentCertID round-trip failed: %q", got.DeploymentCertID)
 	}
 }
 

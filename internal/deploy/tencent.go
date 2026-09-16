@@ -166,16 +166,32 @@ var waitBetweenPolls = func(ctx context.Context, d time.Duration) error {
 // Deploy uploads the new certificate and, when an old one exists, one-click updates every
 // cloud resource bound to it.
 func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM, keyPEM []byte) (string, error) {
+	newID, err := d.Upload(ctx, certName, certPEM, keyPEM)
+	if err != nil {
+		return "", err
+	}
+	return d.DeployUploaded(ctx, certName, oldID, newID)
+}
+
+// Upload stores the certificate and returns its durable Tencent Cloud identity.
+func (d *TencentCLB) Upload(ctx context.Context, certName string, certPEM, keyPEM []byte) (string, error) {
 	client, err := d.client(ctx)
 	if err != nil {
 		return "", err
 	}
+	return d.upload(ctx, client, certName, certPEM, keyPEM)
+}
 
-	newID, err := d.upload(ctx, client, certName, certPEM, keyPEM)
+// DeployUploaded advances a previously uploaded certificate to its cloud binding.
+func (d *TencentCLB) DeployUploaded(ctx context.Context, certName, oldID, newID string) (string, error) {
+	client, err := d.client(ctx)
 	if err != nil {
-		return "", err
+		return newID, err
 	}
+	return d.deployUploaded(ctx, client, certName, oldID, newID)
+}
 
+func (d *TencentCLB) deployUploaded(ctx context.Context, client sslAPI, certName, oldID, newID string) (string, error) {
 	// First issuance: there is no "old certificate -> cloud resource" binding on the Tencent
 	// Cloud side to look up, so after upload a human has to bind it once in the CLB console.
 	// Every renewal after that is fully automatic.
@@ -187,28 +203,48 @@ func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM
 	// The caller must record it in the reclamation list, otherwise this certificate becomes a
 	// cloud orphan that occupies the account's uploaded-certificate quota forever.
 	if err := d.updateInstance(ctx, client, oldID, newID); err != nil {
-		// Before believing that nothing was switched, check whether the new certificate is
-		// already bound to something.
-		//
-		// This is the recovery path for a switch that happened but was not recorded. The
-		// shape is: the rebind went through (or an earlier attempt's did), so the *old*
-		// certificate has no bindings left, and every later round therefore fails the
-		// "nothing to switch" check no matter how many certificates we upload. Asking
-		// about the new certificate settles it directly: if anything is bound to it, the
-		// switch is done and the honest answer is success.
-		//
-		// It also heals deployments that were already stuck this way before the
-		// creation-time progress check was corrected, which no amount of fixing that check
-		// would rescue on its own.
-		if n, berr := d.bindingsWith(ctx, client, newID); berr == nil && n > 0 {
-			d.log.Warn("the one-click update reported nothing to switch, but the new certificate is already bound; "+
-				"treating the switch as done (this is the recovery path for a rebind that succeeded without being recorded)",
-				"oldCertId", oldID, "newCertId", newID, "boundResources", n)
-			return newID, nil
+		// Repair the historical wedge only when the old anchor is entirely gone. A
+		// non-zero new binding alone is not completion: a partially failed task has
+		// exactly that shape and must remain an error.
+		if n, nerr := d.bindingsWith(ctx, client, newID); nerr == nil && n > 0 {
+			if oldBindings, oerr := d.bindingsWith(ctx, client, oldID); oerr == nil && oldBindings == 0 {
+				return newID, nil
+			}
 		}
 		return newID, err
 	}
 	return newID, nil
+}
+
+// ResumeDeploy never uploads. It first observes whether the already-uploaded
+// certificate became live after the caller timed out; otherwise it resumes the
+// cloud-side update using that same certificate ID.
+func (d *TencentCLB) ResumeDeploy(ctx context.Context, certName, oldID, uploadedID string) (string, error) {
+	return d.DeployUploaded(ctx, certName, oldID, uploadedID)
+}
+
+func (d *LazyTencentCLB) ResumeDeploy(ctx context.Context, certName, oldID, uploadedID string) (string, error) {
+	inner, err := d.client()
+	if err != nil {
+		return uploadedID, err
+	}
+	return inner.ResumeDeploy(ctx, certName, oldID, uploadedID)
+}
+
+func (d *LazyTencentCLB) Upload(ctx context.Context, certName string, certPEM, keyPEM []byte) (string, error) {
+	inner, err := d.client()
+	if err != nil {
+		return "", err
+	}
+	return inner.Upload(ctx, certName, certPEM, keyPEM)
+}
+
+func (d *LazyTencentCLB) DeployUploaded(ctx context.Context, certName, oldID, uploadedID string) (string, error) {
+	inner, err := d.client()
+	if err != nil {
+		return uploadedID, err
+	}
+	return inner.DeployUploaded(ctx, certName, oldID, uploadedID)
 }
 
 func (d *TencentCLB) upload(ctx context.Context, client sslAPI, certName string, certPEM, keyPEM []byte) (string, error) {
