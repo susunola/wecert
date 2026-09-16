@@ -75,7 +75,10 @@ if [[ -z "${TENCENTCLOUD_SECRET_ID:-}" || -z "${TENCENTCLOUD_SECRET_KEY:-}" ]]; 
 	echo "Error: TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY are not set in ${CREDS}" >&2
 	exit 1
 fi
-echo "credentials: loaded (${TENCENTCLOUD_SECRET_ID:0:8}...)"
+# Do not echo a prefix of the SecretId. cmd/preflight dropped exactly this: it
+# panicked on a truncated variable, and putting part of a credential into terminal
+# history and CI logs buys nothing -- knowing it is loaded is the whole signal.
+echo "credentials: loaded"
 
 for bin in terraform sqlite3; do
 	command -v "${bin}" >/dev/null 2>&1 || { echo "Error: missing ${bin}" >&2; exit 1; }

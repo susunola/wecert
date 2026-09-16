@@ -137,7 +137,7 @@ Let's Encrypt 的速率限制里，最要命的不是那 100 个 SAN 上限，�
 
 ## 前置条件
 
-- **Go 1.26+**（`go.mod` 声明 `go 1.26.5`）。
+- **Go 1.26+**（`go.mod` 声明 `go 1.26.6`，这个补丁版修掉了 `govulncheck` 列出的标准库漏洞）。
 - **托管在 DNSPod 的域名** —— DNSPod 自有产品（`dnspod.cn`）或腾讯云 DNSPod 都可以。
 - **腾讯云账号**，且账号下有你要绑证书的 CLB 资源。
 - **凭证**，三者之一：
@@ -1151,7 +1151,8 @@ CI（`.github/workflows/ci.yml`）跑 `gofmt` + `vet` + `test -race` + 交叉编
 
 仓库里带了 `e2e-config.example.yaml`（单域名）和 `e2e-config-wildcard.yaml`
 （wildcard + apex，也就是共用同一个 `_acme-challenge` 名字的那种情况）。
-`e2e-test.sh` 默认读 `./e2e-config.yaml`，而它在 `.gitignore` 里 —— 先复制一份：
+`e2e-test.sh` 默认读 `./e2e-config.yaml`，`.gitignore` 把它和 `config.yaml` 一起挡住了 ——
+要提交的配置请保留 `*.example.yaml` / `e2e-config-*.yaml` 这类名字。先复制一份：
 
 ```bash
 make build tools

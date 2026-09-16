@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -169,13 +170,47 @@ func prepareProbe(ctx context.Context, host string, opts Options) (string, []str
 	return host, ips, opts, nil
 }
 
+// probeIPConcurrency caps how many of one host's addresses are dialled at once.
+//
+// Small on purpose: this bounds a single host's address list, not a fan-out over
+// hosts (that cap lives in the reconciler).
+const probeIPConcurrency = 8
+
 // probeIPs is ProbeAll's per-address work, separated so multi-address behavior
 // can be tested without depending on local DNS ordering.
+//
+// The addresses are dialled concurrently. In series, a single blackholed address
+// -- a dropped SYN, which is exactly what a security-group or route
+// misconfiguration looks like -- costs the full per-address budget before the next
+// address is even attempted. A host then spends len(ips) x Timeout, every probed
+// certificate waits its turn behind it, and the whole pass stretches by minutes.
 func probeIPs(ctx context.Context, host string, ips []string, opts Options) []Attempt {
-	attempts := make([]Attempt, 0, len(ips))
-	for _, ip := range ips {
-		attempts = append(attempts, probeIP(ctx, host, ip, opts))
+	attempts := make([]Attempt, len(ips))
+	if len(ips) == 0 {
+		return attempts
 	}
+
+	limit := probeIPConcurrency
+	if len(ips) < limit {
+		limit = len(ips)
+	}
+
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+
+	for i, ip := range ips {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			// Each goroutine writes only its own index; no overlap, so no lock is needed.
+			attempts[i] = probeIP(ctx, host, ip, opts)
+		}(i, ip)
+	}
+	wg.Wait()
+
 	return attempts
 }
 

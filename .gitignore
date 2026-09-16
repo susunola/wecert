@@ -12,6 +12,17 @@ coverage.out
 tfplan
 terraform.tfvars
 
+# Local config files. These are copies of the examples filled in with real values,
+# which means dns.loginToken (full record write over every zone in the account) and
+# tencent.secretId/secretKey. Only the committed examples -- config.example.yaml
+# and the e2e-config-*.yaml fixtures -- belong in the repository.
+#
+# Anchored to the repository root so the fixtures above can never be caught by
+# accident, whatever they are renamed to later.
+/config.yaml
+/e2e-config.yaml
+*.local.yaml
+
 # Local sandbox redirect for the Go caches (holds absolute paths, must not be committed)
 .goenv
 
