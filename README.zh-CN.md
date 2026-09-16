@@ -104,17 +104,55 @@ lego 高层的 `certificate.Obtain` 是刻意不用的：它在内部自己 `new
 
 所有设计都从一条纪律出发：**wecert 永远不推断。** 由另一个东西负责算出应该有什么、并把它写下来，wecert 只读那份文档做收敛。判断只推断一次、以 diff 的形式被 review，而证书生命周期保持稳定。
 
+### 1. 系统全景：谁拥有什么、谁只读什么
+
 ![wecert 系统全景：声明层、推断层、契约、执行层与外部服务](docs/diagrams/zh/01-system-map.png)
 
 从左到右是权限的传递：**意图**（人写，就是 `_wecert` TXT 记录）→ **推断**（`wecert-onboard`，可丢弃）→ **契约**（机器写的期望状态文档）→ **执行**（`wecert`，必须稳）→ **外部服务**。
 
 这么切分是关于失败模式的。如果让 wecert 自己去枚举 DNS 和 CLB，一次接口抖动返回空就可能被读成"这些域名都没了"，于是重签一张不含它们的证书 —— 线上立刻握手失败。中间插一份文档之后，来源故障的后果变成*期望状态不更新*，那是安全的。
 
+### 2. 意图 → 契约：推断侧流水线
+
+![wecert-onboard 流水线：枚举声明、解析与过滤、分组与覆盖、门禁、组装、原子写盘](docs/diagrams/zh/02-intent-to-contract.png)
+
+红色只挂在真正会冻结的地方。单条声明写错只排除那一条；某组超过 SAN 上限只保留该组上一版。**两者都不冻结整轮** —— 一个手误不该让所有证书停止更新。
+
+**通配符优先省下的是配额。** 声明了 `*.example.com` 之后，加 `foo.example.com` 的成本是 **0 次签发**，因为 SAN 集合根本不变；批量导入 50 个子域也是 0 次，而没有通配符时那会花掉整整一周的配额。但通配符不会被凭空造出来 —— 声明 `*.example.com` 意味着证书能对*任意*子域完成握手，那必须是一个显式的决定，不能由分组逻辑替人做。
+
+### 3. 收敛决策
+
+![wecert 每轮对每张证书做的五个有序判断](docs/diagrams/zh/03-reconcile-decisions.png)
+
+判断是**有序**的。第一个命中的分支决定这一轮做什么，全都不命中就是"什么都不做" —— 而那是绝大多数轮次的正常结果。
+
+三条不变量决定了这个顺序：每张证书最多一个在途订单、且 order URL 先落盘；续期一律 ARI 优先并带 `replaces`；通配符与顶点一起写、一起验、一起清。违反任何一条都会直接撞上 *5 certificates per exact set of identifiers / 7 days*，而那条限速没有 override。
+
+### 4. 订单状态机
+
+![ACME 订单状态机，以及每个状态对应 state.db 里哪几个字段](docs/diagrams/zh/04-order-state-machine.png)
+
+这个状态机的全部意义是**让进程随时可以被杀掉**。每个状态都在 `state.db` 里有对应字段，重启之后靠它们决定"接着跑"还是"重新下单"。
+
+order URL 必须在 `newOrder` 返回之后立刻落盘，在任何别的事情之前 —— 这就是崩溃安全的全部依赖。没有它，进程在 DNS 传播那几分钟里被杀掉就会再下一单，而那一单的 identifier 集合与前一单完全相同，直接撞上 exact-set 限速。
+
+### 5. DNS-01：通配符和顶点共用一个 TXT 名字
+
+![DNS-01 时序，展示"全写、全验、一起清"的形状](docs/diagrams/zh/05-dns01-sequence.png)
+
+`example.com` 和 `*.example.com` 的挑战记录都叫 `_acme-challenge.example.com` —— 同一个名字、两个值。按 identifier 逐个处理会在轮到另一个之前把值清掉或覆盖，所以必须是*全写 → 全验 → 一起清*。
+
+传播检查用 quorum 而不是"全部权威 NS 可达"：实测 9 个里总有 1 个不可达，要求全部可达会让验证永远通不过。
+
+### 6. 一张证书的一生
+
 ![证书生命周期时间轴：首次签发、部署、ARI 窗口、renewBefore 兜底、到期](docs/diagrams/zh/06-certificate-lifetime.png)
 
-每一轮问的都是同样五个有序的问题，而绝大多数轮次的答案是"什么都不做"。续期一律 ARI 优先并带 `replaces`，因为 ARI 协调的续期**豁免 Let's Encrypt 的全部限速** —— 而域名集合一变，这次签发就是一张全新证书，豁免随之失效。这正是通配符优先不只是优化的原因：声明了 `*.example.com` 之后，加 `foo.example.com` 的成本是 **0 次签发**。
+时间轴按 `classic` 的 90 天画。真正决定续期时刻的是 ARI 的 `suggestedWindow`；`renewBefore` 只是 ARI 拿不到时的兜底。
 
-完整的故事 —— 六张图，加上数据所有权、失败语义和限速算术 —— 在[证书生命周期](README.reference.zh-CN.md#证书生命周期)。另有一份可交互页面：[docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)，图之间有可点的跳转，还有一个打印/存 PDF 的按钮。
+ARI 协调的续期**豁免 Let's Encrypt 的全部限速** —— 但前提是 identifier 集合不变。这正是通配符优先不只是优化的原因，也是"加一个域名"的成本必须被压到接近零的原因。
+
+这些图背后的三张表 —— 数据所有权、失败语义、限速算术 —— 在[证书生命周期](README.reference.zh-CN.md#证书生命周期)，同样六张图也在那里。另有一份可交互页面：[docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)，图之间有可点的跳转，还有一个打印/存 PDF 的按钮。
 
 ## 事件驱动
 
