@@ -109,7 +109,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 
 	// 退避窗口内直接跳过。已经安排了重试时间就别再敲 CA 的门了。
 	if !st.NextAttemptAt.IsZero() && m.now().Before(st.NextAttemptAt) {
-		m.log.Debug("处于退避窗口内，跳过", "cert", c.Name, "nextAttemptAt", st.NextAttemptAt)
+		m.log.Debug("inside the backoff window; skipping", "cert", c.Name, "nextAttemptAt", st.NextAttemptAt)
 		return nil
 	}
 
@@ -120,7 +120,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		switch {
 		// ExpiresAt 为零值表示服务端没给过期时间：继续推进，让 CA 自己宣布 invalid。
 		case !o.ExpiresAt.IsZero() && !m.now().Before(o.ExpiresAt):
-			m.log.Warn("订单已过期，丢弃后重新决策",
+			m.log.Warn("order expired; discarding it and deciding again",
 				"cert", c.Name, "order", o.OrderURL, "expiredAt", o.ExpiresAt)
 			if err := m.discardOrder(ctx, c.Name); err != nil {
 				return err
@@ -131,7 +131,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 			// 继续推进它只会在 finalize 时被 CA 反复拒绝，一直卡到订单过期 ——
 			// 而"绝不新建订单"这条不变量恰好会让这个卡顿格外持久。
 			// 所以必须果断丢弃，让下一轮按新域名重建。
-			m.log.Warn("配置里的域名已变更，丢弃旧订单后按新域名重建",
+			m.log.Warn("the configured domains changed; discarding the old order and rebuilding for the new set",
 				"cert", c.Name,
 				"orderIdentifiers", o.Identifiers,
 				"configIdentifiers", c.DomainKey())
@@ -140,7 +140,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 			}
 
 		default:
-			m.log.Info("继续推进已有订单", "cert", c.Name, "order", o.OrderURL, "status", o.Status)
+			m.log.Info("resuming the existing order", "cert", c.Name, "order", o.OrderURL, "status", o.Status)
 			return m.advance(ctx, c, st, o)
 		}
 	}
@@ -149,12 +149,12 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	// 授权记录，那它们已经没有归属了（例如上一次删订单成功、删授权失败，
 	// 或者进程被 kill），就地回收，不要让它一直挂在 DNSPod 上。
 	if err := m.cleanupOrphanTXT(ctx, c.Name); err != nil {
-		m.log.Warn("回收残留 TXT 失败", "cert", c.Name, "err", err)
+		m.log.Warn("failed to reclaim a leftover TXT record", "cert", c.Name, "err", err)
 	}
 
 	// 还没有证书 → 首次签发。
 	if st.NotAfter.IsZero() {
-		m.log.Info("首次签发",
+		m.log.Info("first issuance",
 			"cert", c.Name, "names", len(c.Domains), "profile", c.Profile)
 		return m.issue(ctx, c, st, "")
 	}
@@ -165,12 +165,12 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	// 窗口才会生效，classic profile 下最长是一整个有效期。"随时会改域名"
 	// 正是这个项目的使用场景，这种延迟是不可接受的。
 	if leaf, lerr := ParseLeaf(st.CertPEM); lerr != nil {
-		m.log.Warn("解析生效证书失败，跳过域名集合比对", "cert", c.Name, "err", lerr)
+		m.log.Warn("could not parse the live certificate; skipping the SAN comparison", "cert", c.Name, "err", lerr)
 	} else if drifted, detail := CoverageDrift(leaf, c.Domains); drifted {
-		m.log.Warn("生效证书的域名集合与配置不一致，立即重签",
+		m.log.Warn("the live certificate's SANs no longer match the config; reissuing now",
 			"cert", c.Name, "detail", detail,
-			"note", "域名集合变更后的订单不算'同名续期'，会消耗 "+
-				"Certificates per Registered Domain 配额（50 / 7 天，跨账号共享）")
+			"note", "an order after a domain-set change does not count as a same-name renewal and will consume "+
+				"the Certificates per Registered Domain quota (50 per 7 days, shared across accounts)")
 		// 仍然带上 replaces：它表达的语义确实是"替换掉这一张"，
 		// 而且 lego 在服务端返回 alreadyReplaced 时会自动去掉它重试一次。
 		return m.issue(ctx, c, st, st.ARICertID)
@@ -179,14 +179,14 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	// 已有证书 → 决定是否该续期。
 	renewAt, replaces, ariErr := m.renewalDecision(ctx, c, st)
 	if ariErr != nil {
-		m.log.Warn("ARI 查询失败，改用时间兜底", "cert", c.Name, "err", ariErr)
+		m.log.Warn("ARI lookup failed; falling back to a time-based threshold", "cert", c.Name, "err", ariErr)
 	}
 	if m.now().Before(renewAt) {
-		m.log.Debug("尚未到续期时间", "cert", c.Name, "renewAt", renewAt, "notAfter", st.NotAfter)
+		m.log.Debug("not yet due for renewal", "cert", c.Name, "renewAt", renewAt, "notAfter", st.NotAfter)
 		return nil
 	}
 
-	m.log.Info("开始续期",
+	m.log.Info("starting renewal",
 		"cert", c.Name, "notAfter", st.NotAfter, "renewAt", renewAt, "ariReplaces", replaces != "")
 	return m.issue(ctx, c, st, replaces)
 }

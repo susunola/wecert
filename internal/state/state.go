@@ -183,7 +183,7 @@ CREATE TABLE IF NOT EXISTS certificates (
     last_error             TEXT    NOT NULL DEFAULT '',
     deployed_cert_id       TEXT    NOT NULL DEFAULT '',
     -- 上传成功 ≠ 已经绑到监听器上。要等一键更新真正换完才置位，
-    -- 否则首次上传就会被当成"已部署"，人手还没绑之前指标就开始报绿。
+    -- 否则首次上传就会被当成"deployed"，人手还没绑之前指标就开始报绿。
     deploy_confirmed       INTEGER NOT NULL DEFAULT 0,
     updated_at             INTEGER NOT NULL DEFAULT 0
 );

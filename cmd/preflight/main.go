@@ -30,10 +30,10 @@ import (
 )
 
 func main() {
-	domain := flag.String("domain", "", "要验证的域名，例如 atomwangnus.com")
-	listCerts := flag.Bool("list-certs", false, "列出账号下的 SSL 证书（ID / 别名 / 域名 / 状态）")
-	pruneCerts := flag.Bool("prune-certs", false, "删除 wecert 上传的证书（别名以 wecert/ 开头）")
-	yes := flag.Bool("yes", false, "配合 -prune-certs 使用，跳过交互确认")
+	domain := flag.String("domain", "", "domain to verify, e.g. atomwangnus.com")
+	listCerts := flag.Bool("list-certs", false, "list SSL certificates in the account (ID / alias / domain / status)")
+	pruneCerts := flag.Bool("prune-certs", false, "delete the certificates wecert uploaded (alias starting with wecert/)")
+	yes := flag.Bool("yes", false, "use with -prune-certs to skip the interactive confirmation")
 	flag.Parse()
 
 	switch {
@@ -50,17 +50,17 @@ func main() {
 		}
 		return
 	case *domain == "":
-		fmt.Fprintln(os.Stderr, "用法: preflight -domain <域名>")
+		fmt.Fprintln(os.Stderr, "usage: preflight -domain <domain>")
 		fmt.Fprintln(os.Stderr, "      preflight -list-certs")
 		fmt.Fprintln(os.Stderr, "      preflight -prune-certs [-yes]")
 		os.Exit(1)
 	}
 
 	if err := run(*domain); err != nil {
-		fmt.Fprintf(os.Stderr, "\n❌ preflight 失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "\nFAILED: preflight error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("\n✅ preflight 全部通过")
+	fmt.Println("\nOK: all preflight checks passed")
 }
 
 // creds 读取并校验腾讯云凭证。
@@ -72,7 +72,7 @@ func creds() (common.CredentialIface, error) {
 	id := os.Getenv("TENCENTCLOUD_SECRET_ID")
 	key := os.Getenv("TENCENTCLOUD_SECRET_KEY")
 	if id == "" || key == "" {
-		return nil, fmt.Errorf("缺少凭证：请设置 TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY")
+		return nil, fmt.Errorf("missing credentials: set TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY")
 	}
 	return common.NewCredential(id, key), nil
 }
@@ -82,7 +82,7 @@ func run(domain string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("凭证: 已加载")
+	fmt.Println("credentials: loaded")
 	fmt.Println()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -105,17 +105,17 @@ func run(domain string) error {
 // 而错误信息只会说"验证失败"，看不出根因。
 func checkDelegation(ctx context.Context, domain string) error {
 	fmt.Println()
-	fmt.Println("[4/4] 权威 NS 委派检查")
+	fmt.Println("[4/4] authoritative nameserver delegation check")
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	names, err := net.DefaultResolver.LookupNS(ctx, domain)
 	if err != nil {
-		return fmt.Errorf("查询 %s 的 NS 失败: %w", domain, err)
+		return fmt.Errorf("lookup NS for %s failed: %w", domain, err)
 	}
 	if len(names) == 0 {
-		return fmt.Errorf("%s 没有 NS 记录", domain)
+		return fmt.Errorf("%s has no NS records", domain)
 	}
 
 	var hosts []string
@@ -131,25 +131,25 @@ func checkDelegation(ctx context.Context, domain string) error {
 
 	if !onDNSPod {
 		return fmt.Errorf(
-			"%s 的 NS 不是 DNSPod：%s\n"+
-				"     写在 DNSPod 里的 TXT 不会被解析到，CA 的验证必然失败。\n"+
-				"     请先把域名的 NS 切到 DNSPod，或改用该托管商对应的 dns.provider",
+			"%s's nameservers are not DNSPod: %s\n"+
+				"     TXT records written at DNSPod will never be resolved, so CA validation is guaranteed to fail.\n"+
+				"     point the domain's NS at DNSPod first, or switch to the dns.provider for that host\n",
 			domain, strings.Join(hosts, ", "))
 	}
 
-	fmt.Printf("      OK — %d 台 NS，指向 DNSPod（%s）\n", len(hosts), hosts[0])
+	fmt.Printf("      OK - %d nameservers, all pointing at DNSPod (%s)\n", len(hosts), hosts[0])
 	return nil
 }
 
 // checkSSL 验证 SSL 证书服务的读权限。
 func checkSSL(ctx context.Context, cred common.CredentialIface) error {
-	fmt.Println("[1/4] SSL 证书服务读权限")
+	fmt.Println("[1/4] SSL certificate service read access")
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "ssl.tencentcloudapi.com"
 
 	client, err := ssl.NewClient(cred, "", cpf)
 	if err != nil {
-		return fmt.Errorf("构造 SSL 客户端: %w", err)
+		return fmt.Errorf("build SSL client: %w", err)
 	}
 
 	req := ssl.NewDescribeCertificatesRequest()
@@ -157,27 +157,27 @@ func checkSSL(ctx context.Context, cred common.CredentialIface) error {
 
 	resp, err := client.DescribeCertificatesWithContext(ctx, req)
 	if err != nil {
-		return fmt.Errorf("DescribeCertificates 失败（检查 ssl:DescribeCertificates 权限）: %w", err)
+		return fmt.Errorf("DescribeCertificates failed (check the ssl:DescribeCertificates permission): %w", err)
 	}
 
 	var total uint64
 	if resp.Response != nil && resp.Response.TotalCount != nil {
 		total = *resp.Response.TotalCount
 	}
-	fmt.Printf("      OK — 账号下已有 %d 张证书\n", total)
+	fmt.Printf("      OK - the account already holds %d certificates\n", total)
 	return nil
 }
 
 // checkDNSPod 验证 DNSPod 读权限，并确认域名在这个账号下。
 func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string) error {
-	fmt.Println("[2/4] DNSPod 域名归属")
+	fmt.Println("[2/4] DNSPod domain ownership")
 
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "dnspod.tencentcloudapi.com"
 
 	client, err := dnspod.NewClient(cred, "", cpf)
 	if err != nil {
-		return fmt.Errorf("构造 DNSPod 客户端: %w", err)
+		return fmt.Errorf("build DNSPod client: %w", err)
 	}
 
 	// 先用接口直接查目标域名，比拉全量列表再匹配更准。
@@ -187,7 +187,7 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 
 	resp, err := client.DescribeDomainListWithContext(ctx, req)
 	if err != nil {
-		return fmt.Errorf("DescribeDomainList 失败（检查 dnspod:DescribeDomainList 权限）: %w", err)
+		return fmt.Errorf("DescribeDomainList failed (check the dnspod:DescribeDomainList permission): %w", err)
 	}
 
 	var found *dnspod.DomainListItem
@@ -202,17 +202,17 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 
 	if found == nil {
 		return fmt.Errorf(
-			"域名 %s 不在这个腾讯云账号的 DNSPod 下。\n"+
-				"     要么域名托管在别处，要么要用 DNSPod 自有 Token（dns.provider=dnspod）",
+			"domain %s is not under DNSPod in this Tencent Cloud account.\n"+
+				"     either the domain is hosted elsewhere, or you need a DNSPod API token (dns.provider=dnspod)",
 			domain)
 	}
 
-	fmt.Printf("      OK — %s 已找到", deref(found.Name))
+	fmt.Printf("      OK - %s found", deref(found.Name))
 	if found.Status != nil {
-		fmt.Printf("，状态 %s", *found.Status)
+		fmt.Printf(", status %s", *found.Status)
 	}
 	if found.Grade != nil {
-		fmt.Printf("，套餐 %s", *found.Grade)
+		fmt.Printf(", plan %s", *found.Grade)
 	}
 	fmt.Println()
 
@@ -228,11 +228,11 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 		// 这恰恰是我们想看到的状态，不能当失败。
 		if isNoRecord(err) {
 			fmt.Println()
-			fmt.Println("[3/4] _acme-challenge 残留检查")
-			fmt.Println("      OK — 无残留 TXT 记录")
+			fmt.Println("[3/4] _acme-challenge leftover check")
+			fmt.Println("      OK - no leftover TXT records")
 			return nil
 		}
-		return fmt.Errorf("DescribeRecordList 失败（检查 dnspod:DescribeRecordList 权限）: %w", err)
+		return fmt.Errorf("DescribeRecordList failed (check the dnspod:DescribeRecordList permission): %w", err)
 	}
 
 	n := 0
@@ -242,11 +242,11 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 		n = len(records)
 	}
 	fmt.Println()
-	fmt.Println("[3/4] _acme-challenge 残留检查")
+	fmt.Println("[3/4] _acme-challenge leftover check")
 	if n == 0 {
-		fmt.Println("      OK — 无残留 TXT 记录")
+		fmt.Println("      OK - no leftover TXT records")
 	} else {
-		fmt.Printf("      ⚠️  已有 %d 条 TXT 记录，确认不是别的系统在用：\n", n)
+		fmt.Printf("      WARNING: %d TXT records already exist; confirm another system is not using them:\n", n)
 		for _, r := range records {
 			fmt.Printf("          %s = %s\n", deref(r.Name), deref(r.Value))
 		}
@@ -297,10 +297,10 @@ func listCertificates() error {
 		return err
 	}
 	if resp.Response == nil {
-		return fmt.Errorf("DescribeCertificates 返回了空响应")
+		return fmt.Errorf("DescribeCertificates returned an empty response")
 	}
 
-	fmt.Printf("%-12s %-28s %-40s %-10s %s\n", "CertId", "别名", "域名", "状态", "来源")
+	fmt.Printf("%-12s %-28s %-40s %-10s %s\n", "CertId", "alias", "domain", "status", "source")
 	for _, c := range resp.Response.Certificates {
 		fmt.Printf("%-12s %-28s %-40s %-10d %s\n",
 			deref(c.CertificateId), deref(c.Alias), deref(c.Domain), derefU64(c.Status), deref(c.CertificateType))
@@ -308,11 +308,11 @@ func listCertificates() error {
 
 	listed := len(resp.Response.Certificates)
 	total := derefU64(resp.Response.TotalCount)
-	fmt.Printf("\n共 %d 张\n", total)
+	fmt.Printf("\n%d total\n", total)
 	if total > uint64(listed) {
 		// 不做分页就会漏删、也会让人误以为列表是完整的。
-		fmt.Printf("注意: 服务端总数 %d 大于本次列出的 %d（分页上限 100），"+
-			"清单可能不完整\n", total, listed)
+		fmt.Printf("note: the server reports %d in total, more than the %d listed here (page size 100),"+
+			"so this list may be incomplete\n", total, listed)
 	}
 	return nil
 }
@@ -356,7 +356,7 @@ func pruneCertificates(assumeYes bool) error {
 		return err
 	}
 	if listResp.Response == nil {
-		return fmt.Errorf("DescribeCertificates 返回了空响应")
+		return fmt.Errorf("DescribeCertificates returned an empty response")
 	}
 
 	const prefix = "wecert/"
@@ -368,22 +368,22 @@ func pruneCertificates(assumeYes bool) error {
 	}
 
 	if len(doomed) == 0 {
-		fmt.Println("没有 wecert 上传的证书，无需清理")
+		fmt.Println("no wecert-uploaded certificates to clean up")
 		return nil
 	}
 
-	fmt.Printf("将删除 %d 张 wecert 上传的证书：\n", len(doomed))
+	fmt.Printf("about to delete %d certificates uploaded by wecert:\n", len(doomed))
 	for _, c := range doomed {
 		fmt.Printf("  %-12s %-28s %s\n", deref(c.CertificateId), deref(c.Alias), deref(c.Domain))
 	}
 	fmt.Println()
-	fmt.Println("⚠️  这个列表包含线上正在服务的证书 —— wecert 对所有上传的证书")
-	fmt.Println("    都用同一个别名前缀。删除正在被 CLB 引用的证书会导致 HTTPS 中断。")
-	fmt.Println("    如果只是想清掉测试留下的证书，请先核对上面的别名和域名。")
+	fmt.Println("WARNING: this list includes certificates currently serving live traffic - wecert uses the same alias prefix")
+	fmt.Println("    for every certificate it uploads. Deleting one that a CLB still references will break HTTPS.")
+	fmt.Println("    if you only meant to clean up test leftovers, check the alias and domain above first.")
 
 	if !assumeYes {
-		if !confirm("确认删除以上全部证书？") {
-			fmt.Println("已取消，未删除任何证书")
+		if !confirm("delete all of the certificates above?") {
+			fmt.Println("cancelled; nothing was deleted")
 			return nil
 		}
 	}
@@ -395,14 +395,14 @@ func pruneCertificates(assumeYes bool) error {
 		// 我们自己在状态库里管绑定关系，不需要服务端再检查关联资源。
 		req.IsCheckResource = common.BoolPtr(false)
 		if _, err := client.DeleteCertificateWithContext(ctx, req); err != nil {
-			fmt.Printf("  删除 %s 失败: %v\n", deref(c.CertificateId), err)
+			fmt.Printf("  failed to delete %s: %v\n", deref(c.CertificateId), err)
 			failed++
 			continue
 		}
-		fmt.Printf("  已删除 %s\n", deref(c.CertificateId))
+		fmt.Printf("  deleted %s\n", deref(c.CertificateId))
 	}
 	if failed > 0 {
-		return fmt.Errorf("%d 张证书删除失败（其余已删除）", failed)
+		return fmt.Errorf("%d certificates could not be deleted (the rest were)", failed)
 	}
 	return nil
 }

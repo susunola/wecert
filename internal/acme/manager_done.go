@@ -21,7 +21,7 @@ func (m *Manager) download(
 	o *state.Order, order legoacme.ExtendedOrder,
 ) error {
 	if order.Certificate == "" {
-		return m.recordFailure(st, errors.New("订单已 valid 但没有证书 URL"))
+		return m.recordFailure(st, errors.New("the order is valid but has no certificate URL"))
 	}
 
 	// 幂等兜底：订单对应的证书已经是当前生效的那一张，说明上一轮
@@ -32,10 +32,10 @@ func (m *Manager) download(
 	// 把一次成功的续期报成持续故障，consecutive_failures 一路涨到需要人工介入。
 	// 既然结果是已达成状态，直接收尾即可。
 	if st.CertURL != "" && st.CertURL == order.Certificate && !st.NotAfter.IsZero() {
-		m.log.Info("订单对应的证书已是当前生效版本，跳过重复部署",
+		m.log.Info("the order's certificate is already the live one; skipping the duplicate deploy",
 			"cert", c.Name, "certUrl", order.Certificate)
 		if !st.DeployConfirmed && c.Deploy.Enabled {
-			m.log.Warn("但该证书尚未确认部署到云资源，请检查 CLB 监听器是否已绑定",
+			m.log.Warn("but this certificate is not confirmed deployed to a cloud resource; check that the CLB listener has it bound",
 				"cert", c.Name, "deployedCertId", st.DeployedCertID)
 		}
 		return m.discardOrder(ctx, c.Name)
@@ -44,7 +44,7 @@ func (m *Manager) download(
 	// bundle=true → 返回的是 fullchain（叶子 + 中间证书），正是 CLB 需要的格式。
 	fullchain, _, err := m.core.Certificates.Get(order.Certificate, true)
 	if err != nil {
-		return m.recordFailure(st, fmt.Errorf("下载证书: %w", err))
+		return m.recordFailure(st, fmt.Errorf("download certificate: %w", err))
 	}
 
 	leaf, err := ParseLeaf(fullchain)
@@ -57,10 +57,10 @@ func (m *Manager) download(
 	}
 	if !st.NotAfter.IsZero() && !leaf.NotAfter.After(st.NotAfter) {
 		return m.recordFailure(st, fmt.Errorf(
-			"新证书 notAfter (%s) 不晚于当前证书 (%s)，拒绝部署", leaf.NotAfter, st.NotAfter))
+			"the new certificate's notAfter (%s) is not later than the current one (%s); refusing to deploy", leaf.NotAfter, st.NotAfter))
 	}
 	if len(o.KeyPEM) == 0 {
-		return m.recordFailure(st, errors.New("订单缺少私钥，无法部署"))
+		return m.recordFailure(st, errors.New("the order has no private key; cannot deploy"))
 	}
 
 	// 部署。首次签发时 DeployedCertID 为空，此时只上传，等人工在 CLB 绑一次。
@@ -77,7 +77,7 @@ func (m *Manager) download(
 			// ReapRetired 永远看不到它，一次失败就在腾讯云上漏下一张证书，
 			// 最后撞上账号配额，而回收机制的存在意义正是防这个。
 			m.recordOrphanCert(id, oldDeployedID, c.Name)
-			return m.recordFailure(st, fmt.Errorf("部署到腾讯云: %w", derr))
+			return m.recordFailure(st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
 		}
 		deployedID = id
 		rebound = oldDeployedID != ""
@@ -86,7 +86,7 @@ func (m *Manager) download(
 	ariCertID, err := CertID(leaf)
 	if err != nil {
 		// ARI 不可用不该阻断签发，只是失去了速率豁免。
-		m.log.Warn("无法构造 ARI certID，本次续期将不带 replaces", "cert", c.Name, "err", err)
+		m.log.Warn("could not build the ARI certID; this renewal will go out without replaces", "cert", c.Name, "err", err)
 	}
 
 	// 部署成功，此时才把新证书提升为生效版本。
@@ -119,7 +119,7 @@ func (m *Manager) download(
 	// 首次上传还没绑监听器时绝不能退休，否则 7 天后会把人手刚绑上的证删掉。
 	if rebound && oldDeployedID != "" && oldDeployedID != deployedID {
 		if err := m.store.AddRetiredCert(oldDeployedID, c.Name); err != nil {
-			m.log.Warn("记录待回收证书失败", "cert", c.Name, "certId", oldDeployedID, "err", err)
+			m.log.Warn("failed to record the certificate for reclaim", "cert", c.Name, "certId", oldDeployedID, "err", err)
 		}
 	}
 
@@ -128,16 +128,16 @@ func (m *Manager) download(
 	}
 
 	if !c.Deploy.Enabled {
-		m.log.Info("证书已签发并写入本地状态（未开启云端部署）",
+		m.log.Info("certificate issued and recorded locally (cloud deploy is off)",
 			"cert", c.Name, "notAfter", st.NotAfter,
 			"daysLeft", int(time.Until(st.NotAfter).Hours()/24))
 	} else if !st.DeployConfirmed {
-		m.log.Info("证书已上传，等待在 CLB 上手动绑定一次",
+		m.log.Info("certificate uploaded; waiting for a one-time manual bind in the CLB console",
 			"cert", c.Name, "notAfter", st.NotAfter,
 			"uploadedCertId", deployedID,
-			"hint", "绑定完成后，后续续期会走 UpdateCertificateInstance 自动换证")
+			"hint", "once bound, later renewals switch it automatically via UpdateCertificateInstance")
 	} else {
-		m.log.Info("证书已续期并生效",
+		m.log.Info("certificate renewed and live",
 			"cert", c.Name, "notAfter", st.NotAfter,
 			"daysLeft", int(time.Until(st.NotAfter).Hours()/24),
 			"deployedCertId", deployedID, "ariCertId", ariCertID != "")
@@ -149,18 +149,18 @@ func (m *Manager) download(
 func (m *Manager) ReapRetired(ctx context.Context) {
 	retired, err := m.store.ListRetiredCertsBefore(m.now().Add(-m.retention))
 	if err != nil {
-		m.log.Warn("查询待回收证书失败", "err", err)
+		m.log.Warn("failed to list retired certificates", "err", err)
 		return
 	}
 	for _, r := range retired {
 		if err := m.deployer.Delete(ctx, r.CertID); err != nil {
-			m.log.Warn("回收退役证书失败", "certId", r.CertID, "cert", r.CertName, "err", err)
+			m.log.Warn("failed to reclaim a retired certificate", "certId", r.CertID, "cert", r.CertName, "err", err)
 			continue
 		}
-		m.log.Info("已回收退役证书",
+		m.log.Info("reclaimed a retired certificate",
 			"certId", r.CertID, "cert", r.CertName, "retiredAt", r.RetiredAt)
 		if err := m.store.DeleteRetiredCert(r.CertID); err != nil {
-			m.log.Warn("清理回收记录失败", "certId", r.CertID, "err", err)
+			m.log.Warn("failed to remove the reclaim record", "certId", r.CertID, "err", err)
 		}
 	}
 }
@@ -175,7 +175,7 @@ func (m *Manager) recordFailure(st *state.CertState, err error) error {
 	// 停进程 / 父 context 取消不是业务失败。记进去会拉长退避，
 	// 重启后本该立刻续推同一张订单，结果被挡在窗口外。
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		m.log.Warn("本轮被取消，不记失败、不进入退避", "cert", st.Name, "err", err)
+		m.log.Warn("pass cancelled; not counted as a failure and no backoff applied", "cert", st.Name, "err", err)
 		return err
 	}
 
@@ -196,7 +196,7 @@ func (m *Manager) recordFailure(st *state.CertState, err error) error {
 		return errors.Join(err, perr)
 	}
 
-	m.log.Error("处理失败，已安排重试",
+	m.log.Error("pass failed; a retry has been scheduled",
 		"cert", st.Name, "err", err,
 		"consecutiveFailures", st.ConsecutiveFailures, "nextAttemptAt", st.NextAttemptAt)
 	return err
@@ -218,7 +218,7 @@ func (m *Manager) discardOrder(ctx context.Context, certName string) error {
 	if err := m.cleanupOrphanTXT(ctx, certName); err != nil {
 		// 清理失败不能阻止丢弃订单 —— 否则会卡在一张签不出结果的订单上，
 		// 那比多留一条 TXT 严重得多。
-		m.log.Warn("丢弃订单前清理 TXT 失败", "cert", certName, "err", err)
+		m.log.Warn("failed to clean up TXT before discarding the order", "cert", certName, "err", err)
 	}
 	return m.store.DeleteOrder(certName)
 }
@@ -236,7 +236,7 @@ func parseOrderExpires(raw string, now time.Time) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
 		return t, nil
 	}
-	return fallback, fmt.Errorf("无法解析 expires %q", raw)
+	return fallback, fmt.Errorf("cannot parse expires %q", raw)
 }
 
 func (m *Manager) persistOrder(o *state.Order, order legoacme.ExtendedOrder) {
@@ -249,7 +249,7 @@ func (m *Manager) persistOrder(o *state.Order, order legoacme.ExtendedOrder) {
 		o.CertURL = order.Certificate
 	}
 	if err := m.store.PutOrder(o); err != nil {
-		m.log.Warn("更新订单状态失败", "cert", o.CertName, "err", err)
+		m.log.Warn("failed to update the order state", "cert", o.CertName, "err", err)
 	}
 }
 
@@ -260,7 +260,7 @@ func pickDNS01(authz legoacme.Authorization) (legoacme.Challenge, error) {
 		}
 	}
 	return legoacme.Challenge{}, fmt.Errorf(
-		"identifier %s 的授权未提供 dns-01 挑战（通配符只能走 DNS-01）", authz.Identifier.Value)
+		"the authorization for identifier %s offers no dns-01 challenge (wildcards can only use DNS-01)", authz.Identifier.Value)
 }
 
 func authzError(authz legoacme.Authorization) string {
@@ -269,7 +269,7 @@ func authzError(authz legoacme.Authorization) string {
 			return ch.Error.Detail
 		}
 	}
-	return "CA 未给出具体原因"
+	return "the CA gave no specific reason"
 }
 
 // recordOrphanCert 把一个"云上已经存在、但本地没有归属"的证书记进待回收列表。
@@ -282,10 +282,10 @@ func (m *Manager) recordOrphanCert(newID, liveID, certName string) {
 		return
 	}
 	if err := m.store.AddRetiredCert(newID, certName); err != nil {
-		m.log.Warn("记录孤儿证书失败（会一直占用腾讯云证书配额）",
+		m.log.Warn("failed to record the orphaned certificate (it will occupy Tencent Cloud certificate quota indefinitely)",
 			"cert", certName, "certId", newID, "err", err)
 		return
 	}
-	m.log.Info("部署失败时上传的证书已记入待回收列表，稍后会由回收器删除",
+	m.log.Info("the certificate uploaded during the failed deploy has been recorded for reclaim and will be deleted later",
 		"cert", certName, "certId", newID)
 }

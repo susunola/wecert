@@ -117,10 +117,10 @@ func CoverageDrift(leaf *x509.Certificate, want []string) (bool, string) {
 	missing, extra := config.DiffDomains(want, leaf.DNSNames)
 	var parts []string
 	if len(missing) > 0 {
-		parts = append(parts, "配置要求但证书缺失: "+strings.Join(missing, ","))
+		parts = append(parts, "required by the config but missing: "+strings.Join(missing, ","))
 	}
 	if len(extra) > 0 {
-		parts = append(parts, "证书多出但配置已移除: "+strings.Join(extra, ","))
+		parts = append(parts, "certificate present but removed from the config: "+strings.Join(extra, ","))
 	}
 	return true, strings.Join(parts, "; ")
 }
@@ -141,7 +141,7 @@ func VerifyCoverage(leaf *x509.Certificate, want []string) error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("签回的证书未覆盖以下域名: %v (证书实际包含 %v)", missing, leaf.DNSNames)
+		return fmt.Errorf("the issued certificate does not cover these domains: %v (it contains %v)", missing, leaf.DNSNames)
 	}
 	return nil
 }

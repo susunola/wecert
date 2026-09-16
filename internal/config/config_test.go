@@ -339,7 +339,7 @@ certificates:
 	if err == nil {
 		t.Fatal("过短的 token 应当报错")
 	}
-	if !strings.Contains(err.Error(), "太短") {
+	if !strings.Contains(err.Error(), "too short") {
 		t.Errorf("报错应当说明太短，得到: %v", err)
 	}
 }

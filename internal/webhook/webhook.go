@@ -75,7 +75,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.tokenMatches(r) {
-			s.log.Warn("webhook 鉴权失败",
+			s.log.Warn("webhook authentication failed",
 				"remote", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
 			writeJSON(w, http.StatusUnauthorized,
 				map[string]string{"error": "missing or invalid token"})
@@ -142,7 +142,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		resp.Skipped = s.rec.StartAll(s.baseCtx)
 		resp.Accepted = s.rec.CertNames()
 		resp.Accepted = subtract(resp.Accepted, resp.Skipped)
-		s.log.Info("webhook 触发全量收敛",
+		s.log.Info("webhook triggered a full convergence",
 			"accepted", len(resp.Accepted), "skipped", len(resp.Skipped), "remote", r.RemoteAddr)
 	} else {
 		for _, name := range targets {
@@ -155,7 +155,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 				resp.Unknown = append(resp.Unknown, name)
 			}
 		}
-		s.log.Info("webhook 触发收敛",
+		s.log.Info("webhook triggered convergence",
 			"accepted", resp.Accepted, "skipped", resp.Skipped, "unknown", resp.Unknown,
 			"remote", r.RemoteAddr)
 	}
@@ -248,7 +248,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 		rec, err := s.store.GetCert(name)
 		if err != nil {
-			s.log.Warn("读取证书状态失败", "cert", name, "err", err)
+			s.log.Warn("failed to read the certificate state", "cert", name, "err", err)
 			out.Certificates = append(out.Certificates, st)
 			continue
 		}

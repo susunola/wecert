@@ -39,8 +39,8 @@ func NewCredentialSource(cfg config.Tencent) (CredentialFunc, error) {
 		}
 		if id == "" || key == "" {
 			return nil, fmt.Errorf(
-				"credentialMode=static 但缺少凭证：请在配置里填 secretId/secretKey，"+
-					"或设置环境变量 %s / %s", EnvSecretID, EnvSecretKey)
+				"credentialMode=static but no credentials: put secretId/secretKey in the config, "+
+					"or set the environment variables %s / %s", EnvSecretID, EnvSecretKey)
 		}
 		cred := common.NewCredential(id, key)
 		return func(context.Context) (common.CredentialIface, error) { return cred, nil }, nil
@@ -51,7 +51,7 @@ func NewCredentialSource(cfg config.Tencent) (CredentialFunc, error) {
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("未知的凭证模式 %q", cfg.CredentialMode)
+		return nil, fmt.Errorf("unknown credential mode %q", cfg.CredentialMode)
 	}
 }
 
@@ -76,31 +76,31 @@ type cvmRoleCredential struct {
 func fetchCVMRoleCredential(ctx context.Context, roleName string) (common.CredentialIface, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cvmMetadataURL+roleName, nil)
 	if err != nil {
-		return nil, fmt.Errorf("构造元数据请求: %w", err)
+		return nil, fmt.Errorf("build metadata request: %w", err)
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("访问 CVM 元数据服务: %w（若不在 CVM 上运行，请把 tencent.credentialMode 改为 static）", err)
+		return nil, fmt.Errorf("reach the CVM metadata service: %w (if not running on a CVM, set tencent.credentialMode to static)", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if err != nil {
-		return nil, fmt.Errorf("读取元数据响应: %w", err)
+		return nil, fmt.Errorf("read the metadata response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("元数据服务返回 %d；请确认该 CVM 已绑定角色 %q（响应: %s）",
+		return nil, fmt.Errorf("the metadata service returned %d; check that this CVM has role %q attached (response: %s)",
 			resp.StatusCode, roleName, truncate(string(body), 256))
 	}
 
 	var mc cvmRoleCredential
 	if err := json.Unmarshal(body, &mc); err != nil {
-		return nil, fmt.Errorf("解析元数据凭证: %w", err)
+		return nil, fmt.Errorf("parse the metadata credentials: %w", err)
 	}
 	if mc.TmpSecretID == "" || mc.TmpSecretKey == "" {
-		return nil, fmt.Errorf("元数据服务未返回有效凭证 (Code=%q)", mc.Code)
+		return nil, fmt.Errorf("the metadata service returned no usable credentials (Code=%q)", mc.Code)
 	}
 
 	return common.NewTokenCredential(mc.TmpSecretID, mc.TmpSecretKey, mc.Token), nil

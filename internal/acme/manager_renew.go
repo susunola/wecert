@@ -38,7 +38,7 @@ func (m *Manager) renewalDecision(
 			if perr := m.store.PutCert(st); perr != nil {
 				return time.Time{}, "", perr
 			}
-			m.log.Info("已刷新 ARI 窗口",
+			m.log.Info("ARI window refreshed",
 				"cert", c.Name, "start", st.ARIWindowStart, "end", st.ARIWindowEnd, "retryAfter", retryAfter)
 		case errors.Is(err, api.ErrNoARI):
 			// CA 不支持 ARI，永久退化。记一次就够了，不必每轮重试。
@@ -105,15 +105,15 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		ReplacesCertID: replaces,
 	})
 	if err != nil {
-		return m.recordFailure(st, fmt.Errorf("创建订单: %w", err))
+		return m.recordFailure(st, fmt.Errorf("create order: %w", err))
 	}
 	if order.Location == "" {
-		return m.recordFailure(st, errors.New("创建订单: 服务器未返回 order URL"))
+		return m.recordFailure(st, errors.New("create order: the server returned no order URL"))
 	}
 
 	expiresAt, expErr := parseOrderExpires(order.Expires, m.now())
 	if expErr != nil {
-		m.log.Warn("订单 expires 无法解析，使用保守 TTL",
+		m.log.Warn("cannot parse the order's expires; using a conservative TTL",
 			"cert", c.Name, "raw", order.Expires, "err", expErr, "ttl", defaultOrderTTL)
 	}
 
@@ -133,7 +133,7 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		return err
 	}
 
-	m.log.Info("已创建 ACME 订单",
+	m.log.Info("ACME order created",
 		"cert", c.Name, "status", order.Status, "expiresAt", expiresAt,
 		"names", len(c.Domains), "profile", order.Profile, "replaces", replaces != "")
 	return m.advance(ctx, c, st, o)

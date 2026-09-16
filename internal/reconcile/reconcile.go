@@ -19,7 +19,7 @@ import (
 // 这不是异常，而是必须存在的一道闸门：定时器和一个事件触发的收敛
 // 很可能同时落到同一张证书上。两边各下一单，就会直接撞上
 // "5 certificates per exact set of identifiers / 7 days" —— 而且这条没有 override。
-var ErrAlreadyRunning = errors.New("该证书已有一轮正在处理")
+var ErrAlreadyRunning = errors.New("this certificate already has a pass in flight")
 
 // Notifier 在每张证书处理结束后收到通知。可为 nil。
 //
@@ -107,7 +107,7 @@ func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
 		}
 
 		if !r.acquire(c.Name) {
-			r.log.Info("跳过：该证书已有一轮在跑", "cert", c.Name)
+			r.log.Info("skipping: this certificate already has a pass in flight", "cert", c.Name)
 			skipped = append(skipped, c.Name)
 			continue
 		}
@@ -136,7 +136,7 @@ func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 		}
 	}
 	if found == nil {
-		return fmt.Errorf("配置里没有名为 %q 的证书", name)
+		return fmt.Errorf("no certificate named %q in the config", name)
 	}
 
 	if !r.acquire(name) {
@@ -165,7 +165,7 @@ func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 		}
 	}
 	if found == nil {
-		return fmt.Errorf("配置里没有名为 %q 的证书", name)
+		return fmt.Errorf("no certificate named %q in the config", name)
 	}
 
 	if !r.acquire(name) {
@@ -198,7 +198,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) {
 	if err != nil {
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
 		// manager 内部已经打过日志并安排了退避，这里只补一条摘要。
-		r.log.Warn("本轮未成功", "cert", c.Name, "err", err)
+		r.log.Warn("this pass did not succeed", "cert", c.Name, "err", err)
 	} else {
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "ok").Inc()
 	}
@@ -223,7 +223,7 @@ func (r *Reconciler) publish(name string) {
 		metrics.CertNotAfter.WithLabelValues(name).Set(float64(st.NotAfter.Unix()))
 	}
 
-	// 只有确认已经换到新证书才算"已部署"：首次上传之后还要人工绑一次，
+	// 只有确认已经换到新证书才算"deployed"：首次上传之后还要人工绑一次，
 	// 在那之前指示灯不能变绿，否则到期告警会以为一切正常。
 	if st.DeployConfirmed && st.DeployedCertID != "" {
 		metrics.CertDeployed.WithLabelValues(name).Set(1)
@@ -242,7 +242,7 @@ func (r *Reconciler) publish(name string) {
 	if !st.NotAfter.IsZero() {
 		days := time.Until(st.NotAfter).Hours() / 24
 		if days < 21 {
-			r.log.Warn("证书临近到期",
+			r.log.Warn("certificate approaching expiry",
 				"cert", name, "notAfter", st.NotAfter, "daysLeft", int(days),
 				"consecutiveFailures", st.ConsecutiveFailures, "lastError", st.LastError)
 		}
