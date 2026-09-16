@@ -1,4 +1,6 @@
-# CAM policies
+# Deployment artifacts
+
+## CAM policies
 
 Least-privilege CAM policies for running wecert and for the e2e environment.
 
@@ -32,3 +34,15 @@ for different reasons per service:
 Every statement deliberately omits `condition` blocks for the same reason: this
 file documents the minimum action set; tightening resources/conditions is an
 account-specific decision that belongs in your own policy derived from this one.
+
+## Prometheus rules
+
+`prometheus/wecert-alerts.yml` is a ready-to-load rule file: 17 alerts in three groups
+(`wecert.expiry`, `wecert.convergence`, `wecert.integrity`), with a comment above each threshold saying
+where the number came from. Point `rule_files:` at it.
+
+It is here rather than left as an exercise because several of the failures it watches for are silent
+by construction -- a revocation the CA never accepted, a pass that has not finished in two hours, a
+certificate serving that is not the one deployed. None of them produce an error log, so the alert is
+the only thing that notices. `make check-alerts` verifies the file still refers to series this program
+actually exports; a rule against a series that does not exist parses perfectly and never fires.
