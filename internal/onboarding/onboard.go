@@ -128,7 +128,9 @@ type Options struct {
 	KeyType string
 	Deploy  bool
 
-	// MaxNames is the per-certificate SAN cap. 0 means use the profile's own cap.
+	// MaxNames is the per-certificate SAN cap. 0 means the default of 25, which is
+	// deliberately aligned with tlsserver so a later profile switch needs no redesign --
+	// it is *not* the profile's own cap (classic would be 100).
 	MaxNames int
 
 	// RequireRule means a declaration only takes effect when a CLB rule also serves
@@ -628,9 +630,16 @@ func (r *run) resolve() {
 			continue
 		}
 
-		// Guard 1 applies to concrete names only: a wildcard never appears as a
-		// layer-7 rule domain, so demanding a rule for it would mean it never passes.
-		if r.o.opts.RequireRule && !r.guardUnavailable && !r.rules[d.Hostname] {
+		// Guard 1 applies to concrete names only: a wildcard declaration is about the
+		// subdomains, not about a rule domain, so demanding a rule named after it would
+		// mean it never passes.
+		//
+		// The lookup goes through servedByRule, not a flat map hit: a layer-7 rule
+		// domain may itself be a wildcard, and an exact comparison used to reject a
+		// name that *.example.com genuinely serves -- while referenced(), in the same
+		// file, treated that same rule as a reference. One predicate now, so the
+		// addition and deletion paths cannot disagree again.
+		if r.o.opts.RequireRule && !r.guardUnavailable && !r.servedByRule(d.Hostname) {
 			r.reject(d.Hostname, "no CLB rule serves this name (guard 1 not satisfied)")
 			continue
 		}
@@ -745,6 +754,15 @@ func (r *run) referenced(name string) bool {
 	if r.guardUnavailable || r.o.src.Rules == nil {
 		return true
 	}
+	return r.servedByRule(name)
+}
+
+// servedByRule reports whether some layer-7 rule can serve this name.
+//
+// A rule domain may itself be a wildcard (CLB supports *.example.com), so the check
+// is wildcard-aware in both directions: a wildcard declaration is served by any rule
+// it covers, and a concrete name is served by any rule wildcard that covers it.
+func (r *run) servedByRule(name string) bool {
 	if r.rules[name] {
 		return true
 	}

@@ -189,3 +189,84 @@ func TestDeleteAuthorizationKeepsSiblings(t *testing.T) {
 		t.Errorf("deleting twice should be idempotent: %v", err)
 	}
 }
+
+// The deploy_confirmed migration is the other half of the upgrade path, and it had no
+// coverage: TestDeployConfirmedMigratesOnOldSchema opens a *fresh* store, so
+// ensureColumn never took its "column missing -> ALTER TABLE" branch. A typo in that
+// struct literal would be invisible to the suite and surface only as a runtime failure
+// on upgrade -- for exactly the users the migration exists to protect.
+func TestMigrateAddsDeployConfirmedToLegacyDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	// A legacy certificates table: no deploy_confirmed, and it already holds a row.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE certificates (
+			name                 TEXT PRIMARY KEY,
+			not_after            INTEGER NOT NULL DEFAULT 0,
+			cert_url             TEXT    NOT NULL DEFAULT '',
+			cert_pem             BLOB,
+			key_pem              BLOB,
+			issued_at            INTEGER NOT NULL DEFAULT 0,
+			ari_cert_id          TEXT    NOT NULL DEFAULT '',
+			ari_window_start     INTEGER NOT NULL DEFAULT 0,
+			ari_window_end       INTEGER NOT NULL DEFAULT 0,
+			ari_checked_at       INTEGER NOT NULL DEFAULT 0,
+			ari_retry_after_ns   INTEGER NOT NULL DEFAULT 0,
+			consecutive_failures INTEGER NOT NULL DEFAULT 0,
+			next_attempt_at      INTEGER NOT NULL DEFAULT 0,
+			last_error           TEXT    NOT NULL DEFAULT '',
+			deployed_cert_id     TEXT    NOT NULL DEFAULT '',
+			updated_at           INTEGER NOT NULL DEFAULT 0
+		);
+		INSERT INTO certificates (name, not_after, cert_url, deployed_cert_id, key_pem)
+		VALUES ('legacy', 1893456000, 'https://acme.example/cert/1', 'ap-live', x'deadbeef');
+	`)
+	if err != nil {
+		t.Fatalf("building the legacy table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("closing the legacy db: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a legacy db failed (an upgrade that demands deleting the db is worthless): %v", err)
+	}
+	defer s.Close()
+
+	c, err := s.GetCert("legacy")
+	if err != nil {
+		t.Fatalf("GetCert failed: %v", err)
+	}
+	if c == nil {
+		t.Fatal("legacy certificate lost after upgrade")
+	}
+	if c.DeployedCertID != "ap-live" {
+		t.Errorf("DeployedCertID = %q, want ap-live", c.DeployedCertID)
+	}
+	if string(c.KeyPEM) != "\xde\xad\xbe\xef" {
+		t.Errorf("private key not preserved: %x", c.KeyPEM)
+	}
+	// A legacy row cannot know, and false is the conservative answer: it only means
+	// confirmBinding runs once more.
+	if c.DeployConfirmed {
+		t.Error("a legacy row must come out unconfirmed, not deployed")
+	}
+
+	// After the column is added, new values must write normally.
+	c.DeployConfirmed = true
+	if err := s.PutCert(c); err != nil {
+		t.Fatalf("write failed after the column was added: %v", err)
+	}
+	got, err := s.GetCert("legacy")
+	if err != nil {
+		t.Fatalf("GetCert failed: %v", err)
+	}
+	if !got.DeployConfirmed {
+		t.Error("deploy_confirmed did not round-trip after the migration")
+	}
+}

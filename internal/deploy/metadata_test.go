@@ -105,3 +105,49 @@ func TestFetchCVMRoleCredentialEmptyCredentials(t *testing.T) {
 		t.Errorf("err = %v, want the server-reported Code in the message", err)
 	}
 }
+
+// The role name comes from the config, and the metadata URL is host + "/" + name. An
+// unescaped name containing "../" would therefore walk out of the
+// security-credentials path and read other metadata entries, whose bodies are echoed
+// back in the error string.
+func TestFetchCVMRoleCredentialEscapesTheRoleName(t *testing.T) {
+	var gotRequestURI string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// RequestURI is what actually went over the wire; r.URL.Path is the server's
+		// decoded view of it, so it always shows the slashes again.
+		gotRequestURI = r.RequestURI
+		http.Error(w, "nope", http.StatusNotFound)
+	}))
+	defer srv.Close()
+	stubMetadataURL(t, srv.URL+"/")
+
+	_, _ = fetchCVMRoleCredential(context.Background(), "../../latest/meta-data/instance-id")
+
+	// PathEscape turns each slash inside the name into %2F, so the request line stays
+	// one path segment and no real `../` sequence is ever sent.
+	if strings.Contains(gotRequestURI, "../") {
+		t.Errorf("the role name reached the request line as a traversal: %q", gotRequestURI)
+	}
+	if !strings.Contains(gotRequestURI, "%2F") {
+		t.Errorf("the slashes in the role name should be escaped, got %q", gotRequestURI)
+	}
+}
+
+// An empty role name would silently request the credential *directory* rather than a
+// role, and the error would then be about parsing JSON instead of about the missing
+// setting.
+func TestFetchCVMRoleCredentialRejectsAnEmptyRoleName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("no request should be made for an empty role name")
+	}))
+	defer srv.Close()
+	stubMetadataURL(t, srv.URL+"/")
+
+	_, err := fetchCVMRoleCredential(context.Background(), "")
+	if err == nil {
+		t.Fatal("an empty roleName must be rejected")
+	}
+	if !strings.Contains(err.Error(), "roleName") {
+		t.Errorf("err = %v, want it to name the missing setting", err)
+	}
+}
