@@ -66,6 +66,12 @@ func (m *Manager) download(
 	if len(o.KeyPEM) == 0 {
 		return m.recordFailure(st, errors.New("the order has no private key; cannot deploy"))
 	}
+	// The last gate of the same triad as coverage and notAfter: a certificate that covers
+	// the right names and lives long enough, but belongs to a different key, would be
+	// deployed over a working one and break every handshake.
+	if err := VerifyKeyMatch(leaf, o.KeyPEM); err != nil {
+		return m.recordFailure(st, err)
+	}
 
 	// Deploy. On a first issuance DeployedCertID is empty, so this only uploads and waits
 	// for a human to bind it once in the CLB console. A successful upload does not mean the
