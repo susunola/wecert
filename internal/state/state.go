@@ -669,6 +669,28 @@ CREATE TABLE IF NOT EXISTS cert_fallback (
     since     INTEGER NOT NULL DEFAULT 0,
     reason    TEXT NOT NULL DEFAULT ''
 );
+
+-- Rate-limit bucket snapshots.
+--
+-- Let's Encrypt publishes its limits and their token-bucket refill rates but offers no way
+-- to query the remaining allowance, so the only way to answer "how much is left" is to
+-- account for what this program spent. A bucket needs no event log: the model is the memory,
+-- so one row per (limit, scope) holding the last known level and when it was observed can be
+-- rolled forward to any later instant.
+--
+-- scope_id is empty for account-wide limits and holds the registered domain / identifier
+-- otherwise. reset_at is an AUTHORITATIVE instant the CA reported ("retry after ..."), which
+-- beats the local estimate because the estimate cannot see other accounts spending the same
+-- global bucket.
+CREATE TABLE IF NOT EXISTS rate_buckets (
+    limit_name TEXT NOT NULL,
+    scope_id   TEXT NOT NULL DEFAULT '',
+    tokens     REAL NOT NULL DEFAULT 0,
+    observed_at INTEGER NOT NULL DEFAULT 0,
+    reset_at   INTEGER NOT NULL DEFAULT 0,
+    reset_reason TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (limit_name, scope_id)
+);
 `
 	_, err := s.db.Exec(schema)
 	if err != nil {

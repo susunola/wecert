@@ -823,6 +823,26 @@ sudo systemctl enable --now wecert-once.timer
 
 The timer's `Unit=` is not decorative: without it, systemd resolves the service of the same name, so if the file is ever renamed to `wecert.timer` the timer silently points at the **daemon** and timer mode stops working while appearing fine.
 
+### Rate-limit quota
+
+Let's Encrypt publishes its limits and their token-bucket refill rates but offers **no endpoint
+to query the remaining allowance** — so "do 40 more issuances fit in this week's 50?" cannot be
+answered by asking. wecert answers it two ways, and the difference matters:
+
+- **Locally, from what it spent** (`wecert_ratelimit_remaining_tokens`). Every event that
+  consumes quota goes through wecert, and the buckets refill at published rates, so the
+  remainder can be reconstructed exactly — for this program. It is a **lower bound**: the
+  per-registered-domain and per-exact-set limits are global, and another account spending them
+  is invisible here. Read it as "at least this much is left".
+- **From the CA, when it refuses** (`wecert_ratelimit_blocked`). A rate-limited request returns
+  a documented message ending in `retry after <instant>`, and when several limits are exceeded
+  at once the CA reports the one that resets *furthest* in the future. That instant is
+  authoritative — it accounts for every other spend the estimate cannot see — so it is stored
+  and reported until it passes.
+
+The accounting lives in `internal/ratelimit` (pure arithmetic, no dependencies) and persists one
+row per bucket in `rate_buckets`: the bucket model is its own memory, so no event log is needed.
+
 ### Metrics and alerting
 
 `/metrics` exposes:
@@ -841,6 +861,8 @@ The timer's `Unit=` is not decorative: without it, systemd resolves the service 
 | `wecert_certificate_fallback_dropped_names{cert}` | How many names that partial certificate is missing |
 | `wecert_desired_state_age_seconds` | Age of the desired-state document. A growing value means `wecert-onboard` stopped running |
 | `wecert_orphaned_certificates` | Certificates in the state store but absent from the desired state. They will not be renewed |
+| `wecert_ratelimit_remaining_tokens{limit,scope}` | Estimated tokens left in a published CA rate limit. **A lower bound**: it counts only what wecert spent, while *certs per registered domain* and *certs per exact set of identifiers* are global across all accounts |
+| `wecert_ratelimit_blocked{limit,scope}` | `1` while the CA has refused a request against this limit and reported when it will accept one again |
 
 Alert on `not_after`, **not** on "did the renewal job error" — the latter stays silent when the program is quietly broken:
 
