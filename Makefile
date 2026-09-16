@@ -26,7 +26,7 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # yet; keep this list in sync when it lands.
 CMDS := wecert wecert-onboard
 
-.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
+.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-repeat vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
@@ -166,6 +166,14 @@ test:
 test-race:
 	$(GO) test -race ./...
 
+# Flakiness and order-dependence gate. Separate from `check` because it costs REPEAT times a full
+# suite, and -race plus a repeat is the slowest thing here. It earned its place: two tests in
+# internal/reconcile asserted absolute values on process-global counters, which holds only on the
+# first run of a test binary.
+REPEAT ?= 3
+test-repeat:
+	$(GO) test -race -shuffle=on -count=$(REPEAT) ./...
+
 vet:
 	$(GO) vet ./...
 
@@ -193,7 +201,12 @@ check-scripts:
 # The shipped Prometheus rules are the only thing watching several failures that are silent by
 # construction, so a rule that cannot fire is worse than no rule: the operator believes they are
 # covered. One of them could not fire, and this is what now catches that class.
+#
+# The self-test runs first and deliberately: the checker itself reported a green tick over a file
+# it had not understood -- four different ways -- so "the checker passed" is only evidence once
+# the checker has been shown to fail when it should.
 check-alerts:
+	python3 scripts/test-check-alerts.py
 	python3 scripts/check-alerts.py
 
 # A real ACME lifecycle against pebble (plus a real account, real order, real CSR finalize and
