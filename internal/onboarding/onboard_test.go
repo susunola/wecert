@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -1366,4 +1367,202 @@ func TestNilRuleSourceCarriesWithAnHonestReason(t *testing.T) {
 	if strings.Contains(d.Reason, "still references") {
 		t.Errorf("the reason must not claim a rule references the name, got %q", d.Reason)
 	}
+}
+
+// A group that exceeds the SAN cap must not simply vanish.
+//
+// group.ErrTooManyNames is explicitly documented as "callers must NOT read it as drop this
+// group": dropping it makes wecert see a certificate disappear into thin air, and the fix
+// (declare a wildcard for a busy sub-namespace, or move names to another group) is a human
+// decision. With a previous revision the group keeps its old certificate instead; on a
+// first run every name is rejected with the reason, so the operator is told.
+func TestOverLimitKeepsTheGroupInsteadOfDroppingIt(t *testing.T) {
+	const cap = 5
+
+	// First run: no previous revision to carry forward, so every name is rejected loudly
+	// rather than silently omitted.
+	first := newHarness(t, Options{MaxNames: cap})
+	for i := 0; i < 12; i++ {
+		first.decls.raw = append(first.decls.raw,
+			decl(fmt.Sprintf("h%02d.example.com", i)))
+	}
+	rep := first.run(t)
+	if rep.Certificates != 0 {
+		t.Errorf("a group over the cap must not produce a certificate on a first run, got %d",
+			rep.Certificates)
+	}
+	included := 0
+	for _, d := range rep.Decisions {
+		if d.Included {
+			included++
+		}
+	}
+	if included != 0 {
+		t.Errorf("no name may be reported as included when the group cannot be expressed, got %d", included)
+	}
+	if len(rep.Decisions) != 12 {
+		t.Errorf("every name must get a decision explaining, got %d", len(rep.Decisions))
+	}
+
+	// Second run with a previous revision in place: the group keeps its old certificate,
+	// and the report says so.
+	second := newHarness(t, Options{MaxNames: cap})
+	for i := 0; i < 3; i++ {
+		second.decls.raw = append(second.decls.raw,
+			decl(fmt.Sprintf("h%02d.example.com", i)))
+	}
+	if r := second.run(t); r.Certificates != 1 {
+		t.Fatalf("the first run should have produced one certificate, got %d", r.Certificates)
+	}
+	for i := 3; i < 12; i++ {
+		second.decls.raw = append(second.decls.raw,
+			decl(fmt.Sprintf("h%02d.example.com", i)))
+	}
+	over := second.run(t)
+
+	if over.Certificates != 1 {
+		t.Errorf("the group must be carried forward from the previous revision, got %d certificates",
+			over.Certificates)
+	}
+	if over.CarriedForward == 0 {
+		t.Error("the report must say the names were carried forward, not silently keep the certificate")
+	}
+	kept := 0
+	for _, d := range over.Decisions {
+		if d.Included {
+			kept++
+		}
+	}
+	if kept != over.CarriedForward {
+		t.Errorf("CarriedForward=%d but %d decisions report the names as kept: the counter and the "+
+			"report disagree", over.CarriedForward, kept)
+	}
+}
+
+// An existing document that cannot be loaded must fail the round, not silently rebuild the
+// desired state without the previous revision.
+//
+// The previous revision is the safety net for the two decisions that can only remove names:
+// overLimit and overSettingsConflict keep an over-cap (or conflicting) group's existing
+// certificate and reject every one of its names only when there is nothing to keep. With
+// r.prev == nil an over-cap group lost its certificate from the written document, wecert
+// then treated it as an orphan that "will not be renewed and will expire", and it did not
+// self-heal -- the next round's previous revision was the document that had already lost it.
+//
+// The trigger is an over-cap group plus an unloadable document (group-writable after a
+// careless rsync, wrong owner after a one-off root run, generatedAt skew after an NTP step),
+// so the impact is production HTTPS loss from two coincident abnormalities.
+func TestUnloadableDocumentFailsTheRoundInsteadOfDroppingAnOverCapGroup(t *testing.T) {
+	h := newHarness(t, Options{MaxNames: 3})
+
+	// Round 1: a healthy group, written normally.
+	for _, n := range []string{"a", "b", "c"} {
+		h.decls.raw = append(h.decls.raw, decl(n+".example.com"))
+	}
+	if r := h.run(t); r.Certificates != 1 {
+		t.Fatalf("round 1 should write one certificate, got %d", r.Certificates)
+	}
+	before, err := os.ReadFile(h.opts.DocumentPath)
+	if err != nil {
+		t.Fatalf("reading the document: %v", err)
+	}
+
+	// Make the document unloadable the way real life does: group-writable.
+	if err := os.Chmod(h.opts.DocumentPath, 0o664); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	// The group is now over the cap, which is exactly when the previous revision matters.
+	h.decls.raw = append(h.decls.raw,
+		decl("d.example.com"), decl("e.example.com"), decl("f.example.com"))
+
+	if _, err := h.ob.Run(context.Background()); err == nil {
+		t.Fatal("an existing but unloadable document must fail the round: continuing without the " +
+			"previous revision lets an over-cap group lose its live certificate")
+	}
+
+	after, err := os.ReadFile(h.opts.DocumentPath)
+	if err != nil {
+		t.Fatalf("reading the document back: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("a failed round must not touch the document:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// The control: a document that simply does not exist yet is a first run, not a failure.
+// Without this, the test above could be satisfied by refusing every round.
+func TestMissingDocumentIsStillAFirstRun(t *testing.T) {
+	h := newHarness(t, Options{})
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("a missing document means first run, got %v", err)
+	}
+	if rep.Certificates != 1 {
+		t.Errorf("the first run must still build the desired state, got %d certificates", rep.Certificates)
+	}
+}
+
+// Losing the state file must not turn deletion from conservative into aggressive.
+//
+// The state file and the document are separate files, so losing only the state (a cleared
+// cache directory, a document restored without its state, a typo in onboarding.statePath)
+// left LastNames empty while the document still described the live desired state. An empty
+// baseline disabled all three deletion guards in one round: the fuse returned early for lack
+// of a baseline, applyGrace found nothing "newly absent" so the grace period was zero
+// seconds, and MarkAbsent never ran so the report did not even record the removal.
+//
+// LoadState's own comment says a state file that cannot be read must never count as empty,
+// "that zeroes every grace period". A missing file is even easier to reach than a corrupt
+// one, so the same rule holds here: the document is the evidence for what was live.
+//
+// The drop is one name out of four on purpose. Four -> three is 25%, below the fuse's 30%
+// threshold, so the round is NOT frozen and the grace path actually runs. That is what makes
+// this test about the grace period rather than about freezing.
+func TestLostStateFileDoesNotDeleteNamesWithoutAGracePeriod(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	for _, n := range []string{"a", "b", "c", "d"} {
+		h.decls.raw = append(h.decls.raw, decl(n+".example.com"))
+	}
+	if r := h.run(t); r.Certificates != 1 {
+		t.Fatalf("round 1 should write one certificate, got %d", r.Certificates)
+	}
+
+	// The state file disappears; the document survives.
+	if err := os.Remove(h.opts.StatePath); err != nil {
+		t.Fatalf("removing the state file: %v", err)
+	}
+
+	// One name stops being declared: small enough to pass the fuse.
+	h.decls.raw = []RawDeclaration{
+		decl("a.example.com"), decl("b.example.com"), decl("c.example.com"),
+	}
+
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.Frozen() {
+		t.Fatalf("a 25%% drop must not trip the fuse, but the round froze: %v", rep.FreezeReasons)
+	}
+
+	// The grace clock must have started for the now-undeclared name.
+	if _, ok := rep.State.AbsentSince["d.example.com"]; !ok {
+		t.Error("d.example.com was live in the previous document but the round never started its " +
+			"grace clock; with no baseline a name that stops being declared is removed at once")
+	}
+
+	// And it must still be in the document: the grace period is what keeps it served while
+	// the absence is confirmed.
+	doc := h.document(t)
+	for _, d := range doc.Certificates[0].Domains {
+		if d == "d.example.com" {
+			return
+		}
+	}
+	t.Errorf("d.example.com must still be covered during its grace period, got %v",
+		doc.Certificates[0].Domains)
 }

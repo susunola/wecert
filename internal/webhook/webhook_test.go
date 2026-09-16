@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -962,5 +963,82 @@ func TestFullTriggerReportsWhatTheReconcilerStarted(t *testing.T) {
 	}
 	if len(resp.Accepted) != 2 {
 		t.Errorf("accepted = %v, want only the resolver's answer", resp.Accepted)
+	}
+}
+
+// ── Drain ────────────────────────────────────────────────────────────────────────────
+
+// Drain must wait for a notification that is already in flight.
+//
+// Delivery is fire-and-forget: Renewal hands the POST to a goroutine and returns. That is
+// right while the daemon keeps running, but a one-shot run or a shutdown would otherwise
+// exit with the POST in flight and lose it -- including the "result":"error" one, which is
+// the notification an operator most needs. Drain is what the daemon calls before returning.
+func TestDrainWaitsForAnInFlightNotification(t *testing.T) {
+	received := make(chan struct{})
+	release := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Block until the test says so: this is the "still in flight" window.
+		<-release
+		close(received)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	n := NewNotifier(srv.URL, "shhh", log)
+	if n == nil {
+		t.Fatal("NewNotifier returned nil for a configured URL")
+	}
+
+	n.Renewal(context.Background(), "example-com", errors.New("issuance failed"))
+
+	drained := make(chan struct{})
+	go func() {
+		n.Drain(context.Background())
+		close(drained)
+	}()
+
+	// The send is blocked in the handler, so Drain must still be waiting.
+	select {
+	case <-drained:
+		t.Fatal("Drain returned while a notification was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return after the in-flight notification completed")
+	}
+	select {
+	case <-received:
+	default:
+		t.Error("the notification was never delivered to the endpoint")
+	}
+}
+
+// A notification offered after Drain must be refused rather than accepted: nothing is left
+// to wait for it, so taking it is the same as dropping it later, only less visibly.
+func TestDrainRefusesNewNotifications(t *testing.T) {
+	var got int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&got, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	n := NewNotifier(srv.URL, "", log)
+	n.Drain(context.Background())
+
+	n.Renewal(context.Background(), "example-com", nil)
+	time.Sleep(100 * time.Millisecond)
+
+	if atomic.LoadInt32(&got) != 0 {
+		t.Error("a notification accepted after Drain can never be waited for; it must be refused")
 	}
 }

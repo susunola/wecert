@@ -328,7 +328,10 @@ func (o *Onboarder) Run(ctx context.Context) (*Report, error) {
 	r.st = st
 	r.rep.State = st
 
-	r.loadPrevious()
+	if err := r.loadPrevious(); err != nil {
+		return nil, err
+	}
+	r.recoverBaselineFromDocument()
 	r.gather(ctx)
 
 	// The order is deliberate: judge the abrupt change from the raw declarations
@@ -454,21 +457,95 @@ func (o *Onboarder) loadState() (*State, error) {
 
 // loadPrevious reads the previous document.
 //
-// Not finding one is not an error: the first run has none. But if the file exists
-// and cannot be parsed, the previous revision has already rotted, and that must be
-// said out loud -- it means this round has no freeze target.
-func (r *run) loadPrevious() {
+// Not finding one is not an error: the first run has none.
+//
+// An existing document that cannot be loaded IS an error, and the round must stop. It used
+// to log a warning and continue with r.prev == nil, which turned out to be destructive: the
+// previous revision is the safety net for two decisions that can only remove names --
+// overLimit and overSettingsConflict keep a group's old certificate and fall back to
+// rejecting every one of its names only when there is something to keep. With no previous
+// revision, a group that momentarily exceeds the SAN cap has all of its names rejected, the
+// certificate leaves the written document, and wecert then treats it as an orphan that
+// "will not be renewed and will expire". It does not self-heal either: the next round's
+// previous revision is the document that already lost the certificate.
+//
+// Reaching that state needs an over-cap group AND an unloadable document (a group- or
+// world-writable file after a careless rsync, a wrong owner after a one-off root run, a
+// generatedAt skew after an NTP step), which is why it survived this long. The impact is
+// live HTTPS loss, and the safe answer is available: refuse the round. Nothing is written,
+// so the operator fixes the permissions and re-runs.
+//
+// This is the same call loadState makes for a corrupt state file, and for the same reason:
+// continuing without the guard turns "conservative" into "aggressive" for deletions.
+func (r *run) loadPrevious() error {
 	doc, err := spec.LoadDocument(r.o.opts.DocumentPath)
 	if err != nil {
 		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
-			return
+			return nil // first run: no previous revision to protect
 		}
-		r.o.log.Warn("previous desired-state document is unusable; there is no freeze target this round",
-			"path", r.o.opts.DocumentPath, "err", err)
-		return
+		return fmt.Errorf(
+			"the previous desired-state document %s exists but cannot be read (%w); refusing this round "+
+				"rather than rebuilding it without the previous revision -- the previous revision is what keeps "+
+				"an over-cap group's existing certificate instead of dropping it, so writing now could remove a "+
+				"live certificate from the desired state. Fix the file's permissions/ownership (or move it aside "+
+				"to declare a fresh start) and re-run",
+			r.o.opts.DocumentPath, err)
 	}
 	r.prev = doc
 	r.rep.PreviousRevision = doc.Revision
+	return nil
+}
+
+// recoverBaselineFromDocument rebuilds the grace and fuse baseline when the state file is
+// gone but a previous document is on disk.
+//
+// LoadState treats a missing state file as "first run", and on a genuine first run that is
+// right. But the state file and the document are separate files: losing only the state
+// (a cleared /var/lib cache, a restored document without its state, a typo in
+// onboarding.statePath) left LastNames empty while the document still described the live
+// desired state. An empty baseline disables all three of the guards that make deletion
+// conservative, in the same round:
+//
+//   - the abrupt-change fuse returns early with no baseline to compare against, so a mass
+//     disappearance is not noticed at all;
+//   - applyGrace derives "newly absent" from LastNames, so nothing is absent and every
+//     removal takes effect with a zero-second grace period;
+//   - MarkAbsent never runs, so the report shows drop=0 and the removal is not recorded.
+//
+// The document itself is the evidence: it is the previous round's output, and the names it
+// covers are the names that were live. Seeding from it restores the grace period and gives
+// the fuse a baseline, so a name that really has gone still has to survive the usual
+// checks before it is removed. This is the same principle the corrupt-state path already
+// enforces by refusing to run -- the state must never silently read as "nothing was there".
+func (r *run) recoverBaselineFromDocument() {
+	if r.prev == nil || len(r.st.LastNames) > 0 {
+		return
+	}
+	var names []string
+	seen := make(map[string]bool)
+	for i := range r.prev.Certificates {
+		for _, d := range r.prev.Certificates[i].Domains {
+			if !seen[d] {
+				seen[d] = true
+				names = append(names, d)
+			}
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	r.st.SetLastNames(names)
+	if len(r.st.LastDeclared) == 0 {
+		// The fuse compares declarations against declarations. Which of these names were
+		// declared is not recoverable from the document, but using the covered set is the
+		// documented fallback for a state file written before LastDeclared existed, and it
+		// errs toward freezing rather than toward deleting.
+		r.st.SetLastDeclared(names)
+	}
+	r.o.log.Warn("the onboarding state file is missing but a desired-state document exists; "+
+		"rebuilding the grace-period and fuse baseline from the document, so removals are not "+
+		"treated as a first run",
+		"path", r.o.opts.StatePath, "document", r.o.opts.DocumentPath, "names", len(names))
 }
 
 // gather fetches declarations and guards.

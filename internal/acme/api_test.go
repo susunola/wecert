@@ -691,7 +691,7 @@ func TestAdvanceAbortsWhenTheOrderCannotBePersisted(t *testing.T) {
 		t.Fatalf("closing the store: %v", err)
 	}
 
-	err := m.advance(context.Background(), cert, st, o)
+	err := m.advance(context.Background(), cert, st, o, round{})
 	if err == nil {
 		t.Fatal("a failed order write must abort the step; discarding it means recovery resumes from stale state")
 	}
@@ -1030,7 +1030,7 @@ func TestAdvanceInvalidOrderBacksOffEvenWhenDiscardFails(t *testing.T) {
 	o := &state.Order{CertName: cert.Name, OrderURL: "https://ca.test/order/1", Status: "pending"}
 	st := &state.CertState{Name: cert.Name}
 
-	err = m.advance(context.Background(), cert, st, o)
+	err = m.advance(context.Background(), cert, st, o, round{})
 	if err == nil {
 		t.Fatal("an invalid order must fail the pass")
 	}
