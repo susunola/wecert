@@ -35,6 +35,7 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -49,6 +50,8 @@ import (
 	"testing"
 	"time"
 
+	legoacme "github.com/go-acme/lego/v4/acme"
+	"github.com/go-acme/lego/v4/acme/api"
 	"github.com/miekg/dns"
 
 	"github.com/susunola/wecert/internal/config"
@@ -93,8 +96,22 @@ type authDNS struct {
 	// maxValues remembers the most values ever seen at one name at the same time, which is how
 	// the wildcard+apex case proves both values were up together rather than one after the other.
 	maxValues map[string]int
+	// mutations is every write and delete the provider API performed, in order.
+	//
+	// The live set and the peak count cannot answer "did THIS pass write its records and clean
+	// them up again": a renewal writes the same _acme-challenge names the issuance wrote, so by
+	// the time it starts the peak is already above zero and the peak cannot rise again. The
+	// mutation log can, because it is a sequence rather than a high-water mark.
+	mutations []dnsMutation
 	// queries is every question the server was asked, in order: evidence for the report.
 	queries []string
+}
+
+// dnsMutation is one add or delete of a TXT value, as the provider API requested it.
+type dnsMutation struct {
+	name  string
+	value string
+	add   bool
 }
 
 func (s *authDNS) record(proto string, q dns.Question) {
@@ -112,6 +129,7 @@ func (s *authDNS) addTXT(name, value string) {
 		}
 	}
 	s.txt[name] = append(s.txt[name], value)
+	s.mutations = append(s.mutations, dnsMutation{name: name, value: value, add: true})
 	if n := len(s.txt[name]); n > s.maxValues[name] {
 		s.maxValues[name] = n
 	}
@@ -126,11 +144,31 @@ func (s *authDNS) delTXT(name, value string) {
 			kept = append(kept, v)
 		}
 	}
+	// Logged even when the name was already empty: lego's provider deletes whatever it is
+	// asked to delete, and "the cleanup call happened" is the fact worth having.
+	s.mutations = append(s.mutations, dnsMutation{name: name, value: value, add: false})
 	if len(kept) == 0 {
 		delete(s.txt, name)
 		return
 	}
 	s.txt[name] = kept
+}
+
+// mutationCount marks a position in the mutation log, and mutationsSince returns everything
+// after it, so a case can speak about the writes one pass made rather than the whole run's.
+func (s *authDNS) mutationCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.mutations)
+}
+
+func (s *authDNS) mutationsSince(mark int) []dnsMutation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if mark < 0 || mark > len(s.mutations) {
+		return nil
+	}
+	return append([]dnsMutation(nil), s.mutations[mark:]...)
 }
 
 // snapshot returns the live record set and the peak value count per name.
@@ -366,6 +404,137 @@ func startAuthDNS(t *testing.T) *authDNS {
 	return s
 }
 
+// ── what actually left this process ──────────────────────────────────────────────────
+
+// apiTrace records the ACME requests Manager really sent, and passes every one of them through
+// unchanged: each call reaches the real server over the real client, and each response comes
+// back byte for byte (the renewalInfo body it has to read is replayed to the caller).
+//
+// It exists because two of the properties below cannot be read off the signed certificate:
+//
+//   - "the profile name reached the CA": pebble picks a profile at RANDOM for an order that
+//     carries none -- `profileName = profNames[rand.Intn(len(profiles))]` (wfe.go:1767) -- so a
+//     plumbing bug that dropped the name would show up as the wrong lifetime only two runs in
+//     three. The recorded newOrder arguments turn that into a certainty instead of a coin toss.
+//   - "this pass really consulted ARI": the window the CA suggests is what decides when the
+//     renewal runs, and a successful download clears ARIWindowStart/End and ARICheckedAt for the
+//     next cycle (manager_done.go:228-231), so the state left behind cannot show that the pass
+//     asked. The recorded renewalInfo exchange can.
+//
+// It is observation only: nothing here decides anything, and the Manager's behaviour is
+// identical to a run without it.
+type apiTrace struct {
+	API
+
+	mu sync.Mutex
+	tr traced
+}
+
+// traced is everything one pass asked the CA for, as it left this process.
+type traced struct {
+	orders   []tracedOrder
+	ari      []tracedARI
+	authzs   []tracedAuthz
+	accepted []string
+}
+
+// tracedOrder is one newOrder request as it left this process.
+type tracedOrder struct {
+	domains  []string
+	profile  string
+	replaces string
+}
+
+// tracedARI is one renewalInfo exchange: the certID asked about, and the body the CA returned.
+type tracedARI struct {
+	certID string
+	body   string
+	err    error
+}
+
+// tracedAuthz is one authorization the CA returned, with the status it was in at that moment.
+// A "valid" authorization is one the CA kept from an earlier order for the same account and
+// identifier (RFC 8555 §7.5.2), which is the difference between a pass that has to solve a
+// challenge for a name and one that does not.
+//
+// Every read is recorded, in order: the polling loop reads the same authorization again as it
+// turns valid, and the caller has to look at the first read alone to know what the pass decided.
+type tracedAuthz struct {
+	identifier string
+	status     string
+}
+
+func (a *apiTrace) NewOrder(domains []string, opts *api.OrderOptions) (legoacme.ExtendedOrder, error) {
+	t := tracedOrder{domains: append([]string(nil), domains...)}
+	if opts != nil {
+		t.profile, t.replaces = opts.Profile, opts.ReplacesCertID
+	}
+	a.mu.Lock()
+	a.tr.orders = append(a.tr.orders, t)
+	a.mu.Unlock()
+	return a.API.NewOrder(domains, opts)
+}
+
+func (a *apiTrace) GetAuthorization(authzURL string) (legoacme.Authorization, error) {
+	authz, err := a.API.GetAuthorization(authzURL)
+	if err == nil {
+		a.mu.Lock()
+		a.tr.authzs = append(a.tr.authzs, tracedAuthz{identifier: authz.Identifier.Value, status: authz.Status})
+		a.mu.Unlock()
+	}
+	return authz, err
+}
+
+func (a *apiTrace) GetRenewalInfo(certID string) (*http.Response, error) {
+	resp, err := a.API.GetRenewalInfo(certID)
+	if err != nil {
+		a.recordARI(tracedARI{certID: certID, err: err})
+		return resp, err
+	}
+	// Read the body, then hand the same bytes on: a recorder that consumed them would change
+	// the code path it is watching.
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	a.recordARI(tracedARI{certID: certID, body: string(body), err: readErr})
+	return resp, nil
+}
+
+// AcceptChallenge is recorded because it answers "did this pass have to solve a challenge at
+// all": a CA that reuses a still-valid authorization returns the order already authorized, so
+// no challenge is ever accepted and nothing is written to DNS.
+func (a *apiTrace) AcceptChallenge(challengeURL string) error {
+	a.mu.Lock()
+	a.tr.accepted = append(a.tr.accepted, challengeURL)
+	a.mu.Unlock()
+	return a.API.AcceptChallenge(challengeURL)
+}
+
+func (a *apiTrace) recordARI(t tracedARI) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tr.ari = append(a.tr.ari, t)
+}
+
+// reset forgets everything recorded so far, so the next snapshot describes one pass.
+func (a *apiTrace) reset() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tr = traced{}
+}
+
+// snapshot returns what has been recorded since the last reset.
+func (a *apiTrace) snapshot() traced {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return traced{
+		orders:   append([]tracedOrder(nil), a.tr.orders...),
+		ari:      append([]tracedARI(nil), a.tr.ari...),
+		authzs:   append([]tracedAuthz(nil), a.tr.authzs...),
+		accepted: append([]string(nil), a.tr.accepted...),
+	}
+}
+
 // ── the run ──────────────────────────────────────────────────────────────────────────
 
 // e2eCase is one scenario's result, and the shape the HTML report renders.
@@ -488,6 +657,20 @@ func TestRealDNS01Lifecycle(t *testing.T) {
 		certs := []config.Certificate{{
 			Name: name, Domains: domains,
 			Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+		}}
+		if err := config.NormalizeCertificates(certs); err != nil {
+			t.Fatal(err)
+		}
+		return &certs[0]
+	}
+
+	// newTLSServerCert is the same for the 45-day tlsserver profile. renewBefore is an argument
+	// because the renewal case needs the profile's own default (empty means "leave it alone")
+	// and, in one place, a value that puts the local fallback far away from the ARI window.
+	newTLSServerCert := func(name string, domains []string, renewBefore string) *config.Certificate {
+		certs := []config.Certificate{{
+			Name: name, Domains: domains, RenewBefore: renewBefore,
+			Profile: config.ProfileTLSServer, KeyType: config.KeyTypeECDSAP256,
 		}}
 		if err := config.NormalizeCertificates(certs); err != nil {
 			t.Fatal(err)
@@ -660,7 +843,435 @@ func TestRealDNS01Lifecycle(t *testing.T) {
 				"issued for "+strings.Join(wcert.Domains, ", "))
 		})
 
-	// ── case 5: revocation against a real CA ────────────────────────────────────────
+	// ── case 5: the profile name reaches the CA, and is honoured ────────────────────
+	//
+	// The profile is what decides how long a certificate lives, how many names it may carry
+	// and how far ahead of expiry renewal begins, and on the CA's side all of that is keyed by
+	// the name wecert puts in the new-order request. If that name were dropped in the plumbing,
+	// nothing would error: the order would simply be issued under some other profile. So the
+	// claim is split into its two halves -- the request carried the name verbatim, and the
+	// certificate that came back lives exactly the period this suite's pebble configures for
+	// "tlsserver" (3888000s), not the classic profile's 7776000s.
+	//
+	// The first half is checked on the recorded request rather than on the lifetime alone,
+	// because pebble picks a profile at random when the order carries none (see apiTrace): a
+	// dropped name would come back as a wrong lifetime only two runs in three.
+	rep.runCase(t, "tlsserver-profile-issuance",
+		"Issue under the tlsserver profile: the new-order request must carry the profile name verbatim, and the certificate must come back with that profile's 45-day validity instead of the 90-day classic default.",
+		func(t *testing.T, ev *[]string) {
+			// The same numbers the pebble config in pebble_integration_test.go gives the three
+			// profiles; the tlsserver one is what this case is about.
+			const tlsserverValiditySeconds = 3888000
+
+			pdomains := []string{"p1." + testZoneName, "p2." + testZoneName}
+			pcert := newTLSServerCert("e2e-profile", pdomains, "")
+
+			m := mkManager(t)
+			trace := &apiTrace{API: m.core}
+			m.core = trace
+
+			if err := m.Reconcile(context.Background(), pcert); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			st, err := store.GetCert(pcert.Name)
+			if err != nil || st == nil || st.NotAfter.IsZero() {
+				t.Fatalf("no certificate was recorded: %v %+v", err, st)
+			}
+			leaf, err := ParseLeaf(st.CertPEM)
+			if err != nil {
+				t.Fatalf("the downloaded chain does not parse: %v", err)
+			}
+			if err := VerifyCoverage(leaf, pdomains); err != nil {
+				t.Errorf("the issued certificate does not cover the requested names: %v", err)
+			}
+			if err := VerifyKeyMatch(leaf, st.KeyPEM); err != nil {
+				t.Errorf("the certificate does not belong to the stored key: %v", err)
+			}
+
+			// Half one: the name left this process verbatim.
+			seen := trace.snapshot()
+			if len(seen.orders) != 1 {
+				t.Fatalf("the issuance placed %d orders, want exactly 1", len(seen.orders))
+			}
+			if seen.orders[0].profile != config.ProfileTLSServer {
+				t.Errorf("the new-order request carried profile %q, not %q, so whatever profile the CA applied it was not the one this certificate asked for",
+					seen.orders[0].profile, config.ProfileTLSServer)
+			}
+			// Both names are new to this CA, so both authorizations had to be validated: this is
+			// what says the certificate below came from a real DNS-01 order rather than from an
+			// authorization the CA happened to still consider valid.
+			if len(seen.accepted) != len(pdomains) {
+				t.Errorf("the issuance accepted %d challenges for %d names", len(seen.accepted), len(pdomains))
+			}
+
+			// Half two: the CA honoured it, which is visible as the certificate's own lifetime.
+			want := time.Duration(tlsserverValiditySeconds) * time.Second
+			got := leaf.NotAfter.Sub(leaf.NotBefore)
+			// pebble computes notAfter = notBefore + (validityPeriod-1)s (ca.go:296), so the
+			// exact span is one second short of the configured 3888000s. The tolerance is a
+			// minute: it absorbs that arithmetic without coming anywhere near the tens of days
+			// that separate this profile from classic (90d) or shortlived (6d).
+			if d := got - want; d > time.Minute || d < -time.Minute {
+				t.Errorf("the certificate lives %s, not the tlsserver profile's %s (pebble's validityPeriod is %ds): "+
+					"the CA issued it under a different profile",
+					got.Round(time.Second), want, tlsserverValiditySeconds)
+			}
+
+			// For the report only: the same CA, in the same run, issued the classic certificate
+			// that much longer, which is the comparison that makes "45 days" mean something.
+			if bst, _ := store.GetCert("e2e-basic"); bst != nil {
+				if bleaf, berr := ParseLeaf(bst.CertPEM); berr == nil {
+					*ev = append(*ev, fmt.Sprintf("same CA, same run: the classic certificate e2e-basic lives %s against this one's %s",
+						bleaf.NotAfter.Sub(bleaf.NotBefore).Round(time.Second), got.Round(time.Second)))
+				}
+			}
+
+			if o, _ := store.GetOrder(pcert.Name); o != nil {
+				t.Errorf("the order was left behind after a successful issuance: %+v", o)
+			}
+			live, _ := dnsSrv.snapshot()
+			if len(live) != 0 {
+				t.Errorf("challenge records were left behind: %v", live)
+			}
+			*ev = append(*ev,
+				fmt.Sprintf("the new-order request carried profile %q verbatim", seen.orders[0].profile),
+				fmt.Sprintf("issued validity %s (%s..%s) against the configured validityPeriod of %ds",
+					got.Round(time.Second),
+					leaf.NotBefore.UTC().Format(time.RFC3339), leaf.NotAfter.UTC().Format(time.RFC3339),
+					tlsserverValiditySeconds),
+				fmt.Sprintf("issuer %q, %d SAN(s), key matched to the stored private key", leaf.Issuer.CommonName, len(leaf.DNSNames)),
+				"challenge records cleaned up: none left in the zone")
+		})
+
+	// ── case 6: a complete renewal cycle, with nobody watching ──────────────────────
+	//
+	// What decides WHEN a wecert instance renews is the CA's own renewal window: renewalDecision
+	// reads renewalInfo first and only falls back to notAfter-renewBefore when ARI is
+	// unavailable (manager_renew.go:33-78), and the instant it picks inside that window is
+	// deterministic (RenewalTime). So this case does not push the clock forward in the hope of
+	// crossing a threshold; it sets the clock to the instant the CA's window implies, which is
+	// the same instant the manager computes for itself.
+	//
+	// renewBefore is 24h for one reason: the local fallback then sits at notAfter-24h plus its
+	// jitter, while the CA's window ends at notAfter-(validity/3)+24h -- notAfter-14d for this
+	// profile -- so the two candidate instants are at least thirteen days apart and a renewal
+	// that happens a fortnight before expiry cannot be the fallback rule firing. Without that
+	// the two rules point at roughly the same fortnight, by design, since both renew at about
+	// two thirds of the lifetime, and the case could not tell which one renewed. The premise is
+	// asserted below rather than assumed.
+	rep.runCase(t, "automatic-renewal-of-a-tlsserver-certificate",
+		"Issue a tlsserver certificate, let one pass record the CA's ARI window, then move the clock to the instant that window implies and reconcile ONCE: the pass alone must place the order, validate over the test authority, promote the replacement and clean up after itself.",
+		func(t *testing.T, ev *[]string) {
+			ctx := context.Background()
+			rdomains := []string{"r1." + testZoneName, "r2." + testZoneName}
+			rcert := newTLSServerCert("e2e-renewal", rdomains, "24h")
+
+			// One manager for the whole case: SetNow moves this manager's clock, so the pass that
+			// renews has to be run by the same instance.
+			m := mkManager(t)
+			trace := &apiTrace{API: m.core}
+			m.core = trace
+
+			// (a) issue it, and (b) record what is live now.
+			if err := m.Reconcile(ctx, rcert); err != nil {
+				t.Fatalf("the first Reconcile (issuance): %v", err)
+			}
+			before, err := store.GetCert(rcert.Name)
+			if err != nil || before == nil || before.NotAfter.IsZero() {
+				t.Fatalf("no certificate was recorded: %v %+v", err, before)
+			}
+			beforeLeaf, err := ParseLeaf(before.CertPEM)
+			if err != nil {
+				t.Fatalf("the issued chain does not parse: %v", err)
+			}
+			if err := VerifyCoverage(beforeLeaf, rdomains); err != nil {
+				t.Errorf("the issued certificate does not cover the requested names: %v", err)
+			}
+			if err := VerifyKeyMatch(beforeLeaf, before.KeyPEM); err != nil {
+				t.Errorf("the certificate does not belong to the stored key: %v", err)
+			}
+			// The certID is what the renewal's `replaces` is built from; without it there is no
+			// ARI coordination for this case to test at all.
+			if before.ARICertID == "" {
+				t.Fatalf("the issued certificate has no ARI certID, so this renewal could never be CA-coordinated")
+			}
+
+			// (c) one pass inside the validity period: it must decide to wait, and it must
+			// record the window it is waiting for. That window is read back from the state the
+			// production code wrote -- not from a private ARI call made here -- so the clock
+			// below is derived from exactly what the renewal pass will see.
+			trace.reset()
+			if err := m.Reconcile(ctx, rcert); err != nil {
+				t.Fatalf("the pass inside the validity period: %v", err)
+			}
+			st, err := store.GetCert(rcert.Name)
+			if err != nil || st == nil {
+				t.Fatalf("the certificate state disappeared: %v %+v", err, st)
+			}
+			if !st.NotAfter.Equal(before.NotAfter) {
+				t.Errorf("a pass with %s of validity left renewed the certificate (notAfter %s -> %s): the CA's window is not being waited for",
+					st.NotAfter.Sub(m.now()).Round(time.Hour), before.NotAfter, st.NotAfter)
+			}
+			if st.ARICheckedAt.IsZero() {
+				t.Error("the pass recorded no ARI lookup (ARICheckedAt is still zero), so the renewal would not be CA-coordinated")
+			}
+			if st.ARIWindowStart.IsZero() || !st.ARIWindowEnd.After(st.ARIWindowStart) {
+				t.Fatalf("the CA's suggested window was not recorded (start=%s end=%s): with no ARI instant to renew at, the clock below would be a guess",
+					st.ARIWindowStart, st.ARIWindowEnd)
+			}
+			if seen := trace.snapshot(); len(seen.ari) != 1 {
+				t.Errorf("the pass made %d renewalInfo lookups, want exactly 1", len(seen.ari))
+			}
+
+			// The instant inside the CA's window. RenewalTime is the manager's own function, so
+			// this is the same answer the renewal pass will reach for itself.
+			renewAt := RenewalTime(rcert.Name, st.ARIWindowStart, st.ARIWindowEnd)
+			fallbackAt := DeterministicTime(rcert.Name, st.NotAfter.Add(-rcert.RenewBeforeDur), rcert.RenewBeforeDur/8)
+
+			// Three guards on this case's own premise. If any of them fails the run could not
+			// tell ARI from the local rule, and the case would prove nothing -- so it fails
+			// loudly here rather than reporting a pass it did not earn.
+			if renewAt.Before(st.ARIWindowStart) || renewAt.After(st.ARIWindowEnd) {
+				t.Fatalf("the renewal instant %s is outside the CA's window [%s .. %s]", renewAt, st.ARIWindowStart, st.ARIWindowEnd)
+			}
+			if !renewAt.Before(st.NotAfter) {
+				t.Fatalf("the renewal instant %s is not before the certificate's expiry %s: this clock would be set past expiry", renewAt, st.NotAfter)
+			}
+			if !renewAt.Before(fallbackAt) {
+				t.Fatalf("the renewal instant %s is not before the local fallback instant %s, so a renewal here would not prove the CA's window decided it",
+					renewAt, fallbackAt)
+			}
+
+			// (d) the renewal itself: clock to that instant, then ONE pass. Nothing else happens
+			// in between -- no second Reconcile, no order placed by hand, no re-run.
+			m.SetNow(func() time.Time { return renewAt })
+			trace.reset()
+			dnsMark := dnsSrv.mutationCount()
+			if err := m.Reconcile(ctx, rcert); err != nil {
+				t.Fatalf("the renewal pass: %v", err)
+			}
+
+			after, err := store.GetCert(rcert.Name)
+			if err != nil || after == nil || after.NotAfter.IsZero() {
+				t.Fatalf("no certificate is recorded after the renewal pass: %v %+v", err, after)
+			}
+			afterLeaf, err := ParseLeaf(after.CertPEM)
+			if err != nil {
+				t.Fatalf("the renewed chain does not parse: %v", err)
+			}
+
+			// The live certificate changed, and still covers the same names.
+			if afterLeaf.SerialNumber.Cmp(beforeLeaf.SerialNumber) == 0 {
+				t.Errorf("the live certificate is still the one this case issued (serial %s): the renewal pass did not renew",
+					beforeLeaf.SerialNumber)
+			}
+			if afterLeaf.NotAfter.Before(beforeLeaf.NotAfter) {
+				t.Errorf("the renewal's notAfter (%s) is earlier than the certificate it replaced (%s)",
+					afterLeaf.NotAfter, beforeLeaf.NotAfter)
+			}
+			if err := VerifyCoverage(afterLeaf, rdomains); err != nil {
+				t.Errorf("the renewed certificate does not cover the same names: %v", err)
+			}
+			if drifted, detail := CoverageDrift(afterLeaf, rdomains); drifted {
+				t.Errorf("the renewed certificate's SAN set is not the configured one: %s", detail)
+			}
+			if err := VerifyKeyMatch(afterLeaf, after.KeyPEM); err != nil {
+				t.Errorf("the renewed certificate does not belong to the key recorded with it: %v", err)
+			}
+			if span := afterLeaf.NotAfter.Sub(afterLeaf.NotBefore); span < 45*24*time.Hour-time.Minute || span > 45*24*time.Hour+time.Minute {
+				t.Errorf("the renewal was issued under a different profile: it lives %s, not the tlsserver profile's 45 days",
+					span.Round(time.Second))
+			}
+
+			// The renewal pass itself, from the requests it sent: it re-read the CA's window
+			// (the one on file was stale by weeks) and placed exactly one order, carrying the ARI
+			// `replaces` value of the certificate it supersedes.
+			seen := trace.snapshot()
+			if len(seen.ari) != 1 {
+				t.Errorf("the renewal pass made %d renewalInfo lookups, want exactly 1: a stored window that stale has to be re-read, or the renewal runs on old advice",
+					len(seen.ari))
+			} else {
+				var info RenewalInfo
+				if err := json.Unmarshal([]byte(seen.ari[0].body), &info); err != nil {
+					t.Errorf("the renewalInfo response does not parse (%v): %s", err, seen.ari[0].body)
+				} else if !info.SuggestedWindow.Start.Equal(st.ARIWindowStart) || !info.SuggestedWindow.End.Equal(st.ARIWindowEnd) {
+					t.Errorf("the renewal pass was given window [%s .. %s] but the clock was set from [%s .. %s]",
+						info.SuggestedWindow.Start, info.SuggestedWindow.End, st.ARIWindowStart, st.ARIWindowEnd)
+				}
+			}
+			if len(seen.orders) != 1 {
+				t.Errorf("the renewal pass placed %d orders, want exactly 1", len(seen.orders))
+			} else {
+				if seen.orders[0].profile != config.ProfileTLSServer {
+					t.Errorf("the renewal order carried profile %q, not %q", seen.orders[0].profile, config.ProfileTLSServer)
+				}
+				if seen.orders[0].replaces != before.ARICertID {
+					t.Errorf("the renewal order carried replaces=%q instead of the live certificate's ARI certID %q: without it the renewal loses the ARI rate-limit exemption",
+						seen.orders[0].replaces, before.ARICertID)
+				}
+			}
+
+			// Reclamation, which with deploy disabled can only be empty, and the honest
+			// assertion is that it is.
+			//
+			// The reclaim record is written only for a certificate that was actually serving a
+			// cloud resource: download computes
+			//
+			//	retireOld := rebound && oldDeployedID != "" && oldDeployedID != deployedID
+			//
+			// (manager_done.go:285) and `rebound` is only set when Deploy.Enabled. This suite
+			// runs deploy.Noop with deploy disabled, so DeployedCertID is empty for both
+			// issuances, oldDeployedID is empty, and nothing is queued. That is not a gap in the
+			// case: reclaiming exists to free Tencent Cloud certificate quota, and there is no
+			// cloud certificate here -- the outgoing one existed only in state.db, where the
+			// renewal overwrites it. So "the old certificate is in the reclaim queue" would be an
+			// invented property; what is asserted instead is that no cloud certificate was ever
+			// claimed and no phantom reclamation was queued.
+			//
+			// time.Now() rather than m.now(): RetiredAt is stamped with the wall clock by the
+			// store (state.go:1309), while m.now() is this case's advanced clock. The cutoff is
+			// in the real future either way, so the list is everything that exists.
+			retired, err := store.ListRetiredCertsBefore(time.Now().Add(24 * time.Hour))
+			if err != nil {
+				t.Fatalf("list the reclaim queue: %v", err)
+			}
+			if len(retired) != 0 {
+				t.Errorf("something was queued for reclamation although no certificate was ever uploaded to a cloud: %+v", retired)
+			}
+			if after.DeployedCertID != "" || after.DeployConfirmed {
+				t.Errorf("a renewal with deploy disabled claims a cloud certificate: deployedCertId=%q deployConfirmed=%v",
+					after.DeployedCertID, after.DeployConfirmed)
+			}
+
+			if o, _ := store.GetOrder(rcert.Name); o != nil {
+				t.Errorf("the renewal left an order in flight: %+v", o)
+			}
+
+			// The challenge records this renewal wrote, and cleaned up again.
+			//
+			// Counted from the provider API's mutation log rather than from the peak value
+			// count, because the issuance already wrote these same names: a peak cannot rise
+			// twice. And counted per name, because "the renewal wrote a record" and "the zone is
+			// clean" are different facts, and a run that only proved the second would pass even
+			// if the solver had never run.
+			//
+			// Whether a given name needs a challenge at all is the CA's choice, not the test's:
+			// a CA may answer an order with an authorization it still considers valid
+			// (RFC 8555 §7.5.2), and for that name the order is already authorized, so no
+			// challenge is accepted and there is nothing to write. pebble rolls that per
+			// identifier -- see PEBBLE_AUTHZREUSE in pebble_integration_test.go, which this suite
+			// pins to "fresh authorization" so that solving a challenge is the normal path.
+			// Both outcomes are correct, so the assertions follow the authorizations the CA
+			// actually returned instead of demanding the one shape that was hoped for.
+			//
+			// Which names the CA considered already authorized when this pass first looked.
+			//
+			// The first read per identifier is the one that decided whether a challenge had to
+			// be solved; the polling loop reads the same authorization again as it turns valid,
+			// and that later "valid" says nothing about what this pass had to do.
+			firstRead := map[string]string{}
+			for _, az := range seen.authzs {
+				ident := strings.ToLower(az.identifier)
+				if _, ok := firstRead[ident]; !ok {
+					firstRead[ident] = az.status
+				}
+			}
+			reused := map[string]bool{}
+			for ident, status := range firstRead {
+				if status == "valid" {
+					reused[ident] = true
+				}
+			}
+			// An order that comes back already authorized makes wecert skip the authorization
+			// reads altogether, so "no authorization was read" says the same thing as "every
+			// authorization was still valid".
+			allReused := len(firstRead) == 0
+			isReused := func(d string) bool { return allReused || reused[strings.ToLower(d)] }
+
+			muts := dnsSrv.mutationsSince(dnsMark)
+			var added, deleted, reusedCount int
+			for _, d := range rdomains {
+				name := dns.Fqdn("_acme-challenge." + d)
+				var writes, deletes int
+				for _, mu := range muts {
+					if mu.name != name {
+						continue
+					}
+					if mu.add {
+						writes++
+					} else {
+						deletes++
+					}
+				}
+
+				if isReused(d) {
+					reusedCount++
+					if writes != 0 {
+						t.Errorf("the CA still had a valid authorization for %s, so this renewal had nothing to solve for it, yet %d record(s) were written at %s",
+							d, writes, name)
+					}
+					continue
+				}
+				// Not reused: the CA issued a fresh authorization, so this pass had to solve it,
+				// and the record had to exist before the CA would look and be gone afterwards.
+				if writes == 0 {
+					t.Errorf("the renewal accepted a challenge for %s but never wrote its record, so nothing could have validated it", name)
+				}
+				if deletes == 0 {
+					t.Errorf("the renewal never cleaned up %s: the record was written and left in the zone", name)
+				}
+				added, deleted = added+writes, deleted+deletes
+			}
+			if want := len(rdomains) - reusedCount; len(seen.accepted) != want {
+				t.Errorf("the renewal accepted %d challenges but %d of %d authorizations were fresh (the rest were reused)",
+					len(seen.accepted), want, len(rdomains))
+			}
+			live, _ := dnsSrv.snapshot()
+			if len(live) != 0 {
+				t.Errorf("challenge records were left behind: %v", live)
+			}
+			dnsEvidence := fmt.Sprintf("the renewal solved %d of %d names over the test authority (%d record write(s), %d delete(s))",
+				len(seen.accepted), len(rdomains), added, deleted)
+			if reusedCount > 0 {
+				dnsEvidence += fmt.Sprintf("; the other %d already had a valid authorization the CA reused, so nothing had to be written for them", reusedCount)
+			}
+			if len(live) == 0 {
+				dnsEvidence += "; the zone's live record set is empty afterwards"
+			}
+
+			// The renewed certificate is bound into the ARI cycle for its own renewal. The
+			// previous cycle's bookkeeping -- window, checked-at, retry-after -- was cleared at
+			// the same moment (manager_done.go:228-231), which is exactly why the window this
+			// case reasons about had to be read before the renewal rather than after it.
+			wantARICertID, certIDErr := CertID(afterLeaf)
+			if certIDErr != nil {
+				t.Errorf("cannot build the renewed certificate's ARI certID: %v", certIDErr)
+			} else if after.ARICertID != wantARICertID {
+				t.Errorf("the renewed certificate's ARI certID is %q, want %q: its own renewal would look up the wrong certificate",
+					after.ARICertID, wantARICertID)
+			}
+
+			*ev = append(*ev,
+				fmt.Sprintf("issued serial %s, valid %s..%s",
+					beforeLeaf.SerialNumber,
+					beforeLeaf.NotBefore.UTC().Format(time.RFC3339), before.NotAfter.UTC().Format(time.RFC3339)),
+				fmt.Sprintf("the pass inside the validity period recorded the CA's window %s..%s and did not renew",
+					st.ARIWindowStart.UTC().Format(time.RFC3339), st.ARIWindowEnd.UTC().Format(time.RFC3339)),
+				fmt.Sprintf("clock moved to %s, the deterministic instant inside that window (%.1f days before expiry), while the local fallback for renewBefore=%s was %s",
+					renewAt.UTC().Format(time.RFC3339), st.NotAfter.Sub(renewAt).Hours()/24,
+					rcert.RenewBeforeDur, fallbackAt.UTC().Format(time.RFC3339)),
+				fmt.Sprintf("one Reconcile then renewed it: serial %s -> %s, notAfter %s -> %s, still %d names",
+					beforeLeaf.SerialNumber, afterLeaf.SerialNumber,
+					before.NotAfter.UTC().Format(time.RFC3339), after.NotAfter.UTC().Format(time.RFC3339), len(rdomains)),
+				fmt.Sprintf("that pass read renewalInfo once and placed exactly 1 order, profile %q and replaces=%s",
+					config.ProfileTLSServer, before.ARICertID),
+				dnsEvidence,
+				fmt.Sprintf("the outgoing certificate was not queued for reclamation: deploy is disabled, so no cloud certificate ID exists for it (deployedCertId=%q) and the retire branch cannot run",
+					after.DeployedCertID),
+				fmt.Sprintf("the renewed certificate's ARI certID %s is recorded for its own next renewal", after.ARICertID))
+		})
+
+	// ── case 7: revocation against a real CA ────────────────────────────────────────
 	rep.runCase(t, "revocation-and-its-durable-retry",
 		"Revoke a real certificate, then revoke it again: an accepted revocation clears the request, and a refused one must stay recorded so every later pass retries it.",
 		func(t *testing.T, ev *[]string) {

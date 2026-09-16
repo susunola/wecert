@@ -166,9 +166,20 @@ func startPebbleWith(t *testing.T, opts pebbleOptions) (dirURL string, client *h
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = dir
 	// PEBBLE_VA_NOSLEEP keeps validation from adding its deliberate delay.
+	//
+	// PEBBLE_AUTHZREUSE pins how often pebble tries to reuse a still-valid authorization
+	// instead of issuing a fresh one. Its default is 50, and that default quietly removes the
+	// whole DNS-01 path from a run: an order whose identifiers already have a valid
+	// authorization comes back ready, so no challenge is accepted, nothing is written to the
+	// authority and the solver never runs (RFC 8555 §7.5.2 permits exactly that, and a
+	// production CA does it too). These suites exist to exercise the DNS path, so the coin is
+	// pinned to "fresh authorization" -- and e2e_dns_test.go's renewal case still asserts what
+	// is true if a reuse happens anyway, because pebble's roll is `rand.Intn(100) > percent`
+	// and 0 therefore leaves a one-in-a-hundred chance per identifier.
 	cmd.Env = append(os.Environ(),
 		"PEBBLE_VA_NOSLEEP=1",
-		"PEBBLE_WFE_NONCEREJECT=0")
+		"PEBBLE_WFE_NONCEREJECT=0",
+		"PEBBLE_AUTHZREUSE=0")
 	if !opts.validate {
 		// Challenge validation is skipped, which is what the order-protocol tests want: account
 		// binding and kid persistence, authorization polling, CSR finalize, chain download, the
