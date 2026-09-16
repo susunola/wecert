@@ -1273,6 +1273,13 @@ func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
 	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
+	// Read the counters before the pass and assert the delta: these live in the process-global
+	// registry, so an absolute expectation only holds on the first run of the test binary and
+	// `go test -count=2` fails with "got 2". The delta is also the stronger statement -- it says
+	// this pass counted exactly once, which "the counter reads 1" cannot distinguish from "an
+	// earlier run already counted it".
+	before := reconcileCounts(t, name)
+
 	r.RunAll(context.Background())
 
 	// No notification: nothing was attempted.
@@ -1282,16 +1289,31 @@ func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "ok"}); n != 0 {
-		t.Errorf("a skipped pass must not be counted as ok, got %v -- a certificate in failure "+
-			"backoff looked healthy on the counter an operator watches", n)
+	after := reconcileCounts(t, name)
+	if after["ok"] != before["ok"] {
+		t.Errorf("a skipped pass must not be counted as ok, went from %v to %v -- a certificate in "+
+			"failure backoff looked healthy on the counter an operator watches",
+			before["ok"], after["ok"])
 	}
-	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "skipped"}); n != 1 {
-		t.Errorf("a skipped pass must be counted as skipped, got %v", n)
+	if after["skipped"] != before["skipped"]+1 {
+		t.Errorf("a skipped pass must be counted as skipped exactly once, went from %v to %v",
+			before["skipped"], after["skipped"])
 	}
-	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "error"}); n != 0 {
-		t.Errorf("a backoff skip is not a failure; got error count %v", n)
+	if after["error"] != before["error"] {
+		t.Errorf("a backoff skip is not a failure; error count went from %v to %v",
+			before["error"], after["error"])
 	}
+}
+
+// reconcileCounts reads the three result counters for one certificate.
+func reconcileCounts(t *testing.T, name string) map[string]float64 {
+	t.Helper()
+	out := make(map[string]float64, 3)
+	for _, result := range []string{"ok", "error", "skipped"} {
+		out[result] = counterValue(t, "wecert_reconcile_total",
+			map[string]string{"cert": name, "result": result})
+	}
+	return out
 }
 
 // The control: a genuine failure still counts as an error and still notifies, so the fix
@@ -1312,6 +1334,8 @@ func TestGenuineFailureStillCountsAndNotifies(t *testing.T) {
 	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
+	before := reconcileCounts(t, name)
+
 	r.RunAll(context.Background())
 
 	select {
@@ -1322,8 +1346,9 @@ func TestGenuineFailureStillCountsAndNotifies(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("a genuine failure must still notify")
 	}
-	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "error"}); n != 1 {
-		t.Errorf("a genuine failure must count as error, got %v", n)
+	if after := reconcileCounts(t, name); after["error"] != before["error"]+1 {
+		t.Errorf("a genuine failure must count as error exactly once, went from %v to %v",
+			before["error"], after["error"])
 	}
 }
 

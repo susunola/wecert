@@ -80,7 +80,20 @@ func (m *Manager) QuotaStatus(scopes map[string]string) []QuotaReport {
 //
 // Called after a pass rather than on a timer: the numbers only change when this program
 // spends something or the CA reports a deadline, and both happen inside a pass.
+//
+// Both vectors are rebuilt from scratch on every call, because their labels carry the *scope* and
+// the scope comes from the desired state. `WithLabelValues` only ever creates: a deployment that
+// renames its first domain, or drops it, leaves the retired scope's series behind at its last
+// value, and nothing ever revisits them. The visible consequence is permanent, not cosmetic --
+// `WecertRateLimitNearlyExhausted` compares that frozen number against 5 and keeps firing for a
+// domain this program no longer manages, which is the same "stale series is a permanent false
+// alarm" failure the probe metrics had.
+//
+// The cost is that a scrape landing in the window between Reset and the Sets below sees no series
+// at all. Absent reads as "not published", which is the honest answer for a scope that is no
+// longer in the desired state, and it is the same trade the blocked vector already made.
 func (m *Manager) PublishQuota(scopes map[string]string) {
+	metrics.RateLimitRemaining.Reset()
 	metrics.RateLimitBlocked.Reset()
 	for _, rep := range m.QuotaStatus(scopes) {
 		metrics.RateLimitRemaining.WithLabelValues(rep.Limit, rep.Scope).Set(rep.Remaining)

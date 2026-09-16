@@ -754,20 +754,15 @@ dns:
 	}
 }
 
-func TestLegoProviderInADefaultBuildSaysHowToEnableIt(t *testing.T) {
-	path := writeConfig(t, minimalWithDNS+`
-dns:
-  provider: lego
-  legoProvider: cloudflare
-`)
-	_, err := Load(path)
-	if err == nil {
-		t.Skip("this binary was built with -tags lego_dns, so the provider is available")
-	}
-	if !strings.Contains(err.Error(), "lego_dns") {
-		t.Errorf("the error must name the build tag that enables it, got %q", err)
-	}
-}
+// Whether a *valid* lego config loads depends on the build tag, and this package cannot see the
+// tag: acme owns it and config must not import acme (that would be a cycle), so all this package
+// can observe is its own zero value for the flag. A test here therefore cannot tell "correctly
+// refused in a default build" from "wrongly refused in a -tags lego_dns build" -- an earlier
+// version of this test asserted only that the error mentioned lego_dns, which is true in both,
+// and so passed in a tagged binary that would have rejected a valid config.
+//
+// The contract is asserted in internal/acme/lego_build_config_test.go instead, where acme's init
+// has by construction run.
 
 // A provider name that is not one of wecert's own must not fall through to a default: silently
 // issuing with dnspod credentials because someone wrote "cloudflare" is the kind of mistake that
