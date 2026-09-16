@@ -94,6 +94,22 @@
   start one goroutine per certificate, so a 100-certificate state fired 100
   concurrent ACME orders, DNSPod writes and cloud calls from a single request,
   while the timer path walks the same certificates strictly one at a time.
+- Do not read a missing `UpdateSyncProgress` as "nothing is bound". The API creates
+  the rebind task and reports per-region progress separately, so the response that
+  first carries a `DeployRecordId` routinely has no progress yet. wecert failed the
+  rebind on that, and the cloud finished switching the listener 47 seconds later --
+  after which the old certificate had no bindings left, so every later round
+  uploaded another certificate, failed identically and recorded another orphan,
+  while the certificate actually serving traffic sat in `retired_certificates`. A
+  present-but-zero count still refuses; a missing one now defers to the task record.
+- Count queued (`PendingTotalCount`) resources as unfinished when waiting for the
+  rebind, so a batched dispatch cannot be judged complete while listeners still
+  serve the old certificate.
+- Recover a rebind that succeeded without being recorded: when the update reports
+  nothing to switch, check whether the *new* certificate is already bound, and treat
+  it as done if it is. Without this, a deployment already stuck in that state stays
+  stuck after upgrading -- the old certificate has no bindings, so every round fails
+  the check no matter how many certificates are uploaded.
 - Reclaim the per-certificate and per-host metric series when they leave the
   desired state. Nothing revisits a name that has gone, so its gauges sat at their
   last value forever -- and a `not_after` frozen at its last value trips the
@@ -139,5 +155,10 @@
 - Cover the authorization wait loop, `StartAll`'s single resolve, the webhook
   trigger's concurrency bound, metric reclamation, guard 1 against a wildcard rule
   domain, and `roleName` escaping.
+- Cover the incident above: a task created with no progress detail whose record later
+  reports success must not be failed; queued resources must keep the wait going; a
+  task that reports nothing for the whole budget is diagnosed as "no resource
+  appears to be bound"; and an already-bound new certificate recovers a wedged
+  deployment.
 - `fakeManager` is now goroutine-safe. Its `calls` slice was appended without a
   lock, which no existing test hit because they all drive the serial `RunAll`.

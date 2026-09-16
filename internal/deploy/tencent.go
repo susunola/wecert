@@ -183,6 +183,25 @@ func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM
 	// The caller must record it in the reclamation list, otherwise this certificate becomes a
 	// cloud orphan that occupies the account's uploaded-certificate quota forever.
 	if err := d.updateInstance(ctx, client, oldID, newID); err != nil {
+		// Before believing that nothing was switched, check whether the new certificate is
+		// already bound to something.
+		//
+		// This is the recovery path for a switch that happened but was not recorded. The
+		// shape is: the rebind went through (or an earlier attempt's did), so the *old*
+		// certificate has no bindings left, and every later round therefore fails the
+		// "nothing to switch" check no matter how many certificates we upload. Asking
+		// about the new certificate settles it directly: if anything is bound to it, the
+		// switch is done and the honest answer is success.
+		//
+		// It also heals deployments that were already stuck this way before the
+		// creation-time progress check was corrected, which no amount of fixing that check
+		// would rescue on its own.
+		if n, berr := d.bindingsWith(ctx, client, newID); berr == nil && n > 0 {
+			d.log.Warn("the one-click update reported nothing to switch, but the new certificate is already bound; "+
+				"treating the switch as done (this is the recovery path for a rebind that succeeded without being recorded)",
+				"oldCertId", oldID, "newCertId", newID, "boundResources", n)
+			return newID, nil
+		}
 		return newID, err
 	}
 	return newID, nil
@@ -235,21 +254,36 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 		}
 		if resp.Response != nil && resp.Response.DeployRecordId != nil && *resp.Response.DeployRecordId > 0 {
 			recordID = *resp.Response.DeployRecordId
-			// Log the server-reported progress verbatim.
-			// bound is "how many resources this old certificate is actually bound to" --
-			// the only authoritative basis for judging whether the one-click update took
-			// effect, since CLB's DescribeListeners does not read certificate bindings back.
-			bound := progressBoundCount(resp.Response.UpdateSyncProgress)
+			progress := resp.Response.UpdateSyncProgress
+			bound := progressBoundCount(progress)
 			d.log.Info("one-click update task created",
 				"oldCertId", oldID, "newCertId", newID,
 				"deployRecordId", recordID,
 				"boundResources", bound,
-				"progress", formatProgress(resp.Response.UpdateSyncProgress))
-			if bound == 0 {
-				return fmt.Errorf("UpdateCertificateInstance found no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
+				"progress", formatProgress(progress))
+
+			// `bound` is only an answer when the server actually sent progress.
+			//
+			// An empty UpdateSyncProgress is a **missing** answer, not the answer "zero".
+			// The API creates the task and reports per-region progress separately, and on
+			// the response that first carries a DeployRecordId it is routinely still
+			// absent -- observed in production: the task was created (recordId=14822) with
+			// no progress detail, wecert read that as "nothing is bound" and failed the
+			// rebind, and the cloud finished switching the listener 47 seconds later.
+			//
+			// That failure is not self-correcting. wecert keeps the old certificate as its
+			// anchor, the old certificate has no bindings left because the switch *did*
+			// happen, so every later round uploads another certificate, fails the same way,
+			// and records another orphan -- while the certificate actually serving traffic
+			// sits in retired_certificates, protected only by the cloud-side resource check.
+			//
+			// So a present-but-zero count still refuses (that really is "nothing bound"),
+			// and a missing count defers to the task record, which is authoritative.
+			if len(progress) > 0 && bound == 0 {
+				return fmt.Errorf("UpdateCertificateInstance reports no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
 					oldID, d.regions)
 			}
-			return d.waitDeployRecord(ctx, client, recordID)
+			return d.waitDeployRecord(ctx, client, recordID, oldID)
 		}
 		if d.now().After(deadline) {
 			return fmt.Errorf("the UpdateCertificateInstance task was not created within 2m (there may be one already running)")
@@ -266,17 +300,22 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 // happens asynchronously in the background. Setting DeployConfirmed without waiting for it
 // to finish writes the most insidious failure mode -- "the program thinks it succeeded
 // while nothing actually took effect" -- into the state database.
-func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, recordID uint64) error {
+func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, recordID uint64, oldID string) error {
 	deadline := d.now().Add(3 * time.Minute)
 	for {
-		success, failed, running, err := d.describeDeployRecord(ctx, client, recordID)
+		success, failed, running, pending, err := d.describeDeployRecord(ctx, client, recordID)
 		if err != nil {
 			d.log.Warn("failed to query the deploy record; retrying shortly", "deployRecordId", recordID, "err", err)
 		} else {
 			d.log.Info("one-click update progress",
 				"deployRecordId", recordID,
-				"success", success, "failed", failed, "running", running)
-			if running == 0 && (success+failed) > 0 {
+				"success", success, "failed", failed, "running", running, "pending", pending)
+
+			// Pending counts as unfinished. Resources are queued before they run, so
+			// "nothing is running" can be true while most of the task has not started --
+			// declaring success there means retiring the old certificate while listeners
+			// still serve it.
+			if running == 0 && pending == 0 && (success+failed) > 0 {
 				if failed > 0 {
 					return fmt.Errorf("one-click update finished with %d resources failed (%d succeeded)", failed, success)
 				}
@@ -284,8 +323,17 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 			}
 		}
 		if d.now().After(deadline) {
-			return fmt.Errorf("one-click update task %d did not finish within 3m (success=%d failed=%d running=%d)",
-				recordID, success, failed, running)
+			// A task that reports nothing at all, for the whole budget, is the genuine
+			// "no resource was bound to the old certificate" case. It is diagnosed only
+			// here, at the end, rather than from the creation-time response: an all-zero
+			// record is also what a task looks like before the server has populated it,
+			// and failing on that is what broke a rebind that was in fact succeeding.
+			if success == 0 && failed == 0 && running == 0 && pending == 0 {
+				return fmt.Errorf("one-click update task %d reported nothing to update within 3m: no resource appears to be bound to the old certificate %s (regions=%v). Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
+					recordID, oldID, d.regions)
+			}
+			return fmt.Errorf("one-click update task %d did not finish within 3m (success=%d failed=%d running=%d pending=%d)",
+				recordID, success, failed, running, pending)
 		}
 		if err := waitBetweenPolls(ctx, 5*time.Second); err != nil {
 			return err
@@ -294,19 +342,20 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 }
 
 // describeDeployRecord queries the resource-level detail of a deploy record once.
-func (d *TencentCLB) describeDeployRecord(ctx context.Context, client sslAPI, recordID uint64) (success, failed, running int64, err error) {
+func (d *TencentCLB) describeDeployRecord(ctx context.Context, client sslAPI, recordID uint64) (success, failed, running, pending int64, err error) {
 	req := ssl.NewDescribeHostUpdateRecordDetailRequest()
 	req.DeployRecordId = common.StringPtr(strconv.FormatUint(recordID, 10))
 	resp, err := client.DescribeHostUpdateRecordDetailWithContext(ctx, req)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	if resp.Response == nil {
-		return 0, 0, 0, errors.New("DescribeHostUpdateRecordDetail returned an empty response")
+		return 0, 0, 0, 0, errors.New("DescribeHostUpdateRecordDetail returned an empty response")
 	}
 	return derefI64(resp.Response.SuccessTotalCount),
 		derefI64(resp.Response.FailedTotalCount),
 		derefI64(resp.Response.RunningTotalCount),
+		derefI64(resp.Response.PendingTotalCount),
 		nil
 }
 
@@ -423,12 +472,18 @@ func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
 	if certID == "" {
 		return 0, nil
 	}
-
 	client, err := d.client(ctx)
 	if err != nil {
 		return 0, err
 	}
+	return d.bindingsWith(ctx, client, certID)
+}
 
+// bindingsWith enumerates a certificate's bindings against an existing client.
+//
+// Split out so Deploy's recovery path can reuse it: that path already holds a client,
+// and rebuilding one would mean a second credential fetch and TLS setup.
+func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID string) (int, error) {
 	createReq := ssl.NewCreateCertificateBindResourceSyncTaskRequest()
 	createReq.CertificateIds = []*string{common.StringPtr(certID)}
 	// IsCache=1: allow reusing the server-side cache, avoiding a full enumeration on every

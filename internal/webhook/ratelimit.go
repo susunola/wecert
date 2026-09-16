@@ -6,9 +6,9 @@ import (
 )
 
 const (
-	authMaxFailures = 10
-	authWindow      = 5 * time.Minute
-	authBlockFor    = 15 * time.Minute
+	authMaxFailures        = 10
+	authWindow             = 5 * time.Minute
+	authBlockFor           = 15 * time.Minute
 	authLimiterGCThreshold = 4096
 )
 
