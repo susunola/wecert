@@ -7,9 +7,11 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/go-acme/lego/v4/challenge"
+	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/miekg/dns"
 )
 
@@ -296,5 +298,214 @@ func TestFindZoneFailsFastOnPublicSuffix(t *testing.T) {
 	// The walk stops at the TLD's SOA; it must never go probing beyond it.
 	if len(queries) > 3 {
 		t.Errorf("the walk should have stopped at the public suffix, but kept querying: %v", queries)
+	}
+}
+
+// ---------- LookupTXT: the reclaim probe must be authoritative ----------
+
+// cachedNXDOMAINHarness scripts the failure mode that forced the reclaim probe to become
+// authoritative: the recursive resolver serves a **negatively cached** NXDOMAIN for the
+// TXT (the record was written after the negative answer got cached, and DNSPod's SOA
+// negative TTL is ~600s), while the zone's authoritative nameserver answers per
+// authorityReply.
+func cachedNXDOMAINHarness(
+	t *testing.T,
+	authorityReply func(msg *dns.Msg, name, value string) (*dns.Msg, error),
+) (*DNSSolver, DNSRecord, *int) {
+	t.Helper()
+	// No network CNAME chase inside GetChallengeInfo.
+	t.Setenv("LEGO_DISABLE_CNAME_SUPPORT", "true")
+
+	info := dns01.GetChallengeInfo("example.com", "keyauth-1")
+	rec := DNSRecord{FQDN: dns01.ToFqdn(info.EffectiveFQDN), Value: info.Value}
+
+	resolver, authority := "192.0.2.53:53", "198.51.100.53:53"
+	solver := &DNSSolver{
+		recursiveNameservers: []string{resolver},
+		log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	authorityQueries := 0
+	solver.exchange = func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+		name := msg.Question[0].Name
+		switch server {
+		case resolver:
+			switch msg.Question[0].Qtype {
+			case dns.TypeSOA:
+				if name == "example.com." {
+					return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}, Ns: "ns1.example.net."}), nil
+				}
+				resp := dnsReply(msg)
+				resp.Rcode = dns.RcodeNameError
+				return resp, nil
+			case dns.TypeNS:
+				return dnsReply(msg, &dns.NS{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET}, Ns: "ns1.example.net."}), nil
+			case dns.TypeA:
+				if name == "ns1.example.net." {
+					return dnsReply(msg, &dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET}, A: []byte{198, 51, 100, 53}}), nil
+				}
+			case dns.TypeAAAA:
+				return dnsReply(msg), nil
+			case dns.TypeTXT:
+				// The negatively cached answer: NXDOMAIN even though the record may
+				// already exist at the authority.
+				resp := dnsReply(msg)
+				resp.Rcode = dns.RcodeNameError
+				return resp, nil
+			}
+		case authority:
+			authorityQueries++
+			return authorityReply(msg, name, rec.Value)
+		}
+		return nil, fmt.Errorf("unexpected query %s type %d to %s", name, msg.Question[0].Qtype, server)
+	}
+	return solver, rec, &authorityQueries
+}
+
+// The reclaim probe used to trust the recursive resolver's first answer, so a negatively
+// cached NXDOMAIN read as "the record is gone" -- the state row got deleted while the
+// TXT lived on in DNSPod forever. The negative answer must be confirmed against the
+// authority, which here says the record is up.
+func TestLookupTXTDistrustsACachedNXDOMAIN(t *testing.T) {
+	solver, rec, authorityQueries := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, name, value string) (*dns.Msg, error) {
+			resp := dnsReply(msg, &dns.TXT{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{value}})
+			resp.Authoritative = true
+			return resp, nil
+		})
+
+	got, found, err := solver.LookupTXT(context.Background(), "example.com", "keyauth-1")
+	if err != nil {
+		t.Fatalf("LookupTXT: %v", err)
+	}
+	if !found {
+		t.Error("the authority holds the record; the cached NXDOMAIN must not win")
+	}
+	if got != rec {
+		t.Errorf("record identity = %+v, want %+v", got, rec)
+	}
+	if *authorityQueries == 0 {
+		t.Error("a negative recursive answer must be confirmed against the authority")
+	}
+}
+
+// Only an authoritative denial may count as "truly absent" -- that is the answer the
+// reclaim path may delete the state row on.
+func TestLookupTXTAuthoritativeNXDOMAINIsTrulyAbsent(t *testing.T) {
+	solver, _, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			resp := dnsReply(msg)
+			resp.Rcode = dns.RcodeNameError
+			resp.Authoritative = true
+			return resp, nil
+		})
+
+	_, found, err := solver.LookupTXT(context.Background(), "example.com", "keyauth-1")
+	if err != nil {
+		t.Fatalf("an authoritative NXDOMAIN is a definitive answer, not an error: %v", err)
+	}
+	if found {
+		t.Error("every reachable authority denies the record; it is truly absent")
+	}
+}
+
+// No authoritative answer at all (the NS is unreachable): the record's fate is unknown,
+// and an error is what makes the callers keep the state row.
+func TestLookupTXTWithNoAuthoritativeAnswerKeepsTheFateUnknown(t *testing.T) {
+	solver, _, _ := cachedNXDOMAINHarness(t,
+		func(_ *dns.Msg, _, _ string) (*dns.Msg, error) {
+			return nil, errors.New("unreachable")
+		})
+
+	_, found, err := solver.LookupTXT(context.Background(), "example.com", "keyauth-1")
+	if err == nil {
+		t.Error("with no authoritative answer the fate is unknown; that must be an error so the row is kept")
+	}
+	if found {
+		t.Error("a failed probe must never report the record as present")
+	}
+}
+
+// ---------- txtLeases: pruning must never split the per-name mutex ----------
+
+// The lease registry must not accumulate one mutex per challenge FQDN forever: an entry
+// is pruned once no value is live at the name and no goroutine can still be using the
+// per-name mutex.
+func TestTXTLeasesPrunesEmptyEntries(t *testing.T) {
+	l := newTXTLeases()
+	const fqdn = "_acme-challenge.example.com."
+
+	mu, release := l.lock(fqdn)
+	mu.Lock()
+	l.add(fqdn, "v")
+	if others := l.remove(fqdn, "v"); others {
+		t.Fatal("no other value is live at the name")
+	}
+	mu.Unlock()
+	release()
+
+	l.mu.Lock()
+	_, kept := l.entries[fqdn]
+	l.mu.Unlock()
+	if kept {
+		t.Error("an entry with no live values and no users must be pruned")
+	}
+
+	// A name that still has live values must survive: the last leaver's delete-all
+	// depends on finding it.
+	l.add(fqdn, "still-live")
+	l.mu.Lock()
+	_, kept = l.entries[fqdn]
+	l.mu.Unlock()
+	if !kept {
+		t.Error("an entry with live values must not be pruned")
+	}
+}
+
+// The pruning hazard: a goroutine that already fetched the per-name mutex but has not
+// locked it yet must never end up excluded by a **different** mutex than a goroutine
+// that arrives after a prune -- then two provider calls run concurrently at the same
+// name, which is the race the registry exists to prevent. The reference count taken in
+// lock (before the mutex is touched) is what keeps that impossible; this hammers the
+// window and lets the inside-counter (and -race) catch a regression.
+func TestTXTLeasesPruneNeverSplitsTheMutex(t *testing.T) {
+	l := newTXTLeases()
+	const fqdn = "_acme-challenge.race.example."
+
+	var guard sync.Mutex
+	inside := 0
+	split := false
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				mu, release := l.lock(fqdn)
+				mu.Lock()
+
+				guard.Lock()
+				inside++
+				if inside > 1 {
+					split = true
+				}
+				guard.Unlock()
+
+				l.add(fqdn, "v")
+				_ = l.remove(fqdn, "v")
+
+				guard.Lock()
+				inside--
+				guard.Unlock()
+
+				mu.Unlock()
+				release()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if split {
+		t.Error("two goroutines were inside the per-name critical section at once: the prune split the mutex")
 	}
 }

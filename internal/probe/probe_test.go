@@ -14,6 +14,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/susunola/wecert/internal/metrics"
 )
 
 // ── Test scaffolding ────────────────────────────────────────────────────────
@@ -447,5 +451,83 @@ func TestProbeIPsDialsAddressesConcurrently(t *testing.T) {
 	if elapsed > 2*opts.Timeout {
 		t.Errorf("probing 3 blackholed addresses took %v; one budget is %v, so these ran in series",
 			elapsed, opts.Timeout)
+	}
+}
+
+// resultFromCert builds a passing probe Result for a host, the way a real
+// handshake would report it.
+func resultFromCert(t *testing.T, cert tls.Certificate, host string) *Result {
+	t.Helper()
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Result{
+		Host:     host,
+		NotAfter: leaf.NotAfter,
+		SANs:     append([]string(nil), leaf.DNSNames...),
+		cert:     leaf,
+	}
+}
+
+// When only some of the resolved addresses could be probed, "the served
+// certificate is the deployed one" is unproven. Leaving probe_match at its
+// previous value would keep reporting a stale 1 while the verdict is non-OK.
+func TestPartialUnreachableMarksProbeMatchZero(t *testing.T) {
+	const host = "partial-unreachable.example"
+	cert := makeCert(t, []string{host},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+	good := resultFromCert(t, cert, host)
+	expectation := Expectation{Domains: []string{host}, NotAfter: good.NotAfter}
+
+	r := NewRunner(Options{}, 0, nil)
+
+	// Prime with a fully successful round, so probe_match stands at 1.
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{{Address: "192.0.2.10:443", Result: good}}, nil
+	}
+	if v := r.Check(context.Background(), host, expectation); !v.OK {
+		t.Fatalf("the priming round should pass, got: %s", v.Summary())
+	}
+	if got := testutil.ToFloat64(metrics.CertificateProbeMatch.WithLabelValues(host)); got != 1 {
+		t.Fatalf("probe_match should be 1 after a clean round, got %v", got)
+	}
+
+	// One address answers with the right certificate, the other cannot be
+	// reached: the verdict is non-OK and probe_match must say so.
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{
+			{Address: "192.0.2.10:443", Result: good},
+			{Address: "192.0.2.11:443", Err: context.DeadlineExceeded},
+		}, nil
+	}
+	if v := r.Check(context.Background(), host, expectation); v.OK {
+		t.Fatal("a partially unreachable host must not pass")
+	}
+	if got := testutil.ToFloat64(metrics.CertificateProbeMatch.WithLabelValues(host)); got != 0 {
+		t.Errorf("probe_match must drop to 0 when not all addresses were verified, got %v (stale 1)", got)
+	}
+}
+
+// A host whose certificate left the desired state is never probed again; its
+// transition memory must be forgettable, or last grows with every host ever
+// seen -- and certificate names are derived from domains, which churn.
+func TestForgetDropsTheRememberedState(t *testing.T) {
+	const host = "forget.example"
+	cert := makeCert(t, []string{host},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{{Address: "192.0.2.10:443", Result: resultFromCert(t, cert, host)}}, nil
+	}
+	r.Check(context.Background(), host, Expectation{Domains: []string{host}})
+
+	if r.LastState(host) == "" {
+		t.Fatal("the host should be remembered after a probe")
+	}
+	r.Forget(host)
+	if got := r.LastState(host); got != "" {
+		t.Errorf("Forget should drop the remembered state, still have %q", got)
 	}
 }

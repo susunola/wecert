@@ -27,6 +27,7 @@ import (
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/onboarding"
 	"github.com/susunola/wecert/internal/spec"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // version can be injected through -ldflags "-X main.version=...".
@@ -124,7 +125,7 @@ Flags:
 	if out == "" {
 		return exitError, errors.New("no output path: set -out, or desiredState.path in the config")
 	}
-	state := firstNonEmpty(*statePath, cfg.Onboarding.StatePath, out+".state.json")
+	stateFile := firstNonEmpty(*statePath, cfg.Onboarding.StatePath, out+".state.json")
 	report := firstNonEmpty(*reportPath, cfg.Onboarding.ReportPath, out+".report.json")
 	if *noReport {
 		report = ""
@@ -132,7 +133,7 @@ Flags:
 
 	opts := onboarding.Options{
 		DocumentPath: out,
-		StatePath:    state,
+		StatePath:    stateFile,
 		ReportPath:   report,
 		Generator:    "wecert-onboard/" + version,
 
@@ -199,6 +200,25 @@ Flags:
 	ob, err := onboarding.New(src, opts, nil)
 	if err != nil {
 		return exitError, err
+	}
+
+	// Two overlapping runs (cron fired again while the previous one was still
+	// working) would load the same state baseline and then last-writer-wins each
+	// other's save: Changes entries are lost (the budget's accounting) and
+	// AbsentSince / LastDeclared regress (the deletion grace clock and the fuse's
+	// baseline jump backwards). Hold the same cross-process lock the state store
+	// uses for the whole load-compute-write cycle, and fail fast when it is taken
+	// -- a second run that queued up would apply its stale baseline the moment the
+	// first one exits, which is worse than an outright error.
+	//
+	// -dry-run is exempt: it writes nothing, so it cannot corrupt the state, and it
+	// is exactly what a human runs while the scheduled job is also active.
+	var unlock func() error
+	if !*dryRun {
+		if unlock, err = state.LockFile(stateFile + ".lock"); err != nil {
+			return exitError, err
+		}
+		defer func() { _ = unlock() }()
 	}
 
 	rep, err := ob.Run(ctx)
