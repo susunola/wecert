@@ -2,5 +2,5 @@
 
 package state
 
-// setUmask 在非 Unix 平台上是个空操作（Windows 没有 umask 语义）。
+// setUmask is a no-op on non-Unix platforms (Windows has no umask semantics).
 func setUmask(int) int { return 0 }

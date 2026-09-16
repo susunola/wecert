@@ -1,86 +1,92 @@
 ###############################################################################
-# wecert 测试环境 —— 变量
+# wecert test environment — variables
 #
-# 设计原则：所有资源都带统一 tag，且全部由 Terraform 管理，
-# 保证 `terraform destroy` 能一件不剩地清干净，不留孤儿计费资源。
+# Design principle: every resource carries a uniform tag and is managed entirely by
+# Terraform, so `terraform destroy` cleans up every last one and leaves no orphaned
+# billable resources.
 ###############################################################################
 
 variable "region" {
-  description = "地域。CLB 是分地域资源，必须和你实际要用的地域一致。"
+  description = "Region. CLB is a regional resource, so this must match the region you actually use."
   type        = string
   default     = "ap-guangzhou"
 }
 
 variable "availability_zone" {
   description = <<-EOT
-    可用区。必须属于上面的 region，而且必须是该账号下 CVM 真正可售的可用区
-    （子网能建出来不代表 CVM 能在那里开机）。
+    Availability zone. It must belong to the region above, and it must be a zone
+    where CVM is actually sellable for this account (a subnet being creatable does
+    not mean a CVM can boot there).
 
-    不要硬编码猜：用 `terraform plan` 看 available_zones 输出，
-    或临时查 data.tencentcloud_availability_zones.cvm.zones。
-    ap-guangzhou-3 在这个账号下就会报 InvalidZone.MismatchRegion。
+    Do not hard-code a guess: use `terraform plan` and read the available_zones
+    output, or look up data.tencentcloud_availability_zones.cvm.zones temporarily.
+    ap-guangzhou-3 reports InvalidZone.MismatchRegion under this account.
   EOT
   type        = string
   default     = "ap-guangzhou-6"
 }
 
 variable "name_prefix" {
-  description = "所有资源统一前缀，便于识别和清理。"
+  description = "Uniform prefix for all resources, to make them easy to identify and clean up."
   type        = string
   default     = "wecert-test"
 }
 
-# ── 测试阶段开关 ────────────────────────────────────────────────────────────
+# ── test stage switches ─────────────────────────────────────────────────────
 #
-# 阶段 A（wildcard 签发）：不需要任何云资源，这个模块都不用 apply。
-# 阶段 B（验证 UpdateCertificateInstance 重绑定）：create_clb = true
-# 阶段 C（验证 systemd + CVM 角色）：create_cvm = true（依赖 create_clb）
+# Stage A (wildcard issuance): needs no cloud resources; this module need not be
+# applied at all.
+# Stage B (verify the UpdateCertificateInstance rebind): create_clb = true
+# Stage C (verify systemd + the CVM role): create_cvm = true (requires create_clb)
 
 variable "create_clb" {
-  description = "是否创建 VPC + CLB + HTTPS 监听器（阶段 B）。"
+  description = "Whether to create the VPC + CLB + HTTPS listener (stage B)."
   type        = bool
   default     = true
 }
 
 variable "create_cvm" {
-  description = "是否额外创建 CVM（阶段 C：验证 systemd 与 CVM 角色凭证）。"
+  description = "Whether to additionally create a CVM (stage C: verify systemd and CVM role credentials)."
   type        = bool
   default     = false
 }
 
 variable "clb_network_type" {
   description = <<-EOT
-    CLB 网络类型。
-    INTERNAL：内网型，不产生公网带宽费用，但只能从 VPC 内部验证。
-    OPEN    ：公网型，可以直接从外部做黑盒探测（读实际服务的证书），
-              代价是公网带宽费用。
+    CLB network type.
+    INTERNAL: internal, incurs no public bandwidth cost, but can only be verified
+              from inside the VPC.
+    OPEN    : public, allows black-box probing from outside (reading the
+              certificate actually being served), at the cost of public bandwidth.
   EOT
   type        = string
   default     = "OPEN"
 
   validation {
     condition     = contains(["INTERNAL", "OPEN"], var.clb_network_type)
-    error_message = "clb_network_type 只能是 INTERNAL 或 OPEN。"
+    error_message = "clb_network_type must be INTERNAL or OPEN."
   }
 }
 
 variable "clb_sni_domain" {
-  description = "绑定到监听器上的占位证书域名。wecert 续期后会替换掉它。"
+  description = "Domain of the placeholder certificate bound to the listener. wecert replaces it on renewal."
   type        = string
   default     = "placeholder.atomwangnus.com"
 }
 
 variable "clb_rule_domains" {
   description = <<-EOT
-    CLB 七层转发规则的域名列表。腾讯云不允许 url 兜底的默认规则，
-    每条规则必须带域名，所以这里一个域名一条规则。
+    Domain list for the CLB layer-7 forwarding rules. Tencent Cloud does not allow
+    a url-fallback default rule; every rule must carry a domain, so this is one
+    rule per domain.
 
-    注意：这里要用**具体主机名**，不能用通配符。
-    provider 会把规则域名当作健康检查的 Host，而健康检查的
-    HttpCheckDomain 明确拒绝通配符：
+    Note: use **concrete hostnames** here, not wildcards. The provider uses the
+    rule domain as the health check Host, and the health check's HttpCheckDomain
+    explicitly rejects wildcards:
       "HttpCheckDomain:*.alpha.example.com can't be regular expression or wildcards"
-    具体主机名同样被证书的 wildcard 覆盖（*.alpha.example.com 含 test.alpha.example.com），
-    对验证没有影响。
+    A concrete hostname is still covered by the certificate's wildcard
+    (*.alpha.example.com includes test.alpha.example.com), so this does not affect
+    verification.
   EOT
   type        = list(string)
   default     = ["test.alpha.atomwangnus.com", "test.beta.atomwangnus.com"]
@@ -88,9 +94,10 @@ variable "clb_rule_domains" {
 
 variable "backend_pages" {
   description = <<-EOT
-    后端按 Host 头返回的测试页。key 是 Host（CLB 转发规则的域名），
-    value 是页面上显示的大字标签。
-    没配到的 Host 会显示 UNKNOWN，方便一眼看出 CLB 是否正确路由。
+    Test pages the backend returns per Host header. The key is the Host (the CLB
+    forwarding rule's domain) and the value is the large label shown on the page.
+    A Host with no entry shows UNKNOWN, so whether the CLB routes correctly is
+    obvious at a glance.
   EOT
   type        = map(string)
   default = {
@@ -101,87 +108,93 @@ variable "backend_pages" {
 
 variable "clb_allowed_cidrs" {
   description = <<-EOT
-    允许访问 CLB:443 的来源网段。
+    Source CIDRs allowed to reach CLB:443.
 
-    留空表示不挂安全组（CLB 对全网开放）—— 测试环境里可以接受，
-    但公网 CLB 挂着真实证书和测试页，收窄一点更稳妥。
+    Empty means no security group is attached (the CLB is open to the whole
+    internet) — acceptable in a test environment, but a public CLB carrying a real
+    certificate and test pages is safer when narrowed.
 
-    默认放开（0.0.0.0/0）是有原因的，别急着收紧：
-    会话期间本机出口 IP 实测从 121.35.103.225 变成了 14.153.66.173，
-    而且不同探测服务还报出第三个地址 —— 出口地址不稳定。
-    再加上浏览器所在的网络出口我无从得知，一旦白名单写错就会把自己关在门外，
-    而排查这个（TLS 握手直接被重置）并不直观。
+    There is a reason the default is wide open (0.0.0.0/0); do not rush to tighten
+    it: during one session the local egress IP was observed changing from
+    121.35.103.225 to 14.153.66.173, and different probing services reported a
+    third address — the egress address is not stable. On top of that, there is no
+    way to know the network egress the browser sits behind, and one mistake in the
+    allowlist locks you out, while diagnosing that (the TLS handshake is simply
+    reset) is not intuitive.
 
-    等你确认了固定的出口 IP，把这里改成 ["x.x.x.x/32"] 重新 apply 即可收紧。
-    查询出口 IP：curl -s https://ifconfig.me/ip
+    Once you have confirmed a fixed egress IP, change this to ["x.x.x.x/32"] and
+    re-apply to tighten it. Look up the egress IP with:
+    curl -s https://ifconfig.me/ip
   EOT
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }
 
 variable "dns_zone" {
-  description = "测试域名所在的 DNSPod 主域（记录会建在这个 zone 下）。"
+  description = "DNSPod apex domain the test domains live in (records are created under this zone)."
   type        = string
   default     = "atomwangnus.com"
 }
 
 variable "create_dns" {
-  description = "是否为转发规则的域名创建指向 CLB 的 A 记录，便于直接用浏览器访问。"
+  description = "Whether to create A records pointing at the CLB for the forwarding-rule domains, so a browser can reach them directly."
   type        = bool
   default     = true
 }
 
 variable "clb_public_ip" {
   description = <<-EOT
-    CLB 的公网 IP，用于 DNS A 记录。
+    Public IP of the CLB, used for the DNS A record.
 
-    广州地域的公网 CLB 不给静态 VIP，只给一个 *.clb.gz-tencentclb.net 域名，
-    而该域名在部分解析器上取不到（实测本地路由器返回 NXDOMAIN、
-    但 DNSPod 公共 DNS 能解析）。所以 DNS 记录直接用 A 记录指向 IP，
-    比 CNAME 到那个域名可靠。
+    A public CLB in the Guangzhou region gets no static VIP, only a
+    *.clb.gz-tencentclb.net domain, and that domain does not resolve on some
+    resolvers (observed: the local router returns NXDOMAIN while DNSPod public DNS
+    resolves it). So the DNS record points straight at the IP with an A record,
+    which is more reliable than a CNAME to that domain.
 
-    换 CLB 或重建环境后这个值要跟着更新。
+    This value has to be updated when the CLB changes or the environment is rebuilt.
   EOT
   type        = string
   default     = "119.91.16.17"
 }
 
 variable "cvm_instance_type" {
-  description = "CVM 规格。默认 2C2G 最低配。"
+  description = "CVM instance type. Defaults to the smallest 2C2G configuration."
   type        = string
   default     = "S5.MEDIUM2"
 }
 
 variable "cvm_image_id" {
-  description = "CVM 镜像 ID，默认 Ubuntu 22.04。不同地域镜像 ID 不同，必要时覆盖。"
+  description = "CVM image ID, Ubuntu 22.04 by default. Image IDs differ per region; override when needed."
   type        = string
   default     = "img-487zeit5" # Ubuntu Server 22.04 LTS 64bit (ap-guangzhou)
 }
 
 variable "cvm_charge_type" {
-  description = "CVM 计费方式。按量计费便于随时销毁。"
+  description = "CVM billing mode. Pay-as-you-go makes it easy to destroy at any time."
   type        = string
   default     = "POSTPAID_BY_HOUR"
 }
 
 variable "enable_cvm_role" {
-  description = "为 CVM 关联 CAM 角色（验证 wecert 的 cvm-role 凭证路径）。"
+  description = "Attach a CAM role to the CVM (to verify wecert's cvm-role credential path)."
   type        = bool
   default     = false
 }
 
 variable "cam_role_name" {
-  description = "要关联到 CVM 的 CAM 角色名。"
+  description = "Name of the CAM role to attach to the CVM."
   type        = string
   default     = "wecert-test-role"
 }
 
 locals {
-  # 统一 tag，方便在控制台一眼认出哪些是测试资源、以及事后清理。
+  # Uniform tags, so test resources are recognizable at a glance in the console and
+  # easy to clean up afterwards.
   #
-  # 注意：不要用 `project` 作 key —— 它是腾讯云的保留 tag key，
-  # 会直接报 UnsupportedOperation.TagSystemReservedTagKey，
-  # 而且是资源创建到一半才失败。
+  # Note: do not use `project` as a key — it is a reserved Tencent Cloud tag key,
+  # which fails with UnsupportedOperation.TagSystemReservedTagKey, and only halfway
+  # through creating the resource.
   tags = {
     app        = "wecert"
     purpose    = "acme-e2e-test"

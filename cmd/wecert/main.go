@@ -1,8 +1,9 @@
-// Command wecert 是一个 cert-manager 风格的 ACME 证书自动续期器，
-// 面向"TLS 在腾讯云 CLB 终结、多台 CVM 只跑业务"的部署形态。
+// Command wecert is a cert-manager-style ACME certificate renewal daemon, built for
+// deployments where TLS terminates at a Tencent Cloud CLB and the CVM fleet only runs
+// the business workload.
 //
-// 因为解密发生在 CLB，整个系统不需要节点 agent，也不需要分发证书文件：
-// 一台机器、一个二进制、一个 SQLite 文件就够了。
+// Because decryption happens at the CLB, the system needs no node agent and no
+// certificate files have to be distributed: one machine, one binary, one SQLite file.
 package main
 
 import (
@@ -32,7 +33,7 @@ import (
 	"github.com/susunola/wecert/internal/webhook"
 )
 
-// version 可通过 -ldflags "-X main.version=..." 注入。
+// version can be injected through -ldflags "-X main.version=...".
 var version = "dev"
 
 func main() {
@@ -69,13 +70,14 @@ func run() error {
 		cfg.StatePath = *statePath
 	}
 
-	// 取状态库的跨进程排他锁。"每张证书最多一个在飞订单"原本只在一个
-	// 进程内成立，而 daemon 与 timer 两种模式同时启用就会并发下单 ——
-	// 撞上的是 7 天不可恢复的 exact-set 限额。
+	// Take the cross-process exclusive lock on the state store. "At most one in-flight
+	// order per certificate" used to hold only inside a single process, but running the
+	// daemon and the timer at once means concurrent orders -- and what you hit is the
+	// 7-day, unrecoverable exact-set limit.
 	//
-	// -dry-run 例外：它几乎总是在 daemon 正在跑的时候被执行，
-	// 而"因为 daemon 在跑所以连配置都校验不了"会把人逼去瞎改配置。
-	// 这条路径只读已有的 ACME 账号、不发起签发。
+	// -dry-run is exempt: it almost always runs while the daemon is already running, and
+	// "cannot even validate the config because the daemon is up" pushes people into
+	// blindly editing the config. This path only reads the existing ACME account; no issuance.
 	openStore := state.Open
 	if *dryRun {
 		openStore = state.OpenUnlocked
@@ -86,33 +88,35 @@ func run() error {
 	}
 	defer store.Close()
 
-	// 首次运行会新建 ACME 账号。如果同时还是生产目录，值得先把话说清楚：
-	// 账号是有限资源（每 IP 每 3 小时最多 10 个），不该反复重建。
+	// The first run creates a new ACME account. If it is also the production directory,
+	// say this plainly up front: accounts are a finite resource (at most 10 per IP per
+	// 3 hours) and should not be recreated over and over.
 	firstRun, err := isFirstRun(store, cfg)
 	if err != nil {
 		return err
 	}
 	logStartup(log, cfg, firstRun)
 
-	// 期望状态来源在碰网络之前就构造好。
+	// The desired-state source is constructed before anything touches the network.
 	//
-	// enforce 模式下文档读不到必须在**启动时**就炸，而不是等到第一次收敛 ——
-	// 允许"起得来但没有期望状态"意味着 wecert 会安静地什么都不续期，
-	// 直到所有证书过期才被发现。
+	// In enforce mode an unreadable document must blow up at **startup**, not at the
+	// first reconcile: allowing "starts up with no desired state" means wecert quietly
+	// renews nothing, and nobody finds out until every certificate has expired.
 	//
-	// 放在这里而不是更后面，还让 -dry-run 能真正回答那个最关键的问题：
-	// "现在切过去，它起得来吗？" —— 而且不必先成功注册一次 ACME 账号。
+	// Being this early is also what lets -dry-run answer the question that matters: "if I
+	// switch to this now, will it start?", without first registering an ACME account.
 	provider, err := newProvider(cfg, log)
 	if err != nil {
 		return err
 	}
 
-	// 网络侧探测器也在这里就构造好：它只读配置、不碰网络，
-	// 而"探测到底开着没有、拨哪个端口"是切换配置时最该确认的事情之一。
+	// The network-side prober is built here as well: it only reads config and touches no
+	// network, and "is probing on at all, and which port does it dial" is one of the first
+	// things to confirm when switching configuration.
 	//
-	// 它是唯一不信任云控制面的证据，所以默认开着。但它可能不适用 ——
-	// 比如 wecert 跑在一台拨不到 CLB VIP 的机器上。那种情况下的表现是
-	// probe_errors 涨，而 probe_match 不动，不会让证书看起来是坏的。
+	// It is the only evidence that does not trust the cloud control plane, so it is on by
+	// default -- but it may not fit every deployment: on a box that cannot dial the CLB VIP,
+	// probe_errors climbs while probe_match stays flat, so certificates never look broken.
 	var prober *probe.Runner
 	if cfg.Probe.EnabledOr(true) {
 		prober = probe.NewRunner(
@@ -151,13 +155,13 @@ func run() error {
 		return err
 	}
 
-	// 先建进程级上下文：webhook 触发的收敛要在后台跑几分钟，
-	// 必须挂在进程上下文上，而不是某个请求的 context 上。
+	// Build the process-level context first: a webhook-triggered reconcile runs in the
+	// background for minutes, so it must hang off the process context, not a request's.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 注意这里的写法：接口值为 nil 和"持有一个 nil 指针的接口"是两回事，
-	// 直接把 (*webhook.Notifier)(nil) 塞进接口会让下面的 != nil 判断失效。
+	// Note the shape: a nil interface and an interface holding a nil pointer differ, and
+	// stuffing (*webhook.Notifier)(nil) into one defeats the != nil check below.
 	var notifier reconcile.Notifier
 	if n := webhook.NewNotifier(cfg.Webhook.NotifyURL, log); n != nil {
 		notifier = n
@@ -166,9 +170,9 @@ func run() error {
 
 	manager := acme.NewManager(store, acme.NewAPI(core), solver, deployer, log)
 
-	// 到期前降级：一张证书里有几个名字一直签不出来、而它又快到期时，
-	// 摘掉那几个名字先签一张，保住其余部分。默认关闭 —— 它会改变证书
-	// 覆盖什么，那是安全决策，不该由程序替人做。
+	// Near-expiry degradation: when a few names in a certificate keep failing to issue
+	// while it nears expiry, drop them and issue for the rest. Off by default -- it
+	// changes what the certificate covers, which is a security call for a human.
 	if cfg.Fallback.EnabledOr(false) {
 		manager.SetFallbackPolicy(cfg.Fallback)
 		log.Warn("the failure fallback is ON: if issuance keeps failing near expiry, wecert will drop " +
@@ -177,7 +181,7 @@ func run() error {
 	}
 	reconciler := reconcile.New(cfg, provider, store, manager, notifier, log)
 
-	// 网络侧探测：拨一个真实的 TLS 连接，确认线上服务的确实是部署的那张证书。
+	// Network-side probing: dial a real TLS connection to confirm the served cert is the deployed one.
 	reconciler.SetProber(prober)
 	if prober != nil {
 		log.Info("network-side certificate probing is on",
@@ -188,17 +192,17 @@ func run() error {
 			"certificate the cloud API reports as deployed is the one actually being served")
 	}
 
-	// 先求值一次并缓存。这样只读端点（webhook 的名字解析、诊断端点）
-	// 在第一次收敛跑完之前就能给出正确答案，而不是先返回一个空列表 ——
-	// 空列表会被读成"期望为空"。
+	// Evaluate once up front and cache it, so the read-only endpoints (webhook name
+	// resolution, diagnostics) answer correctly before the first reconcile finishes
+	// rather than returning an empty list -- which reads as "the desired state is empty".
 	reconciler.Prime(ctx)
 
-	// 指标服务。先同步绑定端口，失败就直接退出 —— 见下面的注释。
+	// Metrics server. Bind the port synchronously first and exit on failure -- see below.
 	if err := startMetricsServer(ctx, cfg.Metrics.Listen, log); err != nil {
 		return err
 	}
 
-	// 事件触发端点。同理：端口绑定失败必须硬失败。
+	// Event-trigger endpoint. Same rule: a failed port bind must be a hard failure.
 	if err := startWebhookServer(ctx, cfg, reconciler, store, log); err != nil {
 		return err
 	}
@@ -213,16 +217,18 @@ func run() error {
 	return nil
 }
 
-// newProvider 按 desiredState.mode 装配期望状态来源。
+// newProvider assembles the desired-state source according to desiredState.mode.
 //
-// 三种模式的差别是**谁有最终解释权**，而不是"读几个文件"：
+// What separates the three modes is **who has the final say**, not "how many files are
+// read":
 //
-//	static   配置里的 certificates 说了算。历史行为，零风险。
-//	observe  仍然按 certificates 收敛，但同时读文档并报告差异。
-//	enforce  文档说了算，certificates 必须为空。
+//	static   the config's certificates decide. Historic behaviour, zero risk.
+//	observe  still converges on certificates, but also reads the document and reports the diff.
+//	enforce  the document decides; certificates must be empty.
 //
-// 之所以把推断挡在 wecert 之外：这个系统所有已知的坑都在"判断"上，
-// 而判断逻辑必然会反复改，证书生命周期必须稳。
+// Inference is kept outside wecert because every known pitfall in this system lives in
+// the "judging", and judging logic will keep changing while the certificate lifecycle
+// must stay stable.
 func newProvider(cfg *config.Config, log *slog.Logger) (spec.Provider, error) {
 	static := spec.NewStatic(cfg.Certificates)
 
@@ -233,8 +239,8 @@ func newProvider(cfg *config.Config, log *slog.Logger) (spec.Provider, error) {
 		return static, nil
 
 	case config.ModeObserve:
-		// 影子来源构造失败**不**让进程起不来：观察阶段文档还没生成是很正常的事，
-		// 此时应当照旧按配置收敛，只是没有对比结果。
+		// A shadow source that fails to build must **not** stop the process: before the
+		// document exists, converge on the config exactly as before, just with no diff.
 		shadow, err := spec.NewFile(cfg.DesiredState.Path, log)
 		if err != nil {
 			log.Warn("observe mode: the desired-state document is not readable yet; "+
@@ -247,11 +253,12 @@ func newProvider(cfg *config.Config, log *slog.Logger) (spec.Provider, error) {
 		return spec.NewObserver(static, shadow, log), nil
 
 	case config.ModeEnforce:
-		// enforce 模式下文档读不到必须**硬失败**。
+		// In enforce mode an unreadable document must **hard fail**.
 		//
-		// 允许"起得来但没有期望状态"意味着 wecert 会安静地什么都不续期，
-		// 直到所有证书过期才被发现 —— 那是最糟的一种失败：无声，且后果全在线上。
-		// 起不来至少是吵闹的，systemd 会重启它，人也会注意到。
+		// Allowing "starts up with no desired state" means wecert quietly renews nothing
+		// until the certificates expire -- the worst kind of failure: silent, with all of
+		// the consequences landing in production. Failing to start is at least loud;
+		// systemd restarts it, and a human notices.
 		f, err := spec.NewFile(cfg.DesiredState.Path, log)
 		if err != nil {
 			return nil, fmt.Errorf("desiredState.mode=%q requires a readable document: %w",
@@ -266,7 +273,7 @@ func newProvider(cfg *config.Config, log *slog.Logger) (spec.Provider, error) {
 }
 
 func runDaemon(ctx context.Context, r *reconcile.Reconciler, interval time.Duration, log *slog.Logger) {
-	// 启动后先跑一轮，再按间隔循环。加抖动避免多实例同时敲门。
+	// Run one pass after startup, then loop on the interval; jitter avoids simultaneous knocking.
 	next := time.After(jitter(time.Second))
 	for {
 		select {
@@ -280,12 +287,12 @@ func runDaemon(ctx context.Context, r *reconcile.Reconciler, interval time.Durat
 		r.RunOnce(ctx)
 		log.Info("reconcile pass finished", "duration", time.Since(start).Round(time.Millisecond))
 
-		// 每轮都重新抖动：固定间隔会让所有实例长期保持同相位。
+		// Re-jitter every round: a fixed interval keeps all instances phase-locked.
 		next = time.After(jitter(interval))
 	}
 }
 
-// jitter 在 [d*0.9, d*1.1) 内取一个随机值。
+// jitter returns a random value in [d*0.9, d*1.1).
 func jitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return time.Second
@@ -294,16 +301,17 @@ func jitter(d time.Duration) time.Duration {
 	return d - time.Duration(delta) + time.Duration(rand.Float64()*2*delta)
 }
 
-// startMetricsServer 启动指标服务。
+// startMetricsServer starts the metrics server.
 //
-// 这里先同步 net.Listen、失败就返回错误，而不是把 ListenAndServe 丢进
-// goroutine、出错只打一行日志了事。
+// It calls net.Listen synchronously and returns an error on failure, rather than
+// dropping ListenAndServe into a goroutine and merely logging a line if it breaks.
 //
-// 原因：/metrics 是这个系统**唯一**的到期告警通道 —— README 明确要求
-// "到期告警基于 not_after 做，而不要基于续期任务有没有报错"。
-// 端口被占用时如果只是安静地打一条错误，程序看上去一切正常，
-// 但监控侧从此再也收不到任何信号，证书会一路静默过期。
-// 这正是本项目最想避免的那种失效，不该由自己制造一个。
+// Why: /metrics is this system's **only** expiry alerting channel -- the README insists
+// that "expiry alerting is driven by not_after, not by whether the renewal job reported
+// an error". If the port is taken and we quietly log one error, the program looks
+// perfectly healthy while monitoring never hears another signal, and certificates slide
+// silently into expiry. That is precisely the failure this project exists to prevent,
+// and it should not manufacture one itself.
 func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
@@ -332,7 +340,7 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) erro
 	}()
 
 	go func() {
-		// 走到这里的错误只能是 Shutdown 触发的 ErrServerClosed。
+		// The only error that can reach here is ErrServerClosed from Shutdown.
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("the metrics server exited unexpectedly", "err", err)
 		}
@@ -342,11 +350,12 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) erro
 	return nil
 }
 
-// startWebhookServer 启动事件触发端点。
+// startWebhookServer starts the event-trigger endpoint.
 //
-// 和指标服务一样**同步**绑定端口，失败就退出。理由也一样：
-// 这是"事件驱动"这条路径的唯一入口，端口被占却只打一行日志，
-// 会让人以为配好了、实际所有事件都丢了 —— 而证书会照常走向过期。
+// Like the metrics server it binds the port **synchronously** and exits on failure, for
+// the same reason: this is the only entrance to the event-driven path, and occupying the
+// port while merely logging a line makes people believe it is configured when in fact
+// every event is lost -- and certificates march on toward expiry regardless.
 func startWebhookServer(
 	ctx context.Context, cfg *config.Config,
 	rec *reconcile.Reconciler, store *state.Store, log *slog.Logger,
@@ -451,7 +460,7 @@ func logStartup(log *slog.Logger, cfg *config.Config, firstRun bool) {
 			"renewBefore", c.RenewBeforeDur,
 			"deploy", c.Deploy.Enabled)
 
-		// 通配符只覆盖一层，二层子域需要单独申请。这是最常见的一个误解。
+		// A wildcard covers one label only; deeper subdomains need their own entry. The classic mistake.
 		for _, d := range c.Domains {
 			if strings.HasPrefix(d, "*.") && strings.Count(d, ".") > 1 {
 				log.Info("note: a wildcard covers only one label",
@@ -475,7 +484,7 @@ func newLogger(level string) *slog.Logger {
 		lv = slog.LevelInfo
 	}
 
-	// systemd/journald 下不带时间戳更好读；直接跑在终端时时间戳有用。
+	// Without timestamps it reads better under systemd/journald; in a terminal they help.
 	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lv})
 	return slog.New(handler)
 }

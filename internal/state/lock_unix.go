@@ -9,11 +9,12 @@ import (
 	"syscall"
 )
 
-// fileLock 是一个基于 flock 的跨进程排他锁。
+// fileLock is a cross-process exclusive lock built on flock.
 //
-// 为什么是 flock 而不是 PID 文件：内核会在进程退出时自动释放它 ——
-// 包括被 kill -9 的情况。PID 文件在崩溃后会留下一个永远删不掉的陈旧锁，
-// 而那种锁最终一定会被人手动 rm 掉，于是这道保护就形同虚设了。
+// Why flock instead of a PID file: the kernel releases it automatically when the
+// process exits -- including the kill -9 case. A PID file leaves behind a stale lock
+// that can never be removed after a crash, and that lock inevitably gets rm'd by hand
+// sooner or later, at which point this protection is purely nominal.
 type fileLock struct {
 	f    *os.File
 	path string
@@ -25,15 +26,16 @@ func acquireLock(path string) (*fileLock, error) {
 		return nil, fmt.Errorf("create lock file %s: %w", path, err)
 	}
 
-	// LOCK_NB：拿不到就立刻失败，绝不在这里等。
+	// LOCK_NB: fail immediately when it cannot be taken, never wait here.
 	//
-	// 等下去意味着一个误启动的进程会安静地排在前一个后面，等它退出之后
-	// 突然开始签发 —— 那比直接报错危险得多：一次误操作会在几小时之后
-	// 才显现，而那时已经没人记得自己启动过第二个进程了。
+	// Waiting would mean a mistakenly started process quietly queues up behind the
+	// first one and suddenly starts issuing after that one exits -- far more dangerous
+	// than an outright error: the mistake would only surface hours later, by which time
+	// nobody remembers starting a second process.
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
-		// EWOULDBLOCK 和 EAGAIN 在 Linux/macOS 上是同一个值，但不同平台的
-		// syscall 包暴露的名字不完全一致，所以两个都认一下。
+		// EWOULDBLOCK and EAGAIN are the same value on Linux/macOS, but the syscall
+		// package does not expose identical names across platforms, so accept both.
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return nil, fmt.Errorf("%w (lock file: %s)", ErrLocked, path)
 		}
@@ -47,8 +49,9 @@ func (l *fileLock) release() error {
 	if l == nil || l.f == nil {
 		return nil
 	}
-	// 显式解锁再关闭。关闭本身也会释放，但显式做一遍让"锁是什么时候放的"
-	// 在代码里可读，而不是依赖读者知道 close 的副作用。
+	// Unlock explicitly, then close. Closing releases the lock on its own, but doing it
+	// explicitly makes "when the lock was dropped" readable in the code instead of
+	// relying on the reader knowing a close side effect.
 	_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
 	return l.f.Close()
 }

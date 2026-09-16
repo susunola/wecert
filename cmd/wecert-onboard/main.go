@@ -1,14 +1,14 @@
-// Command wecert-onboard 把 DNS 里的 _wecert 声明求值成一份期望状态文档。
+// Command wecert-onboard turns the _wecert declarations in DNS into a desired-state document.
 //
-// 它是这套系统里"推断"的那一半，wecert 是"执行"的那一半。两者只通过
-// 文档通信，所以这个组件可以随时重写、替换、甚至整个丢掉，而不影响签发。
+// It is the "infer" half of this system; wecert is the "act" half. They talk only through
+// the document, so this half can be rewritten, replaced or thrown away without affecting issuance.
 //
-// 最省事的用法：
+// The easiest way to use it:
 //
 //	wecert-onboard -config /etc/wecert/config.yaml
 //
-// 第一次接进去时先加 -dry-run：它会把"如果真的按这份文档来，会加什么、
-// 会删什么"打出来，但一个字都不写。看清楚了再让它落盘。
+// The first time you wire it in, add -dry-run: it prints what would be added and removed
+// under the computed document, writing nothing at all. Look it over before it lands on disk.
 package main
 
 import (
@@ -29,7 +29,7 @@ import (
 	"github.com/susunola/wecert/internal/spec"
 )
 
-// version 可通过 -ldflags "-X main.version=..." 注入。
+// version can be injected through -ldflags "-X main.version=...".
 var version = "dev"
 
 func main() {
@@ -43,8 +43,8 @@ func main() {
 	os.Exit(code)
 }
 
-// 退出码。冻结用 2 而不是 1，是为了让监控能区分
-// "这一轮有意冻结了"（需要人看一眼）和"程序本身跑挂了"（需要修 bug）。
+// Exit codes. The freeze case uses 2 rather than 1 so monitoring can tell "this round
+// deliberately froze" (a human should look) from "the program itself crashed" (a bug to fix).
 const (
 	exitOK     = 0
 	exitError  = 1
@@ -110,8 +110,8 @@ Flags:
 		return exitError, errors.New("-config is required")
 	}
 
-	// 只有**显式给过**的 flag 才覆盖配置。用 fs.Visit 而不是比较零值：
-	// 后者会让 "-require-clb=false" 和"没写这个 flag"变得无法区分。
+	// Only flags **explicitly given** override the config. Use fs.Visit, not zero-value
+	// comparison: the latter cannot tell "-require-clb=false" from "flag not passed".
 	explicit := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 
@@ -152,7 +152,7 @@ Flags:
 		Force: *force,
 	}
 
-	// 配置打底，显式 flag 覆盖。
+	// Config provides the baseline; explicit flags override it.
 	zoneList := cfg.Onboarding.Zones
 	if explicit["zones"] {
 		zoneList = splitList(*zones)
@@ -266,10 +266,10 @@ func printSummary(w io.Writer, rep *onboarding.Report, out string, dryRun, quiet
 	}
 }
 
-// printDecisions 把排除项排在前面。
+// printDecisions puts the exclusions first.
 //
-// "为什么没进去"是这类系统的头号问题，把它埋在几百行成功项后面
-// 等于没做可观测性。
+// "Why was it not included" is the number one question for a system like this, and
+// burying it behind hundreds of success lines is as good as no observability at all.
 func printDecisions(w io.Writer, ds []spec.Decision) {
 	var excluded, included []spec.Decision
 	for _, d := range ds {

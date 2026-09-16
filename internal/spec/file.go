@@ -9,7 +9,7 @@ import (
 	"github.com/susunola/wecert/internal/config"
 )
 
-// File 读取 onboarding 组件写下的期望状态文档。
+// File reads the desired-state document written by the onboarding component.
 type File struct {
 	path string
 	log  *slog.Logger
@@ -18,11 +18,12 @@ type File struct {
 	last *Document
 }
 
-// NewFile 构造文档来源。
+// NewFile constructs the document source.
 //
-// **首次读取必须成功**，否则直接返回错误让进程起不来。
-// 如果允许"起得来但没有期望状态"，wecert 会安静地什么都不续期，
-// 直到所有证书过期才被发现 —— 那是最糟的一种失败：无声，且后果全在线上。
+// **The first read must succeed**; otherwise it returns an error and the process
+// refuses to start. Allowing "starts up but has no desired state" would let
+// wecert quietly renew nothing until every certificate expires -- the worst kind
+// of failure: silent, with all the consequences in production.
 func NewFile(path string, log *slog.Logger) (*File, error) {
 	f := &File{path: path, log: log}
 	doc, err := LoadDocument(path)
@@ -33,10 +34,10 @@ func NewFile(path string, log *slog.Logger) (*File, error) {
 	return f, nil
 }
 
-// Kind 实现 Named。
+// Kind implements Named.
 func (f *File) Kind() string { return "document" }
 
-// Desired 实现 Provider。
+// Desired implements Provider.
 func (f *File) Desired(ctx context.Context) ([]config.Certificate, error) {
 	res, err := f.DesiredWithReasons(ctx)
 	if err != nil {
@@ -45,7 +46,8 @@ func (f *File) Desired(ctx context.Context) ([]config.Certificate, error) {
 	return res.Certificates, nil
 }
 
-// DesiredWithReasons 读文档；读不到就冻结在最后一版可用状态上。
+// DesiredWithReasons reads the document; if it cannot, it freezes on the last
+// usable revision.
 func (f *File) DesiredWithReasons(context.Context) (*Result, error) {
 	doc, err := LoadDocument(f.path)
 	if err == nil {
@@ -63,11 +65,12 @@ func (f *File) DesiredWithReasons(context.Context) (*Result, error) {
 		return nil, fmt.Errorf("no usable desired state: %w", err)
 	}
 
-	// 读来源失败 ≠ 期望为空。
+	// A source read failure is not an empty desired state.
 	//
-	// onboarding 那边已经有同样的三态语义，但契约边界不能假设上游一定做对了：
-	// 一份被截断、被误删、或权限被改掉的文档同样会走到这个分支，
-	// 而"照它执行"的后果是批量摘除 SAN，线上立刻握手失败。
+	// onboarding already has the same three-state semantics, but the contract
+	// boundary cannot assume upstream got it right: a truncated, deleted or
+	// chmod-ed document reaches this branch too, and acting on it strips SANs in
+	// bulk, so TLS handshakes in production fail immediately.
 	f.log.Warn("desired-state document is unreadable; freezing on the last good revision",
 		"path", f.path, "revision", last.Revision, "generatedAt", last.GeneratedAt, "err", err)
 	return documentResult(last, true, err.Error()), nil

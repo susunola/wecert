@@ -1,27 +1,31 @@
 #!/usr/bin/env bash
 #
-# 阶段 A + B 端到端编排
+# Stage A + B end-to-end orchestration
 #
-#   ./scripts/run-stage-ab.sh <域名> <邮箱> [--skip-apply]
+#   ./scripts/run-stage-ab.sh <domain> <email> [--skip-apply]
 #
-# 例：
+# Example:
 #   ./scripts/run-stage-ab.sh example.com ops@example.com
 #
-# 做四件事：
-#   1. terraform apply —— 建 VPC + CLB + HTTPS 监听器 + 占位证书
-#   2. 生成 staging 配置，注册 ACME 账号
-#   3. 把占位证书的 CertId 预置进 wecert 状态库（模拟"证书已绑在监听器上"）
-#   4. 跑 wecert —— 签发 wildcard 证书，并触发 UpdateCertificateInstance 重绑定
+# It does four things:
+#   1. terraform apply — create the VPC + CLB + HTTPS listener + placeholder cert
+#   2. generate the staging config and register the ACME account
+#   3. seed the placeholder cert's CertId into the wecert state store (simulating
+#      "a certificate is already bound to the listener")
+#   4. run wecert — issue the wildcard certificate and trigger the
+#      UpdateCertificateInstance rebind
 #
-# 最后用 wecert-clbverify 从腾讯云侧独立取证，确认监听器的 CertId 真的变了。
+# Finally it uses wecert-clbverify to gather independent evidence from the Tencent
+# Cloud side that the listener's CertId really changed.
 set -euo pipefail
 
 DOMAIN="${1:-}"
 EMAIL="${2:-}"
 shift 2 2>/dev/null || true
 
-# 默认只做 plan。创建真实云资源必须显式加 --yes —— 这类脚本
-# 不应该存在"不小心跑一下就产生费用"的可能。
+# By default it only runs plan. Creating real cloud resources requires an explicit
+# --yes — a script like this should not have a "run it once by accident and get
+# billed" failure mode.
 CONFIRM=""
 SKIP_APPLY=""
 for arg in "$@"; do
@@ -29,7 +33,7 @@ for arg in "$@"; do
 	--yes) CONFIRM="--yes" ;;
 	--skip-apply) SKIP_APPLY="--skip-apply" ;;
 	*)
-		echo "未知参数: ${arg}" >&2
+		echo "unknown argument: ${arg}" >&2
 		exit 1
 		;;
 	esac
@@ -43,50 +47,51 @@ CONFIG="${STATE_DIR}/config.yaml"
 CREDS="${WECERT_CREDS:-/Users/atom/Documents/dsh/.secrets/tencent.env}"
 
 if [[ -z "${DOMAIN}" || -z "${EMAIL}" ]]; then
-	echo "用法: $0 <域名> <邮箱> [--yes] [--skip-apply]" >&2
-	echo "例:   $0 example.com ops@example.com --yes" >&2
+	echo "Usage: $0 <domain> <email> [--yes] [--skip-apply]" >&2
+	echo "Example: $0 example.com ops@example.com --yes" >&2
 	echo >&2
-	echo "不带 --yes 时只生成 terraform plan 并停下，不会创建任何资源。" >&2
+	echo "Without --yes it only generates a terraform plan and stops; no resources are created." >&2
 	exit 1
 fi
 
-# ── 前置检查 ────────────────────────────────────────────────────────────────
+# ── preflight checks ────────────────────────────────────────────────────────
 
 if [[ ! -f "${CREDS}" ]]; then
-	echo "错误: 找不到凭证文件 ${CREDS}" >&2
-	echo "      格式应为：export TENCENTCLOUD_SECRET_ID=... / export TENCENTCLOUD_SECRET_KEY=..." >&2
+	echo "Error: credentials file not found: ${CREDS}" >&2
+	echo "      Expected format: export TENCENTCLOUD_SECRET_ID=... / export TENCENTCLOUD_SECRET_KEY=..." >&2
 	exit 1
 fi
 
-# 只提取需要的两个变量，不整个 source 进来。
+# Extract only the two variables needed; do not source the whole file.
 #
-# 凭证文件里往往还躺着别的密钥（GitHub token、PyPI token 之类），
-# source 会把它们一并塞进当前 shell 并被子进程继承 ——
-# terraform 和 wecert 完全不需要这些，没有理由让它们拿到。
+# A credentials file usually holds other secrets too (GitHub tokens, PyPI tokens
+# and the like), and sourcing it would push all of them into the current shell for
+# child processes to inherit — terraform and wecert have no need for them, so
+# there is no reason to hand them over.
 eval "$(grep -E '^[[:space:]]*(export[[:space:]]+)?(TENCENTCLOUD_SECRET_ID|TENCENTCLOUD_SECRET_KEY)=' "${CREDS}")"
 export TENCENTCLOUD_SECRET_ID TENCENTCLOUD_SECRET_KEY
 
 if [[ -z "${TENCENTCLOUD_SECRET_ID:-}" || -z "${TENCENTCLOUD_SECRET_KEY:-}" ]]; then
-	echo "错误: ${CREDS} 里没有设置 TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY" >&2
+	echo "Error: TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY are not set in ${CREDS}" >&2
 	exit 1
 fi
-echo "凭证: 已加载（${TENCENTCLOUD_SECRET_ID:0:8}...）"
+echo "credentials: loaded (${TENCENTCLOUD_SECRET_ID:0:8}...)"
 
 for bin in terraform sqlite3; do
-	command -v "${bin}" >/dev/null 2>&1 || { echo "错误: 缺少 ${bin}" >&2; exit 1; }
+	command -v "${bin}" >/dev/null 2>&1 || { echo "Error: missing ${bin}" >&2; exit 1; }
 done
 
-[[ -x "${ROOT}/bin/wecert" ]] || { echo "错误: 先 make build" >&2; exit 1; }
-[[ -x "${ROOT}/bin/wecert-clbverify" ]] || { echo "错误: 先构建辅助工具: make tools" >&2; exit 1; }
+[[ -x "${ROOT}/bin/wecert" ]] || { echo "Error: run make build first" >&2; exit 1; }
+[[ -x "${ROOT}/bin/wecert-clbverify" ]] || { echo "Error: build the auxiliary tools first: make tools" >&2; exit 1; }
 
 export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR:-/Users/atom/Documents/dsh/.terraform-plugin-cache}"
 export TF_IN_AUTOMATION=1
 
-echo "域名: ${DOMAIN} + *.${DOMAIN}"
-echo "邮箱: ${EMAIL}"
+echo "domain: ${DOMAIN} + *.${DOMAIN}"
+echo "email: ${EMAIL}"
 echo
 
-# ── 1. 建云资源 ─────────────────────────────────────────────────────────────
+# ── 1. create the cloud resources ───────────────────────────────────────────
 
 if [[ "${SKIP_APPLY}" != "--skip-apply" ]]; then
 	echo "=== [1/4] terraform plan ==="
@@ -99,12 +104,13 @@ if [[ "${SKIP_APPLY}" != "--skip-apply" ]]; then
 	if [[ "${CONFIRM}" != "--yes" ]]; then
 		cat <<'EOF'
 
-⚠️  以上计划尚未执行。这一步会创建真实的腾讯云资源并产生费用
-    （VPC / 内网 CLB / HTTPS 监听器 / 占位证书，共 7 个资源）。
+⚠️  The plan above has not been applied. This step creates real Tencent Cloud
+    resources and incurs charges (VPC / internal CLB / HTTPS listener /
+    placeholder cert — 7 resources in total).
 
-    确认无误后加 --yes 重新运行即可执行：
+    Once you are sure, add --yes and run it again to apply:
 
-        ./scripts/run-stage-ab.sh <域名> <邮箱> --yes
+        ./scripts/run-stage-ab.sh <domain> <email> --yes
 
 EOF
 		exit 0
@@ -116,7 +122,7 @@ EOF
 	rm -f "${TESTENV}/tfplan"
 	echo
 else
-	echo "=== [1/4] 跳过 terraform apply ==="
+	echo "=== [1/4] skipping terraform apply ==="
 fi
 
 cd "${TESTENV}"
@@ -125,19 +131,19 @@ CLB_ID="$(terraform output -raw clb_id)"
 LISTENER_ID="$(terraform output -raw listener_id)"
 PLACEHOLDER_ID="$(terraform output -raw placeholder_cert_id)"
 
-echo "CLB       : ${CLB_ID}"
-echo "监听器     : ${LISTENER_ID}"
-echo "占位证书   : ${PLACEHOLDER_ID}"
+echo "CLB        : ${CLB_ID}"
+echo "listener   : ${LISTENER_ID}"
+echo "placeholder: ${PLACEHOLDER_ID}"
 echo
 
-echo "--- 重绑定前的状态 ---"
+echo "--- state before the rebind ---"
 "${ROOT}/bin/wecert-clbverify" -region "${REGION}" -clb "${CLB_ID}" -listener "${LISTENER_ID}" \
 	-expect "${PLACEHOLDER_ID}"
 echo
 
-# ── 2. 生成配置并初始化 ─────────────────────────────────────────────────────
+# ── 2. generate the config and initialize ───────────────────────────────────
 
-echo "=== [2/4] 生成配置并注册 ACME 账号 ==="
+echo "=== [2/4] generate the config and register the ACME account ==="
 mkdir -p "${STATE_DIR}"
 rm -f "${STATE_DB}" "${STATE_DB}-wal" "${STATE_DB}-shm"
 
@@ -145,76 +151,76 @@ sed -e "s|REPLACE_ME|${DOMAIN}|g" \
 	-e "s|^  email: .*|  email: ${EMAIL}|" \
 	"${ROOT}/e2e-config-wildcard.yaml" > "${CONFIG}"
 
-# 强制 staging：打错一个字符就会消耗真实生产配额。
-grep -q 'acme-staging' "${CONFIG}" || { echo "错误: 配置不是 staging" >&2; exit 1; }
+# Force staging: one wrong character here burns real production quota.
+grep -q 'acme-staging' "${CONFIG}" || { echo "Error: the config is not staging" >&2; exit 1; }
 
 "${ROOT}/bin/wecert" -config "${CONFIG}" -state "${STATE_DB}" -dry-run
 echo
 
-# ── 3. 预置"证书已绑定"状态 ─────────────────────────────────────────────────
+# ── 3. seed the "certificate is already bound" state ────────────────────────
 
-echo "=== [3/4] 预置 deployed_cert_id = 占位证书 ==="
-# 模拟"wecert 管的证书当前正绑在监听器上"。
-# 这样首次签发走到部署阶段时，oldID 不为空，
-# 就会真正触发 UpdateCertificateInstance 这条路。
+echo "=== [3/4] seed deployed_cert_id = the placeholder cert ==="
+# Simulate "the certificate wecert manages is currently bound to the listener".
+# That way, when the first issuance reaches the deploy stage, oldID is non-empty
+# and the UpdateCertificateInstance path is actually exercised.
 sqlite3 "${STATE_DB}" \
 	"INSERT INTO certificates (name, deployed_cert_id) VALUES ('wildcard-test', '${PLACEHOLDER_ID}')
 	 ON CONFLICT(name) DO UPDATE SET deployed_cert_id='${PLACEHOLDER_ID}';"
 sqlite3 "${STATE_DB}" "SELECT name, deployed_cert_id FROM certificates;"
 echo
 
-# ── 4. 签发 + 重绑定 ────────────────────────────────────────────────────────
+# ── 4. issue + rebind ───────────────────────────────────────────────────────
 
-echo "=== [4/4] 签发 wildcard 证书并触发重绑定 ==="
+echo "=== [4/4] issue the wildcard certificate and trigger the rebind ==="
 "${ROOT}/bin/wecert" -config "${CONFIG}" -state "${STATE_DB}" -once
 
 NEW_CERT_ID="$(sqlite3 "${STATE_DB}" "SELECT deployed_cert_id FROM certificates WHERE name='wildcard-test';")"
 echo
-echo "新证书 CertId: ${NEW_CERT_ID}"
+echo "new certificate CertId: ${NEW_CERT_ID}"
 
 if [[ "${NEW_CERT_ID}" == "${PLACEHOLDER_ID}" || -z "${NEW_CERT_ID}" ]]; then
-	echo "错误: 证书没有被上传（deployed_cert_id 未变化）" >&2
+	echo "Error: the certificate was not uploaded (deployed_cert_id did not change)" >&2
 	exit 1
 fi
 
-# ── 独立取证 ────────────────────────────────────────────────────────────────
+# ── independent evidence ────────────────────────────────────────────────────
 
 echo
-echo "=== 从腾讯云侧独立验证重绑定 ==="
+echo "=== independently verify the rebind from the Tencent Cloud side ==="
 "${ROOT}/bin/wecert-clbverify" -region "${REGION}" -clb "${CLB_ID}" -listener "${LISTENER_ID}" \
 	-expect "${NEW_CERT_ID}" \
 	-not-expect "${PLACEHOLDER_ID}"
 
 echo
-echo "=== 校验 ARI（决定能否豁免速率限制）==="
+echo "=== verify ARI (decides the rate-limit exemption) ==="
 ARI="$(sqlite3 "${STATE_DB}" "SELECT ari_cert_id FROM certificates WHERE name='wildcard-test';")"
 if [[ -z "${ARI}" ]]; then
-	echo "⚠️  ARI certID 为空 —— 续期将无法享受速率豁免" >&2
+	echo "⚠️  ARI certID is empty — renewals will not get the rate-limit exemption" >&2
 else
 	echo "ARI certID: ${ARI}"
 fi
 
 echo
-echo "=== 幂等性：再跑一轮不应产生新订单 ==="
+echo "=== idempotency: another round must not create a new order ==="
 "${ROOT}/bin/wecert" -config "${CONFIG}" -state "${STATE_DB}" -once
 ORDERS="$(sqlite3 "${STATE_DB}" "SELECT count(*) FROM orders;")"
-echo "残留订单数: ${ORDERS}（应为 0）"
-[[ "${ORDERS}" == "0" ]] || { echo "错误: 幂等性被破坏" >&2; exit 1; }
+echo "orders left behind: ${ORDERS} (should be 0)"
+[[ "${ORDERS}" == "0" ]] || { echo "Error: idempotency is broken" >&2; exit 1; }
 
 cat <<EOF
 
 ==============================================
- ✅ 阶段 A + B 全部通过
+ ✅ Stage A + B all passed
 
- 验证结论：
-   - wildcard + apex 共用同一 TXT 名字的路径正常
-   - 权威 NS 传播等待正常
-   - 证书成功上传到腾讯云 SSL 证书服务
-   - UpdateCertificateInstance 成功重绑定了 CLB 监听器
-   - 幂等性正常（未到窗口不产生新订单）
+ What was verified:
+   - the path where wildcard + apex share one TXT name works
+   - waiting for propagation to the authoritative NS works
+   - the certificate was uploaded to Tencent Cloud SSL Certificate Service
+   - UpdateCertificateInstance rebound the CLB listener
+   - idempotency holds (no new order before the window opens)
 
- ⚠️  记得清理：
+ ⚠️  Remember to clean up:
      cd ${TESTENV} && terraform destroy
-     以及 wecert 上传的测试证书（Alias 以 wecert/ 开头的那张）
+     plus the test certificate wecert uploaded (the one whose Alias starts with wecert/)
 ==============================================
 EOF

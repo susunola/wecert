@@ -7,70 +7,79 @@ import (
 	"github.com/go-acme/lego/v4/acme/api"
 )
 
-// API 是 Manager 需要的**全部** ACME 操作。
+// API is **every** ACME operation Manager needs.
 //
-// 抽出来是为了让完整签发流程能进单测。在此之前只有清理路径有窄接口，
-// 于是订单状态机 —— 这套系统里最容易出错、也最贵的一段 —— 只能靠
-// 起一个假的 ACME HTTP 服务器来覆盖。那能跑，但没法回答"它到底按什么
-// 顺序调了哪些方法"，而顺序恰恰是这里全部的正确性所在：
+// It is factored out so the whole issuance flow can be unit tested. Before this,
+// only the cleanup path had a narrow interface, so the order state machine -- the
+// most error-prone and most expensive stretch of this system -- could only be
+// covered by standing up a fake ACME HTTP server. That runs, but it cannot answer
+// "which methods did it call, in what order", and the order is the entire
+// correctness argument here:
 //
-//   - order URL 必须在 newOrder 返回之后**立刻**落盘，在任何别的事情之前
-//   - 通配符与顶点必须"全写 → 全验 → 一起清"
-//   - CSR 必须提交到 finalize URL，而不是 order URL
-//   - 下单必须带 replaces，否则拿不到 ARI 的限速豁免
+//   - the order URL must be persisted **immediately** after newOrder returns,
+//     before anything else happens
+//   - a wildcard and its apex must be "written together, validated together,
+//     cleaned up together"
+//   - the CSR must be submitted to the finalize URL, not the order URL
+//   - the order must carry replaces, or we get no ARI rate-limit exemption
 //
-// 这几条任何一条错了，代价都是 7 天不可恢复的 exact-set 限额。
+// Get any one of these wrong and the price is a 7-day, unrecoverable exact-set limit.
 //
-// 注意这些方法**不带 context**：lego 的 api.Core 本身不是 context 感知的，
-// 它靠 http.Client 的超时。硬加一个 ctx 参数只会造出一个"看起来能取消、
-// 实际不会"的假接口 —— 那比没有更危险，因为它会让人以为取消是生效的。
+// Note that these methods **carry no context**: lego's api.Core is not
+// context-aware at all; it leans on http.Client timeouts. Bolting on a ctx parameter
+// would only invent a fake interface that "looks cancellable but never cancels" --
+// worse than none, because it makes callers believe cancellation actually works.
 type API interface {
-	// NewOrder 新建订单。
+	// NewOrder creates a new order.
 	//
-	// opts 里的 ReplacesCertID 是 ARI 限速豁免的前提。漏掉它不会报错，
-	// 只会让这次签发实打实地消耗配额 —— 这类"不报错的错误"正是
-	// 需要一个能断言调用参数的假实现的原因。
+	// ReplacesCertID in opts is the precondition for the ARI rate-limit exemption.
+	// Leave it out and nothing errors -- the issuance just burns real quota. That
+	// class of "error that never errors" is exactly why we need a fake that can
+	// assert on the arguments it was called with.
 	NewOrder(domains []string, opts *api.OrderOptions) (legoacme.ExtendedOrder, error)
 
-	// GetOrder 读订单当前状态。幂等，也是崩溃恢复的入口。
+	// GetOrder reads the order's current state. Idempotent, and the entry point for
+	// crash recovery.
 	GetOrder(orderURL string) (legoacme.ExtendedOrder, error)
 
-	// UpdateOrderForCSR 把 CSR 提交到 finalize URL。
+	// UpdateOrderForCSR submits the CSR to the finalize URL.
 	//
-	// 参数名是 finalizeURL 而不是 lego 那个误导性的 orderURL：
-	// 传了 order URL 会被 LE 当成 POST-as-GET 并报
-	// "POST-as-GET requests must have an empty payload"。
+	// The parameter is named finalizeURL rather than lego's misleading orderURL:
+	// pass the order URL and LE treats it as POST-as-GET and fails with
+	// "POST-as-GET requests must have an empty payload".
 	UpdateOrderForCSR(finalizeURL string, csr []byte) (legoacme.ExtendedOrder, error)
 
-	// GetAuthorization 读一条授权的当前状态。
+	// GetAuthorization reads the current state of one authorization.
 	GetAuthorization(authzURL string) (legoacme.Authorization, error)
 
-	// AcceptChallenge 通知 CA 去验证。
+	// AcceptChallenge tells the CA to go and validate.
 	AcceptChallenge(challengeURL string) error
 
-	// GetCertificate 下载证书。bundle=true 时返回 fullchain（叶子 + 中间），
-	// 正是 CLB 需要的格式。
+	// GetCertificate downloads the certificate. With bundle=true it returns the
+	// fullchain (leaf + intermediates), which is exactly the format CLB needs.
 	GetCertificate(certURL string, bundle bool) ([]byte, []byte, error)
 
-	// GetRenewalInfo 读 ARI（RFC 9773）。
+	// GetRenewalInfo reads ARI (RFC 9773).
 	//
-	// 返回原始的 *http.Response 而不是解析好的结构，是因为 Retry-After
-	// 头本身就是结论的一部分 —— lego 已经帮我们处理了它两种格式
-	// （秒数 / HTTP-date），而这个头决定"多久之后再来问"。
+	// It returns the raw *http.Response instead of a parsed structure because the
+	// Retry-After header is itself part of the conclusion -- lego already copes with
+	// both of its formats (seconds / HTTP-date), and this header decides how long to
+	// wait before asking again.
 	GetRenewalInfo(certID string) (*http.Response, error)
 
-	// GetKeyAuthorization 把 challenge token 换算成 key authorization，
-	// 也就是要写进 DNS TXT 的那个值。
+	// GetKeyAuthorization converts a challenge token into the key authorization --
+	// the value that goes into the DNS TXT record.
 	GetKeyAuthorization(token string) (string, error)
 }
 
-// NewAPI 把 lego 的 *api.Core 适配成 API。
+// NewAPI adapts lego's *api.Core to API.
 func NewAPI(core *api.Core) API { return coreAPI{core: core} }
 
-// coreAPI 是 API 在 lego 上的实现。
+// coreAPI is the lego-backed implementation of API.
 //
-// 刻意只做转发、不做任何判断：判断属于 Manager，而 adapter 里多一行逻辑
-// 就多一个只有真跑 ACME 才能覆盖的地方 —— 那正是这次重构要消除的东西。
+// It deliberately only forwards and never judges: judgment belongs to Manager, and
+// every extra line of logic in the adapter is another place only a real ACME run can
+// cover -- exactly what this refactor set out to eliminate.
 type coreAPI struct{ core *api.Core }
 
 func (c coreAPI) NewOrder(domains []string, opts *api.OrderOptions) (legoacme.ExtendedOrder, error) {
@@ -89,10 +98,11 @@ func (c coreAPI) GetAuthorization(authzURL string) (legoacme.Authorization, erro
 	return c.core.Authorizations.Get(authzURL)
 }
 
-// AcceptChallenge 把 lego 返回的 ExtendedChallenge 丢掉。
+// AcceptChallenge throws away the ExtendedChallenge lego returns.
 //
-// Manager 只关心"通知发出去了没有"，而逼着假实现去构造一个它根本不看的
-// 结构体，只会让测试里多出一堆与断言无关的噪声。
+// Manager only cares whether the notification went out, and forcing fake
+// implementations to build a struct they never read just adds assertion-irrelevant
+// noise to the tests.
 func (c coreAPI) AcceptChallenge(challengeURL string) error {
 	_, err := c.core.Challenges.New(challengeURL)
 	return err

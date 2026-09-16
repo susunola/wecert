@@ -12,18 +12,18 @@ func TestFailureFallbackDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 默认关闭：它会改变证书覆盖什么，那是安全决策。
+	// Off by default: it changes what a certificate covers, a security decision.
 	if cfg.Fallback.Enabled != nil {
-		t.Error("没写 failureFallback.enabled 时应当是未设置状态")
+		t.Error("an omitted failureFallback.enabled should stay unset")
 	}
 	if cfg.Fallback.EnabledOr(false) {
-		t.Error("默认必须是关闭")
+		t.Error("the default must be off")
 	}
 	if cfg.Fallback.BeforeExpiryDur != 7*24*time.Hour {
-		t.Errorf("beforeExpiry 默认应当是 168h，实际 %v", cfg.Fallback.BeforeExpiryDur)
+		t.Errorf("beforeExpiry default should be 168h, got %v", cfg.Fallback.BeforeExpiryDur)
 	}
 	if cfg.Fallback.FailureWindowDur != 24*time.Hour {
-		t.Errorf("failureWindow 默认应当是 24h，实际 %v", cfg.Fallback.FailureWindowDur)
+		t.Errorf("failureWindow default should be 24h, got %v", cfg.Fallback.FailureWindowDur)
 	}
 }
 
@@ -42,7 +42,7 @@ failureFallback:
 	}
 
 	if !cfg.Fallback.EnabledOr(false) {
-		t.Error("显式开启时应当为真")
+		t.Error("an explicit enable should be true")
 	}
 	if cfg.Fallback.AfterFailuresOr(5) != 8 {
 		t.Errorf("afterFailures = %d", cfg.Fallback.AfterFailuresOr(5))
@@ -67,6 +67,6 @@ failureFallback:
   beforeExpiry: eventually
 `))
 	if err == nil || !strings.Contains(err.Error(), "failureFallback.beforeExpiry") {
-		t.Fatalf("非法时长应当报错，实际 %v", err)
+		t.Fatalf("an invalid duration should error, got %v", err)
 	}
 }

@@ -10,18 +10,18 @@ import (
 	"time"
 )
 
-// Notifier 把续期结果推到外部 URL。
+// Notifier pushes renewal results to an external URL.
 //
-// 它实现的是 reconcile.Notifier。放在这里而不是 reconcile 里，
-// 是因为"通过 HTTP 通知"只是一种实现 —— 收敛层只该知道
-// "有人想知道结果"，不该知道是怎么通知的。
+// It implements reconcile.Notifier. It lives here rather than in reconcile
+// because "notify over HTTP" is only one implementation — the convergence layer
+// should only know "someone wants to know the result", not how it is sent.
 type Notifier struct {
 	url    string
 	client *http.Client
 	log    *slog.Logger
 }
 
-// RenewalEvent 是推给外部的事件体。
+// RenewalEvent is the event body pushed outward.
 type RenewalEvent struct {
 	Event     string `json:"event"`
 	Cert      string `json:"cert"`
@@ -30,23 +30,25 @@ type RenewalEvent struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// NewNotifier 构造通知器。url 为空时返回 nil，调用方按 nil 处理即可。
+// NewNotifier builds a notifier. An empty url returns nil; callers treat nil as
+// a no-op.
 func NewNotifier(url string, log *slog.Logger) *Notifier {
 	if url == "" {
 		return nil
 	}
 	return &Notifier{
 		url: url,
-		// 通知是尽力而为的，超时给短一点。
+		// Notifications are best-effort, so keep the timeout short.
 		client: &http.Client{Timeout: 10 * time.Second},
 		log:    log,
 	}
 }
 
-// Renewal 在每次续期尝试结束后推送一条事件。
+// Renewal pushes one event after each finished renewal attempt.
 //
-// 刻意是**异步**的：通知目标慢或挂掉，绝不能拖住收敛循环 ——
-// 那和"一张证书失败拖住其它证书"是同一类耦合错误。
+// Deliberately **asynchronous**: a slow or dead notification target must never
+// stall the convergence loop — that is the same class of coupling error as "one
+// certificate failing stalls the others".
 func (n *Notifier) Renewal(ctx context.Context, certName string, reconcileErr error) {
 	if n == nil {
 		return
@@ -63,8 +65,8 @@ func (n *Notifier) Renewal(ctx context.Context, certName string, reconcileErr er
 		ev.Error = reconcileErr.Error()
 	}
 
-	// 脱离调用方的 ctx：收敛的 ctx 这时候可能已经到期或被取消，
-	// 但"续期成功了"这件事仍然值得发出去。
+	// Detach from the caller's ctx: the convergence ctx may already be expired or
+	// cancelled here, but "the renewal succeeded" is still worth sending.
 	ctx = context.WithoutCancel(ctx)
 
 	go n.send(ctx, ev)
