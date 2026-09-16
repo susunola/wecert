@@ -131,17 +131,24 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client *ssl.Client, old
 			// bound 就是"这张旧证书实际绑了几个资源"——
 			// 它是判断一键更新到底有没有生效的唯一权威依据，
 			// 因为 CLB 的 DescribeListeners 并不回读证书绑定。
-			bound := progressBoundCount(resp.Response.UpdateSyncProgress)
+			bound, progressReady := progressBoundCount(resp.Response.UpdateSyncProgress)
 			d.log.Info("one-click update task created",
 				"oldCertId", oldID, "newCertId", newID,
 				"deployRecordId", recordID,
 				"boundResources", bound,
 				"progress", formatProgress(resp.Response.UpdateSyncProgress))
-			if bound == 0 {
-				return fmt.Errorf("UpdateCertificateInstance found no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
-					oldID, d.regions)
+			if bound == 0 && progressReady {
+				// 进度明细已填充且确实没有任何资源绑定旧证书。
+				return noResourceBoundError(oldID, d.regions)
 			}
-			return d.waitDeployRecord(ctx, client, recordID)
+			if bound == 0 && !progressReady {
+				// 进度明细尚未填充（TotalCount 全为 null）：任务已创建成功，
+				// 不能仅凭同步响应判定失败，等异步任务的真实结果来裁决。
+				d.log.Warn("the sync progress has no per-region detail yet; "+
+					"falling back to the async deploy record to decide whether any resource is bound",
+					"oldCertId", oldID, "newCertId", newID, "deployRecordId", recordID)
+			}
+			return d.waitDeployRecord(ctx, client, recordID, oldID)
 		}
 		if d.now().After(deadline) {
 			return fmt.Errorf("the UpdateCertificateInstance task was not created within 2m (there may be one already running)")
@@ -159,8 +166,11 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client *ssl.Client, old
 // 调 UpdateCertificateInstance 返回只代表任务创建成功，重绑定是后台异步做的。
 // 不等它跑完就把 DeployConfirmed 置位，等于把"程序以为成功、实际没生效"
 // 这个最隐蔽的故障形态写进状态库。
-func (d *TencentCLB) waitDeployRecord(ctx context.Context, client *ssl.Client, recordID uint64) error {
+func (d *TencentCLB) waitDeployRecord(ctx context.Context, client *ssl.Client, recordID uint64, oldID string) error {
 	deadline := d.now().Add(3 * time.Minute)
+	// 任务创建成功之后、服务端把 running 置 1 之前，有一个三个计数全 0 的
+	// 短暂窗口。立刻判"无绑定资源"会复现同步响应误判的问题，先给一个宽限期。
+	graceUntil := d.now().Add(15 * time.Second)
 	for {
 		success, failed, running, err := d.describeDeployRecord(ctx, client, recordID)
 		if err != nil {
@@ -174,6 +184,11 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client *ssl.Client, r
 					return fmt.Errorf("one-click update finished with %d resources failed (%d succeeded)", failed, success)
 				}
 				return nil
+			}
+			// 任务已结束但没有更新任何资源：旧证书确实没有被任何资源绑定。
+			// 这就是同步响应里 TotalCount 为 null 时被推迟到这里的裁决点。
+			if running == 0 && success == 0 && failed == 0 && d.now().After(graceUntil) {
+				return noResourceBoundError(oldID, d.regions)
 			}
 		}
 		if d.now().After(deadline) {
@@ -203,6 +218,13 @@ func (d *TencentCLB) describeDeployRecord(ctx context.Context, client *ssl.Clien
 		derefI64(resp.Response.FailedTotalCount),
 		derefI64(resp.Response.RunningTotalCount),
 		nil
+}
+
+// noResourceBoundError 生成"旧证书没有被任何资源绑定"的错误。
+// 同步响应（进度已填充）和异步任务结果（零资源结束）两处裁决点共用。
+func noResourceBoundError(oldID string, regions []string) error {
+	return fmt.Errorf("UpdateCertificateInstance found no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
+		oldID, regions)
 }
 
 // resourceTypeRegions 按资源类型展开地域列表。
@@ -256,14 +278,24 @@ func toPtrSlice(in []string) []*string {
 // progressBoundCount 统计这次一键更新一共覆盖了几个资源。
 // 为 0 意味着"没找到任何绑定了旧证书的资源"，也就是说证书其实没绑上 ——
 // 这是最容易被忽略的失败形态。
-func progressBoundCount(progress []*ssl.UpdateSyncProgress) int64 {
+//
+// 第二个返回值 ready 表示服务端是否已经填充了进度明细。
+// UpdateCertificateInstance 的同步响应里 UpdateSyncProgressRegions[].TotalCount
+// 是服务端异步填充的：任务刚创建时它可能是 null（实测出现过任务创建成功、
+// 47 秒后后台正常完成，但同步响应里 TotalCount 全为 null 的情形）。
+// null 不等于 0——此时不能据此判定失败，只能等 DescribeHostUpdateRecordDetail
+// 的异步结果来裁决，否则会把一次成功的换绑误报成失败。
+func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready bool) {
 	var n int64
 	for _, p := range progress {
 		for _, r := range p.UpdateSyncProgressRegions {
+			if r.TotalCount != nil {
+				ready = true
+			}
 			n += derefI64(r.TotalCount)
 		}
 	}
-	return n
+	return n, ready
 }
 
 // formatProgress 把 UpdateCertificateInstance 的进度摘要成一行。
