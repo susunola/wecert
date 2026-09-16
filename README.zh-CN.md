@@ -104,6 +104,14 @@ lego 高层的 `certificate.Obtain` 是刻意不用的：它在内部自己 `new
 
 所有设计都从一条纪律出发：**wecert 永远不推断。** 由另一个东西负责算出应该有什么、并把它写下来，wecert 只读那份文档做收敛。判断只推断一次、以 diff 的形式被 review，而证书生命周期保持稳定。
 
+### 0. 要解决的问题
+
+![wecert 要解决的场景：CLB 终结 TLS，业务机器上没有证书文件](docs/diagrams/zh/00-the-problem.png)
+
+TLS 在 CLB 上终结，业务机器上根本没有证书文件 —— 所以常规做法的前提在这里都不成立：certbot 装在每台 CVM 上没有地方放证书，cert-manager 假定有 Kubernetes 而且产出的是 Secret 不是监听器绑定，把文件铺到各节点只是把一把没人读的私钥多复制了几份。
+
+真正让它难的不是麻烦，是最后那一行：ARI 让续期豁免全部限速，但**只对同名续期**成立 —— 所以改一次域名集合就等于烧掉一次签发。而"域名随时会变"恰恰是这个项目的前提，其余每一个设计决定都是从这里推出来的。
+
 ### 1. 系统全景：谁拥有什么、谁只读什么
 
 ![wecert 系统全景：声明层、推断层、契约、执行层与外部服务](docs/diagrams/zh/01-system-map.png)
@@ -152,7 +160,7 @@ order URL 必须在 `newOrder` 返回之后立刻落盘，在任何别的事情�
 
 ARI 协调的续期**豁免 Let's Encrypt 的全部限速** —— 但前提是 identifier 集合不变。这正是通配符优先不只是优化的原因，也是"加一个域名"的成本必须被压到接近零的原因。
 
-这些图背后的三张表 —— 数据所有权、失败语义、限速算术 —— 在[证书生命周期](README.reference.zh-CN.md#证书生命周期)，同样六张图也在那里。另有一份可交互页面：[docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)，图之间有可点的跳转，还有一个打印/存 PDF 的按钮。
+这些图背后的三张表 —— 数据所有权、失败语义、限速算术 —— 在[证书生命周期](README.reference.zh-CN.md#证书生命周期)，同样七张图也在那里。另有一份可交互页面：[docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)，图之间有可点的跳转，还有一个打印/存 PDF 的按钮。
 
 ## 事件驱动
 
@@ -196,7 +204,7 @@ CA/Browser Forum 已排期 **2027-03-15 起证书 ≤100 天，2029-03-15 起 �
 - [配置参考](README.reference.zh-CN.md#配置参考) · [运维](README.reference.zh-CN.md#运维) · [监控与告警](README.reference.zh-CN.md#监控与告警)。
 - [实测踩过的坑](README.reference.zh-CN.md#实测踩过的坑) —— CLB 的 SNI 陷阱、`DescribeListeners` 不回读绑定、DNSPod 的 TTL 下限、lego 的 API 陷阱。
 - [期望状态](docs/desired-state.md) —— 用 `_wecert` DNS 声明域名、生成期望状态文档、以及把 wecert 切过去。设计取舍见 [desired-state-providers.md](docs/desired-state-providers.md)。
-- [证书生命周期](README.reference.zh-CN.md#证书生命周期) —— 六张图，从 DNS 声明一路画到旧证书退役，另附数据所有权、失败语义和限速算术。可交互版本：[docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)。
+- [证书生命周期](README.reference.zh-CN.md#证书生命周期) —— 七张图，从"它要解决什么问题"一路画到旧证书退役，另附数据所有权、失败语义和限速算术。可交互版本：[docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)。
 - [现状与下一步](README.reference.zh-CN.md#现状与下一步) · [开发](README.reference.zh-CN.md#开发)。
 
 <details>

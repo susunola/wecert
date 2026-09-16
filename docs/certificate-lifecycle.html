@@ -137,6 +137,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 .elab{font:600 11px/1 var(--mono);fill:var(--muted)}
 .elab-bg{fill:var(--card)}
 .elab-danger{font:600 11px/1 var(--mono);fill:var(--danger)}
+.mark-x{font:700 16px/1 var(--mono);fill:var(--danger)}
 .life{stroke:var(--rule-2);stroke-width:1.5;stroke-dasharray:5 5}
 .seq-num{font:700 12px/1 var(--mono);fill:var(--local)}
 .lifelbl{font:700 13px/1 var(--mono);fill:var(--ink)}
@@ -179,7 +180,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
   <p class="lede">
     这套系统唯一的核心纪律是：<strong>wecert 永远不推断</strong>。
     某个东西负责推断意图，并把结论写成一份可 diff 的文件；wecert 只读那份文件做收敛。
-    下面六张图从系统全景一路下钻到单个订单的状态机。
+    下面七张图从要解决的问题一路下钻到单个订单的状态机。
   </p>
   <div class="badges">
     <span class="badge">默认模式 <b>static</b></span>
@@ -191,6 +192,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 </header>
 
 <nav class="toc">
+  <a href="#problem">⓪ 要解决的场景</a>
   <a href="#map">① 系统全景</a>
   <a href="#intent">② 意图 → 契约</a>
   <a href="#decide">③ 收敛决策</a>
@@ -202,6 +204,152 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
   <a href="#limits">限速算术</a>
   <a href="#gotchas">坑</a>
 </nav>
+
+<!-- ══════════════════════════════════════════════════════════ ⓪ -->
+<section id="problem">
+  <h2><span class="num">图 ⓪</span>要解决的问题：证书不在业务机器上</h2>
+  <p class="cap">
+    这不是"再写一个证书自动续期工具"的场景。TLS 在 CLB 上终结，业务机器上根本没有证书文件 ——
+    常规做法的前提在这里不成立。下面三块分别是部署形态、为什么现成办法都不行、以及钉死了一切设计的硬约束。
+  </p>
+
+  <figure>
+  <div class="scroll">
+  <svg viewBox="0 0 1228 690" role="img" aria-label="wecert 要解决的场景：CLB 终结 TLS，业务机器上没有证书文件">
+    <defs>
+      <marker id="a0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-edge" d="M0 0 L10 5 L0 10 z"/></marker>
+    </defs>
+
+    <!-- ── 带 1：部署形态 ── -->
+    <rect class="zone" x="24" y="44" width="1180" height="232" rx="14"/>
+    <text class="zone-title" x="36" y="34">部署形态 · 证书不在业务机器上</text>
+
+    <rect class="bx" x="44" y="100" width="176" height="64" rx="8"/>
+    <foreignObject x="44" y="100" width="176" height="64">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">浏览器 / 客户端
+        <span class="s">只认证书，不关心它在哪</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-local" x="336" y="80" width="340" height="104" rx="8"/>
+    <foreignObject x="336" y="80" width="340" height="104">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">腾讯云 CLB
+        <span class="s">TLS <b>在这里终结</b> · SNI · multi_cert_info</span>
+        <span class="s">证书挂在监听器上，是一份云端资源</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx" x="790" y="100" width="200" height="64" rx="8"/>
+    <foreignObject x="790" y="100" width="200" height="64">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">CVM 池
+        <span class="s">只跑业务 · 明文 HTTP</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-ext" x="336" y="204" width="340" height="56" rx="8"/>
+    <foreignObject x="336" y="204" width="340" height="56">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Let's Encrypt
+        <span class="s">ACME · 90 天 · 速率限制</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-danger" x="730" y="188" width="460" height="88" rx="8"/>
+    <foreignObject x="730" y="188" width="460" height="88">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">证书必须挂在这里 —— 业务机器上没有证书文件可分发
+        <span class="s">所以"把证书文件铺到节点上"这个前提，在这个形态下不成立</span>
+      </div>
+    </foreignObject>
+
+    <path class="edge" d="M220 132 H336" marker-end="url(#a0)"/>
+    <path class="edge" d="M676 132 H790" marker-end="url(#a0)"/>
+    <path class="edge-dash" d="M506 184 V204" marker-end="url(#a0)"/>
+
+    <rect class="elab-bg" x="238" y="118" width="80" height="16" rx="3"/>
+    <text class="elab" x="278" y="130" text-anchor="middle">HTTPS</text>
+    <rect class="elab-bg" x="694" y="118" width="78" height="16" rx="3"/>
+    <text class="elab" x="733" y="130" text-anchor="middle">明文 HTTP</text>
+
+    <!-- ── 带 2：现成办法为什么不成立 ── -->
+    <rect class="zone" x="24" y="304" width="1180" height="196" rx="14"/>
+    <text class="zone-title" x="36" y="294">所以现成的办法都不成立</text>
+
+    <rect class="bx" x="44" y="330" width="1140" height="36" rx="8"/>
+    <text class="mark-x" x="62" y="353">✗</text>
+    <foreignObject x="84" y="330" width="1084" height="36">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">certbot 装在每台 CVM 上
+        <span class="s">TLS 不在 CVM 终结，签出来也没地方用；而且每台机器各自签一次，配额按台数翻倍</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx" x="44" y="374" width="1140" height="36" rx="8"/>
+    <text class="mark-x" x="62" y="397">✗</text>
+    <foreignObject x="84" y="374" width="1084" height="36">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">cert-manager + Kubernetes
+        <span class="s">这里没有 K8s，只有 CLB 和几台 CVM；而证书最终要挂到 <b>CLB 监听器</b>上，不是一个 Secret</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx" x="44" y="418" width="1140" height="36" rx="8"/>
+    <text class="mark-x" x="62" y="441">✗</text>
+    <foreignObject x="84" y="418" width="1084" height="36">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">把证书文件分发到各个节点
+        <span class="s">节点根本不读证书 —— 解密发生在 LB，铺文件只是把密钥多复制了几份</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx" x="44" y="462" width="1140" height="36" rx="8"/>
+    <text class="mark-x" x="62" y="485">✗</text>
+    <foreignObject x="84" y="462" width="1084" height="36">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">手工申请 → 上传 → 绑定
+        <span class="s">每 90 天一次，全靠人记得；而忘了的表现是<b>线上直接握手失败</b>，不是一条告警</span>
+      </div>
+    </foreignObject>
+
+    <!-- ── 带 3：硬约束 ── -->
+    <rect class="zone" x="24" y="528" width="1180" height="140" rx="14"/>
+    <text class="zone-title" x="36" y="518">硬约束 · 这些数字决定了一切设计</text>
+
+    <rect class="bx-danger" x="44" y="548" width="276" height="100" rx="8"/>
+    <foreignObject x="44" y="548" width="276" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">90 天 → 47 天
+        <span class="s">2029-03-15 起证书有效期上限</span>
+        <span class="s">续期频率只会更高</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-human" x="345" y="548" width="276" height="100" rx="8"/>
+    <foreignObject x="345" y="548" width="276" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">50 / 7 天
+        <span class="s">每注册域的新证书数</span>
+        <span class="s">跨账号共享，留一半余量</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-danger" x="646" y="548" width="276" height="100" rx="8"/>
+    <foreignObject x="646" y="548" width="276" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">5 / 7 天
+        <span class="s">精确 identifier 集合</span>
+        <span class="s">没有 override，撞了等满一周</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-ext" x="947" y="548" width="276" height="100" rx="8"/>
+    <foreignObject x="947" y="548" width="276" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">ARI 豁免全部限速
+        <span class="s">前提是<b>同名续期</b></span>
+        <span class="s">域名集合一变，这次签发就重新计入配额</span>
+      </div>
+    </foreignObject>
+  </svg>
+  </div>
+  </figure>
+
+  <p>
+    这四张约束里最要命的是最后一张。它意味着<strong>改一次域名集合就等于烧掉一次配额</strong>，
+    而"域名随时会变"恰恰是这个项目的前提。所以整套设计绕着一个问题转：
+    怎么让"加一个域名"这件事<strong>尽量不产生新的签发</strong> —— 答案就是通配符优先（见 <a href="#intent">图 ②</a>）。
+  </p>
+</section>
 
 <!-- ══════════════════════════════════════════════════════════ ① -->
 <section id="map">
