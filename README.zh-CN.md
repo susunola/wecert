@@ -48,6 +48,10 @@ sudo ./install.sh ./dist/wecert_linux_amd64
 
 > module 路径与仓库地址一致，`git clone` 后 `make build` 和 `go install github.com/susunola/wecert/cmd/wecert@latest` 都可以用。
 
+> **注意：程序的日志与错误信息是英文的。** 本文档保留中文说明，但所有
+> 日志、CLI 帮助和错误文本都直接用程序的实际输出（英文），以免文档与实现不一致。
+
+
 ## 快速开始
 
 **1. 先检查凭证、DNS 归属和 NS 委派** —— 全部只读：
@@ -78,7 +82,7 @@ sudo systemctl enable --now wecert                      # 守护模式，每小�
 **4. 人工绑定一次。** 首次签发时腾讯云侧还没有"旧证书 → 云资源"的绑定关系可查，所以 wecert 只会上传证书：
 
 ```
-证书已上传，等待在 CLB 上手动绑定一次 cert=example-com uploadedCertId=xxxxxxxx
+certificate uploaded; waiting for a one-time manual bind in the CLB console cert=example-com uploadedCertId=xxxxxxxx
 ```
 
 去 CLB 控制台绑一次即可。之后每次续期全自动 —— `UpdateCertificateInstance` 会让腾讯云自己去找绑定了旧证书的监听器并换掉。**这里不需要维护监听器清单**，同一监听器上的 SNI 多证书也不会被误覆盖。

@@ -221,8 +221,8 @@ func (c *Config) normalize() error {
 	}
 	if c.DNS.Provider == DNSProviderDNSPod && c.DNS.LoginToken == "" {
 		return fmt.Errorf("dns.provider=dnspod requires dns.loginToken " +
-			"(DNSPod 自有 API Token，不是腾讯云 SecretId/SecretKey；" +
-			"若想用腾讯云 CAM 凭证请设 dns.provider=tencentcloud)")
+			"(a DNSPod API token, not a Tencent Cloud SecretId/SecretKey;" +
+			"to use Tencent Cloud CAM credentials instead, set dns.provider=tencentcloud)")
 	}
 
 	var err error
@@ -286,8 +286,8 @@ func (w *Webhook) normalize() error {
 	// 留空 Listen 表示不启用，此时 Token 也不必设置。
 	if w.Listen == "" {
 		if w.Token != "" {
-			return fmt.Errorf("webhook.token 设置了但 webhook.listen 为空：" +
-				"没有监听地址就不会有端点，token 无从生效")
+			return fmt.Errorf("webhook.token is set but webhook.listen is empty: " +
+				"with no listen address there is no endpoint for the token to guard")
 		}
 		if w.NotifyURL != "" {
 			// NotifyURL 独立于监听端点，允许单独使用。
@@ -297,12 +297,12 @@ func (w *Webhook) normalize() error {
 	}
 
 	if w.Token == "" {
-		return fmt.Errorf("webhook.listen 已设置但缺少 webhook.token：" +
-			"这个端点会触发真实签发并消耗速率限制配额，必须鉴权")
+		return fmt.Errorf("webhook.listen is set but webhook.token is missing: " +
+			"this endpoint triggers real issuance and consumes rate-limit quota, so it must be authenticated")
 	}
 	if len(w.Token) < WebhookTokenMinLen {
-		return fmt.Errorf("webhook.token 太短（%d 字符，至少 %d）："+
-			"这个端点能触发真实签发，弱 token 等于没有鉴权",
+		return fmt.Errorf("webhook.token is too short (%d characters, minimum %d): "+
+			"this endpoint can trigger real issuance, so a weak token is no better than none",
 			len(w.Token), WebhookTokenMinLen)
 	}
 	return nil
