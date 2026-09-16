@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // IdentifierFailure is the authorization failure ledger for one identifier.
@@ -154,14 +155,22 @@ func (s *Store) ClearFallback(certName string) error {
 	return nil
 }
 
-// truncate cuts off potentially very long error text.
+// truncate cuts off potentially very long error text at a rune boundary.
 //
 // What is stored here is human-facing diagnostic information, not a full log -- and a
 // repeatedly failing ACME error can carry an entire response body, so not truncating
 // would bloat the state database for no reason.
+//
+// The cut point is walked back to the start of a rune first: an ACME problem detail
+// or a fallback reason is free-form server text and is not guaranteed to be ASCII, so
+// slicing blindly at byte n can land inside a multi-byte UTF-8 sequence and leave
+// invalid UTF-8 sitting in the state database and every log line built from it.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }
