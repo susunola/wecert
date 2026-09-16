@@ -30,8 +30,33 @@ const authzFetchConcurrency = 8
 func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.CertState, o *state.Order, rd round) error {
 	order, err := m.core.GetOrder(o.OrderURL)
 	if err != nil {
+		// A dead order URL must not block renewal for the order's whole TTL.
+		//
+		// The order branch keeps advancing a persisted order rather than creating a new one,
+		// and renewal is only decided AFTER that branch -- so an order whose URL can never be
+		// fetched again stalls every later renewal until it expires (7 days by default), long
+		// past the renewal window. Observed: a certificate 5 days out sat through 24 passes
+		// and 24 failures, fell to 21 hours left, and issued only once the order expired.
+		//
+		// Reachable without anything exotic: accounts are keyed by ACME directory while orders
+		// are not, so pointing wecert at staging and back leaves orders naming a directory that
+		// no longer serves them.
+		if m.noteOrderFetchFailure(o.OrderURL) {
+			m.log.Warn("the persisted order could not be fetched for several consecutive attempts; "+
+				"treating it as dead and rebuilding, rather than blocking renewal until it expires",
+				"cert", c.Name, "order", o.OrderURL, "attempts", maxOrderFetchFailures, "err", err)
+			if derr := m.discardOrder(ctx, c.Name); derr != nil {
+				// Discarding failed too, so the order row survives; still report the failure so
+				// the backoff applies, and the next round tries again.
+				return m.recordFailure(st, errors.Join(fmt.Errorf("get order: %w", err), derr))
+			}
+			return m.recordFailure(st, fmt.Errorf(
+				"get order: %w (the order was discarded; the next attempt places a new one)", err))
+		}
 		return m.recordFailure(st, fmt.Errorf("get order: %w", err))
 	}
+	// It answered, so the URL is alive: forget any earlier failures.
+	m.clearOrderFetchFailures(o.OrderURL)
 	// Same contract as the other two call sites: persistOrder returns its write
 	// error, and a failed write means crash recovery would resume from stale state.
 	// Discarding it would defeat the point of making it return one, and Go does not
@@ -216,6 +241,11 @@ func (m *Manager) solveChallenges(
 			// says "this certificate will not issue", while pre-expiry degradation has to
 			// answer "which name will not issue" -- without that we could only drop names at
 			// random, and that sacrifices the good names too.
+			// Start the name's cooldown as well as recording the ledger row: the ledger
+			// answers "who has been broken lately" for the fallback, while the cooldown
+			// stops this process from spending the identifier's hourly failure budget on
+			// retries inside the same window (see identifierCooldown).
+			m.noteIdentifierFailure(targeted)
 			if rerr := m.store.RecordIdentifierFailure(
 				c.Name, targeted, authzError(cur), m.now()); rerr != nil {
 				m.log.Warn("failed to record the identifier failure",
@@ -425,6 +455,12 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 
 			// Persist a transition only. The row is what the next pass reads to decide
 			// where to resume, so rewriting an unchanged status is pure fsync.
+			if cur.Status == "valid" {
+				// It validated, so the name is not in trouble: forget any cooldown so a later
+				// failure starts a fresh window rather than inheriting this one. The ledger
+				// row is pruned separately, by applyFallback, once the name is healthy.
+				m.clearIdentifierCooldown(challenge.GetTargetedDomain(cur))
+			}
 			if a.Status != cur.Status {
 				a.Status = cur.Status
 				if perr := m.store.PutAuthorization(a); perr != nil {
@@ -439,6 +475,7 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 				// then the CA later marks the authorization invalid. Keep the
 				// ledger key wildcard-aware, just as solveChallenges does.
 				targeted := challenge.GetTargetedDomain(cur)
+				m.noteIdentifierFailure(targeted)
 				if rerr := m.store.RecordIdentifierFailure(a.CertName, targeted, authzError(cur), m.now()); rerr != nil {
 					m.log.Warn("failed to record the identifier failure", "cert", a.CertName, "identifier", targeted, "err", rerr)
 				}
@@ -486,7 +523,9 @@ func (m *Manager) registerRecoveredLeases() {
 	}
 	for _, a := range rows {
 		if a.TxtName != "" && a.TxtValue != "" {
-			challengeLeases.add(a.TxtName, a.TxtValue)
+			// Under the name's mutex: these are exactly the leases that must be visible to a
+			// concurrent CleanUp's check-then-delete (see addUnderLock).
+			challengeLeases.addUnderLock(a.TxtName, a.TxtValue)
 		}
 	}
 }

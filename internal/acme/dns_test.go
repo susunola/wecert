@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
@@ -507,5 +508,64 @@ func TestTXTLeasesPruneNeverSplitsTheMutex(t *testing.T) {
 
 	if split {
 		t.Error("two goroutines were inside the per-name critical section at once: the prune split the mutex")
+	}
+}
+
+// Registering a lease must serialize with CleanUp's check-then-delete.
+//
+// CleanUp holds the name's mutex across "is any other value live at this name?" and the
+// provider's delete-EVERY-TXT call. A lease registered OUTSIDE that mutex can land between
+// the two: the check does not see it, the delete-all fires, and the value that was just
+// registered is gone -- so the CA is asked to validate a record that no longer exists, which
+// books a billed authorization failure against the 5-per-hour-per-identifier limit and adds
+// an identifier-ledger entry that arms the failure fallback.
+//
+// The two unsafe paths were WaitAll (re-registering the records of a resumed order, whose TXT
+// a previous process wrote) and registerRecoveredLeases. Present was already safe because it
+// adds while holding the mutex.
+//
+// The property is directly observable: while a test holds the name's mutex, an add that takes
+// it must block, and an add that does not take it completes immediately.
+func TestLeaseRegistrationHoldsTheNameLock(t *testing.T) {
+	const fqdn = "_acme-challenge.lock-probe.example.com."
+
+	mu, release := challengeLeases.lock(fqdn)
+	defer release()
+	mu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		challengeLeases.addUnderLock(fqdn, "value-must-wait")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		mu.Unlock()
+		t.Fatal("addUnderLock completed while the name's mutex was held: it does not serialize " +
+			"with CleanUp's check-then-delete, so a concurrent cleanup can delete the value it registers")
+	case <-time.After(150 * time.Millisecond):
+		// Blocked, as it must be.
+	}
+
+	// The contrast that shows the test can tell the two apart: the plain add does NOT block,
+	// which is exactly why the two call sites had to change.
+	plain := make(chan struct{})
+	go func() {
+		challengeLeases.add(fqdn, "value-without-lock")
+		close(plain)
+	}()
+	select {
+	case <-plain:
+	case <-time.After(2 * time.Second):
+		mu.Unlock()
+		t.Fatal("the plain add should not take the name mutex; this test's premise is wrong")
+	}
+
+	mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("addUnderLock never completed after the mutex was released")
 	}
 }
