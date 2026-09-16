@@ -86,7 +86,7 @@ func TestNoopDeleteOfARealIDReportsDeploymentDisabled(t *testing.T) {
 func TestNoopBindingsIsZero(t *testing.T) {
 	var n Noop
 
-	got, err := n.Bindings(context.Background(), "cert")
+	got, _, err := n.Bindings(context.Background(), "cert")
 	if err != nil {
 		t.Fatalf("Bindings must not fail when deployment is disabled: %v", err)
 	}

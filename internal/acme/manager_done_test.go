@@ -247,8 +247,8 @@ func (d *recordingDeployer) Deploy(_ context.Context, _ string, oldID string, _,
 	}
 	return d.id, nil
 }
-func (d *recordingDeployer) Delete(context.Context, string) error          { return nil }
-func (d *recordingDeployer) Bindings(context.Context, string) (int, error) { return 0, nil }
+func (d *recordingDeployer) Delete(context.Context, string) error                { return nil }
+func (d *recordingDeployer) Bindings(context.Context, string) (int, bool, error) { return 0, true, nil }
 
 // A drift reissue must still succeed even when the identifier sets share nothing.
 //

@@ -279,8 +279,12 @@ func TestAuthoritativeNSSkipsAnUnresolvableNameserver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("one unresolvable NS must not fail the lookup: %v", err)
 	}
-	if len(servers) != 1 || servers[0] != "198.51.100.53:53" {
+	if len(servers) != 1 || servers[0].addr != "198.51.100.53:53" {
 		t.Errorf("servers = %v, want only the resolvable one", servers)
+	}
+	if len(servers) == 1 && servers[0].ns == "" {
+		t.Error("each address must carry the NS name it belongs to: the confirmation rule counts " +
+			"servers, and one server with several addresses is still one server")
 	}
 }
 

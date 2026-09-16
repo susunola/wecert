@@ -81,13 +81,13 @@ func (d *LazyTencentCLB) Delete(ctx context.Context, certID string) error {
 }
 
 // Bindings implements Deployer.
-func (d *LazyTencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
+func (d *LazyTencentCLB) Bindings(ctx context.Context, certID string) (int, bool, error) {
 	if certID == "" {
-		return 0, nil
+		return 0, false, nil
 	}
 	inner, err := d.client()
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	return inner.Bindings(ctx, certID)
 }
@@ -216,11 +216,18 @@ func (d *TencentCLB) deployUploaded(ctx context.Context, client sslAPI, certName
 		// listeners switched, so n > 0 -- and then the state anchors on the new ID while the
 		// rest stay on the old certificate, never to be revisited. Requiring oldBindings == 0
 		// distinguishes the two structurally, without having to classify the error.
-		if n, nerr := d.bindingsWith(ctx, client, newID); nerr == nil && n > 0 {
-			if oldBindings, oerr := d.bindingsWith(ctx, client, oldID); oerr == nil && oldBindings == 0 {
+		// cached=false on both: this decides whether a switch took effect, and the SDK's cache can
+		// answer from a completed task up to half an hour old.
+		if n, nerr := d.bindingsWith(ctx, client, newID, false); nerr == nil && n.count > 0 {
+			// oldBindings == 0 is the load-bearing half, so it must come from a COMPLETE answer.
+			// A partial enumeration that skipped a failed region also produces 0, and reading that
+			// as "the old certificate is bound nowhere" is exactly how a half-finished switch gets
+			// recorded as done -- with some listeners still serving the old certificate and nothing
+			// left to revisit them.
+			if oldBindings, oerr := d.bindingsWith(ctx, client, oldID, false); oerr == nil && oldBindings.complete && oldBindings.count == 0 {
 				d.log.Warn("the one-click update reported nothing to switch, but the new certificate is bound "+
 					"and the old one is not; treating the switch as done (the rebind succeeded without being recorded)",
-					"oldCertId", oldID, "newCertId", newID, "boundResources", n)
+					"oldCertId", oldID, "newCertId", newID, "boundResources", n.count)
 				return newID, nil
 			}
 		}
@@ -351,12 +358,24 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 				if werr := d.waitDeployRecord(ctx, client, recordID, oldID); werr != nil {
 					return werr
 				}
-				n, berr := d.bindingsWith(ctx, client, newID)
+				// cached=false: the question is whether THIS certificate is bound right now, and a
+				// cached task result from before the switch answers a different question.
+				n, berr := d.bindingsWith(ctx, client, newID, false)
 				if berr != nil {
 					return fmt.Errorf("the in-progress update task finished, but verifying whether %s is "+
 						"bound failed: %w (refusing to report success on an unverified switch)", newID, berr)
 				}
-				if n == 0 {
+				if n.count == 0 && !n.complete {
+					// Not the same as "it is not bound": at least one region went unanswered, so
+					// this program cannot tell. Reporting failure here would be wrong about a
+					// switch that did happen, and reporting success would be wrong about one that
+					// did not, so it says which it is and refuses to guess.
+					return fmt.Errorf("an update task was already in progress and finished, but the "+
+						"bind-resource enumeration for %s did not cover every region, so whether this "+
+						"switch took effect is unknown (refusing to report success on an unverified switch)",
+						newID)
+				}
+				if n.count == 0 {
 					return fmt.Errorf("an update task was already in progress, and this certificate (%s) is "+
 						"not bound to any resource afterwards; the task belonged to a different switch, so "+
 						"this deploy did not happen", newID)
@@ -765,34 +784,61 @@ func derefI64(v *int64) int64 {
 // false. After a human binds it in the console there used to be no path back to set it --
 // the deployed metric would report "not deployed" for the whole certificate cycle (up to 90
 // days for classic) even though the certificate was serving traffic the entire time.
-func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
+func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, bool, error) {
 	if certID == "" {
-		return 0, nil
+		return 0, false, nil
 	}
 	client, err := d.client(ctx)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return d.bindingsWith(ctx, client, certID)
+	// cached=true: this is the periodic "has a human bound it yet" poll. See bindingsWith.
+	n, err := d.bindingsWith(ctx, client, certID, true)
+	return n.count, n.complete, err
+}
+
+// bindingCount is how many cloud resources a certificate is bound to, and whether that number is
+// the whole answer.
+//
+// The zero is load-bearing and that is the entire reason this is not a plain int. DeployUploaded's
+// repair path reads "the old certificate has 0 bindings" as "the switch happened but was not
+// recorded" and reports success on it; and the adoption path reads "0" as "the task belonged to a
+// different switch, so this deploy did not happen". Neither may be concluded from an answer this
+// program could not fully obtain -- a region whose query failed, a response with no task id, an
+// empty CertTaskIds list. Whenever complete is false, count is a LOWER BOUND: a non-zero count still
+// proves something is bound, but a zero proves nothing at all.
+type bindingCount struct {
+	count    int
+	complete bool
 }
 
 // bindingsWith enumerates a certificate's bindings against an existing client.
 //
 // Split out so Deploy's recovery path can reuse it: that path already holds a client,
 // and rebuilding one would mean a second credential fetch and TLS setup.
-func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID string) (int, error) {
+// cached selects the server-side cache. The SDK documents it as: with IsCache=1, if a completed
+// task exists for this certificate within the last half hour, the query result closest to now
+// *within that half hour* is returned. That is fine for the periodic "has a human bound it yet"
+// poll, which is why that one asks for it -- and wrong for the two calls that decide whether a
+// switch took effect, because a result from up to half an hour ago cannot answer "is it bound
+// now". Those pass cached=false.
+func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID string, cached bool) (bindingCount, error) {
+	cache := uint64(0)
+	if cached {
+		cache = 1
+	}
 	createReq := ssl.NewCreateCertificateBindResourceSyncTaskRequest()
 	createReq.CertificateIds = []*string{common.StringPtr(certID)}
-	// IsCache=1: allow reusing the server-side cache, avoiding a full enumeration on every
-	// reconcile.
-	createReq.IsCache = common.Uint64Ptr(1)
+	createReq.IsCache = common.Uint64Ptr(cache)
 
 	createResp, err := client.CreateCertificateBindResourceSyncTaskWithContext(ctx, createReq)
 	if err != nil {
-		return 0, fmt.Errorf("CreateCertificateBindResourceSyncTask: %w", err)
+		return bindingCount{}, fmt.Errorf("CreateCertificateBindResourceSyncTask: %w", err)
 	}
+	// No task ids is not the answer "bound nowhere": it is the absence of an answer, and an older
+	// API version or a throttled call both look like this.
 	if createResp.Response == nil || len(createResp.Response.CertTaskIds) == 0 {
-		return 0, nil
+		return bindingCount{complete: false}, nil
 	}
 
 	var taskID string
@@ -803,7 +849,9 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 		}
 	}
 	if taskID == "" {
-		return 0, nil
+		// Same reasoning as above: this certificate was in the list but carried no task id, so
+		// there is no enumeration to read.
+		return bindingCount{complete: false}, nil
 	}
 
 	// Enumeration is asynchronous, so poll until there is a result. Keep the ceiling short:
@@ -815,22 +863,32 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 
 		queryResp, err := client.DescribeCertificateBindResourceTaskResultWithContext(ctx, queryReq)
 		if err != nil {
-			return 0, fmt.Errorf("DescribeCertificateBindResourceTaskResult: %w", err)
+			return bindingCount{}, fmt.Errorf("DescribeCertificateBindResourceTaskResult: %w", err)
 		}
 
 		n, done, err := countBindings(queryResp, taskID)
 		if err != nil {
-			return 0, err
+			return bindingCount{}, err
 		}
 		if done {
+			if !n.complete {
+				// The task finished, but at least one region's query failed inside it. Polling
+				// again is not obviously better -- the region error is not a "not ready yet"
+				// signal -- so the caller gets the lower bound and decides. For the confirmation
+				// poll a non-zero count still confirms; for the two verification calls a zero
+				// from an incomplete answer is refused rather than believed.
+				d.log.Warn("the bind-resource enumeration finished with at least one region "+
+					"unanswered; the binding count is a lower bound",
+					"certId", certID, "taskId", taskID, "boundResources", n.count)
+			}
 			return n, nil
 		}
 
 		if d.now().After(deadline) {
-			return 0, fmt.Errorf("the bind-resource enumeration did not finish within 30s (taskId=%s)", taskID)
+			return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within 30s (taskId=%s)", taskID)
 		}
 		if err := waitBetweenPolls(ctx, 2*time.Second); err != nil {
-			return 0, err
+			return bindingCount{}, err
 		}
 	}
 }
@@ -857,9 +915,9 @@ const bindStatusDone = 1
 // perfectly well-bound certificate as unbound.
 func countBindings(
 	resp *ssl.DescribeCertificateBindResourceTaskResultResponse, taskID string,
-) (count int, done bool, err error) {
+) (count bindingCount, done bool, err error) {
 	if resp == nil || resp.Response == nil {
-		return 0, false, nil
+		return bindingCount{}, false, nil
 	}
 
 	for _, r := range resp.Response.SyncTaskBindResourceResult {
@@ -869,35 +927,42 @@ func countBindings(
 
 		// Do not keep waiting idly when the server reports an explicit error.
 		if r.Error != nil && r.Error.Message != nil && *r.Error.Message != "" {
-			return 0, false, fmt.Errorf("bind-resource task %s failed: %s", taskID, *r.Error.Message)
+			return bindingCount{}, false, fmt.Errorf("bind-resource task %s failed: %s", taskID, *r.Error.Message)
 		}
 
 		// Either not finished yet, or finished but the result list is not populated yet --
 		// keep waiting in both cases.
 		if r.Status == nil || *r.Status != bindStatusDone || len(r.BindResourceResult) == 0 {
-			return 0, false, nil
+			return bindingCount{}, false, nil
 		}
 
 		total := 0
+		complete := true
 		for _, res := range r.BindResourceResult {
 			if res == nil {
 				continue
 			}
 			for _, region := range res.BindResourceRegionResult {
+				// A region that is absent from the answer, or that carries no TotalCount, is a
+				// region this enumeration did not count. Skipping it silently made the total read
+				// as a finished answer and, when it happened to be the only region, as the number
+				// zero -- which the repair path treats as "the old certificate is gone".
 				if region == nil || region.TotalCount == nil {
+					complete = false
 					continue
 				}
-				// A non-empty Error means this region's query failed and its result cannot be
-				// trusted -- better to treat that as "not found yet" than to mark the
-				// certificate as deployed based on it.
 				if region.Error != nil && *region.Error != "" {
+					// The region's query failed, so its resources are missing from the total.
+					// This is what the comment always claimed to do and the code did not: the
+					// count is reported as a lower bound instead of as the answer.
+					complete = false
 					continue
 				}
 				total += int(*region.TotalCount)
 			}
 		}
-		return total, true, nil
+		return bindingCount{count: total, complete: complete}, true, nil
 	}
 
-	return 0, false, nil
+	return bindingCount{}, false, nil
 }

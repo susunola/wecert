@@ -25,9 +25,14 @@ ExecStart=/usr/local/bin/wecert -config /etc/wecert/config.yaml -once
 # + 3m waiting for authorizations + 2m waiting for the order. reconcile walks
 # the certificates **serially**, so leave headroom proportional to how many
 # you have. Being killed is not fatal by itself — the order URL is already on
-# disk and the next pass resumes it — but every interruption bumps
-# consecutive_failures and manufactures a pointless alarm. Raise this when you
-# have many certificates, or certificates with many SANs.
+# disk and the next pass resumes it — and it does not count as a failure either:
+# recordFailure returns early for context.Canceled and context.DeadlineExceeded,
+# so a kill on timeout leaves consecutive_failures untouched and the next pass
+# starts from the same place. (This comment used to claim the opposite — that
+# every interruption bumped consecutive_failures — which was true before that
+# guard and is exactly the kind of stale claim that makes an operator distrust a
+# real alarm.) Raise this when you have many certificates, or certificates with
+# many SANs.
 TimeoutStartSec=45min
 
 ProtectSystem=strict
