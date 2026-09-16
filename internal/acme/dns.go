@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -36,9 +37,11 @@ type DNSSolver struct {
 	// term.
 	newProvider func(ctx context.Context) (challenge.Provider, error)
 
-	timeout  time.Duration
-	interval time.Duration
-	log      *slog.Logger
+	timeout              time.Duration
+	interval             time.Duration
+	log                  *slog.Logger
+	recursiveNameservers []string
+	exchange             func(ctx context.Context, msg *dns.Msg, server string) (*dns.Msg, error)
 }
 
 // NewDNSSolver picks an implementation from dns.provider.
@@ -99,12 +102,14 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		return nil, fmt.Errorf("unknown dns.provider %q", dnsCfg.Provider)
 	}
 
-	return &DNSSolver{
-		newProvider: newProvider,
-		timeout:     dnsCfg.Propagation,
-		interval:    dnsCfg.Polling,
-		log:         log,
-	}, nil
+	resolvers, err := recursiveNameservers(dnsCfg.RecursiveNameservers)
+	if err != nil {
+		return nil, err
+	}
+	if err := dns01.AddRecursiveNameservers(resolvers)(&dns01.Challenge{}); err != nil {
+		return nil, fmt.Errorf("configure lego recursive nameservers: %w", err)
+	}
+	return &DNSSolver{newProvider: newProvider, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS}, nil
 }
 
 // DNSRecord is one _acme-challenge TXT record that is to be written or verified.
@@ -155,7 +160,7 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 		}
 		seen[key] = true
 
-		zone, err := dns01.FindZoneByFqdn(r.FQDN)
+		zone, err := s.findZone(ctx, r.FQDN)
 		if err != nil {
 			return fmt.Errorf("find the zone for %s: %w", r.FQDN, err)
 		}
@@ -206,7 +211,7 @@ type recordProbe struct {
 // up to 3 seconds each -- one round then runs far past the 5-second polling interval.
 // Propagation waiting would degrade into "advance a little every 5 seconds", and a
 // 5-minute budget would not survive even a few rounds.
-func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
+func probeRecordsWithExchange(servers []string, recs []DNSRecord, exchange func(*dns.Msg, string) (*dns.Msg, error)) []recordProbe {
 	out := make([]recordProbe, len(recs))
 	if len(recs) == 0 {
 		return out
@@ -227,7 +232,7 @@ func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			ready, summary := probeReady(servers, r.FQDN, r.Value)
+			ready, summary := probeReadyWithExchange(servers, r.FQDN, r.Value, exchange)
 			// Each goroutine writes only its own index; no overlap, so no lock is needed.
 			out[i] = recordProbe{record: r, ready: ready, summary: summary}
 		}(i, r)
@@ -237,13 +242,21 @@ func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
 	return out
 }
 
+func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
+	return probeRecordsWithExchange(servers, recs, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		client := &dns.Client{Timeout: 3 * time.Second}
+		resp, _, err := client.Exchange(msg, server)
+		return resp, err
+	})
+}
+
 // waitZone polls the zone's authoritative NS until the records are confirmed propagated.
 func (s *DNSSolver) waitZone(
 	ctx context.Context, zone string, servers []string, recs []DNSRecord,
 	start, deadline time.Time,
 ) error {
 	for {
-		results := probeRecords(servers, recs)
+		results := s.probeRecords(servers, recs)
 
 		// Summarise only the records that are **not ready yet**.
 		//
@@ -285,16 +298,17 @@ func (s *DNSSolver) waitZone(
 
 // nsProbe is the probe result for one authoritative NS.
 type nsProbe struct {
-	server   string
-	hasValue bool
-	err      error // non-nil means this NS is simply unreachable from here
+	server        string
+	hasValue      bool
+	authoritative bool
+	err           error // non-nil means this NS is simply unreachable from here
 }
 
 // probeTXT probes every authoritative NS concurrently.
 //
 // Concurrency is necessary here: 9 servers in series with a 5-second timeout each makes
 // a worst-case round of 45 seconds.
-func probeTXT(servers []string, fqdn, want string) []nsProbe {
+func probeTXTWithExchange(servers []string, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) []nsProbe {
 	results := make([]nsProbe, len(servers))
 
 	var wg sync.WaitGroup
@@ -304,22 +318,30 @@ func probeTXT(servers []string, fqdn, want string) []nsProbe {
 			defer wg.Done()
 			results[i] = nsProbe{server: server}
 
-			c := &dns.Client{Timeout: 3 * time.Second}
 			m := new(dns.Msg)
 			m.SetQuestion(fqdn, dns.TypeTXT)
 			m.RecursionDesired = false
 
-			resp, _, err := c.Exchange(m, server)
+			resp, err := exchange(m, server)
 			if err != nil {
 				results[i].err = err
 				return
 			}
-			results[i].hasValue = responseHasTXT(resp, want)
+			results[i].authoritative = resp != nil && resp.Authoritative
+			results[i].hasValue = results[i].authoritative && responseHasTXT(resp, want)
 		}(i, server)
 	}
 	wg.Wait()
 
 	return results
+}
+
+func probeTXT(servers []string, fqdn, want string) []nsProbe {
+	return probeTXTWithExchange(servers, fqdn, want, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		client := &dns.Client{Timeout: 3 * time.Second}
+		resp, _, err := client.Exchange(msg, server)
+		return resp, err
+	})
 }
 
 // probeReady decides whether a record can count as propagated, and returns a
@@ -340,14 +362,16 @@ func probeTXT(servers []string, fqdn, want string) []nsProbe {
 //
 // A single-authority zone has to be able to pass: requiring 2 confirmations would leave
 // such a zone waiting for propagation forever.
-func probeReady(servers []string, fqdn, want string) (bool, string) {
-	results := probeTXT(servers, fqdn, want)
+func probeReadyWithExchange(servers []string, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) (bool, string) {
+	results := probeTXTWithExchange(servers, fqdn, want, exchange)
 
-	var confirmed, missing, unreachable int
+	var confirmed, missing, nonAuthoritative, unreachable int
 	for _, r := range results {
 		switch {
 		case r.err != nil:
 			unreachable++
+		case !r.authoritative:
+			nonAuthoritative++
 		case r.hasValue:
 			confirmed++
 		default:
@@ -355,8 +379,7 @@ func probeReady(servers []string, fqdn, want string) (bool, string) {
 		}
 	}
 
-	summary := fmt.Sprintf("confirmed %d / denied %d / unreachable %d (of %d)",
-		confirmed, missing, unreachable, len(results))
+	summary := fmt.Sprintf("confirmed %d / denied %d / non-authoritative %d / unreachable %d (of %d)", confirmed, missing, nonAuthoritative, unreachable, len(results))
 
 	// Any reachable NS denies it -> not propagated yet.
 	if missing > 0 {
@@ -375,6 +398,14 @@ func probeReady(servers []string, fqdn, want string) (bool, string) {
 	return true, summary
 }
 
+func probeReady(servers []string, fqdn, want string) (bool, string) {
+	return probeReadyWithExchange(servers, fqdn, want, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		client := &dns.Client{Timeout: 3 * time.Second}
+		resp, _, err := client.Exchange(msg, server)
+		return resp, err
+	})
+}
+
 // CleanUp deletes the TXT record this call wrote.
 //
 // The provider locates the record by the exact (domain, token, keyAuth) triple, so when
@@ -388,31 +419,159 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	return provider.CleanUp(domain, token, keyAuth)
 }
 
-// authoritativeNS resolves the zone's authoritative NS and turns them into "ip:53".
+func (s *DNSSolver) findZone(ctx context.Context, fqdn string) (string, error) {
+	for _, domain := range domainSequence(fqdn) {
+		msg := new(dns.Msg)
+		msg.SetQuestion(domain, dns.TypeSOA)
+		msg.RecursionDesired = true
+		resp, err := s.queryRecursive(ctx, msg)
+		if err != nil || resp == nil || resp.Rcode == dns.RcodeNameError {
+			continue
+		}
+		if resp.Rcode != dns.RcodeSuccess {
+			return "", fmt.Errorf("SOA lookup for %s returned %s", domain, dns.RcodeToString[resp.Rcode])
+		}
+		for _, rr := range resp.Answer {
+			if soa, ok := rr.(*dns.SOA); ok {
+				return dns.Fqdn(soa.Hdr.Name), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("could not find an SOA for %s via recursive resolvers %s", fqdn, strings.Join(s.recursiveNameservers, ","))
+}
+
+// authoritativeNS resolves the public NS delegation through the configured recursive resolver set.
 func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string, error) {
-	names, err := net.DefaultResolver.LookupNS(ctx, dns01.UnFqdn(zone))
+	msg := new(dns.Msg)
+	msg.SetQuestion(zone, dns.TypeNS)
+	msg.RecursionDesired = true
+	resp, err := s.queryRecursive(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("lookup NS for %s: %w", zone, err)
+	}
+	var names []string
+	for _, rr := range resp.Answer {
+		if ns, ok := rr.(*dns.NS); ok {
+			names = append(names, dns.Fqdn(ns.Ns))
+		}
 	}
 	if len(names) == 0 {
 		return nil, fmt.Errorf("%s has no NS records", zone)
 	}
 
 	var servers []string
+	seen := make(map[string]bool)
 	for _, ns := range names {
-		ips, err := net.DefaultResolver.LookupHost(ctx, strings.TrimSuffix(ns.Host, "."))
+		ips, err := s.lookupHost(ctx, ns)
 		if err != nil {
-			s.log.Warn("could not resolve an authoritative nameserver; skipping it", "ns", ns.Host, "err", err)
+			s.log.Warn("could not resolve an authoritative nameserver; skipping it", "ns", ns, "err", err)
 			continue
 		}
 		for _, ip := range ips {
-			servers = append(servers, net.JoinHostPort(ip, "53"))
+			server := net.JoinHostPort(ip, "53")
+			if !seen[server] {
+				seen[server] = true
+				servers = append(servers, server)
+			}
 		}
 	}
 	if len(servers) == 0 {
 		return nil, fmt.Errorf("none of %s's nameservers resolve to an address", zone)
 	}
 	return servers, nil
+}
+
+func (s *DNSSolver) probeRecords(servers []string, recs []DNSRecord) []recordProbe {
+	return probeRecordsWithExchange(servers, recs, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		return s.exchange(ctx, msg, server)
+	})
+}
+
+func (s *DNSSolver) queryRecursive(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
+	var errs []error
+	for _, resolver := range s.recursiveNameservers {
+		resp, err := s.exchange(ctx, msg.Copy(), resolver)
+		if err == nil && resp != nil && (resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError) {
+			return resp, nil
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", resolver, err))
+		} else if resp == nil {
+			errs = append(errs, fmt.Errorf("%s: empty response", resolver))
+		} else {
+			errs = append(errs, fmt.Errorf("%s: DNS response %s", resolver, dns.RcodeToString[resp.Rcode]))
+		}
+	}
+	return nil, fmt.Errorf("all configured recursive resolvers failed: %w", errors.Join(errs...))
+}
+
+func (s *DNSSolver) lookupHost(ctx context.Context, host string) ([]string, error) {
+	var ips []string
+	var errs []error
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		msg := new(dns.Msg)
+		msg.SetQuestion(host, qtype)
+		msg.RecursionDesired = true
+		resp, err := s.queryRecursive(ctx, msg)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, rr := range resp.Answer {
+			switch r := rr.(type) {
+			case *dns.A:
+				ips = append(ips, r.A.String())
+			case *dns.AAAA:
+				ips = append(ips, r.AAAA.String())
+			}
+		}
+	}
+	if len(ips) == 0 {
+		if len(errs) == 0 {
+			return nil, errors.New("no A or AAAA records")
+		}
+		return nil, fmt.Errorf("no A or AAAA records: %w", errors.Join(errs...))
+	}
+	return ips, nil
+}
+
+func recursiveNameservers(configured []string) ([]string, error) {
+	if len(configured) > 0 {
+		return append([]string(nil), configured...), nil
+	}
+	resolv, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+	if err != nil {
+		return nil, fmt.Errorf("read recursive nameservers from /etc/resolv.conf: %w", err)
+	}
+	if len(resolv.Servers) == 0 {
+		return nil, errors.New("/etc/resolv.conf contains no nameservers")
+	}
+	servers := make([]string, 0, len(resolv.Servers))
+	for _, server := range resolv.Servers {
+		servers = append(servers, net.JoinHostPort(server, resolv.Port))
+	}
+	return servers, nil
+}
+
+func exchangeDNS(ctx context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+	client := &dns.Client{Timeout: 3 * time.Second}
+	resp, _, err := client.ExchangeContext(ctx, msg, server)
+	if err == nil && resp != nil && resp.Truncated {
+		tcp := &dns.Client{Net: "tcp", Timeout: 3 * time.Second}
+		resp, _, err = tcp.ExchangeContext(ctx, msg, server)
+	}
+	return resp, err
+}
+
+func domainSequence(fqdn string) []string {
+	labels := dns.SplitDomainName(dns.Fqdn(fqdn))
+	out := make([]string, 0, len(labels))
+	for i := range labels {
+		out = append(out, strings.Join(labels[i:], ".")+".")
+	}
+	return out
 }
 
 func responseHasTXT(resp *dns.Msg, want string) bool {

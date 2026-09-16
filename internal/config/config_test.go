@@ -67,6 +67,36 @@ certificates:
 	}
 }
 
+func TestRecursiveNameserversAreNormalized(t *testing.T) {
+	body := strings.Replace(minimalPrefix, "  loginToken: token\n", "  loginToken: token\n  recursiveNameservers: [\"1.1.1.1\", \"[2606:4700:4700::1111]:5353\", \"1.1.1.1:53\"]\n", 1)
+	cfg, err := Load(writeConfig(t, body+`
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"1.1.1.1:53", "[2606:4700:4700::1111]:5353"}
+	if strings.Join(cfg.DNS.RecursiveNameservers, ",") != strings.Join(want, ",") {
+		t.Errorf("recursiveNameservers = %v, want %v", cfg.DNS.RecursiveNameservers, want)
+	}
+}
+
+func TestRecursiveNameserversRejectHostnamesAndBadPorts(t *testing.T) {
+	for _, resolver := range []string{"resolver.example", "1.1.1.1:not-a-port", "[2606:4700:4700::1111"} {
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n", "  loginToken: token\n  recursiveNameservers: [\""+resolver+"\"]\n", 1)
+		_, err := Load(writeConfig(t, body+`
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`))
+		if err == nil || !strings.Contains(err.Error(), "recursiveNameservers") {
+			t.Errorf("resolver %q should be rejected, got %v", resolver, err)
+		}
+	}
+}
+
 // The tlsserver profile caps Max Names at 25, so it must be blocked locally,
 // or an order the CA would certainly refuse goes out and burns order quota.
 func TestProfileMaxNamesEnforcedLocally(t *testing.T) {

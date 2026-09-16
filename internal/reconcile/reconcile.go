@@ -437,7 +437,7 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 	// first upload needs a manual bind, and until then the live endpoint is still
 	// serving the old certificate anyway.
 	st, err := r.store.GetCert(c.Name)
-	if err != nil || st == nil || !st.DeployConfirmed {
+	if err != nil || st == nil || !c.Deploy.Enabled || !st.DeployConfirmed {
 		return
 	}
 

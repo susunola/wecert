@@ -1,11 +1,93 @@
 package acme
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/miekg/dns"
 )
+
+func dnsReply(question *dns.Msg, answers ...dns.RR) *dns.Msg {
+	resp := new(dns.Msg)
+	resp.SetReply(question)
+	resp.Answer = append(resp.Answer, answers...)
+	return resp
+}
+
+func TestConfiguredDiscoveryUsesOneResolverViewAndAuthoritativeTXT(t *testing.T) {
+	resolver, authority := "192.0.2.53:53", "198.51.100.53:53"
+	solver := &DNSSolver{recursiveNameservers: []string{resolver}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	var seen []string
+	solver.exchange = func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+		seen = append(seen, server+"|"+dns.TypeToString[msg.Question[0].Qtype])
+		name := msg.Question[0].Name
+		switch server {
+		case resolver:
+			switch msg.Question[0].Qtype {
+			case dns.TypeSOA:
+				return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}, Ns: "ns1.example.net."}), nil
+			case dns.TypeNS:
+				return dnsReply(msg, &dns.NS{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET}, Ns: "ns1.example.net."}), nil
+			case dns.TypeA:
+				if name == "ns1.example.net." {
+					return dnsReply(msg, &dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET}, A: []byte{198, 51, 100, 53}}), nil
+				}
+			case dns.TypeAAAA:
+				return dnsReply(msg), nil
+			}
+		case authority:
+			resp := dnsReply(msg, &dns.TXT{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{"wanted"}})
+			resp.Authoritative = true
+			return resp, nil
+		}
+		return nil, fmt.Errorf("unexpected query %s to %s", name, server)
+	}
+	zone, err := solver.findZone(context.Background(), "_acme-challenge.example.com.")
+	if err != nil || zone != "example.com." {
+		t.Fatalf("findZone = %q, %v", zone, err)
+	}
+	servers, err := solver.authoritativeNS(context.Background(), zone)
+	if err != nil || len(servers) != 1 || servers[0] != authority {
+		t.Fatalf("authoritativeNS = %v, %v", servers, err)
+	}
+	results := solver.probeRecords(servers, []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}})
+	if len(results) != 1 || !results[0].ready {
+		t.Fatalf("authoritative TXT should pass, got %+v", results)
+	}
+	for _, call := range seen {
+		if call != authority+"|TXT" && !strings.HasPrefix(call, resolver) {
+			t.Errorf("discovery queried an unexpected server: %s", call)
+		}
+	}
+}
+
+func TestNonAuthoritativeTXTResponseDoesNotPassPropagation(t *testing.T) {
+	ready, summary := probeReadyWithExchange([]string{"192.0.2.53:53"}, "_acme-challenge.example.com.", "wanted", func(msg *dns.Msg, _ string) (*dns.Msg, error) {
+		return dnsReply(msg, &dns.TXT{Hdr: dns.RR_Header{Name: "_acme-challenge.example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{"wanted"}}), nil
+	})
+	if ready {
+		t.Fatalf("a recursive/non-authoritative TXT response must not pass: %s", summary)
+	}
+}
+
+func TestRecursiveDiscoveryFallsBackToNextConfiguredResolver(t *testing.T) {
+	solver := &DNSSolver{recursiveNameservers: []string{"192.0.2.1:53", "192.0.2.2:53"}}
+	solver.exchange = func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+		if server == "192.0.2.1:53" {
+			return nil, errors.New("unreachable")
+		}
+		return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}, Ns: "ns1.example.net."}), nil
+	}
+	zone, err := solver.findZone(context.Background(), "_acme-challenge.example.com.")
+	if err != nil || zone != "example.com." {
+		t.Fatalf("fallback resolver did not find the zone: %q, %v", zone, err)
+	}
+}
 
 // txtResponse builds a response containing the given TXT records.
 func txtResponse(values ...string) *dns.Msg {
