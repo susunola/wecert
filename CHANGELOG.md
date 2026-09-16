@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.0 - 2026-09-16
+
 ### Security
 
 - Build with Go 1.26.6. The pinned 1.26.5 carried five standard-library
@@ -46,6 +48,14 @@
   fetch, via a narrow `sslAPI` seam; deploy coverage rises from ~11% to ~52%.
 
 ### Fixed
+
+- Keep retired cloud certificates queued when deployment is disabled, clear
+  stale deployment state on local-only renewals, and record authorization
+  failures that occur during validation polling.
+- Reject conflicting group-level onboarding metadata instead of selecting one
+  hostname's profile, key type, or deployment flag by sort order.
+- Use one configurable recursive resolver view for DNS CNAME/SOA/NS discovery,
+  then require authoritative answers when checking challenge TXT propagation.
 
 - Reject `DropThreshold >= 1` in `onboarding.New` so the CLI `-drop-threshold`
   flag can no longer bypass the config layer's `[0,1)` check and silently

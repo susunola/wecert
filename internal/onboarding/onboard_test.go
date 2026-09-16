@@ -770,5 +770,22 @@ func TestGuardOneAcceptsANameServedByAWildcardRule(t *testing.T) {
 	}
 	if got := h.domains(t); len(got) != 1 || got[0] != "www.example.com" {
 		t.Fatalf("domain set = %v, want [www.example.com]", got)
+ 	}
+}
+
+func TestGroupSettingsConflictKeepsPreviousCertificate(t *testing.T) {
+	h := newHarness(t, Options{Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256})
+	h.rules.domains = []string{"api.example.com", "www.example.com"}
+	h.decls.raw = []RawDeclaration{decl("api.example.com", "profile=tlsserver"), decl("www.example.com", "profile=tlsserver")}
+	h.run(t)
+	before := h.document(t)
+	h.decls.raw = []RawDeclaration{decl("api.example.com", "profile=tlsserver"), decl("www.example.com", "profile=classic")}
+	rep := h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("a group settings conflict should keep only that group, not freeze unrelated work: %v", rep.FreezeReasons)
+	}
+	after := h.document(t)
+	if after.Revision != before.Revision || after.Certificates[0].Profile != config.ProfileTLSServer {
+		t.Fatalf("conflicting group settings must keep the previous certificate: before=%+v after=%+v", before.Certificates, after.Certificates)
 	}
 }

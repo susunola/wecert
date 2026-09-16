@@ -474,6 +474,26 @@ func TestChallengesAreAcceptedOncePerAuthorization(t *testing.T) {
 	t.Logf("call sequence: %v", fake.callLog())
 }
 
+func TestAwaitAuthorizationInvalidRecordsIdentifierFailure(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"bad.example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return fixed }
+	fake.authzByURL = map[string]legoacme.Authorization{
+		"https://ca.test/authz/bad": {Status: "invalid", Identifier: legoacme.Identifier{Value: "bad.example.com"}, Challenges: []legoacme.Challenge{{Type: "dns-01", Error: &legoacme.ProblemDetails{Detail: "NXDOMAIN"}}}},
+	}
+	err := m.awaitAuthorizations(context.Background(), []*state.Authorization{{CertName: cert.Name, AuthzURL: "https://ca.test/authz/bad", Identifier: "bad.example.com"}})
+	if err == nil {
+		t.Fatal("invalid authorization must fail")
+	}
+	got, err := store.ListIdentifierFailures(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Identifier != "bad.example.com" || got[0].Failures != 1 {
+		t.Fatalf("invalid authorization must enter the fallback ledger, got %+v", got)
+	}
+}
+
 // ── every persistOrder call site must honour its error ─────────────────────
 
 // persistOrder returns its write error so a failed write aborts the step instead

@@ -332,7 +332,14 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 			switch cur.Status {
 			case "valid":
 			case "invalid":
-				return fmt.Errorf("validation failed for identifier %s: %s", a.Identifier, authzError(cur))
+				// This is the common failure timing: the challenge was accepted,
+				// then the CA later marks the authorization invalid. Keep the
+				// ledger key wildcard-aware, just as solveChallenges does.
+				targeted := challenge.GetTargetedDomain(cur)
+				if rerr := m.store.RecordIdentifierFailure(a.CertName, targeted, authzError(cur), m.now()); rerr != nil {
+					m.log.Warn("failed to record the identifier failure", "cert", a.CertName, "identifier", targeted, "err", rerr)
+				}
+				return fmt.Errorf("validation failed for identifier %s: %s", targeted, authzError(cur))
 			default:
 				stillPending = append(stillPending, a)
 			}
