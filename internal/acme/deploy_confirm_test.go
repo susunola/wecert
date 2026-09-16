@@ -17,8 +17,10 @@ import (
 // fakeDeployer implements only Bindings -- this file tests the "confirm binding" step.
 type fakeDeployer struct {
 	bindings int
-	bindErr  error
-	calls    int
+	// bindingsPartial makes the answer a lower bound: at least one region was not counted.
+	bindingsPartial bool
+	bindErr         error
+	calls           int
 
 	// deleted records the CertIds Delete was called with, and deleteErr makes it
 	// fail, so the reclamation path can be pinned in both directions.
@@ -33,9 +35,15 @@ func (f *fakeDeployer) Delete(_ context.Context, certID string) error {
 	f.deleted = append(f.deleted, certID)
 	return f.deleteErr
 }
-func (f *fakeDeployer) Bindings(_ context.Context, _ string) (int, error) {
+func (f *fakeDeployer) Bindings(_ context.Context, _ string) (int, bool, error) {
 	f.calls++
-	return f.bindings, f.bindErr
+	// complete defaults to true so the existing cases keep testing what they were written for; a
+	// test that wants "at least one region went unanswered" sets it false.
+	complete := true
+	if f.bindingsPartial {
+		complete = false
+	}
+	return f.bindings, complete, f.bindErr
 }
 
 // newConfirmHarness builds the state "issued and uploaded, binding not confirmed yet".
@@ -219,7 +227,7 @@ func TestConfirmedBindingIsPersisted(t *testing.T) {
 
 // The Noop deployer (used when cloud deploy is off) must always report 0 and never fail.
 func TestNoopDeployerReportsNoBindings(t *testing.T) {
-	n, err := deploy.Noop{}.Bindings(context.Background(), "ap-whatever")
+	n, _, err := deploy.Noop{}.Bindings(context.Background(), "ap-whatever")
 	if err != nil {
 		t.Fatalf("Noop.Bindings should not fail: %v", err)
 	}

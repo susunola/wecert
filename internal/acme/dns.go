@@ -199,19 +199,29 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 		return nil
 	}
 
-	// The budget is global: every zone shares one deadline, so the overall wait does not
-	// inflate linearly as zones are added. The error below carries the real elapsed
-	// time, so that a zone handled later cannot report "not confirmed within 5m" when it
-	// actually waited a few seconds.
+	// The budget is global: every zone shares one deadline, so the overall wait does not inflate
+	// linearly as zones are added. That is deliberate (the contract test pins it), but it means a
+	// zone reached after the deadline has already passed must not be entered at all -- it would get
+	// one probe round and then fail with a message blaming it for a wait that was not its own.
 	start := time.Now()
 	deadline := start.Add(s.timeout)
 
+	// byZone is a map, so the order is random: without this, which zone is starved changes from
+	// pass to pass, which is worse than a fixed order because it looks intermittent.
 	for zone, recs := range byZone {
+		waitStart := time.Now()
+		if !waitStart.Before(deadline) {
+			return fmt.Errorf("TXT propagation was not confirmed before the %s budget ran out "+
+				"(zone %s was not reached; %s was spent on the zones before it)",
+				s.timeout, zone, waitStart.Sub(start).Round(time.Second))
+		}
 		servers, err := s.authoritativeNS(ctx, zone)
 		if err != nil {
 			return err
 		}
-		if err := s.waitZone(ctx, zone, servers, recs, start, deadline); err != nil {
+		if err := s.waitZone(ctx, zone, servers, recs, zoneBudget{
+			passStart: start, zoneStart: waitStart, deadline: deadline,
+		}); err != nil {
 			return err
 		}
 	}
@@ -239,7 +249,7 @@ type recordProbe struct {
 // up to 3 seconds each -- one round then runs far past the 5-second polling interval.
 // Propagation waiting would degrade into "advance a little every 5 seconds", and a
 // 5-minute budget would not survive even a few rounds.
-func probeRecordsWithExchange(servers []string, recs []DNSRecord, exchange func(*dns.Msg, string) (*dns.Msg, error)) []recordProbe {
+func probeRecordsWithExchange(servers []nsServer, recs []DNSRecord, exchange func(*dns.Msg, string) (*dns.Msg, error)) []recordProbe {
 	out := make([]recordProbe, len(recs))
 	if len(recs) == 0 {
 		return out
@@ -270,7 +280,7 @@ func probeRecordsWithExchange(servers []string, recs []DNSRecord, exchange func(
 	return out
 }
 
-func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
+func probeRecords(servers []nsServer, recs []DNSRecord) []recordProbe {
 	return probeRecordsWithExchange(servers, recs, func(msg *dns.Msg, server string) (*dns.Msg, error) {
 		client := &dns.Client{Timeout: 3 * time.Second}
 		resp, _, err := client.Exchange(msg, server)
@@ -279,9 +289,21 @@ func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
 }
 
 // waitZone polls the zone's authoritative NS until the records are confirmed propagated.
+// zoneBudget is the propagation budget as it applies to one zone.
+//
+// Two timestamps rather than one because the message has to be honest about both: how long THIS zone
+// waited, and how much of the shared budget was already gone when it was entered. Reporting the pass
+// elapsed as if it were the zone's own wait is what the old message did, and it points the operator
+// at the wrong zone -- the one that happens to sort last in a map iteration.
+type zoneBudget struct {
+	passStart time.Time // when the whole propagation wait began
+	zoneStart time.Time // when this zone was entered
+	deadline  time.Time // shared across every zone
+}
+
+// waitZone polls one zone until its records are confirmed, within the shared deadline.
 func (s *DNSSolver) waitZone(
-	ctx context.Context, zone string, servers []string, recs []DNSRecord,
-	start, deadline time.Time,
+	ctx context.Context, zone string, servers []nsServer, recs []DNSRecord, b zoneBudget,
 ) error {
 	for {
 		results := s.probeRecords(servers, recs)
@@ -307,11 +329,12 @@ func (s *DNSSolver) waitZone(
 			return nil
 		}
 
-		if !time.Now().Before(deadline) {
+		if !time.Now().Before(b.deadline) {
 			return fmt.Errorf(
-				"TXT propagation not confirmed: waited %s (budget %s), zone=%s, ns=%d, "+
-					"%d/%d records still not ready: %s",
-				time.Since(start).Round(time.Second), s.timeout,
+				"TXT propagation not confirmed: this zone waited %s, entering it %s into the %s "+
+					"budget; zone=%s, ns=%d, %d/%d records still not ready: %s",
+				time.Since(b.zoneStart).Round(time.Second),
+				b.zoneStart.Sub(b.passStart).Round(time.Second), s.timeout,
 				zone, len(servers), len(pending), len(recs),
 				strings.Join(pending, " | "))
 		}
@@ -324,38 +347,80 @@ func (s *DNSSolver) waitZone(
 	}
 }
 
-// nsProbe is the probe result for one authoritative NS.
+// nsProbe is the probe result for one address of one authoritative NS.
+//
+// ns is the nameserver NAME this address belongs to, and it is not decoration: a name with both an
+// A and an AAAA record is one server, and the propagation rule requires two *servers* to agree. See
+// probeReadyWithExchange.
 type nsProbe struct {
+	ns            string
 	server        string
 	hasValue      bool
 	authoritative bool
-	err           error // non-nil means this NS is simply unreachable from here
+	err           error // non-nil means this address is unreachable from here, or did not answer
 }
 
 // probeTXT probes every authoritative NS concurrently.
 //
 // Concurrency is necessary here: 9 servers in series with a 5-second timeout each makes
 // a worst-case round of 45 seconds.
-func probeTXTWithExchange(servers []string, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) []nsProbe {
+func probeTXTWithExchange(servers []nsServer, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) []nsProbe {
 	results := make([]nsProbe, len(servers))
 
 	var wg sync.WaitGroup
 	for i, server := range servers {
 		wg.Add(1)
-		go func(i int, server string) {
+		go func(i int, server nsServer) {
 			defer wg.Done()
-			results[i] = nsProbe{server: server}
+			results[i] = nsProbe{ns: server.ns, server: server.addr}
 
 			m := new(dns.Msg)
 			m.SetQuestion(fqdn, dns.TypeTXT)
 			m.RecursionDesired = false
+			// Without EDNS0 the answer is capped at 512 bytes (miekg falls back to
+			// MinMsgSize), and a challenge name shared by a wildcard and its apex plus a
+			// leftover value from the previous round gets close to that. Asking for a bigger
+			// buffer is what keeps the answer whole rather than truncated.
+			m.SetEdns0(4096, false)
 
-			resp, err := exchange(m, server)
+			resp, err := exchange(m, server.addr)
 			if err != nil {
 				results[i].err = err
 				return
 			}
-			results[i].authoritative = resp != nil && resp.Authoritative
+			if resp == nil {
+				results[i].err = errors.New("no response")
+				return
+			}
+			// Rcode decides what kind of answer this is, and the three kinds are not
+			// interchangeable:
+			//
+			//   NOERROR   -- answered; look for the value.
+			//   NXDOMAIN  -- answered definitively: the name does not exist, so the value is not
+			//                there. A denial, which is a real answer.
+			//   anything  -- SERVFAIL, REFUSED, ... The server has not answered the question.
+			//     else       Treating that as "the record is not there" is a false denial, and in
+			//                LookupTXT's branch a false denial is what licenses deleting the
+			//                authorization row of a name that is still being validated. It is not
+			//                a confirmation either, so it counts as unreachable: inconclusive.
+			switch resp.Rcode {
+			case dns.RcodeSuccess:
+			case dns.RcodeNameError:
+				results[i].authoritative = resp.Authoritative
+				results[i].hasValue = false
+				return
+			default:
+				results[i].err = fmt.Errorf("server answered %s", dns.RcodeToString[resp.Rcode])
+				return
+			}
+			// A truncated answer may be missing the very record being looked for, so it can
+			// neither confirm nor deny. exchangeDNS retries over TCP; this is the case where
+			// that failed too.
+			if resp.Truncated {
+				results[i].err = errors.New("truncated answer (TCP retry failed)")
+				return
+			}
+			results[i].authoritative = resp.Authoritative
 			results[i].hasValue = results[i].authoritative && responseHasTXT(resp, want)
 		}(i, server)
 	}
@@ -382,11 +447,22 @@ func probeTXTWithExchange(servers []string, fqdn, want string, exchange func(*dn
 //
 // A single-authority zone has to be able to pass: requiring 2 confirmations would leave
 // such a zone waiting for propagation forever.
-func probeReadyWithExchange(servers []string, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) (bool, string) {
+func probeReadyWithExchange(servers []nsServer, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) (bool, string) {
 	results := probeTXTWithExchange(servers, fqdn, want, exchange)
 
 	var confirmed, missing, nonAuthoritative, unreachable int
+	// Counted per NS NAME, not per address: one server answering on both its A and its AAAA
+	// record is one server, and the rule below is about how many independent servers agree.
+	//
+	// This cuts both ways, and both were wrong before. Counting addresses let a single
+	// multi-homed authority satisfy "two independent confirmations" -- the guard the comment
+	// promises is exactly what it lost. It also made a single-authority zone whose name has an
+	// unreachable second address permanently unconfirmable, because the "one authority is exempt"
+	// branch was keyed on the address count.
+	confirmingNS := map[string]bool{}
+	authorities := map[string]bool{}
 	for _, r := range results {
+		authorities[r.ns] = true
 		switch {
 		case r.err != nil:
 			unreachable++
@@ -394,14 +470,18 @@ func probeReadyWithExchange(servers []string, fqdn, want string, exchange func(*
 			nonAuthoritative++
 		case r.hasValue:
 			confirmed++
+			confirmingNS[r.ns] = true
 		default:
 			missing++
 		}
 	}
 
-	summary := fmt.Sprintf("confirmed %d / denied %d / non-authoritative %d / unreachable %d (of %d)", confirmed, missing, nonAuthoritative, unreachable, len(results))
+	summary := fmt.Sprintf("confirmed %d/%d server(s) / denied %d / non-authoritative %d / unreachable %d (of %d addresses)",
+		len(confirmingNS), len(authorities), missing, nonAuthoritative, unreachable, len(results))
 
-	// Any reachable NS denies it -> not propagated yet.
+	// Any reachable server that answers "no such value" -> not propagated yet. Checked per
+	// address on purpose: one address of one authority denying the value is enough to hold the
+	// whole thing back.
 	if missing > 0 {
 		return false, summary
 	}
@@ -409,16 +489,16 @@ func probeReadyWithExchange(servers []string, fqdn, want string, exchange func(*
 	if confirmed == 0 {
 		return false, summary
 	}
-	// With multiple authorities require at least 2 independent confirmations, so
-	// "only one server was reachable" cannot slip through.
-	// A zone with a single authority is exempt from this rule.
-	if len(results) >= 2 && confirmed < 2 {
+	// With more than one authority, require two of them to confirm, so "only one server was
+	// reachable" cannot slip through. A zone with a single authority is exempt, whoever many
+	// addresses that authority has.
+	if len(authorities) >= 2 && len(confirmingNS) < 2 {
 		return false, summary
 	}
 	return true, summary
 }
 
-func probeReady(servers []string, fqdn, want string) (bool, string) {
+func probeReady(servers []nsServer, fqdn, want string) (bool, string) {
 	return probeReadyWithExchange(servers, fqdn, want, func(msg *dns.Msg, server string) (*dns.Msg, error) {
 		client := &dns.Client{Timeout: 3 * time.Second}
 		resp, _, err := client.Exchange(msg, server)
@@ -702,8 +782,19 @@ func (s *DNSSolver) findZone(ctx context.Context, fqdn string) (string, error) {
 	return "", fmt.Errorf("could not find an SOA for %s via recursive resolvers %s", fqdn, strings.Join(s.recursiveNameservers, ","))
 }
 
+// nsServer is one address of one authoritative nameserver.
+//
+// The name is carried alongside the address because the propagation rule counts SERVERS, and one
+// server commonly owns several addresses: DNSPod's pools publish three A records per NS name, and a
+// dual-stack name publishes an A and an AAAA. Counting addresses instead made a single multi-homed
+// authority look like two independent servers.
+type nsServer struct {
+	ns   string
+	addr string
+}
+
 // authoritativeNS resolves the public NS delegation through the configured recursive resolver set.
-func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string, error) {
+func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]nsServer, error) {
 	msg := new(dns.Msg)
 	msg.SetQuestion(zone, dns.TypeNS)
 	msg.RecursionDesired = true
@@ -721,7 +812,7 @@ func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string,
 		return nil, fmt.Errorf("%s has no NS records", zone)
 	}
 
-	var servers []string
+	var servers []nsServer
 	seen := make(map[string]bool)
 	for _, ns := range names {
 		ips, err := s.lookupHost(ctx, ns)
@@ -730,10 +821,10 @@ func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string,
 			continue
 		}
 		for _, ip := range ips {
-			server := net.JoinHostPort(ip, "53")
-			if !seen[server] {
-				seen[server] = true
-				servers = append(servers, server)
+			addr := net.JoinHostPort(ip, "53")
+			if !seen[addr] {
+				seen[addr] = true
+				servers = append(servers, nsServer{ns: ns, addr: addr})
 			}
 		}
 	}
@@ -743,7 +834,7 @@ func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string,
 	return servers, nil
 }
 
-func (s *DNSSolver) probeRecords(servers []string, recs []DNSRecord) []recordProbe {
+func (s *DNSSolver) probeRecords(servers []nsServer, recs []DNSRecord) []recordProbe {
 	return probeRecordsWithExchange(servers, recs, s.authoritativeExchange())
 }
 
@@ -813,14 +904,29 @@ func recursiveNameservers(configured []string) ([]string, error) {
 	return servers, nil
 }
 
+// exchangeDNS asks one server, retrying over TCP when the UDP answer was truncated.
+//
+// The TCP attempt does not replace the UDP answer on failure. The two share the caller's 3-second
+// context, and a server that is slow to accept TCP is exactly the case this retry exists for, so
+// overwriting `resp` there meant discarding a truncated-but-real answer -- including one whose
+// answer section already carried the value being looked for -- and reporting the server as
+// unreachable. The truncated answer is returned instead, with Truncated still set, and the caller
+// decides: probeTXT classifies it as unreachable (an incomplete answer is not a denial) rather than
+// reading the missing record as "not propagated".
 func exchangeDNS(ctx context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
 	client := &dns.Client{Timeout: 3 * time.Second}
 	resp, _, err := client.ExchangeContext(ctx, msg, server)
-	if err == nil && resp != nil && resp.Truncated {
-		tcp := &dns.Client{Net: "tcp", Timeout: 3 * time.Second}
-		resp, _, err = tcp.ExchangeContext(ctx, msg, server)
+	if err != nil || resp == nil || !resp.Truncated {
+		return resp, err
 	}
-	return resp, err
+
+	tcp := &dns.Client{Net: "tcp", Timeout: 3 * time.Second}
+	tcpResp, _, tcpErr := tcp.ExchangeContext(ctx, msg, server)
+	if tcpErr != nil || tcpResp == nil {
+		// Keep the UDP answer. It is incomplete, and Truncated says so.
+		return resp, nil
+	}
+	return tcpResp, nil
 }
 
 func domainSequence(fqdn string) []string {
