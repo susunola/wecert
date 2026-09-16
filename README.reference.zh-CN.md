@@ -627,6 +627,27 @@ X-Wecert-Token: <token>
 
 `_wecert` 声明语法、五条熔断、systemd 单元和排障表见 [期望状态](desired-state.md)。
 
+### `failureFallback`
+
+一张证书临近到期、而签发一直失败时，摘掉其中授权反复失败的名字，为其它的先签一张。**部分可用好过全挂** —— 25 个名字里有 1 个 DNS 配错了，不该把另外 24 个一起拖下水。
+
+**默认关闭。** 它会改变证书覆盖什么，那是安全决策，不该由程序替人做。触发时打 **ERROR** 级日志，并在指标里长期可见，直到它自己解除。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 开启 |
+| `afterFailures` | `5` | 连续失败多少次之后才考虑降级 |
+| `beforeExpiry` | `168h` | 只在这个窗口内降级。设太大会是净损失：等于用一张缺名字的证书换掉一张还完全有效的证书 |
+| `minIdentifierFailures` | `3` | 某个名字至少失败这么多次才允许摘掉。设成 `1` 会让一次网络抖动就摘掉一个名字 |
+| `failureWindow` | `24h` | 失败记录保持有效多久 |
+| `minNames` | `1` | 剩下的名字少于这个数就拒绝降级 —— 那是"全挂"换了个样子 |
+
+**只摘"确实单独失败过"的名字。** 没有逐个 identifier 的证据时它什么都不做 —— 随机摘会把本来好的名字也一起牺牲掉，那比不降级更糟。它也不适用于"还没有生效证书"的情况：那时没有"保住现有的"这个立论，只有"少签几个"。
+
+**它会自愈。** 被摘掉的名字永远不会再被尝试，所以它不可能靠自己挣回一次成功。走的是另一条路：失败记录在 `failureWindow` 之后老化，那个名字就不再被摘掉，下一轮自然会去重试全集。DNS 修好之后最多等一个窗口就恢复 —— 不需要额外的重试状态，也不需要人工介入。
+
+要盯着的是 `wecert_certificate_fallback_active{cert}` 和 `wecert_certificate_fallback_dropped_names{cert}`。降级长期为 1 说明有个未解决的问题，而不是一个稳态。
+
 ### `certificates[]`
 
 | 字段 | 必填 | 默认 | 说明 |
@@ -706,6 +727,8 @@ timer 里的 `Unit=` 不是装饰：不写这行时 systemd 会解析成同名�
 | `wecert_certificate_probe_match{host}` | 1 = 服务的就是部署的那张；0 = 换绑没生效，或另一张证书在赢 SNI |
 | `wecert_certificate_probe_not_after_timestamp_seconds{host}` | 从网络读回的 `notAfter` —— 和状态库那个对比着看 |
 | `wecert_certificate_probe_errors_total{host}` | 探测根本没跑成。是环境问题，不是证书问题 |
+| `wecert_certificate_fallback_active{cert}` | 1 = 正在服务一张缺了几个名字的证书（因为那几个名字一直签不出来） |
+| `wecert_certificate_fallback_dropped_names{cert}` | 那张证书少了几个名字 |
 | `wecert_desired_state_age_seconds` | 期望状态文档的年龄。持续增长说明 `wecert-onboard` 没在跑 |
 | `wecert_orphaned_certificates` | 状态库里有、期望状态里没有的证书。它们不会再被续期 |
 
@@ -1055,7 +1078,6 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
 - [ ] 切 `profile: tlsserver`（45 天）并验证 ARI 全自动跑满一个完整续期周期
 - [ ] 用 `multi_cert_info` 测 SNI 多证书场景（"换一张不误伤另一张"）
 - [ ] 阶段 C：CVM + systemd + CVM 角色凭证路径（`testenv/` 里已备好，`create_cvm=true`）
-- [ ] 签发失败降级策略：到期前 N 天仍未成功时，自动拆成更小子集先签（部分可用好过全挂）
 - [ ] `state.Store` 缺少事务能力，`download()` 收尾的
       "提升新证书 → 记录退役证书 → 丢弃订单" 三步是各自独立提交的；
       中间失败会留下孤儿云证书或一次假故障告警
@@ -1076,6 +1098,9 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
       见 `probe` 配置节。
 - [x] **给 `state.db` 加跨进程排他锁（`flock`）。** 在 `state.Open` 里对
 - [x] **把 `Manager` 对 `*api.Core` 的依赖抽成窄接口。** `internal/acme/api.go`
+- [x] **签发失败降级：到期前拆分子集。** `failureFallback` 只摘掉逐个授权
+      反复失败的名字，只在到期窗口内生效，而且剩下的名字不够就拒绝降级。
+      默认关闭、以 ERROR 打日志、失败记录老化后自愈。见上面的 `failureFallback` 一节。
       定义了 Manager 真正需要的七个操作，`NewAPI(core)` 是 lego 的适配器。
       收益不在于多一层间接，而在于订单状态机终于可以按**调用顺序和参数**断言，
       不必起 HTTP 服务器。三条以前很难验的不变量现在有了测试：
