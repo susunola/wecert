@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -353,7 +354,7 @@ func (r *Reconciler) StartAll(ctx context.Context) []string {
 // reconcileOne processes one certificate and mirrors the result into metrics
 // and notifications.
 func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) {
-	err := r.manager.Reconcile(ctx, c)
+	err := r.safeReconcile(ctx, c)
 	if err != nil {
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
 		// manager already logged and scheduled backoff; this is just a summary.
@@ -368,6 +369,37 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) {
 	if r.notifier != nil {
 		r.notifier.Renewal(ctx, c.Name, err)
 	}
+}
+
+// safeReconcile calls the manager and recovers from a panic inside it.
+//
+// This is the single choke point every reconcile path goes through (RunAll's
+// loop, RunCert, and StartCert's goroutine), so it is the one place a recover
+// here protects all of them. Without it, one certificate hitting an
+// unanticipated nil pointer or index-out-of-range would not just fail that
+// certificate -- Go terminates the whole process on an unrecovered panic in any
+// goroutine, taking down every other certificate's renewal with it. That is
+// exactly the coupling RunAll's own comment says must never happen, and a
+// panic is the one failure mode a plain error return cannot guard against.
+//
+// The certificate's on-disk state at the moment of the panic is unknown (the
+// manager may have crashed between two writes), so this cannot call
+// recordFailure itself -- it only reports the outcome; the caller's normal
+// error handling (metrics, logging, notification) takes it from there, and the
+// certificate's own next scheduled pass decides fresh from whatever ended up on
+// disk.
+func (r *Reconciler) safeReconcile(ctx context.Context, c *config.Certificate) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			metrics.ReconcilePanics.WithLabelValues(c.Name).Inc()
+			r.log.Error("recovered from a panic while reconciling this certificate; "+
+				"the process keeps running, every other certificate is unaffected, "+
+				"and the next scheduled pass will retry this one",
+				"cert", c.Name, "panic", p, "stack", string(debug.Stack()))
+			err = fmt.Errorf("panic while reconciling %s: %v", c.Name, p)
+		}
+	}()
+	return r.manager.Reconcile(ctx, c)
 }
 
 // probeCert dials a real TLS connection to confirm the live endpoint really
@@ -419,6 +451,16 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 		wg.Add(1)
 		go func(h string) {
 			defer wg.Done()
+			// A panic here is a background probe, not an issuance step, but an
+			// unrecovered panic in any goroutine still kills the whole process --
+			// so a single bad handshake response must not be allowed to take
+			// every certificate's renewal down with it either.
+			defer func() {
+				if p := recover(); p != nil {
+					r.log.Error("recovered from a panic while probing a live endpoint",
+						"cert", c.Name, "host", h, "panic", p, "stack", string(debug.Stack()))
+				}
+			}()
 			r.prober.Check(ctx, h, e)
 		}(host)
 	}

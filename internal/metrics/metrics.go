@@ -44,6 +44,21 @@ var (
 		Help: "Reconcile passes, with result being ok or error.",
 	}, []string{"cert", "result"})
 
+	// ReconcilePanics counts passes that only completed because a panic inside
+	// the manager was recovered.
+	//
+	// This is deliberately a separate metric from ReconcileTotal's "error" result,
+	// not folded into it: an *error* is an expected, handled outcome (ACME said no,
+	// the network blipped) and the backoff in recordFailure already reacts to it. A
+	// *panic* means the code hit a case nobody anticipated -- a nil that should
+	// never be nil, an index that should never be out of range -- and recovering
+	// from it keeps every other certificate's renewal running, but it must alert a
+	// human on its own: staying above 0 always means a bug, never routine churn.
+	ReconcilePanics = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "wecert_reconcile_panics_total",
+		Help: "Passes that only completed because a panic inside the reconcile manager was recovered. Any nonzero value is a bug, not routine churn -- alert on it directly.",
+	}, []string{"cert"})
+
 	// DesiredStateErrors counts passes that could not read the desired state at all.
 	//
 	// When it rises, the whole pass was skipped: no certificate was processed, but

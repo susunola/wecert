@@ -17,7 +17,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +62,8 @@ type Server struct {
 	baseCtx context.Context
 	log     *slog.Logger
 	now     func() time.Time
+
+	limiter *authLimiter
 }
 
 // New builds the webhook server.
@@ -71,6 +75,7 @@ func New(rec Reconciler, store *state.Store, token string, baseCtx context.Conte
 		baseCtx: baseCtx,
 		log:     log,
 		now:     time.Now,
+		limiter: newAuthLimiter(),
 	}
 }
 
@@ -96,15 +101,53 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		addr := clientAddr(r)
+		now := s.now()
+
+		// Checked before the token compare so a locked-out address never gets
+		// another free shot at guessing while it waits out the block.
+		if ok, retryAfter := s.limiter.allowed(addr, now); !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+			s.log.Warn("webhook request refused: this address is locked out after too many failed authentication attempts",
+				"remote", addr, "path", r.URL.Path, "retryAfter", retryAfter.Round(time.Second))
+			writeJSON(w, http.StatusTooManyRequests,
+				map[string]string{"error": "too many failed authentication attempts; try again later"})
+			return
+		}
+
 		if !s.tokenMatches(r) {
+			s.limiter.recordFailure(addr, now)
 			s.log.Warn("webhook authentication failed",
-				"remote", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
+				"remote", addr, "path", r.URL.Path, "method", r.Method)
 			writeJSON(w, http.StatusUnauthorized,
 				map[string]string{"error": "missing or invalid token"})
 			return
 		}
+
+		s.limiter.recordSuccess(addr)
 		next(w, r)
 	}
+}
+
+// clientAddr returns the request's source address without its port, so
+// repeated attempts from the same client land on the same authLimiter key
+// regardless of which ephemeral port each connection used.
+//
+// r.RemoteAddr is a raw TCP peer address, not anything client-supplied (no
+// X-Forwarded-For or similar) -- deliberately: a header is whatever the caller
+// claims, and trusting it here would let an attacker pick a different claimed
+// address on every request and dodge the lockout entirely. Deployments that put
+// this endpoint behind a reverse proxy get real client addresses by having the
+// proxy connect from them, or by proxying at the TCP layer, not by this process
+// trusting a header.
+func clientAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// No port to strip (a unix socket, or a value already host-only): use it
+		// as-is rather than discard a perfectly usable key.
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // tokenMatches accepts both forms and compares in constant time.

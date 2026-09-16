@@ -42,7 +42,13 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		// go through backoff).
 		err := fmt.Errorf("order became invalid: %v", order.Err())
 		if derr := m.discardOrder(ctx, c.Name); derr != nil {
-			return errors.Join(err, derr)
+			// recordFailure must still run even when the cleanup itself failed: this
+			// branch used to return early here, which skipped recordFailure entirely --
+			// ConsecutiveFailures and NextAttemptAt were never set, so the very next
+			// round retried immediately with no backoff at all. A discard failure is a
+			// local DB problem, not an ACME rejection, but the invalid order is still
+			// sitting there either way and hammering it on every round serves nobody.
+			err = errors.Join(err, derr)
 		}
 		return m.recordFailure(st, err)
 
