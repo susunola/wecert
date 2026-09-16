@@ -1,0 +1,309 @@
+package state
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+// snapshotStore builds a store with one row worth protecting, in its own directory so the
+// "was there a database before" logic and the snapshot listing see only this test's files.
+func snapshotStore(t *testing.T) (*Store, string) {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.PutCert(&CertState{Name: "example-com", KeyPEM: []byte("PRIVATE KEY")}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	if err := s.PutAccount(&Account{
+		Directory: "https://acme.test/d", KID: "kid-1", PrivateKeyPEM: []byte("ACCOUNT KEY"),
+	}); err != nil {
+		t.Fatalf("PutAccount: %v", err)
+	}
+	return s, dir
+}
+
+// A snapshot must be a self-contained database, not a copy of the main file.
+//
+// The store runs in WAL mode, so the bytes on disk are state.db plus a -wal holding
+// everything since the last checkpoint. A byte copy of state.db alone can therefore be
+// missing the order URL that was just persisted -- which is precisely the loss a backup
+// exists to prevent. VACUUM INTO asks SQLite for a consistent logical copy instead.
+func TestSnapshotIsASelfContainedDatabase(t *testing.T) {
+	s, dir := snapshotStore(t)
+
+	// A fresh row that is almost certainly still in the WAL rather than checkpointed.
+	if err := s.PutOrder(&Order{
+		CertName: "example-com", OrderURL: "https://acme.test/order/just-written", Status: "pending",
+	}); err != nil {
+		t.Fatalf("PutOrder: %v", err)
+	}
+
+	backups := filepath.Join(dir, "backups")
+	path, err := s.Snapshot(backups, 3)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	// Open the snapshot on its own: it must not need the live -wal to be readable.
+	snap, err := Open(path)
+	if err != nil {
+		t.Fatalf("the snapshot is not a usable database on its own: %v", err)
+	}
+	defer snap.Close()
+
+	o, err := snap.GetOrder("example-com")
+	if err != nil {
+		t.Fatalf("GetOrder from snapshot: %v", err)
+	}
+	if o == nil || o.OrderURL != "https://acme.test/order/just-written" {
+		t.Errorf("the snapshot is missing the order committed just before it: %+v", o)
+	}
+	c, err := snap.GetCert("example-com")
+	if err != nil {
+		t.Fatalf("GetCert from snapshot: %v", err)
+	}
+	if c == nil || string(c.KeyPEM) != "PRIVATE KEY" {
+		t.Errorf("the snapshot is missing the certificate key: %+v", c)
+	}
+}
+
+// The snapshot holds the ACME account key and every certificate private key, so it must be
+// 0600. SQLite creates the destination with the process umask (0644 on a default machine),
+// which is exactly the leak the state file itself was fixed for.
+func TestSnapshotIsNotWorldReadable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no POSIX permission assertions on Windows")
+	}
+
+	old := setUmask(0)
+	defer setUmask(old)
+
+	s, dir := snapshotStore(t)
+	path, err := s.Snapshot(filepath.Join(dir, "backups"), 3)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("snapshot has mode %o: group/other can read the private keys (want 0600)", perm)
+	}
+}
+
+// Retention must bound the directory, newest first.
+func TestSnapshotPrunesToKeep(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+
+	for i := 0; i < 5; i++ {
+		if _, err := s.Snapshot(backups, 2); err != nil {
+			t.Fatalf("snapshot %d: %v", i, err)
+		}
+	}
+
+	names, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 {
+		t.Errorf("kept %d snapshots, want 2: %v", len(names), names)
+	}
+	// The survivors must be usable, not empty husks.
+	for _, n := range names {
+		info, err := os.Stat(n)
+		if err != nil {
+			t.Fatalf("stat %s: %v", n, err)
+		}
+		if info.Size() == 0 {
+			t.Errorf("%s is empty", n)
+		}
+	}
+}
+
+// Snapshots written in the same second must not clobber one another: a duplicate timestamp
+// is not worth losing a backup over.
+func TestSnapshotWithADuplicateTimestampKeepsBoth(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+
+	first, err := s.Snapshot(backups, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Snapshot(backups, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("the second snapshot reused the first path %s, overwriting it", first)
+	}
+	names, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 {
+		t.Errorf("kept %d snapshots, want both: %v", len(names), names)
+	}
+}
+
+// A failing snapshot must not leave a temporary or half-written file behind: a broken file
+// in the backup directory that looks like a backup is worse than no backup at all.
+func TestSnapshotLeavesNoLitterOnFailure(t *testing.T) {
+	s, dir := snapshotStore(t)
+
+	// A directory path that cannot be created as a directory, because a file is in the way.
+	blocked := filepath.Join(dir, "blocked")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Snapshot(filepath.Join(blocked, "sub"), 3); err == nil {
+		t.Fatal("expected the snapshot to fail when its directory cannot be created")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".snapshot-") {
+			t.Errorf("a temporary snapshot file was left behind: %s", e.Name())
+		}
+	}
+}
+
+// Snapshot must be usable on an empty database too: the first snapshot of a fresh
+// deployment is what makes the case "the database was created and then lost" recoverable.
+func TestSnapshotOnAFreshDatabase(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	path, err := s.Snapshot(filepath.Join(dir, "backups"), 1)
+	if err != nil {
+		t.Fatalf("Snapshot on a fresh database: %v", err)
+	}
+	snap, err := Open(path)
+	if err != nil {
+		t.Fatalf("the fresh snapshot is not usable: %v", err)
+	}
+	defer snap.Close()
+	// The schema must be there, or restoring it would not give a working store.
+	if _, err := snap.ListCertNames(); err != nil {
+		t.Errorf("the snapshot has no usable schema: %v", err)
+	}
+}
+
+// A read-only destination must fail the snapshot cleanly, leaving no temporary file behind.
+//
+// A half-written file in the backup directory is worse than no backup: it has the shape and the
+// name of a snapshot, and the moment someone reaches for it is the moment they need it to work.
+func TestSnapshotReportsAReadOnlyDestination(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions, so the failure cannot be provoked")
+	}
+
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "readonly")
+	if err := os.Mkdir(backups, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(backups, 0o755) })
+
+	path, err := s.Snapshot(backups, 3)
+	if err == nil {
+		t.Fatalf("a read-only destination must fail the snapshot, got %q", path)
+	}
+	// The error must say where the problem is, not just "permission denied".
+	if !strings.Contains(err.Error(), backups) {
+		t.Errorf("the error should name the directory, got: %v", err)
+	}
+	if path != "" {
+		t.Errorf("no path should be reported on failure, got %q", path)
+	}
+
+	entries, readErr := os.ReadDir(backups)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("a failed snapshot left %v behind", names)
+	}
+}
+
+// A snapshot must still work when a previous one exists and retention is 1: pruning happens after
+// the new file is in place, so a bug there would either delete the new snapshot or keep all of
+// them forever.
+func TestSnapshotRetentionOfOneKeepsTheNewest(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+
+	var paths []string
+	for i := 0; i < 3; i++ {
+		p, err := s.Snapshot(backups, 1)
+		if err != nil {
+			t.Fatalf("snapshot %d: %v", i, err)
+		}
+		paths = append(paths, p)
+	}
+
+	names, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 {
+		t.Fatalf("kept %d snapshots with keep=1: %v", len(names), names)
+	}
+	if names[0] != paths[len(paths)-1] {
+		t.Errorf("kept %q, want the newest (%q)", names[0], paths[len(paths)-1])
+	}
+	// And the survivor must be usable.
+	snap, err := Open(names[0])
+	if err != nil {
+		t.Fatalf("the newest snapshot is not usable: %v", err)
+	}
+	defer snap.Close()
+	if _, err := snap.ListCertNames(); err != nil {
+		t.Errorf("the surviving snapshot has no usable schema: %v", err)
+	}
+}
+
+// An unwritable state directory must fail at Open with a message about the path, not a SQLite
+// error: the operator needs to know which directory to fix.
+func TestOpenReportsAnUnwritableStateDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions, so the failure cannot be provoked")
+	}
+
+	parent := t.TempDir()
+	locked := filepath.Join(parent, "locked")
+	if err := os.Mkdir(locked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	_, err := Open(filepath.Join(locked, "state.db"))
+	if err == nil {
+		t.Fatal("an unwritable state directory must fail Open")
+	}
+	if !strings.Contains(err.Error(), locked) {
+		t.Errorf("the error should name the directory, got: %v", err)
+	}
+}

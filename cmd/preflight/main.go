@@ -19,6 +19,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -334,6 +335,12 @@ func deref(s *string) string {
 // isNoRecord reports whether the error means "the record list is empty".
 // DNSPod expresses that with ResourceNotFound.NoDataOfRecord.
 func isNoRecord(err error) bool {
+	if err == nil {
+		// A nil error is not "no record": it means the call succeeded, and reporting that as an
+		// absent record would silently pass the delegation check. Guarding also keeps the
+		// substring fallback below from dereferencing nil, which panicked before.
+		return false
+	}
 	var sdkErr *tcerrors.TencentCloudSDKError
 	if errors.As(err, &sdkErr) {
 		return sdkErr.Code == "ResourceNotFound.NoDataOfRecord"
@@ -543,10 +550,21 @@ func pruneCertificates(assumeYes bool) error {
 // terminal) as no -- deleting certificates must not pass just because nobody watched.
 func confirm(prompt string) bool {
 	fmt.Printf("%s [y/N] ", prompt)
-
-	sc := bufio.NewScanner(os.Stdin)
-	if !sc.Scan() {
+	ok := confirmFrom(os.Stdin)
+	if !ok {
 		fmt.Println()
+	}
+	return ok
+}
+
+// confirmFrom reads one answer. Split out so the gate is testable: deleting certificates must
+// not pass just because nobody was watching, and that is decided here.
+//
+// A non-interactive stdin (an empty read) is a NO, not a yes: a cron job or a pipe that forgot
+// to answer must not authorise deleting every certificate wecert ever uploaded.
+func confirmFrom(r io.Reader) bool {
+	sc := bufio.NewScanner(r)
+	if !sc.Scan() {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(sc.Text())) {

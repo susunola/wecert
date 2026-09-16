@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -61,6 +62,10 @@ func run() error {
 	}
 
 	log := newLogger(*logLevel)
+
+	// Let the ACME User-Agent name the running build, so a CA-side log lines up with the
+	// binary that sent the request.
+	acme.SetUserAgentVersion(version)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -198,6 +203,17 @@ func run() error {
 	// rather than returning an empty list -- which reads as "the desired state is empty".
 	reconciler.Prime(ctx)
 
+	// Periodic consistent snapshots of state.db. Started here so a snapshot exists before
+	// the first renewal window can lose an order: the file holds the ACME account key and
+	// every in-flight order URL, and losing an order URL means re-placing it into the
+	// exact-set rate limit.
+	if cfg.StateBackup.EnabledOr(true) {
+		startStateBackups(ctx, store, cfg, log)
+	} else {
+		log.Warn("periodic state database snapshots are DISABLED: losing state.db means a new ACME " +
+			"account and re-placed orders, and nothing here will be able to restore it")
+	}
+
 	// Metrics server. Bind the port synchronously first and exit on failure -- see below.
 	if err := startMetricsServer(ctx, cfg.Metrics.Listen, log); err != nil {
 		return err
@@ -313,6 +329,54 @@ func jitter(d time.Duration) time.Duration {
 // perfectly healthy while monitoring never hears another signal, and certificates slide
 // silently into expiry. That is precisely the failure this project exists to prevent,
 // and it should not manufacture one itself.
+// startStateBackups snapshots the state database on an interval, in the background.
+//
+// It never fails the process: a snapshot that cannot be written is a degraded recovery
+// posture, not a reason to stop renewing certificates. It is logged at ERROR so it shows
+// up in the same place every other operational problem does, and it is reported through
+// the same metric channel as everything else.
+func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Config, log *slog.Logger) {
+	dir := cfg.StateBackup.Dir
+	if dir == "" {
+		dir = filepath.Dir(cfg.StatePath)
+	}
+
+	snapshot := func() {
+		path, err := store.Snapshot(dir, cfg.StateBackup.Keep)
+		if err != nil {
+			// A partial failure still writes the file; say which, so a successful
+			// snapshot with a failed prune is not read as "no backup exists".
+			log.Error("state database snapshot failed", "dir", dir, "err", err)
+			if path != "" {
+				log.Info("a snapshot was written despite the error", "path", path)
+			}
+			return
+		}
+		log.Info("state database snapshotted", "path", path,
+			"interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
+	}
+
+	go func() {
+		// One immediately: waiting a whole interval means a fresh deployment has no
+		// recoverable state for its first day, which is exactly when orders are in flight.
+		snapshot()
+
+		ticker := time.NewTicker(cfg.StateBackup.IntervalDur)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				snapshot()
+			}
+		}
+	}()
+
+	log.Info("periodic state database snapshots are on",
+		"dir", dir, "interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
+}
+
 func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
@@ -331,6 +395,16 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) erro
 	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		// The webhook server below sets all three; this one used to set only the header
+		// timeout. ReadTimeout=0 means a client that announces a body and then dribbles it
+		// (net/http drains up to 256KB in finishRequest) pins a connection and its file
+		// descriptor with no upper bound, and IdleTimeout=0 falls back to ReadTimeout=0, so
+		// keep-alive connections never expire either. The default bind is loopback, which
+		// limits the exposure -- but binding metrics to a VPC address so Prometheus can
+		// scrape it is a documented setup, and that is where this matters.
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {

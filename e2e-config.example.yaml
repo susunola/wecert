@@ -7,9 +7,12 @@
 # It deliberately binds no CLB: OldCertificateId is empty on first issuance, so
 # UpdateCertificateInstance is never called and live traffic is never touched.
 #
-# Credentials are not written in this file; they come from the environment:
-#   source /Users/atom/Documents/dsh/.secrets/tencent.env
-#   export TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY
+# Credentials are not written in this file; they come from the environment. Put them in
+# a file only you can read and source it, e.g.:
+#   export TENCENTCLOUD_SECRET_ID=...
+#   export TENCENTCLOUD_SECRET_KEY=...
+# scripts/run-stage-ab.sh reads ${WECERT_CREDS:-$HOME/.wecert/tencent.env} if you want a
+# convention to copy.
 
 statePath: /tmp/wecert-e2e/state.db
 

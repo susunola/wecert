@@ -251,7 +251,7 @@ Runs as a systemd timer and exits. Only needed once `desiredState.mode` leaves `
 | `-grace` | `24h` | How long a name must be confirmed absent before removal |
 | `-budget` / `-budget-window` | `25` / `168h` | Name-set changes allowed per window |
 | `-drop-threshold` | `0.30` | Freeze when the declared set shrinks by more than this |
-| `-force` | `false` | Skip the fuses; only for a change you made on purpose |
+| `-force` | `false` | Skip the fuses, the grace period and the CLB reference check; only for a change you made on purpose |
 | `-dry-run` | `false` | Compute everything, write nothing |
 | `-json` | `false` | Print the report as JSON |
 
@@ -262,7 +262,7 @@ Exit codes: `0` written (or unchanged), `1` the program failed, `2` **deliberate
 ./bin/wecert-onboard -config /etc/wecert/config.yaml            # write it
 ```
 
-### `wecert-preflight` (read-only)
+### `wecert-preflight` (diagnostic; `-prune-certs` deletes)
 
 | Flag | Description |
 |---|---|

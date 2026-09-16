@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/spec"
 	"io"
 	"log/slog"
 	"net/http"
@@ -24,9 +26,10 @@ const testToken = "0123456789abcdef0123456789abcdef"
 
 // fakeReconciler records what was triggered and returns preset errors.
 type fakeReconciler struct {
-	names   []string
-	started []string
-	failFor map[string]error
+	names    []string
+	started  []string
+	failFor  map[string]error
+	resolves int
 
 	// startAllErr simulates "the desired state is unreadable": nothing started.
 	startAllErr error
@@ -37,6 +40,41 @@ func (f *fakeReconciler) CertNames() []string { return f.names }
 func (f *fakeReconciler) StartCert(_ context.Context, name string) error {
 	f.started = append(f.started, name)
 	return f.failFor[name]
+}
+
+// StartNamed mirrors the real reconciler's batch entry point: resolve once, then start
+// each name. The fake counts resolutions so a test can assert the webhook does not pay
+// one per name, and it keeps the same error buckets as the real implementation: an
+// "already running" or "not managed" answer lands in its bucket, while anything else
+// means the desired state could not be read and nothing may be reported as started.
+func (f *fakeReconciler) StartNamed(_ context.Context, names []string) (started, running, unknown []string, err error) {
+	f.resolves++
+	for _, n := range names {
+		if !f.known(n) {
+			unknown = append(unknown, n)
+			continue
+		}
+		switch e := f.StartCert(context.Background(), n); {
+		case e == nil:
+			started = append(started, n)
+		case errors.Is(e, reconcile.ErrAlreadyRunning):
+			running = append(running, n)
+		case errors.Is(e, reconcile.ErrUnknownCert):
+			unknown = append(unknown, n)
+		default:
+			return nil, nil, nil, e
+		}
+	}
+	return started, running, unknown, nil
+}
+
+func (f *fakeReconciler) known(name string) bool {
+	for _, n := range f.names {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeReconciler) StartAll(ctx context.Context) (accepted, skipped []string, err error) {
@@ -340,6 +378,46 @@ func TestTriggerRejectsNullCerts(t *testing.T) {
 	}
 }
 
+// An explicit "cert": "" (or "cert": null) names no certificate, exactly like an
+// empty certs list. It must be rejected rather than read as an absent body.
+//
+// This is the shape a CI job produces when it templates an unset $CERT into the
+// documented `-d '{"cert":"<name>"}'` call, so widening it into a full-fleet
+// convergence is not a theoretical concern: it burns issuance quota on every
+// certificate the caller never asked about.
+func TestTriggerRejectsEmptyCert(t *testing.T) {
+	for _, body := range []string{`{"cert":""}`, `{"cert":null}`} {
+		t.Run(body, func(t *testing.T) {
+			rec := &fakeReconciler{names: []string{"a", "b"}}
+			s, _ := newTestServer(t, rec)
+
+			w := do(t, s, http.MethodPost, "/hook/reconcile", body, bearer())
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("%s should return 400, got %d", body, w.Code)
+			}
+			if len(rec.started) != 0 {
+				t.Errorf("%s triggered %v; it asks for nothing and must not widen to a full convergence",
+					body, rec.started)
+			}
+		})
+	}
+}
+
+// Control for the two tests above: an absent body still means "everything", so the
+// rejection cannot be implemented by simply refusing all empty-looking requests.
+func TestTriggerWithNoBodyStillProcessesEverything(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a", "b"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", "", bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("an empty body should be accepted as a full trigger, got %d", w.Code)
+	}
+	if len(rec.started) != 2 {
+		t.Errorf("an empty body should process everything, started=%v", rec.started)
+	}
+}
+
 func TestTriggerRejectsGET(t *testing.T) {
 	s, _ := newTestServer(t, &fakeReconciler{names: []string{"a"}})
 
@@ -633,5 +711,256 @@ func TestNotifierOmitsSignatureWithoutASecret(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("no notification received")
+	}
+}
+
+// A multi-name trigger must resolve the desired state once, not once per name.
+//
+// StartCert resolves internally -- a file read, a YAML decode, a full validation and a
+// document hash -- and the webhook's loop used to call it per name, synchronously inside
+// a request with a 15s write timeout. The full-trigger path already had this fixed.
+func TestMultiCertTriggerResolvesTheDesiredStateOnce(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a", "b", "c", "d", "e"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"certs":["a","b","c","d","e"]}`, bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", w.Code)
+	}
+	if rec.resolves != 1 {
+		t.Errorf("the desired state was resolved %d times for a 5-name trigger, want 1", rec.resolves)
+	}
+	if len(rec.started) != 5 {
+		t.Errorf("started = %v, want all five", rec.started)
+	}
+}
+
+// ── /hook/desired ────────────────────────────────────────────────────────────────────
+//
+// The diagnostic endpoint is the one that answers "why isn't my domain being issued?", and the
+// distinction it has to keep is "no desired state has been read" versus "the desired state is
+// empty" -- the second would be read as "nothing should be issued".
+
+// desiredReader is a reconciler that also serves the last resolved desired state.
+type desiredReader struct {
+	*fakeReconciler
+	last *spec.Result
+}
+
+func (d *desiredReader) LastResult() *spec.Result { return d.last }
+
+func newDesiredServer(t *testing.T, last *spec.Result) *Server {
+	t.Helper()
+	rec := &desiredReader{fakeReconciler: &fakeReconciler{names: []string{"a"}}, last: last}
+	s, _ := newTestServer(t, rec)
+	return s
+}
+
+// With no desired state ever read, the endpoint must answer 503 with an explanation rather than
+// an empty certificate list: an empty list means "nothing should be issued", which is a
+// completely different message.
+func TestDesiredWithoutAReadStateIs503(t *testing.T) {
+	s := newDesiredServer(t, nil)
+
+	w := do(t, s, http.MethodGet, "/hook/desired", "", bearer())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when no desired state has been read", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "not the same as an empty desired state") {
+		t.Errorf("the body must explain the distinction, got: %s", w.Body.String())
+	}
+}
+
+// The endpoint must be authenticated like the others: it exposes certificate names, domains and
+// error text.
+func TestDesiredRequiresAuth(t *testing.T) {
+	s := newDesiredServer(t, &spec.Result{})
+
+	w := do(t, s, http.MethodGet, "/hook/desired", "", nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 without a token", w.Code)
+	}
+}
+
+func TestDesiredRejectsNonGET(t *testing.T) {
+	s := newDesiredServer(t, &spec.Result{})
+
+	w := do(t, s, http.MethodPost, "/hook/desired", "", bearer())
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+	if allow := w.Header().Get("Allow"); allow != "GET" {
+		t.Errorf("Allow = %q, want GET", allow)
+	}
+}
+
+// The payload must put what is desired next to whether it exists, and mark issued certificates
+// with their expiry -- that pairing is what makes the endpoint answer "is my domain live?".
+func TestDesiredReportsIssuedStateAndDaysLeft(t *testing.T) {
+	last := &spec.Result{
+		Revision:    "sha256:abc",
+		GeneratedAt: time.Now().Add(-time.Hour),
+		Certificates: []config.Certificate{{
+			Name: "example-com", Domains: []string{"example.com"}, Profile: "classic",
+		}},
+		Decisions: []spec.Decision{{Hostname: "example.com", Included: true, Reason: "declared"}},
+	}
+	s := newDesiredServer(t, last)
+
+	// No certificate row yet: the certificate is desired but not issued.
+	w := do(t, s, http.MethodGet, "/hook/desired", "", bearer())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var view struct {
+		Revision     string `json:"revision"`
+		Certificates []struct {
+			Name     string `json:"name"`
+			Issued   bool   `json:"issued"`
+			NotAfter string `json:"notAfter"`
+			DaysLeft *int   `json:"daysLeft"`
+		} `json:"certificates"`
+		Decisions []spec.Decision `json:"decisions"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.Revision != "sha256:abc" {
+		t.Errorf("revision = %q, want the desired state's", view.Revision)
+	}
+	if len(view.Certificates) != 1 {
+		t.Fatalf("certificates = %+v", view.Certificates)
+	}
+	if view.Certificates[0].Issued {
+		t.Error("no certificate row exists, so issued must be false")
+	}
+	if view.Certificates[0].DaysLeft != nil {
+		t.Error("daysLeft must be absent while nothing is issued")
+	}
+	if len(view.Decisions) != 1 {
+		t.Errorf("decisions must be passed through, got %+v", view.Decisions)
+	}
+}
+
+// An issued certificate must report its expiry and remaining days, rounded up: a caller that
+// treats 0 as expired would read a healthy certificate as down.
+func TestDesiredReportsDaysLeftForAnIssuedCertificate(t *testing.T) {
+	notAfter := time.Now().Add(36 * time.Hour)
+	last := &spec.Result{
+		Certificates: []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}},
+	}
+	s := newDesiredServer(t, last)
+
+	// Seed a certificate row through the store the server holds.
+	store := s.store
+	if err := store.PutCert(&state.CertState{Name: "example-com", NotAfter: notAfter}); err != nil {
+		t.Fatal(err)
+	}
+
+	w := do(t, s, http.MethodGet, "/hook/desired", "", bearer())
+	var view struct {
+		Certificates []struct {
+			Issued   bool   `json:"issued"`
+			DaysLeft *int   `json:"daysLeft"`
+			NotAfter string `json:"notAfter"`
+		} `json:"certificates"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	c := view.Certificates[0]
+	if !c.Issued {
+		t.Fatal("a certificate row exists, so issued must be true")
+	}
+	if c.DaysLeft == nil {
+		t.Fatal("daysLeft must be present for an issued certificate")
+	}
+	if *c.DaysLeft < 1 || *c.DaysLeft > 3 {
+		t.Errorf("daysLeft = %d for a certificate expiring in 36h; it must round up and not read as 0", *c.DaysLeft)
+	}
+}
+
+// A frozen desired state must be visible in the payload: it means the source is unreadable and
+// nothing new will be picked up, which is exactly what an operator needs to see.
+func TestDesiredSurfacesAFrozenState(t *testing.T) {
+	last := &spec.Result{
+		Revision:     "sha256:abc",
+		Frozen:       true,
+		FreezeReason: "the document is unreadable",
+		Certificates: []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}},
+	}
+	s := newDesiredServer(t, last)
+
+	w := do(t, s, http.MethodGet, "/hook/desired", "", bearer())
+	var view struct {
+		Frozen       bool   `json:"frozen"`
+		FreezeReason string `json:"freezeReason"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !view.Frozen || view.FreezeReason == "" {
+		t.Errorf("a frozen state must be reported with its reason, got %+v", view)
+	}
+}
+
+// ── clientIP ─────────────────────────────────────────────────────────────────────────
+
+// The lockout is keyed by client IP, so a RemoteAddr that does not split must fall back to the
+// raw value rather than an empty string -- which would put every such caller in one bucket.
+func TestClientIPFallsBackToRemoteAddr(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "not-a-host-port"
+	if got := clientIP(req); got != "not-a-host-port" {
+		t.Errorf("clientIP = %q, want the raw RemoteAddr", got)
+	}
+
+	req.RemoteAddr = "192.0.2.7:54321"
+	if got := clientIP(req); got != "192.0.2.7" {
+		t.Errorf("clientIP = %q, want the host without the port", got)
+	}
+
+	// An IPv6 literal must keep its brackets stripped correctly, or the bucket key changes
+	// shape and a blocked address can walk back in under the other spelling.
+	req.RemoteAddr = "[2001:db8::1]:443"
+	if got := clientIP(req); got != "2001:db8::1" {
+		t.Errorf("clientIP = %q, want the bare IPv6 address", got)
+	}
+}
+
+// ── full-trigger accounting ──────────────────────────────────────────────────────────
+
+// The full-trigger response is split by the reconciler itself (accepted vs skipped)
+// rather than derived here by subtracting the skipped names from CertNames. Deriving it
+// was wrong whenever the two reads disagreed: a certificate could be reported accepted
+// even though it was never processed.
+func TestFullTriggerReportsWhatTheReconcilerStarted(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a", "b", "c"}}
+	srv, _ := newTestServer(t, rec)
+
+	w := do(t, srv, http.MethodPost, "/hook/reconcile", "", bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: %s", w.Code, w.Body.String())
+	}
+	var resp reconcileResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Accepted) != 3 {
+		t.Errorf("accepted = %v, want all three names", resp.Accepted)
+	}
+	if len(resp.Skipped) != 0 {
+		t.Errorf("skipped = %v, want none", resp.Skipped)
+	}
+
+	// The reported set must come from the reconciler's own answer, not from a second
+	// look at CertNames: dropping a name from the resolver must drop it from accepted.
+	rec.names = []string{"a", "b"}
+	w = do(t, srv, http.MethodPost, "/hook/reconcile", "", bearer())
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Accepted) != 2 {
+		t.Errorf("accepted = %v, want only the resolver's answer", resp.Accepted)
 	}
 }

@@ -164,6 +164,13 @@ func (m *Manager) download(
 		m.log.Warn("could not build the ARI certID; this renewal will go out without replaces", "cert", c.Name, "err", err)
 	}
 
+	// Archive the outgoing certificate's material before the row is overwritten below.
+	// After that point the old key exists nowhere: the retired_certificates row used to keep
+	// only a CertId, so once the cloud copy was reclaimed the certificate could never be
+	// re-uploaded and "rollback" was a 7-day window on someone else's system.
+	oldCertPEM := st.CertPEM
+	oldKeyPEM := st.KeyPEM
+
 	// The deploy succeeded; only now is the new certificate promoted to the live version.
 	st.NotAfter = leaf.NotAfter
 	st.CertURL = order.Certificate
@@ -183,13 +190,30 @@ func (m *Manager) download(
 	st.ARIWindowEnd = time.Time{}
 	st.ARICheckedAt = time.Time{}
 	st.ARIRetryAfter = 0
-	st.ConsecutiveFailures = 0
 	st.NextAttemptAt = time.Time{}
 	st.LastError = ""
+
+	// The failure counter is cleared only when this round actually ordered the full
+	// configured set. A successful issuance for the degraded subset is not evidence that
+	// the dropped identifiers recovered -- they were never attempted -- and zeroing the
+	// counter here is what let the next pass re-order the full set.
+	//
+	// The cost of keeping it is nil: the counter feeds the fallback trigger and the
+	// documented backoff, and both are things we want to stay alert while names are
+	// missing.
+	if m.fullSetRound {
+		st.ConsecutiveFailures = 0
+	}
 
 	if err := m.store.PutCert(st); err != nil {
 		return err
 	}
+	// The fallback record is cleared only when THIS round issued the full desired set --
+	// containsAll(c.Domains, fb.Dropped) is exactly that test, and it is why the record is no
+	// longer cleared by applyFallback: trying the full set is not recovery, issuing it is.
+	//
+	// Note what this does NOT do: clear the per-identifier ledger. See the block after
+	// discardOrder, which is gated the same way and for the same reason.
 	if fb, err := m.store.GetFallback(c.Name); err == nil && fb != nil && containsAll(c.Domains, fb.Dropped) {
 		if err := m.store.ClearFallback(c.Name); err != nil {
 			m.log.Warn("cannot clear the recovered fallback state", "cert", c.Name, "err", err)
@@ -203,7 +227,7 @@ func (m *Manager) download(
 	// one go on the reclaim list. On a first upload nothing is bound to a listener yet, and
 	// retiring it would delete, 7 days later, the very certificate a human just bound.
 	if rebound && oldDeployedID != "" && oldDeployedID != deployedID {
-		if err := m.store.AddRetiredCert(oldDeployedID, c.Name); err != nil {
+		if err := m.store.AddRetiredCert(oldDeployedID, c.Name, oldCertPEM, oldKeyPEM); err != nil {
 			m.log.Warn("failed to record the certificate for reclaim", "cert", c.Name, "certId", oldDeployedID, "err", err)
 		}
 	}
@@ -212,17 +236,26 @@ func (m *Manager) download(
 		return err
 	}
 
-	// After a successful issuance, and only if we are not degraded right now, clear the
-	// per-identifier failure ledger.
+	// After an issuance of the FULL set, clear the per-identifier failure ledger.
 	//
-	// The ledger means "who has been broken lately", not "who has ever been broken". Keeping
-	// it would let a long-since-fixed fault keep that name out of the certificate forever --
-	// and because a dropped name is never tried again, it can never earn the one success that
-	// would clear its name.
-	if fb, err := m.store.GetFallback(c.Name); err == nil && fb == nil {
+	// The ledger means "who has been broken lately", not "who has ever been broken", so a
+	// fully healthy issuance should retire it -- otherwise a long-since-fixed fault keeps a
+	// name out of the certificate forever, and since a dropped name is never attempted
+	// again it can never earn the success that would clear its name.
+	//
+	// A round that deployed the degraded subset must NOT clear it. Tying this to "is a
+	// fallback record present" (the previous test) meant the record was cleared by
+	// applyFallback during the subset round that followed, so the evidence was gone exactly
+	// when it was needed and the next pass re-ordered the broken full set. Keying on what
+	// was actually ordered is the honest question.
+	if m.fullSetRound {
 		if cerr := m.store.ClearIdentifierFailures(c.Name); cerr != nil {
 			m.log.Warn("cannot clear the identifier failure ledger", "cert", c.Name, "err", cerr)
 		}
+	} else if m.degradedRound {
+		m.log.Warn("issued the degraded name set; keeping the identifier failure ledger so the "+
+			"next pass does not immediately re-order the full set",
+			"cert", c.Name, "dropped", len(c.Domains))
 	}
 
 	if !c.Deploy.Enabled {
@@ -427,7 +460,10 @@ func (m *Manager) recordOrphanCert(newID, liveID, certName string) {
 	if newID == "" || newID == liveID {
 		return
 	}
-	if err := m.store.AddRetiredCert(newID, certName); err != nil {
+	// No archived material: this certificate was uploaded during a failed deploy, so the
+	// local row still holds the previous live certificate and the uploaded one's key was
+	// never promoted. The row still matters -- the reaper has to delete it from the cloud.
+	if err := m.store.AddRetiredCert(newID, certName, nil, nil); err != nil {
 		m.log.Warn("failed to record the orphaned certificate (it will occupy Tencent Cloud certificate quota indefinitely)",
 			"cert", certName, "certId", newID, "err", err)
 		return

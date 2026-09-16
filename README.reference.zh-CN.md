@@ -881,12 +881,22 @@ timer 里的 `Unit=` 不是装饰：不写这行时 systemd 会解析成同名�
 ```
 dnspod:DescribeRecordList / CreateRecord / DeleteRecord   scope: 你那一个 acme-auth zone
 ssl:UploadCertificate
-ssl:DescribeCertificate
+ssl:DescribeCertificates
 ssl:DeleteCertificate
 ssl:UpdateCertificateInstance
+ssl:DescribeHostUpdateRecordDetail
+ssl:CreateCertificateBindResourceSyncTask
+ssl:DescribeCertificateBindResourceTaskResult
 ```
 
+后三个不是可选项：缺 `DescribeHostUpdateRecordDetail` 会让每次一键替换都在 3 分钟后超时、
+每轮重新上传证书；缺两个绑定查询动作则 `deployed` 指标永远不会变绿。
+
 现成的策略见 `deploy/cam-policy-test.json` 和 `deploy/cam-policy-stage-ab.json`。
+
+删除时传 `IsCheckResource=true` 会把删除变成异步：返回的任务会被
+`DescribeDeleteCertificatesTaskResult` 轮询到成功为止，因仍有资源引用而失败（status 4）的证书会留在
+回收列表里，下一轮再试——这正是「宁可占配额，也不误删在役证书」的落点。
 
 注意部署器删除证书时传 `IsCheckResource=true`：只要还有云资源引用着这张证书就拒绝删除。
 删不掉的代价是配额被占住，误删的代价是 HTTPS 中断 —— 两者不对等。
@@ -946,6 +956,8 @@ ssl:UpdateCertificateInstance
 | `-yes` | 跳过 `-prune-certs` 的交互确认 |
 
 > `-prune-certs` 的判据是别名前缀 `wecert/`，而 wecert 对**所有**它上传的证书都用这个前缀 ——
+>
+> 另外它传的是 `IsCheckResource=false`，与部署器自己的回收逻辑（传 `true`，让服务端在证书仍被监听器引用时拒绝删除）相反。这是有意为之——清理工具就是为了删掉残留，被引用的残留否则删不掉——但这也意味着**服务端不会替你兜底**：拦住这条命令的只有打印出来的清单和确认提示。
 > 包括当前正在服务的那张。所以命令会先打印待删清单并要求确认，非交互 stdin 按拒绝处理。
 > 请核对清单。
 

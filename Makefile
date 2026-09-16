@@ -126,7 +126,21 @@ fmt-check:
 	fi
 
 # The full pre-commit gate.
-check: check-english fmt-check vet test-race
+# The shell scripts are part of the delivery surface (install.sh, the systemd units, the
+# e2e runners) and nothing else tests them. e2e-wildcard.sh in particular cannot be
+# exercised without real DNS, so its assertions are driven by a canned resolver here.
+check-scripts:
+	@bash scripts/test-e2e-wildcard.sh
+
+# A real ACME lifecycle against pebble (plus a real account, real order, real CSR finalize and
+# real chain download). Behind a build tag because it needs a pebble binary, and it skips with
+# instructions when the binary is absent rather than failing the build.
+#
+#	go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+test-pebble:
+	$(GO) test -tags pebble -count=1 -timeout 5m ./internal/acme/ -run TestPebble -v
+
+check: check-english fmt-check vet test-race check-scripts
 
 clean:
 	rm -rf bin dist coverage.out
