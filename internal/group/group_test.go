@@ -151,6 +151,74 @@ func TestCertNameIsStableAsDomainsChange(t *testing.T) {
 	}
 }
 
+// CertName must be injective: two different registered domains may never produce
+// the same certificate name.
+//
+// A plain "." -> "-" rewrite collides whenever one domain has a dot exactly where
+// the other has a hyphen. That is fatal rather than cosmetic: the two groups both
+// claim the same Name, so WriteDocument fails with "certificate name %q is
+// duplicated" on every round, -force does not help, and no certificate is ever
+// updated again.
+func TestCertNameIsInjective(t *testing.T) {
+	pairs := [][2]string{
+		{"a.co.uk", "a-co.uk"},       // multi-label public suffix
+		{"foo.com.au", "foo-com.au"}, // same shape, different suffix
+		{"x.org.uk", "x-org.uk"},     //
+		{"a.com", "a-com"},           // single-label fallback path
+	}
+	for _, p := range pairs {
+		na, nb := CertName(p[0]), CertName(p[1])
+		if na == nb {
+			t.Errorf("CertName(%q) and CertName(%q) both give %q: the mapping is not injective",
+				p[0], p[1], na)
+		}
+	}
+}
+
+// The end-to-end consequence: declaring two colliding registered domains has to
+// yield two groups with distinct names.
+func TestGroupByGivesCollidingRegisteredDomainsDistinctNames(t *testing.T) {
+	groups, err := GroupBy([]string{"a.co.uk", "a-co.uk"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("want 2 groups, got %d: %+v", len(groups), groups)
+	}
+	if groups[0].Name == groups[1].Name {
+		t.Fatalf("both registered domains produced the certificate name %q; "+
+			"WriteDocument would then reject the document every round", groups[0].Name)
+	}
+}
+
+// Only registered domains containing a hyphen change name under the injective
+// mapping, and only once: everything else has to stay byte-for-byte the same, or
+// existing deployments get a spurious new certificate.
+func TestCertNameKeepsHyphenFreeNamesUnchanged(t *testing.T) {
+	unchanged := map[string]string{
+		"example.com": "example-com",
+		"a.co.uk":     "a-co-uk",
+		"x.org.uk":    "x-org-uk",
+	}
+	for in, want := range unchanged {
+		if got := CertName(in); got != want {
+			t.Errorf("CertName(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// A literal dash is doubled, which is what buys injectivity.
+	changed := map[string]string{
+		"my-site.com":   "my--site-com",
+		"a-co.uk":       "a--co-uk",
+		"my-site.co.uk": "my--site-co-uk",
+	}
+	for in, want := range changed {
+		if got := CertName(in); got != want {
+			t.Errorf("CertName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // Identical input must yield byte-for-byte identical output, in the same order;
 // otherwise every generated document diffs all over and reviewability is zero.
 func TestGroupByIsIdempotent(t *testing.T) {

@@ -229,6 +229,12 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 		for i, a := range opts.Allowlist {
 			opts.Allowlist[i] = group.RegisteredDomain(strings.ToLower(strings.TrimSpace(a)))
 		}
+		// allowed() looks entries up with sort.SearchStrings, so this slice has to
+		// be sorted. Sorting at the call site is not enough: normalising each entry
+		// to its registered domain can reorder it (a.example.com -> example.com),
+		// and an unsorted slice makes the binary search miss entries that really
+		// are on the allowlist -- which silently drops names from certificates.
+		sort.Strings(opts.Allowlist)
 	}
 	return &Onboarder{src: src, opts: opts, log: log}, nil
 }
