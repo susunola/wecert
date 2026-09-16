@@ -226,6 +226,14 @@ Bind it once in the CLB console. Every renewal after that is automatic: [`Update
 
 **There is no listener inventory to maintain here**, and other certificates on the same listener (SNI) are not disturbed.
 
+Once bound, the next pass notices by itself and confirms it:
+
+```
+confirmed the certificate is bound to cloud resources cert=example-com certId=xxxxxxxx resources=2
+```
+
+This matters because `wecert_certificate_deployed` reads `deploy_confirmed`. Without a re-check, a certificate you bound by hand would keep reporting 0 until its next renewal — up to 90 days on the `classic` profile, for a certificate that is serving traffic the whole time. The check is read-only (`CreateCertificateBindResourceSyncTask`, cached) and stops once confirmed.
+
 Once a rebind is confirmed, the log line becomes:
 
 ```
@@ -695,6 +703,10 @@ The result: an HTTPS listener with nothing bound, while every routine check look
 ### Uploading is not binding
 
 `UpdateCertificateInstance` returning success only means the task was created. The actual rebind is asynchronous — and, as the next section shows, it is not atomic either. Asserting without polling misreports it as a failure. This is why `DeployConfirmed` is tracked separately from `DeployedCertID`: driving the `deployed` gauge from "did the upload return an ID" would light it up the moment a certificate is uploaded, before anyone has bound it.
+
+Until v0.4.0 that flag was only ever set by an issuance that performed a rebind, so a hand-bound certificate read 0 until its next renewal. It is now also set by a read-only binding check on each pass (see *The first issuance needs one manual bind*).
+
+**The `Status` field of the bind-resource task is not documented, and guessing it wrong fails silently.** Measured: `Status == 1` means *done*. The first implementation assumed the usual "0 means done", which made confirmation wait until it timed out — and because the result list is also empty on the very first query (server cache not yet built), an early version concluded "0 bindings" and reported a correctly-bound certificate as unbound. Both traps are pinned by tests in `internal/deploy/tencent_test.go`.
 
 ### The rebind is asynchronous **and not atomic**
 

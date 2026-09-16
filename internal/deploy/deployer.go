@@ -25,6 +25,16 @@ type Deployer interface {
 
 	// Delete 删除一张已经退役的证书，用于控制腾讯云侧证书数量不无限增长。
 	Delete(ctx context.Context, certID string) error
+
+	// Bindings 返回这张证书当前绑定到多少个云资源。
+	//
+	// 只读。存在的理由是首次签发只上传、不绑定，所以 DeployConfirmed
+	// 是 false；人工在控制台绑好之后必须有人回来确认，否则 deployed
+	// 指标会在整个证书周期里报“未部署”。
+	//
+	// 查不到绑定不代表失败 —— 返回 0 即可。调用方据此区分
+	// “还没绑”和“查不动”。
+	Bindings(ctx context.Context, certID string) (int, error)
 }
 
 // Noop 在 deploy.enabled=false 时使用：只把证书留在本地状态库里。
@@ -37,3 +47,6 @@ func (Noop) Deploy(_ context.Context, _ string, oldID string, _, _ []byte) (stri
 
 // Delete 什么都不做。
 func (Noop) Delete(_ context.Context, _ string) error { return nil }
+
+// Bindings 恒为 0：Noop 不往任何地方部署，也就无所谓绑定。
+func (Noop) Bindings(_ context.Context, _ string) (int, error) { return 0, nil }

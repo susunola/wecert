@@ -234,6 +234,17 @@ certificate uploaded; waiting for a one-time manual bind in the CLB console cert
 
 **这里不需要维护监听器清单**，同一监听器上的 SNI 多证书也不会被误覆盖。
 
+绑好之后，下一轮收敛会自己发现并确认：
+
+```
+confirmed the certificate is bound to cloud resources cert=example-com certId=xxxxxxxx resources=2
+```
+
+这一条很关键：`wecert_certificate_deployed` 读的是 `deploy_confirmed`。如果没有这个回查，
+你手工绑好的证书会一直报 0，直到下次续期为止 —— classic profile 下最长 **90 天**，
+而这段时间里它其实一直在正常服务。这个检查是只读的
+（`CreateCertificateBindResourceSyncTask`，带缓存），确认一次之后就不再查。
+
 重绑定确认生效后，日志变成：
 
 ```
@@ -728,6 +739,16 @@ NS 委派检查是排障价值最高的一条：域名托管在别处、或者 N
 `UpdateCertificateInstance` 返回成功只代表任务创建成功，真正的重绑定是异步的，
 而且**不是原子的**（见下一节）。不做轮询就断言会把它误判成失败。这也是 `DeployConfirmed` 和 `DeployedCertID` 分开记的原因：
 如果 `deployed` 指标只看"上传有没有返回 ID"，那证书刚上传完、还没绑到监听器上时它就会变绿。
+
+在 v0.4.0 之前，这个标志**只**由"真正执行了重绑的签发"置位，所以人工绑好的证书会一直报 0，
+直到下次续期为止。现在每轮收敛还会做一次只读的绑定查询来补确认
+（见《首次签发需要人工绑一次》）。
+
+**绑定查询任务的 `Status` 字段没有公开文档，猜错会静默失效。**
+实测 **`Status == 1` 才是完成**。第一版按直觉写成了"0 表示完成"，
+结果确认会一直等到超时；而且首次查询时结果列表也是空的（服务端缓存尚未建立），
+早期版本据此得出"绑定数为 0"，把一张绑好的证书判成了未绑定。
+两个坑都在 `internal/deploy/tencent_test.go` 里用测试钉住了。
 
 ### 重绑定是异步的，而且**不是原子的**
 

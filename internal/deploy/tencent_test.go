@@ -37,3 +37,131 @@ func TestProgressBoundCount(t *testing.T) {
 		t.Errorf("bound = %d, want 3", n)
 	}
 }
+
+// ── 确认绑定关系 ────────────────────────────────────────────────────────────
+//
+// 这段逻辑我第一版写错了两处，两处都不会导致编译失败、只会在真机上
+// 把一张绑好的证书判成“未绑定”（deployed 指标静默报 0，最长 90 天）：
+//
+//   1. Status 的语义猜反了。实测成功时 Status == 1，我按直觉写成了
+//      “Status != 0 就是还没好”，于是永远等不到结果。
+//   2. 只看 TaskId 匹配就返回。首次查询（服务端缓存未建立）会返回一个
+//      TaskId 正确、但结果列表为空的对象，那一刻会被判成“绑定数为 0”。
+//
+// 所以这里把两个坑都钉住。
+
+func bindResp(taskID string, status uint64, withResult bool) *ssl.DescribeCertificateBindResourceTaskResultResponse {
+	r := &ssl.SyncTaskBindResourceResult{
+		TaskId: common.StringPtr(taskID),
+		Status: common.Uint64Ptr(status),
+	}
+	if withResult {
+		r.BindResourceResult = []*ssl.BindResourceResult{{
+			ResourceType: common.StringPtr("clb"),
+			BindResourceRegionResult: []*ssl.BindResourceRegionResult{
+				{Region: common.StringPtr("ap-guangzhou"), TotalCount: common.Uint64Ptr(2), Error: common.StringPtr("")},
+				{Region: common.StringPtr("ap-shanghai"), TotalCount: common.Uint64Ptr(1), Error: common.StringPtr("")},
+			},
+		}}
+	}
+	return &ssl.DescribeCertificateBindResourceTaskResultResponse{
+		Response: &ssl.DescribeCertificateBindResourceTaskResultResponseParams{
+			SyncTaskBindResourceResult: []*ssl.SyncTaskBindResourceResult{r},
+		},
+	}
+}
+
+// Status == 1 且结果已填充 → 完成，合计 3。
+func TestCountBindingsDone(t *testing.T) {
+	n, done, err := countBindings(bindResp("t1", bindStatusDone, true), "t1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !done {
+		t.Fatal("Status=1 且结果已填充时应当判定为完成")
+	}
+	if n != 3 {
+		t.Errorf("count = %d, want 3", n)
+	}
+}
+
+// 这条钉住第一个坑：Status=1 是**完成**，不是“进行中”。
+func TestCountBindingsStatusOneMeansDone(t *testing.T) {
+	_, done, _ := countBindings(bindResp("t1", 1, true), "t1")
+	if !done {
+		t.Error("Status=1 必须被当成完成 —— 反过来的话确认会永远超时")
+	}
+}
+
+// 这条钉住第二个坑：TaskId 匹配但结果为空时，必须继续等，不能报 0。
+func TestCountBindingsEmptyResultIsNotDone(t *testing.T) {
+	n, done, err := countBindings(bindResp("t1", bindStatusDone, false), "t1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if done {
+		t.Error("结果列表为空时必须继续等，否则会把绑好的证书判成未绑定")
+	}
+	if n != 0 {
+		t.Errorf("未完成时 count 应为 0，得到 %d", n)
+	}
+}
+
+// 还没到完成状态时同样要继续等。
+func TestCountBindingsPendingIsNotDone(t *testing.T) {
+	_, done, _ := countBindings(bindResp("t1", 0, true), "t1")
+	if done {
+		t.Error("Status=0 表示还没完成，应当继续等")
+	}
+}
+
+// TaskId 对不上时不能拿别人的结果当自己的。
+func TestCountBindingsIgnoresOtherTasks(t *testing.T) {
+	_, done, _ := countBindings(bindResp("other", bindStatusDone, true), "t1")
+	if done {
+		t.Error("TaskId 不匹配时不该判定为完成")
+	}
+}
+
+// 服务端报错时要把错误抛出来，而不是空等到超时。
+func TestCountBindingsSurfacesTaskError(t *testing.T) {
+	resp := bindResp("t1", 0, false)
+	resp.Response.SyncTaskBindResourceResult[0].Error = &ssl.Error{Message: common.StringPtr("boom")}
+
+	if _, _, err := countBindings(resp, "t1"); err == nil {
+		t.Error("任务报错时应当返回错误，而不是继续空等")
+	}
+}
+
+// 某个地域查询异常时，那个地域的数字不可信，不能累加进去。
+func TestCountBindingsSkipsErroredRegion(t *testing.T) {
+	resp := &ssl.DescribeCertificateBindResourceTaskResultResponse{
+		Response: &ssl.DescribeCertificateBindResourceTaskResultResponseParams{
+			SyncTaskBindResourceResult: []*ssl.SyncTaskBindResourceResult{{
+				TaskId: common.StringPtr("t1"),
+				Status: common.Uint64Ptr(bindStatusDone),
+				BindResourceResult: []*ssl.BindResourceResult{{
+					ResourceType: common.StringPtr("clb"),
+					BindResourceRegionResult: []*ssl.BindResourceRegionResult{
+						{Region: common.StringPtr("ap-guangzhou"), TotalCount: common.Uint64Ptr(2)},
+						{Region: common.StringPtr("ap-shanghai"), TotalCount: common.Uint64Ptr(9), Error: common.StringPtr("query failed")},
+					},
+				}},
+			}},
+		},
+	}
+
+	n, done, err := countBindings(resp, "t1")
+	if err != nil || !done {
+		t.Fatalf("done=%v err=%v", done, err)
+	}
+	if n != 2 {
+		t.Errorf("查询异常的地域不应计入，count = %d, want 2", n)
+	}
+}
+
+func TestCountBindingsNilResponse(t *testing.T) {
+	if _, done, _ := countBindings(nil, "t1"); done {
+		t.Error("nil 响应不该判定为完成")
+	}
+}

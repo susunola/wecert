@@ -298,3 +298,139 @@ func derefI64(v *int64) int64 {
 	}
 	return *v
 }
+
+// Bindings 查询这张证书当前绑定到多少个云资源。
+//
+// 这是只读的：CreateCertificateBindResourceSyncTask 建一个枚举任务，
+// 再按 TaskId 取结果。刻意不用 UpdateCertificateInstance 去“试探”，
+// 那个是写操作，确认绑定不该产生副作用。
+//
+// 为什么要它：首次签发只上传、不绑定，DeployConfirmed 因此是 false。
+// 人工在控制台绑好之后，原本没有任何路径回来把它置位 ——
+// deployed 指标会在整个证书周期（classic 最长 90 天）里报“未部署”，
+// 而证书其实一直在正常服务。
+func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
+	if certID == "" {
+		return 0, nil
+	}
+
+	client, err := d.client(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	createReq := ssl.NewCreateCertificateBindResourceSyncTaskRequest()
+	createReq.CertificateIds = []*string{common.StringPtr(certID)}
+	// IsCache=1：允许复用服务端缓存，避免每次收敛都打一次全量枚举。
+	createReq.IsCache = common.Uint64Ptr(1)
+
+	createResp, err := client.CreateCertificateBindResourceSyncTaskWithContext(ctx, createReq)
+	if err != nil {
+		return 0, fmt.Errorf("CreateCertificateBindResourceSyncTask: %w", err)
+	}
+	if createResp.Response == nil || len(createResp.Response.CertTaskIds) == 0 {
+		return 0, nil
+	}
+
+	var taskID string
+	for _, t := range createResp.Response.CertTaskIds {
+		if t != nil && t.CertId != nil && *t.CertId == certID && t.TaskId != nil {
+			taskID = *t.TaskId
+			break
+		}
+	}
+	if taskID == "" {
+		return 0, nil
+	}
+
+	// 枚举是异步的，轮询到有结果为止。给一个短上限：
+	// 这只是个确认动作，不值得为它长时间阻塞收敛。
+	deadline := d.now().Add(30 * time.Second)
+	for {
+		queryReq := ssl.NewDescribeCertificateBindResourceTaskResultRequest()
+		queryReq.TaskIds = []*string{common.StringPtr(taskID)}
+
+		queryResp, err := client.DescribeCertificateBindResourceTaskResultWithContext(ctx, queryReq)
+		if err != nil {
+			return 0, fmt.Errorf("DescribeCertificateBindResourceTaskResult: %w", err)
+		}
+
+		n, done, err := countBindings(queryResp, taskID)
+		if err != nil {
+			return 0, err
+		}
+		if done {
+			return n, nil
+		}
+
+		if d.now().After(deadline) {
+			return 0, fmt.Errorf("绑定关系枚举在 30s 内未完成（taskId=%s）", taskID)
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// bindStatusDone 是枚举任务完成时的 Status 取值。
+//
+// 这个值没有公开文档，是实测出来的（见下面 countBindings 的注释）。
+const bindStatusDone = 1
+
+// countBindings 从查询结果里数出绑定资源总数。
+//
+// 返回值 done=false 表示任务还没出结果，调用方应继续等。
+//
+// 关于 Status 的语义：**实测成功时 Status == 1**。
+// 一开始我按直觉写成“Status != 0 就是还没好”，结果确认永远等不到结果 ——
+// 这个字段的含义不能靠猜，所以把实测结论写在这里。
+//
+// 另外必须同时要求 BindResourceResult 非空：首次查询（服务端缓存尚未建立）
+// 会返回一个 TaskId 匹配、但结果列表为空的对象。只判断 TaskId 的话，
+// 会在那一刻就得出“绑定数为 0”，把一张其实绑好的证书判成未绑定。
+func countBindings(
+	resp *ssl.DescribeCertificateBindResourceTaskResultResponse, taskID string,
+) (count int, done bool, err error) {
+	if resp == nil || resp.Response == nil {
+		return 0, false, nil
+	}
+
+	for _, r := range resp.Response.SyncTaskBindResourceResult {
+		if r == nil || r.TaskId == nil || *r.TaskId != taskID {
+			continue
+		}
+
+		// 服务端明确报错时不要继续空等。
+		if r.Error != nil && r.Error.Message != nil && *r.Error.Message != "" {
+			return 0, false, fmt.Errorf("bind-resource task %s failed: %s", taskID, *r.Error.Message)
+		}
+
+		// 还没完成，或者完成了但结果列表尚未填充 —— 都继续等。
+		if r.Status == nil || *r.Status != bindStatusDone || len(r.BindResourceResult) == 0 {
+			return 0, false, nil
+		}
+
+		total := 0
+		for _, res := range r.BindResourceResult {
+			if res == nil {
+				continue
+			}
+			for _, region := range res.BindResourceRegionResult {
+				if region == nil || region.TotalCount == nil {
+					continue
+				}
+				// Error 非空表示这个地域查询异常，其结果不可信 ——
+				// 宁可当成“还没查到”，也不要据此把证书标成已部署。
+				if region.Error != nil && *region.Error != "" {
+					continue
+				}
+				total += int(*region.TotalCount)
+			}
+		}
+		return total, true, nil
+	}
+
+	return 0, false, nil
+}
