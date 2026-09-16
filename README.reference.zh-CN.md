@@ -386,9 +386,11 @@ retired_certificates          -- 已上传、等待回收的证书
 
 它还会在真实浏览器里**逐语言**量每一个标签：有任何一个溢出盒子、或者两个 `<text>` 标签互相压住，就拒绝出图。英文比中文长，所以"中文放得下、英文溢出"是个真实的失败模式 —— 第一次跑就抓到了两处。
 
-### 0. 部署形态：SNI 多域名、一张多 SAN 证书、后端 RS 池
+### 0. 部署形态：免费证书在 CLB 上自动轮转
 
-![wecert 的部署形态：客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池；wecert 从 DNSPod 与 Let's Encrypt 取得证书并换绑到 CLB](docs/diagrams/zh/00-deployment-shape.png)
+![wecert 的部署形态：免费证书由 Let's Encrypt 自动轮转（免费签发 → 自动换绑 → 服务 90 天 → 到期前自动再签），客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池](docs/diagrams/zh/00-deployment-shape.png)
+
+这套系统要解决的场景就是最上面那条带子：**Let's Encrypt 的证书不花钱，代价是有效期只有 90 天** —— 一年至少要轮 4 次，靠人记着做迟早会漏。所以重点不是"wecert 能签发"，而是"到期前它已经自己换好了，全程不用人管"。
 
 请求带着 SNI 到 CLB。CLB 按客户端给的名字去 `multi_cert_info` 里挑证书，七层规则再按域名分流到后端 RS 池。`wecert` 就跑在其中一台 CVM 上：读 DNSPod 里的 `_wecert.*` 声明、写 `_acme-challenge` 记录、向 Let's Encrypt 取证书、上传到腾讯云 SSL 并换绑监听器。
 
