@@ -32,6 +32,27 @@ var (
 		Help: "Start of the ARI-suggested renewal window in unix seconds; 0 means not yet obtained.",
 	}, []string{"cert"})
 
+	// RevocationPending counts revocation requests the CA has not accepted yet.
+	//
+	// A non-zero value is an outstanding security action, not a background task: the row exists
+	// because someone decided a certificate must stop being trusted, and the request is retried on
+	// every pass until the CA accepts it. Without this gauge the whole revocation path was invisible
+	// to monitoring -- the daemon logged, and nothing could alert.
+	RevocationPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_revocation_pending",
+		Help: "Revocation requests recorded but not yet accepted by the CA. Non-zero means a certificate that should no longer be trusted still is.",
+	})
+
+	// RevocationQueryErrors counts passes that could not read the outstanding revocation requests.
+	//
+	// RevocationPending is deliberately left at its last value when that read fails, so a failure
+	// shows up as a frozen gauge rather than a wrong one. This counter is what separates "the queue
+	// is genuinely empty" from "we have been unable to look for a week".
+	RevocationQueryErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "wecert_revocation_query_errors_total",
+		Help: "Passes that could not read the outstanding revocation requests. wecert_revocation_pending is stale whenever this is increasing.",
+	})
+
 	// RateLimitRemaining reports how much of a published CA rate limit is left, as a LOWER
 	// BOUND.
 	//
@@ -58,6 +79,19 @@ var (
 		Name: "wecert_reconcile_total",
 		Help: "Reconcile passes. result=ok when a pass ran and succeeded, error when it ran and failed, skipped when it deliberately did not run because the certificate is inside its retry backoff window.",
 	}, []string{"cert", "result"})
+
+	// LastReconcile is when the last full pass finished, so "is this daemon converging at all?"
+	// is answerable.
+	//
+	// Not derivable from the counters above: wecert_reconcile_total stops moving both when nothing
+	// is due and when the loop is wedged, and those call for opposite responses. Not derivable from
+	// the exposition's _created timestamps either -- promhttp.Handler() writes the classic text
+	// format, which carries none. 0 means no pass has finished since this process started, which is
+	// itself the answer for a daemon that never got through one.
+	LastReconcile = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_last_reconcile_timestamp_seconds",
+		Help: "Unix time the last full reconcile pass finished; 0 means none has finished since startup.",
+	})
 
 	ReconcilePanics = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "wecert_reconcile_panics_total",
