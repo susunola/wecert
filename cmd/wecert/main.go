@@ -164,7 +164,7 @@ func run() error {
 		log.Info("renewal results will be pushed out", "url", cfg.Webhook.NotifyURL)
 	}
 
-	manager := acme.NewManager(store, core, solver, deployer, log)
+	manager := acme.NewManager(store, acme.NewAPI(core), solver, deployer, log)
 	reconciler := reconcile.New(cfg, provider, store, manager, notifier, log)
 
 	// 网络侧探测：拨一个真实的 TLS 连接，确认线上服务的确实是部署的那张证书。

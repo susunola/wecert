@@ -24,7 +24,7 @@ const authzFetchConcurrency = 8
 
 // advance 推进订单状态机。
 func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.CertState, o *state.Order) error {
-	order, err := m.core.Orders.Get(o.OrderURL)
+	order, err := m.core.GetOrder(o.OrderURL)
 	if err != nil {
 		return m.recordFailure(st, fmt.Errorf("get order: %w", err))
 	}
@@ -102,7 +102,7 @@ func (m *Manager) fetchAuthzs(ctx context.Context, authzs []*state.Authorization
 				errs[i] = err
 				return
 			}
-			cur, err := m.core.Authorizations.Get(authzURL)
+			cur, err := m.core.GetAuthorization(authzURL)
 			if err != nil {
 				errs[i] = err
 				return
@@ -215,7 +215,7 @@ func (m *Manager) solveChallenges(
 		if a.ChallengeSent {
 			continue
 		}
-		if _, err := m.core.Challenges.New(a.ChallengeURL); err != nil {
+		if err := m.core.AcceptChallenge(a.ChallengeURL); err != nil {
 			return false, m.recordFailure(st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
 		}
 		a.ChallengeSent = true
@@ -416,7 +416,7 @@ func (m *Manager) finalize(
 	// lego 那个参数名叫 orderURL 是误导 —— UpdateForCSR 直接往你给的 URL POST。
 	// 传 order URL 会被 LE 当成 POST-as-GET 并报
 	// "POST-as-GET requests must have an empty payload"。
-	if _, err := m.core.Orders.UpdateForCSR(o.FinalizeURL, csr); err != nil {
+	if _, err := m.core.UpdateOrderForCSR(o.FinalizeURL, csr); err != nil {
 		return m.recordFailure(st, fmt.Errorf("submit CSR (finalize): %w", err))
 	}
 
@@ -435,7 +435,7 @@ func (m *Manager) awaitOrderStatus(
 	var last legoacme.ExtendedOrder
 
 	for {
-		o, err := m.core.Orders.Get(orderURL)
+		o, err := m.core.GetOrder(orderURL)
 		if err != nil {
 			return last, fmt.Errorf("poll order: %w", err)
 		}

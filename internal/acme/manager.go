@@ -5,8 +5,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/go-acme/lego/v4/acme/api"
-
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/state"
@@ -52,7 +50,7 @@ type keyAuthProvider interface {
 //     授权行一删，那些记录就永远回收不了了。
 type Manager struct {
 	store    *state.Store
-	core     *api.Core
+	core     API
 	dns      challengeSolver
 	keyAuth  keyAuthProvider
 	deployer deploy.Deployer
@@ -66,7 +64,7 @@ type Manager struct {
 // NewManager 构造收敛器。
 func NewManager(
 	store *state.Store,
-	core *api.Core,
+	core API,
 	dns *DNSSolver,
 	deployer deploy.Deployer,
 	log *slog.Logger,
@@ -77,7 +75,7 @@ func NewManager(
 // newManager 允许注入 DNS solver 与 key authorization 来源，供测试使用。
 func newManager(
 	store *state.Store,
-	core *api.Core,
+	core API,
 	dns challengeSolver,
 	keyAuth keyAuthProvider,
 	deployer deploy.Deployer,
