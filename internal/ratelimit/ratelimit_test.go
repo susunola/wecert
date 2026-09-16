@@ -169,3 +169,63 @@ func TestWorstCaseBlockedByTakesTheLatest(t *testing.T) {
 		t.Error("no deadlines must report not blocked")
 	}
 }
+
+// A negative cost must not hand quota back.
+//
+// The API records consumption, so the only defensible reading of a negative cost is "nothing was
+// consumed". Treating it as credit would mean a sign error in a caller *increases* the reported
+// allowance -- the direction that leads to issue attempts the CA then refuses.
+func TestNegativeCostDoesNotCreditTheBucket(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	l := NewOrdersPerAccount
+
+	spent := Spend(Snapshot{}, l, 10, now)
+	if got := Remaining(spent, l, now); got != l.Capacity-10 {
+		t.Fatalf("after spending 10: %v, want %v", got, l.Capacity-10)
+	}
+
+	credited := Spend(spent, l, -5, now)
+	if got := Remaining(credited, l, now); got != l.Capacity-10 {
+		t.Errorf("a negative cost credited the bucket: %v, want %v (unchanged)",
+			got, l.Capacity-10)
+	}
+}
+
+// A limit with no refill interval must not panic, and must not hand out tokens it cannot justify.
+//
+// Remaining divides by the interval, so this was `integer divide by zero`. Every Limit currently
+// comes from the table in this file, but Remaining takes one, so the function has to be total.
+func TestZeroRefillIntervalIsHandledNotPanicked(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	l := Limit{Name: "no-refill", Capacity: 5, Refill: 0}
+
+	// An exhausted bucket stays exhausted: it never refills.
+	spent := Snapshot{Tokens: 0, At: now.Add(-time.Hour)}
+	if got := Remaining(spent, l, now); got != 0 {
+		t.Errorf("a bucket with no refill interval gained tokens: %v, want 0", got)
+	}
+	// A full one stays full rather than dividing by zero.
+	if got := Remaining(Snapshot{Tokens: 5, At: now.Add(-time.Hour)}, l, now); got != 5 {
+		t.Errorf("got %v, want 5", got)
+	}
+	// And an overdrawn one reports empty rather than negative.
+	if got := Remaining(Snapshot{Tokens: -3, At: now}, l, now); got != 0 {
+		t.Errorf("got %v, want 0 (no negative allowance)", got)
+	}
+}
+
+// The zero instant must be rejected rather than reported as a parsed deadline.
+//
+// "retry after 0001-01-01 00:00:00 UTC" parses cleanly and equals time.Time{}, which is the value
+// callers use for "no deadline". Returning it with ok=true would mean "blocked until the zero
+// time", i.e. not blocked, while looking like a successful parse -- so a malformed instant would
+// silently disable the block that protects the rate-limit budget.
+func TestZeroInstantIsNotADeadline(t *testing.T) {
+	if at, ok := ParseRetryAfter("retry after 0001-01-01 00:00:00 UTC"); ok {
+		t.Errorf("the zero instant means no deadline, not a parsed one; got %v with ok=true", at)
+	}
+	// The documented format still parses.
+	if _, ok := ParseRetryAfter("retry after 2026-09-23 04:00:00 UTC"); !ok {
+		t.Error("the documented format must still parse")
+	}
+}

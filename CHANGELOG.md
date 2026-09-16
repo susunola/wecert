@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- **`ratelimit`: integer divide by zero on a limit with no refill interval.** `Remaining` divides
+  by `Limit.Refill`, so a zero (or negative) interval panicked. Unreachable through today's
+  callers — every `Limit` comes from the published table in that file — but reachable through the
+  public API, which is what a fuzzer checks and a review does not. A degenerate interval is now
+  read as "never refills", the conservative direction.
+- **`ratelimit`: a negative cost credited the bucket.** `Spend` computed `tokens - cost`, so
+  passing a negative cost *increased* the reported allowance. The API records consumption, so a
+  negative cost is now "nothing was consumed" rather than a credit.
+- **`ratelimit`: `ParseRetryAfter` reported the zero instant as a parsed deadline.**
+  `"retry after 0001-01-01 00:00:00 UTC"` parses cleanly and equals `time.Time{}`, which is the
+  value callers use for "no deadline" — so a malformed instant would have silently disabled the
+  block that protects the rate-limit budget while looking like a successful parse.
 - **`wecert_revocation_pending` can no longer report a false all-clear.** `PendingRevocations` used
   to swallow a store error and return `0`, which is a meaningful answer ("nothing outstanding") — so
   a database that could not be read looked exactly like a deployment with no outstanding revocation.
@@ -22,8 +34,15 @@
   names neither the cause nor the fix. The duplicate's ID is the same certificate, so it is a
   usable answer.
 
+All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The first two came from a
+30-second run over 387 lines of pure arithmetic.
+
 ### Added
 
+- Property and fuzz targets for `internal/ratelimit` (`internal/ratelimit/fuzz_test.go`,
+  `fuzz_parse_test.go`), with a committed regression corpus replayed by plain `go test` and a
+  `make fuzz` target. **Not yet wired into CI**: the token used for that needs the `workflow`
+  scope, which it does not have, so the CI step is left for whoever has it.
 - **`deploy/prometheus/wecert-alerts.yml`**: 17 ready-to-load alert rules in three groups
   (`wecert.expiry`, `wecert.convergence`, `wecert.integrity`), each threshold with a comment saying
   where the number came from. Several of the failures they watch for are silent by construction — a
