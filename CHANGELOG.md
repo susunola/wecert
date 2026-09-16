@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Security
+
+- Bind the webhook to loopback by default; refuse `0.0.0.0` / `::` unless `webhook.allowPublic` is set.
+- Sign outbound renewal notifications with `webhook.notifySecret` (`X-Wecert-Signature`).
+- Cap in-flight notification POSTs and lock out webhook clients after repeated auth failures.
+- Compare webhook tokens as SHA-256 digests so a length mismatch cannot short-circuit the compare.
+- Reject CAM role names that would be interpolated as metadata URL path segments.
+- Escape `?` and `#` in the SQLite DSN so a state path cannot swallow the pragmas.
+- Add `deploy/cam-policy-runtime.json` as the production CAM policy, separate from the e2e harness policy.
+
 ### Added
 
 - MIT LICENSE file.
@@ -32,6 +42,8 @@
 
 ### Changed
 
+- Process independent certificates concurrently (`reconcileConcurrency`, default 4 after `Load`).
+- CI runs `govulncheck`.
 - Replace the author's personal domain/IP defaults in `testenv/` with neutral
   placeholders (`wecert-test.invalid`); `clb_public_ip` now defaults to empty
   and the DNS record is skipped until it is set.
