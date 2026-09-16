@@ -207,7 +207,7 @@ func TestReconcileReissuesImmediatelyWhenDomainAdded(t *testing.T) {
 	if err == nil {
 		t.Fatal("配置新增域名后应当立刻去重签（假服务端会拒绝下单，所以必然报错）")
 	}
-	if !strings.Contains(err.Error(), "创建订单") {
+	if !strings.Contains(err.Error(), "create order") {
 		t.Errorf("报错应当来自下单这一步，说明确实走进了签发流程: %v", err)
 	}
 	if n := fake.newOrders.Load(); n != 1 {

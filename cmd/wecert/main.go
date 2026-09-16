@@ -35,20 +35,20 @@ var version = "dev"
 
 func main() {
 	if err := run(); err != nil {
-		slog.Error("wecert 异常退出", "err", err)
+		slog.Error("wecert exited with an error", "err", err)
 		os.Exit(1)
 	}
 }
 
 func run() error {
 	var (
-		configPath = flag.String("config", "config.yaml", "配置文件路径")
-		statePath  = flag.String("state", "", "覆盖配置里的 statePath（便于测试或跑多实例）")
-		once       = flag.Bool("once", false, "只跑一轮就退出（配合 systemd timer / cron）")
-		interval   = flag.Duration("interval", time.Hour, "守护模式下的收敛间隔")
-		logLevel   = flag.String("log-level", "info", "日志级别: debug|info|warn|error")
-		dryRun     = flag.Bool("dry-run", false, "只校验配置并初始化账号，不签发也不部署")
-		showVer    = flag.Bool("version", false, "打印版本后退出")
+		configPath = flag.String("config", "config.yaml", "path to the configuration file")
+		statePath  = flag.String("state", "", "override statePath from the config (handy for tests or running multiple instances)")
+		once       = flag.Bool("once", false, "run one pass and exit (for a systemd timer / cron)")
+		interval   = flag.Duration("interval", time.Hour, "reconcile interval in daemon mode")
+		logLevel   = flag.String("log-level", "info", "log level: debug|info|warn|error")
+		dryRun     = flag.Bool("dry-run", false, "validate the config and initialise the account only; issue and deploy nothing")
+		showVer    = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
 
@@ -88,7 +88,7 @@ func run() error {
 	}
 
 	if *dryRun {
-		log.Info("dry-run 完成：配置与 ACME 账号均正常", "certificates", len(cfg.Certificates))
+		log.Info("dry run finished: the config and the ACME account are both fine", "certificates", len(cfg.Certificates))
 		return nil
 	}
 
@@ -96,7 +96,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Info("DNS-01 solver 已就绪", "provider", cfg.DNS.Provider, "ttl", cfg.DNS.TTL)
+	log.Info("DNS-01 solver ready", "provider", cfg.DNS.Provider, "ttl", cfg.DNS.TTL)
 
 	deployer, err := newDeployer(cfg, log)
 	if err != nil {
@@ -113,7 +113,7 @@ func run() error {
 	var notifier reconcile.Notifier
 	if n := webhook.NewNotifier(cfg.Webhook.NotifyURL, log); n != nil {
 		notifier = n
-		log.Info("续期结果会推送出去", "url", cfg.Webhook.NotifyURL)
+		log.Info("renewal results will be pushed out", "url", cfg.Webhook.NotifyURL)
 	}
 
 	manager := acme.NewManager(store, core, solver, deployer, log)
@@ -134,7 +134,7 @@ func run() error {
 		return nil
 	}
 
-	log.Info("进入守护模式", "interval", *interval)
+	log.Info("entering daemon mode", "interval", *interval)
 	runDaemon(ctx, reconciler, *interval, log)
 	return nil
 }
@@ -145,14 +145,14 @@ func runDaemon(ctx context.Context, r *reconcile.Reconciler, interval time.Durat
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info("收到停止信号，退出")
+			log.Info("stop signal received; exiting")
 			return
 		case <-next:
 		}
 
 		start := time.Now()
 		r.RunOnce(ctx)
-		log.Info("收敛轮次结束", "duration", time.Since(start).Round(time.Millisecond))
+		log.Info("reconcile pass finished", "duration", time.Since(start).Round(time.Millisecond))
 
 		// 每轮都重新抖动：固定间隔会让所有实例长期保持同相位。
 		next = time.After(jitter(interval))
@@ -189,8 +189,8 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) erro
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf(
-			"监听指标端口 %s 失败: %w（端口被占用？同一台机器上只应跑一个 wecert 实例，"+
-				"daemon 与 timer 两种模式不要同时启用）", addr, err)
+			"failed to listen on the metrics port %s: %w (already in use? only one wecert instance should run per machine; "+
+				"do not enable both the daemon and the timer)", addr, err)
 	}
 
 	srv := &http.Server{
@@ -208,11 +208,11 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) erro
 	go func() {
 		// 走到这里的错误只能是 Shutdown 触发的 ErrServerClosed。
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("指标服务异常退出", "err", err)
+			log.Error("the metrics server exited unexpectedly", "err", err)
 		}
 	}()
 
-	log.Info("指标服务已启动", "addr", ln.Addr().String(), "metrics", "/metrics")
+	log.Info("metrics server started", "addr", ln.Addr().String(), "metrics", "/metrics")
 	return nil
 }
 
@@ -226,14 +226,14 @@ func startWebhookServer(
 	rec *reconcile.Reconciler, store *state.Store, log *slog.Logger,
 ) error {
 	if cfg.Webhook.Listen == "" {
-		log.Info("webhook 未启用（webhook.listen 为空），只按定时器收敛")
+		log.Info("webhook disabled (webhook.listen is empty); converging on the timer only")
 		return nil
 	}
 
 	ln, err := net.Listen("tcp", cfg.Webhook.Listen)
 	if err != nil {
 		return fmt.Errorf(
-			"监听 webhook 端口 %s 失败: %w（端口被占用？）", cfg.Webhook.Listen, err)
+			"failed to listen on the webhook port %s: %w (already in use?)", cfg.Webhook.Listen, err)
 	}
 
 	api := webhook.New(rec, store, cfg.Webhook.Token, ctx, log)
@@ -254,11 +254,11 @@ func startWebhookServer(
 
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("webhook 服务异常退出", "err", err)
+			log.Error("the webhook server exited unexpectedly", "err", err)
 		}
 	}()
 
-	log.Info("webhook 已启动",
+	log.Info("webhook server started",
 		"addr", ln.Addr().String(),
 		"trigger", "POST /hook/reconcile",
 		"status", "GET /hook/status")
@@ -274,7 +274,7 @@ func newDeployer(cfg *config.Config, log *slog.Logger) (deploy.Deployer, error) 
 		}
 	}
 	if !enabled {
-		log.Info("所有证书都未开启 deploy，仅维护本地状态（证书不会推送到腾讯云）")
+		log.Info("no certificate has deploy enabled; keeping local state only (nothing is pushed to Tencent Cloud)")
 		return deploy.Noop{}, nil
 	}
 
@@ -282,7 +282,7 @@ func newDeployer(cfg *config.Config, log *slog.Logger) (deploy.Deployer, error) 
 	if err != nil {
 		return nil, err
 	}
-	log.Info("已启用腾讯云部署",
+	log.Info("Tencent Cloud deploy enabled",
 		"credentialMode", cfg.Tencent.CredentialMode,
 		"resourceTypes", cfg.Tencent.ResourceTypes,
 		"regions", cfg.Tencent.Regions)
@@ -300,7 +300,7 @@ func isFirstRun(store *state.Store, cfg *config.Config) (bool, error) {
 func logStartup(log *slog.Logger, cfg *config.Config, firstRun bool) {
 	production := cfg.ACME.Directory == config.DirectoryProduction
 
-	log.Info("wecert 启动",
+	log.Info("wecert starting",
 		"version", version,
 		"directory", cfg.ACME.Directory,
 		"production", production,
@@ -308,16 +308,16 @@ func logStartup(log *slog.Logger, cfg *config.Config, firstRun bool) {
 		"certificates", len(cfg.Certificates))
 
 	if firstRun {
-		log.Warn("状态库中没有账号，将注册一个新的 ACME 账号")
+		log.Warn("no account in the state store; registering a new ACME account")
 		if production {
-			log.Warn("⚠️  当前指向 Let's Encrypt 生产环境。" +
-				"建议先用 https://acme-staging-v02.api.letsencrypt.org/directory 跑通全流程，" +
-				"否则失败重试会消耗真实的生产配额")
+			log.Warn("WARNING: pointed at the Let's Encrypt production environment." +
+				"run the whole flow against https://acme-staging-v02.api.letsencrypt.org/directory first," +
+				"otherwise failed retries burn real production quota")
 		}
 	}
 
 	for _, c := range cfg.Certificates {
-		log.Info("已加载证书",
+		log.Info("loaded certificate",
 			"cert", c.Name,
 			"profile", c.Profile,
 			"domains", len(c.Domains),
@@ -328,9 +328,9 @@ func logStartup(log *slog.Logger, cfg *config.Config, firstRun bool) {
 		// 通配符只覆盖一层，二层子域需要单独申请。这是最常见的一个误解。
 		for _, d := range c.Domains {
 			if strings.HasPrefix(d, "*.") && strings.Count(d, ".") > 1 {
-				log.Info("注意：通配符只覆盖一层标签",
+				log.Info("note: a wildcard covers only one label",
 					"cert", c.Name, "domain", d,
-					"hint", "例如 *.a.example.com 不包含 b.a.example.com，需要另加 *.b.a.example.com 或显式列出")
+					"hint", "e.g. *.a.example.com does not include b.a.example.com; add *.b.a.example.com or list it explicitly")
 			}
 		}
 	}

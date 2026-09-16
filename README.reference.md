@@ -219,7 +219,7 @@ directory: https://acme-v02.api.letsencrypt.org/directory
 On first issuance, Tencent Cloud has no "old certificate → cloud resource" binding to look up, so wecert only uploads the certificate and logs the new CertId:
 
 ```
-证书已上传，等待在 CLB 上手动绑定一次 cert=example-com uploadedCertId=xxxxxxxx
+certificate uploaded; waiting for a one-time manual bind in the CLB console cert=example-com uploadedCertId=xxxxxxxx
 ```
 
 Bind it once in the CLB console. Every renewal after that is automatic: [`UpdateCertificateInstance`](https://www.tencentcloud.com/document/product/1007/57981) makes Tencent Cloud find the listeners bound to the old certificate and swap them.
@@ -229,7 +229,7 @@ Bind it once in the CLB console. Every renewal after that is automatic: [`Update
 Once a rebind is confirmed, the log line becomes:
 
 ```
-证书已续期并生效 cert=example-com notAfter=… deployedCertId=xxxxxxxx
+certificate renewed and live cert=example-com notAfter=… deployedCertId=xxxxxxxx
 ```
 
 > Tencent Cloud also offers `UploadUpdateCertificateInstance`, which keeps the certificate ID stable and replaces the content in place — but it requires a whitelist ticket and is CLB-only. Nice to have, not needed; the public `UpdateCertificateInstance` is sufficient.
@@ -723,7 +723,7 @@ Configuring `ttl: 60` is rejected with `LimitExceeded.RecordTtlLimit`. The defau
 
 DNSPod has 9 authoritative nameservers. Requiring all 9 to respond and agree means that if any one is unreachable from your network, "propagation complete" is never satisfied — which is a different question from whether the record propagated (Let's Encrypt validates from *its* locations). The rule is now: **no reachable NS denies the value, and at least one confirms** — with at least two confirmations required when the zone has more than one nameserver, so "only one NS was reachable" does not pass. A single-nameserver zone must still be able to pass; requiring two confirmations would make such a zone wait forever.
 
-Measured log: `确认 8 / 否认 0 / 不可达 1` — the original strict implementation failed on this.
+Measured log: `confirmed 8 / denied 0 / unreachable 1` — the original strict implementation failed on this.
 
 ### lego API traps
 

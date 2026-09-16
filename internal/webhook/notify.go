@@ -73,7 +73,7 @@ func (n *Notifier) Renewal(ctx context.Context, certName string, reconcileErr er
 func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
 	body, err := json.Marshal(ev)
 	if err != nil {
-		n.log.Warn("序列化通知事件失败", "cert", ev.Cert, "err", err)
+		n.log.Warn("failed to serialise the notification event", "cert", ev.Cert, "err", err)
 		return
 	}
 
@@ -82,23 +82,23 @@ func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.url, bytes.NewReader(body))
 	if err != nil {
-		n.log.Warn("构造通知请求失败", "cert", ev.Cert, "err", err)
+		n.log.Warn("failed to build the notification request", "cert", ev.Cert, "err", err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := n.client.Do(req)
 	if err != nil {
-		n.log.Warn("推送续期通知失败", "cert", ev.Cert, "result", ev.Result, "err", err)
+		n.log.Warn("failed to deliver the renewal notification", "cert", ev.Cert, "result", ev.Result, "err", err)
 		return
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 
 	if resp.StatusCode >= 300 {
-		n.log.Warn("推送续期通知被拒",
+		n.log.Warn("the renewal notification was rejected",
 			"cert", ev.Cert, "status", resp.StatusCode)
 		return
 	}
-	n.log.Debug("续期通知已推送", "cert", ev.Cert, "result", ev.Result)
+	n.log.Debug("renewal notification delivered", "cert", ev.Cert, "result", ev.Result)
 }

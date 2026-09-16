@@ -30,7 +30,7 @@ type RenewalInfo struct {
 // 注意 AKI 用的是扩展里的 keyIdentifier 原始字节，不是整个扩展。
 func CertID(leaf *x509.Certificate) (string, error) {
 	if len(leaf.AuthorityKeyId) == 0 {
-		return "", fmt.Errorf("证书缺少 Authority Key Identifier，无法构造 ARI certID")
+		return "", fmt.Errorf("certificate has no Authority Key Identifier; cannot build an ARI certID")
 	}
 	aki := base64.RawURLEncoding.EncodeToString(leaf.AuthorityKeyId)
 	serial := base64.RawURLEncoding.EncodeToString(leaf.SerialNumber.Bytes())
@@ -58,15 +58,15 @@ func FetchRenewalInfo(core *api.Core, certID string) (*RenewalInfo, time.Duratio
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, retryAfter, fmt.Errorf("renewalInfo 返回 %d", resp.StatusCode)
+		return nil, retryAfter, fmt.Errorf("renewalInfo returned %d", resp.StatusCode)
 	}
 
 	var info RenewalInfo
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&info); err != nil {
-		return nil, retryAfter, fmt.Errorf("解析 renewalInfo: %w", err)
+		return nil, retryAfter, fmt.Errorf("parse renewalInfo: %w", err)
 	}
 	if info.SuggestedWindow.End.Before(info.SuggestedWindow.Start) {
-		return nil, retryAfter, fmt.Errorf("renewalInfo 的 suggestedWindow 非法: %s - %s",
+		return nil, retryAfter, fmt.Errorf("renewalInfo suggestedWindow is invalid: %s - %s",
 			info.SuggestedWindow.Start, info.SuggestedWindow.End)
 	}
 	return &info, retryAfter, nil

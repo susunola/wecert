@@ -21,25 +21,25 @@ import (
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
 func run() error {
 	var (
-		region     = flag.String("region", "", "地域，例如 ap-guangzhou")
-		lbID       = flag.String("clb", "", "CLB 实例 ID")
-		listenerID = flag.String("listener", "", "监听器 ID；省略则取该 CLB 下的第一个监听器")
-		expect     = flag.String("expect", "", "期望的主证书 ID；提供则断言必须相等")
-		notExpect  = flag.String("not-expect", "", "不应出现的证书 ID；提供则断言必须不等")
-		raw        = flag.Bool("raw", false, "原样打印 DescribeListeners 的 JSON 响应，用于排障")
-		wait       = flag.Duration("wait", 0, "轮询等待期望证书出现的最长时间（UpdateCertificateInstance 是异步的）")
+		region     = flag.String("region", "", "region, e.g. ap-guangzhou")
+		lbID       = flag.String("clb", "", "CLB instance ID")
+		listenerID = flag.String("listener", "", "listener ID; when omitted, the first listener on that CLB is used")
+		expect     = flag.String("expect", "", "expected primary certificate ID; when set the assertion must hold")
+		notExpect  = flag.String("not-expect", "", "certificate ID that must NOT be present")
+		raw        = flag.Bool("raw", false, "dump the raw DescribeListeners JSON response for troubleshooting")
+		wait       = flag.Duration("wait", 0, "how long to poll for the expected certificate (UpdateCertificateInstance is asynchronous)")
 	)
 	flag.Parse()
 
 	if *region == "" || *lbID == "" {
-		return fmt.Errorf("必须提供 -region 和 -clb（-listener 可省略，省略则列出全部监听器）")
+		return fmt.Errorf("-region and -clb are required (-listener is optional; omit it to list every listener)")
 	}
 
 	cred := common.NewCredential(
@@ -47,7 +47,7 @@ func run() error {
 		os.Getenv("TENCENTCLOUD_SECRET_KEY"),
 	)
 	if cred.GetSecretId() == "" {
-		return fmt.Errorf("缺少凭证：请设置 TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY")
+		return fmt.Errorf("missing credentials: set TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY")
 	}
 
 	cpf := profile.NewClientProfile()
@@ -55,7 +55,7 @@ func run() error {
 
 	client, err := clb.NewClient(cred, *region, cpf)
 	if err != nil {
-		return fmt.Errorf("构造 CLB 客户端: %w", err)
+		return fmt.Errorf("build CLB client: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -75,7 +75,7 @@ func run() error {
 		return fmt.Errorf("DescribeListeners: %w", err)
 	}
 	if resp.Response == nil || len(resp.Response.Listeners) == 0 {
-		return fmt.Errorf("CLB %s 下没有监听器", *lbID)
+		return fmt.Errorf("CLB %s has no listeners", *lbID)
 	}
 
 	if *raw {
@@ -83,31 +83,31 @@ func run() error {
 		// 避免"我们以为的字段名"和"API 实际返回的"对不上时瞎猜。
 		b, err := json.MarshalIndent(resp.Response, "", "  ")
 		if err != nil {
-			return fmt.Errorf("序列化响应: %w", err)
+			return fmt.Errorf("encode response: %w", err)
 		}
 		fmt.Println(string(b))
 		return nil
 	}
 
 	l := resp.Response.Listeners[0]
-	fmt.Printf("监听器 %s  (%s:%d)\n", derefStr(l.ListenerId), derefStr(l.Protocol), derefI64(l.Port))
+	fmt.Printf("listener %s  (%s:%d)\n", derefStr(l.ListenerId), derefStr(l.Protocol), derefI64(l.Port))
 
 	if l.Certificate == nil || l.Certificate.CertId == nil {
-		return fmt.Errorf("监听器上没有绑定证书")
+		return fmt.Errorf("the listener has no certificate bound")
 	}
 
 	certID := *l.Certificate.CertId
-	fmt.Printf("  主证书 CertId : %s\n", certID)
+	fmt.Printf("  primary certificate: %s\n", certID)
 
 	// SNI 扩展证书：这正是"换一张证书时容易误伤别的证书"的地方，
 	// 所以单独打出来。
 	if n := len(l.Certificate.ExtCertIds); n > 0 {
-		fmt.Printf("  SNI 扩展证书  : %d 张\n", n)
+		fmt.Printf("  SNI certificates  : %d\n", n)
 		for _, e := range l.Certificate.ExtCertIds {
 			fmt.Printf("      %s\n", derefStr(e))
 		}
 	} else {
-		fmt.Printf("  SNI 扩展证书  : 无\n")
+		fmt.Printf("  SNI certificates  : none\n")
 	}
 
 	// UpdateCertificateInstance 是异步 API：调用返回只代表任务创建成功，
@@ -131,11 +131,11 @@ func run() error {
 				// 不能再静默 continue：查询本身失败和"还没换过来"
 				// 是两件完全不同的事，必须让人看得见。
 				lastErr = err
-				fmt.Printf("  ...查询失败，稍后重试: %v\n", err)
+				fmt.Printf("  ...query failed, retrying shortly: %v\n", err)
 				continue
 			}
 			lastErr = nil
-			fmt.Printf("  ...等待中，当前绑定 %s\n", cur)
+			fmt.Printf("  ...waiting; currently bound to %s\n", cur)
 			if cur == *expect {
 				certID = cur
 				break
@@ -143,19 +143,19 @@ func run() error {
 			certID = cur
 		}
 		if certID != *expect && lastErr != nil {
-			fmt.Printf("  ...注意：最后一次查询仍然失败，上面的断言结果可能不可信: %v\n", lastErr)
+			fmt.Printf("  ...note: the final query also failed, so the assertion above may not be trustworthy: %v\n", lastErr)
 		}
 		fmt.Println()
 	}
 
 	if *notExpect != "" && certID == *notExpect {
-		return fmt.Errorf("断言失败：监听器仍然绑着不该出现的证书 %s", *notExpect)
+		return fmt.Errorf("assertion failed: the listener is still bound to %s, which should be gone", *notExpect)
 	}
 	if *expect != "" {
 		if certID != *expect {
-			return fmt.Errorf("断言失败：等待 %s 后仍未变成期望的 %s，实际 %s", *wait, *expect, certID)
+			return fmt.Errorf("assertion failed: after waiting %s it is still not %s (actual: %s)", *wait, *expect, certID)
 		}
-		fmt.Printf("\n✅ 断言通过：监听器已重绑定到 %s\n", *expect)
+		fmt.Printf("\nOK: assertion passed - the listener is now bound to %s\n", *expect)
 	}
 	return nil
 }
@@ -176,11 +176,11 @@ func fetchCertID(ctx context.Context, client *clb.Client, lbID, listenerID strin
 		return "", err
 	}
 	if resp.Response == nil || len(resp.Response.Listeners) == 0 {
-		return "", fmt.Errorf("监听器不存在")
+		return "", fmt.Errorf("the listener does not exist")
 	}
 	l := resp.Response.Listeners[0]
 	if l.Certificate == nil || l.Certificate.CertId == nil {
-		return "", fmt.Errorf("未绑定证书")
+		return "", fmt.Errorf("no certificate bound")
 	}
 	return *l.Certificate.CertId, nil
 }

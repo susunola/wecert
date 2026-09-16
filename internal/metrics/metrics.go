@@ -14,30 +14,30 @@ var (
 	// CertNotAfter 是证书到期时间（unix 秒）。
 	CertNotAfter = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_not_after_timestamp_seconds",
-		Help: "当前生效证书的 notAfter（unix 秒）。",
+		Help: "notAfter of the live certificate, in unix seconds.",
 	}, []string{"cert"})
 
 	// CertDeployed 表示证书是否已经成功部署到云端。
 	CertDeployed = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_deployed",
-		Help: "1 表示已确认绑到腾讯云资源，0 表示尚未绑定（含首次上传后等待人工绑定）。",
+		Help: "1 when the certificate is confirmed bound to a Tencent Cloud resource, 0 otherwise (including the period after the first upload while waiting for a manual bind).",
 	}, []string{"cert"})
 
 	// CertConsecutiveFailures 是连续失败次数，持续大于 0 需要人工介入。
 	CertConsecutiveFailures = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_consecutive_failures",
-		Help: "连续失败次数。重置为 0 表示最近一次处理成功。",
+		Help: "Consecutive failures. Reset to 0 by a successful pass.",
 	}, []string{"cert"})
 
 	// CertARIWindowStart 是 ARI 建议的续期窗口起点。
 	CertARIWindowStart = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_ari_window_start_timestamp_seconds",
-		Help: "ARI 建议的续期窗口起点（unix 秒），0 表示尚未取得。",
+		Help: "Start of the ARI-suggested renewal window in unix seconds; 0 means not yet obtained.",
 	}, []string{"cert"})
 
 	// ReconcileTotal 记录每张证书的处理结果。
 	ReconcileTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "wecert_reconcile_total",
-		Help: "收敛轮次计数，result 取值为 ok / error。",
+		Help: "Reconcile passes, with result being ok or error.",
 	}, []string{"cert", "result"})
 )

@@ -21,30 +21,30 @@ import (
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
 func run() error {
 	var (
-		region   = flag.String("region", "", "地域，例如 ap-guangzhou")
-		instance = flag.String("instance", "", "CVM 实例 ID，例如 ins-xxxx")
-		command  = flag.String("cmd", "", "要执行的 shell 命令")
-		timeout  = flag.Duration("timeout", 180*time.Second, "整体超时")
-		interval = flag.Duration("interval", 3*time.Second, "轮询间隔")
-		quiet    = flag.Bool("quiet", false, "只把命令 stdout 打到标准输出，便于管道处理")
+		region   = flag.String("region", "", "region, e.g. ap-guangzhou")
+		instance = flag.String("instance", "", "CVM instance ID, e.g. ins-xxxx")
+		command  = flag.String("cmd", "", "shell command to run")
+		timeout  = flag.Duration("timeout", 180*time.Second, "overall timeout")
+		interval = flag.Duration("interval", 3*time.Second, "poll interval")
+		quiet    = flag.Bool("quiet", false, "print only the command's stdout, for piping")
 	)
 	flag.Parse()
 
 	if *region == "" || *instance == "" || *command == "" {
-		return fmt.Errorf("必须提供 -region、-instance、-cmd")
+		return fmt.Errorf("-region, -instance and -cmd are required")
 	}
 
 	secretID := os.Getenv("TENCENTCLOUD_SECRET_ID")
 	secretKey := os.Getenv("TENCENTCLOUD_SECRET_KEY")
 	if secretID == "" || secretKey == "" {
-		return fmt.Errorf("缺少凭证：请设置 TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY")
+		return fmt.Errorf("missing credentials: set TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY")
 	}
 
 	cpf := profile.NewClientProfile()
@@ -52,7 +52,7 @@ func run() error {
 
 	client, err := tat.NewClient(common.NewCredential(secretID, secretKey), *region, cpf)
 	if err != nil {
-		return fmt.Errorf("构造 TAT 客户端: %w", err)
+		return fmt.Errorf("build TAT client: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -70,15 +70,15 @@ func run() error {
 
 	runResp, err := client.RunCommandWithContext(ctx, runReq)
 	if err != nil {
-		return fmt.Errorf("RunCommand（检查 tat:RunCommand 权限、以及 CVM 上是否装了 TAT agent）: %w", err)
+		return fmt.Errorf("RunCommand (check the tat:RunCommand permission, and whether the CVM has the TAT agent installed): %w", err)
 	}
 	invocationID := deref(runResp.Response.InvocationId)
 	if invocationID == "" {
-		return fmt.Errorf("RunCommand 未返回 InvocationId")
+		return fmt.Errorf("RunCommand returned no InvocationId")
 	}
 
 	if !*quiet {
-		fmt.Fprintf(os.Stderr, "TAT 命令已下发 (invocation=%s)，等待执行...\n", invocationID)
+		fmt.Fprintf(os.Stderr, "TAT command submitted (invocation=%s), waiting for it to run...\n", invocationID)
 	}
 
 	deadline := time.Now().Add(*timeout)
@@ -98,11 +98,11 @@ func run() error {
 					exitCode = derefI64(task.TaskResult.ExitCode)
 				}
 				if !*quiet {
-					fmt.Fprintf(os.Stderr, "--- 命令输出 (exit=%d) ---\n", exitCode)
+					fmt.Fprintf(os.Stderr, "--- command output (exit=%d) ---\n", exitCode)
 				}
 				fmt.Print(out)
 				if exitCode != 0 {
-					return fmt.Errorf("命令退出码 %d", exitCode)
+					return fmt.Errorf("command exited with code %d", exitCode)
 				}
 				return nil
 
@@ -110,12 +110,12 @@ func run() error {
 				if task.TaskResult != nil {
 					fmt.Print(deref(task.TaskResult.Output))
 				}
-				return fmt.Errorf("TAT 任务 %s: %s", deref(task.TaskStatus), deref(task.ErrorInfo))
+				return fmt.Errorf("TAT task %s: %s", deref(task.TaskStatus), deref(task.ErrorInfo))
 			}
 		}
 
 		if time.Now().After(deadline) {
-			return fmt.Errorf("等待 TAT 结果超时（invocation=%s）", invocationID)
+			return fmt.Errorf("timed out waiting for the TAT result (invocation=%s)", invocationID)
 		}
 		select {
 		case <-ctx.Done():
