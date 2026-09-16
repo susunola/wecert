@@ -13,10 +13,14 @@ import (
 
 func init() { config.SetLegoProviderSupport(true) }
 
-// legoProviderAvailable reports that the full lego DNS provider registry was compiled in.
+// legoProviderAvailable tells the build-tag tests which half of the pair this is. It is not read
+// by the program: config validation is what accepts `dns.provider: lego` here, and it learns that
+// from the init above rather than from this constant.
 const legoProviderAvailable = true
 
-// newLegoProvider builds any of lego's ~198 DNS providers by name.
+// newLegoProvider builds any of lego's ~198 DNS providers by name. Its counterpart under
+// `!lego_dns` returns the rebuild instruction instead; the two are asserted together by
+// lego_build_tags_test.go and lego_build_default_test.go.
 //
 // Each provider reads its own credentials from the environment using lego's documented
 // variables (CLOUDFLARE_DNS_API_TOKEN, AWS_ACCESS_KEY_ID, ...), which is why this needs no

@@ -120,6 +120,12 @@ func (m *Manager) PendingRevocations() (int, error) {
 }
 
 // processRevocation performs one attempt for a recorded request.
+//
+// ctx is accepted and not threaded into the CA call, because lego's low-level api.Core is
+// context-free: there is no ctx-taking RevokeCertificate to pass it to. What bounds the request is
+// the ACME HTTP client's own timeout (main builds it with 60s). The consequence is deliberate and
+// worth stating: a revocation already in flight when the pass is cancelled still runs to
+// completion, because a half-sent revocation is worse than a shutdown that takes another moment.
 func (m *Manager) processRevocation(ctx context.Context, certName string) error {
 	req, err := m.store.GetRevokeRequest(certName)
 	if err != nil {
@@ -165,7 +171,6 @@ func (m *Manager) processRevocation(ctx context.Context, certName string) error 
 	m.log.Error("CERTIFICATE REVOKED",
 		"cert", certName, "reason", ReasonName(req.Reason),
 		"outstandingFor", m.now().Sub(req.RequestedAt).Round(time.Minute))
-	_ = ctx
 	return nil
 }
 

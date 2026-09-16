@@ -318,7 +318,7 @@ func cachedNXDOMAINHarness(
 	t.Setenv("LEGO_DISABLE_CNAME_SUPPORT", "true")
 
 	info := dns01.GetChallengeInfo("example.com", "keyauth-1")
-	rec := DNSRecord{FQDN: dns01.ToFqdn(info.EffectiveFQDN), Value: info.Value}
+	rec := DNSRecord{FQDN: dns.Fqdn(info.EffectiveFQDN), Value: info.Value}
 
 	resolver, authority := "192.0.2.53:53", "198.51.100.53:53"
 	solver := &DNSSolver{
