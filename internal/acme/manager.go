@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/susunola/wecert/internal/config"
@@ -15,8 +16,14 @@ import (
 // disk, "the next round" is cheap while placing a new order is expensive.
 const (
 	authzWaitTimeout = 3 * time.Minute
-	orderWaitTimeout = 2 * time.Minute
-	pollInterval     = 3 * time.Second
+
+	// bindingCheckInterval is how often an uploaded-but-unconfirmed certificate is
+	// re-checked for bindings. Six hours rather than every pass: only a human can
+	// change the answer, and the lookup is a two-call, up-to-30-second enumeration
+	// running inside the serial convergence loop.
+	bindingCheckInterval = 6 * time.Hour
+	orderWaitTimeout     = 2 * time.Minute
+	pollInterval         = 3 * time.Second
 	// ACME's expires is an optional field. When it fails to parse or is not returned we
 	// use this conservative bound; it must never fall back to the zero value, because a
 	// zero value reads as "already expired" and discards an unfinished order.
@@ -78,6 +85,21 @@ type Manager struct {
 	authzWait    time.Duration
 	pollInterval time.Duration
 
+	// bindingCheckEvery throttles the "is this certificate bound yet?" lookup, and
+	// bindingChecked remembers when each certificate was last asked.
+	//
+	// Only a human can change the answer -- the certificate was uploaded but not yet
+	// bound in the console -- so asking on every pass is pure API cost for a fact that
+	// cannot have changed. It is also blocking: the enumeration is asynchronous and the
+	// wait polls it for up to 30s, inside the serial convergence loop.
+	//
+	// In memory rather than in the state database on purpose: a restart re-asking once is
+	// harmless, and this is bookkeeping about a transient state, not something that has
+	// to survive.
+	bindingCheckEvery time.Duration
+	bindingMu         sync.Mutex
+	bindingChecked    map[string]time.Time
+
 	now func() time.Time
 
 	// fallback is the "split off a subset and issue it before expiry" policy. nil means
@@ -106,17 +128,19 @@ func newManager(
 	log *slog.Logger,
 ) *Manager {
 	return &Manager{
-		store:        store,
-		core:         core,
-		dns:          dns,
-		keyAuth:      keyAuth,
-		deployer:     deployer,
-		log:          log,
-		ariInterval:  6 * time.Hour,
-		retention:    7 * 24 * time.Hour,
-		authzWait:    authzWaitTimeout,
-		pollInterval: pollInterval,
-		now:          time.Now,
+		store:             store,
+		core:              core,
+		dns:               dns,
+		keyAuth:           keyAuth,
+		deployer:          deployer,
+		log:               log,
+		ariInterval:       6 * time.Hour,
+		retention:         7 * 24 * time.Hour,
+		authzWait:         authzWaitTimeout,
+		pollInterval:      pollInterval,
+		bindingCheckEvery: bindingCheckInterval,
+		bindingChecked:    make(map[string]time.Time),
+		now:               time.Now,
 	}
 }
 
@@ -210,7 +234,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	//
 	// It sits before the domain comparison: this is bookkeeping only and does not affect
 	// whether to renew.
-	if c.Deploy.Enabled && st.DeployedCertID != "" && !st.DeployConfirmed {
+	if c.Deploy.Enabled && st.DeployedCertID != "" && !st.DeployConfirmed && m.bindingCheckDue(c.Name) {
 		if err := m.confirmBinding(ctx, c, st); err != nil {
 			// A lookup failure is not a binding failure. Renewal is the main line here and
 			// must not be dragged down by a confirmation step.
@@ -272,6 +296,24 @@ func orderMatchesConfig(o *state.Order, c *config.Certificate) bool {
 		return true
 	}
 	return o.Identifiers == c.DomainKey()
+}
+
+// bindingCheckDue reports whether the binding lookup is worth making again, and records
+// that it is about to be made.
+//
+// Recording before the attempt, not after: a lookup that errors would otherwise be
+// retried on every pass, which is the cost this exists to avoid.
+func (m *Manager) bindingCheckDue(certName string) bool {
+	now := m.now()
+
+	m.bindingMu.Lock()
+	defer m.bindingMu.Unlock()
+
+	if last, ok := m.bindingChecked[certName]; ok && now.Sub(last) < m.bindingCheckEvery {
+		return false
+	}
+	m.bindingChecked[certName] = now
+	return true
 }
 
 // confirmBinding looks up once which cloud resources this certificate is bound to, and

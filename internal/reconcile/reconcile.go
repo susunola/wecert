@@ -412,7 +412,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) er
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "ok").Inc()
 	}
 
-	r.publish(c.Name)
+	r.publish(c)
 	r.probeCert(ctx, c)
 
 	if r.notifier != nil {
@@ -499,40 +499,42 @@ func probeHosts(domains []string, max int) []string {
 }
 
 // publish mirrors the current state store into Prometheus.
-func (r *Reconciler) publish(name string) {
-	st, err := r.store.GetCert(name)
+func (r *Reconciler) publish(c *config.Certificate) {
+	st, err := r.store.GetCert(c.Name)
 	if err != nil || st == nil {
 		return
 	}
 
 	if st.NotAfter.IsZero() {
-		metrics.CertNotAfter.WithLabelValues(name).Set(0)
+		metrics.CertNotAfter.WithLabelValues(c.Name).Set(0)
 	} else {
-		metrics.CertNotAfter.WithLabelValues(name).Set(float64(st.NotAfter.Unix()))
+		metrics.CertNotAfter.WithLabelValues(c.Name).Set(float64(st.NotAfter.Unix()))
 	}
 
 	// Only a confirmed swap to the new certificate counts as "deployed": the first
 	// upload still needs a manual bind, and the light must not turn green before
 	// then or the expiry alert will think everything is fine.
 	if st.DeployConfirmed && st.DeployedCertID != "" {
-		metrics.CertDeployed.WithLabelValues(name).Set(1)
+		metrics.CertDeployed.WithLabelValues(c.Name).Set(1)
 	} else {
-		metrics.CertDeployed.WithLabelValues(name).Set(0)
+		metrics.CertDeployed.WithLabelValues(c.Name).Set(0)
 	}
 
-	metrics.CertConsecutiveFailures.WithLabelValues(name).Set(float64(st.ConsecutiveFailures))
+	metrics.CertConsecutiveFailures.WithLabelValues(c.Name).Set(float64(st.ConsecutiveFailures))
 
 	if st.ARIWindowStart.IsZero() {
-		metrics.CertARIWindowStart.WithLabelValues(name).Set(0)
+		metrics.CertARIWindowStart.WithLabelValues(c.Name).Set(0)
 	} else {
-		metrics.CertARIWindowStart.WithLabelValues(name).Set(float64(st.ARIWindowStart.Unix()))
+		metrics.CertARIWindowStart.WithLabelValues(c.Name).Set(float64(st.ARIWindowStart.Unix()))
 	}
 
+	// The threshold scales with the profile: a fixed window is most of a shortlived
+	// certificate's life, which would warn from issuance onwards, every pass.
 	if !st.NotAfter.IsZero() {
-		days := time.Until(st.NotAfter).Hours() / 24
-		if days < 21 {
+		if left := time.Until(st.NotAfter); left < config.ExpiryWarningThreshold(c.Profile) {
 			r.log.Warn("certificate approaching expiry",
-				"cert", name, "notAfter", st.NotAfter, "daysLeft", int(days),
+				"cert", c.Name, "profile", c.Profile, "notAfter", st.NotAfter,
+				"daysLeft", config.DaysUntil(st.NotAfter, time.Now()),
 				"consecutiveFailures", st.ConsecutiveFailures, "lastError", st.LastError)
 		}
 	}

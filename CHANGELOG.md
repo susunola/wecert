@@ -213,6 +213,53 @@
 - Add the missing "When domains are declared elsewhere" section to
   `README.zh-CN.md`.
 
+### Changed
+
+- The "certificate approaching expiry" warning scales with the profile instead of a
+  fixed 21 days. 21 days is most of a `shortlived` certificate's 160-hour life, so
+  that profile warned from the moment it was issued -- every pass, for its whole
+  life -- which is the kind of alarm that trains people to ignore logs. A quarter of
+  the profile's validity is the new threshold.
+- `daysLeft` rounds **up** everywhere, matching `wecert-probe`. Truncation made
+  "23 hours left" read as 0 days, which a caller treating 0 as expired reads as a
+  down certificate.
+- The `/hook/status` field `deployed` is renamed `uploaded`. It always meant "we
+  hold a CertId", while the metric of the same name means "confirmed bound" -- the
+  exact distinction that metric's help text was written to prevent.
+
+### Security
+
+- The desired-state document is refused rather than followed when it is a symlink,
+  when it is group- or world-writable, or when it is not a regular file. In enforce
+  mode that file *is* the desired state: anyone who can write it decides which
+  domains are served and which quietly stop being renewed. Readability is
+  deliberately not checked -- it is written 0644 so an operator can read it, and only
+  the write bits change what it says.
+- `deploy/systemd/wecert.service` gained the standard sandbox beyond the baseline:
+  an empty capability bounding set, `RestrictAddressFamilies`, `RestrictNamespaces`,
+  `RestrictSUIDSGID`, `LockPersonality`, `ProtectProc`, `ProcSubset`,
+  `ProtectKernel*`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`,
+  `RestrictRealtime`, `RemoveIPC`, `SystemCallArchitectures`, `UMask=0077`, and
+  `MemoryDenyWriteExecute` -- the last is safe because the binary is built
+  `CGO_ENABLED=0` and links statically, so there is no JIT to break.
+- `golang.org/x/net` 0.57.0 → 0.59.0.
+
+### Fixed
+
+- The "is this certificate bound yet?" lookup is throttled to once every six hours
+  instead of every pass. Only a human can change the answer, and the lookup is a
+  two-call enumeration that polls asynchronously for up to 30 seconds inside the
+  serial convergence loop -- for an unbound certificate that can sit that way for
+  its whole 90-day life. Measured: five passes used to cost five enumerations.
+
+### Removed
+
+- `probe.Runner.LastState` had no callers, and `probeTXT` in `internal/acme` was left
+  unused by the `...WithExchange` refactor that replaced it. `dns01.ToFqdn` (deprecated)
+  is replaced by `dns.Fqdn`, which is what it forwarded to.
+- The trailing newline on `wecert-preflight`'s NS error, so `staticcheck` is now
+  completely clean.
+
 ### Tests
 
 - `fakeAPI.GetCertificate` records the `bundle` argument it was called with
