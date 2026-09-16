@@ -21,7 +21,21 @@ import (
 // Store 是 SQLite 之上的状态存储。
 type Store struct {
 	db *sql.DB
+
+	// lock 是跨进程排他锁。
+	//
+	// "每张证书最多一个在飞订单"这条不变量原本只在**一个进程内**成立。
+	// daemon 和 timer 两种模式同时启用时，两个进程各自持有一份局部视图，
+	// 于是同一张证书会被下单两次 —— 撞上的是
+	// "5 certificates per exact set of identifiers / 7 days"，
+	// 而那条限额没有 override，撞了要等满 7 天。
+	lock *fileLock
 }
+
+// ErrLocked 表示状态库已经被另一个 wecert 进程独占。
+//
+// 这不是异常，是必须存在的一道闸门。见 Store.lock 的注释。
+var ErrLocked = errors.New("the state database is already held by another wecert process")
 
 // CertState 是一张证书的运行时状态（对应 config.Certificate 的 status）。
 type CertState struct {
@@ -112,19 +126,39 @@ type Account struct {
 	PrivateKeyPEM []byte
 }
 
-// Open 打开（必要时创建）状态库。
+// Open 打开（必要时创建）状态库，并取得跨进程排他锁。
 //
 // 这个文件里存着 ACME 账号私钥和全部生效证书的私钥，所以目录不存在时先建、
 // 文件用 0600 预创建。SQLite 自己是按进程 umask 建文件的 —— 在 umask 022 的
 // 机器上就是 0644，任何本机用户都能把私钥读走。systemd 那条路有
 // StateDirectoryMode=0700 兜着，但手工执行（README 的 -dry-run、e2e 脚本
 // 把库放在 /tmp）时没有这层保护。
-func Open(path string) (*Store, error) {
+func Open(path string) (*Store, error) { return open(path, true) }
+
+// OpenUnlocked 打开状态库但**不**取排他锁。
+//
+// 只给一次性的校验路径用（-dry-run）：它几乎总是在 daemon 正在跑的时候
+// 被执行，而"因为 daemon 在跑所以连配置都校验不了"会把人逼去瞎改配置。
+// 这条路径只读已有的 ACME 账号、不发起任何签发，所以不取锁是安全的。
+func OpenUnlocked(path string) (*Store, error) { return open(path, false) }
+
+func open(path string, exclusive bool) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create state dir %s: %w", dir, err)
 		}
 	}
+
+	// 锁要在建库文件之前拿：两个进程同时初始化一个空库比同时写一个
+	// 已有库更难排查，因为它们会各自建出不同的表结构。
+	var lock *fileLock
+	if exclusive {
+		var err error
+		if lock, err = acquireLock(path + ".lock"); err != nil {
+			return nil, err
+		}
+	}
+
 	if f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600); err == nil {
 		_ = f.Close()
 	}
@@ -132,14 +166,16 @@ func Open(path string) (*Store, error) {
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
+		_ = lock.release()
 		return nil, fmt.Errorf("open state db: %w", err)
 	}
 	// modernc sqlite 是单写入者模型，限制连接数避免 SQLITE_BUSY。
 	db.SetMaxOpenConns(1)
 
-	s := &Store{db: db}
+	s := &Store{db: db, lock: lock}
 	if err := s.migrate(); err != nil {
 		db.Close()
+		_ = lock.release()
 		return nil, err
 	}
 
@@ -148,14 +184,21 @@ func Open(path string) (*Store, error) {
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		if err := os.Chmod(path+suffix, 0o600); err != nil && !os.IsNotExist(err) {
 			db.Close()
+			_ = lock.release()
 			return nil, fmt.Errorf("chmod state file %s: %w", path+suffix, err)
 		}
 	}
 	return s, nil
 }
 
-// Close 关闭状态库。
-func (s *Store) Close() error { return s.db.Close() }
+// Close 关闭状态库并释放跨进程锁。
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if relErr := s.lock.release(); err == nil {
+		err = relErr
+	}
+	return err
+}
 
 func (s *Store) migrate() error {
 	const schema = `
