@@ -9,6 +9,7 @@ import (
 	"github.com/go-acme/lego/v4/acme/api"
 
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -133,6 +134,16 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		Profile:        c.Profile,
 		ReplacesCertID: replaces,
 	})
+	if err == nil {
+		// An order was created, so it counts -- whether or not this pass goes on to finish.
+		// The CA's own documentation is explicit that the resource is consumed at new-order
+		// time, which is why deleting or failing later does not return the quota.
+		m.quota.Spend(ratelimit.NewOrdersPerAccount, "", 1)
+	} else if at, ok := m.quota.NoteRetryAfter(ratelimit.NewOrdersPerAccount, "", err.Error()); ok {
+		m.log.Error("the account is out of new-order quota; every certificate must wait for the "+
+			"reported instant, not just this one",
+			"cert", c.Name, "until", at)
+	}
 	if err != nil && replaces != "" {
 		// A `replaces` that the CA will not honour must never be a dead end, so retry once
 		// without it. Losing the rate-limit exemption is a far smaller cost than not renewing

@@ -1,0 +1,194 @@
+package ratelimit
+
+import (
+	"fmt"
+	"log/slog"
+	"time"
+)
+
+// bucketStore is the persistence the tracker needs. Defined here at the consumer so the
+// tracker can be tested without a real database, and so ratelimit does not depend on the
+// state package (which imports nothing of this one, keeping the layering one-way).
+type bucketStore interface {
+	GetRateBucket(limitName, scopeID string) (*BucketRecord, error)
+	PutRateBucket(*BucketRecord) error
+}
+
+// BucketRecord mirrors state.RateBucket.
+//
+// A local type rather than importing state: this package is pure arithmetic and should stay
+// testable and dependency-free, while the adapter in the acme package translates. The fields
+// are identical, which is the point -- it is a boundary, not a second model.
+type BucketRecord struct {
+	LimitName string
+	ScopeID   string
+
+	Tokens     float64
+	ObservedAt time.Time
+
+	ResetAt     time.Time
+	ResetReason string
+}
+
+// Tracker answers "how much is left" for the limits this program spends.
+//
+// It owns the mapping from a Limit plus a scope (an account-wide limit has none, a
+// per-registered-domain limit has the domain) to a persisted bucket, so callers only ever say
+// "I just spent one order" or "the CA told me to wait until T".
+type Tracker struct {
+	store bucketStore
+	log   *slog.Logger
+	now   func() time.Time
+}
+
+// NewTracker builds a tracker. A nil store makes every method a no-op, so a caller that has
+// no state store (a test, or a diagnostics binary) needs no special case.
+func NewTracker(store bucketStore, log *slog.Logger, now func() time.Time) *Tracker {
+	if now == nil {
+		now = time.Now
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Tracker{store: store, log: log, now: now}
+}
+
+// SetNow replaces the tracker's clock, so a caller that simulates time keeps the accounting
+// on the same timeline as its own decisions.
+func (t *Tracker) SetNow(now func() time.Time) {
+	if t == nil || now == nil {
+		return
+	}
+	t.now = now
+}
+
+// Spend records cost tokens against a limit and scope.
+//
+// A nil tracker or store is a no-op rather than an error: this is accounting, and accounting
+// must never be the reason a renewal fails.
+func (t *Tracker) Spend(l Limit, scopeID string, cost float64) {
+	if t == nil || t.store == nil {
+		return
+	}
+	now := t.now()
+	rec, err := t.store.GetRateBucket(l.Name, scopeID)
+	if err != nil {
+		t.log.Warn("cannot read the rate-limit bucket; the local quota estimate will drift",
+			"limit", l.Name, "scope", scopeID, "err", err)
+		return
+	}
+	snap := Snapshot{Tokens: rec.Tokens, At: rec.ObservedAt}
+	next := Spend(snap, l, cost, now)
+
+	// The deadline travels with the estimate. The real store also guards this with a
+	// COALESCE, but relying on that would make the tracker's behaviour depend on which
+	// implementation is behind the interface -- and a spend that silently dropped a
+	// CA-reported deadline would unblock issuance the CA has already refused.
+	if err := t.store.PutRateBucket(&BucketRecord{
+		LimitName: l.Name, ScopeID: scopeID,
+		Tokens: next.Tokens, ObservedAt: next.At,
+		ResetAt: rec.ResetAt, ResetReason: rec.ResetReason,
+	}); err != nil {
+		t.log.Warn("cannot record the rate-limit spend; the local quota estimate will drift",
+			"limit", l.Name, "scope", scopeID, "err", err)
+	}
+}
+
+// Remaining reports how many tokens a limit has left, or (0, false) when it cannot be read.
+//
+// The estimate is a LOWER BOUND: it counts only what this program spent, while
+// "certs per registered domain" and "certs per exact set" are global across accounts. A value
+// here is therefore "at least this much", never more.
+func (t *Tracker) Remaining(l Limit, scopeID string) (float64, bool) {
+	if t == nil || t.store == nil {
+		return 0, false
+	}
+	rec, err := t.store.GetRateBucket(l.Name, scopeID)
+	if err != nil {
+		return 0, false
+	}
+	if !rec.ResetAt.IsZero() && t.now().Before(rec.ResetAt) {
+		// The CA refused a request and said when to try again. That instant governs: the
+		// local estimate cannot see the other accounts that helped exhaust a global bucket.
+		return 0, true
+	}
+	return Remaining(Snapshot{Tokens: rec.Tokens, At: rec.ObservedAt}, l, t.now()), true
+}
+
+// BlockedUntil reports an authoritative CA-reported deadline for a limit and scope.
+func (t *Tracker) BlockedUntil(l Limit, scopeID string) (time.Time, string, bool) {
+	if t == nil || t.store == nil {
+		return time.Time{}, "", false
+	}
+	rec, err := t.store.GetRateBucket(l.Name, scopeID)
+	if err != nil || rec.ResetAt.IsZero() {
+		return time.Time{}, "", false
+	}
+	if !t.now().Before(rec.ResetAt) {
+		return time.Time{}, "", false
+	}
+	return rec.ResetAt, rec.ResetReason, true
+}
+
+// NoteRetryAfter records an authoritative deadline parsed from a CA error message.
+//
+// It is stored alongside the estimate rather than replacing it: the estimate tells the
+// operator how much is left, the deadline tells them when the CA will listen again, and the
+// second is the one to act on because it accounts for every other spend the local estimate
+// cannot see.
+func (t *Tracker) NoteRetryAfter(l Limit, scopeID, errMsg string) (time.Time, bool) {
+	if t == nil || t.store == nil {
+		return time.Time{}, false
+	}
+	at, ok := ParseRetryAfter(errMsg)
+	if !ok {
+		return time.Time{}, false
+	}
+	rec, err := t.store.GetRateBucket(l.Name, scopeID)
+	if err != nil {
+		return time.Time{}, false
+	}
+	rec.ResetAt = at
+	rec.ResetReason = l.Name
+	if err := t.store.PutRateBucket(rec); err != nil {
+		t.log.Warn("cannot record the CA-reported rate-limit deadline",
+			"limit", l.Name, "scope", scopeID, "until", at, "err", err)
+		return time.Time{}, false
+	}
+	t.log.Error("the CA refused a request against a documented rate limit; no request against "+
+		"this limit will succeed before the reported instant",
+		"limit", l.Name, "scope", scopeID, "until", at)
+	return at, true
+}
+
+// Summarize renders every spendable limit's state for a log line or a status endpoint.
+//
+// scope is the account-wide scope id (empty) plus whatever per-scope buckets the caller wants
+// reported; a limit whose bucket has never been touched reports full, which is the honest
+// answer for "this program has never spent it".
+func (t *Tracker) Summarize(scopes map[string]string) []string {
+	if t == nil || t.store == nil {
+		return nil
+	}
+	var out []string
+	for _, l := range Spendable() {
+		scopeID := ""
+		if l.Scope != "account" {
+			scopeID = scopes[l.Scope]
+			if scopeID == "" {
+				continue
+			}
+		}
+		if at, reason, blocked := t.BlockedUntil(l, scopeID); blocked {
+			out = append(out, fmt.Sprintf("%s: blocked until %s (%s)",
+				l.Name, at.UTC().Format(time.RFC3339), reason))
+			continue
+		}
+		left, ok := t.Remaining(l, scopeID)
+		if !ok {
+			continue
+		}
+		out = append(out, Describe(l, left))
+	}
+	return out
+}
