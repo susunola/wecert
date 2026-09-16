@@ -314,7 +314,7 @@ CREATE TABLE IF NOT EXISTS orders (
     key_pem      BLOB,
     -- The identifier set submitted at newOrder time (canonical form, see config.DomainKey).
     identifiers  TEXT NOT NULL DEFAULT '',
-	deployment_cert_id TEXT NOT NULL DEFAULT '',
+    deployment_cert_id TEXT NOT NULL DEFAULT '',
     updated_at   INTEGER NOT NULL DEFAULT 0
 );
 
