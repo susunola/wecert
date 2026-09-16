@@ -36,12 +36,21 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 	kept, dropped, reason := m.fallbackDomains(c, st)
 
 	if len(dropped) == 0 {
-		if fb, err := m.store.GetFallback(c.Name); err == nil && fb != nil {
+		// Three outcomes, not two. Failing to read the record is not evidence that the
+		// certificate is healthy: reporting "not degraded" from a failed read would flip the
+		// gauge to green exactly when the store is unavailable and degradations are most
+		// likely to be missed. Leave both gauges at their last known value instead.
+		fb, ferr := m.store.GetFallback(c.Name)
+		switch {
+		case ferr != nil:
+			m.log.Warn("cannot read the fallback state; leaving the metrics as they were",
+				"cert", c.Name, "err", ferr)
+		case fb != nil:
 			// Trying the full set is not recovery: it becomes recovery only after a
 			// full certificate is successfully issued and deployed.
 			metrics.CertificateFallbackActive.WithLabelValues(c.Name).Set(1)
 			metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(float64(len(fb.Dropped)))
-		} else {
+		default:
 			metrics.CertificateFallbackActive.WithLabelValues(c.Name).Set(0)
 			metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(0)
 		}
