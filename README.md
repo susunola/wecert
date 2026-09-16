@@ -141,6 +141,7 @@ Deletion is deliberately an order of magnitude more conservative than addition, 
 - [Configuration reference](README.reference.md#configuration-reference) · [Operations](README.reference.md#operations) · [Metrics and alerting](README.reference.md#metrics-and-alerting).
 - [Field notes and pitfalls](README.reference.md#field-notes-and-pitfalls) — the CLB SNI trap, `DescribeListeners` not reading bindings back, the DNSPod TTL floor, the lego API traps.
 - [Desired state](docs/desired-state.md) — declaring domains as `_wecert` DNS records, generating the desired-state document, and switching wecert over to it. Design rationale: [desired-state-providers.md](docs/desired-state-providers.md).
+- [Certificate lifecycle diagram](docs/certificate-lifecycle.html) — six SVG diagrams from a DNS declaration to retiring the old certificate, plus the data-ownership, failure-semantics and rate-limit tables. Open it in a browser.
 - [Roadmap](README.reference.md#roadmap) · [Development](README.reference.md#development).
 
 <details>
