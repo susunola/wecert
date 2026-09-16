@@ -10,6 +10,8 @@ excluded, because their Chinese is **data rather than prose**:
     from it through `scripts/diagram_i18n.py`.
   - `scripts/diagram_i18n.py` — the zh→en translation table. Its Chinese keys
     *are* the lookup keys; translating them silently breaks the diagram build.
+  - `scripts/e2e-report.py` — the label strings of the generated test report,
+    which is the same content as the `docs/*.html` page it writes.
 
 Markdown is excluded as well: the repository ships paired English and Chinese
 documents on purpose (`README.md` / `README.zh-CN.md` and so on).
@@ -38,6 +40,11 @@ ALLOWED = {
     "docs/certificate-lifecycle.html",
     "docs/certificate-lifecycle.en.html",
     "scripts/diagram_i18n.py",
+    # The report renderer's Chinese strings are its output's labels, not prose about the code --
+    # the same content as the docs/*.html files it generates, which are exempt for the same
+    # reason. Keeping them here rather than in a data file means the label and its use are read
+    # together; the alternative was a one-entry lookup table existing only to satisfy this scan.
+    "scripts/e2e-report.py",
 }
 
 SKIP_DIRS = {

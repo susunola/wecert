@@ -89,9 +89,43 @@ func pebbleBinary(t *testing.T) string {
 	return ""
 }
 
-// startPebble writes a config and runs the server, returning its directory URL and the client
-// that trusts its self-signed certificate.
+// pebbleOptions are the two knobs the lifecycle suites differ on.
+type pebbleOptions struct {
+	// dnsServer points pebble's validator at a resolver. Empty means pebble's own default.
+	dnsServer string
+	// validate makes the server really validate challenges. False sets
+	// PEBBLE_VA_ALWAYS_VALID=1, which is what the order-protocol tests want -- see startPebble.
+	validate bool
+}
+
+// startPebble runs pebble with challenge validation disabled, for tests about the ORDER protocol.
 func startPebble(t *testing.T) (dirURL string, client *http.Client, management string) {
+	t.Helper()
+	return startPebbleWith(t, pebbleOptions{})
+}
+
+// startPebbleRealValidation runs pebble with a real validator pointed at dnsServer, for tests that
+// need the challenge record to actually be read. See e2e_dns_test.go.
+//
+// validate=false is a degraded mode, and the caller is told which one it got: pebble's validator
+// forces TCP whenever a custom resolver is configured, so a host that cannot carry TCP on port 53
+// (a sandbox that allows the bind and drops the traffic) can still test everything except the
+// validator's own read.
+func startPebbleRealValidation(t *testing.T, dnsServer string, validate bool) (dirURL string, client *http.Client) {
+	t.Helper()
+	opts := pebbleOptions{dnsServer: dnsServer, validate: validate}
+	if !validate {
+		// No point pointing the validator at a resolver it will never reach: leave it on its
+		// default and turn validation off.
+		opts.dnsServer = ""
+	}
+	dirURL, client, _ = startPebbleWith(t, opts)
+	return dirURL, client
+}
+
+// startPebbleWith writes a config and runs the server, returning its directory URL and the client
+// that trusts its self-signed certificate.
+func startPebbleWith(t *testing.T, opts pebbleOptions) (dirURL string, client *http.Client, management string) {
 	t.Helper()
 
 	bin := pebbleBinary(t)
@@ -125,25 +159,28 @@ func startPebble(t *testing.T) (dirURL string, client *http.Client, management s
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(bin, "-config", confPath)
+	args := []string{"-config", confPath}
+	if opts.dnsServer != "" {
+		args = append(args, "-dnsserver", opts.dnsServer)
+	}
+	cmd := exec.Command(bin, args...)
 	cmd.Dir = dir
 	// PEBBLE_VA_NOSLEEP keeps validation from adding its deliberate delay.
 	cmd.Env = append(os.Environ(),
 		"PEBBLE_VA_NOSLEEP=1",
-		"PEBBLE_WFE_NONCEREJECT=0",
-		// Challenge validation is skipped. This test is about the ORDER protocol against a real
-		// server -- account binding and kid persistence, authorization polling, CSR finalize,
-		// chain download, the notAfter/key-match gates -- not about whether a validator can read
-		// the TXT record.
+		"PEBBLE_WFE_NONCEREJECT=0")
+	if !opts.validate {
+		// Challenge validation is skipped, which is what the order-protocol tests want: account
+		// binding and kid persistence, authorization polling, CSR finalize, chain download, the
+		// notAfter/key-match gates -- not whether a validator can read the TXT record.
 		//
-		// That separation is deliberate and was learned the hard way: making pebble validate
-		// against a local authority needs the authority on port 53 (DNS has no port
-		// indirection in a delegation), which needs root, and pointing pebble at a random port
-		// needs a resolver wecust does not implement. The challenge record itself -- the shared
-		// apex/wildcard name, the write order, and the delete-all on cleanup -- is covered by
-		// this package's own tests with a faithful dns01-based solver, and end to end against
-		// real DNS by scripts/e2e-wildcard.sh.
-		"PEBBLE_VA_ALWAYS_VALID=1")
+		// That separation was learned the hard way: making pebble validate against a local
+		// authority needs the authority on port 53 (DNS has no port indirection in a
+		// delegation). e2e_dns_test.go closes that gap -- it binds 53, points pebble's validator
+		// at it with -dnsserver, and runs the real solver against it -- and skips on a host where
+		// port 53 cannot be bound.
+		cmd.Env = append(cmd.Env, "PEBBLE_VA_ALWAYS_VALID=1")
+	}
 	var out strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &out
