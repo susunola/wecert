@@ -107,6 +107,10 @@ func NewTencentCLB(cfg config.Tencent, log *slog.Logger) (*TencentCLB, error) {
 	}, nil
 }
 
+// deployRecordGrace is how long a deploy record may report all-zero counters before the
+// wait concludes that nothing was bound. See waitDeployRecord.
+const deployRecordGrace = 15 * time.Second
+
 // sslAPI is the narrow slice of the Tencent Cloud SSL client this package uses.
 //
 // *ssl.Client is a concrete struct with no interface seam, and client() used to rebuild
@@ -255,7 +259,7 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 		if resp.Response != nil && resp.Response.DeployRecordId != nil && *resp.Response.DeployRecordId > 0 {
 			recordID = *resp.Response.DeployRecordId
 			progress := resp.Response.UpdateSyncProgress
-			bound := progressBoundCount(progress)
+			bound, progressReady := progressBoundCount(progress)
 			d.log.Info("one-click update task created",
 				"oldCertId", oldID, "newCertId", newID,
 				"deployRecordId", recordID,
@@ -277,11 +281,20 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 			// and records another orphan -- while the certificate actually serving traffic
 			// sits in retired_certificates, protected only by the cloud-side resource check.
 			//
-			// So a present-but-zero count still refuses (that really is "nothing bound"),
-			// and a missing count defers to the task record, which is authoritative.
-			if len(progress) > 0 && bound == 0 {
-				return fmt.Errorf("UpdateCertificateInstance reports no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
-					oldID, d.regions)
+			// So a populated response reporting zero still refuses (that really is "nothing
+			// bound"), and an unpopulated one defers to the task record, which is
+			// authoritative.
+			//
+			// progressReady is the precise form of "populated": it is a null TotalCount,
+			// not an empty progress list, that carries the ambiguity -- a response can list
+			// regions and still have no count for any of them.
+			if bound == 0 && progressReady {
+				return noResourceBoundError(oldID, d.regions)
+			}
+			if bound == 0 && !progressReady {
+				d.log.Warn("the sync progress carries no per-region count yet; "+
+					"deferring to the async deploy record to decide whether anything was bound",
+					"oldCertId", oldID, "newCertId", newID, "deployRecordId", recordID)
 			}
 			return d.waitDeployRecord(ctx, client, recordID, oldID)
 		}
@@ -309,6 +322,14 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 	// misdiagnoses a task that was making progress as "no resource bound to the old
 	// certificate" and sends the operator off to check a listener that is fine.
 	var success, failed, running, pending int64
+
+	// Between the task being created and the server marking it running, every counter is
+	// zero. Concluding "no resource is bound" from that instant would repeat the very
+	// mistake this path exists to absorb, so the zero-resource verdict waits for a short
+	// grace period first -- long enough for a task that has work to show it, short enough
+	// that a genuinely unbound certificate is still diagnosed promptly rather than after
+	// the full three minutes.
+	graceUntil := d.now().Add(deployRecordGrace)
 	for {
 		s, f, r, p, err := d.describeDeployRecord(ctx, client, recordID)
 		if err != nil {
@@ -329,17 +350,15 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 				}
 				return nil
 			}
+
+			// Settled and updated nothing: the old certificate really is bound to no
+			// resource. This is the verdict the sync response defers here when its
+			// per-region TotalCount had not been populated yet.
+			if running == 0 && pending == 0 && success == 0 && failed == 0 && d.now().After(graceUntil) {
+				return noResourceBoundError(oldID, d.regions)
+			}
 		}
 		if d.now().After(deadline) {
-			// A task that reports nothing at all, for the whole budget, is the genuine
-			// "no resource was bound to the old certificate" case. It is diagnosed only
-			// here, at the end, rather than from the creation-time response: an all-zero
-			// record is also what a task looks like before the server has populated it,
-			// and failing on that is what broke a rebind that was in fact succeeding.
-			if success == 0 && failed == 0 && running == 0 && pending == 0 {
-				return fmt.Errorf("one-click update task %d reported nothing to update within 3m: no resource appears to be bound to the old certificate %s (regions=%v). Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
-					recordID, oldID, d.regions)
-			}
 			return fmt.Errorf("one-click update task %d did not finish within 3m (success=%d failed=%d running=%d pending=%d)",
 				recordID, success, failed, running, pending)
 		}
@@ -419,17 +438,36 @@ func toPtrSlice(in []string) []*string {
 	return out
 }
 
-// progressBoundCount counts how many resources this one-click update covers in total.
-// Zero means "no resource bound to the old certificate was found", i.e. the certificate was
-// never actually bound -- the failure mode most easily overlooked.
-func progressBoundCount(progress []*ssl.UpdateSyncProgress) int64 {
+// progressBoundCount counts how many resources this one-click update covers in total,
+// and reports whether the server has populated that detail yet.
+//
+// A count of zero used to be read on its own as "no resource bound to the old
+// certificate", i.e. the certificate was never actually bound -- the failure mode most
+// easily overlooked. But `UpdateSyncProgressRegions[].TotalCount` is filled in
+// asynchronously, so on the response that first carries a DeployRecordId it can still be
+// **null**, and null is not zero: the task was created and may well be switching the
+// listener right now. `ready` separates the two -- at least one region carrying a real
+// TotalCount means the server has answered, and a zero from an answered response is the
+// genuine no-binding case.
+func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready bool) {
 	var n int64
 	for _, p := range progress {
 		for _, r := range p.UpdateSyncProgressRegions {
+			if r.TotalCount != nil {
+				ready = true
+			}
 			n += derefI64(r.TotalCount)
 		}
 	}
-	return n
+	return n, ready
+}
+
+// noResourceBoundError is the diagnosis shared by the two places that can conclude the
+// old certificate was bound to nothing: a populated sync response reporting zero, and an
+// async task that settles having updated nothing.
+func noResourceBoundError(oldID string, regions []string) error {
+	return fmt.Errorf("UpdateCertificateInstance found no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
+		oldID, regions)
 }
 
 // formatProgress summarizes UpdateCertificateInstance progress into a single line.

@@ -516,7 +516,7 @@ func TestWaitDeployRecordWaitsForPendingResources(t *testing.T) {
 // from the creation-time response, because an all-zero record is also what a task looks
 // like before the server has populated it -- and failing on that is what broke a rebind
 // that was in fact succeeding.
-func TestWaitDeployRecordDiagnosesAnEmptyTaskAtTheDeadline(t *testing.T) {
+func TestWaitDeployRecordDiagnosesAnEmptyTaskAfterTheGracePeriod(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	stubSleeper(t, clock)
 	d := newTestDeployer(clock.now)
@@ -531,7 +531,9 @@ func TestWaitDeployRecordDiagnosesAnEmptyTaskAtTheDeadline(t *testing.T) {
 	if err == nil {
 		t.Fatal("a task that never reports anything must not be treated as success")
 	}
-	if !strings.Contains(err.Error(), "no resource appears to be bound") {
+	// The verdict now comes from the shared noResourceBoundError, so this path carries the
+	// same wording -- and the same SNI hint -- as the sync-response path.
+	if !strings.Contains(err.Error(), "no resource bound to the old certificate") {
 		t.Errorf("err = %v, want the no-binding diagnosis", err)
 	}
 }
