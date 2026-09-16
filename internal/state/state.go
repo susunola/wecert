@@ -20,6 +20,14 @@ import (
 	_ "modernc.org/sqlite" // pure Go driver: no CGO, which keeps static builds easy
 )
 
+// maxLastErrorBytes bounds the upstream error text persisted per row.
+//
+// last_error carries remote text verbatim: lego embeds the entire non-JSON ACME
+// error body in its errors, and the CVM metadata path echoes response bodies. Left
+// unbounded it is both a growth vector and a channel for remote-controlled text
+// that /hook/status serves to callers and notifyURL posts off-host.
+const maxLastErrorBytes = 512
+
 // Store is the state store layered on top of SQLite.
 type Store struct {
 	db *sql.DB
@@ -529,8 +537,15 @@ func (s *Store) PutCert(c *CertState) error {
 		c.Name, toUnix(c.NotAfter), c.CertURL, c.CertPEM, c.KeyPEM, toUnix(c.IssuedAt),
 		c.ARICertID, toUnix(c.ARIWindowStart), toUnix(c.ARIWindowEnd), toUnix(c.ARICheckedAt),
 		int64(c.ARIRetryAfter),
-		c.ConsecutiveFailures, toUnix(c.NextAttemptAt), c.LastError, c.DeployedCertID,
-		c.DeployConfirmed, time.Now().Unix())
+		// Truncated at the one place every caller funnels through, not in each
+		// producer. last_error carries upstream text: lego embeds the whole non-JSON
+		// ACME error body in its errors, and the CVM metadata path echoes part of a
+		// response body. Unbounded, that is both a growth vector and remote-controlled
+		// text that /hook/status serves and notifyURL posts off-host. The identifier
+		// ledger already bounds its equivalent at 512 (fallback.go); this is the same
+		// rule applied where it cannot be forgotten.
+		c.ConsecutiveFailures, toUnix(c.NextAttemptAt), truncate(c.LastError, maxLastErrorBytes),
+		c.DeployedCertID, c.DeployConfirmed, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("put cert %s: %w", c.Name, err)
 	}

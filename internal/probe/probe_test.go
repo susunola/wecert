@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -376,5 +377,75 @@ func TestRunnerDetectsAMismatchOnAnyResolvedAddress(t *testing.T) {
 	}
 	if !strings.Contains(v.Summary(), "192.0.2.11:443") {
 		t.Errorf("problem should name the stale address, got: %s", v.Summary())
+	}
+}
+
+// One host's addresses must be dialled concurrently.
+//
+// In series a single blackholed address costs the full per-address budget before
+// the next one is even attempted -- and a dropped SYN is exactly what a
+// security-group or route misconfiguration looks like. A host then spends
+// len(ips) x Timeout, every certificate behind it waits its turn, and the pass
+// stretches by minutes. This pins the concurrency by timing, with a margin wide
+// enough not to flake on a loaded machine.
+func TestProbeIPsDialsAddressesConcurrently(t *testing.T) {
+	// A listener that accepts and then stays silent, so each dial burns its whole
+	// budget instead of failing fast.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range held {
+			_ = c.Close()
+		}
+	})
+
+	opts := Options{
+		Port:    ln.Addr().(*net.TCPAddr).Port,
+		Timeout: 400 * time.Millisecond,
+	}
+	// The same address three times is enough: what is under test is how many
+	// dials are in flight at once, not how they resolve.
+	ips := []string{"127.0.0.1", "127.0.0.1", "127.0.0.1"}
+
+	start := time.Now()
+	attempts := probeIPs(context.Background(), "example.com", ips, opts)
+	elapsed := time.Since(start)
+
+	if len(attempts) != 3 {
+		t.Fatalf("want one attempt per address, got %d", len(attempts))
+	}
+	for i, a := range attempts {
+		if a.Err == nil {
+			t.Errorf("attempt %d should have failed on the timeout", i)
+		}
+		if a.Address == "" {
+			t.Errorf("attempt %d carries no address", i)
+		}
+	}
+
+	// Serial would be ~3 budgets. Two is a generous ceiling that still fails loudly
+	// if the loop ever goes back to being sequential.
+	if elapsed > 2*opts.Timeout {
+		t.Errorf("probing 3 blackholed addresses took %v; one budget is %v, so these ran in series",
+			elapsed, opts.Timeout)
 	}
 }

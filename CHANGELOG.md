@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Security
+
+- Build with Go 1.26.6. The pinned 1.26.5 carried five standard-library
+  vulnerabilities reachable from this code (`net/url`, `crypto/tls`, `net/http`
+  twice, `encoding/asn1`), including one on the TLS handshake path every probe
+  uses. `govulncheck` now reports none.
+- `.gitignore` now covers `config.yaml` and `e2e-config.yaml`. Both are copies of
+  the committed examples filled in with a DNSPod token (full record write over
+  the account) and CAM credentials, and neither was ignored -- the reference
+  readme claimed otherwise. The `*.example.yaml` and `e2e-config-*.yaml` fixtures
+  stay committable.
+- Bound `last_error` at the point it is persisted. It carries upstream text
+  verbatim (lego embeds whole non-JSON ACME error bodies; the metadata path
+  echoes response bodies), and `/hook/status` serves it while `notifyURL` posts
+  it off-host.
+- Stop printing a prefix of `TENCENTCLOUD_SECRET_ID` in `run-stage-ab.sh`. The
+  same line was already removed from `wecert-preflight` for the same reason.
+
 ### Added
 
 - MIT LICENSE file.
@@ -13,14 +31,14 @@
 
 ### Fixed
 
-- Enable Tencent Cloud deployment when an enforce-mode desired-state document
-  contains certificates with `deploy.enabled: true`.
-- Apply the TLS probe timeout to the handshake as well as the TCP dial.
-- Verify every resolved probe address so a partially updated backend cannot
-  hide behind a healthy node.
-- Reject `DropThreshold >= 1` in `onboarding.New` so the CLI
-  `-drop-threshold` flag can no longer bypass the config layer's `[0,1)` check
-  and silently disable the abrupt-change fuse.
+- Reject `DropThreshold >= 1` in `onboarding.New` so the CLI `-drop-threshold`
+  flag can no longer bypass the config layer's `[0,1)` check and silently
+  disable the abrupt-change fuse. `NaN` is rejected too: every comparison against
+  it is false, so it satisfied both bounds and passed straight through.
+- Dial a host's resolved addresses concurrently. A single blackholed address (a
+  dropped SYN, which is what a security-group or route misconfiguration looks
+  like) used to consume its whole budget before the next address was attempted,
+  stretching a pass by minutes.
 - Reject an empty webhook token in `webhook.New`; `"Authorization: Bearer "`
   would otherwise pass the constant-time comparison against it.
 - Propagate order-state persistence errors in the ACME manager instead of only
@@ -29,6 +47,11 @@
 - Release the per-certificate reconcile slot with `defer` in `RunAll` so a
   panic in `reconcileOne` can no longer wedge every later pass with
   `ErrAlreadyRunning`.
+- Enable Tencent Cloud deployment when an enforce-mode desired-state document
+  contains certificates with `deploy.enabled: true`.
+- Apply the TLS probe timeout to the handshake as well as the TCP dial.
+- Verify every resolved probe address so a partially updated backend cannot
+  hide behind a healthy node.
 
 ### Changed
 
@@ -40,3 +63,15 @@
   environment).
 - Add the missing "When domains are declared elsewhere" section to
   `README.zh-CN.md`.
+
+### Tests
+
+- `fakeAPI.GetCertificate` records the `bundle` argument it was called with
+  instead of setting it unconditionally, which made "the download must ask for
+  fullchain" a tautology: `download` could have passed `false` and the suite
+  would have stayed green while the CLB received a leaf with no intermediates.
+- Cover the reclamation path, which had no behavioural test at all: a certificate
+  uploaded during a failed deploy is recorded, is not deleted inside the
+  retention window, is deleted after it, keeps its record when the delete fails,
+  and the live certificate is never recorded -- that last one would schedule the
+  serving certificate for deletion.

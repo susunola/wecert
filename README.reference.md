@@ -129,7 +129,8 @@ Two further deliberate choices:
 
 ## Prerequisites
 
-- **Go 1.26+** to build (the module declares `go 1.26.5`).
+- **Go 1.26+** to build (the module declares `go 1.26.6`, the patch release that
+  fixes the standard-library vulnerabilities listed by `govulncheck`).
 - **A domain hosted on DNSPod** — either the DNSPod product (`dnspod.cn`) or Tencent Cloud DNSPod.
 - **A Tencent Cloud account** with the CLB resources you want the certificate on.
 - **Credentials**, one of:
@@ -1045,7 +1046,9 @@ The `Manager`'s full issuance flow is still not covered end to end — that need
 
 The repository ships `e2e-config.example.yaml` (single domain) and `e2e-config-wildcard.yaml`
 (wildcard + apex, i.e. the shared `_acme-challenge` name case). `e2e-test.sh` defaults to
-`./e2e-config.yaml`, which is gitignored — copy one into place first:
+`./e2e-config.yaml`, which `.gitignore` covers along with `config.yaml` — keep the
+`*.example.yaml` / `e2e-config-*.yaml` names for anything you commit, and copy one into
+place first:
 
 ```bash
 make build tools
