@@ -12,15 +12,30 @@
 # state store, then verify the result. It never touches production and never binds
 # a CLB.
 #
+# It tests a SINGLE-domain certificate. For the wildcard + apex case -- two
+# authorizations that share one challenge name and must coexist as two TXT values --
+# use scripts/e2e-wildcard.sh, which samples the challenge name during issuance and
+# asserts that coexistence actually happened. Even with a wildcard in the config this
+# script cannot see it: it only inspects the end state, by which point cleanup has
+# removed both records.
+#
 # Prerequisites:
 #   - the domain is hosted on DNSPod / Tencent Cloud DNSPod
 #   - dns.provider and the credentials in the config work
 #   - acme.directory points at staging (the script enforces this)
+#   - sqlite3 (steps 4 and 5 read the state store directly; the script asserts on
+#     what they find, so a missing sqlite3 must fail here rather than turn the
+#     assertion into a false one)
 set -euo pipefail
 
 DOMAIN="${1:-}"
 CONFIG="${2:-./e2e-config.yaml}"
 BIN="${BIN:-./bin/wecert}"
+
+if ! command -v sqlite3 >/dev/null 2>&1; then
+	echo "Error: sqlite3 is required (steps 4 and 5 inspect the state store), but it is not installed." >&2
+	exit 1
+fi
 
 if [[ -z "${DOMAIN}" ]]; then
 	echo "Usage: $0 <test domain> [config file]" >&2
@@ -76,22 +91,18 @@ fi
 echo
 
 echo "--- [3/5] inspect the state store ---"
-if command -v sqlite3 >/dev/null 2>&1; then
-	sqlite3 "${STATE_DIR}/state.db" \
-		"SELECT name, datetime(not_after,'unixepoch') AS not_after, deployed_cert_id, ari_cert_id FROM certificates;"
-else
-	echo "(sqlite3 not installed, skipping)"
-fi
+sqlite3 "${STATE_DIR}/state.db" \
+	"SELECT name, datetime(not_after,'unixepoch') AS not_after, deployed_cert_id, ari_cert_id FROM certificates;"
 echo
 
 echo "--- [4/5] verify ARI and order state ---"
 # The key assertions: a successful issuance should leave no order behind, and the
 # ARI certID must have been built — otherwise later renewals lose the
 # "exempt from all rate limits" treatment.
-ORDERS="$(sqlite3 "${STATE_DIR}/state.db" "SELECT count(*) FROM orders;" 2>/dev/null || echo "?")"
+ORDERS="$(sqlite3 "${STATE_DIR}/state.db" "SELECT count(*) FROM orders;")"
 echo "orders left behind: ${ORDERS} (0 only if issuance succeeded; keeping an order around for reuse next round after a failure is correct behavior)"
 
-ARI="$(sqlite3 "${STATE_DIR}/state.db" "SELECT ari_cert_id FROM certificates;" 2>/dev/null || echo "")"
+ARI="$(sqlite3 "${STATE_DIR}/state.db" "SELECT ari_cert_id FROM certificates;")"
 if [[ -z "${ARI}" ]]; then
 	echo "⚠️  ARI certID is empty — renewals will not get the rate-limit exemption; check the certificate's AKI parsing" >&2
 else
@@ -100,14 +111,14 @@ fi
 echo
 
 echo "--- [5/5] idempotency: run another round; the order must be reused, not recreated ---"
-ORDER_BEFORE="$(sqlite3 "${STATE_DIR}/state.db" "SELECT coalesce(order_url,'') FROM orders LIMIT 1;" 2>/dev/null || echo "")"
+ORDER_BEFORE="$(sqlite3 "${STATE_DIR}/state.db" "SELECT coalesce(order_url,'') FROM orders LIMIT 1;")"
 
 if ! "${BIN}" -config "${CONFIG}" -state "${STATE_DIR}/state.db" -once; then
 	echo "second round failed" >&2
 	exit 1
 fi
 
-ORDER_AFTER="$(sqlite3 "${STATE_DIR}/state.db" "SELECT coalesce(order_url,'') FROM orders LIMIT 1;" 2>/dev/null || echo "")"
+ORDER_AFTER="$(sqlite3 "${STATE_DIR}/state.db" "SELECT coalesce(order_url,'') FROM orders LIMIT 1;")"
 
 # The real invariant is "no new order is created", not "there is no order":
 # if the first round failed (the order is still pending), the second round should
@@ -123,7 +134,7 @@ if [[ -n "${ORDER_BEFORE}" ]]; then
 	fi
 	echo "  ✅ order reused correctly, nothing new was created"
 else
-	ORDERS="$(sqlite3 "${STATE_DIR}/state.db" "SELECT count(*) FROM orders;" 2>/dev/null || echo "?")"
+	ORDERS="$(sqlite3 "${STATE_DIR}/state.db" "SELECT count(*) FROM orders;")"
 	echo "orders left behind: ${ORDERS} (the first round succeeded, so no order should exist before the renewal window opens)"
 	if [[ "${ORDERS}" != "0" ]]; then
 		echo "Error: an order was created when none should be; the renewal-window check is wrong" >&2

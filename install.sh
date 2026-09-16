@@ -14,6 +14,9 @@ BINARY="${1:-}"
 INSTALL_PATH="/usr/local/bin/wecert"
 CONFIG_DIR="/etc/wecert"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+# Must match statePath in the config the installer puts in place; the example config's
+# statePath is /var/lib/wecert/state.db. Override it if you changed that.
+STATE_DIR="${WECERT_STATE_DIR:-/var/lib/wecert}"
 
 if [[ -z "${BINARY}" ]]; then
 	echo "Usage: sudo $0 <path to the wecert binary>" >&2
@@ -96,6 +99,19 @@ mkdir -p "${CONFIG_DIR}"
 chown root:wecert "${CONFIG_DIR}"
 chmod 0750 "${CONFIG_DIR}"
 
+# The state directory, for the same reason as the config one.
+#
+# systemd's StateDirectory=wecert creates /var/lib/wecert, but only when the service
+# starts -- and the validation step printed below has to run BEFORE that, as the wecert
+# user (the config carries the DNSPod token, so it is 0640 root:wecert). Without this the
+# prescribed command fails with "create state dir /var/lib/wecert: permission denied".
+# The obvious workaround is worse than the failure: running it under sudo pre-creates
+# state.db as root:root 0600, and StateDirectory= only fixes the directory it owns, not
+# files already inside it, so the service then crash-loops on "pre-create state file ...
+# permission denied" with nothing pointing at the cause.
+echo "==> Preparing state directory ${STATE_DIR}"
+install -d -o wecert -g wecert -m 0700 "${STATE_DIR}"
+
 if [[ -f "${CONFIG_FILE}" ]]; then
 	echo "    config already exists, keeping it as is"
 else
@@ -108,12 +124,23 @@ else
 fi
 
 echo "==> Installing systemd unit"
+units_installed=0
 for unit in wecert.service wecert-once.service wecert-once.timer; do
 	if [[ -f "${SCRIPT_DIR}/deploy/systemd/${unit}" ]]; then
 		install -m 0644 "${SCRIPT_DIR}/deploy/systemd/${unit}" "/etc/systemd/system/${unit}"
 		echo "    ${unit}"
+		units_installed=$((units_installed + 1))
 	fi
 done
+if [[ "${units_installed}" -eq 0 ]]; then
+	# Saying nothing here means the completion message below tells the operator to
+	# "systemctl enable --now wecert" for a unit that does not exist -- and the config
+	# branch just above does warn in the analogous case.
+	echo "Error: no unit file found under ${SCRIPT_DIR}/deploy/systemd/." >&2
+	echo "       The binary and config are installed, but there is no service to start." >&2
+	echo "       Copy the repository's deploy/systemd/ directory next to this script, or" >&2
+	echo "       install the unit by hand before enabling anything." >&2
+fi
 systemctl daemon-reload
 
 cat <<EOF

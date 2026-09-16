@@ -8,7 +8,9 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -79,6 +81,7 @@ var profileRenewBefore = map[string]time.Duration{
 // Config is the whole configuration.
 type Config struct {
 	StatePath    string          `yaml:"statePath"`
+	StateBackup  StateBackup     `yaml:"stateBackup"`
 	ACME         ACME            `yaml:"acme"`
 	DNS          DNS             `yaml:"dns"`
 	Tencent      Tencent         `yaml:"tencent"`
@@ -145,7 +148,8 @@ func (f *FailureFallback) EnabledOr(def bool) bool {
 }
 
 // The Or methods below supply a default when the field is unset (<= 0).
-// Treating 0 as "not written" is safe here: no legal value of these fields is 0.
+// Treating 0 as "not written" is safe here: no legal value of these fields is 0, and
+// normalize rejects negative values rather than letting them be replaced silently.
 func (f *FailureFallback) AfterFailuresOr(def int) int {
 	if f.AfterFailures <= 0 {
 		return def
@@ -174,6 +178,94 @@ func (f *FailureFallback) normalize() error {
 	}
 	if f.FailureWindowDur, err = parseDuration(f.FailureWindow, 24*time.Hour, "failureFallback.failureWindow"); err != nil {
 		return err
+	}
+
+	// A negative count is a typo, not "unset". The *Or helpers treat <= 0 as unset so 0
+	// can mean "use the default", but silently replacing -5 with the default would throw
+	// away the number the operator wrote while the sibling knobs in this block
+	// (dropThreshold, budget, maxNames) all reject out-of-range values -- so the same
+	// mistake would be loud in one place and silent in another.
+	for _, c := range []struct {
+		name string
+		v    int
+	}{
+		{"failureFallback.afterFailures", f.AfterFailures},
+		{"failureFallback.minIdentifierFailures", f.MinIdentifierFailures},
+		{"failureFallback.minNames", f.MinNames},
+	} {
+		if c.v < 0 {
+			return fmt.Errorf("%s must not be negative, got %d (0 means \"use the default\")", c.name, c.v)
+		}
+	}
+	return nil
+}
+
+// Snapshot defaults. Defined here rather than in internal/state because this is the lower
+// layer: the store takes the policy as arguments, the config decides it.
+const (
+	DefaultBackupInterval = 24 * time.Hour
+	DefaultBackupKeep     = 7
+)
+
+// StateBackup controls the periodic consistent snapshot of state.db.
+//
+// Why it exists: losing state.db is the one documented disaster in this system -- the ACME
+// account key (accounts are limited to 10 per IP per 3 hours), every in-flight order URL
+// and every ARI certID live in it. Losing an order URL does not just cost an issuance: the
+// replacement order counts against "5 certificates per exact set of identifiers / 7 days",
+// a limit with no override. Until now the only guidance was a line in the README saying it
+// is "the one thing to back up", with nothing implementing or checking it.
+//
+// On by default where it can be useful, off where it cannot: see normalize.
+type StateBackup struct {
+	// Enabled defaults to true when the state directory is writable, false otherwise.
+	Enabled *bool `yaml:"enabled"`
+
+	// Interval between snapshots. Default 24h; the minimum is 1 minute.
+	Interval string `yaml:"interval"`
+
+	// Keep is how many snapshots to retain, newest first. Default 7.
+	Keep int `yaml:"keep"`
+
+	// Dir is where snapshots are written. Empty means the directory holding state.db,
+	// which is already 0700 and on the same filesystem (so SQLite's write and the rename
+	// are cheap and atomic).
+	Dir string `yaml:"dir"`
+
+	// Parsed, filled in by normalize.
+	IntervalDur time.Duration `yaml:"-"`
+}
+
+// EnabledOr returns the snapshot switch, or def when it is unset.
+func (b *StateBackup) EnabledOr(def bool) bool {
+	if b.Enabled == nil {
+		return def
+	}
+	return *b.Enabled
+}
+
+func (b *StateBackup) normalize() error {
+	var err error
+	if b.IntervalDur, err = parseDuration(b.Interval, DefaultBackupInterval, "stateBackup.interval"); err != nil {
+		return err
+	}
+	// A snapshot per pass would be pointless churn; a snapshot per hour is the useful
+	// floor. The bound also keeps a typo like "1s" from filling the disk.
+	if b.IntervalDur < time.Minute {
+		return fmt.Errorf("stateBackup.interval is %s, which is below the 1m minimum: "+
+			"snapshots are a recovery mechanism, not a change log, and a very short interval just "+
+			"fills the disk with near-identical copies", b.IntervalDur)
+	}
+	if b.Keep == 0 {
+		b.Keep = DefaultBackupKeep
+	}
+	if b.Keep < 1 {
+		return fmt.Errorf("stateBackup.keep must be at least 1, got %d "+
+			"(0 means \"use the default\"; there is no way to disable retention without disabling backups)", b.Keep)
+	}
+	if b.Keep > 365 {
+		return fmt.Errorf("stateBackup.keep is %d, which would retain more than a year of snapshots "+
+			"of a file holding private keys; keep at most 365", b.Keep)
 	}
 	return nil
 }
@@ -593,11 +685,30 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	// A second YAML document is a mistake, not a feature: KnownFields catches a misspelled
+	// key but says nothing about everything after a stray "---", which a copy-paste or a
+	// template edit produces. Silently ignoring half the file is exactly the "why isn't my
+	// certificate being issued" failure this loader exists to prevent.
+	if err := rejectExtraDocuments(dec, path); err != nil {
+		return nil, err
+	}
 
 	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// rejectExtraDocuments fails when the input holds more than one YAML document.
+func rejectExtraDocuments(dec *yaml.Decoder, path string) error {
+	var extra any
+	if err := dec.Decode(&extra); err == nil {
+		return fmt.Errorf("%s contains more than one YAML document (a stray '---'?); "+
+			"everything after the first document would be ignored, so it is rejected instead", path)
+	} else if !errors.Is(err, io.EOF) {
+		return fmt.Errorf("parse config %s: %w", path, err)
+	}
+	return nil
 }
 
 func (c *Config) normalize() error {
@@ -680,6 +791,9 @@ func (c *Config) normalize() error {
 		return fmt.Errorf("tencent.regions is required (CLB is regional; list every region you have CLBs in)")
 	}
 
+	if err := c.StateBackup.normalize(); err != nil {
+		return err
+	}
 	if err := c.DesiredState.normalize(len(c.Certificates) > 0); err != nil {
 		return err
 	}
@@ -802,6 +916,25 @@ func (c *Certificate) normalize(seen map[string]bool) error {
 	if err != nil {
 		return err
 	}
+
+	// renewBefore must be shorter than the certificate's own lifetime.
+	//
+	// The renewal time is notAfter - renewBefore, so a value at or beyond the validity
+	// puts that instant in the past from the moment the certificate is issued: every pass
+	// then decides "renew now". ARI normally masks this -- it takes precedence, and its
+	// window is always inside the lifetime -- so the mistake only surfaces when ARI is
+	// unavailable, and then it re-orders the same identifier set every hour until the
+	// account's 5-per-exact-set/7-day quota is gone.
+	//
+	// Rejecting it is cheap and the failure it prevents is a week-long stall, which is the
+	// same trade the domain validation above makes.
+	if v, ok := profileValidity[c.Profile]; ok && c.RenewBeforeDur >= v {
+		return fmt.Errorf(
+			"certificate %q: renewBefore %s is not shorter than the %s profile's %s validity, "+
+				"so renewal would be due the moment the certificate is issued (and would re-order every pass "+
+				"whenever ARI is unavailable); use less than %s",
+			c.Name, c.RenewBeforeDur, c.Profile, v, v)
+	}
 	return nil
 }
 
@@ -903,12 +1036,40 @@ func ValidateDomain(d string) error { return validateDomain(d) }
 // Both the static config and the desired-state document come through this one
 // entry point, so the two paths cannot differ in strictness — that is where
 // bizarre "passes in the document, fails in the config" gaps come from.
+//
+// The one check it cannot host is spec.checkNameStability, which needs the grouping
+// package; that imports this one, so hosting it here would be a cycle. It is named here
+// so the claim above stays honest instead of quietly becoming false.
 func NormalizeCertificates(certs []Certificate) error {
 	seen := make(map[string]bool, len(certs))
+	byDomainSet := make(map[string]string, len(certs))
 	for i := range certs {
 		if err := certs[i].normalize(seen); err != nil {
 			return err
 		}
+
+		// Reject two certificates that ask for the same identifier set under different
+		// names.
+		//
+		// Both count against the same "5 certificates per exact set of identifiers /
+		// 7 days" bucket and both spend "Certificates per Registered Domain", and they
+		// cover the same names, so the second one buys nothing while halving the number
+		// of attempts left for the first. This is exactly the cheap local rejection the
+		// domain validation above exists for.
+		//
+		// The desired-state path additionally requires a certificate name to be derived
+		// from its registered domain (spec.checkNameStability); that rule lives there
+		// because it needs the grouping package, which imports this one. The overlap
+		// check needs nothing beyond DomainKey, so it protects both entry points -- which
+		// is what the "same entry point, same strictness" claim requires.
+		key := certs[i].DomainKey()
+		if prev, dup := byDomainSet[key]; dup {
+			return fmt.Errorf(
+				"certificates %q and %q ask for the same identifier set (%s): they would share the "+
+					"5-per-exact-set/7-days quota and cover the same names, so one of them can only waste it",
+				prev, certs[i].Name, key)
+		}
+		byDomainSet[key] = certs[i].Name
 	}
 	return nil
 }

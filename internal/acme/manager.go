@@ -111,6 +111,32 @@ type Manager struct {
 	// fallback is the "split off a subset and issue it before expiry" policy. nil means
 	// off, which is the default. See SetFallbackPolicy and applyFallback.
 	fallback *config.FailureFallback
+
+	// degradedRound / fullSetRound describe the domain set THIS round ordered for, and
+	// they are the difference between a fallback that holds and a fallback that
+	// oscillates.
+	//
+	// A successful issuance for the degraded subset used to reset consecutive_failures
+	// and clear the identifier ledger along with every other success. That erased the
+	// only evidence that anything was wrong, so the very next pass judged the
+	// certificate "recoverable", tried the full set again, and fell back once more --
+	// once per backoff window, forever, spending an order on an identifier set already
+	// known to be broken. See download for what each flag suppresses.
+	//
+	// Per-certificate and never read across goroutines: the reconciler runs one pass
+	// per certificate at a time (ErrAlreadyRunning).
+	degradedRound bool
+	fullSetRound  bool
+
+	// fallbackActive records that a degradation decision is in force for this certificate
+	// (a cert_fallback row exists), whether or not this round dropped anything.
+	//
+	// The SAN-drift branch in Reconcile reads it: while a fallback is active the live
+	// certificate is *supposed* to be missing the dropped names, so "the SANs do not
+	// match the config" is not evidence that anything needs reissuing. Without this the
+	// drift check re-ordered the full set on every pass, which is what made the fallback
+	// oscillate instead of hold.
+	fallbackActive bool
 }
 
 // NewManager builds the converger.
@@ -162,12 +188,27 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		st = &state.CertState{Name: c.Name}
 	}
 
+	// Reset per-round intent: every early return below must leave it false, so a
+	// previous pass can never make this one look like it ordered something.
+	m.degradedRound = false
+	m.fullSetRound = false
+	// Whether a degradation record exists is a durable fact, not a per-round one, so it
+	// is re-read rather than reset. A read failure leaves it false, which is the
+	// pre-existing behaviour.
+	if fb, ferr := m.store.GetFallback(c.Name); ferr == nil {
+		m.fallbackActive = fb != nil
+	}
 	// Skip straight through the backoff window. Once a retry is scheduled, stop knocking
 	// on the CA's door.
 	if !st.NextAttemptAt.IsZero() && m.now().Before(st.NextAttemptAt) {
 		m.log.Debug("inside the backoff window; skipping", "cert", c.Name, "nextAttemptAt", st.NextAttemptAt)
 		return nil
 	}
+
+	// The configured (full) set, captured before applyFallback may reduce it. Only the
+	// count is needed: applyFallback removes names and never adds any, so an unchanged
+	// count means the ordered set is the full one.
+	cfgDomains := c.Domains
 
 	// Pre-expiry degradation: which domain set this round should actually order for.
 	//
@@ -176,7 +217,17 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	// CSR, the identifier fingerprint. If even one of them used the full configured set,
 	// then during a fallback it would fight with "the order's identifier set disagrees
 	// with the config -> discard and rebuild", turning into a pointless order every round.
+	//
+	// Note what this does NOT mean: using the reduced set here is not a licence to forget
+	// that names were dropped. download keys off the flag below so that a successful
+	// issuance for the subset keeps the failure evidence intact; without it the next pass
+	// sees a "healthy" certificate and immediately re-orders the full set.
 	c = m.applyFallback(c, st)
+	if len(c.Domains) == len(cfgDomains) {
+		// applyFallback only ever removes names, so the counts matching means the full
+		// configured set is what this round would order for.
+		m.fullSetRound = true
+	}
 
 	// Invariant 1: with an unexpired order in progress, keep advancing it, never create a
 	// new one.
@@ -258,27 +309,50 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	if leaf, lerr := ParseLeaf(st.CertPEM); lerr != nil {
 		m.log.Warn("could not parse the live certificate; skipping the SAN comparison", "cert", c.Name, "err", lerr)
 	} else if drifted, detail := CoverageDrift(leaf, c.Domains); drifted {
-		m.log.Warn("the live certificate's SANs no longer match the config; reissuing now",
-			"cert", c.Name, "detail", detail,
-			"note", "an order after a domain-set change does not count as a same-name renewal and will consume "+
-				"the Certificates per Registered Domain quota (50 per 7 days, shared across accounts)")
-		// replaces is deliberately **not** sent here, unlike on a renewal.
-		//
-		// ARI's `replaces` means "this order replaces that certificate", and the CA
-		// compares the two identifier sets. Let's Encrypt answers
-		// `malformed: Could not validate ARI 'replaces' field: identifiers in this
-		// order do not match any identifiers in the certificate being replaced` when
-		// they do not overlap at all -- and that error comes back from newOrder, so no
-		// order is created and every later round sends the same replaces and fails the
-		// same way. Changing a certificate to a wholly different domain set (moving a
-		// name between certificates, or migrating a service) would then never issue
-		// again, which is the worst failure this system can have.
-		//
-		// It would also buy nothing: the ARI exemption applies to renewals of the
-		// *same* identifier set, and a changed set is a different bucket anyway -- as
-		// the note above says, this order consumes the per-registered-domain quota
-		// regardless. So send no replaces and let the order succeed.
-		return m.issue(ctx, c, st, "")
+		if m.fallbackActive {
+			// A degradation is in force, so the live certificate is *supposed* to be
+			// missing names: this drift is the fallback working, not a config change that
+			// needs converging on.
+			//
+			// Reissuing here is what turned the fallback into an oscillation. Every pass
+			// saw "the SANs do not match the config" and placed a fresh order for the full
+			// set -- the very set whose one broken identifier caused the fallback -- so the
+			// account spent an order per pass on a known-bad identifier set. The reduced
+			// set is already deployed and serving; the full set gets its next attempt at
+			// the renewal window below, and the failure evidence expiring (or an operator
+			// fixing the name) is what ends the fallback, not another immediate order.
+			m.log.Warn("the live certificate is the degraded name set and a fallback is in force; "+
+				"holding it until the renewal window instead of re-ordering the broken full set",
+				"cert", c.Name, "detail", detail,
+				"note", "the full set is retried once the identifier failure evidence ages out, "+
+					"or when an operator fixes the failing name")
+		} else {
+			m.log.Warn("the live certificate's SANs no longer match the config; reissuing now",
+				"cert", c.Name, "detail", detail,
+				"note", "an order after a domain-set change does not count as a same-name renewal and will consume "+
+					"the Certificates per Registered Domain quota (50 per 7 days, shared across accounts)")
+			// replaces is deliberately **not** sent here, unlike on a renewal.
+			//
+			// ARI's `replaces` means "this order replaces that certificate", and the CA
+			// compares the two identifier sets. Let's Encrypt answers
+			// `malformed: Could not validate ARI 'replaces' field: identifiers in this
+			// order do not match any identifiers in the certificate being replaced` when
+			// they do not overlap at all -- and that error comes back from newOrder, so no
+			// order is created and every later round sends the same replaces and fails the
+			// same way. Changing a certificate to a wholly different domain set (moving a
+			// name between certificates, or migrating a service) would then never issue
+			// again, which is the worst failure this system can have.
+			//
+			// It would also buy nothing: the ARI exemption applies to renewals of the
+			// *same* identifier set, and a changed set is a different bucket anyway -- as
+			// the note above says, this order consumes the per-registered-domain quota
+			// regardless. So send no replaces and let the order succeed.
+			//
+			// The fallback case above reconciles the two concerns: it holds the degraded
+			// set rather than reissuing, so the "changed identifier set" this branch exists
+			// for is a genuine config change, and no replaces is the right call for it.
+			return m.issue(ctx, c, st, "")
+		}
 	}
 
 	// Certificate exists -> decide whether renewal is due.

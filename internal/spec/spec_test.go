@@ -278,7 +278,9 @@ func TestDiffIsEmptyWhenNothingChanged(t *testing.T) {
 func TestLoadDocumentRefusesASymlinkOrAWritableFile(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.yaml")
-	body := "apiVersion: wecert/v1\nkind: DesiredState\ngeneratedAt: 2026-09-16T12:00:00Z\ngenerator: wecert-onboard/test\ncertificates:\n  - name: example-com\n    domains: [example.com]\n"
+	body := "apiVersion: wecert/v1\nkind: DesiredState\ngeneratedAt: " +
+		time.Now().UTC().Add(-time.Minute).Format(time.RFC3339) +
+		"\ngenerator: wecert-onboard/test\ncertificates:\n  - name: example-com\n    domains: [example.com]\n"
 	if err := os.WriteFile(good, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -313,4 +315,307 @@ func TestLoadDocumentRefusesASymlinkOrAWritableFile(t *testing.T) {
 	if !strings.Contains(err.Error(), "symlink") {
 		t.Errorf("err = %v, want it to name the symlink", err)
 	}
+}
+
+// A generatedAt in the future must be refused: the staleness alarm is
+// time.Since(generatedAt) > maxStaleness, so a far-future date makes that comparison
+// false forever -- and Revision covers only the certificates, so changing generatedAt
+// alone trips no other check. It is the one signal this architecture has for "the
+// generator died and no new name will ever be picked up".
+func TestValidateRejectsAFutureGeneratedAt(t *testing.T) {
+	doc := testDoc(t)
+	doc.GeneratedAt = time.Now().Add(24 * time.Hour)
+	if err := doc.Validate(); err == nil {
+		t.Fatal("a generatedAt a day in the future must be rejected")
+	}
+
+	// A little clock skew is still fine.
+	doc = testDoc(t)
+	doc.GeneratedAt = time.Now().Add(time.Minute)
+	if err := doc.Validate(); err != nil {
+		t.Fatalf("a minute of clock skew must be tolerated: %v", err)
+	}
+}
+
+// A document inside a world-writable directory must be refused even when the file
+// itself is 0644: WriteDocument installs the file by rename, so the directory's
+// permissions -- not the file's -- decide who can replace its contents.
+func TestLoadDocumentRefusesAWorldWritableDirectory(t *testing.T) {
+	dir := t.TempDir()
+	inner := filepath.Join(dir, "docs")
+	if err := os.Mkdir(inner, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(inner, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(inner, "desired-state.yaml")
+	doc := testDoc(t)
+	if err := WriteDocument(path, doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadDocument(path); err == nil {
+		t.Fatal("a document in a world-writable directory must be refused")
+	}
+}
+
+// ── provider entry points ────────────────────────────────────────────────────────────
+//
+// The providers are what the convergence loop actually talks to, and the three modes differ
+// only in which one is wired up. Until now only the document loader and the diff were covered;
+// the provider methods themselves were not, which is the layer where "observe mode signs
+// nothing" and "an unreadable source freezes" have to hold.
+
+// Static must copy the caller's slice: the config is shared with the running process, and a
+// provider that aliases it would let a later mutation change the desired state underneath
+// convergence.
+func TestStaticCopiesTheCertificateSlice(t *testing.T) {
+	certs := []config.Certificate{{Name: "a", Domains: []string{"a.example.com"}}}
+	st := NewStatic(certs)
+
+	certs[0].Name = "mutated"
+	got, err := st.Desired(context.Background())
+	if err != nil {
+		t.Fatalf("Desired: %v", err)
+	}
+	if got[0].Name != "a" {
+		t.Errorf("the provider aliases the caller's slice: name became %q", got[0].Name)
+	}
+	if st.Kind() != config.ModeStatic {
+		t.Errorf("Kind = %q, want %q", st.Kind(), config.ModeStatic)
+	}
+}
+
+// The static result must carry a revision and per-name decisions, because the diagnostic
+// endpoint and the shadow report both read them.
+func TestStaticReportsRevisionAndDecisions(t *testing.T) {
+	st := NewStatic([]config.Certificate{{Name: "a", Domains: []string{"a.example.com"}}})
+	res, err := st.DesiredWithReasons(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Revision == "" {
+		t.Error("a revision is required: the shadow report compares against it")
+	}
+	if len(res.Decisions) != 1 || res.Decisions[0].Hostname != "a.example.com" {
+		t.Errorf("decisions = %+v, want one for a.example.com", res.Decisions)
+	}
+	if res.Shadow != nil {
+		t.Error("static mode has no shadow source, so Shadow must stay nil")
+	}
+}
+
+// The File provider must satisfy the same interface as Static, so switching desiredState.mode
+// needs no change to the convergence loop.
+func TestFileProviderServesTheDocument(t *testing.T) {
+	doc := testDoc(t)
+	path := writeDoc(t, doc)
+
+	f, err := NewFile(path, testLogger())
+	if err != nil {
+		t.Fatalf("NewFile: %v", err)
+	}
+	if f.Kind() != "document" {
+		t.Errorf("Kind = %q, want document", f.Kind())
+	}
+
+	certs, err := f.Desired(context.Background())
+	if err != nil {
+		t.Fatalf("Desired: %v", err)
+	}
+	if len(certs) != len(doc.Certificates) {
+		t.Fatalf("got %d certificates, want %d", len(certs), len(doc.Certificates))
+	}
+
+	res, err := f.DesiredWithReasons(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Frozen {
+		t.Error("a readable document must not be reported as frozen")
+	}
+	if res.Revision != doc.Revision {
+		t.Errorf("revision = %q, want the document's %q", res.Revision, doc.Revision)
+	}
+}
+
+// An unreadable document must return the LAST GOOD revision marked frozen -- never an error and
+// never an empty set. An empty desired state would strip every SAN from every certificate, so
+// the failure has to degrade to "carry on with what we had".
+func TestFileProviderFreezesOnAnUnreadableDocument(t *testing.T) {
+	doc := testDoc(t)
+	path := writeDoc(t, doc)
+
+	f, err := NewFile(path, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read once successfully, so there is a last-good revision.
+	if _, err := f.DesiredWithReasons(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := f.DesiredWithReasons(context.Background())
+	if err != nil {
+		t.Fatalf("an unreadable document must not be an error: %v", err)
+	}
+	if !res.Frozen {
+		t.Error("the result must be marked frozen")
+	}
+	if res.FreezeReason == "" {
+		t.Error("a freeze must say why, or the metric alerts with no explanation")
+	}
+	if res.Revision != doc.Revision {
+		t.Errorf("revision = %q, want the last good %q", res.Revision, doc.Revision)
+	}
+	if len(res.Certificates) != len(doc.Certificates) {
+		t.Errorf("got %d certificates, want the last good %d", len(res.Certificates), len(doc.Certificates))
+	}
+	// Desired() must inherit the same semantics rather than reporting an error.
+	certs, err := f.Desired(context.Background())
+	if err != nil {
+		t.Fatalf("Desired on a frozen source: %v", err)
+	}
+	if len(certs) != len(doc.Certificates) {
+		t.Errorf("Desired returned %d certificates while frozen, want the last good set", len(certs))
+	}
+}
+
+// A document that is unreadable at startup must be an error, not a freeze: there is no last
+// good revision, and starting with no desired state means renewing nothing.
+func TestNewFileFailsWhenThereIsNothingToFallBackTo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.yaml")
+	if _, err := NewFile(path, testLogger()); err == nil {
+		t.Fatal("NewFile on a missing document must fail, or enforce mode starts with no state")
+	}
+}
+
+// ── Observer: the static -> enforce migration step ───────────────────────────────────
+
+// Observe mode must converge on the PRIMARY source. It is a reporting step, and if the shadow
+// ever won, switching to observe would change what is issued -- which is the one thing it
+// promises not to do.
+func TestObserverConvergesOnThePrimary(t *testing.T) {
+	primary := NewStatic([]config.Certificate{{Name: "primary", Domains: []string{"p.example.com"}}})
+	shadowDoc := testDoc(t)
+	shadow := NewStatic(shadowDoc.Certificates)
+
+	o := NewObserver(primary, shadow, testLogger())
+	if !strings.Contains(o.Kind(), "observe(") {
+		t.Errorf("Kind = %q, want it to name the wrapped source", o.Kind())
+	}
+
+	certs, err := o.Desired(context.Background())
+	if err != nil {
+		t.Fatalf("Desired: %v", err)
+	}
+	if len(certs) != 1 || certs[0].Name != "primary" {
+		t.Fatalf("observe mode must serve the primary source, got %+v", certs)
+	}
+
+	res, err := o.DesiredWithReasons(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Certificates) != 1 || res.Certificates[0].Name != "primary" {
+		t.Errorf("the reported certificates must be the primary's, got %+v", res.Certificates)
+	}
+	if res.Shadow == nil {
+		t.Fatal("observe mode must attach a shadow report; it is the whole output")
+	}
+	if res.Shadow.Empty() {
+		t.Error("the two sources differ, so the report must not read as agreement")
+	}
+	if res.Shadow.Error != "" {
+		t.Errorf("both sources are readable, so there is no error to report: %q", res.Shadow.Error)
+	}
+}
+
+// An unreadable shadow must not fail the pass: during observation the document is often absent
+// because generation has not started yet, and convergence has to carry on.
+func TestObserverSurvivesAnUnreadableShadow(t *testing.T) {
+	primary := NewStatic([]config.Certificate{{Name: "primary", Domains: []string{"p.example.com"}}})
+	// NewFile refuses to construct without a document, so the unreadable shadow is a provider
+	// that reports the failure instead -- which is what a document that disappears mid-run
+	// turns into.
+	o := NewObserver(primary, failingProvider{}, testLogger())
+
+	res, err := o.DesiredWithReasons(context.Background())
+	if err != nil {
+		t.Fatalf("a shadow failure must not fail the pass: %v", err)
+	}
+	if res.Shadow == nil || res.Shadow.Error == "" {
+		t.Fatal("the failure must be recorded in the report, not silently dropped")
+	}
+	// Empty() means "a comparison was produced and it agrees". A report carrying an error is
+	// therefore NOT empty: the whole point is that "we could not compare" must not read as
+	// "they agree".
+	if res.Shadow.Empty() {
+		t.Error("a report carrying an error must not read as agreement")
+	}
+	if len(res.Certificates) != 1 {
+		t.Error("convergence must still use the primary source")
+	}
+}
+
+// failingProvider always fails, standing in for an unreadable source.
+type failingProvider struct{}
+
+func (failingProvider) Desired(context.Context) ([]config.Certificate, error) {
+	return nil, fmt.Errorf("source is unreadable")
+}
+func (failingProvider) DesiredWithReasons(context.Context) (*Result, error) {
+	return nil, fmt.Errorf("source is unreadable")
+}
+
+// spec.Desired must prefer the reporting path when a provider implements it, so callers get
+// decisions and revisions rather than a bare certificate list.
+func TestDesiredUsesTheReportingPathWhenAvailable(t *testing.T) {
+	withReasons := NewStatic([]config.Certificate{{Name: "a", Domains: []string{"a.example.com"}}})
+	res, err := Desired(context.Background(), withReasons)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Decisions) == 0 {
+		t.Error("the reporting path was not used: decisions are what make the diagnostics explain themselves")
+	}
+
+	// A bare Provider must still work, with a revision computed from the certificates.
+	bare := &bareProvider{certs: []config.Certificate{{Name: "b", Domains: []string{"b.example.com"}}}}
+	res, err = Desired(context.Background(), bare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Revision == "" {
+		t.Error("a revision must be computed for a bare provider")
+	}
+	if len(res.Certificates) != 1 {
+		t.Errorf("certificates = %+v", res.Certificates)
+	}
+}
+
+// bareProvider implements only Provider, like a future source that does not report reasons.
+type bareProvider struct{ certs []config.Certificate }
+
+func (b *bareProvider) Desired(context.Context) ([]config.Certificate, error) { return b.certs, nil }
+
+// KindOf must not panic on a provider that does not implement Named.
+func TestKindOfFallsBackForAnUnnamedProvider(t *testing.T) {
+	if got := KindOf(&bareProvider{}); got != "unknown" {
+		t.Errorf("KindOf = %q, want unknown", got)
+	}
+}
+
+// writeDoc writes a valid document and returns its path.
+func writeDoc(t *testing.T, doc *Document) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "desired-state.yaml")
+	if err := WriteDocument(path, doc); err != nil {
+		t.Fatalf("WriteDocument: %v", err)
+	}
+	return path
 }

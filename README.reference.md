@@ -302,7 +302,7 @@ The ACME order state machine is in [Order state machine](#4-order-state-machine)
 
 ### State schema
 
-A single SQLite file. Losing it means re-ordering, which collides with the rate limits — so it is the one thing to back up.
+A single SQLite file. Losing it means re-ordering, which collides with the rate limits — so it is the one thing to back up. wecert snapshots it on an interval by default (`stateBackup`, using `VACUUM INTO` so the copy is consistent despite WAL) and keeps the newest `keep` of them beside it; snapshots are not off-host backup, and **docs/recovery.md** is the restore procedure.
 
 ```
 accounts                      -- one ACME account per directory URL
@@ -469,7 +469,7 @@ The CA/Browser Forum has scheduled **≤100 days from 2027-03-15 and ≤47 days 
 | `desired-state.yaml` | wecert-onboard | wecert | **Safe** — wecert freezes on the previous revision and alarms |
 | `onboard-state.json` | wecert-onboard | wecert-onboard | **Matters** — the grace period resets, so deletion becomes aggressive |
 | `desired-state.report.json` | wecert-onboard | a human | **Harmless** — troubleshooting only |
-| `state.db` | wecert | wecert | **Disaster** — order URLs, ARI certIDs and CertIds all gone, so orders are re-placed into the exact-set limit |
+| `state.db` | wecert | wecert | **Disaster** — order URLs, ARI certIDs and CertIds all gone, so orders are re-placed into the exact-set limit. Snapshotted automatically (`stateBackup`); restore with **docs/recovery.md** |
 | The ACME account key | wecert | wecert | **Disaster** — accounts are a limited resource (10 per IP per 3 hours) |
 
 ### Failure semantics
@@ -538,6 +538,10 @@ Deletion is deliberately an order of magnitude more conservative than addition: 
 | Field | Required | Default | Description |
 |---|---|---|---|
 | `statePath` | yes | — | SQLite path. Must be on persistent storage — losing it re-orders. |
+| `stateBackup.enabled` | no | `true` | Periodic consistent snapshot of `state.db` (`VACUUM INTO`, so the copy is valid despite WAL). Losing the database means a new ACME account and re-placed orders — see **docs/recovery.md** |
+| `stateBackup.interval` | no | `24h` | Minimum `1m`. Snapshots are a recovery mechanism, not a change log |
+| `stateBackup.keep` | no | `7` | Snapshots retained, newest first. `1`–`365` |
+| `stateBackup.dir` | no | directory of `statePath` | Where snapshots are written. Defaults beside the database (0700), so copy them off-host for real protection |
 | `acme` | yes | — | See below |
 | `dns` | yes | — | See below |
 | `tencent` | yes | — | See below |
@@ -861,14 +865,26 @@ With a **CVM role** (the default), credentials come from instance metadata and n
 ```
 dnspod:DescribeRecordList / CreateRecord / DeleteRecord   scope: your single acme-auth zone
 ssl:UploadCertificate
-ssl:DescribeCertificate
+ssl:DescribeCertificates
 ssl:DeleteCertificate
 ssl:UpdateCertificateInstance
+ssl:DescribeHostUpdateRecordDetail
+ssl:CreateCertificateBindResourceSyncTask
+ssl:DescribeCertificateBindResourceTaskResult
 ```
+
+Omitting any of the last three is not a soft failure: without
+`DescribeHostUpdateRecordDetail` every one-click rebind times out after three minutes and
+the certificate is re-uploaded each round, and without the two bind-resource actions the
+`deployed` metric can never turn green.
 
 `deploy/cam-policy-test.json` and `deploy/cam-policy-stage-ab.json` contain ready-made policies.
 
 The deployer passes `IsCheckResource=true` on delete: if any cloud resource still references a certificate, the delete is refused. Being unable to delete costs quota; deleting a referenced certificate costs an HTTPS outage. `ReapRetired` logs the refusal and retries on the next pass.
+Because `IsCheckResource=true` makes the call asynchronous, the returned task is polled through
+`DescribeDeleteCertificatesTaskResult` until it reports success; a task that fails because a resource
+is still bound (status 4) keeps the certificate on the reclaim list for the next pass.
+
 
 ## CLI reference
 
@@ -884,7 +900,7 @@ The deployer passes `IsCheckResource=true` on delete: if any cloud resource stil
 | `-dry-run` | `false` | Validate config and initialise the ACME account; sign and deploy nothing |
 | `-version` | `false` | Print version and exit |
 
-### `wecert-preflight` (read-only)
+### `wecert-preflight` (diagnostic; `-prune-certs` deletes)
 
 | Flag | Description |
 |---|---|
@@ -894,6 +910,8 @@ The deployer passes `IsCheckResource=true` on delete: if any cloud resource stil
 | `-yes` | Skip the interactive confirmation for `-prune-certs` |
 
 > `-prune-certs` matches on the alias prefix `wecert/`, which wecert applies to **every** certificate it uploads — including the one currently serving. The command therefore prints what it will delete and requires confirmation; a non-interactive stdin is treated as "no". Read the list.
+>
+> It also passes `IsCheckResource=false`, unlike the deployer's own reaper (which passes `true` and lets the server refuse a certificate a listener still references). That is deliberate — pruning exists to remove leftovers, and a bound leftover would otherwise be undeletable — but it means **the server will not protect you here**. Only the printed list and the confirmation prompt stand between this command and an HTTPS outage.
 
 The NS delegation check is the highest-value one: a domain hosted elsewhere, or a half-finished nameserver migration, means the TXT records you write are never seen — the classic "the write succeeded but the CA's validation fails", which burns one authorization-failure credit per attempt without saying why.
 

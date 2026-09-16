@@ -6,10 +6,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -95,21 +97,42 @@ func LoadDocument(path string) (*Document, error) {
 	//
 	// Readability is deliberately not checked: the file is 0644 so an operator can
 	// inspect it, and only the *write* bits can change what it says.
-	fi, err := os.Lstat(path)
+	//
+	// The checks below run against the file that is actually READ, not against a path
+	// inspected a moment earlier. os.Open + f.Stat closes two holes at once: a symlink
+	// swapped in between the check and the read is no longer followed (O_NOFOLLOW where
+	// the platform has it), and the mode/owner being validated are the ones on the open
+	// descriptor rather than on whatever the name resolves to now.
+	f, err := openDocumentFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("stat desired-state document: %w", err)
+		return nil, err
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("the desired-state document %s is a symlink; refusing to follow it -- point the config at the real file", path)
-	}
-	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
-		return nil, fmt.Errorf("the desired-state document %s is group- or world-writable (%04o); anyone who can write it can change which domains are served", path, perm)
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat desired-state document %s: %w", path, err)
 	}
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("the desired-state document %s is not a regular file", path)
 	}
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		return nil, fmt.Errorf("the desired-state document %s is group- or world-writable (%04o); anyone who can write it can change which domains are served", path, perm)
+	}
+	// Ownership is the other half of "nothing but the daemon's account may write this":
+	// the mode bits say nothing about WHO the writer is, so a 0644 document owned by a
+	// different local user passes the check above and can be rewritten at will.
+	if err := checkDocumentOwner(path, fi); err != nil {
+		return nil, err
+	}
+	// And the parent directory decides who may replace the file, since the writer
+	// installs it by rename (see WriteDocument). A 0644 document in a 0777 directory is
+	// world-writable in every sense that matters.
+	if err := checkDocumentDir(path); err != nil {
+		return nil, err
+	}
 
-	data, err := os.ReadFile(path)
+	data, err := io.ReadAll(io.LimitReader(f, maxDocumentBytes))
 	if err != nil {
 		return nil, fmt.Errorf("read desired-state document: %w", err)
 	}
@@ -123,11 +146,88 @@ func LoadDocument(path string) (*Document, error) {
 	if err := dec.Decode(doc); err != nil {
 		return nil, fmt.Errorf("parse desired-state document %s: %w", path, err)
 	}
+	if err := rejectExtraDocuments(dec, path); err != nil {
+		return nil, err
+	}
 
 	if err := doc.Validate(); err != nil {
 		return nil, fmt.Errorf("desired-state document %s: %w", path, err)
 	}
 	return doc, nil
+}
+
+// maxGeneratedAtSkew is how far in the future generatedAt may be before it is rejected.
+// Generous enough for clock skew between the onboarding host and this one, far short of
+// the days-or-years a value would need to silence the staleness alarm.
+const maxGeneratedAtSkew = 15 * time.Minute
+
+// maxDocumentBytes bounds a document read. A desired-state document for even a few
+// thousand names is far below this; the cap is here so a runaway generator cannot make
+// the daemon allocate without limit.
+const maxDocumentBytes = 16 << 20
+
+// openDocumentFile opens the document for reading, refusing to follow a symlink.
+//
+// O_NOFOLLOW makes the symlink refusal a property of the open call rather than of a
+// separate Lstat that a concurrent writer can invalidate between the two.
+func openDocumentFile(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EMLINK) {
+			return nil, fmt.Errorf("the desired-state document %s is a symlink; refusing to follow it -- point the config at the real file", path)
+		}
+		return nil, fmt.Errorf("open desired-state document %s: %w", path, err)
+	}
+	return f, nil
+}
+
+// checkDocumentOwner requires the document to be owned by the account running wecert.
+//
+// On platforms without POSIX ownership the check is skipped: the alternative is refusing
+// to run at all, and the mode-bit checks above still apply.
+func checkDocumentOwner(path string, fi os.FileInfo) error {
+	uid, ok := fileOwnerUID(fi)
+	if !ok {
+		return nil
+	}
+	if uid != uint32(os.Geteuid()) {
+		return fmt.Errorf(
+			"the desired-state document %s is owned by uid %d but wecert runs as uid %d; "+
+				"whoever owns the file can rewrite which domains are served",
+			path, uid, os.Geteuid())
+	}
+	return nil
+}
+
+// checkDocumentDir rejects a document whose parent directory is group- or world-writable.
+//
+// WriteDocument installs the file by rename, so the directory's permissions -- not the
+// file's -- are what decide whether someone else can replace its contents with their own.
+func checkDocumentDir(path string) error {
+	dir := filepath.Dir(path)
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat the desired-state document's directory %s: %w", dir, err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf(
+			"the directory holding the desired-state document (%s) is group- or world-writable (%04o); "+
+				"anyone who can write it can replace the document, which decides which domains are served",
+			dir, perm)
+	}
+	return nil
+}
+
+// rejectExtraDocuments fails when the input holds more than one YAML document.
+func rejectExtraDocuments(dec *yaml.Decoder, path string) error {
+	var extra any
+	if err := dec.Decode(&extra); err == nil {
+		return fmt.Errorf("%s contains more than one YAML document (a stray '---'?); "+
+			"everything after the first document would be ignored, so it is rejected instead", path)
+	} else if !errors.Is(err, io.EOF) {
+		return fmt.Errorf("parse desired-state document %s: %w", path, err)
+	}
+	return nil
 }
 
 // Validate checks the document envelope, the certificate list and Name stability.
@@ -140,6 +240,21 @@ func (d *Document) Validate() error {
 	}
 	if d.GeneratedAt.IsZero() {
 		return errors.New("generatedAt is required: without it there is no way to tell a fresh document from one the onboarding component stopped updating weeks ago")
+	}
+	// A future timestamp is not a harmless clock skew: the staleness alarm is
+	// "time.Since(generatedAt) > maxStaleness", so a date far enough ahead makes that
+	// comparison false forever. It is the one signal this architecture has for "the
+	// onboarding component died and no new name will ever be picked up", and a
+	// machine-written field that a human can edit must not be able to switch it off
+	// silently -- especially since Revision deliberately covers only the certificates, so
+	// changing generatedAt alone trips no other check.
+	//
+	// A little slack is allowed for clock skew between the generator and this process.
+	if skew := time.Until(d.GeneratedAt); skew > maxGeneratedAtSkew {
+		return fmt.Errorf(
+			"generatedAt (%s) is %s in the future; that would disable the document staleness alarm, "+
+				"so it is rejected (allow at most %s of clock skew)",
+			d.GeneratedAt.UTC().Format(time.RFC3339), skew.Round(time.Minute), maxGeneratedAtSkew)
 	}
 
 	// An empty document is always rejected.

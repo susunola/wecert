@@ -2,6 +2,145 @@
 
 ## Unreleased
 
+### Fixed
+
+- `UploadCertificate` now reads `RepeatCertId`. The SDK documents that once the same
+  certificate has been uploaded more than 5000 times the API ignores `Repeatable=true` and
+  returns the existing copy's ID there instead of creating another one; reading only
+  `CertificateId` turned that into "UploadCertificate returned no CertificateId", an error that
+  names neither the cause nor the fix. The duplicate's ID is the same certificate, so it is a
+  usable answer.
+
+### Added
+
+- **Periodic, consistent snapshots of `state.db`** (`stateBackup`, on by default: 24h
+  interval, 7 kept, beside the database). They use `VACUUM INTO`, not a file copy — the
+  database runs in WAL mode, so a copy of `state.db` alone can miss the order URL committed
+  seconds earlier, which is the one thing a backup exists to recover. Snapshots are written
+  `0600` (they hold the account key and every certificate private key) and pruned newest-first.
+  Until now the only guidance was a README line calling it "the one thing to back up", with
+  nothing implementing or checking it.
+- **`docs/recovery.md`**: what is in `state.db` and what each loss costs, how to restore a
+  snapshot and verify it before starting, what happens when there is no snapshot (including
+  the rate-limit consequence), and how to roll a certificate back using the archived material.
+- `wecert-preflight`'s `-prune-certs` documentation now states that it bypasses the
+  server-side reference check on purpose. (Earlier in this release.)
+
+### Fixed
+
+- A **corrupt or truncated `state.db`** now fails with an actionable error naming the file and
+  pointing at `docs/recovery.md`, instead of a raw SQLite code ("database disk image is
+  malformed (11)") from whichever statement happened to touch it first. The check is
+  `PRAGMA quick_check`, run before any migration.
+- **Losing `state.db` no longer passes silently.** If the file is absent while its lock file
+  exists — which is what a deleted or lost database looks like, and never a first install —
+  wecert warns loudly at startup that the ACME account key and every in-flight order are gone
+  and that orders will be re-placed into the exact-set limit.
+- **A retired certificate keeps its key material.** `retired_certificates` used to hold only
+  the CertId while the private key was overwritten in the `certificates` row at the moment of
+  renewal, so "kept for rollback" meant "whatever the cloud still has": once the retention
+  period expired and the reaper deleted the cloud copy, there was nothing left to re-upload.
+  The fullchain and key are now archived with the row, so the rollback is real, and they are
+  pruned with it. Existing databases gain the columns on upgrade; legacy rows keep NULL.
+
+### Security
+
+- `statePath` is escaped before it is placed in the SQLite DSN, and the 0600
+  permission contract is now enforced against the file the driver reports it
+  opened rather than against the configured string. A `?`, `#` or `%XX` in the
+  path is a DSN metacharacter, so SQLite opened a *truncated* path and created
+  it with the process umask (0644 on a default machine): the ACME account key
+  and every certificate private key landed in a world-readable `-wal` while
+  `chmod` tightened a zero-byte decoy, and a backup of `statePath` restored
+  nothing.
+- The desired-state document is opened with `O_NOFOLLOW`, validated as the file
+  that is actually read (owner included), and its parent directory must not be
+  group- or world-writable. The previous `Lstat`-then-`ReadFile` sequence left a
+  TOCTOU window, never checked the owner, and never looked at the directory --
+  which is what decides whether someone else can replace the document by rename.
+- The webhook auth limiter is swept on successful authentication as well as
+  failed ones, and has a hard ceiling on tracked addresses. It was only ever
+  collected from the failure path, so a burst of failed attempts left its
+  entries behind forever; an IPv6 /64 makes that unbounded.
+
+### Fixed
+
+- **The failure fallback no longer oscillates.** A successful issuance for the
+  reduced subset used to reset `consecutive_failures` and clear the identifier
+  ledger, the pre-expiry window was re-evaluated as "the danger is over" once a
+  fresh subset certificate moved `notAfter` months out, and the SAN-drift check
+  re-ordered the full set on every pass. The net effect was an order per backoff
+  window for the identifier set that was already known to be broken, which
+  exhausts Let's Encrypt's 5-per-exact-set/7-days quota within days. The
+  fallback now holds until the failure evidence ages out.
+- A degraded issuance keeps its failure evidence: `consecutive_failures` and the
+  per-identifier ledger survive a successful subset order, so the next pass can
+  still tell that something is broken.
+- `DeleteCertificate` is treated as what it is: `IsCheckResource=true` makes the
+  call asynchronous and returns a task ID, so the task is now polled through
+  `DescribeDeleteCertificatesTaskResult` and `DeleteResult` is honoured.
+  Reporting "accepted" as "deleted" made `ReapRetired` drop its reclaim record
+  and leak the certificate forever -- including the case the resource check
+  exists for, which arrives asynchronously as status 4.
+- `Deploy` no longer reports a partial rebind as success. Its recovery path
+  ("is the new certificate already bound?") ran for every failure, and a
+  half-migrated fleet has some listener on the new certificate, so the answer
+  was yes and the remaining listeners were never revisited. That path now runs
+  only for the "nothing was bound to the old certificate" verdict.
+- An in-progress update task is no longer adopted as this deploy's outcome.
+  `DeployStatus == 0` means the request created nothing and the returned record
+  ID belongs to someone else's task; that task is now waited on and then
+  verified against *this* certificate before success is reported.
+- The CAM policies gain the three `ssl:*` actions the runtime actually calls
+  (`DescribeHostUpdateRecordDetail` on every rebind, `CreateCertificateBindResourceSyncTask`
+  and `DescribeCertificateBindResourceTaskResult` behind the `deployed` metric)
+  and drop the unused `ssl:DescribeCertificate`. A least-privilege role built
+  from the old files failed every rebind. **If you built a role from these
+  files, reapply them.**
+- `renewBefore` at or beyond the profile's validity is rejected: it puts the
+  renewal instant in the past from issuance, and ARI only hides that until ARI
+  is unavailable, at which point every pass re-orders the same set.
+- A `{"cert": ""}` (or `"cert": null`) trigger is rejected with 400 instead of
+  widening into a full-fleet convergence, matching the existing `certs` guard.
+  This is the shape a CI job produces when it templates an unset `$CERT`.
+- A second YAML document in the config or the desired-state document is rejected
+  rather than silently ignored.
+- A `generatedAt` in the future is rejected: it made `time.Since` negative and
+  disabled the document staleness alarm permanently, and `Revision` does not
+  cover the envelope, so nothing else noticed.
+- Two certificates asking for the same identifier set are rejected in every
+  mode. The desired-state path already refused them; static and observe mode
+  accepted them, sharing one quota bucket for no benefit.
+- Negative `failureFallback` counts are rejected instead of being silently
+  replaced by the defaults.
+- A multi-certificate webhook trigger resolves the desired state once instead of
+  once per name (a file read, a YAML decode, a validation and a hash each time,
+  inside a 15s request).
+- Onboarding: declarations excluded by guard 1 no longer dictate the group's
+  profile/keyType/deploy -- one excluded declaration silently moved a served
+  certificate onto a different profile, and two that disagreed froze the whole
+  round. Guard 1 also checks the names a declaration contributes rather than the
+  bare hostname, so a wildcard declaration served by a wildcard rule is no
+  longer rejected.
+- `install.sh` creates the state directory, so the `-dry-run` step the installer
+  itself prescribes can run as the `wecert` user; previously it failed with a
+  permission error, and the `sudo` workaround created `state.db` as root and
+  made the service crash-loop. It also fails loudly when no systemd unit was
+  found instead of telling the operator to enable one that does not exist.
+- The metrics server gets read/write/idle timeouts, matching the webhook server.
+- Per-host probe metric series are reclaimed when a host is no longer probed.
+  `DeleteProbeSeries` existed with no caller, so a certificate leaving the
+  desired state left `wecert_certificate_probe_match{host}` frozen forever --
+  and the documentation says to alert on that being 0.
+- Observe mode exposes `wecert_desired_state_shadow_errors_total` and
+  `wecert_desired_state_shadow_last_read_timestamp_seconds`. A shadow read
+  failure used to leave the diff gauge at its previous value (often 0) while
+  nothing was compared, and its own help text tells operators to gate the switch
+  to enforce on that 0.
+- The webhook per-name path and the probe-series reclamation are covered by
+  tests; so are the fallback hold, both deploy failure paths, the async delete,
+  the `UpdateCert` contract, and the document trust checks.
+
 ### Security
 
 - The challenge-lease registry is re-seeded from the state store before any
