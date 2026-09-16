@@ -566,6 +566,7 @@ The two providers use completely different credentials. Don't mix them up.
 | `ttl` | no | `600` | TTL for the `_acme-challenge` TXT record. **600 is the floor on DNSPod's free tier** — configuring 60 is rejected with `LimitExceeded.RecordTtlLimit`. Paid tiers can go lower to speed up propagation and cleanup. |
 | `propagationTimeout` | no | `5m` | Upper bound on waiting for all authoritative nameservers to see the record |
 | `pollingInterval` | no | `5s` | Interval between propagation probes |
+| `recursiveNameservers` | no | `/etc/resolv.conf` | Trusted recursive resolver IPs, optionally with ports, used consistently for CNAME, SOA and NS discovery. The TXT check itself still queries the discovered authoritative NS directly and requires an authoritative (`AA`) response. Set this in split-horizon/VPN environments to avoid mixing resolver views. |
 
 #### Strongly recommended: `_acme-challenge` CNAME delegation
 

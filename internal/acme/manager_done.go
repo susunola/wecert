@@ -88,6 +88,14 @@ func (m *Manager) download(
 		}
 		deployedID = id
 		rebound = oldDeployedID != ""
+	} else {
+		// A local-only renewal must never inherit "deployed" from an older
+		// configuration. The old cloud certificate may still exist, but it is
+		// not this newly issued certificate; retaining its ID and confirmation
+		// makes metrics green and causes the network probe to compare against a
+		// stale certificate.
+		deployedID = ""
+		st.DeployConfirmed = false
 	}
 
 	ariCertID, err := CertID(leaf)

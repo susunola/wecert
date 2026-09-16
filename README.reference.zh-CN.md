@@ -594,6 +594,7 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 | `ttl` | 否 | `600` | `_acme-challenge` TXT 记录的 TTL。**600 是 DNSPod 免费套餐的下限** —— 配 60 会被 `LimitExceeded.RecordTtlLimit` 拒绝。付费套餐可以调低以加快传播与清理。 |
 | `propagationTimeout` | 否 | `5m` | 等待全部权威 NS 可见该记录的上限 |
 | `pollingInterval` | 否 | `5s` | 传播探测的间隔 |
+| `recursiveNameservers` | 否 | `/etc/resolv.conf` | 可信递归 DNS 的 IP（可带端口），统一用于 CNAME、SOA 与 NS 委派发现。TXT 仍直接查询发现的权威 NS，且必须带权威（`AA`）响应。在 split-horizon / VPN 环境中配置它，避免混用不同的 DNS 视图。 |
 
 #### 强烈建议：`_acme-challenge` CNAME 委派
 

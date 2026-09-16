@@ -812,10 +812,11 @@ func (r *run) build() {
 			return
 		}
 
-		// Use the declared metadata when the whole group agrees on it, otherwise keep
-		// the default and leave a record. Letting one subdomain's declaration quietly
-		// retune the whole certificate is the kind of change nobody can explain later.
-		profile, keyType, deploy := r.groupSettings(g)
+		profile, keyType, deploy, err := r.groupSettings(g)
+		if err != nil {
+			r.overSettingsConflict(g, err)
+			continue
+		}
 
 		r.certs = append(r.certs, config.Certificate{
 			Name:    g.Name,
@@ -887,24 +888,51 @@ func (r *run) previousCert(name string) *config.Certificate {
 }
 
 // groupSettings aggregates the metadata of the declarations in a group.
-func (r *run) groupSettings(g group.Group) (profile, keyType string, deploy bool) {
+func (r *run) groupSettings(g group.Group) (profile, keyType string, deploy bool, err error) {
 	profile, keyType, deploy = r.o.opts.Profile, r.o.opts.KeyType, r.o.opts.Deploy
+	var profileSet, keyTypeSet, deploySet bool
 
 	for _, d := range r.declarations {
 		if group.RegisteredDomain(d.Hostname) != g.Registered {
 			continue
 		}
 		if d.Profile != "" {
+			if profileSet && profile != d.Profile {
+				return "", "", false, fmt.Errorf("conflicting profile declarations %q and %q", profile, d.Profile)
+			}
 			profile = d.Profile
+			profileSet = true
 		}
 		if d.KeyType != "" {
+			if keyTypeSet && keyType != d.KeyType {
+				return "", "", false, fmt.Errorf("conflicting keyType declarations %q and %q", keyType, d.KeyType)
+			}
 			keyType = d.KeyType
+			keyTypeSet = true
 		}
 		if d.Deploy != nil {
+			if deploySet && deploy != *d.Deploy {
+				return "", "", false, fmt.Errorf("conflicting deploy declarations %t and %t", deploy, *d.Deploy)
+			}
 			deploy = *d.Deploy
+			deploySet = true
 		}
 	}
-	return profile, keyType, deploy
+	return profile, keyType, deploy, nil
+}
+
+func (r *run) overSettingsConflict(g group.Group, cause error) {
+	if prev := r.previousCert(g.Name); prev != nil {
+		r.certs = append(r.certs, *prev)
+		for _, n := range append(append([]string(nil), g.Names...), g.Wildcards...) {
+			r.rep.Decisions = append(r.rep.Decisions, spec.Decision{Hostname: n, Included: true, Certificate: g.Name, Reason: fmt.Sprintf("kept at the previous revision: %v", cause)})
+		}
+		r.rep.CarriedForward += len(g.Names) + len(g.Wildcards)
+		return
+	}
+	for _, n := range append(append([]string(nil), g.Names...), g.Wildcards...) {
+		r.reject(n, fmt.Sprintf("cannot choose group-level certificate settings: %v", cause))
+	}
 }
 
 // budget is §5.4: the quota fuse.
