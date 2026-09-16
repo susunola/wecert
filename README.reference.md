@@ -597,6 +597,7 @@ Optional. Omit it and wecert only converges on the timer.
 | `listen` | *(empty — disabled)* | Address for the trigger endpoint |
 | `token` | — | **Required when `listen` is set**, minimum 16 characters |
 | `notifyURL` | *(empty)* | Optional outbound event target |
+| `notifySecret` | *(empty)* | Optional HMAC key for outbound events, minimum 32 characters. Without `notifyURL` it is a config error |
 
 The trigger endpoint performs **real issuance** and consumes Let's Encrypt rate-limit quota, so it is never allowed to run unauthenticated. A token shorter than 16 characters is rejected at config load: on this endpoint a weak token is the same as no token.
 
@@ -622,6 +623,8 @@ The trigger body is optional. Omit it to converge everything:
 {"cert": "example-com"}             // one
 {"certs": ["a-com", "b-com"]}       // several
 ```
+
+`"certs": []` and `"certs": null` ask for nothing and are rejected with `400` rather than widened into a full convergence — a Go caller marshalling a nil `[]string` sends `null`, and quietly issuing for the whole fleet is not what it asked for.
 
 It answers `202 Accepted` — not `200` — because convergence is handed to the background and can take minutes (DNS propagation). Waiting would blow up the caller's timeout.
 
@@ -658,6 +661,14 @@ With `notifyURL` set, every renewal attempt emits:
 ```
 
 `result` is `ok` or `error` (with an `error` field). Delivery is **asynchronous and best-effort**: a slow or dead notification target must never slow down renewal — that is the same class of coupling error as one certificate's failure blocking the others.
+
+The notify target is usually an endpoint that other traffic can reach too, so authenticity is opt-in via `notifySecret`. When it is set, every request carries:
+
+```
+X-Wecert-Signature: sha256=<hex HMAC-SHA256 of the raw request body>
+```
+
+Compute the HMAC over the exact bytes received, not a re-serialised copy of the JSON — key order and whitespace are not part of the contract. A secret shorter than 32 characters is rejected at config load: an HMAC key that short can be recovered from a single signed event, which would make the signature decorative.
 
 ### `desiredState`
 

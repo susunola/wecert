@@ -1,10 +1,12 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +19,13 @@ import (
 func TestLocalOnlyRenewalClearsDeploymentStateWithoutRetiringLiveCloudCert(t *testing.T) {
 	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
 	cert.Deploy.Enabled = false
+
+	// The ID of the certificate that is being left behind is the only local record that
+	// it exists, and nothing else in the system will mention it again. Capture the log so
+	// "it was dropped" cannot regress into "it vanished".
+	var logs bytes.Buffer
+	m.log = slog.New(slog.NewTextHandler(&logs, nil))
+
 	oldExpiry, newExpiry := time.Now().Add(24*time.Hour), time.Now().Add(90*24*time.Hour)
 	st := &state.CertState{Name: cert.Name, NotAfter: oldExpiry, CertURL: "https://ca.test/old", CertPEM: selfSignedCertPEM(t, oldExpiry, "example.com"), KeyPEM: []byte("old-key"), DeployedCertID: "cloud-old", DeployConfirmed: true}
 	if err := store.PutCert(st); err != nil {
@@ -51,6 +60,9 @@ func TestLocalOnlyRenewalClearsDeploymentStateWithoutRetiringLiveCloudCert(t *te
 	}
 	if len(retired) != 0 {
 		t.Fatalf("the old cloud certificate may still be bound, so local-only renewal must not retire it: %+v", retired)
+	}
+	if !strings.Contains(logs.String(), "cloud-old") {
+		t.Errorf("the ID of the certificate that is left behind must be logged, got:\n%s", logs.String())
 	}
 }
 
