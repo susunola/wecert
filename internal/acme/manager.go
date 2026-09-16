@@ -262,9 +262,23 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 			"cert", c.Name, "detail", detail,
 			"note", "an order after a domain-set change does not count as a same-name renewal and will consume "+
 				"the Certificates per Registered Domain quota (50 per 7 days, shared across accounts)")
-		// Still pass replaces: its semantics really are "replace this one", and lego
-		// automatically drops it and retries once when the server answers alreadyReplaced.
-		return m.issue(ctx, c, st, st.ARICertID)
+		// replaces is deliberately **not** sent here, unlike on a renewal.
+		//
+		// ARI's `replaces` means "this order replaces that certificate", and the CA
+		// compares the two identifier sets. Let's Encrypt answers
+		// `malformed: Could not validate ARI 'replaces' field: identifiers in this
+		// order do not match any identifiers in the certificate being replaced` when
+		// they do not overlap at all -- and that error comes back from newOrder, so no
+		// order is created and every later round sends the same replaces and fails the
+		// same way. Changing a certificate to a wholly different domain set (moving a
+		// name between certificates, or migrating a service) would then never issue
+		// again, which is the worst failure this system can have.
+		//
+		// It would also buy nothing: the ARI exemption applies to renewals of the
+		// *same* identifier set, and a changed set is a different bucket anyway -- as
+		// the note above says, this order consumes the per-registered-domain quota
+		// regardless. So send no replaces and let the order succeed.
+		return m.issue(ctx, c, st, "")
 	}
 
 	// Certificate exists -> decide whether renewal is due.
