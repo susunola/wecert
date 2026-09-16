@@ -374,11 +374,11 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <text class="elab" x="1014" y="202" text-anchor="middle">部署</text>
 
     <!-- 底部注释带 -->
-    <rect x="24" y="452" width="1180" height="112" rx="10" fill="#ecebe5" stroke="var(--rule)"/>
-    <foreignObject x="24" y="452" width="1180" height="112">
+    <rect x="24" y="432" width="1180" height="176" rx="10" fill="#ecebe5" stroke="var(--rule)"/>
+    <foreignObject x="24" y="432" width="1180" height="176">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:12.5px">
-        同一个 DNS zone 既放<b>声明</b>（输入）也放 <code>_acme-challenge</code> 挑战记录（机制）——
-        谁能写这个 zone，谁本来就能为其中任何名字做 DNS-01 验证，<b>把声明放这里没有引入新的信任边界</b>。
+        <span>同一个 DNS zone 既放<b>声明</b>（输入）也放 <code>_acme-challenge</code> 挑战记录（机制）——
+        谁能写这个 zone，谁本来就能为其中任何名字做 DNS-01 验证，<b>把声明放这里没有引入新的信任边界</b>。</span>
         <span class="s">挑战回环的时序见 <a href="#dns01" style="color:inherit">图 ⑤</a></span>
         <span class="s" style="margin-top:5px">另外，每一轮都会<b>拨一个真实的 TLS 连接</b>读回对端实际出示的证书，比对"在服务的"和"部署的" ——
         这是唯一不信任云控制面的证据，因为换绑是异步的、SNI 上也可能有另一张证书在赢。<code>wecert-probe</code></span>
@@ -939,7 +939,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 
     <rect class="bx" x="120" y="116" width="250" height="56" rx="6"/>
     <foreignObject x="120" y="116" width="250" height="56">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">上传 SSL + <b>人工绑一次</b> → deploy_confirmed=1</div>
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px"><span>上传 SSL + <b>人工绑一次</b> → deploy_confirmed=1</span></div>
     </foreignObject>
     <path class="edge" d="M150 120 V110"/>
 
@@ -965,10 +965,10 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <line x1="817" y1="386" x2="817" y2="392" stroke="var(--rule-2)"/>
 
     <!-- 说明 -->
-    <rect x="90" y="332" width="700" height="50" rx="6" fill="#ecebe5" stroke="var(--rule)"/>
-    <foreignObject x="90" y="332" width="700" height="50">
+    <rect x="90" y="330" width="700" height="58" rx="6" fill="#ecebe5" stroke="var(--rule)"/>
+    <foreignObject x="90" y="330" width="700" height="58">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">
-        到期告警应当基于 <code>not_after</code>，<b>不是</b>基于"续期任务有没有报错"—— 后者会在程序静默失效时保持沉默。
+        <span>到期告警应当基于 <code>not_after</code>，<b>不是</b>基于"续期任务有没有报错"—— 后者会在程序静默失效时保持沉默。</span>
       </div>
     </foreignObject>
   </svg>
