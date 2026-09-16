@@ -163,8 +163,11 @@ type Options struct {
 	BudgetWindow time.Duration
 	Budget       int
 
-	// Force skips the abrupt-change fuse, the quota budget and the deletion grace
-	// period, writing exactly what this round computed.
+	// Force skips the abrupt-change fuse, the quota budget, the deletion grace period
+	// AND the "is a CLB rule still referencing this name?" check, writing exactly what
+	// this round computed. The reference check is the last thing standing between this
+	// flag and removing a name that is still being served, so it is named in the flag
+	// help as well as here.
 	//
 	// It exists to give "yes, I really did cause this drop" an escape hatch. But it
 	// must be an explicit human action -- automation must never carry it, or the gate
@@ -426,6 +429,17 @@ type run struct {
 
 	// eligible is the expanded name set that passed the allowlist and the guards.
 	eligible map[string]bool
+
+	// accepted records which declarations of this round contributed an eligible name.
+	//
+	// groupSettings aggregates profile/keyType/deploy per registered domain, and it must
+	// only look at declarations that actually survived the guards: one excluded by guard 1
+	// was excluded precisely because nothing serves it, so letting it dictate the group's
+	// settings contradicts the decision the report just announced. That is not merely
+	// cosmetic -- a single excluded declaration silently moved a served certificate onto a
+	// different profile, and two excluded ones with different profiles froze the whole
+	// round with "the desired state came out empty".
+	accepted map[string]bool
 
 	// certs are the certificates computed this round, sorted by certificate name.
 	certs []config.Certificate
@@ -715,6 +729,7 @@ func (r *run) documentReflects(declared map[string]bool) bool {
 // the final set of names to cover.
 func (r *run) resolve() {
 	r.eligible = make(map[string]bool, len(r.declarations)*2)
+	r.accepted = make(map[string]bool, len(r.declarations))
 
 	for _, d := range r.declarations {
 		if !r.allowed(d.Hostname) {
@@ -725,20 +740,25 @@ func (r *run) resolve() {
 			continue
 		}
 
-		// Guard 1 applies to concrete names only: a wildcard declaration is about the
-		// subdomains, not about a rule domain, so demanding a rule named after it would
-		// mean it never passes.
+		// Guard 1: a declaration only counts when a CLB rule actually serves it.
 		//
-		// The lookup goes through servedByRule, not a flat map hit: a layer-7 rule
-		// domain may itself be a wildcard, and an exact comparison used to reject a
-		// name that *.example.com genuinely serves -- while referenced(), in the same
-		// file, treated that same rule as a reference. One predicate now, so the
-		// addition and deletion paths cannot disagree again.
-		if r.o.opts.RequireRule && !r.guardUnavailable && !r.servedByRule(d.Hostname) {
+		// The check is against the names the declaration contributes, not against
+		// Hostname alone. A wildcard declaration's subject is its subdomains, so asking
+		// whether a rule serves the bare Hostname rejects it even when *.Hostname is
+		// served -- which is the arrangement this guard exists to recognise, and the
+		// rejection froze the whole round when it was the only declaration.
+		//
+		// A concrete declaration contributes just its Hostname, so its behaviour is
+		// unchanged; the wildcard form additionally passes when the wildcard itself (or a
+		// rule covering it) is served. The servedByRule lookup deliberately asks about the
+		// expanded name as written, so a wildcard rule covers "*.example.com" and not the
+		// apex -- that asymmetry is real and is why both names are checked separately.
+		if r.o.opts.RequireRule && !r.guardUnavailable && !r.anyNameServed(d) {
 			r.reject(d.Hostname, "no CLB rule serves this name (guard 1 not satisfied)")
 			continue
 		}
 
+		r.accepted[d.Hostname] = true
 		for _, n := range d.Names() {
 			r.eligible[n] = true
 		}
@@ -748,6 +768,17 @@ func (r *run) resolve() {
 	// after parse in Run. Here we only look at names "present last round, ineligible
 	// now".
 	r.applyGrace()
+}
+
+// anyNameServed reports whether a CLB rule serves any of the names this declaration
+// contributes. See the guard-1 comment in resolve.
+func (r *run) anyNameServed(d *Declaration) bool {
+	for _, n := range d.Names() {
+		if r.servedByRule(n) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *run) allowed(hostname string) bool {
@@ -991,11 +1022,18 @@ func (r *run) previousCert(name string) *config.Certificate {
 }
 
 // groupSettings aggregates the metadata of the declarations in a group.
+//
+// Only declarations that survived the guards contribute: see run.accepted.
 func (r *run) groupSettings(g group.Group) (profile, keyType string, deploy bool, err error) {
 	profile, keyType, deploy = r.o.opts.Profile, r.o.opts.KeyType, r.o.opts.Deploy
 	var profileSet, keyTypeSet, deploySet bool
 
 	for _, d := range r.declarations {
+		if !r.accepted[d.Hostname] {
+			// Excluded this round (allowlist or guard 1). Its settings must not leak onto
+			// names it is not part of.
+			continue
+		}
 		if group.RegisteredDomain(d.Hostname) != g.Registered {
 			continue
 		}

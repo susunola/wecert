@@ -37,6 +37,8 @@ type Fallback struct {
 // This ledger is the only input to "pre-expiry fallback": without it, fallback could
 // only drop names at random, and dropping at random sacrifices names that were fine.
 func (s *Store) RecordIdentifierFailure(certName, identifier, errMsg string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`
 		INSERT INTO identifier_failures (cert_name, identifier, failures, last_error, last_failed_at)
 		VALUES (?, ?, 1, ?, ?)
@@ -54,6 +56,8 @@ func (s *Store) RecordIdentifierFailure(certName, identifier, errMsg string, now
 // ListIdentifierFailures returns the failure records for every identifier under one
 // certificate, sorted by identifier so identical input yields identical output.
 func (s *Store) ListIdentifierFailures(certName string) ([]*IdentifierFailure, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	rows, err := s.db.Query(`
 		SELECT cert_name, identifier, failures, last_error, last_failed_at
 		FROM identifier_failures WHERE cert_name = ? ORDER BY identifier`, certName)
@@ -81,6 +85,8 @@ func (s *Store) ListIdentifierFailures(certName string) ([]*IdentifierFailure, e
 // lately", not "who has ever been broken". Keeping it around would let a long-fixed
 // fault keep a name dropped out forever.
 func (s *Store) ClearIdentifierFailures(certName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, err := s.db.Exec(`DELETE FROM identifier_failures WHERE cert_name = ?`, certName); err != nil {
 		return fmt.Errorf("clear identifier failures for %s: %w", certName, err)
 	}
@@ -94,6 +100,8 @@ func (s *Store) ClearIdentifierFailures(certName string) error {
 // authorizations will never be attempted again and there will never be a "success" that
 // clears them.
 func (s *Store) PruneIdentifierFailures(certName string, now time.Time, age time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	cutoff := now.Add(-age)
 	if _, err := s.db.Exec(`
 		DELETE FROM identifier_failures WHERE cert_name = ? AND last_failed_at < ?`,
@@ -104,7 +112,15 @@ func (s *Store) PruneIdentifierFailures(certName string, now time.Time, age time
 }
 
 // PutFallback records fallback state.
+//
+// An existing record keeps its original `since`: the field means "when did this
+// certificate start serving a reduced name set", and the manager now re-writes the row
+// on every degraded pass. Letting the upsert refresh it would make "degraded for three
+// days" unanswerable, which is exactly the question an operator asks when the fallback
+// metric goes off.
 func (s *Store) PutFallback(f *Fallback) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	dropped := append([]string(nil), f.Dropped...)
 	sort.Strings(dropped)
 
@@ -113,7 +129,7 @@ func (s *Store) PutFallback(f *Fallback) error {
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(cert_name) DO UPDATE SET
 			dropped = excluded.dropped,
-			since   = excluded.since,
+			since   = cert_fallback.since,
 			reason  = excluded.reason`,
 		f.CertName, strings.Join(dropped, ","), f.Since.Unix(), truncate(f.Reason, maxLastErrorBytes))
 	if err != nil {
@@ -124,6 +140,8 @@ func (s *Store) PutFallback(f *Fallback) error {
 
 // GetFallback reads fallback state; returns (nil, nil) when there is no record.
 func (s *Store) GetFallback(certName string) (*Fallback, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	row := s.db.QueryRow(`
 		SELECT cert_name, dropped, since, reason FROM cert_fallback WHERE cert_name = ?`, certName)
 
@@ -149,6 +167,8 @@ func (s *Store) GetFallback(certName string) (*Fallback, error) {
 
 // ClearFallback clears fallback state. Called when the full set issues successfully.
 func (s *Store) ClearFallback(certName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, err := s.db.Exec(`DELETE FROM cert_fallback WHERE cert_name = ?`, certName); err != nil {
 		return fmt.Errorf("clear fallback for %s: %w", certName, err)
 	}

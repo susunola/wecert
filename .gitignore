@@ -29,3 +29,13 @@ terraform.tfvars
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Go build outputs. `go build ./cmd/x/` in the repository root drops the binary here (the
+# path, not just the name, is what those two entries above miss), and a 12 MB arm64 binary
+# was once committed by exactly that accident.
+/wecert
+/wecert-probe
+/wecert-onboard
+/clbverify
+/tatrun
+/preflight
