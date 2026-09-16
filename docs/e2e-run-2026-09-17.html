@@ -69,7 +69,7 @@
     <h1>真实 E2E 实跑报告</h1>
     <p class="framing">不是单元测试的汇总，而是一轮可复现的端到端实跑：真实的 ACME 服务端、真实的权威 DNS 服务（53 端口）、真实的 DNS-01 记录写入与回读、真实签发的证书；以及这套环境里<strong>跑不了</strong>的部分，和它们各自需要什么才能跑。</p>
     <div class="metabar">
-      <span><b>开始</b> 2026-09-17 01:47 UTC</span>
+      <span><b>开始</b> 2026-09-17 01:51 UTC</span>
       <span><b>用例</b> 7 通过 / 0 失败</span>
       <span><b>未跑</b> 4 项（附原因与命令）</span>
       <span><b>宿主</b> macOS-26.6.2-arm64-arm-64bit-Mach-O</span>
@@ -96,37 +96,37 @@
   <h2>套件结果<span class="zh">suites</span></h2>
   <div class="tablebox"><table>
     <tr><th>套件</th><th>结论</th><th>耗时</th><th>覆盖什么</th></tr>
-      <tr><td class="mono">TestRealDNS01Lifecycle</td><td><span class="badge pass">通过</span></td><td class="num">26s</td><td class="muted">real ACME server + real authoritative DNS on :53 + real solver + real propagation check</td></tr>      <tr><td class="mono">TestPebble (order protocol)</td><td><span class="badge pass">通过</span></td><td class="num">4s</td><td class="muted">account/key binding, authorization polling, CSR finalize, chain download against the same real ACME server</td></tr>      <tr><td class="mono">test-e2e-wildcard.sh</td><td><span class="badge pass">通过</span></td><td class="num">22s</td><td class="muted">the shared apex/wildcard _acme-challenge name, against a canned resolver</td></tr>
+      <tr><td class="mono">TestRealDNS01Lifecycle</td><td><span class="badge pass">通过</span></td><td class="num">30s</td><td class="muted">real ACME server + real authoritative DNS on :53 + real solver + real propagation check</td></tr>      <tr><td class="mono">TestPebble (order protocol)</td><td><span class="badge pass">通过</span></td><td class="num">6s</td><td class="muted">account/key binding, authorization polling, CSR finalize, chain download against the same real ACME server</td></tr>      <tr><td class="mono">test-e2e-wildcard.sh</td><td><span class="badge pass">通过</span></td><td class="num">22s</td><td class="muted">the shared apex/wildcard _acme-challenge name, against a canned resolver</td></tr>
   </table></div>
 
   <h2>用例结果<span class="zh">cases</span></h2>
   <p class="lede">每条用例都是对一个可再生故障的断言，不是"跑通了"。失败会让整轮退出码非零，所以这份报告不可能在红的运行上显示成绿的。</p>
       <div class="card good">
-        <div class="t"><span class="n">issue-over-real-validation</span><span class="badge pass">通过</span><span class="d">3.08s</span></div>
+        <div class="t"><span class="n">issue-over-real-validation</span><span class="badge pass">通过</span><span class="d">3.12s</span></div>
         <p class="what">Place an order, write the challenge records through the real solver, wait for the real propagation check, and let a real ACME server validate them over DNS and sign the certificate.</p>
-        <ul class="ev"><li>propagation probe queried TXT _acme-challenge.a.e2e.example.com over UDP</li><li>propagation probe queried TXT _acme-challenge.b.e2e.example.com over UDP</li><li>issued 2026-09-16T17:47:15Z..2026-12-15T17:47:14Z, 2 SAN(s)</li><li>issuer &quot;Pebble Intermediate CA 1fa43d&quot;</li><li>challenge records cleaned up: none left in the zone</li></ul>
+        <ul class="ev"><li>propagation probe queried TXT _acme-challenge.a.e2e.example.com over UDP</li><li>propagation probe queried TXT _acme-challenge.b.e2e.example.com over UDP</li><li>issued 2026-09-16T17:51:08Z..2026-12-15T17:51:07Z, 2 SAN(s)</li><li>issuer &quot;Pebble Intermediate CA 740117&quot;</li><li>challenge records cleaned up: none left in the zone</li></ul>
       </div>      <div class="card good">
         <div class="t"><span class="n">second-pass-places-no-order</span><span class="badge pass">通过</span><span class="d">0.00s</span></div>
         <p class="what">Reconcile again immediately: a fresh certificate must not be reissued, and the ARI window must have been recorded so the next renewal is CA-coordinated.</p>
-        <ul class="ev"><li>notAfter unchanged: 2026-12-15T17:47:14Z</li><li>ARI window recorded at 2026-09-16T17:47:18Z</li></ul>
+        <ul class="ev"><li>notAfter unchanged: 2026-12-15T17:51:07Z</li><li>ARI window recorded at 2026-09-16T17:51:11Z</li></ul>
       </div>      <div class="card good">
-        <div class="t"><span class="n">domain-drift-reissues</span><span class="badge pass">通过</span><span class="d">3.12s</span></div>
+        <div class="t"><span class="n">domain-drift-reissues</span><span class="badge pass">通过</span><span class="d">3.15s</span></div>
         <p class="what">Add a name to the certificate and reconcile: the SAN set is the desired state, so it must reissue at once instead of waiting for the renewal window.</p>
         <ul class="ev"><li>reissued for a.e2e.example.com, b.e2e.example.com, c.e2e.example.com</li></ul>
       </div>      <div class="card good">
-        <div class="t"><span class="n">wildcard-and-apex-share-one-name</span><span class="badge pass">通过</span><span class="d">3.10s</span></div>
+        <div class="t"><span class="n">wildcard-and-apex-share-one-name</span><span class="badge pass">通过</span><span class="d">3.06s</span></div>
         <p class="what">A wildcard and its apex hash to the same _acme-challenge name, so both values must be up at the same time: write all, verify all, and only then let the CA validate.</p>
         <ul class="ev"><li>_acme-challenge.e2e.example.com. held 2 values simultaneously</li><li>issued for e2e.example.com, *.e2e.example.com</li></ul>
       </div>      <div class="card good">
-        <div class="t"><span class="n">tlsserver-profile-issuance</span><span class="badge pass">通过</span><span class="d">3.11s</span></div>
+        <div class="t"><span class="n">tlsserver-profile-issuance</span><span class="badge pass">通过</span><span class="d">3.07s</span></div>
         <p class="what">Issue under the tlsserver profile: the new-order request must carry the profile name verbatim, and the certificate must come back with that profile&#x27;s 45-day validity instead of the 90-day classic default.</p>
-        <ul class="ev"><li>same CA, same run: the classic certificate e2e-basic lives 2159h59m59s against this one&#x27;s 1079h59m59s</li><li>the new-order request carried profile &quot;tlsserver&quot; verbatim</li><li>issued validity 1079h59m59s (2026-09-16T17:47:24Z..2026-10-31T17:47:23Z) against the configured validityPeriod of 3888000s</li><li>issuer &quot;Pebble Intermediate CA 1fa43d&quot;, 2 SAN(s), key matched to the stored private key</li><li>challenge records cleaned up: none left in the zone</li></ul>
+        <ul class="ev"><li>same CA, same run: the classic certificate e2e-basic lives 2159h59m59s against this one&#x27;s 1079h59m59s</li><li>the new-order request carried profile &quot;tlsserver&quot; verbatim</li><li>issued validity 1079h59m59s (2026-09-16T17:51:17Z..2026-10-31T17:51:16Z) against the configured validityPeriod of 3888000s</li><li>issuer &quot;Pebble Intermediate CA 740117&quot;, 2 SAN(s), key matched to the stored private key</li><li>challenge records cleaned up: none left in the zone</li></ul>
       </div>      <div class="card good">
-        <div class="t"><span class="n">automatic-renewal-of-a-tlsserver-certificate</span><span class="badge pass">通过</span><span class="d">6.24s</span></div>
+        <div class="t"><span class="n">automatic-renewal-of-a-tlsserver-certificate</span><span class="badge pass">通过</span><span class="d">6.19s</span></div>
         <p class="what">Issue a tlsserver certificate, let one pass record the CA&#x27;s ARI window, then move the clock to the instant that window implies and reconcile ONCE: the pass alone must place the order, validate over the test authority, promote the replacement and clean up after itself.</p>
-        <ul class="ev"><li>issued serial 6845824245814325119, valid 2026-09-16T17:47:27Z..2026-10-31T17:47:26Z</li><li>the pass inside the validity period recorded the CA&#x27;s window 2026-10-15T17:47:26Z..2026-10-17T17:47:26Z and did not renew</li><li>clock moved to 2026-10-17T03:40:53Z, the deterministic instant inside that window (14.6 days before expiry), while the local fallback for renewBefore=24h0m0s was 2026-10-30T20:06:45Z</li><li>one Reconcile then renewed it: serial 6845824245814325119 -&gt; 9103866484426919904, notAfter 2026-10-31T17:47:26Z -&gt; 2026-10-31T17:47:29Z, still 2 names</li><li>that pass read renewalInfo once and placed exactly 1 order, profile &quot;tlsserver&quot; and replaces=Wg4NrHOOpsNPxMrYt6hyv_8ph08.XwFA4X6E738</li><li>the renewal solved 2 of 2 names over the test authority (2 record write(s), 2 delete(s)); the zone&#x27;s live record set is empty afterwards</li><li>the outgoing certificate was not queued for reclamation: deploy is disabled, so no cloud certificate ID exists for it (deployedCertId=&quot;&quot;) and the retire branch cannot run</li><li>the renewed certificate&#x27;s ARI certID Wg4NrHOOpsNPxMrYt6hyv_8ph08.flduVU7Zz-A is recorded for its own next renewal</li></ul>
+        <ul class="ev"><li>issued serial 6598715515027478299, valid 2026-09-16T17:51:20Z..2026-10-31T17:51:19Z</li><li>the pass inside the validity period recorded the CA&#x27;s window 2026-10-15T17:51:19Z..2026-10-17T17:51:19Z and did not renew</li><li>clock moved to 2026-10-16T09:11:59Z, the deterministic instant inside that window (15.4 days before expiry), while the local fallback for renewBefore=24h0m0s was 2026-10-30T20:10:38Z</li><li>one Reconcile then renewed it: serial 6598715515027478299 -&gt; 7221652998901688835, notAfter 2026-10-31T17:51:19Z -&gt; 2026-10-31T17:51:22Z, still 2 names</li><li>that pass read renewalInfo once and placed exactly 1 order, profile &quot;tlsserver&quot; and replaces=7-5s4BdFL7rkw_mqBPB0LsmJGlA.W5NYzKcSVxs</li><li>the renewal solved 2 of 2 names over the test authority (2 record write(s), 2 delete(s)); the zone&#x27;s live record set is empty afterwards</li><li>the outgoing certificate was not queued for reclamation: deploy is disabled, so no cloud certificate ID exists for it (deployedCertId=&quot;&quot;) and the retire branch cannot run</li><li>the renewed certificate&#x27;s ARI certID 7-5s4BdFL7rkw_mqBPB0LsmJGlA.ZDh3I_qragM is recorded for its own next renewal</li></ul>
       </div>      <div class="card good">
-        <div class="t"><span class="n">revocation-and-its-durable-retry</span><span class="badge pass">通过</span><span class="d">0.01s</span></div>
+        <div class="t"><span class="n">revocation-and-its-durable-retry</span><span class="badge pass">通过</span><span class="d">0.00s</span></div>
         <p class="what">Revoke a real certificate, then revoke it again: an accepted revocation clears the request, and a refused one must stay recorded so every later pass retries it.</p>
         <ul class="ev"><li>first revocation: recorded in state.db, submitted, accepted, cleared</li><li>second revocation: the CA refused it and the request is still recorded for the next pass</li></ul>
       </div>
