@@ -8,11 +8,11 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// fallbackPolicy 是一份"开启、阈值调小"的策略，便于测试。
+// fallbackPolicy is an "enabled, small thresholds" policy meant for tests.
 //
-// BeforeExpiryDur / FailureWindowDur 在这里直接给：config.normalize 平时会
-// 填它们，而 SetFallbackPolicy 收的是原样的结构体。
-// fallbackPolicyPtr 返回策略的指针，便于在用例里传 nil 表示"没配置"。
+// BeforeExpiryDur / FailureWindowDur are set directly here: config.normalize would
+// normally fill them in, while SetFallbackPolicy takes the struct as-is.
+// fallbackPolicyPtr returns a pointer to it, so tests can pass nil for "not configured".
 func fallbackPolicyPtr() *config.FailureFallback {
 	p := fallbackPolicy()
 	return &p
@@ -30,7 +30,7 @@ func fallbackPolicy() config.FailureFallback {
 	}
 }
 
-// fallbackFixture 搭一个"三张名字、快到期、连续失败"的现场。
+// fallbackFixture builds a scenario with "three names, near expiry, repeated failures".
 func fallbackFixture(t *testing.T, policy *config.FailureFallback) (*state.Store, *Manager, *config.Certificate, time.Time) {
 	t.Helper()
 
@@ -46,7 +46,7 @@ func fallbackFixture(t *testing.T, policy *config.FailureFallback) (*state.Store
 	return store, m, cert, fixed
 }
 
-// 策略要显式开启，而且要显式把 Enabled 设成 true。
+// The policy must be turned on explicitly: Enabled has to be set to true.
 func TestFallbackIsOffByDefault(t *testing.T) {
 	store, m, cert, now := fallbackFixture(t, nil)
 
@@ -60,12 +60,12 @@ func TestFallbackIsOffByDefault(t *testing.T) {
 	got := m.applyFallback(cert, st)
 
 	if len(got.Domains) != 3 {
-		t.Fatalf("策略没开启时不该摘任何名字，实际 %v", got.Domains)
+		t.Fatalf("no name should be dropped when the policy is off, got %v", got.Domains)
 	}
 }
 
-// 失败次数不够时不动。降级是一次主动放弃覆盖面的决定，
-// 不能因为"这轮没签出来"就触发 —— 那几乎每张证书都会遇到。
+// Below the failure threshold nothing moves: falling back deliberately gives up coverage,
+// so it must not fire just because "this pass did not issue" -- that hits almost every certificate.
 func TestFallbackWaitsForEnoughConsecutiveFailures(t *testing.T) {
 	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
 
@@ -78,14 +78,14 @@ func TestFallbackWaitsForEnoughConsecutiveFailures(t *testing.T) {
 	st := &state.CertState{
 		Name:                cert.Name,
 		NotAfter:            now.Add(24 * time.Hour),
-		ConsecutiveFailures: 2, // 阈值是 3
+		ConsecutiveFailures: 2, // threshold is 3
 	}
 	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
-		t.Fatalf("失败次数不够时不该降级，实际 %v", got.Domains)
+		t.Fatalf("should not fall back below the failure threshold, got %v", got.Domains)
 	}
 }
 
-// 也不能太早降级：用一张缺名字的证书换掉一张还完全有效的证书是净损失。
+// Nor may it fall back too early: trading a fully valid certificate for one that lacks names is a net loss.
 func TestFallbackWaitsForTheExpiryWindow(t *testing.T) {
 	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
 
@@ -97,15 +97,16 @@ func TestFallbackWaitsForTheExpiryWindow(t *testing.T) {
 
 	st := &state.CertState{
 		Name:                cert.Name,
-		NotAfter:            now.Add(30 * 24 * time.Hour), // 还在 7 天窗口之外
+		NotAfter:            now.Add(30 * 24 * time.Hour), // still outside the 7-day window
 		ConsecutiveFailures: 9,
 	}
 	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
-		t.Fatalf("还没进入到期窗口时不该降级，实际 %v", got.Domains)
+		t.Fatalf("should not fall back outside the expiry window, got %v", got.Domains)
 	}
 }
 
-// 没有生效证书时没有"保住现有的"这个立论 —— 那不是部分可用，是只签一部分。
+// With no live certificate the "keep the current one alive" argument does not hold -- that
+// is not partial availability, it is issuing only some of the names.
 func TestFallbackRefusesWithoutALiveCertificate(t *testing.T) {
 	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
 
@@ -115,14 +116,14 @@ func TestFallbackRefusesWithoutALiveCertificate(t *testing.T) {
 		}
 	}
 
-	st := &state.CertState{Name: cert.Name, ConsecutiveFailures: 9} // NotAfter 是零值
+	st := &state.CertState{Name: cert.Name, ConsecutiveFailures: 9} // NotAfter is the zero value
 	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
-		t.Fatalf("没有生效证书时不该降级，实际 %v", got.Domains)
+		t.Fatalf("should not fall back without a live certificate, got %v", got.Domains)
 	}
 }
 
-// 不知道是哪个名字坏的时候绝不能摘 —— 随机摘会把本来好的名字也一起牺牲掉，
-// 那比不降级更糟。
+// When it is unknown which name is broken, nothing may be dropped -- dropping at random
+// would sacrifice healthy names too, which is worse than not falling back at all.
 func TestFallbackRefusesWithoutASpecificFailingIdentifier(t *testing.T) {
 	_, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
 
@@ -132,15 +133,15 @@ func TestFallbackRefusesWithoutASpecificFailingIdentifier(t *testing.T) {
 		ConsecutiveFailures: 9,
 	}
 	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
-		t.Fatalf("没有 identifier 级失败记录时不该降级，实际 %v", got.Domains)
+		t.Fatalf("should not fall back without per-identifier failure records, got %v", got.Domains)
 	}
 }
 
-// 这是这个功能的核心：只摘掉反复失败的那几个名字，其余原样保留。
+// This is the core of the feature: drop only the names that fail repeatedly, keep the rest as-is.
 func TestFallbackDropsOnlyTheFailingIdentifiers(t *testing.T) {
 	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
 
-	// b 反复失败（3 次），a 只抖了一下（1 次，低于阈值 2）。
+	// Name b fails repeatedly (3 times); name a blipped only once (1 time, below the threshold of 2).
 	for i := 0; i < 3; i++ {
 		if err := store.RecordIdentifierFailure(cert.Name, "b.example.com", "dns says no", now); err != nil {
 			t.Fatal(err)
@@ -161,41 +162,42 @@ func TestFallbackDropsOnlyTheFailingIdentifiers(t *testing.T) {
 
 	want := []string{"a.example.com", "c.example.com"}
 	if len(got.Domains) != len(want) {
-		t.Fatalf("域名集合 = %v，期望 %v", got.Domains, want)
+		t.Fatalf("domain set = %v, want %v", got.Domains, want)
 	}
 	for i := range want {
 		if got.Domains[i] != want[i] {
-			t.Fatalf("域名集合 = %v，期望 %v", got.Domains, want)
+			t.Fatalf("domain set = %v, want %v", got.Domains, want)
 		}
 	}
 
-	// 原对象不能被改动：调用方拿的还是配置里那份。
+	// The original object must not be mutated: the caller still holds the one from the config.
 	if len(cert.Domains) != 3 {
-		t.Fatalf("不该就地修改调用方传进来的证书，实际 %v", cert.Domains)
+		t.Fatalf("the certificate passed in by the caller must not be mutated in place, got %v", cert.Domains)
 	}
 
-	// 降级状态必须落盘 —— 它是"现在有一张缺名字的证书在服务"的唯一记录。
+	// The fallback state must be persisted -- it is the only record that a certificate
+	// missing some names is currently serving traffic.
 	fb, err := store.GetFallback(cert.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fb == nil {
-		t.Fatal("降级状态必须落盘，否则没人知道证书少了几个名字")
+		t.Fatal("fallback state must be persisted, otherwise nothing records that names are missing")
 	}
 	if len(fb.Dropped) != 1 || fb.Dropped[0] != "b.example.com" {
-		t.Errorf("记录的被摘名字 = %v，期望 [b.example.com]", fb.Dropped)
+		t.Errorf("dropped names recorded = %v, want [b.example.com]", fb.Dropped)
 	}
 	if fb.Reason == "" {
-		t.Error("降级必须带上原因")
+		t.Error("fallback must carry a reason")
 	}
 }
 
-// 剩下的名字太少就拒绝降级：那是"全挂"换了个样子，
-// 却会让人以为还有部分可用。
+// Refuse to fall back when too few names would remain: that is "everything is down"
+// wearing a different face, yet it reads as if part of it were still available.
 func TestFallbackRefusesWhenItWouldDropTooMany(t *testing.T) {
 	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
 
-	// a 和 b 都反复失败，只剩 c 一个 —— 而下限是 2。
+	// Names a and b both fail repeatedly, leaving only c -- and the minimum is 2.
 	for _, id := range []string{"a.example.com", "b.example.com"} {
 		for i := 0; i < 3; i++ {
 			if err := store.RecordIdentifierFailure(cert.Name, id, "dns says no", now); err != nil {
@@ -215,21 +217,21 @@ func TestFallbackRefusesWhenItWouldDropTooMany(t *testing.T) {
 	}
 
 	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
-		t.Fatalf("剩下的名字少于下限时应当拒绝降级，实际 %v", got.Domains)
+		t.Fatalf("must refuse to fall back when fewer names than the minimum remain, got %v", got.Domains)
 	}
 	if fb, _ := store.GetFallback(cert.Name); fb != nil {
-		t.Error("拒绝降级时不该留下降级记录")
+		t.Error("a refused fallback must not leave a fallback record behind")
 	}
 }
 
-// 老失败记录不参与 —— 那正是自愈的入口。
+// Old failure records do not count -- that is exactly the door to self-healing.
 //
-// 被摘掉的名字永远不会再被尝试，所以它等不到一次"成功"来洗白自己；
-// 唯一的出路就是记录老化。
+// A dropped name is never attempted again, so it never gets a success that could clear
+// it; the only way out is for the record to age out.
 func TestFallbackIgnoresStaleFailures(t *testing.T) {
 	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
 
-	stale := now.Add(-48 * time.Hour) // 窗口是 24h
+	stale := now.Add(-48 * time.Hour) // the window is 24h
 	for i := 0; i < 5; i++ {
 		if err := store.RecordIdentifierFailure(cert.Name, "b.example.com", "dns says no", stale); err != nil {
 			t.Fatal(err)
@@ -242,11 +244,11 @@ func TestFallbackIgnoresStaleFailures(t *testing.T) {
 		ConsecutiveFailures: 9,
 	}
 	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
-		t.Fatalf("超过失败窗口的记录不该再参与降级，实际 %v", got.Domains)
+		t.Fatalf("records older than the failure window must not count towards fallback, got %v", got.Domains)
 	}
 }
 
-// 恢复之后要能自己走出去，并且把账本清掉。
+// Once the names recover it must walk itself back out and clear its ledger.
 func TestFallbackClearsItselfOnceTheNamesAreHealthy(t *testing.T) {
 	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
 
@@ -259,14 +261,14 @@ func TestFallbackClearsItselfOnceTheNamesAreHealthy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 这一轮没有任何 identifier 在失败 → 用全集。
+	// No identifier is failing in this pass, so use the full set.
 	st := &state.CertState{
 		Name:                cert.Name,
 		NotAfter:            now.Add(24 * time.Hour),
 		ConsecutiveFailures: 0,
 	}
 	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
-		t.Fatalf("应当回到全集，实际 %v", got.Domains)
+		t.Fatalf("should return to the full set, got %v", got.Domains)
 	}
 
 	fb, err := store.GetFallback(cert.Name)
@@ -274,6 +276,6 @@ func TestFallbackClearsItselfOnceTheNamesAreHealthy(t *testing.T) {
 		t.Fatal(err)
 	}
 	if fb != nil {
-		t.Errorf("回到全集之后降级记录应当被清掉，实际 %+v", fb)
+		t.Errorf("the fallback record should be cleared after returning to the full set, got %+v", fb)
 	}
 }

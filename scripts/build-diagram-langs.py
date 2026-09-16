@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""从中文版页面生成英文版页面。
+"""Generate the English page from the Chinese one.
 
-中文的 `docs/certificate-lifecycle.html` 是唯一的事实来源，英文版是派生产物。
-这么做而不是维护两份手写文件，是因为两份手写文件一定会漂移，而漂移的表现
-是"英文版里混着一段中文"—— 那种问题没人会主动去发现。
+The Chinese `docs/certificate-lifecycle.html` is the single source of truth; the
+English page is a derived artifact. This is done instead of maintaining two
+hand-written files because two hand-written files inevitably drift, and the
+symptom of that drift is "a Chinese paragraph left inside the English version" —
+the kind of problem nobody goes looking for.
 
-生成完之后会**再扫一遍渲染文本**，有中文残留就直接失败。所以漏译不可能
-悄悄过去：要么翻译表补全，要么构建红掉。
+After building, the **rendered text is scanned again**, and any Chinese left over
+fails the build outright. So a missed translation cannot slip through quietly:
+either the translation table gets completed, or the build goes red.
 
-## 为什么用 HTML 解析器而不是正则
+## Why an HTML parser instead of regex
 
-第一版是用正则找"最内层块级元素"的。它在嵌套 `<div>` 上必然出错：正则
-没法配对嵌套标签，`<div class="grid2"><div>…</div>…</div>` 会匹配到第一个
-`</div>` 就收尾，于是那一整块内容被跳过 —— 更糟的是，被跳过的东西连
-"待译清单"都不会出现，因为清单就是从同一次遍历里出来的。
+The first version used a regex to find the "innermost block element". It is bound
+to fail on nested `<div>`s: a regex cannot pair nested tags, so
+`<div class="grid2"><div>…</div>…</div>` matches through the first `</div>` and
+stops there, skipping that entire block — and worse, the skipped content never
+even appears in the "to-translate list", because that list came out of the same
+traversal.
 
-结果就是"构建通过但页面里混着中文"。换成 html.parser 建树、自底向上替换，
-这类问题从根上没有了。
+The result is "the build passes but the page has Chinese mixed in". Moving to
+html.parser to build a tree and substituting bottom-up removes this class of
+problem at the root.
 
-用法：
-    python3 scripts/build-diagram-langs.py            # 生成英文版
-    python3 scripts/build-diagram-langs.py --dump     # 打印待译键的骨架
+Usage:
+    python3 scripts/build-diagram-langs.py            # build the English page
+    python3 scripts/build-diagram-langs.py --dump     # print the skeleton of pending keys
 """
 
 import argparse
@@ -44,21 +50,26 @@ TABLE = {**LABELS, **PROSE}
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input",
         "link", "meta", "param", "source", "track", "wbr"}
 
-# 整棵子树都不翻译的：样式表和脚本里的中文是注释，不是内容。
+# Subtrees that are never translated: the Chinese in stylesheets and scripts is
+# comments, not content.
 SKIP_SUBTREE = {"style", "script"}
 
-# 属性里的文案
+# Copy carried in attributes
 TRANSLATABLE_ATTRS = ("aria-label", "title", "alt")
 
-# 只有这些标签才可能是"一段文案"。**白名单，不是黑名单。**
+# Only these tags can be "a piece of copy". **A whitelist, not a blacklist.**
 #
-# 先写过一版黑名单（列出容器），结果 `html`/`head`/`body`/`svg`/`nav`
-# 全漏了过去 —— 它们的直接孩子里没有块级标签，于是被当成一段文案查表，
-# 而那段"文案"是整个文档拼起来的字符串。真正危险的不是查不到，
-# 是万一查到了：替换会把整棵子树抹掉。
+# A blacklist version (listing containers) was written first, and it let
+# `html`/`head`/`body`/`svg`/`nav` all slip through — none of them has a block
+# tag among its direct children, so each was treated as one piece of copy, and
+# that "copy" was the whole document concatenated into a single string. The real
+# danger is not a failed lookup but a successful one: the replacement would wipe
+# out the entire subtree.
 #
-# 白名单的失败方向是安全的：没列进来的标签不翻译，最坏结果是漏译，
-# 而漏译会被最后那道"渲染文本里还有中文吗"的检查抓住。
+# A whitelist fails in the safe direction: tags that are not listed are not
+# translated, so the worst case is a missed translation — and a missed
+# translation is caught by the final "is there any Chinese left in the rendered
+# text?" check.
 TEXT_UNITS = {
     "title", "p", "li", "td", "th", "caption", "h1", "h2", "h3", "h4",
     "h5", "h6", "summary", "button", "a", "strong", "em", "b", "i",
@@ -66,15 +77,18 @@ TEXT_UNITS = {
     "option", "blockquote",
 }
 
-# 纯行内标签。它们的内容注定是某段文案的一部分（"必须写 <code>X</code>。"），
-# 单独查表只会得到一堆碎片，所以它们自己永远不是一个翻译单元。
+# Purely inline tags. Their content is by definition part of some piece of copy
+# ("must write <code>X</code>."), and looking them up on their own only yields a
+# pile of fragments, so they are never a translation unit by themselves.
 INLINE_ONLY = {"strong", "em", "b", "i", "code", "small", "u", "sub", "sup",
                "mark", "kbd", "samp", "var", "abbr", "cite", "q", "time",
-               # <br/> 也要算进来：否则"文本 + <br/> + 文本"的 div 会被判成
-               # 布局容器而不翻译，页脚那块整段留在中文里。
+               # <br/> counts too: otherwise a div shaped "text + <br/> + text"
+               # is judged a layout container and left untranslated, keeping that
+               # whole footer block in Chinese.
                "br", "wbr"}
 
-# 块级标签：孩子里只要有这些，这个元素就是容器而不是文案，一律不查表。
+# Block tags: if any of these is among the children, the element is a container
+# rather than copy, and is never looked up.
 BLOCKY = {
     "div", "p", "section", "table", "thead", "tbody", "tr", "ul", "ol",
     "h1", "h2", "h3", "h4", "h5", "h6", "header", "footer", "nav", "svg",
@@ -85,11 +99,11 @@ missing: dict[str, str] = {}
 
 
 def plain(s: str) -> str:
-    """把一段带标签的 HTML 压成纯文本并折叠空白 —— 查表用的键。"""
+    """Flatten a tagged HTML fragment to plain text with whitespace collapsed — the lookup key."""
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", s))).strip()
 
 
-# ── 建树 ────────────────────────────────────────────────────────────────────
+# ── tree building ───────────────────────────────────────────────────────────
 
 class Node:
     __slots__ = ("tag", "raw_name", "raw_open", "children", "parent",
@@ -97,9 +111,10 @@ class Node:
 
     def __init__(self, tag, raw_open="", kind="elem", text=""):
         self.tag = tag
-        # 标签名按**原样**保留。HTMLParser 会把它小写化，而在 SVG 里
-        # 标签名是大小写敏感的：`</foreignObject>` 写成 `</foreignobject>`
-        # 会让 Chrome 报标签不匹配，整张图不渲染。
+        # The tag name is preserved **as written**. HTMLParser lowercases it, and
+        # in SVG tag names are case-sensitive: writing `</foreignObject>` as
+        # `</foreignobject>` makes Chrome report a tag mismatch and the whole
+        # diagram fails to render.
         m = re.match(r"<\s*([^\s/>]+)", raw_open)
         self.raw_name = m.group(1) if m else tag
         self.raw_open = raw_open
@@ -107,9 +122,10 @@ class Node:
         self.parent = None
         self.kind = kind          # elem | text | comment | decl
         self.text = text
-        # 形如 <path .../> 的元素。必须单独记：它的 raw_open 里已经带了斜杠，
-        # 序列化时再补一个 </path> 会让 SVG 变成非法 XML，
-        # Chrome 会直接报 "Opening and ending tag mismatch" 并且不渲染。
+        # Elements shaped like <path .../>. This must be tracked separately: its
+        # raw_open already carries the slash, and adding another </path> at
+        # serialization time makes the SVG invalid XML, so Chrome reports
+        # "Opening and ending tag mismatch" and does not render it.
         self.self_closed = False
 
 
@@ -132,7 +148,7 @@ class Builder(HTMLParser):
 
     def handle_startendtag(self, tag, attrs):
         raw = self.get_starttag_text() or f"<{tag}/>"
-        n = self._add(Node(tag, raw_open=raw))  # 自闭合，不进栈
+        n = self._add(Node(tag, raw_open=raw))  # self-closing, do not push onto the stack
         n.self_closed = True
 
     def handle_endtag(self, tag):
@@ -144,9 +160,10 @@ class Builder(HTMLParser):
     def handle_data(self, data):
         self._add(Node("#text", kind="text", text=data))
 
-    # convert_charrefs=False 时，&gt; 这类实体不走 handle_data，而是单独回调。
-    # 不接住它们，序列化时会被静默丢掉 —— `&gt;30%` 变成 `30%`，
-    # 图上的文字就错了，而且错得很安静。
+    # With convert_charrefs=False, entities like &gt; do not go through
+    # handle_data but arrive as their own callback. If they are not captured,
+    # serialization silently drops them — `&gt;30%` becomes `30%`, so the text on
+    # the diagram is wrong, and it is wrong very quietly.
     def handle_entityref(self, name):
         self._add(Node("#text", kind="text", text=f"&{name};"))
 
@@ -170,7 +187,7 @@ def parse(doc: str) -> Node:
     return b.root
 
 
-# ── 翻译 ────────────────────────────────────────────────────────────────────
+# ── translation ─────────────────────────────────────────────────────────────
 
 def inner_text(n: Node) -> str:
     out = []
@@ -197,43 +214,50 @@ def lookup(text: str, where: str) -> str | None:
 
 
 def has_element_child(n: Node) -> bool:
-    """div 是不是布局容器。
+    """Is this div a layout container?
 
-    div 在这个页面里既当文案（`<div class="eyebrow">`）又当布局
-    （`.legend`、`.badges`、`footer .row`）。布局容器整块查表即使命中也是错的：
-    它的孩子是带图标/色块的 span，整块替换会把那些元素抹掉。
+    In this page a div serves both as copy (`<div class="eyebrow">`) and as layout
+    (`.legend`, `.badges`, `footer .row`). Looking a layout container up as a
+    whole is wrong even when it hits: its children are spans carrying icons or
+    color chips, and replacing the whole block would erase those elements.
 
-    判据是"有没有非纯行内的元素孩子"—— 纯文字或只带 `<b>`/`<code>` 的 div
-    仍然是文案。
+    The test is "does it have an element child that is not purely inline" — a div
+    holding only text, or only `<b>`/`<code>`, is still copy.
     """
     return any(c.kind == "elem" and c.tag not in INLINE_ONLY for c in n.children)
 
 
 def translate(n: Node) -> None:
-    """自顶向下翻译。
+    """Translate top-down.
 
-    顺序很重要：父元素先试。命中就整块替换，内部的 `<b>`/`<code>` 这些强调
-    随英文一起写进译文里 —— 它们不该被当成独立的翻译单元。
+    Order matters: the parent is tried first. On a hit the whole block is
+    replaced, and the inline emphasis inside it (`<b>`/`<code>`) is written into
+    the English text along with it — those must not be treated as independent
+    translation units.
 
-    没命中才往下走。这一点必须清楚：**父元素没命中不等于子元素不用翻**。
-    `<div class="legend">` 整体不是一句文案，但它里面的每个 `<span>` 是 ——
-    如果因为父元素没命中就把子元素也压掉，图例会整块留在中文里。
+    Only on a miss do we descend. This point has to be clear: **a parent miss does
+    not mean the children need no translation**. `<div class="legend">` as a whole
+    is not a piece of copy, but every `<span>` inside it is — suppressing the
+    children just because the parent missed would leave the whole legend in
+    Chinese.
 
-    真正需要压制的只有纯行内碎片（`<b>`、`<code>` 之类），那是 INLINE_ONLY
-    的职责，不需要再传一个状态。
+    The only thing that genuinely needs suppressing is purely inline fragments
+    (`<b>`, `<code>` and friends), and that is INLINE_ONLY's job; no extra state
+    has to be threaded through.
     """
     if n.kind != "elem" or n.tag in SKIP_SUBTREE:
         return
 
-    # 1) 图里的 <text>
+    # 1) <text> inside the diagram
     if n.tag == "text":
         got = lookup(inner_text(n), "<text>")
         if got is not None:
             replace_children(n, got)
         return
 
-    # 2) foreignObject 里的 div：按 br / span 切段，逐段查表。
-    #    不能整块查，因为一块里往往有几行独立的话。
+    # 2) divs inside a foreignObject: split on br / span and look up each
+    #    segment. The whole block cannot be looked up because one block usually
+    #    holds several independent lines of text.
     if n.tag == "div" and any(a == "class" and "fo" in v for a, v in attrs_of(n)):
         translate_fo(n)
         return
@@ -260,7 +284,7 @@ def attrs_of(n: Node) -> list[tuple[str, str]]:
 
 
 def replace_children(n: Node, raw_html: str) -> None:
-    """把元素的子节点换成一段原样输出的 HTML。"""
+    """Replace the element's children with a snippet of HTML emitted verbatim."""
     node = Node("#raw", kind="text", text=raw_html)
     node.parent = n
     n.children = [node]
@@ -270,11 +294,12 @@ STRUCTURAL_TAGS = {"span", "br"}
 
 
 def translate_fo(n: Node) -> None:
-    """foreignObject 的内部：按结构性标签切段。
+    """The inside of a foreignObject: split into segments on structural tags.
 
-    `<div class="fo">A<b>B</b><br/>C<span class="s">D</span></div>` 要切成
-    "A<b>B</b>"、"C"、"D" 三段分别查表 —— 整块查的话键是 "A B C D"，
-    和表里任何一条都对不上。
+    `<div class="fo">A<b>B</b><br/>C<span class="s">D</span></div>` has to be cut
+    into the three segments "A<b>B</b>", "C" and "D" and looked up separately —
+    looked up as a whole the key would be "A B C D", which matches nothing in the
+    table.
     """
     out: list[Node] = []
     run: list[Node] = []
@@ -294,9 +319,11 @@ def translate_fo(n: Node) -> None:
         if c.kind == "elem" and c.tag in STRUCTURAL_TAGS:
             flush()
             if c.tag == "span":
-                # 先查整段，没命中再往下。顺序反了的话，里面的 <a> 会先被
-                # 翻译成英文，整段的键就对不上了（"挑战回环的时序见 图 ⑤"
-                # 会变成 "挑战回环的时序见 diagram ⑤"）。
+                # Look up the whole segment first, and descend only on a miss.
+                # With the order reversed, an inner <a> would be translated to
+                # English first and the whole-segment key would no longer match
+                # the table: the inner fragment gets replaced while the outer key
+                # still expects the original Chinese wording.
                 got = lookup(inner_html(c), "foreignObject span")
                 if got is not None:
                     replace_children(c, got)
@@ -329,7 +356,7 @@ def translate_attrs(n: Node) -> None:
         translate_attrs(c)
 
 
-# ── 序列化 ──────────────────────────────────────────────────────────────────
+# ── serialization ───────────────────────────────────────────────────────────
 
 def serialize(n: Node) -> str:
     if n.kind == "text":
@@ -345,29 +372,31 @@ def serialize(n: Node) -> str:
     return n.raw_open + "".join(serialize(c) for c in n.children) + f"</{n.raw_name}>"
 
 
-# ── 入口 ────────────────────────────────────────────────────────────────────
+# ── entry point ─────────────────────────────────────────────────────────────
 
 def roundtrip_check(doc: str) -> None:
-    """parse → serialize 必须与原文件逐字节一致。
+    """parse → serialize must reproduce the original file byte for byte.
 
-    这是"序列化器会不会弄坏文档"的唯一硬保证。少了它，一个像
-    "自闭合标签又补了结束标签"这样的 bug 会安静地把英文页面变成
-    Chrome 的错误页 —— 而尺寸检查不会发现，因为它只量盒子。
+    This is the only hard guarantee that the serializer does not corrupt the
+    document. Without it, a bug like "self-closing tag also gets an end tag"
+    would quietly turn the English page into a Chrome error page — and the size
+    check would not notice, because it only measures boxes.
     """
     again = serialize(parse(doc))
     if again == doc:
         return
     for i, (a, b) in enumerate(zip(doc, again)):
         if a != b:
-            print(f"✗ 序列化器不是无损的，第一处差异在第 {i} 字节：\n"
-                  f"  原: {doc[max(0,i-60):i+60]!r}\n"
-                  f"  新: {again[max(0,i-60):i+60]!r}")
+            print(f"✗ serializer is not lossless; first difference at byte {i}:\n"
+                  f"  old: {doc[max(0,i-60):i+60]!r}\n"
+                  f"  new: {again[max(0,i-60):i+60]!r}")
             sys.exit(1)
-    sys.exit(f"✗ 序列化器改变了文档长度：{len(doc)} → {len(again)}")
+    sys.exit(f"✗ serializer changed the document length: {len(doc)} → {len(again)}")
 
 
-# 生成产物开头的横幅。手改这个文件会在下一次 `make diagrams` 时被覆盖，
-# 把这句话放在第一行比写在 README 里有用。
+# The banner at the top of the generated artifact. Editing that file by hand is
+# overwritten by the next `make diagrams`, and putting this sentence on the first
+# line is more useful than writing it in the README.
 GENERATED_BANNER = (
     "<!-- Generated by scripts/build-diagram-langs.py from "
     "docs/certificate-lifecycle.html. Do not edit by hand:\n"
@@ -375,15 +404,20 @@ GENERATED_BANNER = (
     "scripts/diagram_i18n.py, then run `make diagrams`. -->"
 )
 
-# 语言切换链接。这是唯一一条不走翻译表的替换 —— 因为它翻的不是文案，
-# 而是"链接指向哪一边"：中文页指向英文页，英文页指向中文页。
-# 用翻译表表达不了，因为键必须是含中文的串，而 "English" 不含中文。
+# The language switch link. This is the one substitution that does not go through
+# the translation table — because what it translates is not copy but which side
+# the link points at: the Chinese page points to the English page, and the English
+# page points back to the Chinese one.
+# The table cannot express this, because a key must be a string containing
+# Chinese, and "English" contains none.
 LANG_SWITCH = re.compile(
     r'(<a class="langswitch" href=")certificate-lifecycle\.en\.html("[^>]*>)English(<)')
 
 
 def switch_lang(m: re.Match) -> str:
-    return m.group(1) + "certificate-lifecycle.html" + m.group(2) + "中文" + m.group(3)
+    # "\u4e2d\u6587" is the label shown on the English page (literally "Chinese"),
+    # written as an escape so this source file stays free of CJK characters.
+    return m.group(1) + "certificate-lifecycle.html" + m.group(2) + "\u4e2d\u6587" + m.group(3)
 
 
 def build() -> str:
@@ -395,17 +429,18 @@ def build() -> str:
     out = serialize(root)
     out, n = LANG_SWITCH.subn(switch_lang, out)
     if n != 1:
-        sys.exit(f"✗ 语言切换链接应当恰好匹配 1 处，实际 {n} 处 —— "
-                 f"中文页头部的 langswitch 锚点被改了？")
+        sys.exit(f"✗ language switch link should match exactly 1 place, found {n} — "
+                 f"was the langswitch anchor in the Chinese page header changed?")
     return out.replace("<!DOCTYPE html>", "<!DOCTYPE html>\n" + GENERATED_BANNER, 1)
 
 
 def rendered_text(doc: str) -> str:
-    """只看真正会渲染出来的文本（去掉注释、样式、脚本、语言切换链接）。"""
+    """Keep only the text that actually renders (comments, styles, scripts and the language switch link removed)."""
     body = re.sub(r"<!--.*?-->", "", doc, flags=re.S)
     body = re.sub(r"<style\b.*?</style>", "", body, flags=re.S)
     body = re.sub(r"<script\b.*?</script>", "", body, flags=re.S)
-    # 语言切换链接在英文页里就该是中文（"中文"）—— 它是入口，不是漏译。
+    # The language switch link is supposed to be Chinese on the English page —
+    # it is the entry point, not a missed translation.
     body = re.sub(r'<a class="langswitch".*?</a>', "", body, flags=re.S)
     return body
 
@@ -415,9 +450,9 @@ def dump() -> None:
     translate(root)
     translate_attrs(root)
     if not missing:
-        print("# 没有缺的，翻译表是完整的")
+        print("# nothing missing, the translation table is complete")
         return
-    print(f"# {len(missing)} 条待译，按出现顺序：\n")
+    print(f"# {len(missing)} keys pending translation, in order of appearance:\n")
     for key, where in missing.items():
         print(f"    {key!r}:")
         print('        "",  # ' + where)
@@ -427,31 +462,31 @@ def main() -> None:
     doc = build()
 
     if missing:
-        print(f"✗ 有 {len(missing)} 条中文没有英文对照"
-              f"（补进 scripts/diagram_i18n.py）:\n")
+        print(f"✗ {len(missing)} Chinese strings have no English counterpart"
+              f" (add them to scripts/diagram_i18n.py):\n")
         for key, where in list(missing.items())[:80]:
             print(f"  [{where}] {key[:90]}")
         if len(missing) > 80:
-            print(f"  … 还有 {len(missing) - 80} 条")
+            print(f"  … {len(missing) - 80} more")
         sys.exit(1)
 
     left = sorted({h.strip() for h in re.findall(r">([^<]*[\u4e00-\u9fff][^<]*)<",
                                                  rendered_text(doc)) if h.strip()})
     if left:
-        print(f"✗ 渲染文本里还剩 {len(left)} 处中文:\n")
+        print(f"✗ {len(left)} Chinese fragments remain in the rendered text:\n")
         for s in left[:40]:
             print(f"  {s[:90]}")
         if len(left) > 40:
-            print(f"  … 还有 {len(left) - 40} 处")
+            print(f"  … {len(left) - 40} more")
         sys.exit(1)
 
     DST.write_text(doc, encoding="utf-8")
-    print(f"✓ 写入 {DST.relative_to(ROOT)}（{len(doc)} 字节，渲染文本无中文残留）")
+    print(f"✓ wrote {DST.relative_to(ROOT)} ({len(doc)} bytes, no Chinese left in the rendered text)")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", action="store_true",
-                    help="打印待译键的骨架，用于填 scripts/diagram_i18n.py")
+                    help="print the skeleton of pending keys, for filling in scripts/diagram_i18n.py")
     args = ap.parse_args()
     dump() if args.dump else main()

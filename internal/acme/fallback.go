@@ -9,8 +9,9 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// 各字段未配置时用的默认值。它们在 config 里也各有一份，这里是兜底 ——
-// 策略是通过 SetFallbackPolicy 传进来的，不保证经过 config.normalize。
+// Defaults for fields left unset. Config carries its own copy of each one; these are
+// the backstop, because the policy arrives through SetFallbackPolicy and is not
+// guaranteed to have gone through config.normalize.
 const (
 	defaultFallbackAfterFailures = 5
 	defaultFallbackBeforeExpiry  = 7 * 24 * time.Hour
@@ -19,17 +20,18 @@ const (
 	defaultFallbackMinNames      = 1
 )
 
-// SetFallbackPolicy 挂上"到期前拆分子集先签"的策略。
+// SetFallbackPolicy attaches the "split off a subset and issue it before expiry" policy.
 //
-// 不调用它就等于完全关闭 —— 这是默认状态。它会改变证书覆盖什么，
-// 那是安全决策，不该由程序替人做。
+// Not calling it means fully off, which is the default state. This changes what the
+// certificate covers, and that is a security decision the program should not make on
+// someone's behalf.
 func (m *Manager) SetFallbackPolicy(p config.FailureFallback) { m.fallback = &p }
 
-// applyFallback 决定这一轮该为什么样的域名集合下单。
+// applyFallback decides which domain set to order for this round.
 //
-// 绝大多数时候它原样返回。只有在一张证书已经"快到期了而且一直签不出来"
-// 的时候才摘掉其中反复失败的那几个名字 —— 那 24 个本来好的名字不该
-// 陪着 1 个配错 DNS 的名字一起过期。
+// Almost always it returns the input unchanged. Only when a certificate is "nearly
+// expired and still refuses to issue" does it drop the names that keep failing -- those
+// 24 names that were fine should not expire alongside the 1 name with broken DNS.
 func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *config.Certificate {
 	kept, dropped, reason := m.fallbackDomains(c, st)
 
@@ -37,8 +39,9 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 		metrics.CertificateFallbackActive.WithLabelValues(c.Name).Set(0)
 		metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(0)
 
-		// 这一轮用的是全集。如果之前处于降级，说明已经恢复 ——
-		// 那条记录的全部意义就是"现在有一张缺名字的证书在服务"。
+		// This round uses the full set. If we were degraded before, we have recovered --
+		// that record exists for exactly one reason: to say "a certificate missing names
+		// is serving right now".
 		if fb, err := m.store.GetFallback(c.Name); err == nil && fb != nil {
 			m.log.Info("back on the full name set; clearing the fallback record",
 				"cert", c.Name, "wasDropping", fb.Dropped, "since", fb.Since)
@@ -46,8 +49,9 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 				m.log.Warn("cannot clear the fallback record", "cert", c.Name, "err", cerr)
 			}
 		}
-		// 顺手把老账本丢掉：那些 identifier 已经不在证书里了，
-		// 它们的授权永远不会再被尝试，也就永远等不到一次"成功"来清掉它们。
+		// Throw away the stale ledger while we are here: those identifiers are no longer
+		// in the certificate, so their authorizations will never be attempted again and
+		// can never earn the "success" that would clear them.
 		if perr := m.store.PruneIdentifierFailures(c.Name, m.now(),
 			m.fallbackWindow()); perr != nil {
 			m.log.Warn("cannot prune the identifier failure ledger", "cert", c.Name, "err", perr)
@@ -58,8 +62,8 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 	cp := *c
 	cp.Domains = kept
 
-	// ERROR 而不是 WARN：这是一次"我们主动把某些名字从证书里拿掉了"的决定，
-	// 必须吵闹到没人能错过。
+	// ERROR, not WARN: this is the decision "we deliberately removed names from the
+	// certificate", and it has to be loud enough that nobody can miss it.
 	m.log.Error("FALLING BACK to a subset of names so the rest stay available",
 		"cert", c.Name,
 		"keeping", kept, "dropping", dropped,
@@ -78,26 +82,30 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 	return &cp
 }
 
-// fallbackDomains 判断该不该降级，以及该摘掉哪些名字。
+// fallbackDomains decides whether to degrade, and which names to drop.
 //
-// 返回的 dropped 非空才表示要降级。所有条件必须同时满足：
+// A non-empty dropped is the only thing that means "degrade". Every condition has to
+// hold at the same time:
 //
-//   - 策略显式开启
-//   - 已经有一张生效的证书（没有它就没有"保住现有的"这个立论）
-//   - 这张证书连续失败足够多次
-//   - 已经进入到期前的危险窗口
-//   - 有**具体某个** identifier 反复失败
-//   - 摘完之后剩下的名字不少于下限
+//   - the policy is explicitly enabled
+//   - a certificate is already in effect (without one there is no "keep what we have"
+//     to argue for)
+//   - this certificate has failed enough times in a row
+//   - we are already inside the danger window before expiry
+//   - **one specific** identifier keeps failing
+//   - the names left after dropping are no fewer than the floor
 //
-// 最后两条是关键。不知道是哪个名字坏的时候绝不能摘 —— 随机摘会把
-// 本来好的名字也一起牺牲掉，那比不降级更糟。
+// The last two are the crux. When we do not know which name is broken we must never
+// drop anything -- dropping at random also sacrifices names that were fine, and that is
+// worse than not degrading at all.
 func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState) (kept, dropped []string, reason string) {
 	p := m.fallback
 	if p == nil || !p.EnabledOr(false) {
 		return c.Domains, nil, ""
 	}
 
-	// 没有生效证书就没有"部分可用"可言：那不是保住什么，而是只签一部分。
+	// With no certificate in effect there is no "partially available" to speak of:
+	// that is not preserving anything, it is just issuing a subset.
 	if st.NotAfter.IsZero() {
 		return c.Domains, nil, ""
 	}
@@ -123,8 +131,9 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState) (k
 		return c.Domains, nil, ""
 	}
 
-	// 只摘"最近还在失败"的那些。老记录不参与 —— 那正是自愈的入口：
-	// 问题修好之后记录老化，下一轮自然就去试全集了。
+	// Only drop names that are still failing recently. Stale entries do not count --
+	// that is exactly the self-healing entry point: once the problem is fixed the
+	// entries age out and the next round naturally tries the full set again.
 	minFailures := p.MinIdentifierFailuresOr(defaultFallbackMinIdentFail)
 	cutoff := m.now().Add(-m.fallbackWindow())
 
@@ -149,7 +158,8 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState) (k
 
 	minNames := p.MinNamesOr(defaultFallbackMinNames)
 	if len(kept) < minNames {
-		// 这已经是"全挂"换了个样子，却会让人以为还有部分可用。
+		// This is a total outage wearing a disguise, yet it would read as "still
+		// partially available".
 		m.log.Error("the failure fallback would leave too few names; refusing to fall back",
 			"cert", c.Name, "wouldKeep", len(kept), "minNames", minNames, "wouldDrop", dropped)
 		return c.Domains, nil, ""

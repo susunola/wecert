@@ -18,22 +18,23 @@ func TestDesiredStateDefaultsToStatic(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.DesiredState.Mode != ModeStatic {
-		t.Errorf("默认应当是 %q，实际 %q", ModeStatic, cfg.DesiredState.Mode)
+		t.Errorf("default should be %q, got %q", ModeStatic, cfg.DesiredState.Mode)
 	}
 	if cfg.DesiredState.MaxStalenessDur != 48*time.Hour {
-		t.Errorf("maxStaleness 默认应当是 48h，实际 %v", cfg.DesiredState.MaxStalenessDur)
+		t.Errorf("maxStaleness default should be 48h, got %v", cfg.DesiredState.MaxStalenessDur)
 	}
 }
 
-// static 模式下留着一个用不上的 path，几乎一定是"切到 observe/enforce 切了一半"。
-// 静默忽略它，会让人以为文档已经在生效了。
+// An unused path left in static mode is almost certainly a half-finished switch
+// to observe/enforce. Silently ignoring it makes people think the document is
+// already in effect.
 func TestStaticModeRejectsAnUnusedPath(t *testing.T) {
 	_, err := Load(writeConfig(t, minimalPrefix+oneCert+`
 desiredState:
   path: /tmp/desired-state.yaml
 `))
 	if err == nil || !strings.Contains(err.Error(), "desiredState.path") {
-		t.Fatalf("static 模式下设置 path 应当报错，实际 %v", err)
+		t.Fatalf("setting path in static mode should error, got %v", err)
 	}
 }
 
@@ -44,13 +45,13 @@ desiredState:
   mode: `+mode+`
 `))
 		if err == nil || !strings.Contains(err.Error(), "requires desiredState.path") {
-			t.Errorf("mode=%s 缺少 path 应当报错，实际 %v", mode, err)
+			t.Errorf("mode=%s without path should error, got %v", mode, err)
 		}
 	}
 }
 
-// observe 仍然按 certificates 收敛，所以证书列表还是必需的。
-// 它不是一个"什么都不做"的模式：它只是额外报告一份差异。
+// observe still converges on certificates, so the list is still required. It is
+// not a "does nothing" mode: it only reports an extra diff.
 func TestObserveStillRequiresCertificates(t *testing.T) {
 	_, err := Load(writeConfig(t, minimalPrefix+`
 desiredState:
@@ -58,7 +59,7 @@ desiredState:
   path: /tmp/desired-state.yaml
 `))
 	if err == nil || !strings.Contains(err.Error(), "at least one certificate") {
-		t.Fatalf("observe 模式缺少 certificates 应当报错，实际 %v", err)
+		t.Fatalf("observe mode without certificates should error, got %v", err)
 	}
 
 	if _, err := Load(writeConfig(t, minimalPrefix+oneCert+`
@@ -66,12 +67,13 @@ desiredState:
   mode: observe
   path: /tmp/desired-state.yaml
 `)); err != nil {
-		t.Fatalf("observe 模式带 certificates 应当通过，实际 %v", err)
+		t.Fatalf("observe mode with certificates should pass, got %v", err)
 	}
 }
 
-// enforce 模式下文档是唯一来源，配置里再留一份 certificates 只会造成
-// "我改了配置却没生效"这种最难查的困惑。
+// In enforce mode the document is the only source; leaving a certificates block
+// behind only creates the hardest-to-debug confusion: "I changed the config and
+// nothing happened".
 func TestEnforceModeRejectsCertificatesInTheConfig(t *testing.T) {
 	_, err := Load(writeConfig(t, minimalPrefix+oneCert+`
 desiredState:
@@ -79,7 +81,7 @@ desiredState:
   path: /tmp/desired-state.yaml
 `))
 	if err == nil || !strings.Contains(err.Error(), "certificates is not empty") {
-		t.Fatalf("enforce 模式带 certificates 应当报错，实际 %v", err)
+		t.Fatalf("enforce mode with certificates should error, got %v", err)
 	}
 
 	cfg, err := Load(writeConfig(t, minimalPrefix+`
@@ -88,7 +90,7 @@ desiredState:
   path: /tmp/desired-state.yaml
 `))
 	if err != nil {
-		t.Fatalf("enforce 模式不带 certificates 应当通过，实际 %v", err)
+		t.Fatalf("enforce mode without certificates should pass, got %v", err)
 	}
 	if cfg.DesiredState.Mode != ModeEnforce {
 		t.Errorf("mode = %q", cfg.DesiredState.Mode)
@@ -102,7 +104,7 @@ desiredState:
   path: /tmp/desired-state.yaml
 `))
 	if err == nil || !strings.Contains(err.Error(), "desiredState.mode must be") {
-		t.Fatalf("未知模式应当报错，实际 %v", err)
+		t.Fatalf("an unknown mode should error, got %v", err)
 	}
 }
 
@@ -112,26 +114,27 @@ func TestOnboardingDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Onboarding.GraceDur != 24*time.Hour {
-		t.Errorf("gracePeriod 默认应当是 24h，实际 %v", cfg.Onboarding.GraceDur)
+		t.Errorf("gracePeriod default should be 24h, got %v", cfg.Onboarding.GraceDur)
 	}
 	if cfg.Onboarding.BudgetDur != 7*24*time.Hour {
-		t.Errorf("budgetWindow 默认应当是 168h，实际 %v", cfg.Onboarding.BudgetDur)
+		t.Errorf("budgetWindow default should be 168h, got %v", cfg.Onboarding.BudgetDur)
 	}
-	// 未设置时指针应当是 nil，默认值由调用方给：
-	// CLI 传的默认值是 true（守卫 1 默认开启），
-	// 它挡住"声明写了但规则还没配"这类会造成无用签发的情况。
+	// Unset means the pointer is nil and the caller supplies the default: the CLI
+	// passes true (guard 1 is on by default), which blocks cases like "declared but
+	// the rule is not configured yet" that cause useless issuance.
 	if cfg.Onboarding.RequireCLBRule != nil {
-		t.Error("没写 requireCLBRule 时应当是未设置状态，而不是被填成某个值")
+		t.Error("an omitted requireCLBRule should stay unset, not be filled with some value")
 	}
 	if !cfg.Onboarding.RequireCLBRuleOr(true) {
-		t.Error("未设置时应当采用调用方给的默认值")
+		t.Error("when unset it should take the caller-supplied default")
 	}
 	if !cfg.Onboarding.DeployOr(true) {
-		t.Error("deploy 未设置时应当沿调用方给的默认值")
+		t.Error("an unset deploy should follow the caller-supplied default")
 	}
 }
 
-// 指针字段存在的理由：false 是有意义的值，而零值分不出"没写"和"写了 false"。
+// Why the pointer fields exist: false is meaningful, and the zero value cannot
+// distinguish "not written" from "written false".
 func TestOnboardingPointerFieldsCanBeSetToFalse(t *testing.T) {
 	cfg, err := Load(writeConfig(t, minimalPrefix+oneCert+`
 onboarding:
@@ -144,10 +147,10 @@ onboarding:
 		t.Fatal(err)
 	}
 	if cfg.Onboarding.RequireCLBRuleOr(true) {
-		t.Error("显式写成 false 时不该被默认值盖掉")
+		t.Error("an explicit false must not be overridden by the default")
 	}
 	if cfg.Onboarding.DeployOr(true) {
-		t.Error("显式写成 false 时不该被默认值盖掉")
+		t.Error("an explicit false must not be overridden by the default")
 	}
 	if cfg.Onboarding.GraceDur != 72*time.Hour {
 		t.Errorf("gracePeriod = %v", cfg.Onboarding.GraceDur)
@@ -163,6 +166,6 @@ onboarding:
   gracePeriod: someday
 `))
 	if err == nil || !strings.Contains(err.Error(), "onboarding.gracePeriod") {
-		t.Fatalf("非法时长应当报错，实际 %v", err)
+		t.Fatalf("an invalid duration should error, got %v", err)
 	}
 }

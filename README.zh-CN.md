@@ -106,7 +106,7 @@ lego 高层的 `certificate.Obtain` 是刻意不用的：它在内部自己 `new
 
 ### 0. 部署形态：SNI 多域名、一张多 SAN 证书、后端 RS 池
 
-![wecert 的部署形态：客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池；wecert 从 DNSPod 与 Let's Encrypt 取得证书并换绑到 CLB](docs/diagrams/zh/00-the-problem.png)
+![wecert 的部署形态：客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池；wecert 从 DNSPod 与 Let's Encrypt 取得证书并换绑到 CLB](docs/diagrams/zh/00-deployment-shape.png)
 
 请求带着 SNI 到 CLB。CLB 按客户端给的名字去 `multi_cert_info` 里挑证书，七层规则再按域名分流到后端 RS 池。`wecert` 就跑在其中一台 CVM 上：读 DNSPod 里的 `_wecert.*` 声明、写 `_acme-challenge` 记录、向 Let's Encrypt 取证书、上传到腾讯云 SSL 并换绑监听器。
 

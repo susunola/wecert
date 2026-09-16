@@ -10,15 +10,16 @@ func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatalf("打开状态库失败: %v", err)
+		t.Fatalf("opening state db: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
-// 这是整个系统最重要的不变量：订单连同它的私钥必须能跨进程重启完整恢复。
-// 丢了 order URL 就会重新下单，直接撞上
-// "5 certificates per exact set of identifiers / 7 days"。
+// This is the single most important invariant in the system: an order and its private
+// key must survive a process restart fully intact.
+// Losing the order URL means re-ordering, walking straight into
+// "5 certificates per exact set of identifiers / 7 days".
 func TestOrderRoundTripPreservesKey(t *testing.T) {
 	s := openTestStore(t)
 
@@ -34,31 +35,31 @@ func TestOrderRoundTripPreservesKey(t *testing.T) {
 		KeyPEM:      keyPEM,
 	}
 	if err := s.PutOrder(want); err != nil {
-		t.Fatalf("PutOrder 失败: %v", err)
+		t.Fatalf("PutOrder failed: %v", err)
 	}
 
 	got, err := s.GetOrder("example-com")
 	if err != nil {
-		t.Fatalf("GetOrder 失败: %v", err)
+		t.Fatalf("GetOrder failed: %v", err)
 	}
 	if got == nil {
-		t.Fatal("GetOrder 返回 nil，订单丢失")
+		t.Fatal("GetOrder returned nil, the order was lost")
 	}
 
 	if got.OrderURL != want.OrderURL {
-		t.Errorf("OrderURL = %q，期望 %q", got.OrderURL, want.OrderURL)
+		t.Errorf("OrderURL = %q, want %q", got.OrderURL, want.OrderURL)
 	}
 	if got.FinalizeURL != want.FinalizeURL {
-		t.Errorf("FinalizeURL = %q，期望 %q", got.FinalizeURL, want.FinalizeURL)
+		t.Errorf("FinalizeURL = %q, want %q", got.FinalizeURL, want.FinalizeURL)
 	}
 	if got.Status != "pending" {
-		t.Errorf("Status = %q，期望 pending", got.Status)
+		t.Errorf("Status = %q, want pending", got.Status)
 	}
 	if !got.ExpiresAt.Equal(expires) {
-		t.Errorf("ExpiresAt = %s，期望 %s", got.ExpiresAt, expires)
+		t.Errorf("ExpiresAt = %s, want %s", got.ExpiresAt, expires)
 	}
 	if string(got.KeyPEM) != string(keyPEM) {
-		t.Errorf("KeyPEM 未原样恢复: %q", got.KeyPEM)
+		t.Errorf("KeyPEM was not restored verbatim: %q", got.KeyPEM)
 	}
 }
 
@@ -69,7 +70,7 @@ func TestOrderUpsertKeepsSingleRow(t *testing.T) {
 	if err := s.PutOrder(o); err != nil {
 		t.Fatal(err)
 	}
-	// 同一张证书再写一次应当覆盖，而不是留下两个订单。
+	// Writing the same certificate again must overwrite, not leave two orders behind.
 	o.OrderURL = "url-2"
 	o.Status = "ready"
 	if err := s.PutOrder(o); err != nil {
@@ -81,7 +82,7 @@ func TestOrderUpsertKeepsSingleRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.OrderURL != "url-2" || got.Status != "ready" {
-		t.Errorf("订单未被子 upsert 覆盖: %+v", got)
+		t.Errorf("order was not overwritten by the upsert: %+v", got)
 	}
 }
 
@@ -89,13 +90,13 @@ func TestGetMissingReturnsNil(t *testing.T) {
 	s := openTestStore(t)
 
 	if o, err := s.GetOrder("nope"); err != nil || o != nil {
-		t.Errorf("GetOrder 对不存在的证书应返回 (nil, nil)，得到 (%v, %v)", o, err)
+		t.Errorf("GetOrder on a missing certificate should return (nil, nil), got (%v, %v)", o, err)
 	}
 	if c, err := s.GetCert("nope"); err != nil || c != nil {
-		t.Errorf("GetCert 对不存在的证书应返回 (nil, nil)，得到 (%v, %v)", c, err)
+		t.Errorf("GetCert on a missing certificate should return (nil, nil), got (%v, %v)", c, err)
 	}
 	if a, err := s.GetAccount("nope"); err != nil || a != nil {
-		t.Errorf("GetAccount 对不存在的目录应返回 (nil, nil)，得到 (%v, %v)", a, err)
+		t.Errorf("GetAccount on a missing directory should return (nil, nil), got (%v, %v)", a, err)
 	}
 }
 
@@ -123,38 +124,39 @@ func TestCertStateRoundTrip(t *testing.T) {
 		DeployedCertID:      "TencentCertId123",
 	}
 	if err := s.PutCert(want); err != nil {
-		t.Fatalf("PutCert 失败: %v", err)
+		t.Fatalf("PutCert failed: %v", err)
 	}
 
 	got, err := s.GetCert("example-com")
 	if err != nil {
-		t.Fatalf("GetCert 失败: %v", err)
+		t.Fatalf("GetCert failed: %v", err)
 	}
 
 	if !got.NotAfter.Equal(notAfter) {
-		t.Errorf("NotAfter = %s，期望 %s", got.NotAfter, notAfter)
+		t.Errorf("NotAfter = %s, want %s", got.NotAfter, notAfter)
 	}
 	if got.ARICertID != want.ARICertID {
-		t.Errorf("ARICertID = %q，期望 %q", got.ARICertID, want.ARICertID)
+		t.Errorf("ARICertID = %q, want %q", got.ARICertID, want.ARICertID)
 	}
 	if !got.ARIWindowStart.Equal(windowStart) || !got.ARIWindowEnd.Equal(windowEnd) {
-		t.Errorf("ARI 窗口未恢复: %s - %s", got.ARIWindowStart, got.ARIWindowEnd)
+		t.Errorf("ARI window was not restored: %s - %s", got.ARIWindowStart, got.ARIWindowEnd)
 	}
 	if got.ARIRetryAfter != 6*time.Hour {
-		t.Errorf("ARIRetryAfter = %v，期望 6h", got.ARIRetryAfter)
+		t.Errorf("ARIRetryAfter = %v, want 6h", got.ARIRetryAfter)
 	}
 	if got.ConsecutiveFailures != 3 {
-		t.Errorf("ConsecutiveFailures = %d，期望 3", got.ConsecutiveFailures)
+		t.Errorf("ConsecutiveFailures = %d, want 3", got.ConsecutiveFailures)
 	}
 	if got.DeployedCertID != "TencentCertId123" {
 		t.Errorf("DeployedCertID = %q", got.DeployedCertID)
 	}
 	if string(got.CertPEM) != "fullchain" || string(got.KeyPEM) != "privkey" {
-		t.Errorf("证书/私钥未恢复: %q / %q", got.CertPEM, got.KeyPEM)
+		t.Errorf("cert/key was not restored: %q / %q", got.CertPEM, got.KeyPEM)
 	}
 }
 
-// 零值时间必须能原样往返，否则"还没签发"会被误判成"1970 年就签发了"。
+// Zero times must round-trip verbatim, otherwise "not issued yet" is misread as
+// "issued back in 1970".
 func TestZeroTimesRoundTrip(t *testing.T) {
 	s := openTestStore(t)
 
@@ -166,20 +168,21 @@ func TestZeroTimesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !got.NotAfter.IsZero() {
-		t.Errorf("NotAfter 应为零值，得到 %s", got.NotAfter)
+		t.Errorf("NotAfter should be zero, got %s", got.NotAfter)
 	}
 	if !got.ARIWindowStart.IsZero() || !got.ARICheckedAt.IsZero() {
-		t.Error("ARI 时间字段应为零值")
+		t.Error("ARI time fields should be zero")
 	}
 	if !got.NextAttemptAt.IsZero() {
-		t.Errorf("NextAttemptAt 应为零值，得到 %s", got.NextAttemptAt)
+		t.Errorf("NextAttemptAt should be zero, got %s", got.NextAttemptAt)
 	}
 }
 
 func TestAuthorizationRoundTrip(t *testing.T) {
 	s := openTestStore(t)
 
-	// wildcard 和 apex 会落在同一个 TXT 名字上，两条授权必须能各自独立保存。
+	// wildcard and apex land on the same TXT name, so the two authorizations must be
+	// storable independently of each other.
 	for _, a := range []*Authorization{
 		{CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
 			TxtName: "_acme-challenge.example.com.", TxtValue: "value-1", Presented: true},
@@ -187,7 +190,7 @@ func TestAuthorizationRoundTrip(t *testing.T) {
 			TxtName: "_acme-challenge.example.com.", TxtValue: "value-2", Presented: true},
 	} {
 		if err := s.PutAuthorization(a); err != nil {
-			t.Fatalf("PutAuthorization 失败: %v", err)
+			t.Fatalf("PutAuthorization failed: %v", err)
 		}
 	}
 
@@ -196,7 +199,7 @@ func TestAuthorizationRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 2 {
-		t.Fatalf("应有 2 条授权，得到 %d", len(got))
+		t.Fatalf("want 2 authorizations, got %d", len(got))
 	}
 
 	values := map[string]string{}
@@ -205,19 +208,19 @@ func TestAuthorizationRoundTrip(t *testing.T) {
 			t.Errorf("TxtName = %q", a.TxtName)
 		}
 		if !a.Presented {
-			t.Errorf("%s 的 Presented 应为 true", a.Identifier)
+			t.Errorf("Presented for %s should be true", a.Identifier)
 		}
 		values[a.Identifier] = a.TxtValue
 	}
 	if values["example.com"] != "value-1" || values["*.example.com"] != "value-2" {
-		t.Errorf("两条同名 TXT 的值未正确区分: %v", values)
+		t.Errorf("the two TXT records sharing one name were not kept distinct: %v", values)
 	}
 
 	if err := s.DeleteAuthorizations("c"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.ListAuthorizations("c"); len(got) != 0 {
-		t.Errorf("删除后应为空，得到 %d 条", len(got))
+		t.Errorf("want empty after delete, got %d rows", len(got))
 	}
 }
 
@@ -227,16 +230,16 @@ func TestRetiredCerts(t *testing.T) {
 	if err := s.AddRetiredCert("old-1", "example-com"); err != nil {
 		t.Fatal(err)
 	}
-	// 重复添加应当被忽略而不是报错（幂等）。
+	// Adding twice should be ignored rather than erroring (idempotent).
 	if err := s.AddRetiredCert("old-1", "example-com"); err != nil {
-		t.Fatalf("重复添加退役证书应当幂等: %v", err)
+		t.Fatalf("adding a retired cert twice should be idempotent: %v", err)
 	}
 
-	// 保留期之外的才该被回收。
+	// Only certs past the retention window should be reclaimed.
 	if got, err := s.ListRetiredCertsBefore(time.Now().Add(-7 * 24 * time.Hour)); err != nil {
 		t.Fatal(err)
 	} else if len(got) != 0 {
-		t.Errorf("刚退役的证书不应出现在回收列表，得到 %d 条", len(got))
+		t.Errorf("a just-retired cert should not appear in the reclamation list, got %d rows", len(got))
 	}
 
 	got, err := s.ListRetiredCertsBefore(time.Now().Add(time.Minute))
@@ -244,18 +247,19 @@ func TestRetiredCerts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || got[0].CertID != "old-1" {
-		t.Fatalf("应回收 1 张退役证书，得到 %+v", got)
+		t.Fatalf("want 1 retired cert reclaimed, got %+v", got)
 	}
 
 	if err := s.DeleteRetiredCert("old-1"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.ListRetiredCertsBefore(time.Now().Add(time.Minute)); len(got) != 0 {
-		t.Errorf("回收后列表应为空，得到 %d 条", len(got))
+		t.Errorf("want empty after reclamation, got %d rows", len(got))
 	}
 }
 
-// 状态库重开后数据必须还在 —— 这是"重启不重新下单"的物理基础。
+// Data must still be there after the state db is reopened -- the physical basis for
+// "restart without re-ordering".
 func TestStatePersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 
@@ -281,6 +285,6 @@ func TestStatePersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got == nil || got.OrderURL != "persisted-url" {
-		t.Fatalf("重开后订单丢失: %+v", got)
+		t.Fatalf("order lost after reopen: %+v", got)
 	}
 }

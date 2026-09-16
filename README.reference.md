@@ -376,7 +376,7 @@ The build also *measures* every label in a real browser, in **both** languages, 
 
 ### 0. Deployment shape — SNI for several domains, one multi-SAN certificate, a backend RS pool
 
-![wecert's deployment shape: clients reach the CLB over SNI, one multi-SAN certificate routes to a backend RS pool, and wecert obtains it from DNSPod and Let's Encrypt and rebinds it to the CLB](docs/diagrams/en/00-the-problem.png)
+![wecert's deployment shape: clients reach the CLB over SNI, one multi-SAN certificate routes to a backend RS pool, and wecert obtains it from DNSPod and Let's Encrypt and rebinds it to the CLB](docs/diagrams/en/00-deployment-shape.png)
 
 Requests arrive at the CLB over SNI. The CLB picks the certificate out of `multi_cert_info` using the name the client sent, and the layer-7 rules route by domain to the backend RS pool. `wecert` runs on one of those CVMs; it reads the `_wecert.*` declarations from DNSPod, writes the `_acme-challenge` records, obtains the certificate from Let's Encrypt, uploads it to Tencent Cloud SSL and rebinds the listener.
 

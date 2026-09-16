@@ -27,11 +27,11 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// fakeACME 起一个最小的 ACME 目录（TLS）。
+// fakeACME starts a minimal ACME directory (over TLS).
 //
-// 只实现到"能构造出 api.Core 并让 NewOrder 失败"为止 ——
-// 目的不是模拟一个 CA，而是让 Reconcile 的**决策路径**可以被观察：
-// 它到底有没有去下单。
+// It only implements enough to construct an api.Core and make NewOrder fail -- the point is
+// not to emulate a CA but to make Reconcile's **decision path** observable: did it actually
+// try to create an order.
 type fakeACME struct {
 	srv       *httptest.Server
 	newOrders atomic.Int64
@@ -43,8 +43,8 @@ func newFakeACME(t *testing.T) *fakeACME {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/directory", func(w http.ResponseWriter, r *http.Request) {
-		// lego 会强制 https（sender.newHTTPSOnly 检查 req.URL.Scheme），
-		// 所以假服务端必须走 TLS；srv.Client() 自带测试 CA。
+		// lego forces https (sender.newHTTPSOnly checks req.URL.Scheme), so the fake server
+		// must speak TLS; srv.Client() comes with the test CA.
 		base := "https://" + r.Host
 		writeJSON(w, map[string]any{
 			"newNonce":   base + "/new-nonce",
@@ -52,8 +52,8 @@ func newFakeACME(t *testing.T) *fakeACME {
 			"newOrder":   base + "/new-order",
 			"revokeCert": base + "/revoke-cert",
 			"keyChange":  base + "/key-change",
-			// 故意不提供 renewalInfo：GetRenewalInfo 会返回 ErrNoARI，
-			// 于是续期决策退化到时间兜底，不产生额外请求。
+			// renewalInfo is deliberately omitted: GetRenewalInfo returns ErrNoARI, so the
+			// renewal decision falls back to time-based logic and makes no extra requests.
 		})
 	})
 	mux.HandleFunc("/new-nonce", func(w http.ResponseWriter, _ *http.Request) {
@@ -62,11 +62,11 @@ func newFakeACME(t *testing.T) *fakeACME {
 	})
 	mux.HandleFunc("/new-order", func(w http.ResponseWriter, _ *http.Request) {
 		f.newOrders.Add(1)
-		// 明确的失败，让 recordFailure 走完。
+		// Fail explicitly so recordFailure runs to completion.
 		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, map[string]any{
 			"type":   "urn:ietf:params:acme:error:malformed",
-			"detail": "测试用的假服务端不接受下单",
+			"detail": "the fake test server does not accept order creation",
 		})
 	})
 	mux.HandleFunc("/new-account", func(w http.ResponseWriter, r *http.Request) {
@@ -85,13 +85,13 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// selfSignedCertPEM 造一张带指定 SAN 的自签证书，用来填 CertState.CertPEM。
+// selfSignedCertPEM builds a self-signed certificate with the given SANs, used to fill CertState.CertPEM.
 func selfSignedCertPEM(t *testing.T, notAfter time.Time, dnsNames ...string) []byte {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("生成私钥失败: %v", err)
+		t.Fatalf("generate private key: %v", err)
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
@@ -104,38 +104,38 @@ func selfSignedCertPEM(t *testing.T, notAfter time.Time, dnsNames ...string) []b
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
-		t.Fatalf("签发测试证书失败: %v", err)
+		t.Fatalf("issue test certificate: %v", err)
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
-// newReconcileHarness 搭一个"证书已经签发好、正处于有效期中期"的现场。
+// newReconcileHarness sets up "certificate already issued, still mid-lifetime".
 func newReconcileHarness(t *testing.T, domains []string, certSANs []string) (*Manager, *state.Store, *fakeACME, *config.Certificate) {
 	t.Helper()
 
 	fake := newFakeACME(t)
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatalf("打开状态库失败: %v", err)
+		t.Fatalf("open state store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
 	httpClient := fake.srv.Client()
-	// 账号的 kid 与私钥随便给：这个测试只关心"有没有去下单"。
+	// The account kid and private key are arbitrary: this test only cares whether an order was tried.
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	core, err := legoapi.New(httpClient, "wecert-test", fake.srv.URL+"/directory", "kid-1", key)
 	if err != nil {
-		t.Fatalf("构造 api.Core 失败: %v", err)
+		t.Fatalf("build api.Core: %v", err)
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	solver := &fakeSolver{}
 	m := newManager(store, NewAPI(core), solver, fakeKeyAuth{}, deploy.Noop{}, log)
 
-	// 90 天有效期、刚签不久：距离 classic 的 30 天续期窗口还很远。
+	// 90-day validity, freshly issued: still far from classic's 30-day renewal window.
 	notAfter := time.Now().Add(90 * 24 * time.Hour).Truncate(time.Second)
 	certPEM := selfSignedCertPEM(t, notAfter, certSANs...)
 
@@ -146,7 +146,7 @@ func newReconcileHarness(t *testing.T, domains []string, certSANs []string) (*Ma
 		KeyPEM:    []byte("irrelevant"),
 		IssuedAt:  time.Now(),
 		CertURL:   "https://acme.example/cert/old",
-		ARICertID: "", // 关掉 ARI，让决策完全走时间兜底，避免额外请求
+		ARICertID: "", // disable ARI so the decision falls back to time alone, avoiding extra requests
 	}); err != nil {
 		t.Fatalf("PutCert: %v", err)
 	}
@@ -162,24 +162,24 @@ func newReconcileHarness(t *testing.T, domains []string, certSANs []string) (*Ma
 	}
 }
 
-// 最核心的一条：域名集合一致时**什么都不做**。
+// The most important one: when the domain sets match, **do nothing**.
 //
-// 这同时验证了另一个方向 —— 漂移检测不会误报，把正常的证书推去重签。
-// 如果这里错了，每轮 reconcile 都会下一次单，几天内撞满
-// "5 certs per exact set of identifiers / 7 days"。
+// This also verifies the other direction -- drift detection must not fire falsely and push a
+// healthy certificate into reissuance: if this is wrong, every reconcile creates an order and
+// hits "5 certs per exact set of identifiers / 7 days" within days.
 func TestReconcileSkipsWhenDomainsMatch(t *testing.T) {
 	domains := []string{"a.example.com", "b.example.com", "c.example.com"}
 	m, _, fake, cert := newReconcileHarness(t, domains, domains)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("域名一致且未到续期窗口，不该报错: %v", err)
+		t.Fatalf("domains match and no renewal window reached: no error expected, got %v", err)
 	}
 	if n := fake.newOrders.Load(); n != 0 {
-		t.Errorf("不应创建任何订单，实际创建了 %d 张 —— 这会在几天内撞满限额", n)
+		t.Errorf("no order should be created, but %d were -- this exhausts the rate-limit quota within days", n)
 	}
 }
 
-// 顺序无关、大小写无关的集合相等不应被误判成漂移。
+// Set equality that ignores order and case must not be misread as drift.
 func TestReconcileIgnoresDomainOrderAndCase(t *testing.T) {
 	m, _, fake, cert := newReconcileHarness(t,
 		[]string{"B.Example.com", "a.example.com"},
@@ -187,48 +187,48 @@ func TestReconcileIgnoresDomainOrderAndCase(t *testing.T) {
 	)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("集合等价时不该报错: %v", err)
+		t.Fatalf("equivalent sets: no error expected, got %v", err)
 	}
 	if n := fake.newOrders.Load(); n != 0 {
-		t.Errorf("集合等价却被判定成漂移，创建了 %d 张订单", n)
+		t.Errorf("equivalent sets were judged as drift and created %d orders", n)
 	}
 }
 
-// 关键回归：给已生效的证书**加一个域名**必须立刻触发重签，
-// 而不是傻等到 30 天后的续期窗口。
+// Key regression: **adding a domain** to a live certificate must trigger reissuance right away,
+// not wait for the renewal window 30 days out.
 //
-// 这里通过"确实去下了单"来证明决策路径走对了 ——
-// 真正的签发需要真实 ACME 服务端，不在单测范围内。
+// "An order was actually attempted" is how we prove the decision path was taken -- real
+// issuance needs a real ACME server and is out of scope for unit tests.
 func TestReconcileReissuesImmediatelyWhenDomainAdded(t *testing.T) {
 	live := []string{"a.example.com", "b.example.com"}
 	m, store, fake, cert := newReconcileHarness(t, append(live, "new.example.com"), live)
 
 	err := m.Reconcile(context.Background(), cert)
 	if err == nil {
-		t.Fatal("配置新增域名后应当立刻去重签（假服务端会拒绝下单，所以必然报错）")
+		t.Fatal("adding a domain must reissue immediately (the fake server rejects orders, so this must fail)")
 	}
 	if !strings.Contains(err.Error(), "create order") {
-		t.Errorf("报错应当来自下单这一步，说明确实走进了签发流程: %v", err)
+		t.Errorf("the error should come from order creation, proving issuance was really entered: %v", err)
 	}
 	if n := fake.newOrders.Load(); n != 1 {
-		t.Errorf("应当恰好尝试下单 1 次，实际 %d 次", n)
+		t.Errorf("should attempt to create exactly 1 order, got %d", n)
 	}
 
-	// 失败要落盘并安排退避，否则每轮都会重打 CA。
+	// The failure must be persisted and a backoff scheduled, otherwise every round re-hits the CA.
 	st, gerr := store.GetCert("many-sans")
 	if gerr != nil {
 		t.Fatal(gerr)
 	}
 	if st.ConsecutiveFailures != 1 {
-		t.Errorf("ConsecutiveFailures = %d，期望 1", st.ConsecutiveFailures)
+		t.Errorf("ConsecutiveFailures = %d, want 1", st.ConsecutiveFailures)
 	}
 	if st.NextAttemptAt.IsZero() {
-		t.Error("应当安排下一次尝试时间（退避）")
+		t.Error("the next attempt time (backoff) should be scheduled")
 	}
 }
 
-// 反向：配置里**删掉**一个域名同样必须触发重签。
-// 只查 missing 会漏掉这种情况，证书会继续带着已经不该有的 SAN。
+// The reverse: **removing** a domain from the config must trigger reissuance too.
+// Checking only for missing names would miss it, leaving a SAN the certificate should no longer have.
 func TestReconcileReissuesImmediatelyWhenDomainRemoved(t *testing.T) {
 	m, _, fake, cert := newReconcileHarness(t,
 		[]string{"a.example.com"},
@@ -236,15 +236,15 @@ func TestReconcileReissuesImmediatelyWhenDomainRemoved(t *testing.T) {
 	)
 
 	if err := m.Reconcile(context.Background(), cert); err == nil {
-		t.Fatal("配置删掉域名后应当立刻去重签")
+		t.Fatal("removing a domain from the config should reissue immediately")
 	}
 	if n := fake.newOrders.Load(); n != 1 {
-		t.Errorf("应当尝试下单 1 次，实际 %d 次", n)
+		t.Errorf("should attempt to create 1 order, got %d", n)
 	}
 }
 
-// 已有未过期订单、且它匹配当前配置时，必须继续推进而不是新建 ——
-// 这是防止撞限速的核心不变量。
+// When a non-expired order exists and it matches the current config, keep advancing it
+// instead of creating a new one -- the core invariant that avoids rate-limit hits.
 func TestReconcileResumesMatchingOrderInsteadOfCreatingNew(t *testing.T) {
 	domains := []string{"a.example.com", "b.example.com"}
 	m, store, fake, cert := newReconcileHarness(t, domains, domains)
@@ -260,29 +260,29 @@ func TestReconcileResumesMatchingOrderInsteadOfCreatingNew(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// advance 会去查订单，假服务端没有这个端点 → 报错。
-	// 关键是 NewOrder 一次都不能发生。
+	// advance will look up the order; the fake server has no such endpoint -> error.
+	// The point is that NewOrder must not happen even once.
 	_ = m.Reconcile(context.Background(), cert)
 
 	if n := fake.newOrders.Load(); n != 0 {
-		t.Errorf("已有匹配的在飞订单时不应新建订单，实际新建了 %d 张", n)
+		t.Errorf("must not create a new order while a matching in-flight order exists, created %d", n)
 	}
 }
 
-// 配置变了之后，在飞订单必须被丢弃 ——
-// 否则会一直推进一张 finalize 必然被拒的订单，卡到它 7 天后过期。
+// Once the config changes, an in-flight order must be discarded -- otherwise we keep advancing
+// an order whose finalize is bound to be rejected until it expires 7 days later.
 //
-// 现场按最真实的样子搭：生效证书还是**旧**域名集合，
-// 配置已经改了，同时在飞的订单也还是按旧集合下的。
-// 一轮 reconcile 应当同时完成"丢弃旧订单"和"按新域名重新签发"。
+// The setup mirrors the real thing: the live certificate still carries the **old** domain set,
+// the config has already changed, and the in-flight order was created for the old set too.
+// A single reconcile should both "discard the old order" and "reissue for the new domains".
 func TestReconcileDiscardsStaleOrderAndReissues(t *testing.T) {
 	oldDomains := []string{"a.example.com", "b.example.com"}
 	newDomains := []string{"a.example.com", "b.example.com", "c.example.com"}
 
-	// 生效证书是旧的集合，配置是新的集合。
+	// The live certificate holds the old set, the config holds the new one.
 	m, store, fake, cert := newReconcileHarness(t, newDomains, oldDomains)
 
-	// 在飞订单也是按旧集合下的。
+	// The in-flight order was created for the old set too.
 	if err := store.PutOrder(&state.Order{
 		CertName:    "many-sans",
 		OrderURL:    fake.srv.URL + "/order/stale",
@@ -301,22 +301,22 @@ func TestReconcileDiscardsStaleOrderAndReissues(t *testing.T) {
 		t.Fatal(err)
 	}
 	if o != nil {
-		t.Errorf("域名变更后应当丢弃旧订单，但它还在: %+v", o)
+		t.Errorf("the old order should be discarded after the domain change, but it is still there: %+v", o)
 	}
 	if n := fake.newOrders.Load(); n != 1 {
-		t.Errorf("丢弃旧订单后应当按新域名重新下单，实际新建 %d 张", n)
+		t.Errorf("after discarding the old order, a new one should be created for the new domains, created %d", n)
 	}
 }
 
-// 反过来：订单和配置不一致，但生效证书**已经**符合配置时，
-// 丢弃订单就够了，不该顺势再签一张 ——
-// 否则每轮 reconcile 都白烧一次订单配额。
+// The converse: when the order does not match the config but the live certificate **already**
+// does, discarding the order is enough -- do not reissue along the way, otherwise every
+// reconcile pointlessly burns one order from the rate-limit quota.
 func TestReconcileDiscardStaleOrderDoesNotForceReissue(t *testing.T) {
 	domains := []string{"a.example.com", "b.example.com"}
-	// 生效证书已经就是配置要的集合。
+	// The live certificate already carries exactly the set the config asks for.
 	m, store, fake, cert := newReconcileHarness(t, domains, domains)
 
-	// 在飞订单却按另一个（更早的）集合下的。
+	// The in-flight order was created for a different (earlier) set.
 	if err := store.PutOrder(&state.Order{
 		CertName:    "many-sans",
 		OrderURL:    fake.srv.URL + "/order/stale",
@@ -329,13 +329,13 @@ func TestReconcileDiscardStaleOrderDoesNotForceReissue(t *testing.T) {
 	}
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("Reconcile 不该报错: %v", err)
+		t.Fatalf("Reconcile should not return an error: %v", err)
 	}
 
 	if o, _ := store.GetOrder("many-sans"); o != nil {
-		t.Errorf("过期集合的订单应当被丢弃: %+v", o)
+		t.Errorf("the order for the stale set should be discarded: %+v", o)
 	}
 	if n := fake.newOrders.Load(); n != 0 {
-		t.Errorf("证书已符合配置且未到续期窗口，不该下单，实际新建 %d 张", n)
+		t.Errorf("certificate already matches the config and no renewal window was reached: created %d orders", n)
 	}
 }
