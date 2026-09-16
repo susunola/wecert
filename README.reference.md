@@ -610,6 +610,27 @@ Two metrics keep the failure modes apart:
 
 > **The comparison is against what was deployed, not "some valid certificate".** `wecert_certificate_probe_not_after_timestamp_seconds` (read over the network) sitting next to `wecert_certificate_not_after_timestamp_seconds` (read from the state store) is what makes "the rebind silently did nothing" visible.
 
+### `failureFallback`
+
+When a certificate is close to expiry and issuance keeps failing, drop the names whose authorizations keep failing and issue for the rest. **Partial availability beats total failure** — one misconfigured DNS record out of 25 names should not take the other 24 down with it.
+
+**Off by default.** It changes what the certificate covers, which is a security decision, and it is not the job of the program to make it on your behalf. When it fires it logs at **ERROR** and stays visible in metrics until it clears.
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Turn it on |
+| `afterFailures` | `5` | Consecutive failures before falling back at all |
+| `beforeExpiry` | `168h` | Only inside this window. Too large a value is a net loss: you would be trading a perfectly valid certificate for one with names missing |
+| `minIdentifierFailures` | `3` | A name must have failed this many times before it may be dropped. `1` would let a single network blip drop a name |
+| `failureWindow` | `24h` | How long a failure record stays relevant |
+| `minNames` | `1` | Refuse to fall back if it would leave fewer than this. That would be total failure wearing a disguise |
+
+**It only ever drops names that failed individually.** With no per-identifier evidence it does nothing — dropping names at random would sacrifice the healthy ones too, which is worse than not falling back at all. It also requires a live certificate: without one there is no "keep what you have" argument, only "sign for less".
+
+**It heals itself.** A dropped name is never attempted again, so it can never earn its way back through a success. Instead the failure record ages out after `failureWindow`, the name stops being dropped, and the next pass retries the full set. Fix the DNS and recovery takes at most one window — no extra retry state, no manual step.
+
+`wecert_certificate_fallback_active{cert}` and `wecert_certificate_fallback_dropped_names{cert}` are what you alert on. A fallback that stays active is an unresolved problem, not a steady state.
+
 ### `certificates[]`
 
 | Field | Required | Default | Description |
@@ -689,6 +710,8 @@ The timer's `Unit=` is not decorative: without it, systemd resolves the service 
 | `wecert_certificate_probe_match{host}` | 1 when the certificate served is the one deployed; 0 when a rebind did not take effect or another certificate is winning SNI |
 | `wecert_certificate_probe_not_after_timestamp_seconds{host}` | `notAfter` read back over the network — compare against the state-store value |
 | `wecert_certificate_probe_errors_total{host}` | The probe could not run at all. An environment problem, not a certificate problem |
+| `wecert_certificate_fallback_active{cert}` | 1 while a partial certificate is being served because some names keep failing |
+| `wecert_certificate_fallback_dropped_names{cert}` | How many names that partial certificate is missing |
 | `wecert_desired_state_age_seconds` | Age of the desired-state document. A growing value means `wecert-onboard` stopped running |
 | `wecert_orphaned_certificates` | Certificates in the state store but absent from the desired state. They will not be renewed |
 
@@ -945,6 +968,7 @@ Runs a full issuance against staging with a throwaway state database, refusing t
 - [x] **External black-box probe (dial 443 and check the effective `notAfter`).** Lands in `internal/probe` and `cmd/wecert-probe`: every pass dials the first few names of each deployed certificate and compares what is *actually served* against what was *deployed*. "The API says the rebind succeeded" and "the browser gets this certificate" are two different things — the rebind is asynchronous, and another certificate can be winning SNI. Neither is visible through the control plane. See the `probe` section above.
 - [x] **Cross-process exclusive lock (`flock`) on `state.db`.** Acquired in `state.Open` on `<statePath>.lock`; a second process fails at startup instead of double-ordering. Kernel-managed, so a crash releases it — no stale PID file. See the systemd deployment section above.
 - [x] **Abstract `Manager`'s dependency on `*api.Core` behind a narrow `API` interface.** `internal/acme/api.go` now defines the seven operations the Manager actually needs, plus `NewAPI(core)` as the lego adapter. The payoff is not the indirection — it is that the order state machine can finally be asserted on *call order and arguments*, without an HTTP server. Three invariants now have tests that would have been awkward before: the order URL is on disk before the next ACME call, renewals carry `replaces`, and the CSR is DER posted to the finalize URL.
+- [x] **Failure fallback: split into subsets before expiry.** `failureFallback` drops only the names whose authorizations individually keep failing, only when the certificate is inside the expiry window, and only if enough names remain. Off by default, logged at ERROR, self-healing once the failure records age out. See the `failureFallback` section above.
 
 **Outstanding:**
 
@@ -952,7 +976,6 @@ Runs a full issuance against staging with a throwaway state database, refusing t
 - [ ] Switch to `profile: tlsserver` (45 days) and run a complete renewal cycle fully automatically
 - [ ] Test the SNI multi-certificate case with `multi_cert_info` ("replacing one doesn't disturb another")
 - [ ] Stage C: CVM + systemd + CVM role credential path (`testenv/` is ready, `create_cvm=true`)
-- [ ] Failure fallback: if issuance still hasn't succeeded N days before expiry, split into smaller subsets and sign those first (partial availability beats total failure)
 - [ ] `state.Store` has no transaction support, so the `download()` epilogue (promote the new certificate → retire the old → discard the order) commits in separate statements. A partial failure leaves an orphaned cloud certificate or a false failure alarm.
 
 ## License

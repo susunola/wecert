@@ -127,6 +127,18 @@ func (m *Manager) download(
 		return err
 	}
 
+	// 一次成功的签发之后，如果此刻并没有处于降级，就把逐个 identifier 的
+	// 失败账本清掉。
+	//
+	// 账本的意义是"最近谁在坏"，不是"历史上谁坏过"。留着它会让一次早已
+	// 修好的故障把那个名字一直摘在证书外面 —— 而且因为被摘掉的名字永远
+	// 不会再被尝试，它也就永远等不到一次成功来给自己洗白。
+	if fb, err := m.store.GetFallback(c.Name); err == nil && fb == nil {
+		if cerr := m.store.ClearIdentifierFailures(c.Name); cerr != nil {
+			m.log.Warn("cannot clear the identifier failure ledger", "cert", c.Name, "err", cerr)
+		}
+	}
+
 	if !c.Deploy.Enabled {
 		m.log.Info("certificate issued and recorded locally (cloud deploy is off)",
 			"cert", c.Name, "notAfter", st.NotAfter,
