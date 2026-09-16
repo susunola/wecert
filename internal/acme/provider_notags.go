@@ -13,11 +13,16 @@ import (
 
 func init() { config.SetLegoProviderSupport(false) }
 
-// legoProviderAvailable reports that the full lego DNS provider registry is NOT compiled in.
+// legoProviderAvailable tells the build-tag tests which half of the pair this is. It is not read
+// by the program: config validation is what refuses `dns.provider: lego` here, and it learns that
+// from the init above rather than from this constant.
 const legoProviderAvailable = false
 
-// newLegoProvider exists so the error is raised where the operator can act on it, and so the
-// build-tag branch has an identical signature.
+// newLegoProvider exists so the two build variants have identical signatures, and as the backstop
+// for a config that reaches the solver without having been validated. `config.Load` is what
+// normally refuses `dns.provider: lego` in this build, and it refuses it with the same
+// instruction, before the ACME account has been touched -- see lego_build_default_test.go, which
+// asserts both halves of that.
 //
 // Why this is a build tag rather than always-available. lego's registry imports all ~198
 // provider packages, and between them they depend on hundreds of third-party modules (the
