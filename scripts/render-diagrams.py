@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -173,7 +174,19 @@ def main() -> None:
                 w, h = int(float(vb.group(1))), int(float(vb.group(2)))
 
                 svg_path = Path(tmp) / f"{lang}-{name}.svg"
-                svg_path.write_text(standalone(svg, css, i), encoding="utf-8")
+                doc = standalone(svg, css, i)
+
+                # standalone SVG 是被浏览器当 **XML** 解析的，而 HTML 允许的
+                # 写法在 XML 里未必合法 —— 最典型的是 `<br>`：HTML 里没问题，
+                # 在 SVG 里会让整张图变成 Chrome 的错误页，而且**渲染仍然"成功"**，
+                # 只是产出一张写着报错的图。所以这里先验一遍。
+                try:
+                    ET.fromstring(doc)
+                except ET.ParseError as e:
+                    sys.exit(f"✗ {lang}/{name}: 生成的 SVG 不是合法 XML（{e}）。\n"
+                             f"  多半是源文件里写了 HTML 才允许的简写，"
+                             f"比如 <br> 而不是 <br/>。")
+                svg_path.write_text(doc, encoding="utf-8")
 
                 png_path = out_dir / f"{name}.png"
                 render(chrome, svg_path, png_path, w, h)
