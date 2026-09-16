@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,7 +15,7 @@ import (
 	"github.com/susunola/wecert/internal/spec"
 )
 
-// ── 测试替身 ────────────────────────────────────────────────────────────────
+// ── test doubles ───────────────────────────────────────────────────────────
 
 type fakeDeclarations struct {
 	raw []RawDeclaration
@@ -34,7 +35,7 @@ func (f *fakeRules) ListRuleDomains(context.Context) ([]string, error) {
 	return f.domains, f.err
 }
 
-// clock 让宽限期和配额预算可以被测出来，而不是靠 sleep。
+// clock lets the grace period and quota budget be tested without sleeping.
 type clock struct{ t time.Time }
 
 func newClock() *clock                   { return &clock{t: time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)} }
@@ -84,31 +85,31 @@ func newHarness(t *testing.T, opts Options) *harness {
 
 	ob, err := New(Sources{Declarations: h.decls, Rules: h.rules}, opts, testLogger())
 	if err != nil {
-		t.Fatalf("构造 onboarding 失败: %v", err)
+		t.Fatalf("constructing the onboarder failed: %v", err)
 	}
 	h.ob = ob
 	return h
 }
 
-// run 跑一轮并落盘，返回报告。
+// run runs one round, persists it, and returns the report.
 func (h *harness) run(t *testing.T) *Report {
 	t.Helper()
 	rep, err := h.ob.Run(context.Background())
 	if err != nil {
-		t.Fatalf("Run 失败: %v", err)
+		t.Fatalf("Run failed: %v", err)
 	}
 	if err := h.ob.Commit(rep); err != nil {
-		t.Fatalf("Commit 失败: %v", err)
+		t.Fatalf("Commit failed: %v", err)
 	}
 	return rep
 }
 
-// document 读回落盘的文档，用来验证"没写坏的进去"。
+// document reads back the persisted document, to verify "nothing bad was written".
 func (h *harness) document(t *testing.T) *spec.Document {
 	t.Helper()
 	doc, err := spec.LoadDocument(h.opts.DocumentPath)
 	if err != nil {
-		t.Fatalf("读回文档失败: %v", err)
+		t.Fatalf("reading the document back failed: %v", err)
 	}
 	return doc
 }
@@ -117,7 +118,7 @@ func (h *harness) domains(t *testing.T) []string {
 	t.Helper()
 	doc := h.document(t)
 	if len(doc.Certificates) != 1 {
-		t.Fatalf("期望 1 张证书，实际 %d: %+v", len(doc.Certificates), doc.Certificates)
+		t.Fatalf("expected 1 certificate, got %d: %+v", len(doc.Certificates), doc.Certificates)
 	}
 	return doc.Certificates[0].Domains
 }
@@ -131,7 +132,7 @@ func decisionFor(rep *Report, hostname string) (spec.Decision, bool) {
 	return spec.Decision{}, false
 }
 
-// ── 声明解析 ────────────────────────────────────────────────────────────────
+// ── declaration parsing ────────────────────────────────────────────────────
 
 func TestParseDeclaration(t *testing.T) {
 	d, err := ParseDeclaration("example.com", "_wecert.example.com",
@@ -143,44 +144,45 @@ func TestParseDeclaration(t *testing.T) {
 		t.Errorf("Hostname = %q", d.Hostname)
 	}
 	if !d.Wildcard {
-		t.Error("wildcard=1 应当生效")
+		t.Error("wildcard=1 must take effect")
 	}
 	if d.Profile != "tlsserver" {
 		t.Errorf("Profile = %q", d.Profile)
 	}
 	if d.Deploy == nil || *d.Deploy {
-		t.Errorf("deploy=0 应当生效，实际 %v", d.Deploy)
+		t.Errorf("deploy=0 must take effect, got %v", d.Deploy)
 	}
 	if got := d.Names(); len(got) != 2 || got[1] != "*.example.com" {
-		t.Errorf("Names() = %v，应当展开通配符", got)
+		t.Errorf("Names() = %v, must expand the wildcard", got)
 	}
 }
 
-// 裸记录本身就是声明，这是最常见的写法。
+// A bare record is itself a declaration; this is the most common form.
 func TestParseDeclarationAcceptsABareRecord(t *testing.T) {
 	d, err := ParseDeclaration("example.com", "_wecert.api.example.com", []string{""})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if d.Hostname != "api.example.com" || d.Wildcard {
-		t.Errorf("裸记录应当只声明自己: %+v", d)
+		t.Errorf("a bare record must declare only itself: %+v", d)
 	}
 }
 
-// 拼错的键必须报错而不是忽略。
+// A misspelled key must be an error, not ignored.
 //
-// `wildard=1` 被静默忽略的结果是"声明了通配符但没生效"，
-// 而人会一直以为它生效了 —— 这类沉默的偏差比一条清晰的报错昂贵得多。
+// Silently ignoring `wildard=1` yields "the wildcard was declared but never took
+// effect", while the human keeps believing it did -- a silent divergence like that
+// costs far more than a clear error.
 func TestParseDeclarationRejectsUnknownKeys(t *testing.T) {
 	_, err := ParseDeclaration("example.com", "_wecert.example.com", []string{"wildard=1"})
 	if err == nil || !strings.Contains(err.Error(), "unknown key") {
-		t.Fatalf("未知键应当报错，实际 %v", err)
+		t.Fatalf("an unknown key must fail, got %v", err)
 	}
 }
 
 func TestParseDeclarationRejectsBadVersion(t *testing.T) {
 	if _, err := ParseDeclaration("example.com", "_wecert.example.com", []string{"v=wecert9"}); err == nil {
-		t.Fatal("未知版本号应当报错")
+		t.Fatal("an unknown version must fail")
 	}
 }
 
@@ -188,56 +190,58 @@ func TestParseDeclarationRejectsConflictingKeys(t *testing.T) {
 	_, err := ParseDeclaration("example.com", "_wecert.example.com",
 		[]string{"wildcard=1", "wildcard=0"})
 	if err == nil {
-		t.Fatal("同一个键给出互相矛盾的值应当报错")
+		t.Fatal("the same key given contradictory values must fail")
 	}
 }
 
-// ── §5.1 来源失败 ≠ 名字消失 ────────────────────────────────────────────────
+// ── §5.1 source failure ≠ name gone ────────────────────────────────────────
 
-// 这是整套设计里唯一能造成灾难的地方。
+// This is the one place in the entire design that can cause a disaster.
 //
-// DNS 枚举接口抖动 → 返回空 → 若被理解成"这些名字都没了" →
-// 期望状态里没有域名了 → 重签一张不含域名的证书 → 线上立刻握手失败。
-// 这比不签发严重得多，所以正确反应是冻结。
+// A DNS enumeration API blip → returns empty → if read as "all these names are
+// gone" → the desired state has no domains → a certificate with no domains is
+// re-issued → live handshakes fail immediately. That is far worse than not
+// issuing, so the correct reaction is to freeze.
 func TestSourceFailureFreezesInsteadOfEmptying(t *testing.T) {
 	h := newHarness(t, Options{})
 	h.decls.raw = []RawDeclaration{decl("example.com")}
 	h.rules.domains = []string{"example.com"}
 
 	if rep := h.run(t); rep.Frozen() {
-		t.Fatalf("第一轮不该冻结: %v", rep.FreezeReasons)
+		t.Fatalf("the first round must not freeze: %v", rep.FreezeReasons)
 	}
 	before := h.domains(t)
 
-	// 来源挂了。
+	// The source dies.
 	h.decls.err = errors.New("dnspod api timeout")
 
 	rep := h.run(t)
 	if !rep.Frozen() {
-		t.Fatal("来源失败时必须冻结")
+		t.Fatal("a source failure must freeze")
 	}
 	if len(rep.FreezeReasons) == 0 {
-		t.Error("冻结必须带上原因")
+		t.Error("a freeze must carry a reason")
 	}
 
-	// 文档必须一个字都没变 —— 尤其不能被清空。
+	// The document must be unchanged character for character -- above all not emptied.
 	after := h.domains(t)
 	if len(after) != len(before) || after[0] != before[0] {
-		t.Fatalf("冻结时期望状态被改动了: %v -> %v", before, after)
+		t.Fatalf("the desired state changed while frozen: %v -> %v", before, after)
 	}
 }
 
-// 冻结时不能推进删除宽限期。
+// A freeze must not advance the deletion grace clock.
 //
-// AbsentSince 是"这个名字已经被确认缺席多久"的账本，而冻结的那一轮
-// 我们根本不知道名字还在不在。推进它等于用噪声缩短宽限期。
+// AbsentSince is the ledger of "how long this name has been confirmed absent", but
+// on a frozen round we have no idea whether the name still exists. Advancing it uses
+// noise to shorten the grace period.
 func TestSourceFailureDoesNotAdvanceTheGraceClock(t *testing.T) {
 	h := newHarness(t, Options{DropThreshold: 0.9})
 	h.decls.raw = []RawDeclaration{decl("a.example.com"), decl("b.example.com")}
 	h.rules.domains = []string{"a.example.com", "b.example.com"}
 	h.run(t)
 
-	// b 的声明消失，来源正常 —— 此时应当记下 AbsentSince。
+	// b's declaration disappears while the source is healthy -- AbsentSince should be recorded.
 	h.decls.raw = []RawDeclaration{decl("a.example.com")}
 	h.run(t)
 
@@ -247,10 +251,10 @@ func TestSourceFailureDoesNotAdvanceTheGraceClock(t *testing.T) {
 	}
 	since, ok := st.AbsentSince["b.example.com"]
 	if !ok {
-		t.Fatal("b.example.com 应当被记下缺席时刻")
+		t.Fatal("b.example.com must have its absence time recorded")
 	}
 
-	// 再过几轮，但来源全是失败的：AbsentSince 不能往前推。
+	// More rounds pass, all with a failing source: AbsentSince must not move forward.
 	h.clock.advance(time.Hour)
 	h.decls.err = errors.New("boom")
 	h.run(t)
@@ -260,14 +264,60 @@ func TestSourceFailureDoesNotAdvanceTheGraceClock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := after.AbsentSince["b.example.com"]; !got.Equal(since) {
-		t.Errorf("冻结不该推进缺席时刻: %v -> %v", since, got)
+		t.Errorf("a freeze must not advance the absence time: %v -> %v", since, got)
 	}
 }
 
-// ── §5.2 期望状态骤变熔断 ───────────────────────────────────────────────────
+// ── §5.2 abrupt desired-state fuse ─────────────────────────────────────────
 
-// 正常的一次下线不会让集合少三成。突然少三成，几乎一定是上游出了问题
-// （API 返回不完整、权限被改、zone 读失败）。照做的后果是批量摘除 SAN。
+// A DropThreshold at or above 1 can never be exceeded, so the fuse would never
+// fire. The config layer rejects it, but the CLI -drop-threshold flag reaches
+// Options directly -- the constructor must hold the same line.
+func TestDropThresholdAtOrAboveOneIsRejected(t *testing.T) {
+	// New validates several required paths before it reaches the policy checks, so
+	// they all have to be filled in. Otherwise every case below would fail for an
+	// unrelated reason and the test would pass without the check it exists to pin.
+	base := func() Options {
+		dir := t.TempDir()
+		return Options{
+			DocumentPath: filepath.Join(dir, "desired-state.yaml"),
+			StatePath:    filepath.Join(dir, "onboard-state.json"),
+			ReportPath:   filepath.Join(dir, "report.json"),
+			Generator:    "wecert-onboard/test",
+		}
+	}
+	src := Sources{Declarations: &fakeDeclarations{}, Rules: &fakeRules{}}
+
+	// The fuse compares a loss ratio that can never exceed 1, so a threshold at or
+	// above 1 -- or a percentage written as `30` -- can never be exceeded. NaN is in
+	// the list because every comparison against it is false, so it satisfies both
+	// this bound and the `<= 0` default above.
+	for _, v := range []float64{30, 1.5, 1, math.NaN()} {
+		opts := base()
+		opts.DropThreshold = v
+		_, err := New(src, opts, testLogger())
+		if err == nil {
+			t.Errorf("New accepted DropThreshold=%v; the abrupt-change fuse could never fire", v)
+			continue
+		}
+		if !strings.Contains(err.Error(), "DropThreshold") {
+			t.Errorf("New rejected DropThreshold=%v for the wrong reason: %v", v, err)
+		}
+	}
+
+	// 0 means "use the default", and anything in (0,1) is a real threshold.
+	for _, v := range []float64{0, 0.3, 0.99} {
+		opts := base()
+		opts.DropThreshold = v
+		if _, err := New(src, opts, testLogger()); err != nil {
+			t.Errorf("New rejected a valid DropThreshold=%v: %v", v, err)
+		}
+	}
+}
+
+// A normal decommission does not remove a third of the set. Losing a third at once
+// is almost certainly an upstream fault (incomplete API response, changed
+// permissions, zone read failure). Acting on it strips SANs in bulk.
 func TestAbruptDropFreezes(t *testing.T) {
 	h := newHarness(t, Options{})
 
@@ -280,20 +330,20 @@ func TestAbruptDropFreezes(t *testing.T) {
 	h.decls.raw, h.rules.domains = raw, rules
 	h.run(t)
 
-	// 四个里只剩一个：掉了 75%，远超 30% 的阈值。
+	// One of four remains: a 75% drop, far above the 30% threshold.
 	h.decls.raw = []RawDeclaration{decl("a.example.com")}
 	h.rules.domains = []string{"a.example.com"}
 
 	rep := h.run(t)
 	if !rep.Frozen() {
-		t.Fatal("超过阈值的骤降必须冻结")
+		t.Fatal("a drop above the threshold must freeze")
 	}
 	if !strings.Contains(strings.Join(rep.FreezeReasons, " "), "force") {
-		t.Error("冻结原因应当告诉人怎么确认这次骤降是有意的")
+		t.Error("the freeze reason must tell a human how to confirm the drop was intentional")
 	}
 }
 
-// 小幅度下降不该触发熔断，否则正常下线就走不动了。
+// A small drop must not trip the fuse, or normal decommissions could never proceed.
 func TestSmallDropDoesNotFreeze(t *testing.T) {
 	h := newHarness(t, Options{})
 
@@ -306,62 +356,65 @@ func TestSmallDropDoesNotFreeze(t *testing.T) {
 	h.decls.raw, h.rules.domains = raw, rules
 	h.run(t)
 
-	// 掉一个 = 10%，低于 30%。
+	// One gone = 10%, below 30%.
 	h.decls.raw = raw[:9]
 	h.rules.domains = rules[:9]
-	h.clock.advance(48 * time.Hour) // 越过宽限期
+	h.clock.advance(48 * time.Hour) // past the grace period
 
 	if rep := h.run(t); rep.Frozen() {
-		t.Fatalf("10%% 的下降不该冻结: %v", rep.FreezeReasons)
+		t.Fatalf("a 10%% drop must not freeze: %v", rep.FreezeReasons)
 	}
 }
 
-// ── §5.3 删除比增加保守一个量级 ─────────────────────────────────────────────
+// ── §5.3 deletion an order of magnitude more conservative than addition ────
 
-// 声明消失之后不能立刻把域名从证书里摘掉。
+// A vanished declaration must not immediately strip the domain from the certificate.
 //
-// 双来源的结构天然会让状态抖动：DNS 查询抖一下 → 立刻删 → 重签 →
-// DNS 恢复 → 又重签。一次上线触发三次签发，白烧配额。
+// A two-source design naturally makes state flap: a DNS query blips → delete at
+// once → re-issue → DNS recovers → re-issue again. One rollout triggers three
+// issuances and burns quota for nothing.
 func TestRemovalWaitsForTheGracePeriod(t *testing.T) {
-	// 阈值调高，把骤变熔断排除在外，单独观察宽限期。
+	// Raise the threshold to rule out the abrupt-change fuse and observe the grace
+	// period alone.
 	h := newHarness(t, Options{DropThreshold: 0.9})
 
 	h.decls.raw = []RawDeclaration{decl("a.example.com"), decl("b.example.com")}
 	h.rules.domains = []string{"a.example.com", "b.example.com"}
 	h.run(t)
 
-	// b 的声明没了，规则也不再服务它，来源是健康的。
+	// b's declaration is gone and no rule serves it any more, but the source is healthy.
 	h.decls.raw = []RawDeclaration{decl("a.example.com")}
 	h.rules.domains = []string{"a.example.com"}
 
 	rep := h.run(t)
 	if rep.Frozen() {
-		t.Fatalf("不该冻结: %v", rep.FreezeReasons)
+		t.Fatalf("must not freeze: %v", rep.FreezeReasons)
 	}
 	domains := h.domains(t)
 	if len(domains) != 2 {
-		t.Fatalf("宽限期内 b 必须留着，实际 %v", domains)
+		t.Fatalf("b must stay during the grace period, got %v", domains)
 	}
 	d, ok := decisionFor(rep, "b.example.com")
 	if !ok || !d.Included {
-		t.Fatalf("b 应当被标记为保留: %+v", d)
+		t.Fatalf("b must be marked as kept: %+v", d)
 	}
 	if !strings.Contains(d.Reason, "grace period") {
-		t.Errorf("理由应当提到宽限期，实际 %q", d.Reason)
+		t.Errorf("the reason must mention the grace period, got %q", d.Reason)
 	}
 
-	// 越过宽限期之后才真的移除。
+	// Only past the grace period is it actually removed.
 	h.clock.advance(25 * time.Hour)
 	h.run(t)
 
 	if got := h.domains(t); len(got) != 1 || got[0] != "a.example.com" {
-		t.Fatalf("超过宽限期后应当移除 b，实际 %v", got)
+		t.Fatalf("b must be removed after the grace period, got %v", got)
 	}
 }
 
-// 名字回来之后宽限期要重置。
+// The grace clock must reset once a name comes back.
 //
-// 否则一次抖动会把缺席时刻一路带下去，宽限期形同虚设。
+// Otherwise one blip carries the absence time forward forever and the grace period
+// is a sham.
 func TestReappearingNameResetsTheGraceClock(t *testing.T) {
 	h := newHarness(t, Options{DropThreshold: 0.9})
 
@@ -382,11 +435,12 @@ func TestReappearingNameResetsTheGraceClock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, still := st.AbsentSince["b.example.com"]; still {
-		t.Error("名字回来之后缺席标记应当被清掉")
+		t.Error("the absence marker must be cleared once the name is back")
 	}
 }
 
-// 还在被 CLB 规则引用的名字不能因为声明没了就拆掉 —— 那会直接打断线上。
+// A name still referenced by a CLB rule must not be torn down just because its
+// declaration is gone -- that would cut live traffic immediately.
 func TestRemovalIsBlockedWhileACLBRuleStillReferencesIt(t *testing.T) {
 	h := newHarness(t, Options{DropThreshold: 0.9})
 
@@ -394,32 +448,33 @@ func TestRemovalIsBlockedWhileACLBRuleStillReferencesIt(t *testing.T) {
 	h.rules.domains = []string{"a.example.com", "b.example.com"}
 	h.run(t)
 
-	// 声明没了，但规则还在 —— 说明还有流量。
+	// The declaration is gone but the rule remains -- meaning traffic remains.
 	h.decls.raw = []RawDeclaration{decl("a.example.com")}
-	h.run(t) // 这一轮才会第一次记下 b 的缺席时刻
+	h.run(t) // this round records b's absence time for the first time
 
-	// 越过宽限期：走到这一步才会轮到引用检查，而不是宽限期分支。
+	// Past the grace period: only now does the reference check apply instead of the
+	// grace branch.
 	h.clock.advance(72 * time.Hour)
 
 	rep := h.run(t)
 	d, ok := decisionFor(rep, "b.example.com")
 	if !ok || !d.Included {
-		t.Fatalf("规则还引用着，b 必须保留: %+v", d)
+		t.Fatalf("a rule still references it, so b must be kept: %+v", d)
 	}
 	if !strings.Contains(d.Reason, "CLB rule still references") {
-		t.Errorf("理由应当说明是引用检查拦下的，实际 %q", d.Reason)
+		t.Errorf("the reason must say the reference check blocked it, got %q", d.Reason)
 	}
 	if got := h.domains(t); len(got) != 2 {
-		t.Fatalf("b 应当还在证书里，实际 %v", got)
+		t.Fatalf("b must still be in the certificate, got %v", got)
 	}
 }
 
-// ── §5.5 显式授权与守卫 ─────────────────────────────────────────────────────
+// ── §5.5 explicit authorization and guards ─────────────────────────────────
 
-// 声明必须有 CLB 规则兜底（守卫 1）才生效。
+// A declaration only takes effect when a CLB rule backs it (guard 1).
 //
-// 它挡住两类真问题：声明写了但规则还没配（会造成一次无用的签发），
-// 以及拼错的域名（规则里根本不存在）。
+// It blocks two real problems: a declaration written before its rule exists (causing
+// a useless issuance), and a misspelled domain no rule serves at all.
 func TestGuardRequiresACLBRule(t *testing.T) {
 	h := newHarness(t, Options{RequireRule: true})
 
@@ -428,25 +483,26 @@ func TestGuardRequiresACLBRule(t *testing.T) {
 
 	rep := h.run(t)
 	if rep.Frozen() {
-		t.Fatalf("不该冻结: %v", rep.FreezeReasons)
+		t.Fatalf("must not freeze: %v", rep.FreezeReasons)
 	}
 
 	if got := h.domains(t); len(got) != 1 || got[0] != "served.example.com" {
-		t.Fatalf("只有被规则服务的名字该进证书，实际 %v", got)
+		t.Fatalf("only names served by a rule may enter the certificate, got %v", got)
 	}
 	d, ok := decisionFor(rep, "typo.example.com")
 	if !ok || d.Included {
-		t.Fatalf("typo.example.com 应当被排除: %+v", d)
+		t.Fatalf("typo.example.com must be excluded: %+v", d)
 	}
 	if !strings.Contains(d.Reason, "no CLB rule") {
-		t.Errorf("理由应当说明守卫未通过，实际 %q", d.Reason)
+		t.Errorf("the reason must say the guard was not satisfied, got %q", d.Reason)
 	}
 }
 
-// 守卫读不到时一律不做删除决策。
+// With the guard unreadable, no deletion decisions are made at all.
 //
-// §9 明确不做"来源不可用时降级成单来源"：降级会让安全性随故障一起消失，
-// 而你恰好在那时最需要它。
+// §9 explicitly refuses "degrade to a single source when one is unavailable":
+// degradation makes safety vanish together with the source, exactly when it is
+// needed most.
 func TestUnavailableGuardRemovesNothing(t *testing.T) {
 	h := newHarness(t, Options{RequireRule: true, DropThreshold: 0.9})
 
@@ -454,23 +510,25 @@ func TestUnavailableGuardRemovesNothing(t *testing.T) {
 	h.rules.domains = []string{"a.example.com", "b.example.com"}
 	h.run(t)
 
-	// 规则接口挂了，同时 b 的声明也消失了。此时不能判断 b 是不是还在服务。
+	// The rules API is down and b's declaration vanished too. Now we cannot tell
+	// whether b is still served.
 	h.rules.err = errors.New("clb api unreachable")
 	h.decls.raw = []RawDeclaration{decl("a.example.com")}
 
 	rep := h.run(t)
 	if rep.Frozen() {
-		t.Fatalf("守卫不可用不该整体冻结: %v", rep.FreezeReasons)
+		t.Fatalf("an unavailable guard must not freeze everything: %v", rep.FreezeReasons)
 	}
 	if !rep.GuardUnavailable {
-		t.Error("报告应当标出守卫这一轮不可用")
+		t.Error("the report must flag that the guard was unavailable this round")
 	}
 	if got := h.domains(t); len(got) != 2 {
-		t.Fatalf("守卫不可用时不许删任何名字，实际 %v", got)
+		t.Fatalf("no name may be deleted while the guard is unavailable, got %v", got)
 	}
 }
 
-// 允许清单是 §5.5 的护栏：来源只提供线索，授权必须是明确的动作。
+// The allowlist is the §5.5 railing: sources only provide clues, authorization must
+// be an explicit act.
 func TestAllowlistLimitsWhichRegisteredDomainsMayBeIssuedFor(t *testing.T) {
 	h := newHarness(t, Options{Allowlist: []string{"allowed.example"}})
 
@@ -482,20 +540,73 @@ func TestAllowlistLimitsWhichRegisteredDomainsMayBeIssuedFor(t *testing.T) {
 
 	rep := h.run(t)
 	if got := h.domains(t); len(got) != 1 || got[0] != "allowed.example" {
-		t.Fatalf("允许清单外的注册域不该进证书，实际 %v", got)
+		t.Fatalf("a registered domain outside the allowlist must not enter the certificate, got %v", got)
 	}
 	if d, ok := decisionFor(rep, "other.example"); !ok || !strings.Contains(d.Reason, "allowlist") {
-		t.Fatalf("other.example 应当因允许清单被排除: %+v", d)
+		t.Fatalf("other.example must be excluded by the allowlist: %+v", d)
 	}
 }
 
-// ── §6.1 通配符优先 ─────────────────────────────────────────────────────────
-
-// 这是整个设计里最值钱的一条：声明了 *.example.com 之后，
-// 再加子域不动 SAN 集合，也就是 **0 次签发**。
+// The allowlist is matched with a binary search, so it has to be sorted -- and
+// normalising each entry to its registered domain can *reorder* it, so sorting the
+// caller's input is not enough and sorting must happen inside New.
 //
-// 没有它，批量导入 50 个子域就是 50 次重签 —— 直接撞满
-// "50 certificates per registered domain per 7 days"。
+// Unsorted, the binary search misses entries that really are on the allowlist, and
+// the names are rejected with the misleading reason `registered domain "x" is not
+// in the allowlist` -- naming a domain that is in fact listed.
+func TestAllowlistIsSortedAfterNormalization(t *testing.T) {
+	// Normalising these two gives ["example.com", "b.co.uk"], which is not in
+	// ascending order even though the input was.
+	h := newHarness(t, Options{Allowlist: []string{"a.example.com", "b.co.uk"}})
+
+	h.decls.raw = []RawDeclaration{
+		{Zone: "example.com", Record: DeclarationPrefix + "example.com", Values: []string{""}},
+		{Zone: "b.co.uk", Record: DeclarationPrefix + "b.co.uk", Values: []string{""}},
+	}
+	h.rules.domains = []string{"example.com", "b.co.uk"}
+
+	// Assert on the decisions before reading the document, so a regression fails
+	// with the real reason instead of "the document does not exist".
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	for _, want := range []string{"example.com", "b.co.uk"} {
+		if d, ok := decisionFor(rep, want); ok && !d.Included {
+			t.Errorf("%s is on the allowlist but was excluded: %s", want, d.Reason)
+		}
+	}
+
+	if err := h.ob.Commit(rep); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	// Two registered domains means two certificates, so collect across all of them.
+	var got []string
+	for _, c := range h.document(t).Certificates {
+		got = append(got, c.Domains...)
+	}
+	for _, want := range []string{"example.com", "b.co.uk"} {
+		found := false
+		for _, g := range got {
+			if g == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s is on the allowlist but is not in any certificate: %v", want, got)
+		}
+	}
+}
+
+// ── §6.1 wildcard-first ────────────────────────────────────────────────────
+
+// This is the most valuable rule in the whole design: once *.example.com is
+// declared, adding subdomains leaves the SAN set untouched, i.e. **0 issuances**.
+//
+// Without it, bulk-importing 50 subdomains is 50 re-issues -- straight into
+// "50 certificates per registered domain per 7 days".
 func TestWildcardCoverageMakesNewSubdomainsFree(t *testing.T) {
 	h := newHarness(t, Options{})
 
@@ -508,35 +619,35 @@ func TestWildcardCoverageMakesNewSubdomainsFree(t *testing.T) {
 
 	first := h.run(t)
 	if first.Frozen() {
-		t.Fatalf("不该冻结: %v", first.FreezeReasons)
+		t.Fatalf("must not freeze: %v", first.FreezeReasons)
 	}
 
 	domains := h.domains(t)
 	if len(domains) != 2 || domains[0] != "example.com" || domains[1] != "*.example.com" {
-		t.Fatalf("SAN 集合应当是 [example.com *.example.com]，实际 %v", domains)
+		t.Fatalf("the SAN set must be [example.com *.example.com], got %v", domains)
 	}
 	if first.CoveredByWildcard != 2 {
-		t.Errorf("应当有 2 个名字被通配符覆盖，实际 %d", first.CoveredByWildcard)
+		t.Errorf("2 names must be covered by the wildcard, got %d", first.CoveredByWildcard)
 	}
 
-	// 现在加一个新的子域，并且规则也配好了。
+	// Now add a new subdomain, with its rule in place too.
 	h.decls.raw = append(h.decls.raw, decl("foo.example.com"))
 	h.rules.domains = append(h.rules.domains, "foo.example.com")
 
 	second := h.run(t)
 	if second.Mode != ModeUnchanged {
-		t.Fatalf("新子域被通配符覆盖，期望状态不该变，实际 %s (rev %s -> %s)",
+		t.Fatalf("the new subdomain is covered by the wildcard, so the desired state must not change, got %s (rev %s -> %s)",
 			second.Mode, second.PreviousRevision, second.Revision)
 	}
 	if got := h.domains(t); len(got) != 2 {
-		t.Fatalf("SAN 集合不该因为加了子域而变大，实际 %v", got)
+		t.Fatalf("the SAN set must not grow from adding a subdomain, got %v", got)
 	}
 	if d, ok := decisionFor(second, "foo.example.com"); !ok || !strings.Contains(d.Reason, "wildcard") {
-		t.Fatalf("新子域应当被解释为「被通配符覆盖」: %+v", d)
+		t.Fatalf("the new subdomain must be explained as \"covered by the wildcard\": %+v", d)
 	}
 }
 
-// ── §5.4 配额熔断 ───────────────────────────────────────────────────────────
+// ── §5.4 quota fuse ────────────────────────────────────────────────────────
 
 func TestChangeBudgetFreezes(t *testing.T) {
 	h := newHarness(t, Options{Budget: 1})
@@ -545,39 +656,40 @@ func TestChangeBudgetFreezes(t *testing.T) {
 	h.rules.domains = []string{"a.example.com"}
 	h.run(t)
 
-	// 第二次集合变更就把只有 1 次的预算用光了。
+	// The second set change exhausts a budget of just 1.
 	h.decls.raw = append(h.decls.raw, decl("b.example.com"))
 	h.rules.domains = append(h.rules.domains, "b.example.com")
 
 	rep := h.run(t)
 	if !rep.Frozen() {
-		t.Fatal("预算耗尽必须冻结")
+		t.Fatal("an exhausted budget must freeze")
 	}
 	if !strings.Contains(strings.Join(rep.FreezeReasons, " "), "budget") {
-		t.Errorf("原因应当说明是预算耗尽: %v", rep.FreezeReasons)
+		t.Errorf("the reason must say the budget is exhausted: %v", rep.FreezeReasons)
 	}
 }
 
-// ── 空期望状态 ──────────────────────────────────────────────────────────────
+// ── empty desired state ────────────────────────────────────────────────────
 
-// "合法的空"和"生成失败导致的空"在文件里长得一模一样，
-// 而后者一旦被写出去，后果是每张证书的每个域名都被摘掉。
+// A "legitimately empty" file and a "generation failed, hence empty" file look
+// identical, and writing the latter strips every domain from every certificate.
 func TestEmptyDesiredStateIsRefused(t *testing.T) {
 	h := newHarness(t, Options{})
 
 	rep := h.run(t)
 	if !rep.Frozen() {
-		t.Fatal("空期望状态必须被拒绝")
+		t.Fatal("an empty desired state must be refused")
 	}
 	if !strings.Contains(strings.Join(rep.FreezeReasons, " "), "empty") {
-		t.Errorf("原因应当说明是空期望状态: %v", rep.FreezeReasons)
+		t.Errorf("the reason must say the desired state is empty: %v", rep.FreezeReasons)
 	}
 }
 
-// ── 幂等 ────────────────────────────────────────────────────────────────────
+// ── idempotence ────────────────────────────────────────────────────────────
 
-// 同样的输入连着跑两次，第二轮的指纹必须与上一版相同 ——
-// 否则期望状态文档每次生成都会 diff 一片，可 review 性直接归零。
+// Run the same input twice and the second round's fingerprint must match the
+// previous one -- otherwise every generated document diffs all over and
+// reviewability drops to zero.
 func TestSecondRunIsUnchanged(t *testing.T) {
 	h := newHarness(t, Options{})
 	h.decls.raw = []RawDeclaration{decl("example.com", "wildcard=1"), decl("api.example.com")}
@@ -587,37 +699,39 @@ func TestSecondRunIsUnchanged(t *testing.T) {
 	second := h.run(t)
 
 	if second.Mode != ModeUnchanged {
-		t.Fatalf("第二轮应当是 unchanged，实际 %s", second.Mode)
+		t.Fatalf("the second round must be unchanged, got %s", second.Mode)
 	}
 	if first.Revision != second.Revision {
-		t.Errorf("指纹不该变: %s vs %s", first.Revision, second.Revision)
+		t.Errorf("the fingerprint must not change: %s vs %s", first.Revision, second.Revision)
 	}
 }
 
-// 一条声明无效不能连累整轮：那样一个手误就会让所有证书停止更新。
+// One invalid declaration must not drag down the whole round: otherwise a single
+// typo stops every certificate from updating.
 func TestOneBadDeclarationDoesNotFreezeEverything(t *testing.T) {
 	h := newHarness(t, Options{})
 
 	h.decls.raw = []RawDeclaration{
 		decl("good.example.com"),
-		decl("bad.example.com", "wildard=1"), // 拼错的键
+		decl("bad.example.com", "wildard=1"), // misspelled key
 	}
 	h.rules.domains = []string{"good.example.com", "bad.example.com"}
 
 	rep := h.run(t)
 	if rep.Frozen() {
-		t.Fatalf("单条声明出错不该冻结整轮: %v", rep.FreezeReasons)
+		t.Fatalf("one bad declaration must not freeze the whole round: %v", rep.FreezeReasons)
 	}
 	if got := h.domains(t); len(got) != 1 || got[0] != "good.example.com" {
-		t.Fatalf("好声明应当照常生效，实际 %v", got)
+		t.Fatalf("the good declaration must still take effect, got %v", got)
 	}
 	if d, ok := decisionFor(rep, "bad.example.com"); !ok || d.Included {
-		t.Fatalf("坏声明应当被排除并留下理由: %+v", d)
+		t.Fatalf("the bad declaration must be excluded with a reason: %+v", d)
 	}
 }
 
-// 组内声明对元数据不一致时，默认值说了算 —— 让某个子域的声明
-// 悄悄改掉整张证书的属性，是那种事后没人能解释的变更。
+// When declarations in a group disagree on metadata, the default wins -- letting one
+// subdomain's declaration quietly retune the whole certificate is the kind of change
+// nobody can explain afterwards.
 func TestGroupSettingsComeFromDeclarations(t *testing.T) {
 	h := newHarness(t, Options{Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256})
 
@@ -627,9 +741,51 @@ func TestGroupSettingsComeFromDeclarations(t *testing.T) {
 
 	c := h.document(t).Certificates[0]
 	if c.Profile != config.ProfileTLSServer {
-		t.Errorf("profile 应当来自声明，实际 %q", c.Profile)
+		t.Errorf("profile must come from the declaration, got %q", c.Profile)
 	}
 	if c.KeyType != config.KeyTypeECDSAP384 {
-		t.Errorf("keyType 应当来自声明，实际 %q", c.KeyType)
+		t.Errorf("keyType must come from the declaration, got %q", c.KeyType)
+	}
+}
+
+// Guard 1 must accept a name that a wildcard rule domain serves.
+//
+// CLB layer-7 rules support `*.example.com` as a rule domain, and the deletion-side
+// check (referenced) already understood that -- while guard 1 did a flat map lookup.
+// So one rule could be simultaneously "not serving" a name (rejecting the
+// declaration, and freezing the round when it was the only one) and "still
+// referencing" it (blocking deletion).
+func TestGuardOneAcceptsANameServedByAWildcardRule(t *testing.T) {
+	h := newHarness(t, Options{RequireRule: true})
+
+	h.decls.raw = []RawDeclaration{
+		{Zone: "example.com", Record: DeclarationPrefix + "www.example.com", Values: []string{""}},
+	}
+	h.rules.domains = []string{"*.example.com"}
+
+	rep := h.run(t)
+
+	if d, ok := decisionFor(rep, "www.example.com"); ok && !d.Included {
+		t.Fatalf("www.example.com is served by the *.example.com rule but was rejected: %s", d.Reason)
+	}
+	if got := h.domains(t); len(got) != 1 || got[0] != "www.example.com" {
+		t.Fatalf("domain set = %v, want [www.example.com]", got)
+	}
+}
+
+func TestGroupSettingsConflictKeepsPreviousCertificate(t *testing.T) {
+	h := newHarness(t, Options{Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256})
+	h.rules.domains = []string{"api.example.com", "www.example.com"}
+	h.decls.raw = []RawDeclaration{decl("api.example.com", "profile=tlsserver"), decl("www.example.com", "profile=tlsserver")}
+	h.run(t)
+	before := h.document(t)
+	h.decls.raw = []RawDeclaration{decl("api.example.com", "profile=tlsserver"), decl("www.example.com", "profile=classic")}
+	rep := h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("a group settings conflict should keep only that group, not freeze unrelated work: %v", rep.FreezeReasons)
+	}
+	after := h.document(t)
+	if after.Revision != before.Revision || after.Certificates[0].Profile != config.ProfileTLSServer {
+		t.Fatalf("conflicting group settings must keep the previous certificate: before=%+v after=%+v", before.Certificates, after.Certificates)
 	}
 }

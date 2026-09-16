@@ -1,4 +1,4 @@
-// Package reconcile 驱动整体的收敛循环。
+// Package reconcile drives the overall convergence loop.
 package reconcile
 
 import (
@@ -18,35 +18,39 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// ErrAlreadyRunning 表示这张证书已经有一轮在跑了。
+// ErrAlreadyRunning means this certificate already has a pass in flight.
 //
-// 这不是异常，而是必须存在的一道闸门：定时器和一个事件触发的收敛
-// 很可能同时落到同一张证书上。两边各下一单，就会直接撞上
-// "5 certificates per exact set of identifiers / 7 days" —— 而且这条没有 override。
+// This is not exceptional; it is a gate that must exist: the timer and an
+// event-triggered convergence very likely land on the same certificate at the
+// same time. Two orders from the two sides run straight into "5 certificates
+// per exact set of identifiers / 7 days" — and that limit has no override.
 var ErrAlreadyRunning = errors.New("this certificate already has a pass in flight")
 
-// Notifier 在每张证书处理结束后收到通知。可为 nil。
+// Notifier is notified after each certificate finishes processing. May be nil.
 //
-// 放在这一层而不是 webhook 层，是为了让"续期结果"这个事件
-// 无论由定时器还是由外部触发都同样发得出去。
+// It lives on this layer rather than in the webhook layer so the "renewal
+// result" event goes out the same way whether the timer or an external trigger
+// started the pass.
 type Notifier interface {
 	Renewal(ctx context.Context, certName string, err error)
 }
 
-// CertManager 是 Reconciler 需要的能力。
+// CertManager is the capability Reconciler needs.
 //
-// 定义成接口而不是直接依赖 *acme.Manager，是为了让收敛循环可测 ——
-// 直接依赖具体类型的话，"一张证书失败不能拖住其它证书" 这类
-// 编排逻辑就只能靠真跑一遍 ACME 才能验证。
+// It is an interface rather than a direct *acme.Manager dependency so the
+// convergence loop is testable — depending on the concrete type would mean
+// orchestration logic like "one certificate failing must not stall the others"
+// could only be verified by really running ACME.
 type CertManager interface {
 	Reconcile(ctx context.Context, c *config.Certificate) error
 	ReapRetired(ctx context.Context)
 }
 
-// Reconciler 逐张收敛当前期望状态里的证书。
+// Reconciler converges the certificates in the current desired state one by one.
 //
-// 并发安全：定时循环和 webhook 触发的收敛会同时调用它，
-// 靠 running 这张表保证同一张证书不会被并发处理。
+// Concurrency-safe: the timer loop and webhook-triggered convergence call it at
+// the same time, and the running map keeps one certificate from being processed
+// concurrently.
 type Reconciler struct {
 	cfg      *config.Config
 	provider spec.Provider
@@ -58,40 +62,57 @@ type Reconciler struct {
 	mu      sync.Mutex
 	running map[string]struct{}
 
-	// prober 是可选的网络侧探测器。为 nil 表示不探测。
+	// startSlots bounds how many certificates a full trigger converges at once.
 	//
-	// 用 SetProber 挂上来而不是塞进 New 的参数表：它是一层纯粹的附加观测，
-	// 不该让每一个测试替身都去构造它。
+	// Without it, POST /hook/reconcile started one goroutine per certificate, so a
+	// 100-certificate state fired 100 concurrent ACME orders, DNSPod writes and
+	// Tencent Cloud calls from a single HTTP request -- while the timer path walks the
+	// same certificates strictly one at a time. The bound matches the fan-out caps the
+	// acme and probe packages already use.
+	startSlots chan struct{}
+
+	// prober is the optional network-side prober. Nil means no probing.
+	//
+	// It is attached with SetProber instead of being a New parameter: it is purely
+	// additional observation and should not force every test double to construct
+	// one.
 	prober *probe.Runner
 
-	// last 是最近一次成功求值出来的期望状态，供只读诊断端点使用。
-	// 存指针是必要的：诊断端点会在另一个 goroutine 里读它。
+	// last is the most recently resolved desired state, for read-only diagnostics.
+	// A pointer is required: the diagnostic endpoint reads it from another
+	// goroutine.
 	last atomic.Pointer[spec.Result]
 }
 
-// SetProber 挂上网络侧探测器。必须在第一次收敛之前调用。
-//
-// 传 nil 时整条探测路径都是空操作，收敛行为与不挂时完全一致。
+// SetProber attaches the network-side prober. Must be called before the first
+// convergence. Passing nil makes the whole probe path a no-op, so convergence
+// behaves exactly as if none were attached.
 func (r *Reconciler) SetProber(p *probe.Runner) { r.prober = p }
 
-// New 构造收敛器。
+// New builds a reconciler.
 //
-// provider 是期望状态的来源，可以是 spec.Static（配置里的 certificates）、
-// spec.File（onboarding 写出来的文档）或 spec.Observer（前者 + 影子对比）。
-// 收敛逻辑完全不关心是哪一个 —— 这正是切换来源不用动收敛代码的原因。
+// provider is the source of the desired state: spec.Static (the certificates in
+// the config), spec.File (the document onboarding writes) or spec.Observer (the
+// former plus shadow comparison). The convergence logic does not care which —
+// that is exactly why switching sources requires no changes here.
 func New(cfg *config.Config, provider spec.Provider, store *state.Store, manager CertManager, notifier Notifier, log *slog.Logger) *Reconciler {
 	return &Reconciler{
-		cfg:      cfg,
-		provider: provider,
-		store:    store,
-		manager:  manager,
-		notifier: notifier,
-		log:      log,
-		running:  make(map[string]struct{}),
+		cfg:        cfg,
+		provider:   provider,
+		store:      store,
+		manager:    manager,
+		notifier:   notifier,
+		log:        log,
+		running:    make(map[string]struct{}),
+		startSlots: make(chan struct{}, maxConcurrentStarts),
 	}
 }
 
-// acquire 尝试占住某张证书。返回 false 表示已经有人在跑。
+// maxConcurrentStarts bounds the fan-out of a full webhook trigger. See
+// Reconciler.startSlots.
+const maxConcurrentStarts = 8
+
+// acquire tries to claim a certificate. False means someone is already running it.
 func (r *Reconciler) acquire(name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -108,21 +129,24 @@ func (r *Reconciler) release(name string) {
 	delete(r.running, name)
 }
 
-// ── 期望状态 ────────────────────────────────────────────────────────────────
+// ── Desired state ────────────────────────────────────────────────────────────────
 
-// Prime 求值一次期望状态并缓存，不触发任何收敛。
+// Prime resolves the desired state once and caches it, triggering no
+// convergence.
 //
-// 启动时调一次，让只读端点（webhook 的名字解析、诊断端点）在第一次
-// 收敛跑完之前就能给出正确答案。
+// Call it once at startup so read-only endpoints (webhook name resolution,
+// diagnostics) give correct answers before the first convergence finishes.
 func (r *Reconciler) Prime(ctx context.Context) {
 	r.resolve(ctx)
 }
 
-// resolve 求值期望状态。返回 nil 表示这一轮**什么都不该做**。
+// resolve resolves the desired state. A nil result means **nothing should be
+// done this pass**.
 //
-// 这是整套设计里最关键的一条失败语义：拿不到期望状态，绝不等于
-// "期望为空"。后者会让 wecert 把域名从每张证书里摘掉，线上立刻握手失败。
-// 跳过一轮的代价只是"这次没续上"，下一轮还有机会。
+// This is the most important failure semantic in the design: an unreadable
+// desired state never means an empty one. The latter makes wecert strip domains
+// from every certificate and the live endpoints fail handshakes immediately.
+// Skipping a pass only costs "not renewed this time"; the next pass retries.
 func (r *Reconciler) resolve(ctx context.Context) *spec.Result {
 	res, err := spec.Desired(ctx, r.provider)
 	if err != nil {
@@ -138,13 +162,14 @@ func (r *Reconciler) resolve(ctx context.Context) *spec.Result {
 	return res
 }
 
-// LastResult 返回最近一次成功求值出来的期望状态，可能为 nil。
+// LastResult returns the most recently resolved desired state; may be nil.
 func (r *Reconciler) LastResult() *spec.Result { return r.last.Load() }
 
-// CertNames 返回当前期望状态里的证书名，顺序与期望状态一致。
+// CertNames returns the certificate names in the current desired state, in its
+// order.
 //
-// 取的是缓存而不是重新求值：这个方法是给只读端点和触发路径用的，
-// 每次都去读一遍来源会让一次 HTTP 请求的延迟取决于云 API 的响应时间。
+// It reads the cache instead of re-resolving: re-reading the source on every
+// call would tie an HTTP request's latency to the cloud API's response time.
 func (r *Reconciler) CertNames() []string {
 	res := r.last.Load()
 	if res == nil {
@@ -153,7 +178,7 @@ func (r *Reconciler) CertNames() []string {
 	return res.CertNames()
 }
 
-// publishDesired 把期望状态的健康状况同步到指标和日志。
+// publishDesired mirrors desired-state health into metrics and logs.
 func (r *Reconciler) publishDesired(res *spec.Result) {
 	metrics.DesiredStateCertificates.Set(float64(len(res.Certificates)))
 
@@ -166,9 +191,9 @@ func (r *Reconciler) publishDesired(res *spec.Result) {
 		metrics.DesiredStateFrozen.Set(0)
 	}
 
-	// 文档年龄是这套架构特有的失败信号：onboarding 组件挂掉之后，
-	// wecert 会一直按旧文档正常续期，一切看起来都正常，
-	// 只是新域名再也不会进来。
+	// Document age is the failure signal unique to this architecture: after the
+	// onboarding component dies, wecert keeps renewing from the old document quite
+	// normally, everything looks fine, only no new domain ever enters.
 	if !res.GeneratedAt.IsZero() {
 		age := time.Since(res.GeneratedAt)
 		metrics.DesiredStateAge.Set(age.Seconds())
@@ -185,11 +210,13 @@ func (r *Reconciler) publishDesired(res *spec.Result) {
 	}
 }
 
-// publishOrphans 报告"状态库里有、期望状态里已经没有"的证书。
+// publishOrphans reports certificates present in the state store but no longer
+// in the desired state.
 //
-// 这类证书不会再被续期，最终会安静地过期。期望状态的删除路径本来就有
-// 宽限期和引用检查，这个检查是最后一道兜底 —— 万一还是漏出去了，
-// 至少能在到期之前看见它，而不是等站点握手失败。
+// They will not be renewed and will quietly expire. The desired-state deletion
+// path already has a grace period and reference checks; this is the last safety
+// net — if something still slips through, at least it is visible before expiry
+// rather than only when a site fails a handshake.
 func (r *Reconciler) publishOrphans(res *spec.Result) {
 	names, err := r.store.ListCertNames()
 	if err != nil {
@@ -209,6 +236,12 @@ func (r *Reconciler) publishOrphans(res *spec.Result) {
 		}
 		orphans++
 
+		// Reclaim the per-certificate series. Nothing else ever revisits a name that
+		// has left the desired state, so its gauges would sit at their last value
+		// forever -- and a not_after frozen at its last value trips the documented
+		// expiry rule permanently, for a certificate that no longer exists.
+		metrics.DeleteCertSeries(name)
+
 		attrs := []any{"cert", name}
 		if st, err := r.store.GetCert(name); err == nil && st != nil && !st.NotAfter.IsZero() {
 			attrs = append(attrs, "notAfter", st.NotAfter,
@@ -221,19 +254,21 @@ func (r *Reconciler) publishOrphans(res *spec.Result) {
 	metrics.OrphanedCertificates.Set(float64(orphans))
 }
 
-// ── 收敛 ────────────────────────────────────────────────────────────────────
+// ── Convergence ────────────────────────────────────────────────────────────────────
 
-// RunAll 跑一轮全部证书。
+// RunAll runs one pass over every certificate.
 //
-// 单张证书失败不会中断这一轮：否则一张配错域名的证书会把其它所有证书
-// 的续期一起拖住 —— 那是自动化里最危险的一种耦合。
+// One certificate failing does not abort the pass: otherwise a certificate with
+// a mistyped domain stalls every other certificate's renewal — the most
+// dangerous kind of coupling in automation.
 //
-// 正在被别处处理的证书会被跳过，并在返回值里列出。
+// Certificates already being processed elsewhere are skipped and listed.
 func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
 	res := r.resolve(ctx)
 	if res == nil {
-		// 即使拿不到期望状态也要回收退役证书：那批证书已经被换掉了，
-		// 回收它们和期望状态无关，而放着不管会把云端证书配额慢慢耗光。
+		// Reap retired certificates even when the desired state is unreadable: they
+		// have already been replaced, reaping them is unrelated to the desired state,
+		// and ignoring them slowly exhausts the cloud certificate quota.
 		r.manager.ReapRetired(ctx)
 		return nil
 	}
@@ -251,21 +286,25 @@ func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
 			skipped = append(skipped, c.Name)
 			continue
 		}
-		r.reconcileOne(ctx, c)
-		r.release(c.Name)
+		// defer inside the loop body so a panic in reconcileOne cannot leak the slot
+		// and wedge every later pass with ErrAlreadyRunning.
+		func() {
+			defer r.release(c.Name)
+			r.reconcileOne(ctx, c)
+		}()
 	}
 
 	r.manager.ReapRetired(ctx)
 	return skipped
 }
 
-// RunOnce 是 RunAll 的兼容别名。
+// RunOnce is a compatibility alias for RunAll.
 func (r *Reconciler) RunOnce(ctx context.Context) {
 	r.RunAll(ctx)
 }
 
-// RunCert 只处理指定的一张证书。未知名字返回错误；
-// 已在处理中返回 ErrAlreadyRunning。
+// RunCert processes exactly one named certificate. An unknown name returns an
+// error; one already being processed returns ErrAlreadyRunning.
 func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 	res := r.resolve(ctx)
 	if res == nil {
@@ -285,14 +324,48 @@ func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 	return nil
 }
 
-// StartCert 异步处理一张证书。
+// StartCert processes one certificate asynchronously.
 //
-// 求值和占位都是**同步**做的 —— 所以"这张证书是否已经在处理中"、
-// "这个名字到底存不存在"都能立刻回答调用方；真正的收敛丢到后台，
-// 因为它可能要几分钟（DNS 传播），让 HTTP 请求等着会把调用方的超时拖爆。
+// Resolution and claiming are **synchronous** — so "is this certificate already
+// being processed" and "does this name exist" are answered to the caller
+// immediately; the actual convergence goes to the background because it can
+// take minutes (DNS propagation) and making the HTTP request wait would blow
+// the caller's timeout.
 //
-// ctx 必须是**进程级**上下文，不能用请求的 context：
-// 请求一返回它的 context 就被取消，后台那一轮会被立刻打断。
+// ctx must be a **process-level** context, never a request context: it is
+// cancelled the moment the response returns, killing the background pass.
+// startCert launches one certificate's pass against an already-resolved desired
+// state.
+//
+// The resolved result is a parameter rather than something the callee fetches,
+// because resolve() costs a file read, a YAML decode, a full validation and a
+// sha256 of the document -- and a full trigger would otherwise pay that once per
+// certificate.
+func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.Certificate) error {
+	if !r.acquire(c.Name) {
+		return ErrAlreadyRunning
+	}
+
+	// res is heap-allocated and not reused during this pass, so referring to its
+	// elements is safe.
+	go func() {
+		defer r.release(c.Name)
+
+		// Queue for a start slot instead of running immediately. Nothing is dropped:
+		// the caller has already been told "accepted", and the pass starts as soon as
+		// a slot frees up.
+		select {
+		case r.startSlots <- struct{}{}:
+			defer func() { <-r.startSlots }()
+		case <-ctx.Done():
+			return
+		}
+
+		r.reconcileOne(ctx, c)
+	}()
+	return nil
+}
+
 func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 	res := r.resolve(ctx)
 	if res == nil {
@@ -302,20 +375,11 @@ func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 	if found == nil {
 		return fmt.Errorf("no certificate named %q in the desired state", name)
 	}
-
-	if !r.acquire(name) {
-		return ErrAlreadyRunning
-	}
-
-	// res 是在堆上分配的，这一轮期间不会被复用，所以引用它的元素是安全的。
-	go func() {
-		defer r.release(name)
-		r.reconcileOne(ctx, found)
-	}()
-	return nil
+	return r.startCert(ctx, res, found)
 }
 
-// StartAll 异步处理全部证书，同步返回被跳过的（已在处理中的）名字。
+// StartAll processes every certificate asynchronously and synchronously returns
+// the skipped (already running) names.
 func (r *Reconciler) StartAll(ctx context.Context) []string {
 	res := r.resolve(ctx)
 	if res == nil {
@@ -323,20 +387,23 @@ func (r *Reconciler) StartAll(ctx context.Context) []string {
 	}
 
 	var skipped []string
-	for _, name := range res.CertNames() {
-		if err := r.StartCert(ctx, name); err != nil {
-			skipped = append(skipped, name)
+	// Walk the resolved slice directly: looking each name up with Find over the same
+	// slice would make this O(n^2).
+	for i := range res.Certificates {
+		if err := r.startCert(ctx, res, &res.Certificates[i]); err != nil {
+			skipped = append(skipped, res.Certificates[i].Name)
 		}
 	}
 	return skipped
 }
 
-// reconcileOne 处理单张证书，并把结果同步到指标和通知。
+// reconcileOne processes one certificate and mirrors the result into metrics
+// and notifications.
 func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) {
 	err := r.manager.Reconcile(ctx, c)
 	if err != nil {
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
-		// manager 内部已经打过日志并安排了退避，这里只补一条摘要。
+		// manager already logged and scheduled backoff; this is just a summary.
 		r.log.Warn("this pass did not succeed", "cert", c.Name, "err", err)
 	} else {
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "ok").Inc()
@@ -350,29 +417,33 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) {
 	}
 }
 
-// probeCert 拨一个真实的 TLS 连接，确认线上服务的确实是刚部署的那张证书。
+// probeCert dials a real TLS connection to confirm the live endpoint really
+// serves the certificate that was just deployed.
 //
-// 这是整套系统里唯一不信任云控制面的证据。控制面说"绑定成功"和浏览器
-// 真的能拿到这张证书是两件事，而这两件事之间的差距 —— 换绑是异步的、
-// SNI 上可能有另一张证书在赢 —— 恰好是 CLB 上最容易出问题的地方。
+// It is the only evidence in the system that does not trust the cloud control
+// plane. The control plane saying "bound successfully" and a browser actually
+// getting the certificate are two things, and the gap between them — async
+// rebinds, another certificate winning SNI — is where CLB fails most often.
 //
-// 拿不到结论**不会**影响这一轮的结果：一个拨不出去的探测不该让一次
-// 成功的续期看起来像失败。它只影响指标和告警。
+// Failing to reach a conclusion **does not** affect this pass: a probe that
+// cannot dial out must not make a successful renewal look failed. It only
+// affects metrics and alerts.
 func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 	if r.prober == nil {
 		return
 	}
 
-	// 还没确认部署的东西拨了也只会报错 —— 首次上传之后要人工绑一次，
-	// 在那之前线上服务的本来就还是旧证书。
+	// Probing something whose deployment is unconfirmed only produces errors — the
+	// first upload needs a manual bind, and until then the live endpoint is still
+	// serving the old certificate anyway.
 	st, err := r.store.GetCert(c.Name)
-	if err != nil || st == nil || !st.DeployConfirmed {
+	if err != nil || st == nil || !c.Deploy.Enabled || !st.DeployConfirmed {
 		return
 	}
 
 	hosts := probeHosts(c.Domains, r.cfg.Probe.MaxHostsPerCert)
 	if len(hosts) == 0 {
-		// 整张证书都是通配符：没有具体名字可以拨。
+		// Every name in this certificate is a wildcard: nothing concrete to dial.
 		r.log.Debug("nothing to probe: every name in this certificate is a wildcard",
 			"cert", c.Name, "domains", c.Domains)
 		return
@@ -387,8 +458,9 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 		MinValidFor: r.cfg.Probe.MinValidDur,
 	}
 
-	// 同一张证书的几个名字并发拨。串行的话，一张 3 个名字的证书在
-	// 全部超时的情况下要占 30 秒，而这是每一轮都要跑的东西。
+	// Dial the names of one certificate concurrently. Serially, a 3-name
+	// certificate takes 30 seconds when every probe times out, and this runs every
+	// single pass.
 	var wg sync.WaitGroup
 	for _, host := range hosts {
 		wg.Add(1)
@@ -400,10 +472,11 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 	wg.Wait()
 }
 
-// probeHosts 从一张证书的域名里挑出可以拨的名字。
+// probeHosts picks the dialable names out of one certificate's domains.
 //
-// 通配符没有自己的地址，所以跳过；其余按声明顺序取前 max 个 ——
-// 声明顺序把注册域放在最前面，而那通常是最该被验的那个。
+// Wildcards have no address of their own, so they are skipped; the rest are
+// taken in declaration order up to max — declaration order puts the registered
+// domain first, and that is usually the one most worth verifying.
 func probeHosts(domains []string, max int) []string {
 	if max <= 0 {
 		return nil
@@ -421,7 +494,7 @@ func probeHosts(domains []string, max int) []string {
 	return out
 }
 
-// publish 把状态库里的现状同步到 Prometheus。
+// publish mirrors the current state store into Prometheus.
 func (r *Reconciler) publish(name string) {
 	st, err := r.store.GetCert(name)
 	if err != nil || st == nil {
@@ -434,8 +507,9 @@ func (r *Reconciler) publish(name string) {
 		metrics.CertNotAfter.WithLabelValues(name).Set(float64(st.NotAfter.Unix()))
 	}
 
-	// 只有确认已经换到新证书才算"deployed"：首次上传之后还要人工绑一次，
-	// 在那之前指示灯不能变绿，否则到期告警会以为一切正常。
+	// Only a confirmed swap to the new certificate counts as "deployed": the first
+	// upload still needs a manual bind, and the light must not turn green before
+	// then or the expiry alert will think everything is fine.
 	if st.DeployConfirmed && st.DeployedCertID != "" {
 		metrics.CertDeployed.WithLabelValues(name).Set(1)
 	} else {

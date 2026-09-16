@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -14,22 +15,34 @@ import (
 	"github.com/susunola/wecert/internal/config"
 )
 
-// cvmMetadataURL 是 CVM 实例元数据服务里读取 CAM 角色临时凭证的地址。
-// 用角色而不是把 SecretId/SecretKey 写进配置文件，是为了让密钥不落盘。
-const cvmMetadataURL = "http://metadata.tencentyun.com/latest/meta-data/cam/security-credentials/"
+// cvmMetadataURL is the address for reading CAM role temporary credentials from the CVM
+// instance metadata service.
+// Using a role instead of writing SecretId/SecretKey into the config file keeps the
+// secrets off disk.
+// It is a variable rather than a constant so tests can point it at an httptest server;
+// production code never reassigns it.
+var cvmMetadataURL = "http://metadata.tencentyun.com/latest/meta-data/cam/security-credentials/"
 
-// CredentialFunc 每次都重新获取一份凭证。
-// 不缓存是有意的：临时凭证会过期，而部署动作几十天才发生一次。
+// CredentialFunc fetches a fresh credential every time.
+// The lack of caching is deliberate: temporary credentials expire, and deployment only
+// happens once every few dozen days.
 type CredentialFunc func(ctx context.Context) (common.CredentialIface, error)
 
-// NewCredentialSource 按配置返回一个凭证来源。
-// 证书部署和 dns.provider=tencentcloud 的 DNS-01 共用同一套凭证。
+// NewCredentialSource returns a credential source according to config.
+// Certificate deployment and DNS-01 with dns.provider=tencentcloud share the same
+// credentials.
 func NewCredentialSource(cfg config.Tencent) (CredentialFunc, error) {
 	switch cfg.CredentialMode {
 	case config.CredentialStatic:
-		// 优先用配置里的值，其次回退到腾讯云官方约定的环境变量。
-		// 走环境变量的意义在于：凭证不必落进配置文件，
-		// 配置文件和 systemd unit 就可以放心提交、放心备份。
+		// Prefer values from the config, then fall back to Tencent Cloud's official
+		// environment variables. The point of the environment is that the credentials
+		// need not land in the config file, so that file can be committed and backed up
+		// freely.
+		//
+		// It does *not* follow that they may go in the systemd unit: install.sh writes
+		// the units 0644 root:root, so an inline Environment= line would make a
+		// long-lived CAM key world-readable. Put them in an EnvironmentFile that is
+		// 0600 root:wecert instead.
 		id, key := cfg.SecretID, cfg.SecretKey
 		if id == "" {
 			id = os.Getenv(EnvSecretID)
@@ -55,7 +68,7 @@ func NewCredentialSource(cfg config.Tencent) (CredentialFunc, error) {
 	}
 }
 
-// 腾讯云 SDK 约定的环境变量名。
+// Environment variable names as agreed by the Tencent Cloud SDK.
 const (
 	EnvSecretID  = "TENCENTCLOUD_SECRET_ID"
 	EnvSecretKey = "TENCENTCLOUD_SECRET_KEY"
@@ -69,12 +82,19 @@ type cvmRoleCredential struct {
 	Code         string `json:"Code"`
 }
 
-// fetchCVMRoleCredential 每次部署都重新取一次临时凭证。
+// fetchCVMRoleCredential fetches a fresh temporary credential on every deploy.
 //
-// 不做缓存是有意的：临时凭证通常 2 小时过期，而部署动作 45~90 天才发生一次，
-// 缓存它只会换来"等真要用的时候才发现已经过期"这种最难排查的故障。
+// The lack of caching is deliberate: temporary credentials usually expire in 2 hours
+// while a deploy happens only once every 45-90 days, so caching one buys nothing but the
+// hardest kind of failure to diagnose -- "it turned out to be expired right when we
+// finally needed it".
 func fetchCVMRoleCredential(ctx context.Context, roleName string) (common.CredentialIface, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cvmMetadataURL+roleName, nil)
+	if roleName == "" {
+		return nil, fmt.Errorf("credentialMode=cvm-role requires tencent.roleName")
+	}
+	// Escaped, not concatenated raw: the role name comes from the config, and an
+	// unescaped "../" would let it reach other metadata paths.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cvmMetadataURL+url.PathEscape(roleName), nil)
 	if err != nil {
 		return nil, fmt.Errorf("build metadata request: %w", err)
 	}
@@ -91,6 +111,11 @@ func fetchCVMRoleCredential(ctx context.Context, roleName string) (common.Creden
 		return nil, fmt.Errorf("read the metadata response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		// The body *is* included, bounded: on a 404 it is the only thing that says
+		// "the role is not attached" rather than just "404", and that is the difference
+		// between an actionable error and a round of guessing. It is safe to bound here
+		// because state.PutCert also caps last_error at 512 bytes, which is where this
+		// string ends up.
 		return nil, fmt.Errorf("the metadata service returned %d; check that this CVM has role %q attached (response: %s)",
 			resp.StatusCode, roleName, truncate(string(body), 256))
 	}

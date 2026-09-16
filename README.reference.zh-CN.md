@@ -137,7 +137,7 @@ Let's Encrypt 的速率限制里，最要命的不是那 100 个 SAN 上限，�
 
 ## 前置条件
 
-- **Go 1.26+**（`go.mod` 声明 `go 1.26.5`）。
+- **Go 1.26+**（`go.mod` 声明 `go 1.26.6`，这个补丁版修掉了 `govulncheck` 列出的标准库漏洞）。
 - **托管在 DNSPod 的域名** —— DNSPod 自有产品（`dnspod.cn`）或腾讯云 DNSPod 都可以。
 - **腾讯云账号**，且账号下有你要绑证书的 CLB 资源。
 - **凭证**，三者之一：
@@ -386,13 +386,24 @@ retired_certificates          -- 已上传、等待回收的证书
 
 它还会在真实浏览器里**逐语言**量每一个标签：有任何一个溢出盒子、或者两个 `<text>` 标签互相压住，就拒绝出图。英文比中文长，所以"中文放得下、英文溢出"是个真实的失败模式 —— 第一次跑就抓到了两处。
 
-### 0. 要解决的问题
+### 0. 部署形态：免费证书在 CLB 上自动轮转
 
-![wecert 要解决的场景：CLB 终结 TLS，业务机器上没有证书文件](docs/diagrams/zh/00-the-problem.png)
+![wecert 的部署形态：免费证书由 Let's Encrypt 自动轮转（免费签发 → 自动换绑 → 服务 90 天 → 到期前自动再签）；选它而不是腾讯云自带的免费 DV，是因为后者单域名、不支持 SAN 也不支持通配符](docs/diagrams/zh/00-deployment-shape.png)
 
-TLS 在 CLB 上终结，业务机器上根本没有证书文件 —— 所以常规做法的前提在这里都不成立：certbot 装在每台 CVM 上没有地方放证书，cert-manager 假定有 Kubernetes 而且产出的是 Secret 不是监听器绑定，把文件铺到各节点只是把一把没人读的私钥多复制了几份。
+这套系统要解决的场景就是最上面那条带子：**Let's Encrypt 的证书不花钱，代价是有效期只有 90 天** —— 一年至少要轮 4 次，靠人记着做迟早会漏。
 
-真正让它难的不是麻烦，是最后那一行：ARI 让续期豁免全部限速，但**只对同名续期**成立 —— 所以改一次域名集合就等于烧掉一次签发。而"域名随时会变"恰恰是这个项目的前提，其余每一个设计决定都是从这里推出来的。
+腾讯云自带的免费 DV 并不能替代它：**那是单域名证书，不支持 SAN，也不支持通配符**。手上只要有几个域名，就得每个域名一张证书、每条证书各自维护一条轮转。而 Let's Encrypt 一张证书最多能装 100 个名字、还支持通配符，几个域名（含 `*.example.com`）可以合成一张证书、只轮转一条 —— 下面画的那张多 SAN 证书能成立，前提就在这里。
+
+所以重点不是"wecert 能签发"，而是"到期前它已经自己换好了，全程不用人管"。
+
+请求带着 SNI 到 CLB。CLB 按客户端给的名字去 `multi_cert_info` 里挑证书，七层规则再按域名分流到后端 RS 池。`wecert` 就跑在其中一台 CVM 上：读 DNSPod 里的 `_wecert.*` 声明、写 `_acme-challenge` 记录、向 Let's Encrypt 取证书、上传到腾讯云 SSL 并换绑监听器。
+
+这个形态里有两件容易被忽略的事：
+
+- **后端 RS 完全不参与 TLS。** 解密发生在 CLB，所以证书是一份*云端资源*而不是几个文件。把 certbot 装在每台 RS 上拿不到任何好处，而假设"证书最终写进一个 Secret"的工具在这里也没有落点。
+- **共用一张证书的域名生死与共。** SNI 只决定*用哪一张*，真正决定"能不能服务这个域名"的是那张证书的 SAN。所以 `a.example.com` 和 `b.example.com` 一旦进了同一张证书，其中一个的 DNS 出问题就会把另一个一起拖下水。
+
+第二条是其余一切设计的出发点 —— 通配符优先分组、期望状态、以及到期前降级，都是因为它。
 
 ### 1. 系统全景：谁拥有什么、谁只读什么
 
@@ -583,6 +594,7 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 | `ttl` | 否 | `600` | `_acme-challenge` TXT 记录的 TTL。**600 是 DNSPod 免费套餐的下限** —— 配 60 会被 `LimitExceeded.RecordTtlLimit` 拒绝。付费套餐可以调低以加快传播与清理。 |
 | `propagationTimeout` | 否 | `5m` | 等待全部权威 NS 可见该记录的上限 |
 | `pollingInterval` | 否 | `5s` | 传播探测的间隔 |
+| `recursiveNameservers` | 否 | `/etc/resolv.conf` | 可信递归 DNS 的 IP（可带端口），统一用于 CNAME、SOA 与 NS 委派发现。TXT 仍直接查询发现的权威 NS，且必须带权威（`AA`）响应。在 split-horizon / VPN 环境中配置它，避免混用不同的 DNS 视图。 |
 
 #### 强烈建议：`_acme-challenge` CNAME 委派
 
@@ -720,7 +732,7 @@ X-Wecert-Token: <token>
 | `deploy` | `true` | 生成证书的默认部署开关 |
 | `gracePeriod` | `24h` | 名字必须被**确认**缺失多久才允许移除 |
 | `budget` / `budgetWindow` | `25` / `168h` | 窗口内允许的集合变更次数。LE 允许每注册域 50 次 / 7 天且跨账号共享，预算取其一半 |
-| `dropThreshold` | `0.30` | 声明集合缩小超过这个比例就冻结 |
+| `dropThreshold` | `0.30` | 声明集合缩小超过这个比例就冻结。必须落在 **[0,1)**：`0.3` 就是 30%，`0` 表示用默认值。丢失比例最大也只能是 1，所以写成 `30`（当成百分比）或任何 `>= 1` 的值都会让保险丝永远无法触发 —— `config.Load` 会直接拒绝，而不是让这道防线无声消失 |
 | `statePath` | `<out>.state.json` | 宽限期与预算的账本。必须持久化：内存里的宽限期跨不过进程重启 |
 | `reportPath` | `<out>.report.json` | 逐 hostname 的决策报告 |
 
@@ -1140,7 +1152,8 @@ CI（`.github/workflows/ci.yml`）跑 `gofmt` + `vet` + `test -race` + 交叉编
 
 仓库里带了 `e2e-config.example.yaml`（单域名）和 `e2e-config-wildcard.yaml`
 （wildcard + apex，也就是共用同一个 `_acme-challenge` 名字的那种情况）。
-`e2e-test.sh` 默认读 `./e2e-config.yaml`，而它在 `.gitignore` 里 —— 先复制一份：
+`e2e-test.sh` 默认读 `./e2e-config.yaml`，`.gitignore` 把它和 `config.yaml` 一起挡住了 ——
+要提交的配置请保留 `*.example.yaml` / `e2e-config-*.yaml` 这类名字。先复制一份：
 
 ```bash
 make build tools

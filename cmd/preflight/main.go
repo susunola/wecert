@@ -1,14 +1,15 @@
-// Command preflight 在动任何云资源之前验证凭证与前置条件。
+// Command preflight validates credentials and preconditions before touching any cloud resource.
 //
-// 检查三件事（全部只读，不会创建或修改任何东西）：
-//  1. 凭证能用（SSL 证书服务能列出来）
-//  2. 有 DNSPod 读权限，且目标域名确实在这个账号下
-//  3. 目标域名的 NS 确实指向 DNSPod —— 否则写了 TXT 也不会生效，
-//     白白消耗一次授权失败配额
-//  4. 是否已存在 _acme-challenge 记录（残留会让验证出现难以解释的结果）
+// It checks four things (all read-only; nothing is created or modified):
+//  1. the credentials work (the SSL certificate service can be listed)
+//  2. there is DNSPod read access, and the target domain is really in this account
+//  3. the domain's NS really point at DNSPod -- otherwise a written TXT record never
+//     takes effect, and the attempt burns an authorization-failure quota for nothing
+//  4. whether an _acme-challenge record already exists (leftovers confuse CA validation)
 //
-// 第 3 项是排障价值最高的一条，也是"写了 TXT 但 CA 就是验不过"
-// 最常见的根因：域名托管在别处，或者 NS 还没切换完。
+// Item 3 has the highest troubleshooting value and is the most common root cause of
+// "the TXT record is written but the CA will not validate": the domain is hosted
+// elsewhere, or the NS switch has not finished.
 package main
 
 import (
@@ -73,11 +74,11 @@ func main() {
 	fmt.Println("\nOK: all preflight checks passed")
 }
 
-// creds 读取并校验腾讯云凭证。
+// creds loads and validates the Tencent Cloud credentials.
 //
-// 不回显 SecretId 前缀：旧的实现直接写 id[:8]，环境变量被截断或写错时
-// 会 panic，而且把一个秘密的前缀写进终端历史也没什么好处 ——
-// 知道"已加载"就够了。
+// It does not echo a SecretId prefix: the old implementation printed id[:8], which
+// panics when the environment variable is truncated or malformed, and writing part of a
+// secret into terminal history buys nothing -- knowing it is "loaded" is enough.
 func creds() (common.CredentialIface, error) {
 	id := os.Getenv("TENCENTCLOUD_SECRET_ID")
 	key := os.Getenv("TENCENTCLOUD_SECRET_KEY")
@@ -107,12 +108,12 @@ func run(domain string) error {
 	return checkDelegation(ctx, domain)
 }
 
-// checkDelegation 确认域名的权威 NS 确实是 DNSPod 的。
+// checkDelegation confirms the domain's authoritative NS really are DNSPod's.
 //
-// 这一条值得单独查：域名写进 DNSPod 了、但 NS 还指着别处托管商，
-// 是"TXT 写成功、CA 却验证失败"最典型的成因。此时 wecert 每次尝试
-// 都要赔上一次 authorization failure 配额（5 次/小时），
-// 而错误信息只会说"验证失败"，看不出根因。
+// This deserves its own check: a domain added to DNSPod while the NS still point at
+// another host is the classic cause of "the TXT write succeeded but CA validation
+// failed". Every attempt then costs wecert one authorization-failure quota unit (5 per
+// hour), while the error message says only "validation failed" and hides the root cause.
 func checkDelegation(ctx context.Context, domain string) error {
 	fmt.Println()
 	fmt.Println("[4/4] authoritative nameserver delegation check")
@@ -133,7 +134,7 @@ func checkDelegation(ctx context.Context, domain string) error {
 	for _, ns := range names {
 		host := strings.TrimSuffix(ns.Host, ".")
 		hosts = append(hosts, host)
-		// DNSPod 的权威 NS 域名形如 xxx.dnspod.net / xxx.dnsv1.com 等。
+		// DNSPod's authoritative nameserver hostnames look like xxx.dnspod.net / xxx.dnsv1.com.
 		if strings.Contains(host, "dnspod") || strings.Contains(host, "dnsv") {
 			onDNSPod = true
 		}
@@ -151,7 +152,7 @@ func checkDelegation(ctx context.Context, domain string) error {
 	return nil
 }
 
-// checkSSL 验证 SSL 证书服务的读权限。
+// checkSSL verifies read access to the SSL certificate service.
 func checkSSL(ctx context.Context, cred common.CredentialIface) error {
 	fmt.Println("[1/4] SSL certificate service read access")
 	cpf := profile.NewClientProfile()
@@ -178,7 +179,7 @@ func checkSSL(ctx context.Context, cred common.CredentialIface) error {
 	return nil
 }
 
-// checkDNSPod 验证 DNSPod 读权限，并确认域名在这个账号下。
+// checkDNSPod verifies DNSPod read access and confirms the domain belongs to this account.
 func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string) error {
 	fmt.Println("[2/4] DNSPod domain ownership")
 
@@ -190,7 +191,7 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 		return fmt.Errorf("build DNSPod client: %w", err)
 	}
 
-	// 先用接口直接查目标域名，比拉全量列表再匹配更准。
+	// Query the target domain directly: more precise than pulling the full list and matching.
 	req := dnspod.NewDescribeDomainListRequest()
 	req.Keyword = common.StringPtr(domain)
 	req.Limit = common.Int64Ptr(20)
@@ -226,7 +227,7 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 	}
 	fmt.Println()
 
-	// 顺手检查 _acme-challenge 有没有残留记录。
+	// Also check whether any _acme-challenge records are left over.
 	recReq := dnspod.NewDescribeRecordListRequest()
 	recReq.Domain = common.StringPtr(domain)
 	recReq.Subdomain = common.StringPtr("_acme-challenge")
@@ -234,8 +235,8 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 
 	recResp, err := client.DescribeRecordListWithContext(ctx, recReq)
 	if err != nil {
-		// DNSPod 在"一条记录都没有"时返回的是错误码而不是空列表，
-		// 这恰恰是我们想看到的状态，不能当失败。
+		// When there are no records at all DNSPod returns an error code rather than an
+		// empty list -- which is exactly the state we want, so it must not count as failure.
 		if isNoRecord(err) {
 			fmt.Println()
 			fmt.Println("[3/4] _acme-challenge leftover check")
@@ -271,8 +272,8 @@ func deref(s *string) string {
 	return *s
 }
 
-// isNoRecord 判断错误是否为"记录列表为空"。
-// DNSPod 用 ResourceNotFound.NoDataOfRecord 表达这个语义。
+// isNoRecord reports whether the error means "the record list is empty".
+// DNSPod expresses that with ResourceNotFound.NoDataOfRecord.
 func isNoRecord(err error) bool {
 	var sdkErr *tcerrors.TencentCloudSDKError
 	if errors.As(err, &sdkErr) {
@@ -281,9 +282,9 @@ func isNoRecord(err error) bool {
 	return strings.Contains(err.Error(), "NoDataOfRecord")
 }
 
-// listCertificates 列出账号下的 SSL 证书。
-// 主要用途：确认 wecert 上传的证书到底是什么状态，
-// 以及找出测试过程中堆积的证书以便清理。
+// listCertificates lists the SSL certificates in the account.
+// Its main uses: confirm what state the certificates wecert uploaded are really in, and
+// find the ones piling up from testing so they can be cleaned up.
 func listCertificates() error {
 	cred, err := creds()
 	if err != nil {
@@ -320,7 +321,7 @@ func listCertificates() error {
 	total := derefU64(resp.Response.TotalCount)
 	fmt.Printf("\n%d total\n", total)
 	if total > uint64(listed) {
-		// 不做分页就会漏删、也会让人误以为列表是完整的。
+		// Without paging some certificates go unlisted (and thus undeleted), and the list still looks complete.
 		fmt.Printf("note: the server reports %d in total, more than the %d listed here (page size 100),"+
 			"so this list may be incomplete\n", total, listed)
 	}
@@ -334,15 +335,15 @@ func derefU64(v *uint64) uint64 {
 	return *v
 }
 
-// pruneCertificates 删除 wecert 上传的证书。
+// pruneCertificates deletes the certificates wecert uploaded.
 //
-// 为什么需要它：腾讯云账号下上传证书数量有配额，长期测试/长期运行的自动化
-// 如果不回收，早晚会撞上配额导致无法续期。
+// Why it is needed: accounts have a quota on uploaded certificates, and long-running testing
+// or automation that never reclaims them will hit it and be unable to renew.
 //
-// ⚠️ 关于范围：wecert 上传证书时给**所有**证书打的前缀都是 "wecert/"
-// （见 deploy.tencent.go 的 upload），所以这里筛出来的不只是测试留下的证书，
-// **也包括线上正在服务的那张**。因此必须有确认门禁 ——
-// 早先的实现打印完列表就直接开删，一个没有 --dry-run 习惯的人很容易误伤生产。
+// ⚠️ On scope: when uploading, wecert prefixes **every** certificate with "wecert/" (see
+// upload in deploy.tencent.go), so this selects not only test leftovers but **also the one
+// serving production right now**. Hence the confirmation gate -- an earlier version printed
+// the list and deleted straight away, and anyone without a --dry-run habit hurt production.
 func pruneCertificates(assumeYes bool) error {
 	cred, err := creds()
 	if err != nil {
@@ -402,7 +403,7 @@ func pruneCertificates(assumeYes bool) error {
 	for _, c := range doomed {
 		req := ssl.NewDeleteCertificateRequest()
 		req.CertificateId = c.CertificateId
-		// 我们自己在状态库里管绑定关系，不需要服务端再检查关联资源。
+		// We track bindings in our own state store, so the server need not check associated resources.
 		req.IsCheckResource = common.BoolPtr(false)
 		if _, err := client.DeleteCertificateWithContext(ctx, req); err != nil {
 			fmt.Printf("  failed to delete %s: %v\n", deref(c.CertificateId), err)
@@ -417,8 +418,8 @@ func pruneCertificates(assumeYes bool) error {
 	return nil
 }
 
-// confirm 在终端上读一次 y/N。非交互环境（stdin 不是终端）时按拒绝处理 ——
-// 删证书这件事不该因为"没人在那儿看"就默认通过。
+// confirm reads one y/N from the terminal, and treats a non-interactive stdin (not a
+// terminal) as no -- deleting certificates must not pass just because nobody watched.
 func confirm(prompt string) bool {
 	fmt.Printf("%s [y/N] ", prompt)
 
@@ -435,10 +436,11 @@ func confirm(prompt string) bool {
 	}
 }
 
-// dumpBindings 原样打出“这张证书绑了哪些云资源”的 API 返回。
+// dumpBindings prints the raw API response for "which cloud resources this certificate
+// is bound to".
 //
-// 排障用：确认绑定关系时，服务端的字段语义（Status 的取值、
-// 结果何时填充）不能靠猜，把原始响应打出来最快。
+// For troubleshooting: the server's field semantics for bindings (what Status can hold,
+// when results are populated) must not be guessed -- dump the raw response instead.
 func dumpBindings(certID string) error {
 	secretID := os.Getenv("TENCENTCLOUD_SECRET_ID")
 	secretKey := os.Getenv("TENCENTCLOUD_SECRET_KEY")

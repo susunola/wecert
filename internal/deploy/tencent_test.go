@@ -39,11 +39,15 @@ func TestProgressBoundCount(t *testing.T) {
 	}
 }
 
-// 钉住换绑误判的坑：UpdateCertificateInstance 任务创建成功、后台实际也会
-// 正常完成，但同步响应里 UpdateSyncProgressRegions[].TotalCount 全为 null
-// （服务端异步填充）。null 必须被视为"进度未就绪"，而不是"没有绑定资源"——
-// 否则一次成功的换绑会被误报成失败，随后以旧证书为锚重试又会陷入
-// bound=0 的死循环，每一轮还多漏一张孤儿证书。
+// The production incident, pinned at its narrowest point.
+//
+// UpdateCertificateInstance returned a real DeployRecordId while every
+// UpdateSyncProgressRegions[].TotalCount was still null -- the server fills that in
+// asynchronously -- and the background task went on to complete normally. Null has to
+// read as "the progress is not populated yet", never as "no resource is bound":
+// otherwise a rebind that succeeded is reported as a failure, and the retry anchored on
+// the now-unbound old certificate fails identically every round while leaking another
+// orphan certificate each time.
 func TestProgressBoundCountNullTotalCountIsNotReady(t *testing.T) {
 	progress := []*ssl.UpdateSyncProgress{{
 		ResourceType: common.StringPtr("clb"),
@@ -64,7 +68,8 @@ func TestProgressBoundCountNullTotalCountIsNotReady(t *testing.T) {
 	}
 }
 
-// 混合情形：任一 region 的 TotalCount 非 nil 即视为进度已填充。
+// A partially populated response still counts as answered: one region carrying a real
+// TotalCount is enough, and the null regions simply contribute nothing.
 func TestProgressBoundCountMixedNullAndValue(t *testing.T) {
 	progress := []*ssl.UpdateSyncProgress{{
 		ResourceType: common.StringPtr("clb"),
@@ -94,17 +99,20 @@ func TestNoResourceBoundErrorMentionsCertAndSNIHint(t *testing.T) {
 	}
 }
 
-// ── 确认绑定关系 ────────────────────────────────────────────────────────────
+// ── Confirming bindings ─────────────────────────────────────────────────────
 //
-// 这段逻辑我第一版写错了两处，两处都不会导致编译失败、只会在真机上
-// 把一张绑好的证书判成“未绑定”（deployed 指标静默报 0，最长 90 天）：
+// I got this logic wrong in two places in my first version. Neither breaks the build;
+// both just misjudge a well-bound certificate as "unbound" on a real machine (the
+// deployed metric silently reports 0, for up to 90 days):
 //
-//   1. Status 的语义猜反了。实测成功时 Status == 1，我按直觉写成了
-//      “Status != 0 就是还没好”，于是永远等不到结果。
-//   2. 只看 TaskId 匹配就返回。首次查询（服务端缓存未建立）会返回一个
-//      TaskId 正确、但结果列表为空的对象，那一刻会被判成“绑定数为 0”。
+//   1. I guessed the meaning of Status backwards. Empirically Status == 1 on success, but
+//      I wrote "Status != 0 means not ready yet" by intuition, so it waited for a result
+//      that never arrived.
+//   2. I returned as soon as the TaskId matched. The first query (before the server-side
+//      cache exists) returns an object with a correct TaskId but an empty result list, and
+//      that instant gets judged as "0 bindings".
 //
-// 所以这里把两个坑都钉住。
+// So both traps are pinned down here.
 
 func bindResp(taskID string, status uint64, withResult bool) *ssl.DescribeCertificateBindResourceTaskResultResponse {
 	r := &ssl.SyncTaskBindResourceResult{
@@ -127,69 +135,71 @@ func bindResp(taskID string, status uint64, withResult bool) *ssl.DescribeCertif
 	}
 }
 
-// Status == 1 且结果已填充 → 完成，合计 3。
+// Status == 1 with results populated -> done, totaling 3.
 func TestCountBindingsDone(t *testing.T) {
 	n, done, err := countBindings(bindResp("t1", bindStatusDone, true), "t1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !done {
-		t.Fatal("Status=1 且结果已填充时应当判定为完成")
+		t.Fatal("Status=1 with results populated should be judged done")
 	}
 	if n != 3 {
 		t.Errorf("count = %d, want 3", n)
 	}
 }
 
-// 这条钉住第一个坑：Status=1 是**完成**，不是“进行中”。
+// This pins down the first trap: Status=1 means **done**, not "in progress".
 func TestCountBindingsStatusOneMeansDone(t *testing.T) {
 	_, done, _ := countBindings(bindResp("t1", 1, true), "t1")
 	if !done {
-		t.Error("Status=1 必须被当成完成 —— 反过来的话确认会永远超时")
+		t.Error("Status=1 must be treated as done -- the reverse makes confirmation time out forever")
 	}
 }
 
-// 这条钉住第二个坑：TaskId 匹配但结果为空时，必须继续等，不能报 0。
+// This pins down the second trap: when the TaskId matches but results are empty it must
+// keep waiting, and must not report 0.
 func TestCountBindingsEmptyResultIsNotDone(t *testing.T) {
 	n, done, err := countBindings(bindResp("t1", bindStatusDone, false), "t1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if done {
-		t.Error("结果列表为空时必须继续等，否则会把绑好的证书判成未绑定")
+		t.Error("an empty result list must keep waiting, otherwise a bound certificate is judged unbound")
 	}
 	if n != 0 {
-		t.Errorf("未完成时 count 应为 0，得到 %d", n)
+		t.Errorf("count should be 0 when not done, got %d", n)
 	}
 }
 
-// 还没到完成状态时同样要继续等。
+// A not-yet-done status must likewise keep waiting.
 func TestCountBindingsPendingIsNotDone(t *testing.T) {
 	_, done, _ := countBindings(bindResp("t1", 0, true), "t1")
 	if done {
-		t.Error("Status=0 表示还没完成，应当继续等")
+		t.Error("Status=0 means not done yet, so it should keep waiting")
 	}
 }
 
-// TaskId 对不上时不能拿别人的结果当自己的。
+// A mismatched TaskId must not take someone else's result as its own.
 func TestCountBindingsIgnoresOtherTasks(t *testing.T) {
 	_, done, _ := countBindings(bindResp("other", bindStatusDone, true), "t1")
 	if done {
-		t.Error("TaskId 不匹配时不该判定为完成")
+		t.Error("a mismatched TaskId should not be judged done")
 	}
 }
 
-// 服务端报错时要把错误抛出来，而不是空等到超时。
+// A server-reported error must be surfaced rather than waiting idly until timeout.
 func TestCountBindingsSurfacesTaskError(t *testing.T) {
 	resp := bindResp("t1", 0, false)
 	resp.Response.SyncTaskBindResourceResult[0].Error = &ssl.Error{Message: common.StringPtr("boom")}
 
 	if _, _, err := countBindings(resp, "t1"); err == nil {
-		t.Error("任务报错时应当返回错误，而不是继续空等")
+		t.Error("a failing task should return an error rather than keep waiting idly")
 	}
 }
 
-// 某个地域查询异常时，那个地域的数字不可信，不能累加进去。
+// When a region's query fails, that region's number cannot be trusted and must not be
+// added in.
 func TestCountBindingsSkipsErroredRegion(t *testing.T) {
 	resp := &ssl.DescribeCertificateBindResourceTaskResultResponse{
 		Response: &ssl.DescribeCertificateBindResourceTaskResultResponseParams{
@@ -212,12 +222,12 @@ func TestCountBindingsSkipsErroredRegion(t *testing.T) {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
 	if n != 2 {
-		t.Errorf("查询异常的地域不应计入，count = %d, want 2", n)
+		t.Errorf("an errored region should not be counted, count = %d, want 2", n)
 	}
 }
 
 func TestCountBindingsNilResponse(t *testing.T) {
 	if _, done, _ := countBindings(nil, "t1"); done {
-		t.Error("nil 响应不该判定为完成")
+		t.Error("a nil response should not be judged done")
 	}
 }

@@ -13,27 +13,28 @@ func TestProbeDefaults(t *testing.T) {
 	}
 
 	if cfg.Probe.Port != 443 {
-		t.Errorf("port 默认应当是 443，实际 %d", cfg.Probe.Port)
+		t.Errorf("port default should be 443, got %d", cfg.Probe.Port)
 	}
 	if cfg.Probe.TimeoutDur != 10*time.Second {
-		t.Errorf("timeout 默认应当是 10s，实际 %v", cfg.Probe.TimeoutDur)
+		t.Errorf("timeout default should be 10s, got %v", cfg.Probe.TimeoutDur)
 	}
 	if cfg.Probe.MaxHostsPerCert != 3 {
-		t.Errorf("maxHostsPerCert 默认应当是 3，实际 %d", cfg.Probe.MaxHostsPerCert)
+		t.Errorf("maxHostsPerCert default should be 3, got %d", cfg.Probe.MaxHostsPerCert)
 	}
 	if cfg.Probe.MinValidDur != 0 {
-		t.Errorf("minValidFor 默认应当是不检查，实际 %v", cfg.Probe.MinValidDur)
+		t.Errorf("minValidFor default should be no check, got %v", cfg.Probe.MinValidDur)
 	}
-	// 未设置时是 nil，默认值由调用方给 —— main 传的是 true。
+	// Unset means nil and the caller supplies the default — main passes true.
 	if cfg.Probe.Enabled != nil {
-		t.Error("没写 probe.enabled 时应当是未设置状态")
+		t.Error("an omitted probe.enabled should stay unset")
 	}
 	if !cfg.Probe.EnabledOr(true) {
-		t.Error("未设置时应当采用调用方给的默认值")
+		t.Error("when unset it should take the caller-supplied default")
 	}
 }
 
-// 显式关掉是必要的：不是每个部署都能从运行 wecert 的机器拨到这个 VIP。
+// An explicit off switch is necessary: not every deployment can dial this VIP
+// from the machine running wecert.
 func TestProbeCanBeTurnedOff(t *testing.T) {
 	cfg, err := Load(writeConfig(t, minimalPrefix+oneCert+`
 probe:
@@ -43,7 +44,7 @@ probe:
 		t.Fatal(err)
 	}
 	if cfg.Probe.EnabledOr(true) {
-		t.Error("显式写成 false 时不该被默认值盖掉")
+		t.Error("an explicit false must not be overridden by the default")
 	}
 }
 
@@ -79,7 +80,7 @@ probe:
   port: `+port+`
 `))
 		if err == nil || !strings.Contains(err.Error(), "probe.port") {
-			t.Errorf("port=%s 应当报错，实际 %v", port, err)
+			t.Errorf("port=%s should error, got %v", port, err)
 		}
 	}
 }
@@ -90,18 +91,19 @@ probe:
   timeout: soon
 `))
 	if err == nil || !strings.Contains(err.Error(), "probe.timeout") {
-		t.Fatalf("非法时长应当报错，实际 %v", err)
+		t.Fatalf("an invalid duration should error, got %v", err)
 	}
 }
 
-// 上限为 0 会被 normalize 补成默认值，负数才是错误 ——
-// 那多半是想写 0 表达"关掉"，而关掉应该用 enabled: false。
+// A cap of 0 is filled in by normalize as the default; only a negative is an
+// error — that usually means someone wrote 0 to say "off", but off is spelled
+// enabled: false.
 func TestProbeRejectsANegativeCap(t *testing.T) {
 	_, err := Load(writeConfig(t, minimalPrefix+oneCert+`
 probe:
   maxHostsPerCert: -1
 `))
 	if err == nil || !strings.Contains(err.Error(), "maxHostsPerCert") {
-		t.Fatalf("负数上限应当报错，实际 %v", err)
+		t.Fatalf("a negative cap should error, got %v", err)
 	}
 }

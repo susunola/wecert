@@ -31,16 +31,17 @@ func testDoc(t *testing.T) *Document {
 	}
 }
 
-// 空文档一律拒绝。
+// An empty document is always rejected.
 //
-// "合法的空"和"生成失败导致的空"在文件里长得一模一样，而后者一旦被接受，
-// 后果是每张证书的每个域名都被摘掉。这个风险太不对称。
+// A "legitimately empty" file and a "generation failed, hence empty" file look
+// identical, and accepting the latter strips every domain from every certificate.
+// The risk is far too asymmetric.
 func TestValidateRejectsEmptyCertificates(t *testing.T) {
 	doc := testDoc(t)
 	doc.Certificates = nil
 
 	if err := doc.Validate(); err == nil {
-		t.Fatal("空 certificates 应当被拒绝")
+		t.Fatal("an empty certificates list must be rejected")
 	}
 }
 
@@ -59,27 +60,28 @@ func TestValidateRequiresEnvelope(t *testing.T) {
 			tc.mutate(doc)
 			err := doc.Validate()
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("期望提到 %q 的报错，实际 %v", tc.want, err)
+				t.Fatalf("expected an error mentioning %q, got %v", tc.want, err)
 			}
 		})
 	}
 }
 
-// 证书名必须由分组键派生。
+// Certificate names must derive from the grouping key.
 //
-// 这是契约边界上唯一能拦住"名字跟着域名集合跑"的地方 ——
-// 等 wecert 读进来的时候，孤儿状态已经产生了。
+// This is the only place on the contract boundary that can stop "the name
+// follows the domain set" -- by the time wecert reads it, the orphan state
+// already exists.
 func TestValidateRejectsNameThatFollowsTheDomainSet(t *testing.T) {
 	doc := testDoc(t)
 	doc.Certificates = []config.Certificate{{
-		// 注册域是 example.com，所以名字必须是 example-com。
+		// The registered domain is example.com, so the name must be example-com.
 		Name:    "example-com-plus-api",
 		Domains: []string{"example.com", "api.example.com"},
 	}}
 
 	err := doc.Validate()
 	if err == nil || !strings.Contains(err.Error(), "not stable") {
-		t.Fatalf("期望 Name 稳定性报错，实际 %v", err)
+		t.Fatalf("expected a Name stability error, got %v", err)
 	}
 }
 
@@ -92,21 +94,22 @@ func TestValidateRejectsCrossRegisteredDomain(t *testing.T) {
 
 	err := doc.Validate()
 	if err == nil || !strings.Contains(err.Error(), "registered domains") {
-		t.Fatalf("期望跨注册域报错，实际 %v", err)
+		t.Fatalf("expected a cross-registered-domain error, got %v", err)
 	}
 }
 
-// 指纹只覆盖证书内容，不吃时间戳和顺序。
-// 否则每跑一次 onboarding 指纹都变，"期望状态到底变了没有"就答不了。
+// The fingerprint covers certificate content only, ignoring timestamps and order.
+// Otherwise it would change on every onboarding run and "did the desired state
+// actually change?" could not be answered.
 func TestRevisionIgnoresOrderAndTimestamps(t *testing.T) {
 	a := []config.Certificate{{Name: "example-com", Domains: []string{"example.com", "*.example.com"}}}
 	b := []config.Certificate{{Name: "example-com", Domains: []string{"*.example.com", "example.com"}}}
 
 	if Revision(a) != Revision(b) {
-		t.Errorf("域名顺序不该影响指纹: %s vs %s", Revision(a), Revision(b))
+		t.Errorf("domain order must not affect the fingerprint: %s vs %s", Revision(a), Revision(b))
 	}
 	if Revision(a) == Revision([]config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}}) {
-		t.Error("域名集合变了指纹就该变")
+		t.Error("changing the domain set must change the fingerprint")
 	}
 }
 
@@ -116,10 +119,11 @@ func TestRevisionRejectsATamperedDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 改内容但留着旧指纹 —— 手工编辑最常见的形态。
+	// Change the content but keep the old fingerprint -- the most common shape of
+	// a hand edit.
 	doc.Certificates[0].Domains = append(doc.Certificates[0].Domains, "www.example.com")
 	if err := doc.Validate(); err == nil || !strings.Contains(err.Error(), "revision") {
-		t.Fatalf("期望指纹不匹配的报错，实际 %v", err)
+		t.Fatalf("expected a fingerprint mismatch error, got %v", err)
 	}
 }
 
@@ -136,7 +140,7 @@ func TestWriteAndLoadRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(string(raw), "# ") {
-		t.Error("文档应当以'请勿手工编辑'的提示开头")
+		t.Error("the document must start with the do-not-edit-by-hand header")
 	}
 
 	got, err := LoadDocument(path)
@@ -144,33 +148,36 @@ func TestWriteAndLoadRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.Revision != doc.Revision {
-		t.Errorf("指纹丢失: %q vs %q", got.Revision, doc.Revision)
+		t.Errorf("fingerprint lost: %q vs %q", got.Revision, doc.Revision)
 	}
 	if len(got.Certificates) != 1 || got.Certificates[0].Name != "example-com" {
-		t.Errorf("证书没读回来: %+v", got.Certificates)
+		t.Errorf("certificate was not read back: %+v", got.Certificates)
 	}
-	// profile/keyType 应当被规范化填上默认值，而不是留空。
+	// profile/keyType must be normalized to their defaults rather than left empty.
 	if got.Certificates[0].Profile != config.ProfileClassic {
-		t.Errorf("profile 应填默认值，实际 %q", got.Certificates[0].Profile)
+		t.Errorf("profile must be filled with the default, got %q", got.Certificates[0].Profile)
 	}
 }
 
-// 启动时文档读不到，构造 provider 就该失败。
+// If the document is unreadable at startup, constructing the provider must fail.
 //
-// 允许"起得来但没有期望状态"意味着 wecert 会安静地什么都不续期，
-// 直到所有证书过期才被发现 —— 那是最糟的一种失败：无声，且后果全在线上。
+// Allowing "starts up but has no desired state" means wecert quietly renews
+// nothing until every certificate expires -- the worst kind of failure: silent,
+// with all the consequences in production.
 func TestNewFileFailsWhenTheDocumentIsMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nope.yaml")
 	if _, err := NewFile(path, testLogger()); err == nil {
-		t.Fatal("文档不存在时 NewFile 应当报错")
+		t.Fatal("NewFile must fail when the document is missing")
 	}
 }
 
-// 运行期文档读不到 ≠ 期望为空。
+// An unreadable document at runtime is not an empty desired state.
 //
-// 这是整套设计里唯一能造成灾难的地方：如果读失败被当成"期望为空"，
-// wecert 会把域名从每张证书里摘掉，线上立刻握手失败。
-// 正确反应是冻结在最后一版可用状态上，并继续按它收敛。
+// This is the one place in the entire design that can cause a disaster: if a read
+// failure were treated as "desired state is empty", wecert would strip domains
+// from every certificate and handshakes would fail in production immediately.
+// The correct reaction is to freeze on the last usable revision and keep
+// converging on it.
 func TestFileProviderFreezesOnUnreadableDocument(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "desired-state.yaml")
 	if err := WriteDocument(path, testDoc(t)); err != nil {
@@ -187,30 +194,30 @@ func TestFileProviderFreezesOnUnreadableDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 	if good.Frozen {
-		t.Fatal("第一次读成功时不该是冻结状态")
+		t.Fatal("a successful first read must not be frozen")
 	}
 
-	// 文档被删掉（或权限被改、或写到一半被截断）。
+	// The document is deleted (or chmod-ed, or truncated mid-write).
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
 
 	frozen, err := f.DesiredWithReasons(context.Background())
 	if err != nil {
-		t.Fatalf("冻结时不该返回错误，实际 %v", err)
+		t.Fatalf("freezing must not return an error, got %v", err)
 	}
 	if !frozen.Frozen {
-		t.Error("读不到文档时必须标记为冻结")
+		t.Error("an unreadable document must be marked as frozen")
 	}
 	if frozen.FreezeReason == "" {
-		t.Error("冻结时必须说明原因")
+		t.Error("a frozen state must explain the reason")
 	}
 	if len(frozen.Certificates) != len(good.Certificates) {
-		t.Fatalf("冻结时应保留上一版证书，实际 %d -> %d",
+		t.Fatalf("freezing must keep the previous certificates, got %d -> %d",
 			len(good.Certificates), len(frozen.Certificates))
 	}
 	if frozen.Revision != good.Revision {
-		t.Errorf("冻结时应保留上一版指纹，实际 %q -> %q", good.Revision, frozen.Revision)
+		t.Errorf("freezing must keep the previous revision, got %q -> %q", good.Revision, frozen.Revision)
 	}
 }
 
@@ -229,26 +236,26 @@ func TestDiffReportsAddRemoveAndChange(t *testing.T) {
 	got := Diff(enforced, shadow)
 
 	if len(got.AddCertificates) != 1 || got.AddCertificates[0] != "fresh-io" {
-		t.Errorf("新增证书识别错误: %v", got.AddCertificates)
+		t.Errorf("wrong certificates detected as added: %v", got.AddCertificates)
 	}
 	if len(got.RemoveCertificates) != 1 || got.RemoveCertificates[0] != "gone-net" {
-		t.Errorf("待移除证书识别错误: %v", got.RemoveCertificates)
+		t.Errorf("wrong certificates detected as removed: %v", got.RemoveCertificates)
 	}
 	if len(got.ChangeCertificates) != 1 {
-		t.Fatalf("应当识别出 1 张变化的证书，实际 %v", got.ChangeCertificates)
+		t.Fatalf("exactly 1 changed certificate must be detected, got %v", got.ChangeCertificates)
 	}
 	ch := got.ChangeCertificates[0]
 	if ch.Name != "example-com" {
-		t.Errorf("变化的证书名不对: %q", ch.Name)
+		t.Errorf("wrong changed certificate name: %q", ch.Name)
 	}
 	if len(ch.Added) != 1 || ch.Added[0] != "new.example.com" {
-		t.Errorf("新增域名识别错误: %v", ch.Added)
+		t.Errorf("wrong domains detected as added: %v", ch.Added)
 	}
 	if len(ch.Removed) != 1 || ch.Removed[0] != "old.example.com" {
-		t.Errorf("移除域名识别错误: %v", ch.Removed)
+		t.Errorf("wrong domains detected as removed: %v", ch.Removed)
 	}
 	if got.Empty() {
-		t.Error("有差异时 Empty 必须是 false")
+		t.Error("Empty must be false when there is a diff")
 	}
 }
 
@@ -256,6 +263,6 @@ func TestDiffIsEmptyWhenNothingChanged(t *testing.T) {
 	certs := []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}}
 	got := Diff(&Result{Certificates: certs}, &Result{Certificates: certs})
 	if !got.Empty() {
-		t.Errorf("没有差异时应当报告为空: %+v", got)
+		t.Errorf("no diff must be reported as empty: %+v", got)
 	}
 }

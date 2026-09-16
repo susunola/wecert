@@ -119,7 +119,7 @@ button.print{
 button.print:hover{border-color:var(--ink)}
 button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 
-/* ---- SVG 内部 ---- */
+/* ---- SVG internals ---- */
 .bx{fill:var(--card);stroke:var(--rule-2);stroke-width:1.5}
 .bx-human{fill:var(--human-bg);stroke:var(--human-ln);stroke-width:1.5}
 .bx-local{fill:var(--local-bg);stroke:var(--local-ln);stroke-width:1.5}
@@ -192,7 +192,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 </header>
 
 <nav class="toc">
-  <a href="#problem">ⓐ The problem</a>
+  <a href="#problem">ⓐ Deployment</a>
   <a href="#map">① System map</a>
   <a href="#intent">② Intent → contract</a>
   <a href="#decide">③ Reconcile decisions</a>
@@ -207,130 +207,181 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 
 <!-- ══════════════════════════════════════════════════════════ ⓪ -->
 <section id="problem">
-  <h2><span class="num">diagram ⓐ</span>The problem: the certificate is not on the business machines</h2>
-  <p class="cap">This is not “yet another certificate renewal tool”. TLS terminates at the CLB and the business machines hold no certificate file at all — so the premise every conventional approach rests on does not hold here. Below: the deployment shape, why the off-the-shelf tools do not fit, and the hard limits that shaped every other decision.</p>
+  <h2><span class="num">diagram ⓐ</span>Deployment shape: a free certificate rotating itself on the CLB</h2>
+  <p class="cap">The band on top is the scenario this system exists for: <b>a free certificate is valid for 90 days, so it has to rotate automatically</b> — and why the choice falls on Let’s Encrypt rather than Tencent Cloud’s own free DV: <b>those are single-domain certificates, supporting neither SAN nor wildcard</b>, so every extra domain means another rotation to maintain. One Let’s Encrypt certificate holds up to 100 names and does support wildcards, so several domains combine into one certificate and rotate as one. The two bands below are what that scenario looks like on Tencent Cloud — the request path on top, and where the certificate comes from underneath. The relationship in the middle is the one that matters: <b>SNI decides which certificate the CLB uses, and that certificate’s SAN decides which domains it can complete a handshake for</b> — so domains sharing one certificate share its fate.</p>
 
   <figure>
   <div class="scroll">
-  <svg viewBox="0 0 1228 690" role="img" aria-label="wecert's problem scenario: TLS terminates at the CLB and the business machines hold no certificate">
+  <svg viewBox="0 0 1228 1084" role="img" aria-label="wecert's deployment shape: a free certificate rotated automatically by Let's Encrypt (issued for free → rebound automatically → serving for 90 days → reissued before expiry); Let's Encrypt is chosen over Tencent Cloud's own free DV because the latter is single-domain and supports neither SAN nor wildcard. Clients reach the CLB over SNI and one multi-SAN certificate routes to a backend RS pool">
     <defs>
       <marker id="a0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-edge" d="M0 0 L10 5 L0 10 z"/></marker>
+      <marker id="a0d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-ink" d="M0 0 L10 5 L0 10 z"/></marker>
     </defs>
 
-    <!-- ── 带 1：部署形态 ── -->
-    <rect class="zone" x="24" y="44" width="1180" height="232" rx="14"/>
-    <text class="zone-title" x="36" y="34">Deployment shape · the certificate is not on the business machines</text>
+    <!-- ── band 0: the scenario, and why it has to rotate ── -->
+    <rect class="zone" x="24" y="44" width="1180" height="304" rx="14"/>
+    <text class="zone-title" x="36" y="34">The scenario · a free certificate (Let’s Encrypt), rotating automatically</text>
 
-    <rect class="bx" x="44" y="100" width="176" height="64" rx="8"/>
-    <foreignObject x="44" y="100" width="176" height="64">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Browser / client<span class="s">only checks the certificate, never where it lives</span>
+    <foreignObject x="40" y="50" width="1156" height="26">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left" style="font-size:12px">Let’s Encrypt costs nothing; the price is a 90-day validity — at least four rotations a year, and a human remembering each one will eventually miss.</div>
+    </foreignObject>
+
+    <rect class="bx-ext" x="56" y="84" width="243" height="92" rx="8"/>
+    <foreignObject x="56" y="84" width="243" height="92">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Issued for free<span class="s">Let's Encrypt · ACME</span>
+        <span class="s">no cost, but only 90 days</span>
       </div>
     </foreignObject>
 
-    <rect class="bx-local" x="336" y="80" width="340" height="104" rx="8"/>
-    <foreignObject x="336" y="80" width="340" height="104">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Tencent Cloud CLB<span class="s">TLS <b>terminates here</b> · SNI · multi_cert_info</span>
-        <span class="s">the certificate is bound to a listener — a cloud resource</span>
+    <rect class="bx-ext" x="347" y="84" width="243" height="92" rx="8"/>
+    <foreignObject x="347" y="84" width="243" height="92">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Rebound automatically<span class="s">uploaded to Tencent Cloud SSL</span>
+        <span class="s">then bound to the CLB listener</span>
       </div>
     </foreignObject>
 
-    <rect class="bx" x="790" y="100" width="200" height="64" rx="8"/>
-    <foreignObject x="790" y="100" width="200" height="64">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">CVM pool<span class="s">business only · plain HTTP</span>
+    <rect class="bx" x="638" y="84" width="243" height="92" rx="8"/>
+    <foreignObject x="638" y="84" width="243" height="92">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Serving traffic<span class="s">SNI picks the certificate</span>
+        <span class="s">only 90 days left on it</span>
       </div>
     </foreignObject>
 
-    <rect class="bx-ext" x="336" y="204" width="340" height="56" rx="8"/>
-    <foreignObject x="336" y="204" width="340" height="56">
+    <rect class="bx-local" x="929" y="84" width="243" height="92" rx="8"/>
+    <foreignObject x="929" y="84" width="243" height="92">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Reissued before expiry<span class="s">ARI suggests the window</span>
+        <span class="s">nobody has to be involved</span>
+      </div>
+    </foreignObject>
+
+    <path class="edge" d="M299 130 H347" marker-end="url(#a0)"/>
+    <path class="edge" d="M590 130 H638" marker-end="url(#a0)"/>
+    <path class="edge" d="M881 130 H929" marker-end="url(#a0)"/>
+    <path class="edge" d="M1051 176 V198 H178 V176" marker-end="url(#a0)"/>
+    <rect class="elab-bg" x="536" y="190" width="156" height="16" rx="3"/>
+    <text class="elab" x="614" y="202" text-anchor="middle">before expiry, back to step 1 automatically</text>
+
+    <text class="zone-title" x="36" y="232">Why Let’s Encrypt rather than Tencent Cloud’s own free DV</text>
+
+    <rect class="bx-danger" x="56" y="244" width="540" height="88" rx="8"/>
+    <foreignObject x="56" y="244" width="540" height="88">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Tencent Cloud free DV<span class="s">one domain only · no SAN · no wildcard</span>
+        <span class="s">3 domains = 3 certificates = 3 rotations to look after</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-ext" x="632" y="244" width="540" height="88" rx="8"/>
+    <foreignObject x="632" y="244" width="540" height="88">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Let's Encrypt
-        <span class="s">ACME · 90 days · rate limits</span>
+        <span class="s">up to 100 SANs in one certificate · wildcards supported</span>
+        <span class="s">3 domains (incl. *.example.com) = 1 certificate = 1 rotation</span>
       </div>
     </foreignObject>
 
-    <rect class="bx-danger" x="730" y="188" width="460" height="88" rx="8"/>
-    <foreignObject x="730" y="188" width="460" height="88">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">The certificate has to live here — there is no certificate file on the business machines to distribute<span class="s">so “copy the certificate file onto every node” has no meaning in this shape</span>
+    <g transform="translate(0,334)">
+
+    <!-- ── band 1: the request path ── -->
+    <rect class="zone" x="24" y="44" width="1180" height="296" rx="14"/>
+    <text class="zone-title" x="36" y="34">Request path · SNI picks the certificate, the certificate’s SAN decides which domains it can serve</text>
+
+    <rect class="bx" x="40" y="150" width="176" height="80" rx="8"/>
+    <foreignObject x="40" y="150" width="176" height="80">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Browser / client<span class="s">HTTPS · SNI = a.example.com</span>
       </div>
     </foreignObject>
 
-    <path class="edge" d="M220 132 H336" marker-end="url(#a0)"/>
-    <path class="edge" d="M676 132 H790" marker-end="url(#a0)"/>
-    <path class="edge-dash" d="M506 184 V204" marker-end="url(#a0)"/>
-
-    <rect class="elab-bg" x="238" y="118" width="80" height="16" rx="3"/>
-    <text class="elab" x="278" y="130" text-anchor="middle">HTTPS</text>
-    <rect class="elab-bg" x="694" y="118" width="78" height="16" rx="3"/>
-    <text class="elab" x="733" y="130" text-anchor="middle">plain HTTP</text>
-
-    <!-- ── 带 2：现成办法为什么不成立 ── -->
-    <rect class="zone" x="24" y="304" width="1180" height="196" rx="14"/>
-    <text class="zone-title" x="36" y="294">So none of the off-the-shelf approaches fit</text>
-
-    <rect class="bx" x="44" y="330" width="1140" height="36" rx="8"/>
-    <text class="mark-x" x="62" y="353">✗</text>
-    <foreignObject x="84" y="330" width="1084" height="36">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">certbot on every CVM<span class="s">TLS does not terminate on the CVMs, so a certificate there is useless — and each machine would issue its own, multiplying the quota</span>
+    <rect class="bx-local" x="252" y="72" width="560" height="248" rx="8"/>
+    <foreignObject x="268" y="84" width="528" height="56">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">CLB · listener 443 · <b>SNI on</b><span class="s">it picks the certificate out of multi_cert_info using the SNI the client sent</span>
       </div>
     </foreignObject>
 
-    <rect class="bx" x="44" y="374" width="1140" height="36" rx="8"/>
-    <text class="mark-x" x="62" y="397">✗</text>
-    <foreignObject x="84" y="374" width="1084" height="36">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">cert-manager + Kubernetes
-        <span class="s">There is no Kubernetes here, just a CLB and a few CVMs — and the certificate ends up on a <b>CLB listener</b>, not in a Secret</span>
+    <rect class="bx-ctr" x="268" y="150" width="528" height="92" rx="8"/>
+    <foreignObject x="268" y="150" width="528" height="92">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">The one certificate that is bound<span class="s mono">SAN = a.example.com · b.example.com · *.example.com</span>
+        <span class="s">these domains share their fate: they succeed, fail and expire together</span>
       </div>
     </foreignObject>
 
-    <rect class="bx" x="44" y="418" width="1140" height="36" rx="8"/>
-    <text class="mark-x" x="62" y="441">✗</text>
-    <foreignObject x="84" y="418" width="1084" height="36">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">Distribute the certificate file to each node<span class="s">The nodes never read a certificate — decryption happens at the LB, so this only makes more copies of the private key</span>
+    <rect class="bx" x="268" y="250" width="528" height="64" rx="8"/>
+    <foreignObject x="268" y="250" width="528" height="64">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Layer-7 rules route by domain to the backend<span class="s mono">a.example.com → RS group A　　b.example.com → RS group B</span>
       </div>
     </foreignObject>
 
-    <rect class="bx" x="44" y="462" width="1140" height="36" rx="8"/>
-    <text class="mark-x" x="62" y="485">✗</text>
-    <foreignObject x="84" y="462" width="1084" height="36">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">Apply → upload → bind, by hand<span class="s">Once every 90 days, entirely on someone remembering — and forgetting shows up as <b>a broken handshake in production</b>, not as an alert</span>
+    <rect class="bx" x="850" y="110" width="320" height="170" rx="8"/>
+    <foreignObject x="850" y="110" width="320" height="170">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Backend RS pool<span class="s mono">rs-1 · rs-2 · rs-3</span>
+        <span class="s">business only · plain HTTP</span>
+        <span class="s">no certificate file on these machines, and none is needed</span>
       </div>
     </foreignObject>
 
-    <!-- ── 带 3：硬约束 ── -->
-    <rect class="zone" x="24" y="528" width="1180" height="140" rx="14"/>
-    <text class="zone-title" x="36" y="518">Hard limits · these numbers shaped every design decision</text>
+    <path class="edge" d="M216 190 H252" marker-end="url(#a0)"/>
+    <path class="edge" d="M812 190 H850" marker-end="url(#a0)"/>
+    <rect class="elab-bg" x="222" y="176" width="52" height="16" rx="3"/>
+    <text class="elab" x="248" y="188" text-anchor="middle">HTTPS</text>
+    <rect class="elab-bg" x="816" y="176" width="76" height="16" rx="3"/>
+    <text class="elab" x="854" y="188" text-anchor="middle">plain HTTP</text>
 
-    <rect class="bx-danger" x="44" y="548" width="276" height="100" rx="8"/>
-    <foreignObject x="44" y="548" width="276" height="100">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">90 days → 47 days<span class="s">the validity ceiling from 2029-03-15</span>
-        <span class="s">renewal only gets more frequent</span>
+    <!-- ── band 2: the control plane ── -->
+    <rect class="zone" x="24" y="380" width="1180" height="340" rx="14"/>
+    <text class="zone-title" x="36" y="370">Control plane · where this certificate comes from (wecert runs on one of the CVMs)</text>
+
+    <rect class="bx-local" x="40" y="440" width="260" height="250" rx="8"/>
+    <foreignObject x="40" y="440" width="260" height="250">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">
+        <span class="tag">daemon · one CVM</span>
+        wecert
+        <span class="s left" style="display:block;text-align:left;margin-top:6px">1 · read the desired state (read-only)<br/>2 · decide: issue / reissue / renew<br/>3 · write _acme-challenge<br/>4 · finalize and download<br/>5 · upload and rebind to the CLB</span>
       </div>
     </foreignObject>
 
-    <rect class="bx-human" x="345" y="548" width="276" height="100" rx="8"/>
-    <foreignObject x="345" y="548" width="276" height="100">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">50 / 7 days<span class="s">new certificates per registered domain</span>
-        <span class="s">shared across accounts — keep half in reserve</span>
+    <rect class="bx-human" x="380" y="424" width="330" height="100" rx="8"/>
+    <foreignObject x="380" y="424" width="330" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">DNSPod
+        <span class="s mono">_wecert.* declarations — where the intent comes from</span>
+        <span class="s mono">_acme-challenge — the DNS-01 challenge</span>
       </div>
     </foreignObject>
 
-    <rect class="bx-danger" x="646" y="548" width="276" height="100" rx="8"/>
-    <foreignObject x="646" y="548" width="276" height="100">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">5 / 7 days<span class="s">the exact identifier set</span>
-        <span class="s">no override; hit it and you wait a week</span>
+    <rect class="bx-ext" x="380" y="560" width="330" height="100" rx="8"/>
+    <foreignObject x="380" y="560" width="330" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Let's Encrypt
+        <span class="s">ACME · order / finalize / download</span>
+        <span class="s">ARI · coordinated renewal (exempt from rate limits)</span>
       </div>
     </foreignObject>
 
-    <rect class="bx-ext" x="947" y="548" width="276" height="100" rx="8"/>
-    <foreignObject x="947" y="548" width="276" height="100">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">ARI exempts all of them<span class="s">but only for a <b>same-name renewal</b></span>
-        <span class="s">change the name set and this issuance counts again</span>
+    <rect class="bx-ext" x="760" y="424" width="420" height="100" rx="8"/>
+    <foreignObject x="760" y="424" width="420" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Tencent Cloud SSL<span class="s mono">upload the certificate (wecert/ prefix)</span>
+        <span class="s mono">UpdateCertificateInstance rebinds it</span>
       </div>
     </foreignObject>
+
+    <rect class="bx-danger" x="760" y="560" width="420" height="100" rx="8"/>
+    <foreignObject x="760" y="560" width="420" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">The rebind is asynchronous (measured ~15s) and not atomic<span class="s">so every pass also dials 443 and reads back the certificate <b>actually served</b>, confirming that what is live really is this one — the control plane saying “done” is not the same as it being in effect</span>
+      </div>
+    </foreignObject>
+
+    <path class="edge" d="M300 480 H380" marker-end="url(#a0)"/>
+    <path class="edge" d="M300 610 H380" marker-end="url(#a0)"/>
+    <path class="edge" d="M170 440 V400 H970 V424" marker-end="url(#a0)"/>
+    <path class="edge-thick" d="M1150 424 V358 H700 V320" marker-end="url(#a0d)"/>
+
+    <rect class="elab-bg" x="536" y="386" width="88" height="16" rx="3"/>
+    <text class="elab" x="580" y="398" text-anchor="middle">upload</text>
+    <rect class="elab-bg" x="884" y="344" width="132" height="16" rx="3"/>
+    <text class="elab" x="950" y="356" text-anchor="middle">rebind to the listener</text>
+    </g>
   </svg>
   </div>
   </figure>
 
-  <p>The last of those four is the one that bites: <strong>changing the name set once burns one issuance</strong>, and “domains change all the time” is this project’s premise. So the whole design turns on one question — how to make “add a domain” <strong>avoid producing a new issuance</strong> as often as possible. The answer is wildcard-first (see <a href="#intent">diagram ②</a>).</p>
+  <p>One easily missed consequence of this shape: <strong>the backend RSs take no part in TLS at all</strong> — decryption happens at the CLB, so the certificate is a <strong>cloud resource</strong>, not a few files. Putting certbot on every RS buys nothing, and tools that assume “the certificate ends up in a Secret” have nowhere to land here.</p>
+  <p>The other is that <strong>domains sharing one certificate share its fate</strong>. SNI only decides <em>which</em> certificate is used; what decides whether a domain can actually be served is that certificate’s SAN. So once <code>a</code> and <code>b</code> are in the same certificate, a DNS problem on <code>a</code> drags <code>b</code> down with it. That is the constraint the grouping policy, wildcard-first and the failure fallback are all built around (see <a href="#intent">diagram ②</a> and <a href="#failure">table B</a>).</p>
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ ① -->
@@ -347,7 +398,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <marker id="a1i" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="m-ink" d="M0 0 L10 5 L0 10 z"/></marker>
     </defs>
 
-    <!-- 分区 -->
+    <!-- zones -->
     <rect class="zone" x="24"   y="44" width="210" height="396" rx="14"/>
     <rect class="zone" x="274"  y="44" width="250" height="396" rx="14"/>
     <rect class="zone" x="564"  y="44" width="140" height="396" rx="14"/>
@@ -359,7 +410,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <text class="zone-title" x="756"  y="34">execution · stable</text>
     <text class="zone-title" x="1046" y="34">external</text>
 
-    <!-- 意图 -->
+    <!-- intent -->
     <rect class="bx-human" x="38" y="68" width="182" height="52" rx="8"/>
     <foreignObject x="38" y="68" width="182" height="52">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Human / CI / upstream</div>
@@ -385,7 +436,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       </div>
     </foreignObject>
 
-    <!-- 推断 -->
+    <!-- inference -->
     <rect class="bx-local" x="288" y="68" width="222" height="240" rx="8"/>
     <foreignObject x="288" y="68" width="222" height="240">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">
@@ -404,7 +455,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:12px">report.json <span class="s">per-name reasons</span></div>
     </foreignObject>
 
-    <!-- 契约 -->
+    <!-- contract -->
     <rect class="bx-ctr" x="578" y="140" width="112" height="220" rx="8"/>
     <foreignObject x="578" y="140" width="112" height="220">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">desired-state document<span class="s mono">desired-state.yaml</span>
@@ -412,7 +463,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       </div>
     </foreignObject>
 
-    <!-- 执行 -->
+    <!-- execution -->
     <rect class="bx-local" x="758" y="68" width="222" height="240" rx="8"/>
     <foreignObject x="758" y="68" width="222" height="240">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">
@@ -429,7 +480,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       </div>
     </foreignObject>
 
-    <!-- 外部 -->
+    <!-- external -->
     <rect class="bx-ext" x="1048" y="68" width="142" height="84" rx="8"/>
     <foreignObject x="1048" y="68" width="142" height="84">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Let's Encrypt
@@ -455,7 +506,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:12px">Prometheus<span class="s">/ webhook</span></div>
     </foreignObject>
 
-    <!-- 边 -->
+    <!-- edges -->
     <path class="edge" d="M129 120 V140" marker-end="url(#a1)"/>
     <path class="edge" d="M220 190 H288" marker-end="url(#a1)"/>
     <path class="edge" d="M220 292 H288" marker-end="url(#a1)"/>
@@ -470,7 +521,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <path class="edge-dash" d="M1119 260 V284" marker-end="url(#a1)"/>
     <path class="edge" d="M980 280 H1014 V400 H1048" marker-end="url(#a1)"/>
 
-    <!-- 边标签（每个都带底色，压在线上也能读） -->
+    <!-- edge labels (each gets a backing rect so it stays readable when it crosses a line) -->
     <rect class="elab-bg" x="238" y="176" width="34" height="16" rx="3"/>
     <text class="elab" x="255" y="188" text-anchor="middle">enumerate</text>
     <rect class="elab-bg" x="238" y="278" width="34" height="16" rx="3"/>
@@ -484,7 +535,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <rect class="elab-bg" x="990" y="190" width="48" height="16" rx="3"/>
     <text class="elab" x="1014" y="202" text-anchor="middle">deploy</text>
 
-    <!-- 底部注释带 -->
+    <!-- bottom note band -->
     <rect x="24" y="432" width="1180" height="176" rx="10" fill="#ecebe5" stroke="var(--rule)"/>
     <foreignObject x="24" y="432" width="1180" height="176">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:12.5px">
@@ -691,7 +742,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       </div>
     </foreignObject>
 
-    <!-- 分支箭头 -->
+    <!-- branch arrows -->
     <path class="edge-red" d="M490 160 H540" marker-end="url(#a3r)"/>
     <path class="edge" d="M490 248 H540" marker-end="url(#a3)"/>
     <path class="edge" d="M490 336 H540" marker-end="url(#a3)"/>
@@ -699,7 +750,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <path class="edge" d="M490 512 H540" marker-end="url(#a3)"/>
     <path class="edge" d="M490 600 H540" marker-end="url(#a3)"/>
 
-    <!-- 继续往下 -->
+    <!-- fall through to the next check -->
     <path class="edge" d="M275 192 V216" marker-end="url(#a3)"/>
     <path class="edge" d="M275 280 V304" marker-end="url(#a3)"/>
     <path class="edge" d="M275 368 V392" marker-end="url(#a3)"/>
@@ -790,12 +841,12 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <rect class="elab-bg" x="1013" y="126" width="24" height="15" rx="3"/>
     <text class="elab" x="1025" y="137" text-anchor="middle">bind</text>
 
-    <!-- 续期回环 -->
+    <!-- renewal loop -->
     <path class="edge" d="M1106 100 V56 H122 V100" marker-end="url(#a4)"/>
     <rect class="elab-bg" x="520" y="42" width="188" height="17" rx="3"/>
     <text class="elab" x="614" y="55" text-anchor="middle">ARI window opens → new order carries replaces</text>
 
-    <!-- 失败收集 -->
+    <!-- failure collection -->
     <path class="edge-red" d="M286 184 V250 H942" marker-end="url(#a4r)"/>
     <path class="edge-red" d="M614 184 V250" marker-end="url(#a4r)"/>
     <path class="edge-red" d="M362 250 V320" marker-end="url(#a4r)"/>
@@ -806,7 +857,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       </div>
     </foreignObject>
 
-    <!-- 退役 -->
+    <!-- retirement -->
     <path class="edge-dash" d="M1106 184 V246 H1038 V320" marker-end="url(#a4)"/>
     <rect class="bx-store" x="712" y="320" width="466" height="90" rx="8"/>
     <foreignObject x="712" y="320" width="466" height="90">
@@ -836,7 +887,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-edge" d="M0 0 L10 5 L0 10 z"/></marker>
     </defs>
 
-    <!-- 参与者 -->
+    <!-- participants -->
     <rect class="bx-local" x="160" y="40" width="180" height="60" rx="8"/>
     <foreignObject x="160" y="40" width="180" height="60">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">wecert</div>
@@ -854,63 +905,63 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <line class="life" x1="600" y1="100" x2="600" y2="700"/>
     <line class="life" x1="950" y1="100" x2="950" y2="700"/>
 
-    <!-- 步骤 1 -->
+    <!-- step 1 -->
     <text class="seq-num" x="256" y="142">1</text>
     <path class="edge" d="M250 150 H950" marker-end="url(#a5)"/>
     <rect class="elab-bg" x="415" y="126" width="380" height="18" rx="3"/>
     <text class="elab" x="605" y="139" text-anchor="middle">newOrder(identifiers, replaces = the old certID when ARI is in play)</text>
 
-    <!-- 步骤 2 -->
+    <!-- step 2 -->
     <text class="seq-num" x="256" y="192">2</text>
     <path class="edge" d="M950 200 H250" marker-end="url(#a5)"/>
     <rect class="elab-bg" x="450" y="176" width="300" height="18" rx="3"/>
     <text class="elab" x="600" y="189" text-anchor="middle">order + one authorization per identifier</text>
 
-    <!-- 注释 3 -->
+    <!-- note 3 -->
     <rect class="bx-danger" x="16" y="228" width="212" height="60" rx="8"/>
     <foreignObject x="16" y="228" width="212" height="60">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">3 · two identifiers turn out to<br/>share one record name</div>
     </foreignObject>
     <path class="edge-dot" d="M228 258 H250"/>
 
-    <!-- 步骤 4 -->
+    <!-- step 4 -->
     <text class="seq-num" x="256" y="312">4</text>
     <path class="edge-thick" d="M250 320 H600" marker-end="url(#a5)"/>
     <rect class="elab-bg" x="300" y="296" width="254" height="18" rx="3"/>
     <text class="elab" x="427" y="309" text-anchor="middle">write every TXT (not one at a time)</text>
 
-    <!-- 注释 5 -->
+    <!-- note 5 -->
     <rect class="bx" x="16" y="350" width="212" height="60" rx="8"/>
     <foreignObject x="16" y="350" width="212" height="60">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">5 · propagation check (quorum)<br/>no reachable NS denies it, and ≥2 confirm</div>
     </foreignObject>
     <path class="edge-dot" d="M228 380 H250"/>
 
-    <!-- 步骤 6 -->
+    <!-- step 6 -->
     <text class="seq-num" x="606" y="427">6</text>
     <path class="edge-dash" d="M950 435 H600" marker-end="url(#a5)"/>
     <rect class="elab-bg" x="640" y="411" width="300" height="18" rx="3"/>
     <text class="elab" x="790" y="424" text-anchor="middle">read the TXT back from several vantage points</text>
 
-    <!-- 步骤 7 -->
+    <!-- step 7 -->
     <text class="seq-num" x="256" y="482">7</text>
     <path class="edge" d="M950 490 H250" marker-end="url(#a5)"/>
     <rect class="elab-bg" x="450" y="466" width="300" height="18" rx="3"/>
     <text class="elab" x="600" y="479" text-anchor="middle">authorizations: all valid</text>
 
-    <!-- 步骤 8 -->
+    <!-- step 8 -->
     <text class="seq-num" x="256" y="537">8</text>
     <path class="edge-thick" d="M250 545 H950" marker-end="url(#a5)"/>
     <rect class="elab-bg" x="400" y="521" width="400" height="18" rx="3"/>
     <text class="elab" x="600" y="534" text-anchor="middle">POST the CSR (DER) to the finalize URL ← not the order URL</text>
 
-    <!-- 步骤 9 -->
+    <!-- step 9 -->
     <text class="seq-num" x="256" y="592">9</text>
     <path class="edge" d="M950 600 H250" marker-end="url(#a5)"/>
     <rect class="elab-bg" x="450" y="576" width="300" height="18" rx="3"/>
     <text class="elab" x="600" y="589" text-anchor="middle">order valid + certificate URL → download it</text>
 
-    <!-- 步骤 10 -->
+    <!-- step 10 -->
     <text class="seq-num" x="256" y="652">10</text>
     <path class="edge-thick" d="M250 660 H600" marker-end="url(#a5)"/>
     <rect class="elab-bg" x="320" y="636" width="214" height="18" rx="3"/>
@@ -936,17 +987,17 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-edge" d="M0 0 L10 5 L0 10 z"/></marker>
     </defs>
 
-    <!-- 轴 -->
+    <!-- axis -->
     <line x1="90" y1="196" x2="1180" y2="196" stroke="var(--rule-2)" stroke-width="1.5"/>
     <line x1="90" y1="386" x2="1180" y2="386" stroke="var(--rule-2)" stroke-width="1.5"/>
 
-    <!-- 有效区间 -->
+    <!-- validity window -->
     <rect class="bx-ext" x="90" y="170" width="1090" height="40" rx="6"/>
     <foreignObject x="90" y="170" width="1090" height="40">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:12px">certificate validity</div>
     </foreignObject>
 
-    <!-- ARI 窗口 -->
+    <!-- ARI window -->
     <rect class="bx-local" x="901" y="228" width="158" height="38" rx="6"/>
     <foreignObject x="901" y="228" width="158" height="38">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">ARI suggested window</div>
@@ -956,7 +1007,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <rect class="elab-bg" x="836" y="192" width="190" height="18" rx="3"/>
     <text class="elab" x="931" y="205" text-anchor="middle">around two-thirds in, decided by the CA</text>
 
-    <!-- renewBefore 兜底 -->
+    <!-- renewBefore fallback -->
     <rect class="bx-danger" x="817" y="282" width="363" height="38" rx="6"/>
     <foreignObject x="817" y="282" width="363" height="38">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">renewBefore fallback (only when ARI is unavailable)</div>
@@ -964,7 +1015,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <path class="edge-dot" d="M817 282 V210"/>
     <path class="edge-dot" d="M1180 282 V266"/>
 
-    <!-- 里程碑 -->
+    <!-- milestones -->
     <line x1="90" y1="150" x2="90" y2="386" stroke="var(--ink)" stroke-width="2"/>
     <circle cx="90" cy="196" r="5" fill="var(--ink)"/>
     <rect class="elab-bg" x="52" y="86" width="120" height="18" rx="3"/>
@@ -989,7 +1040,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <rect class="elab-bg" x="1112" y="86" width="112" height="18" rx="3"/>
     <text class="elab" x="1168" y="99" text-anchor="middle">day 90 · notAfter</text>
 
-    <!-- 刻度 -->
+    <!-- ticks -->
     <text class="elab" x="90" y="406" text-anchor="middle">0</text>
     <text class="elab" x="453" y="406" text-anchor="middle">30</text>
     <text class="elab" x="817" y="406" text-anchor="middle">60</text>
@@ -997,7 +1048,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <line x1="453" y1="386" x2="453" y2="392" stroke="var(--rule-2)"/>
     <line x1="817" y1="386" x2="817" y2="392" stroke="var(--rule-2)"/>
 
-    <!-- 说明 -->
+    <!-- note -->
     <rect x="90" y="330" width="700" height="58" rx="6" fill="#ecebe5" stroke="var(--rule)"/>
     <foreignObject x="90" y="330" width="700" height="58">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">
@@ -1021,7 +1072,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
   <p>The CA/Browser Forum has scheduled <strong>≤100 days from 2027-03-15</strong> and <strong>≤47 days from 2029-03-15</strong>, so “90 days plus a manual fallback” stops being an option within two years. The desired-state generator caps a certificate at <strong>25</strong> names by default (aligned with <code>tlsserver</code>) so that switching profiles later needs no redesign.</p>
 </section>
 
-<!-- ══════════════════════════════════════════════════════════ 表 -->
+<!-- ══════════════════════════════════════════════════════════ tables -->
 <section id="ownership">
   <h2><span class="num">table A</span>Data ownership — who writes, who reads, and what losing it costs</h2>
   <p class="cap">“What losing it costs” is the column worth remembering: it decides where each piece of state belongs and whether it needs backing up.</p>

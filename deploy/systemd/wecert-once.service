@@ -1,12 +1,13 @@
-# 备选方案：用 systemd timer 代替常驻守护进程。
-# 适合不想跑长驻进程、或者偏好"每次执行完就退出"的场景。
+# Alternative to the daemon: drive wecert from a systemd timer instead.
+# Useful when you would rather not run a long-lived process, or prefer
+# "start, do one pass, exit".
 #
-# 启用方式：
+# To switch:
 #   systemctl disable --now wecert.service
 #   systemctl enable --now wecert-once.timer
 
 [Unit]
-Description=wecert 单轮收敛（配合 wecert-once.timer）
+Description=wecert single-pass convergence (driven by wecert-once.timer)
 After=network-online.target time-sync.target
 Wants=network-online.target
 
@@ -20,11 +21,13 @@ StateDirectoryMode=0700
 
 ExecStart=/usr/local/bin/wecert -config /etc/wecert/config.yaml -once
 
-# 单轮的最坏耗时 ≈ 每张证书 (DNS 传播 5m + 授权等待 3m + 订单等待 2m)，
-# 而 reconcile 是**串行**遍历所有证书的，所以这个值要按证书数量留足余量。
-# 被打断本身不致命（订单已落盘，下一轮接着推进），
-# 但每次都会推高 consecutive_failures，制造无谓的告警。
-# 证书多或 SAN 多时请相应上调。
+# Worst case for one pass is roughly, per certificate: 5m of DNS propagation
+# + 3m waiting for authorizations + 2m waiting for the order. reconcile walks
+# the certificates **serially**, so leave headroom proportional to how many
+# you have. Being killed is not fatal by itself — the order URL is already on
+# disk and the next pass resumes it — but every interruption bumps
+# consecutive_failures and manufactures a pointless alarm. Raise this when you
+# have many certificates, or certificates with many SANs.
 TimeoutStartSec=45min
 
 ProtectSystem=strict

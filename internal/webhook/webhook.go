@@ -1,9 +1,12 @@
-// Package webhook 让 wecert 可以被外部事件触发，而不是只能等定时器。
+// Package webhook lets wecert be triggered by external events instead of only
+// waiting for the timer.
 //
-// 典型用法：域名新增后由 CI 或事件总线调一次，不必等到下一个整点。
+// Typical use: call it once from CI or an event bus after a domain is added,
+// without waiting for the next top of the hour.
 //
-// 这个端点会触发**真实签发**并消耗 Let's Encrypt 的速率限制配额，
-// 所以鉴权不是可选项 —— 见 config.Webhook 的 token 校验。
+// This endpoint triggers **real issuance** and consumes Let's Encrypt
+// rate-limit quota, so authentication is not optional — see the token checks in
+// config.Webhook.
 package webhook
 
 import (
@@ -23,29 +26,33 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// errBothForms 拦截同时给了 cert 和 certs 的请求 —— 语义有歧义，不如直接拒绝。
+// errBothForms rejects requests that send both cert and certs — ambiguous, so
+// refuse outright.
 var errBothForms = errors.New("cert and certs are mutually exclusive")
 
-// Reconciler 是 webhook 需要的收敛能力。定义在使用方，便于测试替换。
+// Reconciler is the convergence capability the webhook needs. Defined at the
+// consumer for easy test substitution.
 type Reconciler interface {
 	CertNames() []string
 	StartCert(ctx context.Context, name string) error
 	StartAll(ctx context.Context) []string
 }
 
-// DesiredReader 是只读诊断端点需要的能力。
+// DesiredReader is the capability the read-only diagnostic endpoint needs.
 //
-// 单独定义而不是塞进 Reconciler，是为了让这个端点保持
-// "可有可无的只读附加物"的定位：不实现它就只是不挂载，
-// 不影响触发路径，也不需要每个测试替身都去实现它。
+// It is defined separately rather than folded into Reconciler to keep that
+// endpoint an "optional read-only add-on": not implementing it simply means it
+// is not mounted, the trigger path is unaffected and no test double has to
+// implement it.
 type DesiredReader interface {
 	LastResult() *spec.Result
 }
 
-// Server 提供触发端点与状态端点。
+// Server provides the trigger and status endpoints.
 //
-// baseCtx 是**进程级**上下文，不是某个请求的。后台那轮收敛可能跑几分钟，
-// 用请求的 context 会在响应返回时被立刻取消 —— 那样触发等于没触发。
+// baseCtx is a **process-level** context, not a request's. The background
+// convergence can run for minutes, and a request context would be cancelled the
+// moment the response returns — a trigger that triggers nothing.
 type Server struct {
 	rec     Reconciler
 	store   *state.Store
@@ -55,8 +62,16 @@ type Server struct {
 	now     func() time.Time
 }
 
-// New 构造 webhook 服务。
-func New(rec Reconciler, store *state.Store, token string, baseCtx context.Context, log *slog.Logger) *Server {
+// New builds the webhook server.
+//
+// The empty-token check is defence in depth, not redundancy with the config
+// layer: "Authorization: Bearer " would pass a constant-time compare against an
+// empty configured token, so the invariant "an authed endpoint always requires a
+// real token" must hold here rather than being outsourced to every caller.
+func New(rec Reconciler, store *state.Store, token string, baseCtx context.Context, log *slog.Logger) (*Server, error) {
+	if token == "" {
+		return nil, errors.New("webhook: token must not be empty")
+	}
 	return &Server{
 		rec:     rec,
 		store:   store,
@@ -64,14 +79,15 @@ func New(rec Reconciler, store *state.Store, token string, baseCtx context.Conte
 		baseCtx: baseCtx,
 		log:     log,
 		now:     time.Now,
-	}
+	}, nil
 }
 
-// Handler 返回路由。
+// Handler returns the routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// 健康检查不需要鉴权：它不泄漏任何信息，且探活要能拿到。
+	// Health checks need no auth: they leak nothing and liveness probes must reach
+	// them.
 	mux.HandleFunc("/healthz", s.handleHealth)
 
 	mux.HandleFunc("/hook/reconcile", s.auth(s.handleReconcile))
@@ -84,7 +100,7 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// ── 鉴权 ────────────────────────────────────────────────────────────────────
+// ── Authentication ────────────────────────────────────────────────────────────────────
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +115,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// tokenMatches 支持两种带法，并用常量时间比较。
+// tokenMatches accepts both forms and compares in constant time.
 func (s *Server) tokenMatches(r *http.Request) bool {
 	presented := ""
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
@@ -108,12 +124,13 @@ func (s *Server) tokenMatches(r *http.Request) bool {
 		presented = h
 	}
 
-	// 常量时间比较：逐字符比较会在第一个不同的字符处返回，
-	// 从而泄漏 token 前缀。这个端点的价值足以让人逐位试探。
+	// Constant-time comparison: a byte-by-byte compare returns at the first
+	// differing character, leaking the token prefix. This endpoint is valuable
+	// enough for someone to probe it bit by bit.
 	return subtle.ConstantTimeCompare([]byte(presented), []byte(s.token)) == 1
 }
 
-// ── 端点 ────────────────────────────────────────────────────────────────────
+// ── Endpoints ────────────────────────────────────────────────────────────────────
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -121,7 +138,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-// reconcileRequest 是触发请求体。整体可以省略 —— 不带 body 就是"全部处理"。
+// reconcileRequest is the trigger request body. It may be omitted entirely — no
+// body means "process everything".
 type reconcileRequest struct {
 	Cert  string   `json:"cert"`
 	Certs []string `json:"certs"`
@@ -151,7 +169,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 
 	resp := reconcileResponse{Unknown: unknown}
 
-	// 不带 cert/certs 就是全量触发。
+	// No cert/certs means a full trigger.
 	if len(targets) == 0 && len(unknown) == 0 {
 		resp.Skipped = s.rec.StartAll(s.baseCtx)
 		resp.Accepted = s.rec.CertNames()
@@ -174,20 +192,22 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 			"remote", r.RemoteAddr)
 	}
 
-	// 202 而不是 200：收敛已经受理，但还没跑完。
-	// 一轮可能要几分钟（DNS 传播），让调用方等着只会把它的超时拖爆。
-	// 想知道结果就轮询 /hook/status。
+	// 202 rather than 200: convergence is accepted but not finished. A pass can
+	// take minutes (DNS propagation), and making the caller wait would only blow
+	// its timeout. To learn the result, poll /hook/status.
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
-// parseTrigger 读取请求体。空 body 合法，表示全量触发。
+// parseTrigger reads the request body. An empty body is legal and means a full
+// trigger.
 func parseTrigger(r *http.Request) (reconcileRequest, error) {
 	var req reconcileRequest
 	if r.Body == nil {
 		return req, nil
 	}
 
-	// 限制体积：这是个触发端点，没有理由接受大 body。
+	// Cap the size: this is a trigger endpoint and has no reason to accept large
+	// bodies.
 	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
 	if err != nil {
 		return req, err
@@ -204,7 +224,7 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 	return req, nil
 }
 
-// resolveTargets 把请求里的名字映射到配置中真实存在的证书。
+// resolveTargets maps requested names onto certificates that actually exist.
 func (s *Server) resolveTargets(req reconcileRequest) (targets, unknown []string) {
 	known := make(map[string]struct{})
 	for _, n := range s.rec.CertNames() {
@@ -226,7 +246,7 @@ func (s *Server) resolveTargets(req reconcileRequest) (targets, unknown []string
 	return targets, unknown
 }
 
-// ── 状态端点 ────────────────────────────────────────────────────────────────
+// ── Status endpoint ────────────────────────────────────────────────────────────────
 
 type certStatus struct {
 	Name                string `json:"name"`
@@ -239,10 +259,10 @@ type certStatus struct {
 	LastError           string `json:"lastError,omitempty"`
 }
 
-// handleStatus 让调用方在触发之后能查结果。
+// handleStatus lets the caller look up the result after triggering.
 //
-// 触发是异步的（202），所以需要一个地方回答"到底成了没有" ——
-// 否则调用方只能去翻日志。
+// Triggering is asynchronous (202), so something must answer "did it actually
+// work" — otherwise the caller can only dig through logs.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
@@ -286,9 +306,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// ── 诊断端点 ────────────────────────────────────────────────────────────────
+// ── Diagnostic endpoint ────────────────────────────────────────────────────────────────
 
-// desiredCert 把"期望什么"和"实际上有没有"并排放在一起。
+// desiredCert puts "what is desired" next to "whether it actually exists".
 type desiredCert struct {
 	Name     string   `json:"name"`
 	Domains  []string `json:"domains"`
@@ -304,7 +324,8 @@ type desiredView struct {
 	Revision string `json:"revision,omitempty"`
 	Frozen   bool   `json:"frozen"`
 
-	// FreezeReason 非空说明这一轮来源读不到，收敛在上一版可用状态上。
+	// A non-empty FreezeReason means the source was unreadable this pass and the
+	// convergence is running on the last good revision.
 	FreezeReason string `json:"freezeReason,omitempty"`
 
 	GeneratedAt string             `json:"generatedAt,omitempty"`
@@ -314,14 +335,16 @@ type desiredView struct {
 	Decisions    []spec.Decision `json:"decisions"`
 }
 
-// handleDesired 回答这套系统上线后最常被问的那几个问题：
+// handleDesired answers the questions most often asked once this system is in
+// production:
 //
-//	期望状态是什么？        certificates
-//	某个域名为什么没进去？   decisions[].reason
-//	和另一份来源差在哪？     shadow（observe 模式下）
-//	期望了但实际有没有？     certificates[].issued
+//	What is the desired state?           certificates
+//	Why is a domain missing?             decisions[].reason
+//	Where does it differ from a source?  shadow (in observe mode)
+//	Desired but does it exist for real?  certificates[].issued
 //
-// 没有它，这几个问题都只能靠翻日志，而日志会被轮转掉。
+// Without it, every one of those questions means digging through logs, and logs
+// get rotated away.
 func (s *Server) handleDesired(dr DesiredReader) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -333,8 +356,9 @@ func (s *Server) handleDesired(dr DesiredReader) http.HandlerFunc {
 
 		res := dr.LastResult()
 		if res == nil {
-			// 还没成功读过一次期望状态。这不是"期望为空"，
-			// 所以绝不能返回一份空的证书列表 —— 那会被读成"什么都没有"。
+			// No desired state has ever been read successfully. That is not "the desired
+			// state is empty", so returning an empty certificate list is out of the
+			// question — it would be read as "nothing".
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 				"error": "no desired state has been read yet; this is not the same as an empty desired state",
 			})
@@ -376,7 +400,7 @@ func (s *Server) handleDesired(dr DesiredReader) http.HandlerFunc {
 	}
 }
 
-// ── 小工具 ──────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

@@ -1,18 +1,18 @@
-// Package group 把"声明要证书的名字"整理成证书分组。
+// Package group turns "names declared to need certificates" into certificate groups.
 //
-// 这里的规则不是可选的优化，它直接决定 Let's Encrypt 的配额消耗速度：
-// 域名集合变一次就是一张新证书，实打实消耗
-// "Certificates per Registered Domain"（50 / 7 天，跨账号共享）。
-// 通配符优先能把"加一个子域"从 1 次签发降到 0 次。
+// These rules are not an optional optimization: they directly decide how fast
+// Let's Encrypt quota burns. One change to the domain set is one new certificate,
+// spending real "Certificates per Registered Domain" quota (50 / 7 days, shared
+// across accounts); wildcard-first can cut "add a subdomain" from 1 issuance to 0.
 //
-// 两条必须钉住的性质：
-//  1. 幂等：同样的输入永远给出同样的输出，顺序也一致
-//  2. Name 稳定：证书名只由分组键派生，绝不随域名集合变化
+// Two properties must be pinned down:
+//  1. Idempotent: identical input always yields identical output, in the same order
+//  2. Name-stable: names derive only from the grouping key, never from the domain set
 //
-// 第 2 条一旦破掉，加一个域名就会在状态库里凭空多出一条新记录，
-// 旧那条的 order URL、ARI certID、deployed CertID 全部成为孤儿 ——
-// "每张证书最多一个进行中的订单"这条不变量随之失效，两边的订单会同时飞，
-// 直接撞上 exact-set 限速（这条没有 override）。
+// Once property 2 breaks, adding one domain conjures a new record in the state
+// store and the old record's order URL, ARI certID and deployed CertID all become
+// orphans -- "at most one in-flight order per certificate" stops holding, both
+// orders fly at once, and they hit the exact-set rate limit (no override).
 package group
 
 import (
@@ -27,7 +27,8 @@ import (
 	"github.com/susunola/wecert/internal/config"
 )
 
-// Normalize 规范化一个声明的名字：去空白、转小写、去末尾点，并校验。
+// Normalize normalizes a declared name: trim space, lowercase, strip a trailing
+// dot, and validate.
 func Normalize(raw string) (string, error) {
 	n := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
 	if n == "" {
@@ -39,17 +40,18 @@ func Normalize(raw string) (string, error) {
 	return n, nil
 }
 
-// IsWildcard 报告名字是否为通配符，形如 *.example.com。
+// IsWildcard reports whether the name is a wildcard, shaped like *.example.com.
 func IsWildcard(name string) bool { return strings.HasPrefix(name, "*.") }
 
-// Base 去掉通配符前缀，返回它所依附的父名字。
+// Base strips the wildcard prefix and returns the parent name it hangs off.
 func Base(name string) string { return strings.TrimPrefix(name, "*.") }
 
-// RegisteredDomain 返回 host 的注册域（eTLD+1）。
+// RegisteredDomain returns the host's registered domain (eTLD+1).
 //
-// 用 Public Suffix List 而不是简单的"取最后两段"：后者会把
-// a.b.co.uk 算成 co.uk，于是一整片互不相干的站点被并进同一张证书，
-// 而 LE 恰恰也是按 PSL 算配额的 —— 两边必须用同一把尺子。
+// It uses the Public Suffix List rather than a naive "take the last two labels":
+// the latter counts a.b.co.uk as co.uk, bundling a whole swathe of unrelated
+// sites into one certificate -- and LE counts quota by the PSL too, so both sides
+// must use the same ruler.
 func RegisteredDomain(host string) string {
 	h := Base(strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), "."))
 	if h == "" {
@@ -60,42 +62,61 @@ func RegisteredDomain(host string) string {
 	}
 	etld1, err := publicsuffix.EffectiveTLDPlusOne(h)
 	if err != nil {
-		// 单标签主机名（"localhost"）或 PSL 查不到：退化成自身。
+		// Single-label hostname ("localhost") or no PSL entry: fall back to itself.
 		return h
 	}
 	return etld1
 }
 
-// CertName 由分组键派生证书名。
+// CertName derives the certificate name from the grouping key.
 //
-// 这是 Name 稳定性的落点：入参只能是注册域，绝不能是域名集合。
+// This is where Name stability lands: the input can only be the registered
+// domain, never the domain set.
+//
+// The mapping also has to be **injective**. Two registered domains that collapse
+// to the same certificate name make the whole document invalid ("certificate
+// name %q is duplicated"), so WriteDocument fails on every round and no
+// certificate is ever updated again. A naive `.` -> `-` mapping collides:
+//
+//	a.co.uk  vs a-co.uk
+//	a.com    vs a-com
+//
+// So a literal `-` is doubled before dots become dashes:
+//
+//	a.co.uk  -> a-co-uk
+//	a-co.uk  -> a--co-uk
+//
+// Decoding is unambiguous -- scan for `--` first (a literal dash); a lone `-`
+// was a dot -- which is what makes the map injective. Registered domains
+// without a hyphen are named exactly as before.
 func CertName(registered string) string {
-	s := strings.NewReplacer(".", "-", ":", "-").Replace(strings.ToLower(registered))
-	s = strings.Trim(s, "-")
-	for strings.Contains(s, "--") {
-		s = strings.ReplaceAll(s, "--", "-")
-	}
-	return s
+	s := strings.ReplaceAll(strings.ToLower(registered), "-", "--")
+	s = strings.NewReplacer(".", "-", ":", "-").Replace(s)
+	// Only ever strips a leading/trailing dash from a malformed hostname: the
+	// inputs are registered domains, which by RFC 1123 cannot start or end with
+	// one. Kept because RegisteredDomain falls back to the raw hostname.
+	return strings.Trim(s, "-")
 }
 
-// Group 是同一注册域下的一组声明。
+// Group is the set of declarations under one registered domain.
 type Group struct {
-	// Registered 是 eTLD+1。
+	// Registered is the eTLD+1.
 	Registered string
 
-	// Name 是证书名，只由 Registered 派生。
+	// Name is the certificate name, derived from Registered alone.
 	Name string
 
-	// Wildcards 是已声明的通配符，已排序。
+	// Wildcards are the declared wildcards, sorted.
 	Wildcards []string
 
-	// Names 是已声明的具体名字，已排序。
+	// Names are the declared concrete names, sorted.
 	Names []string
 }
 
-// GroupBy 按注册域把声明分组。
+// GroupBy groups declarations by registered domain.
 //
-// 结果按证书名排序，保证同样的输入给出逐字节相同的输出。
+// The result is sorted by certificate name so identical input yields
+// byte-for-byte identical output.
 func GroupBy(declared []string) ([]Group, error) {
 	byReg := make(map[string]*Group)
 	for _, raw := range declared {
@@ -124,38 +145,41 @@ func GroupBy(declared []string) ([]Group, error) {
 	for _, g := range byReg {
 		sort.Strings(g.Wildcards)
 		sort.Strings(g.Names)
-		// 通配符优先：它必须排在最前面吗？不。这里只排序，选择在 Cover 里做。
+		// Wildcard-first: must it come first here? No. This only sorts; Cover chooses.
 		out = append(out, *g)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 
-// Coverage 是覆盖一组声明所需的最小 SAN 集合。
+// Coverage is the minimal SAN set needed to cover a group's declarations.
 type Coverage struct {
-	// Domains 是 SAN 集合，顺序稳定。
+	// Domains is the SAN set, in stable order.
 	Domains []string
 
-	// Covered 记录哪些名字是被哪个通配符覆盖的，因而不必单独进 SAN。
-	// 这张表是可观测性的一部分：回答"我加的子域为什么没出现在证书里"。
+	// Covered records which names are covered by which wildcard, so they need no
+	// separate SAN entry. The table is part of observability: it answers "why
+	// didn't the subdomain I added show up in the certificate?".
 	Covered map[string]string
 }
 
-// ErrTooManyNames 表示一组声明的 SAN 集合超过了 profile 上限。
+// ErrTooManyNames means a group's SAN set exceeds the profile's limit.
 //
-// 调用方**不应该**把它当成"这组不要了"：正确反应是保留上一版期望状态并告警。
-// 直接丢掉会让 wecert 看到一张证书凭空消失。
+// Callers must **not** read it as "drop this group": the correct reaction is to
+// keep the previous desired state and alert. Dropping it makes wecert see a
+// certificate vanish into thin air.
 var ErrTooManyNames = errors.New("group exceeds the profile's max number of names")
 
-// Cover 计算覆盖本组所有声明所需的最小 SAN 集合。
+// Cover computes the minimal SAN set needed to cover every declaration in the group.
 //
-// 规则：
-//   - 已声明的通配符直接进 SAN
-//   - 被某个已声明通配符覆盖的名字不进 SAN（这就是省配额的地方）
-//   - 其余名字各自进 SAN
+// Rules:
+//   - declared wildcards go into the SAN set as-is
+//   - names covered by a declared wildcard do not (this is where quota is saved)
+//   - every remaining name goes in on its own
 //
-// 注意不会**凭空造通配符**：加一张 *.example.com 意味着证书能对
-// 任意子域完成握手，那是权限扩张，必须是显式声明的动作。
+// Note that it never **invents a wildcard**: adding a *.example.com means the
+// certificate can complete a handshake for any subdomain, which is privilege
+// expansion and must be an explicit declaration.
 func (g Group) Cover(maxNames int) (*Coverage, error) {
 	cov := &Coverage{Covered: make(map[string]string, len(g.Names))}
 
@@ -177,8 +201,8 @@ func (g Group) Cover(maxNames int) (*Coverage, error) {
 	sort.Strings(uncovered)
 
 	domains := make([]string, 0, len(g.Wildcards)+len(uncovered))
-	// 注册域本体排最前：classic profile 会把第一个 dNSName 提升为 Subject CN，
-	// 让 CN 是裸域比让 CN 是某个子域可读得多。
+	// The registered domain goes first: classic promotes the first dNSName to
+	// Subject CN, and a bare domain reads far better as CN than some subdomain.
 	if i := sort.SearchStrings(uncovered, g.Registered); i < len(uncovered) && uncovered[i] == g.Registered {
 		domains = append(domains, g.Registered)
 		uncovered = append(uncovered[:i], uncovered[i+1:]...)
@@ -197,10 +221,10 @@ func (g Group) Cover(maxNames int) (*Coverage, error) {
 	return cov, nil
 }
 
-// WildcardCovers 报告通配符 wc 是否覆盖 host。
+// WildcardCovers reports whether wildcard wc covers host.
 //
-// 只覆盖**一层**标签：*.example.com 覆盖 foo.example.com，
-// 但不覆盖 example.com（这是最常见的误解），也不覆盖 a.b.example.com。
+// It covers **one** label only: *.example.com covers foo.example.com, but not
+// example.com (the most common misunderstanding) and not a.b.example.com.
 func WildcardCovers(wc, host string) bool {
 	if !IsWildcard(wc) {
 		return false

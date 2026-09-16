@@ -12,15 +12,17 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// renewalDecision 返回"什么时候续期"和"下单时该带哪个 replaces"。
+// renewalDecision returns "when to renew" and "which replaces to send when ordering".
 //
-// ARI 优先：走 ARI 并带 replaces 的续期豁免 Let's Encrypt 的全部速率限制。
-// ARI 不可用时退化到 notAfter - renewBefore，并叠加确定性抖动。
+// ARI comes first: a renewal that goes through ARI and carries replaces is exempt from every
+// Let's Encrypt rate limit. When ARI is unavailable it degrades to notAfter - renewBefore,
+// with deterministic jitter layered on top.
 func (m *Manager) renewalDecision(
 	ctx context.Context, c *config.Certificate, st *state.CertState,
 ) (renewAt time.Time, replaces string, ariErr error) {
-	// lego 的 ACME API 不接受 context，所以取消没法传进网络调用本身；
-	// 但至少在这里检查一次，避免收到停止信号后还在白跑一轮。
+	// lego's ACME API does not take a context, so cancellation cannot reach the network calls
+	// themselves; but at least check once here, so a stop signal does not leave us grinding
+	// through a whole round for nothing.
 	if err := ctx.Err(); err != nil {
 		return time.Time{}, "", err
 	}
@@ -41,7 +43,8 @@ func (m *Manager) renewalDecision(
 			m.log.Info("ARI window refreshed",
 				"cert", c.Name, "start", st.ARIWindowStart, "end", st.ARIWindowEnd, "retryAfter", retryAfter)
 		case errors.Is(err, api.ErrNoARI):
-			// CA 不支持 ARI，永久退化。记一次就够了，不必每轮重试。
+			// The CA does not support ARI: degrade permanently. Recording it once is enough;
+			// retrying every round buys nothing.
 			st.ARICheckedAt = now
 			st.ARIRetryAfter = 0
 			if perr := m.store.PutCert(st); perr != nil {
@@ -49,12 +52,12 @@ func (m *Manager) renewalDecision(
 			}
 			ariErr = err
 		default:
-			// 失败也必须记账。
+			// A failure has to be recorded too.
 			//
-			// 节流判据 ariCheckDue 完全基于 ARICheckedAt，如果这里不写，
-			// 每一轮 reconcile（默认 1 小时）都会重打一次 ARI；
-			// 而且服务端给的 Retry-After 会被丢掉 —— FetchRenewalInfo
-			// 明明已经替我们解析好了，连非 200 响应的情况都覆盖了。
+			// The throttling test ariCheckDue is based entirely on ARICheckedAt, so if we did not
+			// write it here, every reconcile round (1 hour by default) would hit ARI all over
+			// again; and the server's Retry-After would be thrown away -- even though
+			// FetchRenewalInfo has already parsed it for us, covering even non-200 responses.
 			st.ARICheckedAt = now
 			st.ARIRetryAfter = retryAfter
 			if perr := m.store.PutCert(st); perr != nil {
@@ -68,8 +71,8 @@ func (m *Manager) renewalDecision(
 		return RenewalTime(c.Name, st.ARIWindowStart, st.ARIWindowEnd), st.ARICertID, ariErr
 	}
 
-	// 兜底：不用 ARI，但仍把 identifier 集合保持不变，
-	// 这样至少还能享受"非 ARI 续期"对订单数与每域名证书数的豁免。
+	// Fallback: no ARI, but the identifier set still stays identical, so at least we keep the
+	// "non-ARI renewal" exemptions on the order count and on certificates per domain.
 	base := st.NotAfter.Add(-c.RenewBeforeDur)
 	return DeterministicTime(c.Name, base, c.RenewBeforeDur/8), st.ARICertID, ariErr
 }
@@ -78,18 +81,19 @@ func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
 	if st.ARICheckedAt.IsZero() {
 		return true
 	}
-	// Let's Encrypt 建议最多 6 小时查一次 renewalInfo。
+	// Let's Encrypt recommends checking renewalInfo at most once every 6 hours.
 	if now.Before(st.ARICheckedAt.Add(m.ariInterval)) {
 		return false
 	}
-	// 并遵守服务端给的 Retry-After。
+	// And respect the Retry-After the server gave us.
 	if st.ARIRetryAfter > 0 && now.Before(st.ARICheckedAt.Add(st.ARIRetryAfter)) {
 		return false
 	}
 	return true
 }
 
-// issue 创建订单。注意顺序：先把订单（含本次生成的私钥）落盘，再推进它。
+// issue creates an order. Mind the order of operations: persist the order (including the
+// private key generated here) first, and only then advance it.
 func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.CertState, replaces string) error {
 	key, err := GenerateKey(c.KeyType)
 	if err != nil {
@@ -125,8 +129,8 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		ExpiresAt:   expiresAt,
 		Status:      order.Status,
 		KeyPEM:      keyPEM,
-		// 记下这张订单的 identifier 集合。之后配置里改了域名，
-		// Reconcile 就能立刻发现并丢弃它，而不是推进到过期。
+		// Record this order's identifier set. If the configured domains change later, Reconcile
+		// spots it immediately and discards the order, instead of advancing it until it expires.
 		Identifiers: c.DomainKey(),
 	}
 	if err := m.store.PutOrder(o); err != nil {

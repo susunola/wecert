@@ -3,12 +3,16 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/susunola/wecert/internal/config"
@@ -17,25 +21,38 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// fakeManager 用来把收敛循环的编排逻辑单独测出来。
+// fakeManager isolates the convergence loop's orchestration logic for testing.
 type fakeManager struct {
+	// Reconcile runs concurrently for a full webhook trigger (one goroutine per
+	// certificate, bounded), so the recording has to be guarded.
+	mu       sync.Mutex
 	calls    []string
 	failWith map[string]error
 
 	reaped int
 
-	// onReconcile 在每次 Reconcile 时回调，便于在测试里做取消等操作。
+	// onReconcile fires on every Reconcile, so tests can cancel and so on.
 	onReconcile func(name string)
 
 	reapBefore chan struct{}
 }
 
 func (f *fakeManager) Reconcile(_ context.Context, c *config.Certificate) error {
+	f.mu.Lock()
 	f.calls = append(f.calls, c.Name)
+	f.mu.Unlock()
+
 	if f.onReconcile != nil {
 		f.onReconcile(c.Name)
 	}
 	return f.failWith[c.Name]
+}
+
+// reconciled returns the names Reconcile was called with.
+func (f *fakeManager) reconciled() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
 }
 
 func (f *fakeManager) ReapRetired(_ context.Context) {
@@ -50,7 +67,7 @@ func newTestReconciler(t *testing.T, names []string, mgr CertManager) (*Reconcil
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatalf("打开状态库失败: %v", err)
+		t.Fatalf("failed to open the state store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
@@ -63,7 +80,7 @@ func newTestReconciler(t *testing.T, names []string, mgr CertManager) (*Reconcil
 	return New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, log), store
 }
 
-// fakeNotifier 记录收到的通知，用来验证"结果事件确实发出去了"。
+// fakeNotifier records notifications, to verify "the result event really went out".
 type fakeNotifier struct {
 	events chan struct {
 		cert string
@@ -104,10 +121,10 @@ func TestNotifierReceivesRenewalResult(t *testing.T) {
 	select {
 	case ev := <-notifier.events:
 		if ev.cert != name || ev.err != nil {
-			t.Errorf("通知内容不对: cert=%q err=%v", ev.cert, ev.err)
+			t.Errorf("wrong notification content: cert=%q err=%v", ev.cert, ev.err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("没有收到续期通知")
+		t.Fatal("no renewal notification received")
 	}
 }
 
@@ -130,24 +147,24 @@ func TestNotifierReceivesFailure(t *testing.T) {
 	select {
 	case ev := <-notifier.events:
 		if ev.err == nil {
-			t.Error("失败也应当通知，且带上错误")
+			t.Error("failures should be notified too, with the error attached")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("没有收到失败通知")
+		t.Fatal("no failure notification received")
 	}
 }
 
-// ── 事件触发相关 ────────────────────────────────────────────────────────────
+// ── Event triggering ────────────────────────────────────────────────────────────
 
 func TestRunCertUnknownName(t *testing.T) {
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"a"}, mgr)
 
 	if err := r.RunCert(context.Background(), "nope"); err == nil {
-		t.Fatal("未知证书名应当报错")
+		t.Fatal("an unknown certificate name should error")
 	}
 	if len(mgr.calls) != 0 {
-		t.Errorf("未知名字不该触发任何处理，实际 %v", mgr.calls)
+		t.Errorf("an unknown name should trigger nothing, got %v", mgr.calls)
 	}
 }
 
@@ -156,15 +173,16 @@ func TestRunCertProcessesOnlyThatCert(t *testing.T) {
 	r, _ := newTestReconciler(t, []string{"a", "b", "c"}, mgr)
 
 	if err := r.RunCert(context.Background(), "b"); err != nil {
-		t.Fatalf("RunCert 失败: %v", err)
+		t.Fatalf("RunCert failed: %v", err)
 	}
 	if len(mgr.calls) != 1 || mgr.calls[0] != "b" {
-		t.Errorf("只应处理 b，实际 %v", mgr.calls)
+		t.Errorf("only b should be processed, got %v", mgr.calls)
 	}
 }
 
-// 这条是整个并发闸门存在的理由：定时器和事件触发的收敛同时落到同一张证书上，
-// 两边各下一单就会撞 "5 certificates per exact set of identifiers / 7 days"。
+// This is why the whole concurrency gate exists: the timer and an
+// event-triggered convergence landing on one certificate together means two
+// orders that run into "5 certificates per exact set of identifiers / 7 days".
 func TestConcurrentRunCertIsRejected(t *testing.T) {
 	const name = "busy"
 	release := make(chan struct{})
@@ -177,18 +195,19 @@ func TestConcurrentRunCertIsRejected(t *testing.T) {
 	r, _ := newTestReconciler(t, []string{name}, mgr)
 
 	go func() { _ = r.RunCert(context.Background(), name) }()
-	<-entered // 等第一轮真的进去
+	<-entered // wait until the first pass is really inside
 
 	err := r.RunCert(context.Background(), name)
 	if !errors.Is(err, ErrAlreadyRunning) {
-		t.Errorf("并发处理同一张证书应返回 ErrAlreadyRunning，实际 %v", err)
+		t.Errorf("concurrent processing of one certificate should return ErrAlreadyRunning, got %v", err)
 	}
 
 	close(release)
 }
 
-// StartCert 必须**同步**占位：否则调用方拿到"已受理"之后，
-// 同一张证书可能已经被别处又启动了一轮。
+// StartCert must claim the slot **synchronously**: otherwise, right after the
+// caller gets "accepted", the same certificate could already have been started
+// again elsewhere.
 func TestStartCertReservesSlotSynchronously(t *testing.T) {
 	const name = "async"
 	release := make(chan struct{})
@@ -203,11 +222,12 @@ func TestStartCertReservesSlotSynchronously(t *testing.T) {
 	r, _ := newTestReconciler(t, []string{name}, mgr)
 
 	if err := r.StartCert(context.Background(), name); err != nil {
-		t.Fatalf("StartCert 失败: %v", err)
+		t.Fatalf("StartCert failed: %v", err)
 	}
-	// 立刻再启动一次，必须被拒 —— 此时后台那轮还没跑完。
+	// Start again immediately; it must be refused — the background pass is still
+	// running.
 	if err := r.StartCert(context.Background(), name); !errors.Is(err, ErrAlreadyRunning) {
-		t.Errorf("应立刻报告已在处理中，实际 %v", err)
+		t.Errorf("should immediately report already running, got %v", err)
 	}
 
 	<-entered
@@ -241,7 +261,7 @@ func TestStartAllSkipsBusyCerts(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("StartAll 应报告 %q 被跳过，实际 %v", busy, skipped)
+		t.Errorf("StartAll should report %q as skipped, got %v", busy, skipped)
 	}
 	close(release)
 }
@@ -264,7 +284,7 @@ func TestRunAllSkipsBusyCerts(t *testing.T) {
 
 	skipped := r.RunAll(context.Background())
 	if len(skipped) != 1 || skipped[0] != busy {
-		t.Errorf("RunAll 应跳过 %q，实际 %v", busy, skipped)
+		t.Errorf("RunAll should skip %q, got %v", busy, skipped)
 	}
 	close(release)
 }
@@ -273,26 +293,28 @@ func TestCertNamesPreservesConfigOrder(t *testing.T) {
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"z", "a", "m"}, mgr)
 
-	// CertNames 读的是最近一次求值的缓存，所以先求值一次。
-	// 启动时 main 会调 Prime 做同一件事：只读端点在第一次收敛之前
-	// 就必须能回答"有哪些证书"，否则它会返回空列表 ——
-	// 而空列表会被读成"期望为空"。
+	// CertNames reads the cache of the last resolution, so resolve once first.
+	// At startup main calls Prime to do the same: read-only endpoints must be able
+	// to answer "which certificates exist" before the first convergence, or they
+	// return an empty list — and an empty list is read as "the desired state is
+	// empty".
 	r.Prime(context.Background())
 
 	got := r.CertNames()
 	want := []string{"z", "a", "m"}
 	if len(got) != len(want) {
-		t.Fatalf("CertNames = %v，期望 %v", got, want)
+		t.Fatalf("CertNames = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("CertNames 顺序应与配置一致: %v vs %v", got, want)
+			t.Fatalf("CertNames order should match the config: %v vs %v", got, want)
 		}
 	}
 }
 
-// 这是 RunOnce 存在的全部理由：一张证书炸了不能把其它证书的续期一起拖住。
-// 自动化里最危险的就是这种耦合 —— 一个配错的域名能让全站证书都不续。
+// This is the entire reason RunOnce exists: one exploding certificate must not
+// stall the others' renewals. The most dangerous thing in automation is that
+// coupling — one mistyped domain and no certificate on the site renews.
 func TestRunOnceContinuesAfterOneCertFails(t *testing.T) {
 	mgr := &fakeManager{failWith: map[string]error{
 		"b": errors.New("boom"),
@@ -302,12 +324,12 @@ func TestRunOnceContinuesAfterOneCertFails(t *testing.T) {
 	r.RunOnce(context.Background())
 
 	if len(mgr.calls) != 3 {
-		t.Fatalf("三张证书都应被处理，实际只处理了 %v", mgr.calls)
+		t.Fatalf("all three certificates should be processed, only got %v", mgr.calls)
 	}
 	want := []string{"a", "b", "c"}
 	for i := range want {
 		if mgr.calls[i] != want[i] {
-			t.Errorf("处理顺序应为 %v，实际 %v", want, mgr.calls)
+			t.Errorf("processing order should be %v, got %v", want, mgr.calls)
 			break
 		}
 	}
@@ -320,11 +342,11 @@ func TestRunOnceReapsRetiredCerts(t *testing.T) {
 	r.RunOnce(context.Background())
 
 	if mgr.reaped != 1 {
-		t.Errorf("每轮都应回收一次退役证书，实际 %d 次", mgr.reaped)
+		t.Errorf("every pass should reap retired certificates once, got %d", mgr.reaped)
 	}
 }
 
-// 收到停止信号后不该再往下处理后续证书。
+// After a stop signal, no further certificates should be processed.
 func TestRunOnceStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -335,7 +357,7 @@ func TestRunOnceStopsOnContextCancel(t *testing.T) {
 	r.RunOnce(ctx)
 
 	if len(mgr.calls) != 1 {
-		t.Errorf("取消后应停在第一张，实际处理了 %v", mgr.calls)
+		t.Errorf("after cancellation it should stop at the first, processed %v", mgr.calls)
 	}
 }
 
@@ -352,18 +374,18 @@ func TestPublishExportsNotAfter(t *testing.T) {
 
 	got := testutil.ToFloat64(metrics.CertNotAfter.WithLabelValues("pub-notafter"))
 	if int64(got) != notAfter.Unix() {
-		t.Errorf("CertNotAfter = %d，期望 %d", int64(got), notAfter.Unix())
+		t.Errorf("CertNotAfter = %d, want %d", int64(got), notAfter.Unix())
 	}
 }
 
-// 首次上传后还要人工绑一次，在那之前"已部署"不能亮绿灯 ——
-// 否则到期告警会以为一切正常。
+// The first upload still needs a manual bind, and "deployed" must not go green
+// before then — or the expiry alert will think everything is fine.
 func TestPublishDeployedRequiresConfirmation(t *testing.T) {
 	const name = "pub-deployed"
 	mgr := &fakeManager{}
 	r, store := newTestReconciler(t, []string{name}, mgr)
 
-	// 只上传了，还没确认绑定
+	// Uploaded only, binding not yet confirmed
 	if err := store.PutCert(&state.CertState{
 		Name: name, NotAfter: time.Now().Add(24 * time.Hour), DeployedCertID: "ap-uploaded",
 	}); err != nil {
@@ -371,10 +393,10 @@ func TestPublishDeployedRequiresConfirmation(t *testing.T) {
 	}
 	r.RunOnce(context.Background())
 	if got := testutil.ToFloat64(metrics.CertDeployed.WithLabelValues(name)); got != 0 {
-		t.Errorf("未确认绑定时 CertDeployed 应为 0，实际 %v", got)
+		t.Errorf("CertDeployed should be 0 when the binding is unconfirmed, got %v", got)
 	}
 
-	// 确认之后才该亮绿灯
+	// Only after confirmation should it go green
 	if err := store.PutCert(&state.CertState{
 		Name: name, NotAfter: time.Now().Add(24 * time.Hour),
 		DeployedCertID: "ap-uploaded", DeployConfirmed: true,
@@ -383,11 +405,12 @@ func TestPublishDeployedRequiresConfirmation(t *testing.T) {
 	}
 	r.RunOnce(context.Background())
 	if got := testutil.ToFloat64(metrics.CertDeployed.WithLabelValues(name)); got != 1 {
-		t.Errorf("确认绑定后 CertDeployed 应为 1，实际 %v", got)
+		t.Errorf("CertDeployed should be 1 after confirmation, got %v", got)
 	}
 }
 
-// 状态库里没有这张证书时不应 panic，也不该写出任何指标。
+// A certificate missing from the state store must not panic or write any
+// metric.
 func TestPublishMissingCertIsNoop(t *testing.T) {
 	const name = "pub-missing"
 	mgr := &fakeManager{}
@@ -395,9 +418,9 @@ func TestPublishMissingCertIsNoop(t *testing.T) {
 
 	r.RunOnce(context.Background())
 
-	// 关键是不能 panic。指标此时应为默认 0。
+	// The point is no panic. The metric should be at its default 0 here.
 	if got := testutil.ToFloat64(metrics.CertConsecutiveFailures.WithLabelValues(name)); got != 0 {
-		t.Errorf("缺失证书的失败计数应为 0，实际 %v", got)
+		t.Errorf("a missing certificate's failure count should be 0, got %v", got)
 	}
 }
 
@@ -413,27 +436,30 @@ func TestRunOnceCountsFailuresInMetrics(t *testing.T) {
 	r.RunOnce(context.Background())
 
 	if got := testutil.ToFloat64(metrics.CertConsecutiveFailures.WithLabelValues(name)); got != 3 {
-		t.Errorf("连续失败次数应透出为 3，实际 %v", got)
+		t.Errorf("the consecutive failure count should surface as 3, got %v", got)
 	}
 }
 
-// ── 期望状态来源的失败语义 ──────────────────────────────────────────────────
+// ── Failure semantics of the desired-state source ──────────────────────────────────────────────────
 
-// failingProvider 模拟"来源读不到"。
+// failingProvider simulates "the source cannot be read".
 type failingProvider struct{ err error }
 
 func (f failingProvider) Desired(context.Context) ([]config.Certificate, error) {
 	return nil, f.err
 }
 
-// 来源读不到时**绝不能**被当成"期望为空"。
+// An unreadable source must **never** be treated as an empty desired state.
 //
-// 这是整套设计里唯一能造成灾难的地方：空结果一旦被当作期望状态，
-// wecert 就会把域名从每张证书里摘掉，线上立刻握手失败 ——
-// 这比"这轮没签发"严重得多。正确反应是整个跳过这一轮。
+// This is the one place in the design that can cause a disaster: once an empty
+// result is taken as the desired state, wecert strips domains from every
+// certificate and the live endpoints fail handshakes immediately — far worse
+// than "nothing was issued this pass". The correct reaction is to skip the
+// whole pass.
 //
-// 这条不变量既在 onboarding 侧（三态语义）守，也在这里守：
-// 契约边界不能假设上游一定做对了。
+// This invariant is guarded both on the onboarding side (three-state
+// semantics) and here: a contract boundary cannot assume the upstream got it
+// right.
 func TestUnreadableSourceSkipsThePassEntirely(t *testing.T) {
 	mgr := &fakeManager{}
 
@@ -451,20 +477,23 @@ func TestUnreadableSourceSkipsThePassEntirely(t *testing.T) {
 	r.RunOnce(context.Background())
 
 	if len(mgr.calls) != 0 {
-		t.Errorf("来源读不到时不该处理任何证书，实际处理了 %v", mgr.calls)
+		t.Errorf("an unreadable source should process no certificates, processed %v", mgr.calls)
 	}
 	if got := testutil.ToFloat64(metrics.DesiredStateErrors); got != before+1 {
-		t.Errorf("DesiredStateErrors 应当加一，实际 %v -> %v", before, got)
+		t.Errorf("DesiredStateErrors should increment by one, got %v -> %v", before, got)
 	}
-	// CertNames 也不能因此变成空列表：空列表会被读成"期望为空"。
+	// CertNames must not become an empty list either: an empty list is read as
+	// "the desired state is empty".
 	if got := r.CertNames(); got != nil {
-		t.Errorf("没有成功求值过时 CertNames 应为 nil，实际 %v", got)
+		t.Errorf("with no successful resolution CertNames should be nil, got %v", got)
 	}
 }
 
-// 状态库里有、但期望状态里已经没有的证书不会再被续期，最终会安静地过期。
-// 这条告警是那条失败路径唯一的兜底：删除路径本来就有宽限期和引用检查，
-// 万一还是漏出去了，至少要在到期之前看见它。
+// Certificates in the state store but gone from the desired state are never
+// renewed and quietly expire. This alert is that failure path's only safety
+// net: the deletion path already has a grace period and reference checks, but
+// if something still slips through, it should at least be visible before
+// expiry.
 func TestOrphanedCertificatesAreReported(t *testing.T) {
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -484,6 +513,198 @@ func TestOrphanedCertificatesAreReported(t *testing.T) {
 	r.RunOnce(context.Background())
 
 	if got := testutil.ToFloat64(metrics.OrphanedCertificates); got != 1 {
-		t.Errorf("应报告 1 张孤儿证书，实际 %v", got)
+		t.Errorf("should report 1 orphaned certificate, got %v", got)
+	}
+}
+
+// ── a full trigger must resolve once and stay bounded ──────────────────────
+
+// countingProvider counts Desired calls.
+type countingProvider struct {
+	inner spec.Provider
+	calls atomic.Int64
+}
+
+func (c *countingProvider) Desired(ctx context.Context) ([]config.Certificate, error) {
+	c.calls.Add(1)
+	return c.inner.Desired(ctx)
+}
+
+// StartAll used to resolve the desired state once itself and then once more inside
+// every StartCert: N+1 file reads, YAML decodes, full validations and document
+// hashes, plus an O(n^2) Find over a slice it was already holding.
+func TestStartAllResolvesTheDesiredStateOnce(t *testing.T) {
+	const n = 12
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{}
+	for i := 0; i < n; i++ {
+		cfg.Certificates = append(cfg.Certificates, config.Certificate{Name: fmt.Sprintf("c-%02d", i)})
+	}
+
+	done := make(chan struct{}, n)
+	mgr := &fakeManager{onReconcile: func(string) { done <- struct{}{} }}
+	prov := &countingProvider{inner: spec.NewStatic(cfg.Certificates)}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, mgr, nil, log)
+
+	if skipped := r.StartAll(context.Background()); len(skipped) != 0 {
+		t.Fatalf("nothing should be skipped, got %v", skipped)
+	}
+
+	// Wait for every pass to finish so nothing is still reading the provider.
+	for i := 0; i < n; i++ {
+		<-done
+	}
+
+	if got := prov.calls.Load(); got != 1 {
+		t.Errorf("the desired state was read %d times for one full trigger; want exactly 1", got)
+	}
+	if got := len(mgr.reconciled()); got != n {
+		t.Errorf("every certificate must still be reconciled, got %d of %d", got, n)
+	}
+}
+
+// A full trigger used to start one goroutine per certificate, so a large state
+// fired that many concurrent ACME orders, DNS writes and cloud calls from a single
+// HTTP request. The timer path walks the same certificates strictly one at a time.
+func TestFullTriggerBoundsConcurrentReconciles(t *testing.T) {
+	const n = 40
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{}
+	for i := 0; i < n; i++ {
+		cfg.Certificates = append(cfg.Certificates, config.Certificate{Name: fmt.Sprintf("c-%02d", i)})
+	}
+
+	var inFlight, peak atomic.Int64
+	release := make(chan struct{})
+	mgr := &fakeManager{onReconcile: func(string) {
+		cur := inFlight.Add(1)
+		for {
+			old := peak.Load()
+			if cur <= old || peak.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		<-release
+		inFlight.Add(-1)
+	}}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, log)
+
+	r.StartAll(context.Background())
+
+	// Long enough for every goroutine that can hold a slot to take one and block.
+	time.Sleep(200 * time.Millisecond)
+
+	if got := peak.Load(); got > maxConcurrentStarts {
+		t.Errorf("%d certificates reconciled concurrently; the bound is %d", got, maxConcurrentStarts)
+	}
+	if got := peak.Load(); got == 0 {
+		t.Error("no reconcile started at all")
+	}
+
+	close(release)
+}
+
+// mutableProvider lets a test change the desired state between passes.
+type mutableProvider struct {
+	mu    sync.Mutex
+	certs []config.Certificate
+}
+
+func (m *mutableProvider) Desired(context.Context) ([]config.Certificate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]config.Certificate(nil), m.certs...), nil
+}
+
+func (m *mutableProvider) set(certs ...config.Certificate) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.certs = certs
+}
+
+// hasCertSeries reports whether the not_after gauge currently exports this cert.
+//
+// ToFloat64 cannot answer this: reading a deleted label set creates a fresh child, so
+// it returns 0 either way.
+func hasCertSeries(t *testing.T, name string) bool {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != "wecert_certificate_not_after_timestamp_seconds" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "cert" && l.GetValue() == name {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// A per-certificate gauge is only ever written for names in the *current* desired
+// state, so nothing revisits one that leaves it: the series stays exported at its
+// last value forever. A not_after frozen at its last value then trips the documented
+// expiry rule -- (not_after - now) < 21 days -- permanently, for a certificate that
+// no longer exists, and the vecs grow without bound as domains churn.
+func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: "gone"}, config.Certificate{Name: "kept"})
+
+	cfg := &config.Config{}
+	cfg.Certificates = []config.Certificate{{Name: "gone"}, {Name: "kept"}}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, &fakeManager{}, nil, log)
+
+	// State rows are what publish() reads; without them it returns early.
+	for _, n := range []string{"gone", "kept"} {
+		if err := store.PutCert(&state.CertState{Name: n, NotAfter: time.Now().Add(48 * time.Hour)}); err != nil {
+			t.Fatalf("PutCert: %v", err)
+		}
+	}
+
+	r.RunAll(context.Background())
+	if !hasCertSeries(t, "gone") || !hasCertSeries(t, "kept") {
+		t.Fatal("both certificates should be exported after the first pass")
+	}
+
+	// The declaration disappears.
+	prov.set(config.Certificate{Name: "kept"})
+	cfg.Certificates = []config.Certificate{{Name: "kept"}}
+	r.RunAll(context.Background())
+
+	if hasCertSeries(t, "gone") {
+		t.Error("the removed certificate's series must be reclaimed, or its frozen " +
+			"not_after keeps firing the expiry alert forever")
+	}
+	if !hasCertSeries(t, "kept") {
+		t.Error("the remaining certificate must stay exported")
 	}
 }

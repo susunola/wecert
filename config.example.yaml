@@ -1,48 +1,64 @@
-# wecert 配置示例
+# wecert example config
 #
-# 安全提示：这份文件包含 DNSPod token，务必 chmod 600 并确保属主是运行 wecert 的用户。
-# 腾讯云凭证默认走 CVM 角色（临时凭证，不落盘），不需要在这里写 SecretId/SecretKey。
+# Security note: this file holds a DNSPod token, so chmod 600 it and make sure it
+# is owned by the user that runs wecert.
+# Tencent Cloud credentials default to the CVM role (temporary credentials, never
+# written to disk), so there is no need to put SecretId/SecretKey here.
 
 statePath: /var/lib/wecert/state.db
 
 acme:
-  # ⚠️ 默认指向 staging。install.sh 会把这份文件直接装成
-  #    /etc/wecert/config.yaml，所以默认值必须是安全的那个：
-  #    一旦默认指向生产，用户照着 README 跑一遍 -dry-run 就已经在
-  #    生产环境注册了真实 ACME 账号（配额 10 个 / IP / 3 小时）。
+  # ⚠️ Defaults to staging. install.sh installs this very file as
+  #    /etc/wecert/config.yaml, so the default has to be the safe one: if the
+  #    default pointed at production, a user following the README through a
+  #    single -dry-run would already have registered a real ACME account in
+  #    production (quota: 10 per IP per 3 hours).
   #
-  #    先用下面这个跑通全流程，确认 DNS-01、部署、ARI 都正常，
-  #    再显式换成生产目录：
+  #    Get the whole flow working with the directory below first, confirming
+  #    that DNS-01, deployment and ARI all behave, then switch explicitly to the
+  #    production directory:
   #      https://acme-v02.api.letsencrypt.org/directory
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
   email: ops@example.com
 
 dns:
-  # ── 二选一，两者的凭证体系完全不同，别搞混 ───────────────────────
+  # ── pick one; the two use completely different credential systems, do not mix them up ──
   #
-  #   tencentcloud  用腾讯云 CAM 凭证（下面的 tencent 段），
-  #                 调 dnspod.tencentcloudapi.com。推荐：能和证书部署
-  #                 共用一套凭证，且支持 SessionToken，可以走 CVM 角色。
+  #   tencentcloud  uses Tencent Cloud CAM credentials (the tencent section
+  #                 below) and calls dnspod.tencentcloudapi.com. Recommended: it
+  #                 can share one set of credentials with certificate deployment,
+  #                 supports SessionToken, and can run off the CVM role.
   #
-  #   dnspod        用 DNSPod 自有的 API Token（dnspod.cn → 密钥管理），
-  #                 调 dnsapi.cn。注意这**不是**腾讯云的 SecretId/SecretKey。
+  #   dnspod        uses DNSPod's own API Token (dnspod.cn -> key management) and
+  #                 calls dnsapi.cn. Note this is **not** a Tencent Cloud
+  #                 SecretId/SecretKey.
   provider: tencentcloud
 
-  # provider=dnspod 时必填。形如 "12345,abcdef0123456789..."
+  # Required when provider=dnspod. Looks like "12345,abcdef0123456789..."
   # loginToken: ""
 
-  # TXT 记录的 TTL。
-  # ⚠️ DNSPod 免费套餐的 TTL 下限是 600，写 60 会被 API 拒绝
-  #    (LimitExceeded.RecordTtlLimit)。付费套餐可调低。
+  # TTL of the TXT record.
+  # ⚠️ The DNSPod free tier has a TTL floor of 600; a value of 60 is rejected by
+  #    the API (LimitExceeded.RecordTtlLimit). Paid tiers can go lower.
   ttl: 600
-  # 写完 TXT 后，等待全部权威 NS 可见的上限。LE 会从多个 vantage point 校验，
-  # 全部一致才算通过，所以这一步不能省。
+  # Upper bound on waiting for the TXT to become visible on every authoritative
+  # NS after it is written. LE validates from multiple vantage points and only
+  # passes when they all agree, so this step cannot be skipped.
   propagationTimeout: 5m
   pollingInterval: 5s
 
+  # Optional trusted recursive resolvers used consistently for CNAME, SOA and
+  # NS discovery before wecert queries the discovered authoritative NS directly.
+  # Leave empty to read /etc/resolv.conf. Use IP literals (optionally :port),
+  # not hostnames, so resolver discovery cannot silently fall back to another
+  # local DNS view (VPN / split-horizon / captive resolver).
+  # recursiveNameservers: ["1.1.1.1", "8.8.8.8"]
+
 tencent:
-  # cvm-role：从实例元数据服务取临时凭证（推荐，密钥不落盘）
-  # static  ：在下面填 secretId / secretKey（本地调试或 dns.provider=tencentcloud 时用）
+  # cvm-role: fetch temporary credentials from the instance metadata service
+  #           (recommended; no key ever touches disk)
+  # static  : fill in secretId / secretKey below (for local debugging, or when
+  #           dns.provider=tencentcloud)
   credentialMode: cvm-role
   roleName: wecert-role
 
@@ -50,13 +66,13 @@ tencent:
   # secretId: "REPLACE_ME"
   # secretKey: "REPLACE_ME"
 
-  # UpdateCertificateInstance 支持的资源类型。
-  # clb 是最常用的；cdn、waf、tke、apigateway 等也支持。
+  # Resource types that UpdateCertificateInstance supports.
+  # clb is the most common; cdn, waf, tke, apigateway and others also work.
   resourceTypes:
     - clb
 
-  # CLB 是分地域的资源，这里必须列出你所有有 CLB 的地域，
-  # 漏掉的地域不会被更新，那边的证书会静默过期。
+  # CLB is a regional resource, so list every region where you have a CLB: a
+  # region left out is never updated, and the certificates there expire silently.
   regions:
     - ap-guangzhou
     - ap-shanghai
@@ -64,162 +80,194 @@ tencent:
 metrics:
   listen: 127.0.0.1:9800
 
-# ── 期望状态来源（可选） ────────────────────────────────────────────────────
-# 决定**谁对"应该有什么证书"有最终解释权**。留空 = static，
-# 即下面那份 certificates 说了算，和以前完全一样。
+# ── source of desired state (optional) ──────────────────────────────────────
+# Decides **who has the final say over what certificates should exist**.
+# Empty = static, i.e. the certificates list below decides, exactly as before.
 #
-# 迁移路径是 static → observe → enforce，不要跳步：
+# The migration path is static -> observe -> enforce; do not skip a step:
 #
-#   static   配置里的 certificates 说了算。零风险。
-#   observe  仍然按 certificates 收敛，但**额外**读文档并报告差异。
-#            它不签发任何东西，只回答"如果按文档来会加什么、会删什么"。
-#            先让它跑两周：漂移频率、有没有批量导入、有没有奇怪的记录，
-#            这些数据直接决定去抖窗口、分组大小和熔断阈值。参数猜错的代价
-#            是账号级的限速。
-#   enforce  文档说了算。此时 certificates 必须为空，否则配置加载直接报错。
+#   static   the certificates list in the config decides. Zero risk.
+#   observe  still converges on certificates, but **additionally** reads the
+#            document and reports differences. It issues nothing; it only answers
+#            "what would be added or removed if the document had its way".
+#            Let it run for two weeks first: drift rate, whether there are bulk
+#            imports, whether there are odd records — that data directly drives
+#            the debounce window, group size and circuit-breaker thresholds.
+#            Guessing these parameters wrong costs account-level rate limiting.
+#   enforce  the document decides. Here certificates must be empty, or config
+#            loading fails outright.
 #
 # desiredState:
 #   mode: observe
 #   path: /var/lib/wecert/desired-state.yaml
-#   # 文档多久没刷新就告警。这是这套架构新引入的失败模式：
-#   # onboarding 挂掉之后 wecert 会一直按旧文档正常续期，一切看起来都正常，
-#   # 只是新域名再也不会进来。
+#   # Alert when the document has not been refreshed for this long. This is the
+#   # failure mode this architecture newly introduces: after onboarding dies,
+#   # wecert keeps renewing happily from the stale document and everything looks
+#   # fine — new domains simply never come in again.
 #   maxStaleness: 48h
 
-# ── onboarding 的策略（可选） ──────────────────────────────────────────────
-# 只被 wecert-onboard 读取，wecert 自己完全不看这一节。
-# 这些数字决定配额消耗速度和删除的保守程度，所以放在配置里而不是代码里 ——
-# 它们本来就该从真实漂移数据里调出来。
+# ── onboarding policy (optional) ────────────────────────────────────────────
+# Read only by wecert-onboard; wecert itself never looks at this section.
+# These numbers decide how fast quota is consumed and how conservative deletion
+# is, which is why they live in config rather than code — they are meant to be
+# tuned from real drift data.
 #
 # onboarding:
-#   # 留空 = 枚举账号下所有 zone。
+#   # Empty = enumerate every zone in the account.
 #   zones: [example.com]
 #
-#   # 守卫 1：声明必须同时有 CLB 规则兜底才生效，默认 true。
-#   # 它挡住"声明写了但规则还没配好"（会造成一次无用的签发）和拼错的域名。
+#   # Guard 1: a declaration only takes effect if a CLB rule backs it too,
+#   # default true. It blocks "declared but the rule is not configured yet"
+#   # (which would cause one useless issuance) and misspelled domains.
 #   requireCLBRule: true
 #
-#   # 允许签发证书的注册域，会归一成 eTLD+1。留空 = 不限制。
-#   # 这是显式授权的护栏，能限制"某个脚本批量写了 500 条声明"的辐射范围。
+#   # Registered domains allowed to get certificates, normalized to eTLD+1.
+#   # Empty = unrestricted. This is an explicit-authorization guardrail that
+#   # bounds the blast radius of "some script wrote 500 declarations in bulk".
 #   allowlist: [example.com]
 #
-#   # 单证书 SAN 上限。建议 25，与 tlsserver 对齐，
-#   # 将来切 profile 不用改架构。同证书的域名生死与共。
+#   # SAN cap per certificate. 25 is recommended, aligned with tlsserver, so
+#   # switching profiles later needs no architectural change. Domains on one
+#   # certificate live and die together.
 #   maxNames: 25
 #   profile: classic
 #   keyType: ecdsa-p256
 #   deploy: true
 #
-#   # 名字必须被**确认**缺失多久才允许从证书里移除。
-#   # 增加是收敛，删除是决策，两者保守程度差一个量级：
-#   # DNS 查询抖一下就把域名摘掉再签回来，一次上线就是三次签发。
+#   # How long a name must be **confirmed** missing before it may be removed from
+#   # a certificate. Adding is convergence, removing is a decision, and the two
+#   # differ by an order of magnitude in how conservative they should be: dropping
+#   # a domain because one DNS query flapped and signing it back adds up to three
+#   # issuances for a single rollout.
 #   gracePeriod: 24h
 #
-#   # 窗口内允许的集合变更次数。LE 允许每注册域 50 次 / 7 天，
-#   # 且跨账号共享，所以预算取其一半。
+#   # Allowed set changes within the window. LE allows 50 per registered domain
+#   # per 7 days and shares that across accounts, so the budget takes half.
 #   budget: 25
 #   budgetWindow: 168h
 #
-#   # 声明集合一次缩小超过这个比例就冻结告警。
-#   # 正常的一次下线不会让集合少三成；突然少三成几乎一定是上游出了问题
-#   # （API 返回不完整、权限被改、zone 读失败），照做的后果是批量摘除 SAN。
+#   # Freeze and alert when the declared set shrinks by more than this fraction in
+#   # one step. A normal decommission does not cut the set by 30%; a sudden 30%
+#   # drop almost always means something upstream broke (incomplete API response,
+#   # changed permissions, a failed zone read), and acting on it would strip SANs
+#   # in bulk.
 #   dropThreshold: 0.30
 #
-#   # 宽限期与预算的账本。必须持久化：onboarding 是跑完就退出的一次性进程，
-#   # 内存里的宽限期跨不过重启，等于宽限期永远走不完。
+#   # The ledger for grace periods and budget. It must be persisted: onboarding is
+#   # a run-once-and-exit process, and an in-memory grace period does not survive
+#   # a restart, which means it would never elapse.
 #   statePath: /var/lib/wecert/onboard-state.json
 #   reportPath: /var/lib/wecert/desired-state.report.json
 
-# ── 网络侧证书探测（可选，默认开启） ────────────────────────────────────────
-# 云 API 说"绑定成功"，和浏览器真的能拿到这张证书，是两件事：
-# 前者走控制面，后者要拨一个真实的 TLS 连接。
+# ── network-side certificate probe (optional, on by default) ────────────────
+# The cloud API saying "bind succeeded" and a browser actually getting that
+# certificate are two different things: the former goes through the control plane,
+# the latter requires dialing a real TLS connection.
 #
-# 控制面看不出来、只有拨一次才知道的故障：
-#   - 重绑定是异步的（实测约 15 秒），API 说成功时线上可能还是旧证书
-#   - CLB 上另一张证书在赢 SNI
-#   - 换绑根本没发生，只是 API 没报错
+# Failures the control plane cannot see, which only a dial reveals:
+#   - the rebind is asynchronous (about 15 seconds in practice), so when the API
+#     says success the edge may still be serving the old certificate
+#   - another certificate on the CLB is winning SNI
+#   - the rebind never happened and the API simply reported no error
 #
-# 默认开着。如果 wecert 跑在一台拨不到 CLB VIP 的机器上，把它关掉：
-# 那种情况下涨的是 wecert_certificate_probe_errors_total，
-# 而 wecert_certificate_probe_match 不动 —— 不会让证书看起来是坏的。
+# On by default. If wecert runs on a machine that cannot reach the CLB VIP, turn
+# it off: in that situation wecert_certificate_probe_errors_total goes up while
+# wecert_certificate_probe_match stays flat — it will not make certificates look
+# broken.
 #
 # probe:
 #   enabled: true
 #   port: 443
-#   # 跨可用区握手慢到 3~5 秒是常态。设小了会频繁误报，
-#   # 而误报会训练人忽略告警，那比不探测更糟。
+#   # Cross-AZ handshakes routinely take 3-5 seconds. Setting this too low
+#   # produces frequent false alarms, and false alarms train people to ignore
+#   # alerts, which is worse than not probing at all.
 #   timeout: 10s
-#   # 每张证书最多拨几个名字。不做全量：一张 25 个名字的证书每轮拨 25 次，
-#   # 收益递减而成本线性增长。
+#   # Maximum number of names to dial per certificate. Not all of them: dialing
+#   # all 25 names of a 25-name certificate every round has diminishing returns
+#   # and linearly growing cost.
 #   maxHostsPerCert: 3
-#   # 留空表示不检查剩余有效期。这个检查是冗余的，但它的失败模式不同：
-#   # 它验的是"线上真的在服务一张没过期的证书"，
-#   # 而不是"我以为部署了一张没过期的证书"。
+#   # Empty means do not check remaining validity. This check is redundant, but it
+#   # fails differently: it verifies "the edge really is serving a non-expired
+#   # certificate" rather than "I believe a non-expired certificate was deployed".
 #   # minValidFor: 168h
 
-# ── 到期前降级（可选，默认关闭） ────────────────────────────────────────────
-# 一张证书里有几个名字一直签不出来、而它又快到期时，摘掉那几个名字先签一张，
-# 保住其余部分。部分可用好过全挂。
+# ── degradation before expiry (optional, off by default) ────────────────────
+# When a few names on a certificate keep failing to validate and it is close to
+# expiry, drop those names, issue the certificate now and save the rest. Partial
+# availability beats total failure.
 #
-# 为什么需要它：一张 25 个名字的证书里只要有 1 个名字的 DNS 配错了，
-# 整张证书就签不出来 —— 而那 24 个本来好的名字会跟着一起过期。
+# Why it is needed: one misconfigured DNS record out of 25 names makes the whole
+# certificate impossible to issue — and the other 24 perfectly good names expire
+# along with it.
 #
-# ⚠️ 默认关闭，因为它会改变证书覆盖什么，那是安全决策，不该由程序替人做。
-#    开启之后被摘掉的名字会失去覆盖，而且降低的是**那些名字**的安全性，
-#    不是这张证书的。它会以 ERROR 级别打日志，并在指标里长期可见。
+# ⚠️ Off by default, because it changes what a certificate covers, and that is a
+#    security decision a program should not make for a person. Once enabled, the
+#    dropped names lose coverage, and what degrades is the security of **those
+#    names**, not of this certificate. It logs at ERROR level and stays visible in
+#    the metrics.
 #
-# 只会摘掉"具体某个 identifier 反复失败"的名字。不知道是哪个名字坏的时候
-# 绝不降级 —— 随机摘会把本来好的名字也一起牺牲掉，那比不降级更糟。
+# It only drops names where a **specific identifier** keeps failing. When it is not
+# known which name is broken it never degrades — dropping at random would
+# sacrifice good names too, which is worse than not degrading.
 #
 # failureFallback:
 #   enabled: false
-#   # 这张证书连续失败多少次之后才考虑降级。
+#   # Consecutive failures of this certificate before degradation is considered.
 #   afterFailures: 5
-#   # 距离到期多久之内才考虑降级。不能设太大：太早降级等于用一张缺名字的
-#   # 证书换掉一张还完全有效的证书，那是净损失。
+#   # How close to expiry degradation is considered. It cannot be set too large:
+#   # degrading early swaps a still fully valid certificate for one missing names,
+#   # which is a net loss.
 #   beforeExpiry: 168h
-#   # 某个 identifier 至少失败多少次才允许把它摘掉。设成 1 会让一次网络
-#   # 抖动就摘掉一个名字。
+#   # Minimum failures for one identifier before it may be dropped. Setting it to
+#   # 1 would drop a name on a single network blip.
 #   minIdentifierFailures: 3
-#   # 失败记录多久算过期。它同时是自愈机制：记录老化之后那个名字不再被摘掉，
-#   # 下一轮自然去重试全集 —— 问题修好之后最多等这么久就自动恢复，
-#   # 不需要任何额外的重试状态。
+#   # How long a failure record stays valid. It doubles as the self-healing
+#   # mechanism: once the record ages out the name is no longer dropped, and the
+#   # next round retries the full set — so after a fix the system recovers within
+#   # at most this long, with no extra retry state.
 #   failureWindow: 24h
-#   # 降级之后至少保留几个名字。少于这个数就拒绝降级：那是"全挂"换了个
-#   # 样子，却会让人以为还有部分可用。
+#   # Minimum names kept after degradation. Below that it refuses to degrade: that
+#   # is total failure wearing a different hat, while making people believe
+#   # something is still partially available.
 #   minNames: 1
 
-# ── 事件触发（可选） ────────────────────────────────────────────────────────
-# 默认不启用，只按定时器收敛。配上之后就可以由外部事件驱动，
-# 比如域名新增后由 CI 调一次，不用等下一个整点。
+# ── event triggering (optional) ─────────────────────────────────────────────
+# Disabled by default; convergence happens on the timer only. Configure it and
+# external events can drive it, for example CI calling it once after a domain is
+# added, instead of waiting for the next hour.
 #
 # webhook:
 #   listen: 127.0.0.1:9801
 #
-#   # 必填，至少 16 字符。
-#   # 这个端点会触发**真实签发**并消耗 Let's Encrypt 的速率限制配额，
-#   # 所以绝不能裸奔。太短的 token 在这个端点上等于没有鉴权。
+#   # Required, at least 16 characters.
+#   # This endpoint triggers **real issuance** and consumes Let's Encrypt rate
+#   # limit quota, so it must never be left unprotected. A too-short token on this
+#   # endpoint is as good as no authentication at all.
 #   token: "REPLACE_ME_WITH_A_LONG_RANDOM_SECRET"
 #
-#   # 可选。设置后每次续期尝试结束都会向它 POST 一条 JSON 事件，
-#   # 用来把"证书已续期"接进下游流程（例如触发一次配置重载）。
+#   # Optional. When set, every renewal attempt ends by POSTing a JSON event to
+#   # it, to wire "the certificate was renewed" into downstream flows (for example
+#   # triggering a config reload).
 #   # notifyURL: "https://ci.example.com/hooks/wecert"
 
 certificates:
-  # ── 一组证书 = 一组"生死与共"的域名 ──────────────────────────────
-  # 同一张证书里的域名会一起成功、一起失败、一起过期。
-  # 不要把无关业务塞进同一张证书，否则一个域名的 DNS 故障会拖垮全部。
+  # ── one certificate = one set of domains that live and die together ──────
+  # Domains on the same certificate succeed together, fail together and expire
+  # together. Do not stuff unrelated services onto one certificate, or a single
+  # domain's DNS failure drags all of them down.
   #
-  # 建议每张证书不超过 25 个域名：既留出余量，也对齐 tlsserver profile
-  # 的 Max Names（25），将来切 profile 不用改架构。
+  # Keep each certificate to 25 domains or fewer: that leaves headroom and also
+  # aligns with the tlsserver profile's Max Names (25), so switching profiles
+  # later needs no architectural change.
 
   - name: example-com
-    # profile 决定 Max Names：classic=100（90天），tlsserver=25（45天）
-    # 长期方向是 tlsserver —— BR 已排期 2029-03-15 起所有证书 ≤47 天。
+    # profile decides Max Names: classic=100 (90 days), tlsserver=25 (45 days).
+    # The long-term direction is tlsserver — the BR schedule requires all
+    # certificates to be <=47 days from 2029-03-15.
     profile: classic
     keyType: ecdsa-p256
-    # 可选，默认按 profile 推导：classic=30d，tlsserver=15d。
-    # 仅在 ARI 不可用时作为兜底。
+    # Optional; by default derived from the profile: classic=30d, tlsserver=15d.
+    # Only a fallback for when ARI is unavailable.
     # renewBefore: 30d
     domains:
       - example.com
@@ -227,8 +275,9 @@ certificates:
     deploy:
       enabled: true
 
-  # 通配符只覆盖一层标签：*.example.com 不包含 a.b.example.com。
-  # 多层命名需要为每个子区单独申请。
+  # A wildcard covers exactly one label: *.example.com does not include
+  # a.b.example.com. Multi-level naming requires a separate certificate per
+  # sub-zone.
   - name: api-example-com
     profile: tlsserver
     keyType: ecdsa-p256

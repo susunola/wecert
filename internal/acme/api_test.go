@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,45 +21,58 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// fakeAPI 记录每一次 ACME 调用，并返回预先编排好的响应。
+// fakeAPI records every ACME call and returns pre-scripted responses.
 //
-// 它就是把 Manager 对 *api.Core 的依赖抽成窄接口真正换来的东西。
-// 订单状态机的正确性完全在于**调用的顺序和参数**：
+// It is the real payoff of narrowing Manager's dependency on *api.Core to an interface.
+// The order state machine's correctness is entirely about **call order and arguments**:
 //
-//   - order URL 必须在联系 CA 之前落盘
-//   - 续期的订单必须带 replaces，否则拿不到 ARI 的限速豁免
-//   - CSR 必须是 DER，而且必须提交到 finalize URL
+//   - the order URL must be on disk before we contact the CA
+//   - a renewal order must carry replaces, or we get no ARI rate-limit exemption
+//   - the CSR must be DER, and must be submitted to the finalize URL
 //
-// 这三条都不会报错，只会安静地烧配额或者让重绑定不生效 —— 正是最需要
-// 断言、也最需要在一个不需要网络的测试里断言的那类东西。
+// None of the three errors out; they just quietly burn quota or no-op the rebind --
+// exactly what most needs asserting, and in a test that needs no network.
 //
-// 之前这些只能靠起一个假的 ACME HTTP 服务器来覆盖：那能跑通全流程，
-// 但没法回答"它到底先做了什么"。
+// Previously the only way to cover these was a fake ACME HTTP server: it runs the whole
+// flow, but cannot answer "what did it actually do first".
 type fakeAPI struct {
 	mu    sync.Mutex
 	calls []string
 
-	// beforeCall 在每次调用**之前**执行，用来断言"此刻的状态库是什么样"。
+	// beforeCall runs **before** each call, to assert "what the state store looks like now".
 	//
-	// 崩溃安全只能这样验：它断言的是一个**时刻**，而不是某个最终结果。
-	// "最后订单落盘了"和"在联系 CA 之前订单就落盘了"是两回事，
-	// 而只有后者能挡住"进程在 DNS 传播那几分钟里被杀掉之后重新下单"。
+	// Crash safety can only be verified this way: it asserts a **moment**, not a final outcome.
+	// "the order ended up on disk" and "the order was on disk before contacting the CA" are
+	// different; only the latter blocks a re-order when the process is killed mid-propagation.
 	beforeCall func(call string)
 
-	// orders 是 GetOrder 依次返回的剧本；用完之后一直返回最后一个，
-	// 这样轮询循环能收敛而不是空转。
+	// orders is the script GetOrder returns in turn; once exhausted it keeps returning the
+	// last one, so the polling loop converges instead of spinning.
 	orders   []legoacme.ExtendedOrder
 	orderIdx int
+
+	// authzByURL overrides GetAuthorization per authorization URL. URLs left out keep the
+	// default "everything is valid" answer, so only the tests that need a failing -- or a
+	// wildcard -- authorization have to populate it.
+	authzByURL map[string]legoacme.Authorization
+
+	// authzHits counts GetAuthorization per URL, so a test can tell "polled again"
+	// from "polled once".
+	authzHits map[string]int
 
 	certPEM []byte
 	certErr error
 
-	// 记录下来的参数。
+	// Arguments captured from the calls.
 	newOrderDomains []string
 	newOrderOpts    *api.OrderOptions
 	finalizeURL     string
 	finalizeCSR     []byte
 	accepted        []string
+	// certBundle records the *argument* GetCertificate was called with. Setting it
+	// unconditionally would make the "must ask for fullchain" assertion a tautology:
+	// download could pass bundle=false and the suite would stay green, while the CLB
+	// received a leaf with no intermediates.
 	certBundle      bool
 	renewalInfoHits int
 }
@@ -85,7 +99,7 @@ func (f *fakeAPI) NewOrder(domains []string, opts *api.OrderOptions) (legoacme.E
 	f.newOrderDomains = append([]string(nil), domains...)
 	f.newOrderOpts = opts
 	if len(f.orders) == 0 {
-		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: NewOrder 没有编排任何订单")
+		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: NewOrder has no scripted orders")
 	}
 	return f.orders[0], nil
 }
@@ -95,7 +109,7 @@ func (f *fakeAPI) GetOrder(string) (legoacme.ExtendedOrder, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.orders) == 0 {
-		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: GetOrder 没有编排任何订单")
+		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: GetOrder has no scripted orders")
 	}
 	o := f.orders[f.orderIdx]
 	if f.orderIdx < len(f.orders)-1 {
@@ -111,14 +125,34 @@ func (f *fakeAPI) UpdateOrderForCSR(finalizeURL string, csr []byte) (legoacme.Ex
 	f.finalizeURL = finalizeURL
 	f.finalizeCSR = append([]byte(nil), csr...)
 	if len(f.orders) == 0 {
-		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: UpdateOrderForCSR 没有编排任何订单")
+		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: UpdateOrderForCSR has no scripted orders")
 	}
 	return f.orders[len(f.orders)-1], nil
 }
 
-func (f *fakeAPI) GetAuthorization(string) (legoacme.Authorization, error) {
+func (f *fakeAPI) GetAuthorization(authzURL string) (legoacme.Authorization, error) {
 	f.enter("GetAuthorization")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.authzHits == nil {
+		f.authzHits = make(map[string]int)
+	}
+	f.authzHits[authzURL]++
+	if a, ok := f.authzByURL[authzURL]; ok {
+		return a, nil
+	}
 	return legoacme.Authorization{Status: "valid", Identifier: legoacme.Identifier{Value: "a.example.com"}}, nil
+}
+
+// authorizationHits returns a copy of the per-URL GetAuthorization counts.
+func (f *fakeAPI) authorizationHits() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]int, len(f.authzHits))
+	for k, v := range f.authzHits {
+		out[k] = v
+	}
+	return out
 }
 
 func (f *fakeAPI) AcceptChallenge(challengeURL string) error {
@@ -129,35 +163,35 @@ func (f *fakeAPI) AcceptChallenge(challengeURL string) error {
 	return nil
 }
 
-func (f *fakeAPI) GetCertificate(string, bool) ([]byte, []byte, error) {
+func (f *fakeAPI) GetCertificate(_ string, bundle bool) ([]byte, []byte, error) {
 	f.enter("GetCertificate")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.certBundle = true
+	f.certBundle = bundle
 	return f.certPEM, []byte("key"), f.certErr
 }
 
-// GetRenewalInfo 默认报错：ARI 是可选路径，而一个没编排过的 ARI 调用
-// 通常意味着测试现场的 throttling 没设对。让它显式失败比返回空响应好查。
+// GetRenewalInfo errors by default: ARI is optional, and an unscripted ARI call usually
+// means the test's throttling is wrong. Failing loudly is easier to debug than an empty response.
 func (f *fakeAPI) GetRenewalInfo(string) (*http.Response, error) {
 	f.enter("GetRenewalInfo")
 	f.mu.Lock()
 	f.renewalInfoHits++
 	f.mu.Unlock()
-	return nil, errors.New("fakeAPI: ARI 没有编排")
+	return nil, errors.New("fakeAPI: ARI is not scripted")
 }
 
 func (f *fakeAPI) GetKeyAuthorization(token string) (string, error) {
 	return "keyauth(" + token + ")", nil
 }
 
-// ── 脚手架 ──────────────────────────────────────────────────────────────────
+// ---------- scaffolding ----------
 
-// terminalOrder 返回一张"已经签发好"的订单。
+// terminalOrder returns an order that is "already issued".
 //
-// 每个测试都编排能收敛的订单序列：假的 GetOrder 如果一直返回 pending，
-// 状态机会老老实实轮询到 2 分钟的超时 —— 那让整个包的测试慢到没法用，
-// 而且掩盖了真正想断言的东西。
+// Every test scripts a converging order sequence: if the fake GetOrder kept returning
+// pending, the state machine would dutifully poll until the 2-minute timeout -- making
+// the package's tests unusably slow, and hiding what the test actually wants to assert.
 func terminalOrder(location, finalize, certURL string) legoacme.ExtendedOrder {
 	return legoacme.ExtendedOrder{
 		Order:    legoacme.Order{Status: "valid", Finalize: finalize, Certificate: certURL},
@@ -170,7 +204,7 @@ func newAPITestHarness(t *testing.T, domains []string) (*state.Store, *Manager, 
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatalf("打开状态库失败: %v", err)
+		t.Fatalf("open state store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
@@ -186,19 +220,19 @@ func newAPITestHarness(t *testing.T, domains []string) (*state.Store, *Manager, 
 		Deploy:  config.Deploy{Enabled: false},
 	}}
 	if err := config.NormalizeCertificates(certs); err != nil {
-		t.Fatalf("规范化证书失败: %v", err)
+		t.Fatalf("normalize certificate: %v", err)
 	}
 	return store, m, fake, &certs[0]
 }
 
-// ── 不变量 1：order URL 先落盘，再联系 CA ───────────────────────────────────
+// ---------- invariant 1: the order URL is on disk before we contact the CA ----------
 
-// 这是崩溃安全的全部依赖。
+// This is the entire basis of crash safety.
 //
-// 如果 order URL 没落盘，进程在 DNS 传播那几分钟里被杀掉之后会重新下单，
-// 而那一单的 identifier 集合与前一单完全相同 —— 直接撞上
-// "5 certificates per exact set of identifiers / 7 days"，
-// 而且没有任何 override 可以申请。
+// If the order URL is not on disk, a process killed during those minutes of DNS
+// propagation places a new order whose identifier set is exactly the same as the
+// previous one -- walking straight into "5 certificates per exact set of identifiers / 7 days",
+// with no override to appeal for.
 func TestOrderURLIsOnDiskBeforeTheNextACMECall(t *testing.T) {
 	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
 
@@ -213,7 +247,7 @@ func TestOrderURLIsOnDiskBeforeTheNextACMECall(t *testing.T) {
 
 	var checked bool
 	fake.beforeCall = func(call string) {
-		// NewOrder 之后的下一次调用就是状态机去查订单；那一刻落盘必须已经发生。
+		// The call after NewOrder is the state machine reading the order; by then the write must be on disk.
 		if call != "GetOrder" || checked {
 			return
 		}
@@ -221,46 +255,46 @@ func TestOrderURLIsOnDiskBeforeTheNextACMECall(t *testing.T) {
 
 		o, err := store.GetOrder(cert.Name)
 		if err != nil {
-			t.Fatalf("读订单失败: %v", err)
+			t.Fatalf("read order: %v", err)
 		}
 		if o == nil {
-			t.Fatal("联系 CA 之前 order URL 必须先落盘：进程在这里被 kill，" +
-				"重启后会为同一组 identifier 再下一单，撞上 7 天不可恢复的限额")
+			t.Fatal("the order URL must be on disk before we contact the CA: a kill here makes the restart" +
+				" place another order for the same identifier set and hit the unrecoverable 7-day limit")
 		}
 		if o.OrderURL != "https://ca.test/order/1" {
-			t.Fatalf("落盘的 order URL = %q，期望 https://ca.test/order/1", o.OrderURL)
+			t.Fatalf("persisted order URL = %q, want https://ca.test/order/1", o.OrderURL)
 		}
-		// finalize URL 也必须一起落盘：它只有这一次能拿到。
+		// The finalize URL must be persisted alongside it: this is the only time we get it.
 		if o.FinalizeURL != "https://ca.test/finalize/1" {
-			t.Fatalf("落盘的 finalize URL = %q", o.FinalizeURL)
+			t.Fatalf("persisted finalize URL = %q", o.FinalizeURL)
 		}
-		// identifier 集合也要记下来，否则之后配置改了也发现不了。
+		// The identifier set must be recorded too, or a later config change goes unnoticed.
 		if o.Identifiers != cert.DomainKey() {
-			t.Fatalf("落盘的 identifier 指纹 = %q，期望 %q", o.Identifiers, cert.DomainKey())
+			t.Fatalf("persisted identifier fingerprint = %q, want %q", o.Identifiers, cert.DomainKey())
 		}
 	}
 
 	_ = m.Reconcile(context.Background(), cert)
 
 	if !checked {
-		t.Fatalf("假 API 的 GetOrder 一次都没被调用，这个测试什么都没验到（调用序列: %v）", fake.callLog())
+		t.Fatalf("GetOrder was never called on the fake; this test verified nothing (calls: %v)", fake.callLog())
 	}
 }
 
-// ── 不变量 2：续期必须带 replaces ───────────────────────────────────────────
+// ---------- invariant 2: a renewal must carry replaces ----------
 
-// 不带 replaces 的订单拿不到 ARI 的限速豁免 —— 它不会报错，
-// 只会让这次签发实打实地消耗"每注册域 50 张 / 7 天"。
-// 这类不报错的错误正是需要一个能断言调用参数的假实现的原因。
+// An order without replaces gets no ARI rate-limit exemption -- and it does not error,
+// it just makes this issuance genuinely consume "50 per registered domain / 7 days".
+// Silent failures like this are exactly why the fake needs to assert call arguments.
 func TestRenewalCarriesTheReplacesCertID(t *testing.T) {
 	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
 
 	now := m.now()
 	const certID = "YWJj.ZGVm"
 
-	// ARI 窗口整个落在过去 → 现在就该续期。
-	// ARICheckedAt 设成"刚查过"，把 ARI 拉取那一步节流掉，
-	// 这样这个测试只关心下落单时带了什么。
+	// The whole ARI window is in the past, so renewal is due now.
+	// ARICheckedAt is set to "just checked", which throttles the ARI fetch step,
+	// so this test only cares about what the order was placed with.
 	if err := store.PutCert(&state.CertState{
 		Name:           cert.Name,
 		NotAfter:       now.Add(20 * 24 * time.Hour),
@@ -284,28 +318,28 @@ func TestRenewalCarriesTheReplacesCertID(t *testing.T) {
 	_ = m.Reconcile(context.Background(), cert)
 
 	if fake.newOrderOpts == nil {
-		t.Fatalf("应当下一张续期订单，实际调用序列: %v", fake.callLog())
+		t.Fatalf("expected a renewal order, call sequence: %v", fake.callLog())
 	}
 	if fake.newOrderOpts.ReplacesCertID != certID {
-		t.Errorf("下单必须带 replaces=%q（ARI 豁免的前提），实际 %q",
+		t.Errorf("the order must carry replaces=%q (the precondition for the ARI exemption), got %q",
 			certID, fake.newOrderOpts.ReplacesCertID)
 	}
 	if fake.newOrderOpts.Profile != config.ProfileClassic {
-		t.Errorf("profile 应当透传给 CA，实际 %q", fake.newOrderOpts.Profile)
+		t.Errorf("the profile should be passed through to the CA, got %q", fake.newOrderOpts.Profile)
 	}
 	if fake.renewalInfoHits != 0 {
-		t.Errorf("ARICheckedAt 刚更新过，不该再去查 ARI，实际查了 %d 次", fake.renewalInfoHits)
+		t.Errorf("ARICheckedAt was just set, so ARI must not be refetched; got %d fetches", fake.renewalInfoHits)
 	}
 }
 
-// ── 不变量 3：CSR 是 DER，且提交到 finalize URL ─────────────────────────────
+// ---------- invariant 3: the CSR is DER and goes to the finalize URL ----------
 
-// 这两条都踩过：
+// Both of these have bitten us:
 //
-//   - 传 PEM 会得到 asn1 "tags don't match"
-//   - 提交到 order URL 会得到 "POST-as-GET requests must have an empty payload"
+//   - pass PEM and asn1 says "tags don't match"
+//   - submit to the order URL and you get "POST-as-GET requests must have an empty payload"
 //
-// lego 那个参数名恰好叫 orderURL，所以后者尤其容易踩。
+// lego happens to name that parameter orderURL, which makes the latter especially easy to hit.
 func TestCSRIsDERAndGoesToTheFinalizeURL(t *testing.T) {
 	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com", "b.example.com"})
 
@@ -333,7 +367,7 @@ func TestCSRIsDERAndGoesToTheFinalizeURL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 状态为 ready → 直接进 finalize，不必推挑战。
+	// Status ready means go straight to finalize; no challenge needs pushing.
 	fake.orders = []legoacme.ExtendedOrder{
 		{Order: legoacme.Order{Status: "ready", Finalize: finalizeURL}, Location: orderURL},
 		{Order: legoacme.Order{Status: "valid", Finalize: finalizeURL, Certificate: certURL}, Location: orderURL},
@@ -341,50 +375,50 @@ func TestCSRIsDERAndGoesToTheFinalizeURL(t *testing.T) {
 	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("Reconcile 失败: %v", err)
+		t.Fatalf("Reconcile: %v", err)
 	}
 
 	if fake.finalizeURL != finalizeURL {
-		t.Errorf("CSR 必须提交到 finalize URL %q，实际提交到 %q（传 order URL 会被 LE 当成 POST-as-GET）",
+		t.Errorf("the CSR must go to finalize URL %q, went to %q (LE reads an order URL as POST-as-GET)",
 			finalizeURL, fake.finalizeURL)
 	}
 
-	// DER 而不是 PEM：PEM 会在 CA 那边报 asn1 "tags don't match"。
+	// DER, not PEM: PEM makes the CA report asn1 "tags don't match".
 	if len(fake.finalizeCSR) == 0 {
-		t.Fatal("没有捕获到提交的 CSR")
+		t.Fatal("no CSR was captured")
 	}
 	req, err := x509.ParseCertificateRequest(fake.finalizeCSR)
 	if err != nil {
-		t.Fatalf("提交的不是 DER 编码的 CSR（传 PEM 会得到 asn1 tags don't match）: %v", err)
+		t.Fatalf("the submitted CSR is not DER (PEM yields asn1 tags don't match): %v", err)
 	}
 	if err := req.CheckSignature(); err != nil {
-		t.Errorf("CSR 签名校验失败: %v", err)
+		t.Errorf("CSR signature check: %v", err)
 	}
 	if got := len(req.DNSNames); got != len(cert.Domains) {
-		t.Errorf("CSR 里的名字数 = %d，期望 %d: %v", got, len(cert.Domains), req.DNSNames)
+		t.Errorf("CSR has %d names, want %d: %v", got, len(cert.Domains), req.DNSNames)
 	}
 
 	if !fake.certBundle {
-		t.Error("下载证书时应当要 fullchain（bundle=true），那才是 CLB 需要的格式")
+		t.Error("the certificate download must ask for fullchain (bundle=true); that is the format CLB needs")
 	}
 
-	// 最后证书必须真的落到状态库里，否则这一轮等于白跑。
+	// Finally the certificate must actually reach the state store, or this whole round was for nothing.
 	st, err := store.GetCert(cert.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st == nil || st.NotAfter.IsZero() {
-		t.Fatalf("证书没有落盘: %+v", st)
+		t.Fatalf("certificate was not persisted: %+v", st)
 	}
 	if st.ARICertID == "" {
-		t.Error("应当从证书里算出 ARI certID —— 那是下一次续期拿限速豁免的前提")
+		t.Error("the ARI certID must be derived from the certificate; the next renewal depends on that exemption")
 	}
 }
 
-// 状态机不应该在已 valid 的授权上重复调 AcceptChallenge。
+// The state machine must not call AcceptChallenge again on an already-valid authorization.
 //
-// 重复通知不会报错，但那是每轮一次的无用往返；更重要的是，
-// 一个"每轮都重推一遍挑战"的实现会掩盖真正的进度问题。
+// Re-notifying does not error, but it is a wasted round trip every round; more important,
+// an implementation that re-pushes the challenge every round hides real progress problems.
 func TestChallengesAreAcceptedOncePerAuthorization(t *testing.T) {
 	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
 
@@ -418,7 +452,7 @@ func TestChallengesAreAcceptedOncePerAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 订单停在 pending，而授权已经是 valid：不该再有挑战要推。
+	// The order sits at pending while the authorization is already valid: no challenge should be pushed.
 	fake.orders = []legoacme.ExtendedOrder{
 		{
 			Order:    legoacme.Order{Status: "pending", Finalize: "https://ca.test/finalize/3"},
@@ -429,13 +463,123 @@ func TestChallengesAreAcceptedOncePerAuthorization(t *testing.T) {
 	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("Reconcile 失败: %v", err)
+		t.Fatalf("Reconcile: %v", err)
 	}
 
 	if len(fake.accepted) != 0 {
-		t.Errorf("授权已经 valid，不该再通知 CA 去验证，实际推了 %v", fake.accepted)
+		t.Errorf("the authorization is already valid, so no challenge should be pushed; got %v", fake.accepted)
 	}
 
-	// 这个测试的价值有一半在于确认调用序列真的是我们以为的那几步。
-	t.Logf("调用序列: %v", fake.callLog())
+	// Half this test's value is confirming the call sequence really is the steps we think it is.
+	t.Logf("call sequence: %v", fake.callLog())
+}
+
+func TestAwaitAuthorizationInvalidRecordsIdentifierFailure(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"bad.example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return fixed }
+	fake.authzByURL = map[string]legoacme.Authorization{
+		"https://ca.test/authz/bad": {Status: "invalid", Identifier: legoacme.Identifier{Value: "bad.example.com"}, Challenges: []legoacme.Challenge{{Type: "dns-01", Error: &legoacme.ProblemDetails{Detail: "NXDOMAIN"}}}},
+	}
+	err := m.awaitAuthorizations(context.Background(), []*state.Authorization{{CertName: cert.Name, AuthzURL: "https://ca.test/authz/bad", Identifier: "bad.example.com"}})
+	if err == nil {
+		t.Fatal("invalid authorization must fail")
+	}
+	got, err := store.ListIdentifierFailures(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Identifier != "bad.example.com" || got[0].Failures != 1 {
+		t.Fatalf("invalid authorization must enter the fallback ledger, got %+v", got)
+	}
+}
+
+// ── every persistOrder call site must honour its error ─────────────────────
+
+// persistOrder returns its write error so a failed write aborts the step instead
+// of being logged and forgotten: crash recovery would otherwise resume from stale
+// state, which is the invariant the whole package is built around. There are three
+// call sites, and Go does not warn about a dropped return value -- so this pins the
+// one in advance(), which the contract change originally missed.
+func TestAdvanceAbortsWhenTheOrderCannotBePersisted(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
+
+	fake.orders = []legoacme.ExtendedOrder{{
+		Order:    legoacme.Order{Status: "pending", Finalize: "https://ca.test/finalize/1"},
+		Location: "https://ca.test/order/1",
+	}}
+
+	o := &state.Order{CertName: cert.Name, OrderURL: "https://ca.test/order/1", Status: "pending"}
+	st := &state.CertState{Name: cert.Name}
+
+	// Closing the store makes every write fail, which is the situation the error
+	// return exists for. recordFailure joins its own write error onto this one, so
+	// the original message has to survive into what the caller sees.
+	if err := store.Close(); err != nil {
+		t.Fatalf("closing the store: %v", err)
+	}
+
+	err := m.advance(context.Background(), cert, st, o)
+	if err == nil {
+		t.Fatal("a failed order write must abort the step; discarding it means recovery resumes from stale state")
+	}
+	if !strings.Contains(err.Error(), "order state") {
+		t.Errorf("want the error to name the failed order write, got: %v", err)
+	}
+}
+
+// ── the authorization wait loop must not re-poll what already concluded ─────
+
+// awaitAuthorizations used to fetch and re-persist *every* authorization on every
+// poll round. For a 25-name certificate that takes its whole 3-minute budget that
+// is ~1500 CA round trips and ~1500 upserts, of which only the first 25 ever carry
+// new information -- and each upsert is its own WAL commit.
+func TestAwaitAuthorizationsStopsPollingConcludedAuthorizations(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com", "b.example.com", "c.example.com"})
+
+	const (
+		aURL = "https://ca.test/authz/a"
+		bURL = "https://ca.test/authz/b"
+		cURL = "https://ca.test/authz/c"
+	)
+	fake.orders = []legoacme.ExtendedOrder{{
+		Order: legoacme.Order{
+			Status:         "pending",
+			Finalize:       "https://ca.test/finalize/1",
+			Authorizations: []string{aURL, bURL, cURL},
+		},
+		Location: "https://ca.test/order/1",
+	}}
+	fake.authzByURL = map[string]legoacme.Authorization{
+		aURL: {Status: "valid", Identifier: legoacme.Identifier{Value: "a.example.com"}},
+		bURL: {Status: "valid", Identifier: legoacme.Identifier{Value: "b.example.com"}},
+		// Never concludes, so the loop keeps polling until its budget is gone.
+		cURL: {Status: "pending", Identifier: legoacme.Identifier{Value: "c.example.com"}},
+	}
+
+	// A short budget with a very short interval gives many rounds and no real waiting.
+	m.authzWait = 200 * time.Millisecond
+	m.pollInterval = time.Millisecond
+
+	var authzs []*state.Authorization
+	for _, u := range []string{aURL, bURL, cURL} {
+		a := &state.Authorization{CertName: cert.Name, AuthzURL: u, Status: "pending"}
+		if err := store.PutAuthorization(a); err != nil {
+			t.Fatalf("PutAuthorization: %v", err)
+		}
+		authzs = append(authzs, a)
+	}
+
+	if err := m.awaitAuthorizations(context.Background(), authzs); err == nil {
+		t.Fatal("an authorization that never concludes must exhaust the budget and error")
+	}
+
+	hits := fake.authorizationHits()
+	if hits[aURL] != 1 || hits[bURL] != 1 {
+		t.Errorf("a concluded authorization must be polled exactly once, got a=%d b=%d",
+			hits[aURL], hits[bURL])
+	}
+	if hits[cURL] < 2 {
+		t.Errorf("the pending authorization must keep being polled, got %d", hits[cURL])
+	}
 }

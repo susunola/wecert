@@ -1,10 +1,12 @@
-// Package state 是 wecert 的持久化层。
+// Package state is wecert's persistence layer.
 //
-// 这一层的存在本身就是需求：Let's Encrypt 官方点名了最常见的撞限方式 ——
-// "每次部署都删掉 ACME 客户端的配置数据"。丢失 order URL 会让进程重启后
-// 重新下单，直接撞上 "5 certificates per exact set of identifiers / 7 days"。
+// The existence of this layer is itself a requirement: Let's Encrypt explicitly
+// names the most common way people hit rate limits -- "deleting the ACME client's
+// configuration data on every deploy". Losing the order URL makes a restarted
+// process place a fresh order, walking straight into
+// "5 certificates per exact set of identifiers / 7 days".
 //
-// 所以：account key、order URL、ARI 窗口、腾讯云 CertId 全部落盘。
+// So: account key, order URL, ARI window, and Tencent Cloud CertId all hit disk.
 package state
 
 import (
@@ -15,69 +17,84 @@ import (
 	"path/filepath"
 	"time"
 
-	_ "modernc.org/sqlite" // 纯 Go driver，免 CGO，方便静态编译
+	_ "modernc.org/sqlite" // pure Go driver: no CGO, which keeps static builds easy
 )
 
-// Store 是 SQLite 之上的状态存储。
+// maxLastErrorBytes bounds the upstream error text persisted per row.
+//
+// last_error carries remote text verbatim: lego embeds the entire non-JSON ACME
+// error body in its errors, and the CVM metadata path echoes response bodies. Left
+// unbounded it is both a growth vector and a channel for remote-controlled text
+// that /hook/status serves to callers and notifyURL posts off-host.
+const maxLastErrorBytes = 512
+
+// Store is the state store layered on top of SQLite.
 type Store struct {
 	db *sql.DB
 
-	// lock 是跨进程排他锁。
+	// lock is the cross-process exclusive lock.
 	//
-	// "每张证书最多一个在飞订单"这条不变量原本只在**一个进程内**成立。
-	// daemon 和 timer 两种模式同时启用时，两个进程各自持有一份局部视图，
-	// 于是同一张证书会被下单两次 —— 撞上的是
-	// "5 certificates per exact set of identifiers / 7 days"，
-	// 而那条限额没有 override，撞了要等满 7 天。
+	// The "at most one in-flight order per certificate" invariant used to hold only
+	// **within a single process**. With daemon and timer modes both enabled, each
+	// process keeps its own local view, so the same certificate gets ordered twice --
+	// and what you hit is
+	// "5 certificates per exact set of identifiers / 7 days",
+	// a limit with no override: trip it and you wait the full 7 days.
 	lock *fileLock
 }
 
-// ErrLocked 表示状态库已经被另一个 wecert 进程独占。
+// ErrLocked means the state database is already held exclusively by another wecert
+// process.
 //
-// 这不是异常，是必须存在的一道闸门。见 Store.lock 的注释。
+// This is not an anomaly, it is a gate that has to exist. See the Store.lock comment.
 var ErrLocked = errors.New("the state database is already held by another wecert process")
 
-// CertState 是一张证书的运行时状态（对应 config.Certificate 的 status）。
+// CertState is the runtime state of one certificate (the status of config.Certificate).
 type CertState struct {
 	Name string
 
-	// 当前生效的证书。
+	// The certificate currently in effect.
 	NotAfter time.Time
 	CertURL  string
 	CertPEM  []byte
 	KeyPEM   []byte
 	IssuedAt time.Time
 
-	// ARI（RFC 9773）。CertID = base64url(AKI) + "." + base64url(Serial)。
+	// ARI (RFC 9773). CertID = base64url(AKI) + "." + base64url(Serial).
 	ARICertID      string
 	ARIWindowStart time.Time
 	ARIWindowEnd   time.Time
 	ARICheckedAt   time.Time
 	ARIRetryAfter  time.Duration
 
-	// 失败退避。撞了 "5 authorization failures per identifier per hour" 之后
-	// 继续猛重试只会让情况更糟，所以这里必须有上限并转为人工介入。
+	// Failure backoff. After tripping
+	// "5 authorization failures per identifier per hour", hammering retries only
+	// makes things worse, so there has to be a ceiling here that hands off to a human.
 	ConsecutiveFailures int
 	NextAttemptAt       time.Time
 	LastError           string
 
-	// 腾讯云侧当前生效的证书 ID，作为 UpdateCertificateInstance 的 OldCertificateId。
-	// 空字符串表示还没有绑定过，需要人工绑一次。
+	// The certificate ID currently active on the Tencent Cloud side, passed as
+	// UpdateCertificateInstance's OldCertificateId.
+	// An empty string means it was never bound and a human has to bind it once.
 	DeployedCertID string
 
-	// DeployConfirmed 表示"证书确实已经在云资源上生效"，而不只是上传成功。
-	// 首次上传拿到 CertId 之后还要人工在 CLB 绑一次，那之前不能算已部署 ——
-	// 否则到期告警会因为 deployed=1 而误以为一切正常。
+	// DeployConfirmed means "the certificate is genuinely live on the cloud
+	// resource", not merely uploaded successfully.
+	// After the first upload returns a CertId, a human still has to bind it on the
+	// CLB; until that happens it does not count as deployed -- otherwise the expiry
+	// alert sees deployed=1 and assumes everything is fine.
 	DeployConfirmed bool
 
 	UpdatedAt time.Time
 }
 
-// Order 是一个进行中的 ACME 订单。
+// Order is an in-flight ACME order.
 //
-// KeyPEM 是这张订单签发时生成的私钥。它必须挂在订单上而不是直接覆盖
-// CertState.KeyPEM —— 否则一旦部署失败，当前正在服务的证书私钥就被覆盖没了。
-// 只有新证书成功上线后，才会把 KeyPEM 提升为生效私钥。
+// KeyPEM is the private key generated while issuing this order. It must hang off the
+// order rather than overwriting CertState.KeyPEM directly -- otherwise a failed
+// deploy wipes out the private key of the certificate currently in service. Only
+// once the new certificate is successfully live is KeyPEM promoted to the active key.
 type Order struct {
 	CertName    string
 	OrderURL    string
@@ -87,22 +104,25 @@ type Order struct {
 	Status      string
 	KeyPEM      []byte
 
-	// Identifiers 是创建这张订单时提交的 identifier 集合（规范形式，
-	// 见 config.DomainKey）。空字符串表示订单来自旧版本、没有这份记录。
+	// Identifiers is the identifier set submitted when this order was created
+	// (canonical form, see config.DomainKey). An empty string means the order came
+	// from an older version and has no such record.
 	//
-	// 为什么必须存：订单的 identifier 集合是 newOrder 那一刻定下的，
-	// 之后配置里改了 domains，CSR 就和订单对不上，CA 会一直拒绝 finalize。
-	// 而"绝不新建订单"这条不变量又会让程序不停地推进同一张坏订单，
-	// 于是卡到订单 7 天后过期为止 —— 期间该证书的任何域名改动都无法生效。
+	// Why it must be stored: an order's identifier set is fixed at the moment of
+	// newOrder. If domains are later changed in config, the CSR no longer matches the
+	// order and the CA keeps rejecting finalize. The "never create a new order"
+	// invariant then makes the program keep pushing the same broken order, so it
+	// stalls until the order expires 7 days later -- and during that window no domain
+	// change for that certificate can take effect.
 	Identifiers string
 }
 
-// Authorization 是订单里的一个 identifier 授权。
+// Authorization is one identifier authorization inside an order.
 //
-// 注意：wildcard 和 apex 的授权会落在同一个 TXT 名字上
-// （`example.com` 和 `*.example.com` 都写 `_acme-challenge.example.com`），
-// 所以这里按 authz URL 分行存，每行各自持有自己的 TXT 值，
-// 由 manager 保证"全部写入 → 全部验证 → 才统一清理"。
+// Note: wildcard and apex authorizations land on the same TXT name
+// (`example.com` and `*.example.com` both write `_acme-challenge.example.com`),
+// so rows here are stored per authz URL and each holds its own TXT value, with the
+// manager guaranteeing "write all -> validate all -> only then clean up together".
 type Authorization struct {
 	CertName       string
 	AuthzURL       string
@@ -113,33 +133,37 @@ type Authorization struct {
 	TxtName        string
 	TxtValue       string
 
-	// Presented 表示 TXT 已经写进 DNS（但不保证传播完成）。
+	// Presented means the TXT has been written into DNS (propagation is not guaranteed).
 	Presented bool
-	// ChallengeSent 表示已经 POST 通知 CA 去验证。
+	// ChallengeSent means the CA has been POSTed to go and validate.
 	ChallengeSent bool
 }
 
-// Account 是 ACME 账号。
+// Account is an ACME account.
 type Account struct {
 	Directory     string
 	KID           string
 	PrivateKeyPEM []byte
 }
 
-// Open 打开（必要时创建）状态库，并取得跨进程排他锁。
+// Open opens (creating it if necessary) the state database and takes the
+// cross-process exclusive lock.
 //
-// 这个文件里存着 ACME 账号私钥和全部生效证书的私钥，所以目录不存在时先建、
-// 文件用 0600 预创建。SQLite 自己是按进程 umask 建文件的 —— 在 umask 022 的
-// 机器上就是 0644，任何本机用户都能把私钥读走。systemd 那条路有
-// StateDirectoryMode=0700 兜着，但手工执行（README 的 -dry-run、e2e 脚本
-// 把库放在 /tmp）时没有这层保护。
+// This file holds the ACME account private key and the private keys of every active
+// certificate, so the directory is created first when missing and the file is
+// pre-created with 0600. SQLite creates its own files according to the process
+// umask -- on a umask 022 machine that means 0644, and any local user can read the
+// private keys out. The systemd path is covered by StateDirectoryMode=0700, but
+// manual runs (the README's -dry-run, e2e scripts that put the database in /tmp)
+// have no such protection.
 func Open(path string) (*Store, error) { return open(path, true) }
 
-// OpenUnlocked 打开状态库但**不**取排他锁。
+// OpenUnlocked opens the state database but does **not** take the exclusive lock.
 //
-// 只给一次性的校验路径用（-dry-run）：它几乎总是在 daemon 正在跑的时候
-// 被执行，而"因为 daemon 在跑所以连配置都校验不了"会把人逼去瞎改配置。
-// 这条路径只读已有的 ACME 账号、不发起任何签发，所以不取锁是安全的。
+// Only for the one-shot validation path (-dry-run): it almost always runs while the
+// daemon is up, and "you cannot even validate the config because the daemon is
+// running" pushes people into editing the config blindly. This path only reads the
+// existing ACME account and initiates no issuance, so skipping the lock is safe.
 func OpenUnlocked(path string) (*Store, error) { return open(path, false) }
 
 func open(path string, exclusive bool) (*Store, error) {
@@ -149,8 +173,9 @@ func open(path string, exclusive bool) (*Store, error) {
 		}
 	}
 
-	// 锁要在建库文件之前拿：两个进程同时初始化一个空库比同时写一个
-	// 已有库更难排查，因为它们会各自建出不同的表结构。
+	// The lock has to be taken before the database file is created: two processes
+	// initializing an empty database at once is harder to diagnose than two writing
+	// an existing one, because they each end up with a different table schema.
 	var lock *fileLock
 	if exclusive {
 		var err error
@@ -169,7 +194,7 @@ func open(path string, exclusive bool) (*Store, error) {
 		_ = lock.release()
 		return nil, fmt.Errorf("open state db: %w", err)
 	}
-	// modernc sqlite 是单写入者模型，限制连接数避免 SQLITE_BUSY。
+	// modernc sqlite is a single-writer model, so cap connections to avoid SQLITE_BUSY.
 	db.SetMaxOpenConns(1)
 
 	s := &Store{db: db, lock: lock}
@@ -179,8 +204,9 @@ func open(path string, exclusive bool) (*Store, error) {
 		return nil, err
 	}
 
-	// migrate 之后 -wal / -shm 才真正出现，统一收一次权限。
-	// WAL 文件是私钥的副本，权限必须一起管。
+	// -wal / -shm only really appear after migrate, so tighten all permissions once.
+	// The WAL file is a copy of the private keys, so its permissions must be managed
+	// along with the rest.
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		if err := os.Chmod(path+suffix, 0o600); err != nil && !os.IsNotExist(err) {
 			db.Close()
@@ -191,7 +217,7 @@ func open(path string, exclusive bool) (*Store, error) {
 	return s, nil
 }
 
-// Close 关闭状态库并释放跨进程锁。
+// Close closes the state database and releases the cross-process lock.
 func (s *Store) Close() error {
 	err := s.db.Close()
 	if relErr := s.lock.release(); err == nil {
@@ -225,8 +251,9 @@ CREATE TABLE IF NOT EXISTS certificates (
     next_attempt_at        INTEGER NOT NULL DEFAULT 0,
     last_error             TEXT    NOT NULL DEFAULT '',
     deployed_cert_id       TEXT    NOT NULL DEFAULT '',
-    -- 上传成功 ≠ 已经绑到监听器上。要等一键更新真正换完才置位，
-    -- 否则首次上传就会被当成"deployed"，人手还没绑之前指标就开始报绿。
+    -- Upload success != bound to the listener. Only set once the one-click update
+    -- has actually swapped it over; otherwise the first upload is treated as
+    -- "deployed" and metrics go green before a human has bound anything.
     deploy_confirmed       INTEGER NOT NULL DEFAULT 0,
     updated_at             INTEGER NOT NULL DEFAULT 0
 );
@@ -239,7 +266,7 @@ CREATE TABLE IF NOT EXISTS orders (
     expires_at   INTEGER NOT NULL DEFAULT 0,
     status       TEXT NOT NULL DEFAULT '',
     key_pem      BLOB,
-    -- 下单时提交的 identifier 集合（规范形式，见 config.DomainKey）。
+    -- The identifier set submitted at newOrder time (canonical form, see config.DomainKey).
     identifiers  TEXT NOT NULL DEFAULT '',
     updated_at   INTEGER NOT NULL DEFAULT 0
 );
@@ -258,22 +285,25 @@ CREATE TABLE IF NOT EXISTS authorizations (
     PRIMARY KEY (cert_name, authz_url)
 );
 
--- 已退役但尚未删除的云端证书。保留一段时间用于回滚，
--- 之后必须回收：腾讯云账号下上传证书数量有配额。
+-- Cloud certificates that are retired but not yet deleted. Kept for a while to allow
+-- rollback, then they must be reclaimed: Tencent Cloud accounts have a quota on the
+-- number of uploaded certificates.
 CREATE TABLE IF NOT EXISTS retired_certificates (
     cert_id    TEXT PRIMARY KEY,
     cert_name  TEXT NOT NULL,
     retired_at INTEGER NOT NULL
 );
 
--- 逐个 identifier 的授权失败账本。
+-- Per-identifier authorization failure ledger.
 --
--- 证书级的 consecutive_failures 只告诉你"这张证书签不出来"，
--- 而到期前降级要回答的是"是**哪个名字**签不出来" —— 不知道这个，
--- 就只能随机摘名字，那会把本来好的名字也一起牺牲掉。
+-- The certificate-level consecutive_failures only tells you "this certificate cannot
+-- be issued", whereas pre-expiry fallback has to answer "**which name** cannot be
+-- issued" -- without that, the only option is dropping names at random, which
+-- sacrifices names that were fine to begin with.
 --
--- last_failed_at 同时承担了自愈：失败记录老化之后那个 identifier
--- 就不再被摘掉，下一轮自然会去重试全集。不需要额外的重试状态。
+-- last_failed_at also provides self-healing: once a failure record ages out, that
+-- identifier stops being dropped and the next round naturally retries the full set.
+-- No extra retry state is needed.
 CREATE TABLE IF NOT EXISTS identifier_failures (
     cert_name      TEXT NOT NULL,
     identifier     TEXT NOT NULL,
@@ -283,11 +313,13 @@ CREATE TABLE IF NOT EXISTS identifier_failures (
     PRIMARY KEY (cert_name, identifier)
 );
 
--- 当前生效的降级状态：这张证书正服务着一张缺了几个名字的证书。
+-- The currently active fallback state: this certificate is serving a certificate that
+-- is missing some names.
 --
--- 单独一张表而不是给 certificates 加字段：它不是证书的属性，
--- 而是一个"正在发生的异常"，生命周期也完全不同 ——
--- 全集签发成功就该清掉，证书续期却不该碰它。
+-- A separate table rather than extra columns on certificates: this is not a property
+-- of the certificate but an "incident in progress", and its lifecycle is completely
+-- different -- it should be cleared once the full set issues successfully, while
+-- certificate renewal must not touch it.
 CREATE TABLE IF NOT EXISTS cert_fallback (
     cert_name TEXT PRIMARY KEY,
     dropped   TEXT NOT NULL DEFAULT '',
@@ -300,9 +332,10 @@ CREATE TABLE IF NOT EXISTS cert_fallback (
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	// CREATE TABLE IF NOT EXISTS 不会给**已存在**的表补字段，所以给老库单独补。
-	// 状态库里那句"丢了它就等于撞限速"的警告同样适用于这里：
-	// 升级时宁可多迁一步，也绝不能要求用户删库重建。
+	// CREATE TABLE IF NOT EXISTS does not add columns to an **existing** table, so
+	// patch old databases separately. The package-level warning -- "losing it means
+	// hitting the rate limit" -- applies here too: on upgrade, one extra migration
+	// step is always better than demanding that users delete and rebuild the database.
 	for _, m := range []struct{ table, column, decl string }{
 		{"certificates", "deploy_confirmed", "INTEGER NOT NULL DEFAULT 0"},
 		{"orders", "identifiers", "TEXT NOT NULL DEFAULT ''"},
@@ -314,11 +347,12 @@ CREATE TABLE IF NOT EXISTS cert_fallback (
 	return nil
 }
 
-// ensureColumn 在表上补一个字段（不存在时）。
+// ensureColumn adds a column to a table (when it does not already exist).
 //
-// columnExists 自己把 rows 关掉再返回，是有意的：连接池被限制成
-// MaxOpenConns(1)，靠 rows 迭代到 EOF 触发的隐式关闭来释放连接太隐晦 ——
-// 一旦有人把下面这个循环改成提前 return，ALTER 就会永久阻塞在等连接上。
+// columnExists closing rows itself before returning is deliberate: the pool is capped
+// at MaxOpenConns(1), and relying on the implicit close triggered by iterating rows to
+// EOF to free the connection is too subtle -- if someone changes the loop below to
+// return early, ALTER blocks forever waiting for a connection.
 func (s *Store) ensureColumn(table, column, decl string) error {
 	exists, err := s.columnExists(table, column)
 	if err != nil {
@@ -327,8 +361,9 @@ func (s *Store) ensureColumn(table, column, decl string) error {
 	if exists {
 		return nil
 	}
-	// 这里是拼字符串而不是占位符：SQLite 的 DDL 不接受参数化列名/类型。
-	// 三个入参都是代码里的字面量，不含用户输入。
+	// String concatenation instead of placeholders here: SQLite DDL does not accept
+	// parameterized column names or types. All three arguments are literals in the
+	// code and contain no user input.
 	if _, err := s.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl); err != nil {
 		return fmt.Errorf("alter %s add %s: %w", table, column, err)
 	}
@@ -361,7 +396,7 @@ func (s *Store) columnExists(table, column string) (bool, error) {
 	return false, rows.Err()
 }
 
-// ---------- 时间辅助：SQLite 里统一存 unix 秒，0 表示零值 ----------
+// ---------- Time helpers: SQLite stores unix seconds throughout, 0 means zero value ----------
 
 func toUnix(t time.Time) int64 {
 	if t.IsZero() {
@@ -379,7 +414,7 @@ func fromUnix(v int64) time.Time {
 
 // ---------- Account ----------
 
-// GetAccount 读取账号；不存在时返回 (nil, nil)。
+// GetAccount reads the account; returns (nil, nil) when it does not exist.
 func (s *Store) GetAccount(directory string) (*Account, error) {
 	row := s.db.QueryRow(
 		`SELECT directory, kid, private_key_pem FROM accounts WHERE directory = ?`, directory)
@@ -394,7 +429,7 @@ func (s *Store) GetAccount(directory string) (*Account, error) {
 	return a, nil
 }
 
-// PutAccount 写入账号。
+// PutAccount writes the account.
 func (s *Store) PutAccount(a *Account) error {
 	_, err := s.db.Exec(`
 		INSERT INTO accounts (directory, kid, private_key_pem, updated_at)
@@ -412,10 +447,11 @@ func (s *Store) PutAccount(a *Account) error {
 
 // ---------- CertState ----------
 
-// ListCertNames 返回状态库里所有证书名，已排序。
+// ListCertNames returns every certificate name in the state database, sorted.
 //
-// 用途是"孤儿检查"：状态库里有、但期望状态里已经没有的证书不会再被续期，
-// 最终会安静地过期。让这个集合能被看见，是那条失败路径唯一的兜底。
+// Its purpose is the "orphan check": a certificate present in the state database but
+// gone from the desired state will never be renewed again and will quietly expire.
+// Making this set visible is the only backstop for that failure path.
 func (s *Store) ListCertNames() ([]string, error) {
 	rows, err := s.db.Query(`SELECT name FROM certificates ORDER BY name`)
 	if err != nil {
@@ -434,7 +470,7 @@ func (s *Store) ListCertNames() ([]string, error) {
 	return out, rows.Err()
 }
 
-// GetCert 读取证书状态；不存在时返回 (nil, nil)。
+// GetCert reads certificate state; returns (nil, nil) when it does not exist.
 func (s *Store) GetCert(name string) (*CertState, error) {
 	row := s.db.QueryRow(`
 		SELECT name, not_after, cert_url, cert_pem, key_pem, issued_at,
@@ -472,7 +508,7 @@ func (s *Store) GetCert(name string) (*CertState, error) {
 	return c, nil
 }
 
-// PutCert 写入证书状态。
+// PutCert writes certificate state.
 func (s *Store) PutCert(c *CertState) error {
 	_, err := s.db.Exec(`
 		INSERT INTO certificates (
@@ -501,8 +537,15 @@ func (s *Store) PutCert(c *CertState) error {
 		c.Name, toUnix(c.NotAfter), c.CertURL, c.CertPEM, c.KeyPEM, toUnix(c.IssuedAt),
 		c.ARICertID, toUnix(c.ARIWindowStart), toUnix(c.ARIWindowEnd), toUnix(c.ARICheckedAt),
 		int64(c.ARIRetryAfter),
-		c.ConsecutiveFailures, toUnix(c.NextAttemptAt), c.LastError, c.DeployedCertID,
-		c.DeployConfirmed, time.Now().Unix())
+		// Truncated at the one place every caller funnels through, not in each
+		// producer. last_error carries upstream text: lego embeds the whole non-JSON
+		// ACME error body in its errors, and the CVM metadata path echoes part of a
+		// response body. Unbounded, that is both a growth vector and remote-controlled
+		// text that /hook/status serves and notifyURL posts off-host. The identifier
+		// ledger already bounds its equivalent at 512 (fallback.go); this is the same
+		// rule applied where it cannot be forgotten.
+		c.ConsecutiveFailures, toUnix(c.NextAttemptAt), truncate(c.LastError, maxLastErrorBytes),
+		c.DeployedCertID, c.DeployConfirmed, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("put cert %s: %w", c.Name, err)
 	}
@@ -511,7 +554,7 @@ func (s *Store) PutCert(c *CertState) error {
 
 // ---------- Order ----------
 
-// GetOrder 读取进行中的订单；不存在时返回 (nil, nil)。
+// GetOrder reads the in-flight order; returns (nil, nil) when it does not exist.
 func (s *Store) GetOrder(certName string) (*Order, error) {
 	row := s.db.QueryRow(`
 		SELECT cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers
@@ -531,7 +574,7 @@ func (s *Store) GetOrder(certName string) (*Order, error) {
 	return o, nil
 }
 
-// PutOrder 写入进行中的订单。
+// PutOrder writes the in-flight order.
 func (s *Store) PutOrder(o *Order) error {
 	_, err := s.db.Exec(`
 		INSERT INTO orders (
@@ -555,7 +598,7 @@ func (s *Store) PutOrder(o *Order) error {
 	return nil
 }
 
-// DeleteOrder 丢弃当前订单（订单已失效或被放弃）。
+// DeleteOrder discards the current order (it expired or was abandoned).
 func (s *Store) DeleteOrder(certName string) error {
 	_, err := s.db.Exec(`DELETE FROM orders WHERE cert_name = ?`, certName)
 	if err != nil {
@@ -566,7 +609,7 @@ func (s *Store) DeleteOrder(certName string) error {
 
 // ---------- Authorization ----------
 
-// ListAuthorizations 列出某证书订单下的全部授权。
+// ListAuthorizations lists every authorization under a certificate's order.
 func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 	rows, err := s.db.Query(`
 		SELECT cert_name, authz_url, identifier, status, challenge_url, challenge_token,
@@ -590,7 +633,7 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 	return out, rows.Err()
 }
 
-// PutAuthorization 写入单个授权。
+// PutAuthorization writes a single authorization.
 func (s *Store) PutAuthorization(a *Authorization) error {
 	_, err := s.db.Exec(`
 		INSERT INTO authorizations (
@@ -614,11 +657,12 @@ func (s *Store) PutAuthorization(a *Authorization) error {
 	return nil
 }
 
-// DeleteAuthorizations 清空某证书的全部授权记录。
+// DeleteAuthorizations clears every authorization record for a certificate.
 //
-// 注意：manager 现在不走它了 —— 丢弃订单时应该调 cleanupOrphanTXT，
-// 它会先把 DNS 上还挂着的 TXT 收掉再删行。这个方法是留给"确实要整表清空"
-// 的场景（例如测试或人工干预）的兜底。
+// Note: the manager no longer goes through this -- discarding an order should call
+// cleanupOrphanTXT, which first reclaims TXT records still present in DNS and only
+// then deletes rows. This method is a backstop for cases that genuinely need the whole
+// table cleared (tests or manual intervention, for example).
 func (s *Store) DeleteAuthorizations(certName string) error {
 	_, err := s.db.Exec(`DELETE FROM authorizations WHERE cert_name = ?`, certName)
 	if err != nil {
@@ -627,8 +671,9 @@ func (s *Store) DeleteAuthorizations(certName string) error {
 	return nil
 }
 
-// DeleteAuthorization 删除单条授权记录。
-// 用于清理已经回收掉 TXT、不再需要跟踪的残留授权行。
+// DeleteAuthorization deletes a single authorization record.
+// Used to clean up leftover authorization rows whose TXT has already been reclaimed
+// and no longer needs tracking.
 func (s *Store) DeleteAuthorization(certName, authzURL string) error {
 	_, err := s.db.Exec(
 		`DELETE FROM authorizations WHERE cert_name = ? AND authz_url = ?`, certName, authzURL)
@@ -640,14 +685,14 @@ func (s *Store) DeleteAuthorization(certName, authzURL string) error {
 
 // ---------- RetiredCert ----------
 
-// RetiredCert 是一张已从线上换下、暂时保留用于回滚的云端证书。
+// RetiredCert is a cloud certificate taken out of service and kept briefly for rollback.
 type RetiredCert struct {
 	CertID    string
 	CertName  string
 	RetiredAt time.Time
 }
 
-// AddRetiredCert 记录一张退役证书。
+// AddRetiredCert records a retired certificate.
 func (s *Store) AddRetiredCert(certID, certName string) error {
 	_, err := s.db.Exec(`
 		INSERT INTO retired_certificates (cert_id, cert_name, retired_at) VALUES (?, ?, ?)
@@ -659,7 +704,7 @@ func (s *Store) AddRetiredCert(certID, certName string) error {
 	return nil
 }
 
-// ListRetiredCertsBefore 列出退役时间早于 cutoff 的证书，用于回收。
+// ListRetiredCertsBefore lists certificates retired before cutoff, for reclamation.
 func (s *Store) ListRetiredCertsBefore(cutoff time.Time) ([]*RetiredCert, error) {
 	rows, err := s.db.Query(`
 		SELECT cert_id, cert_name, retired_at FROM retired_certificates WHERE retired_at < ?`,
@@ -682,7 +727,8 @@ func (s *Store) ListRetiredCertsBefore(cutoff time.Time) ([]*RetiredCert, error)
 	return out, rows.Err()
 }
 
-// DeleteRetiredCert 从回收列表里移除（云端删除成功后调用）。
+// DeleteRetiredCert removes an entry from the reclamation list (called after the
+// cloud-side delete succeeds).
 func (s *Store) DeleteRetiredCert(certID string) error {
 	_, err := s.db.Exec(`DELETE FROM retired_certificates WHERE cert_id = ?`, certID)
 	if err != nil {

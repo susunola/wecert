@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
@@ -16,7 +17,8 @@ import (
 	"github.com/susunola/wecert/internal/config"
 )
 
-// TencentCLB 通过腾讯云 SSL 证书服务把证书一键更新到绑定的 CLB 资源上。
+// TencentCLB uses the Tencent Cloud SSL certificate service to one-click update a
+// certificate onto its bound CLB resources.
 type TencentCLB struct {
 	credential CredentialFunc
 	regions    []string
@@ -25,7 +27,72 @@ type TencentCLB struct {
 	now        func() time.Time
 }
 
-// NewTencentCLB 构造部署器。
+// LazyTencentCLB creates the Tencent Cloud deployer only when an operation
+// actually needs it. Desired-state documents can enable deployment after the
+// process has started, while a document that keeps every certificate local
+// should not require otherwise-unused static credentials at startup.
+type LazyTencentCLB struct {
+	cfg config.Tencent
+	log *slog.Logger
+
+	mu    sync.Mutex
+	inner *TencentCLB
+}
+
+// NewLazyTencentCLB returns a deployer that defers credential validation and
+// client construction until Deploy, Delete, or Bindings is first needed.
+func NewLazyTencentCLB(cfg config.Tencent, log *slog.Logger) *LazyTencentCLB {
+	return &LazyTencentCLB{cfg: cfg, log: log}
+}
+
+func (d *LazyTencentCLB) client() (*TencentCLB, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.inner != nil {
+		return d.inner, nil
+	}
+	inner, err := NewTencentCLB(d.cfg, d.log)
+	if err != nil {
+		return nil, err
+	}
+	d.inner = inner
+	return inner, nil
+}
+
+// Deploy implements Deployer.
+func (d *LazyTencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM, keyPEM []byte) (string, error) {
+	inner, err := d.client()
+	if err != nil {
+		return "", err
+	}
+	return inner.Deploy(ctx, certName, oldID, certPEM, keyPEM)
+}
+
+// Delete implements Deployer.
+func (d *LazyTencentCLB) Delete(ctx context.Context, certID string) error {
+	if certID == "" {
+		return nil
+	}
+	inner, err := d.client()
+	if err != nil {
+		return err
+	}
+	return inner.Delete(ctx, certID)
+}
+
+// Bindings implements Deployer.
+func (d *LazyTencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
+	if certID == "" {
+		return 0, nil
+	}
+	inner, err := d.client()
+	if err != nil {
+		return 0, err
+	}
+	return inner.Bindings(ctx, certID)
+}
+
+// NewTencentCLB constructs the deployer.
 func NewTencentCLB(cfg config.Tencent, log *slog.Logger) (*TencentCLB, error) {
 	src, err := NewCredentialSource(cfg)
 	if err != nil {
@@ -40,23 +107,64 @@ func NewTencentCLB(cfg config.Tencent, log *slog.Logger) (*TencentCLB, error) {
 	}, nil
 }
 
-// client 构造 SSL 证书服务的客户端。
-func (d *TencentCLB) client(ctx context.Context) (*ssl.Client, error) {
+// deployRecordGrace is how long a deploy record may report all-zero counters before the
+// wait concludes that nothing was bound. See waitDeployRecord.
+const deployRecordGrace = 15 * time.Second
+
+// sslAPI is the narrow slice of the Tencent Cloud SSL client this package uses.
+//
+// *ssl.Client is a concrete struct with no interface seam, and client() used to rebuild
+// it on every call -- which left the polling logic in updateInstance and
+// waitDeployRecord (the most failure-prone part of the package) impossible to
+// unit-test. Declaring only the used methods as an interface lets tests substitute a
+// fake while the production implementation stays the real SDK client.
+type sslAPI interface {
+	UploadCertificateWithContext(ctx context.Context, req *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error)
+	UpdateCertificateInstanceWithContext(ctx context.Context, req *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error)
+	DescribeHostUpdateRecordDetailWithContext(ctx context.Context, req *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error)
+	DeleteCertificateWithContext(ctx context.Context, req *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error)
+	CreateCertificateBindResourceSyncTaskWithContext(ctx context.Context, req *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error)
+	DescribeCertificateBindResourceTaskResultWithContext(ctx context.Context, req *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error)
+}
+
+// newSSLClient builds the production SSL API client.
+//
+// It is a package-level variable rather than a parameter of NewTencentCLB: that keeps
+// the exported constructor (and its callers, e.g. internal/acme) unchanged while still
+// letting tests swap in a fake.
+var newSSLClient = func(cred common.CredentialIface) (sslAPI, error) {
+	cpf := profile.NewClientProfile()
+	cpf.HttpProfile.Endpoint = "ssl.tencentcloudapi.com"
+	// The upload request body can be hundreds of KB, so the default timeout is not enough.
+	cpf.HttpProfile.ReqTimeout = 60
+
+	// The SSL certificate service is global, so pass an empty Region.
+	return ssl.NewClient(cred, "", cpf)
+}
+
+// client resolves credentials and builds a client for the SSL certificate service.
+func (d *TencentCLB) client(ctx context.Context) (sslAPI, error) {
 	cred, err := d.credential(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	cpf := profile.NewClientProfile()
-	cpf.HttpProfile.Endpoint = "ssl.tencentcloudapi.com"
-	// 上传证书的请求体可能几百 KB，默认超时不够用。
-	cpf.HttpProfile.ReqTimeout = 60
-
-	// SSL 证书服务是全局的，Region 传空。
-	return ssl.NewClient(cred, "", cpf)
+	return newSSLClient(cred)
 }
 
-// Deploy 上传新证书，并在存在旧证书时一键更新所有绑定了旧证书的云资源。
+// waitBetweenPolls sleeps between polling iterations while still honoring context
+// cancellation. It is a variable so tests can advance a fake clock instantly instead
+// of waiting real seconds; production behavior is a plain interruptible sleep.
+var waitBetweenPolls = func(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
+// Deploy uploads the new certificate and, when an old one exists, one-click updates every
+// cloud resource bound to it.
 func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM, keyPEM []byte) (string, error) {
 	client, err := d.client(ctx)
 	if err != nil {
@@ -68,28 +176,49 @@ func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM
 		return "", err
 	}
 
-	// 首次签发：腾讯云侧还没有"旧证书 → 云资源"的绑定关系可查，
-	// 只能上传后由人工在 CLB 控制台绑定一次。之后每次续期都是全自动的。
+	// First issuance: there is no "old certificate -> cloud resource" binding on the Tencent
+	// Cloud side to look up, so after upload a human has to bind it once in the CLB console.
+	// Every renewal after that is fully automatic.
 	if oldID == "" {
 		return newID, nil
 	}
 
-	// 注意：出错时仍然把已经上传成功的 newID 交出去。
-	// 调用方必须把它记进待回收列表，否则这张证书会变成云端孤儿，
-	// 永远占着账号的上传证书配额。
+	// Note: on error, still hand back the newID that was already uploaded successfully.
+	// The caller must record it in the reclamation list, otherwise this certificate becomes a
+	// cloud orphan that occupies the account's uploaded-certificate quota forever.
 	if err := d.updateInstance(ctx, client, oldID, newID); err != nil {
+		// Before believing that nothing was switched, check whether the new certificate is
+		// already bound to something.
+		//
+		// This is the recovery path for a switch that happened but was not recorded. The
+		// shape is: the rebind went through (or an earlier attempt's did), so the *old*
+		// certificate has no bindings left, and every later round therefore fails the
+		// "nothing to switch" check no matter how many certificates we upload. Asking
+		// about the new certificate settles it directly: if anything is bound to it, the
+		// switch is done and the honest answer is success.
+		//
+		// It also heals deployments that were already stuck this way before the
+		// creation-time progress check was corrected, which no amount of fixing that check
+		// would rescue on its own.
+		if n, berr := d.bindingsWith(ctx, client, newID); berr == nil && n > 0 {
+			d.log.Warn("the one-click update reported nothing to switch, but the new certificate is already bound; "+
+				"treating the switch as done (this is the recovery path for a rebind that succeeded without being recorded)",
+				"oldCertId", oldID, "newCertId", newID, "boundResources", n)
+			return newID, nil
+		}
 		return newID, err
 	}
 	return newID, nil
 }
 
-func (d *TencentCLB) upload(ctx context.Context, client *ssl.Client, certName string, certPEM, keyPEM []byte) (string, error) {
+func (d *TencentCLB) upload(ctx context.Context, client sslAPI, certName string, certPEM, keyPEM []byte) (string, error) {
 	req := ssl.NewUploadCertificateRequest()
 	req.CertificatePublicKey = common.StringPtr(string(certPEM))
 	req.CertificatePrivateKey = common.StringPtr(string(keyPEM))
 	req.CertificateType = common.StringPtr("SVR")
 	req.Alias = common.StringPtr("wecert/" + certName)
-	// 允许重复上传相同指纹的证书：否则重试一次上传就会直接失败。
+	// Allow re-uploading a certificate with the same fingerprint: otherwise a single upload
+	// retry fails outright.
 	req.Repeatable = common.BoolPtr(true)
 
 	resp, err := client.UploadCertificateWithContext(ctx, req)
@@ -102,23 +231,25 @@ func (d *TencentCLB) upload(ctx context.Context, client *ssl.Client, certName st
 	return *resp.Response.CertificateId, nil
 }
 
-// updateInstance 调 UpdateCertificateInstance 做一键更新。
+// updateInstance calls UpdateCertificateInstance to do the one-click update.
 //
-// 这个 API 是异步的，而且有个不太直观的约定：DeployRecordId == 0
-// 表示任务还在创建中，必须重复请求直到它 > 0 才算创建成功。
-// DeployStatus == 0 则表示"已有一个进行中的任务"，这天然就是幂等的。
-func (d *TencentCLB) updateInstance(ctx context.Context, client *ssl.Client, oldID, newID string) error {
+// The API is asynchronous and has a rather unintuitive convention: DeployRecordId == 0
+// means the task is still being created, so the request must be repeated until it is > 0
+// before creation counts as successful.
+// DeployStatus == 0 means "a task is already in progress", which is naturally idempotent.
+func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, newID string) error {
 	req := ssl.NewUpdateCertificateInstanceRequest()
 	req.OldCertificateId = common.StringPtr(oldID)
 	req.CertificateId = common.StringPtr(newID)
 	req.ResourceTypes = toPtrSlice(d.types)
 	req.ResourceTypesRegions = d.resourceTypeRegions()
-	// 1 = 忽略旧证书的到期提醒。不加这条，续期成功后旧证书还会一直发到期告警。
+	// 1 = ignore the old certificate's expiry reminder. Without this, the old certificate
+	// keeps firing expiry alerts even after a successful renewal.
 	req.ExpiringNotificationSwitch = common.Uint64Ptr(1)
 
 	deadline := d.now().Add(2 * time.Minute)
-	// 注意类型：UpdateCertificateInstance 响应里的 DeployRecordId 是 *uint64
-	// （SDK 里另有几处同名字段是 *int64，别抄错那个）。
+	// Mind the type: DeployRecordId in the UpdateCertificateInstance response is *uint64
+	// (the SDK has several same-named fields elsewhere that are *int64 -- do not copy that).
 	var recordID uint64
 	for {
 		resp, err := client.UpdateCertificateInstanceWithContext(ctx, req)
@@ -127,25 +258,42 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client *ssl.Client, old
 		}
 		if resp.Response != nil && resp.Response.DeployRecordId != nil && *resp.Response.DeployRecordId > 0 {
 			recordID = *resp.Response.DeployRecordId
-			// 把服务端报的进度原样打出来。
-			// bound 就是"这张旧证书实际绑了几个资源"——
-			// 它是判断一键更新到底有没有生效的唯一权威依据，
-			// 因为 CLB 的 DescribeListeners 并不回读证书绑定。
-			bound, progressReady := progressBoundCount(resp.Response.UpdateSyncProgress)
+			progress := resp.Response.UpdateSyncProgress
+			bound, progressReady := progressBoundCount(progress)
 			d.log.Info("one-click update task created",
 				"oldCertId", oldID, "newCertId", newID,
 				"deployRecordId", recordID,
 				"boundResources", bound,
-				"progress", formatProgress(resp.Response.UpdateSyncProgress))
+				"progress", formatProgress(progress))
+
+			// `bound` is only an answer when the server actually sent progress.
+			//
+			// An empty UpdateSyncProgress is a **missing** answer, not the answer "zero".
+			// The API creates the task and reports per-region progress separately, and on
+			// the response that first carries a DeployRecordId it is routinely still
+			// absent -- observed in production: the task was created (recordId=14822) with
+			// no progress detail, wecert read that as "nothing is bound" and failed the
+			// rebind, and the cloud finished switching the listener 47 seconds later.
+			//
+			// That failure is not self-correcting. wecert keeps the old certificate as its
+			// anchor, the old certificate has no bindings left because the switch *did*
+			// happen, so every later round uploads another certificate, fails the same way,
+			// and records another orphan -- while the certificate actually serving traffic
+			// sits in retired_certificates, protected only by the cloud-side resource check.
+			//
+			// So a populated response reporting zero still refuses (that really is "nothing
+			// bound"), and an unpopulated one defers to the task record, which is
+			// authoritative.
+			//
+			// progressReady is the precise form of "populated": it is a null TotalCount,
+			// not an empty progress list, that carries the ambiguity -- a response can list
+			// regions and still have no count for any of them.
 			if bound == 0 && progressReady {
-				// 进度明细已填充且确实没有任何资源绑定旧证书。
 				return noResourceBoundError(oldID, d.regions)
 			}
 			if bound == 0 && !progressReady {
-				// 进度明细尚未填充（TotalCount 全为 null）：任务已创建成功，
-				// 不能仅凭同步响应判定失败，等异步任务的真实结果来裁决。
-				d.log.Warn("the sync progress has no per-region detail yet; "+
-					"falling back to the async deploy record to decide whether any resource is bound",
+				d.log.Warn("the sync progress carries no per-region count yet; "+
+					"deferring to the async deploy record to decide whether anything was bound",
 					"oldCertId", oldID, "newCertId", newID, "deployRecordId", recordID)
 			}
 			return d.waitDeployRecord(ctx, client, recordID, oldID)
@@ -153,82 +301,87 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client *ssl.Client, old
 		if d.now().After(deadline) {
 			return fmt.Errorf("the UpdateCertificateInstance task was not created within 2m (there may be one already running)")
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(3 * time.Second):
+		if err := waitBetweenPolls(ctx, 3*time.Second); err != nil {
+			return err
 		}
 	}
 }
 
-// waitDeployRecord 等一键更新任务真正跑完。
+// waitDeployRecord waits for the one-click update task to actually finish.
 //
-// 调 UpdateCertificateInstance 返回只代表任务创建成功，重绑定是后台异步做的。
-// 不等它跑完就把 DeployConfirmed 置位，等于把"程序以为成功、实际没生效"
-// 这个最隐蔽的故障形态写进状态库。
-func (d *TencentCLB) waitDeployRecord(ctx context.Context, client *ssl.Client, recordID uint64, oldID string) error {
+// UpdateCertificateInstance returning only means the task was created; the rebinding
+// happens asynchronously in the background. Setting DeployConfirmed without waiting for it
+// to finish writes the most insidious failure mode -- "the program thinks it succeeded
+// while nothing actually took effect" -- into the state database.
+func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, recordID uint64, oldID string) error {
 	deadline := d.now().Add(3 * time.Minute)
-	// 任务创建成功之后、服务端把 running 置 1 之前，有一个三个计数全 0 的
-	// 短暂窗口。立刻判"无绑定资源"会复现同步响应误判的问题，先给一个宽限期。
-	graceUntil := d.now().Add(15 * time.Second)
+
+	// Between the task being created and the server marking it running, every counter is
+	// zero. Concluding "no resource is bound" from that instant would repeat the very
+	// mistake this path exists to absorb, so the zero-resource verdict waits for a short
+	// grace period first -- long enough for a task that has work to show it, short enough
+	// that a genuinely unbound certificate is still diagnosed promptly rather than after
+	// the full three minutes.
+	graceUntil := d.now().Add(deployRecordGrace)
+
 	for {
-		success, failed, running, err := d.describeDeployRecord(ctx, client, recordID)
+		success, failed, running, pending, err := d.describeDeployRecord(ctx, client, recordID)
 		if err != nil {
 			d.log.Warn("failed to query the deploy record; retrying shortly", "deployRecordId", recordID, "err", err)
 		} else {
 			d.log.Info("one-click update progress",
 				"deployRecordId", recordID,
-				"success", success, "failed", failed, "running", running)
-			if running == 0 && (success+failed) > 0 {
+				"success", success, "failed", failed, "running", running, "pending", pending)
+
+			// Pending counts as unfinished. Resources are queued before they run, so
+			// "nothing is running" can be true while most of the task has not started --
+			// declaring success there means retiring the old certificate while listeners
+			// still serve it.
+			if running == 0 && pending == 0 && (success+failed) > 0 {
 				if failed > 0 {
 					return fmt.Errorf("one-click update finished with %d resources failed (%d succeeded)", failed, success)
 				}
 				return nil
 			}
-			// 任务已结束但没有更新任何资源：旧证书确实没有被任何资源绑定。
-			// 这就是同步响应里 TotalCount 为 null 时被推迟到这里的裁决点。
-			if running == 0 && success == 0 && failed == 0 && d.now().After(graceUntil) {
+
+			// Settled and updated nothing: the old certificate really is bound to no
+			// resource. This is the verdict the sync response defers here when its
+			// per-region TotalCount had not been populated yet.
+			if running == 0 && pending == 0 && success == 0 && failed == 0 && d.now().After(graceUntil) {
 				return noResourceBoundError(oldID, d.regions)
 			}
 		}
 		if d.now().After(deadline) {
-			return fmt.Errorf("one-click update task %d did not finish within 3m (success=%d failed=%d running=%d)",
-				recordID, success, failed, running)
+			return fmt.Errorf("one-click update task %d did not finish within 3m (success=%d failed=%d running=%d pending=%d)",
+				recordID, success, failed, running, pending)
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		if err := waitBetweenPolls(ctx, 5*time.Second); err != nil {
+			return err
 		}
 	}
 }
 
-// describeDeployRecord 查询一次部署记录的资源级明细。
-func (d *TencentCLB) describeDeployRecord(ctx context.Context, client *ssl.Client, recordID uint64) (success, failed, running int64, err error) {
+// describeDeployRecord queries the resource-level detail of a deploy record once.
+func (d *TencentCLB) describeDeployRecord(ctx context.Context, client sslAPI, recordID uint64) (success, failed, running, pending int64, err error) {
 	req := ssl.NewDescribeHostUpdateRecordDetailRequest()
 	req.DeployRecordId = common.StringPtr(strconv.FormatUint(recordID, 10))
 	resp, err := client.DescribeHostUpdateRecordDetailWithContext(ctx, req)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	if resp.Response == nil {
-		return 0, 0, 0, errors.New("DescribeHostUpdateRecordDetail returned an empty response")
+		return 0, 0, 0, 0, errors.New("DescribeHostUpdateRecordDetail returned an empty response")
 	}
 	return derefI64(resp.Response.SuccessTotalCount),
 		derefI64(resp.Response.FailedTotalCount),
 		derefI64(resp.Response.RunningTotalCount),
+		derefI64(resp.Response.PendingTotalCount),
 		nil
 }
 
-// noResourceBoundError 生成"旧证书没有被任何资源绑定"的错误。
-// 同步响应（进度已填充）和异步任务结果（零资源结束）两处裁决点共用。
-func noResourceBoundError(oldID string, regions []string) error {
-	return fmt.Errorf("UpdateCertificateInstance found no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
-		oldID, regions)
-}
-
-// resourceTypeRegions 按资源类型展开地域列表。
-// CLB 等资源是分地域的，不传地域会一个实例都更新不到。
+// resourceTypeRegions expands the region list per resource type.
+// Resources such as CLB are regional, so omitting regions means not one instance gets
+// updated.
 func (d *TencentCLB) resourceTypeRegions() []*ssl.ResourceTypeRegions {
 	out := make([]*ssl.ResourceTypeRegions, 0, len(d.types))
 	for _, t := range d.types {
@@ -240,10 +393,11 @@ func (d *TencentCLB) resourceTypeRegions() []*ssl.ResourceTypeRegions {
 	return out
 }
 
-// Delete 删除一张已退役的证书。
+// Delete removes a retired certificate.
 //
-// 这一步不是可选的：腾讯云账号下上传证书数量有配额，
-// 长期运行的自动化如果不回收旧证书，早晚会撞上配额而无法续期。
+// This step is not optional: Tencent Cloud accounts have a quota on uploaded certificates,
+// and long-running automation that never reclaims old certificates will eventually hit the
+// quota and be unable to renew.
 func (d *TencentCLB) Delete(ctx context.Context, certID string) error {
 	if certID == "" {
 		return nil
@@ -255,10 +409,12 @@ func (d *TencentCLB) Delete(ctx context.Context, certID string) error {
 
 	req := ssl.NewDeleteCertificateRequest()
 	req.CertificateId = common.StringPtr(certID)
-	// true = 让服务端仍然检查关联资源：只要还有云资源引用着这张证书就拒绝删除。
-	// 这比"我们自己管绑定关系、跳过检查"更保守 —— 删不掉的代价是配额被占住，
-	// 误删的代价是线上 HTTPS 直接中断，两者不对等。
-	// 删不掉时 ReapRetired 会记警告并在下一轮重试。
+	// true = have the server still check associated resources: refuse the delete as long as
+	// any cloud resource still references this certificate.
+	// This is more conservative than "we track bindings ourselves and skip the check" -- the
+	// cost of a failed delete is a held quota slot, while the cost of a mistaken delete is
+	// production HTTPS going down. The two are not equivalent.
+	// When the delete fails, ReapRetired logs a warning and retries next round.
 	req.IsCheckResource = common.BoolPtr(true)
 
 	if _, err := client.DeleteCertificateWithContext(ctx, req); err != nil {
@@ -275,16 +431,17 @@ func toPtrSlice(in []string) []*string {
 	return out
 }
 
-// progressBoundCount 统计这次一键更新一共覆盖了几个资源。
-// 为 0 意味着"没找到任何绑定了旧证书的资源"，也就是说证书其实没绑上 ——
-// 这是最容易被忽略的失败形态。
+// progressBoundCount counts how many resources this one-click update covers in total,
+// and reports whether the server has populated that detail yet.
 //
-// 第二个返回值 ready 表示服务端是否已经填充了进度明细。
-// UpdateCertificateInstance 的同步响应里 UpdateSyncProgressRegions[].TotalCount
-// 是服务端异步填充的：任务刚创建时它可能是 null（实测出现过任务创建成功、
-// 47 秒后后台正常完成，但同步响应里 TotalCount 全为 null 的情形）。
-// null 不等于 0——此时不能据此判定失败，只能等 DescribeHostUpdateRecordDetail
-// 的异步结果来裁决，否则会把一次成功的换绑误报成失败。
+// A count of zero used to be read on its own as "no resource bound to the old
+// certificate", i.e. the certificate was never actually bound -- the failure mode most
+// easily overlooked. But `UpdateSyncProgressRegions[].TotalCount` is filled in
+// asynchronously, so on the response that first carries a DeployRecordId it can still be
+// **null**, and null is not zero: the task was created and may well be switching the
+// listener right now. `ready` separates the two -- at least one region carrying a real
+// TotalCount means the server has answered, and a zero from an answered response is the
+// genuine no-binding case.
 func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready bool) {
 	var n int64
 	for _, p := range progress {
@@ -298,7 +455,15 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready 
 	return n, ready
 }
 
-// formatProgress 把 UpdateCertificateInstance 的进度摘要成一行。
+// noResourceBoundError is the diagnosis shared by the two places that can conclude the
+// old certificate was bound to nothing: a populated sync response reporting zero, and an
+// async task that settles having updated nothing.
+func noResourceBoundError(oldID string, regions []string) error {
+	return fmt.Errorf("UpdateCertificateInstance found no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
+		oldID, regions)
+}
+
+// formatProgress summarizes UpdateCertificateInstance progress into a single line.
 func formatProgress(progress []*ssl.UpdateSyncProgress) string {
 	if len(progress) == 0 {
 		return "(the server returned no progress detail)"
@@ -331,29 +496,37 @@ func derefI64(v *int64) int64 {
 	return *v
 }
 
-// Bindings 查询这张证书当前绑定到多少个云资源。
+// Bindings queries how many cloud resources this certificate is currently bound to.
 //
-// 这是只读的：CreateCertificateBindResourceSyncTask 建一个枚举任务，
-// 再按 TaskId 取结果。刻意不用 UpdateCertificateInstance 去“试探”，
-// 那个是写操作，确认绑定不该产生副作用。
+// This is read-only: CreateCertificateBindResourceSyncTask creates an enumeration task and
+// the result is then fetched by TaskId. Deliberately not using UpdateCertificateInstance to
+// "probe" the state, because that is a write operation and confirming a binding must not
+// produce side effects.
 //
-// 为什么要它：首次签发只上传、不绑定，DeployConfirmed 因此是 false。
-// 人工在控制台绑好之后，原本没有任何路径回来把它置位 ——
-// deployed 指标会在整个证书周期（classic 最长 90 天）里报“未部署”，
-// 而证书其实一直在正常服务。
+// Why it is needed: first issuance only uploads and does not bind, so DeployConfirmed is
+// false. After a human binds it in the console there used to be no path back to set it --
+// the deployed metric would report "not deployed" for the whole certificate cycle (up to 90
+// days for classic) even though the certificate was serving traffic the entire time.
 func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
 	if certID == "" {
 		return 0, nil
 	}
-
 	client, err := d.client(ctx)
 	if err != nil {
 		return 0, err
 	}
+	return d.bindingsWith(ctx, client, certID)
+}
 
+// bindingsWith enumerates a certificate's bindings against an existing client.
+//
+// Split out so Deploy's recovery path can reuse it: that path already holds a client,
+// and rebuilding one would mean a second credential fetch and TLS setup.
+func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID string) (int, error) {
 	createReq := ssl.NewCreateCertificateBindResourceSyncTaskRequest()
 	createReq.CertificateIds = []*string{common.StringPtr(certID)}
-	// IsCache=1：允许复用服务端缓存，避免每次收敛都打一次全量枚举。
+	// IsCache=1: allow reusing the server-side cache, avoiding a full enumeration on every
+	// reconcile.
 	createReq.IsCache = common.Uint64Ptr(1)
 
 	createResp, err := client.CreateCertificateBindResourceSyncTaskWithContext(ctx, createReq)
@@ -375,8 +548,8 @@ func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
 		return 0, nil
 	}
 
-	// 枚举是异步的，轮询到有结果为止。给一个短上限：
-	// 这只是个确认动作，不值得为它长时间阻塞收敛。
+	// Enumeration is asynchronous, so poll until there is a result. Keep the ceiling short:
+	// this is only a confirmation action and not worth blocking reconciliation on for long.
 	deadline := d.now().Add(30 * time.Second)
 	for {
 		queryReq := ssl.NewDescribeCertificateBindResourceTaskResultRequest()
@@ -396,32 +569,34 @@ func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
 		}
 
 		if d.now().After(deadline) {
-			return 0, fmt.Errorf("绑定关系枚举在 30s 内未完成（taskId=%s）", taskID)
+			return 0, fmt.Errorf("the bind-resource enumeration did not finish within 30s (taskId=%s)", taskID)
 		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-time.After(2 * time.Second):
+		if err := waitBetweenPolls(ctx, 2*time.Second); err != nil {
+			return 0, err
 		}
 	}
 }
 
-// bindStatusDone 是枚举任务完成时的 Status 取值。
+// bindStatusDone is the Status value when the enumeration task has completed.
 //
-// 这个值没有公开文档，是实测出来的（见下面 countBindings 的注释）。
+// This value has no public documentation; it was determined empirically (see the
+// countBindings comment below).
 const bindStatusDone = 1
 
-// countBindings 从查询结果里数出绑定资源总数。
+// countBindings counts the total number of bound resources out of the query result.
 //
-// 返回值 done=false 表示任务还没出结果，调用方应继续等。
+// A return value of done=false means the task has no result yet and the caller should keep
+// waiting.
 //
-// 关于 Status 的语义：**实测成功时 Status == 1**。
-// 一开始我按直觉写成“Status != 0 就是还没好”，结果确认永远等不到结果 ——
-// 这个字段的含义不能靠猜，所以把实测结论写在这里。
+// On the meaning of Status: **empirically, Status == 1 means success**.
+// I first wrote "Status != 0 means not ready yet" on intuition, and the confirmation then
+// never saw a result -- this field's meaning cannot be guessed, so the empirical finding is
+// recorded here.
 //
-// 另外必须同时要求 BindResourceResult 非空：首次查询（服务端缓存尚未建立）
-// 会返回一个 TaskId 匹配、但结果列表为空的对象。只判断 TaskId 的话，
-// 会在那一刻就得出“绑定数为 0”，把一张其实绑好的证书判成未绑定。
+// BindResourceResult must also be required to be non-empty: the first query (before the
+// server-side cache exists) returns an object whose TaskId matches but whose result list is
+// empty. Checking only TaskId would conclude "0 bindings" at that instant and judge a
+// perfectly well-bound certificate as unbound.
 func countBindings(
 	resp *ssl.DescribeCertificateBindResourceTaskResultResponse, taskID string,
 ) (count int, done bool, err error) {
@@ -434,12 +609,13 @@ func countBindings(
 			continue
 		}
 
-		// 服务端明确报错时不要继续空等。
+		// Do not keep waiting idly when the server reports an explicit error.
 		if r.Error != nil && r.Error.Message != nil && *r.Error.Message != "" {
 			return 0, false, fmt.Errorf("bind-resource task %s failed: %s", taskID, *r.Error.Message)
 		}
 
-		// 还没完成，或者完成了但结果列表尚未填充 —— 都继续等。
+		// Either not finished yet, or finished but the result list is not populated yet --
+		// keep waiting in both cases.
 		if r.Status == nil || *r.Status != bindStatusDone || len(r.BindResourceResult) == 0 {
 			return 0, false, nil
 		}
@@ -453,8 +629,9 @@ func countBindings(
 				if region == nil || region.TotalCount == nil {
 					continue
 				}
-				// Error 非空表示这个地域查询异常，其结果不可信 ——
-				// 宁可当成“还没查到”，也不要据此把证书标成已部署。
+				// A non-empty Error means this region's query failed and its result cannot be
+				// trusted -- better to treat that as "not found yet" than to mark the
+				// certificate as deployed based on it.
 				if region.Error != nil && *region.Error != "" {
 					continue
 				}
