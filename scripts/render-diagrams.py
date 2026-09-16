@@ -10,8 +10,9 @@
 不会自动折行）。librsvg 会把 foreignObject 整个丢掉，渲出来是六张空图。
 
 用法：
-    python3 scripts/render-diagrams.py            # 全部重渲
-    python3 scripts/render-diagrams.py --only 1   # 只渲第 1 张
+    python3 scripts/render-diagrams.py                # 两种语言全部重渲
+    python3 scripts/render-diagrams.py --only 1       # 只渲第 1 张
+    python3 scripts/render-diagrams.py --lang en      # 只渲英文
 """
 
 import argparse
@@ -24,8 +25,14 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "docs" / "certificate-lifecycle.html"
 OUT_DIR = ROOT / "docs" / "diagrams"
+
+# 两种语言各一套图。中文版是手写的事实来源，英文版由
+# scripts/build-diagram-langs.py 生成。
+LANGS = [
+    ("zh", ROOT / "docs" / "certificate-lifecycle.html"),
+    ("en", ROOT / "docs" / "certificate-lifecycle.en.html"),
+]
 
 # 每张图的文件名与所对应的 SVG 序号（1 起）。名字是给 readme 里的引用用的，
 # 所以取得能自解释，而不是 diagram-1/2/3。
@@ -132,41 +139,48 @@ def render(chrome: str, svg_path: Path, png_path: Path, w: int, h: int) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", type=int, help="只渲第 N 张（1 起）")
+    ap.add_argument("--lang", choices=[l for l, _ in LANGS], help="只渲某一种语言")
     args = ap.parse_args()
 
-    if not SOURCE.exists():
-        sys.exit(f"找不到源文件 {SOURCE}")
-
     chrome = find_chrome()
-    html = SOURCE.read_text(encoding="utf-8")
-    css = extract_style(html)
-    svgs = extract_svgs(html)
-
-    if len(svgs) != len(NAMES):
-        sys.exit(f"源文件里有 {len(svgs)} 张图，但这个脚本预期 {len(NAMES)} 张——"
-                 f"加图或删图之后记得同步 NAMES")
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as tmp:
-        for i, svg in enumerate(svgs, start=1):
-            if args.only and i != args.only:
+        for lang, source in LANGS:
+            if args.lang and lang != args.lang:
                 continue
+            if not source.exists():
+                sys.exit(f"找不到 {source}（英文版要先跑 scripts/build-diagram-langs.py）")
 
-            name = NAMES[i - 1]
-            vb = re.search(r'viewBox="[\d.]+ [\d.]+ ([\d.]+) ([\d.]+)"', svg)
-            w, h = int(float(vb.group(1))), int(float(vb.group(2)))
+            html = source.read_text(encoding="utf-8")
+            css = extract_style(html)
+            svgs = extract_svgs(html)
 
-            svg_path = Path(tmp) / f"{name}.svg"
-            svg_path.write_text(standalone(svg, css, i), encoding="utf-8")
+            if len(svgs) != len(NAMES):
+                sys.exit(f"{source.name} 里有 {len(svgs)} 张图，脚本预期 {len(NAMES)} 张"
+                         f"——加图或删图之后记得同步 NAMES")
 
-            png_path = OUT_DIR / f"{name}.png"
-            render(chrome, svg_path, png_path, w, h)
+            out_dir = OUT_DIR / lang
+            out_dir.mkdir(parents=True, exist_ok=True)
+            print(f"{lang}: {source.name}")
 
-            kb = png_path.stat().st_size / 1024
-            print(f"  {name}.png  {w}x{h} @{SCALE}x  {kb:.0f} KB")
+            for i, svg in enumerate(svgs, start=1):
+                if args.only and i != args.only:
+                    continue
 
-    print(f"\n已写入 {OUT_DIR.relative_to(ROOT)}/")
+                name = NAMES[i - 1]
+                vb = re.search(r'viewBox="[\d.]+ [\d.]+ ([\d.]+) ([\d.]+)"', svg)
+                w, h = int(float(vb.group(1))), int(float(vb.group(2)))
+
+                svg_path = Path(tmp) / f"{lang}-{name}.svg"
+                svg_path.write_text(standalone(svg, css, i), encoding="utf-8")
+
+                png_path = out_dir / f"{name}.png"
+                render(chrome, svg_path, png_path, w, h)
+
+                kb = png_path.stat().st_size / 1024
+                print(f"  {name}.png  {w}x{h} @{SCALE}x  {kb:.0f} KB")
+
+    print(f"\n已写入 {OUT_DIR.relative_to(ROOT)}/{{zh,en}}/")
 
 
 if __name__ == "__main__":

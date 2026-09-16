@@ -382,17 +382,19 @@ retired_certificates          -- 已上传、等待回收的证书
 
 六张图，从"有人在 DNS zone 里加了一行"一路画到"旧证书从云上删掉"。它们也在同一份可交互页面里 —— 图之间有可点的跳转，还有一个打印/存 PDF 的按钮：[docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)；下面这些就是那份页面渲染出来的图。
 
-重新生成用 `make diagrams`。它会先在真实浏览器里**量**每一个标签，只要有任何一个溢出盒子就拒绝出图。
+重新生成用 `make diagrams`。**中文页是唯一的事实来源**，英文页和两套图都由翻译表从它生成；只要有东西没译到，构建就直接报错 —— 所以两种语言不可能悄悄漂移。
+
+它还会在真实浏览器里**逐语言**量每一个标签：有任何一个溢出盒子、或者两个 `<text>` 标签互相压住，就拒绝出图。英文比中文长，所以"中文放得下、英文溢出"是个真实的失败模式 —— 第一次跑就抓到了两处。
 
 ### 1. 系统全景：谁拥有什么、谁只读什么
 
-![wecert 系统全景：声明层、推断层、契约、执行层与外部服务](docs/diagrams/01-system-map.png)
+![wecert 系统全景：声明层、推断层、契约、执行层与外部服务](docs/diagrams/zh/01-system-map.png)
 
 从左到右是权限的传递：**意图**（人写）→ **推断**（可丢弃）→ **契约**（机器写）→ **执行**（必须稳）→ **外部**。每一层的失败模式都不一样，这正是它们被拆开的原因。
 
 ### 2. 意图 → 契约：推断侧流水线
 
-![wecert-onboard 流水线：枚举、解析与过滤、分组与覆盖、门禁、组装、原子写盘](docs/diagrams/02-intent-to-contract.png)
+![wecert-onboard 流水线：枚举、解析与过滤、分组与覆盖、门禁、组装、原子写盘](docs/diagrams/zh/02-intent-to-contract.png)
 
 注意红色只挂在真正会冻结的地方。阶段 2 里单条声明写错只排除那一条；阶段 3 里某组超过 SAN 上限只保留该组上一版。**两者都不冻结整轮** —— 一个手误不该让所有证书停止更新。
 
@@ -409,7 +411,7 @@ retired_certificates          -- 已上传、等待回收的证书
 
 ### 3. 收敛决策
 
-![wecert 每轮对每张证书做的五个有序判断](docs/diagrams/03-reconcile-decisions.png)
+![wecert 每轮对每张证书做的五个有序判断](docs/diagrams/zh/03-reconcile-decisions.png)
 
 判断是**有序**的。从上往下第一个命中的分支决定这一轮做什么，全都不命中就是"本轮不动" —— 而那是绝大多数轮次的正常结果。
 
@@ -417,7 +419,7 @@ retired_certificates          -- 已上传、等待回收的证书
 
 ### 4. 订单状态机
 
-![ACME 订单状态机，以及每个状态对应 state.db 里哪几个字段](docs/diagrams/04-order-state-machine.png)
+![ACME 订单状态机，以及每个状态对应 state.db 里哪几个字段](docs/diagrams/zh/04-order-state-machine.png)
 
 这个状态机的全部意义是**让进程随时可以被杀掉**。每个状态都在 `state.db` 里有对应字段，重启之后靠它们决定"接着跑"还是"重新下单"。
 
@@ -427,7 +429,7 @@ retired_certificates          -- 已上传、等待回收的证书
 
 ### 5. DNS-01：通配符和顶点共用一个 TXT 名字
 
-![DNS-01 时序，展示"全写、全验、一起清"的形状](docs/diagrams/05-dns01-sequence.png)
+![DNS-01 时序，展示"全写、全验、一起清"的形状](docs/diagrams/zh/05-dns01-sequence.png)
 
 这是最容易写错、也最难发现的一段。`example.com` 和 `*.example.com` 的挑战记录都叫 `_acme-challenge.example.com` —— 同一个名字、两个值。
 
@@ -437,7 +439,7 @@ retired_certificates          -- 已上传、等待回收的证书
 
 ### 6. 一张证书的一生
 
-![证书生命周期时间轴：首次签发、部署、ARI 窗口、renewBefore 兜底、到期](docs/diagrams/06-certificate-lifetime.png)
+![证书生命周期时间轴：首次签发、部署、ARI 窗口、renewBefore 兜底、到期](docs/diagrams/zh/06-certificate-lifetime.png)
 
 时间轴按 `classic` 的 90 天画。真正决定续期时刻的是 ARI 的 `suggestedWindow`；下面的 `renewBefore` 只是 ARI 拿不到时的兜底。
 
