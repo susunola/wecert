@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -146,6 +147,37 @@ func VerifyCoverage(leaf *x509.Certificate, want []string) error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("the issued certificate does not cover these domains: %v (it contains %v)", missing, leaf.DNSNames)
+	}
+	return nil
+}
+
+// VerifyKeyMatch checks that the issued certificate really belongs to the private key this
+// order was placed with.
+//
+// It is the one property VerifyCoverage and the notAfter check cannot see. A certificate
+// for a different key covers exactly the same names and lives exactly as long, so nothing
+// else in the download path would object -- and the result is a certificate that cannot
+// complete a single handshake, deployed over the working one. "The renewal succeeded and
+// HTTPS is down" is the worst combination of symptoms to debug.
+//
+// The comparison goes through PKIX encodings rather than comparing key structures, so it
+// does not care which algorithm or curve either side uses.
+func VerifyKeyMatch(leaf *x509.Certificate, keyPEM []byte) error {
+	key, err := ParsePrivateKeyPEM(keyPEM)
+	if err != nil {
+		return fmt.Errorf("parse the order's private key: %w", err)
+	}
+	leafPub, err := x509.MarshalPKIXPublicKey(leaf.PublicKey)
+	if err != nil {
+		return fmt.Errorf("encode the certificate's public key: %w", err)
+	}
+	keyPub, err := x509.MarshalPKIXPublicKey(key.Public())
+	if err != nil {
+		return fmt.Errorf("encode the private key's public key: %w", err)
+	}
+	if !bytes.Equal(leafPub, keyPub) {
+		return errors.New("the issued certificate does not belong to the private key this order was placed with; " +
+			"deploying it would break every TLS handshake, so this pass is failed instead")
 	}
 	return nil
 }
