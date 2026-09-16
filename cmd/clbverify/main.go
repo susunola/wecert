@@ -76,7 +76,7 @@ func run() error {
 		return fmt.Errorf("DescribeListeners: %w", err)
 	}
 	if resp.Response == nil || len(resp.Response.Listeners) == 0 {
-		return fmt.Errorf("CLB %s has no listeners", *lbID)
+		return noListenersError(*lbID, *listenerID)
 	}
 
 	if *raw {
@@ -159,6 +159,18 @@ func run() error {
 		fmt.Printf("\nOK: assertion passed - the listener is now bound to %s\n", *expect)
 	}
 	return nil
+}
+
+// noListenersError words the empty-listener failure to fit how the query was made:
+// without a -listener filter an empty list really means the CLB has no listeners, but
+// with one it means that specific listener matched nothing -- deleted, or a typo --
+// while the CLB itself may be serving other listeners just fine. Blaming the CLB in
+// that case sends the operator debugging the wrong object.
+func noListenersError(lbID, listenerID string) error {
+	if listenerID != "" {
+		return fmt.Errorf("CLB %s returned no listener %s (it may have been deleted, or the ID is a typo)", lbID, listenerID)
+	}
+	return fmt.Errorf("CLB %s has no listeners", lbID)
 }
 
 // fetchCertID queries the listener's currently bound primary certificate ID once.

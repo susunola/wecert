@@ -150,10 +150,12 @@ type Account struct {
 // cross-process exclusive lock.
 //
 // This file holds the ACME account private key and the private keys of every active
-// certificate, so the directory is created first when missing and the file is
-// pre-created with 0600. SQLite creates its own files according to the process
-// umask -- on a umask 022 machine that means 0644, and any local user can read the
-// private keys out. The systemd path is covered by StateDirectoryMode=0700, but
+// certificate, so the directory is created first when missing, the file is
+// pre-created with 0600, and the whole create/migrate section runs under a
+// restrictive umask: SQLite derives the permissions of its own -wal/-shm files
+// (copies of the private keys) from the process umask, so on a umask 022 machine
+// they would otherwise be born 0644 and stay readable by any local user until the
+// post-hoc chmod ran. The systemd path is covered by StateDirectoryMode=0700, but
 // manual runs (the README's -dry-run, e2e scripts that put the database in /tmp)
 // have no such protection.
 func Open(path string) (*Store, error) { return open(path, true) }
@@ -165,6 +167,24 @@ func Open(path string) (*Store, error) { return open(path, true) }
 // running" pushes people into editing the config blindly. This path only reads the
 // existing ACME account and initiates no issuance, so skipping the lock is safe.
 func OpenUnlocked(path string) (*Store, error) { return open(path, false) }
+
+// LockFile takes the cross-process exclusive lock described in Store.lock on an
+// arbitrary file and returns the function that releases it.
+//
+// The store locks "<db>.lock" itself inside Open; this is for sibling state files
+// that need the same "at most one process" gate -- wecert-onboard's state file,
+// where two overlapping cron runs would each load the same baseline and then
+// last-writer-wins the save, losing Changes entries and regressing AbsentSince.
+// Like the store's lock it fails fast rather than queueing: a second run that
+// waited would apply its stale baseline the moment the first one exits, which is
+// worse than an outright error.
+func LockFile(path string) (unlock func() error, err error) {
+	lock, err := acquireLock(path)
+	if err != nil {
+		return nil, err
+	}
+	return lock.release, nil
+}
 
 func open(path string, exclusive bool) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
@@ -184,12 +204,30 @@ func open(path string, exclusive bool) (*Store, error) {
 		}
 	}
 
+	s, err := openFiles(path, lock)
+	if err != nil {
+		_ = lock.release()
+		return nil, err
+	}
+	return s, nil
+}
+
+// openFiles creates/opens the database files and runs the schema migration.
+//
+// Everything file-creating in here runs under a restrictive umask (see
+// restrictiveUmask): SQLite creates -wal/-shm during migrate() with permissions
+// derived from the process umask, and those files are copies of the private keys.
+// The post-hoc chmod at the end stays as a backstop -- and as the fix-up for
+// databases created before the umask was tightened.
+func openFiles(path string, lock *fileLock) (*Store, error) {
+	restore := restrictiveUmask()
+	defer restore()
+
 	// The 0600 pre-create (see Open) is part of the security contract, so a failure
 	// here is fatal. Swallowing it lets the sql.Open below fail instead -- with a
 	// message that points at SQLite rather than at the real permission problem.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		_ = lock.release()
 		return nil, fmt.Errorf("pre-create state file %s: %w", path, err)
 	}
 	_ = f.Close()
@@ -197,7 +235,6 @@ func open(path string, exclusive bool) (*Store, error) {
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		_ = lock.release()
 		return nil, fmt.Errorf("open state db: %w", err)
 	}
 	// modernc sqlite is a single-writer model, so cap connections to avoid SQLITE_BUSY.
@@ -206,7 +243,6 @@ func open(path string, exclusive bool) (*Store, error) {
 	s := &Store{db: db, lock: lock}
 	if err := s.migrate(); err != nil {
 		db.Close()
-		_ = lock.release()
 		return nil, err
 	}
 
@@ -216,7 +252,6 @@ func open(path string, exclusive bool) (*Store, error) {
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		if err := os.Chmod(path+suffix, 0o600); err != nil && !os.IsNotExist(err) {
 			db.Close()
-			_ = lock.release()
 			return nil, fmt.Errorf("chmod state file %s: %w", path+suffix, err)
 		}
 	}
