@@ -374,9 +374,11 @@ Regenerate them with `make diagrams`. The **Chinese page is the source of truth*
 
 The build also *measures* every label in a real browser, in **both** languages, and refuses to render if any of them overflows its box or if two `<text>` labels collide. English runs longer than Chinese, so "fits in Chinese, overflows in English" is a real failure mode — the first run caught exactly that.
 
-### 0. Deployment shape — SNI for several domains, one multi-SAN certificate, a backend RS pool
+### 0. Deployment shape — a free certificate rotating itself on the CLB
 
-![wecert's deployment shape: clients reach the CLB over SNI, one multi-SAN certificate routes to a backend RS pool, and wecert obtains it from DNSPod and Let's Encrypt and rebinds it to the CLB](docs/diagrams/en/00-deployment-shape.png)
+![wecert's deployment shape: a free certificate rotated automatically by Let's Encrypt (issued for free → rebound automatically → serving for 90 days → reissued before expiry), with clients reaching the CLB over SNI and one multi-SAN certificate routing to a backend RS pool](docs/diagrams/en/00-deployment-shape.png)
+
+The scenario this system exists for is the band on top: **a Let's Encrypt certificate is free, and the price is a 90-day validity** — at least four rotations a year, and a human remembering each one will eventually miss. The point is not that wecert *can* issue; it is that the certificate is already replaced before it expires, with nobody involved.
 
 Requests arrive at the CLB over SNI. The CLB picks the certificate out of `multi_cert_info` using the name the client sent, and the layer-7 rules route by domain to the backend RS pool. `wecert` runs on one of those CVMs; it reads the `_wecert.*` declarations from DNSPod, writes the `_acme-challenge` records, obtains the certificate from Let's Encrypt, uploads it to Tencent Cloud SSL and rebinds the listener.
 
