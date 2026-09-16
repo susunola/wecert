@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -452,4 +453,38 @@ func TestChallengesAreAcceptedOncePerAuthorization(t *testing.T) {
 
 	// Half this test's value is confirming the call sequence really is the steps we think it is.
 	t.Logf("call sequence: %v", fake.callLog())
+}
+
+// ── every persistOrder call site must honour its error ─────────────────────
+
+// persistOrder returns its write error so a failed write aborts the step instead
+// of being logged and forgotten: crash recovery would otherwise resume from stale
+// state, which is the invariant the whole package is built around. There are three
+// call sites, and Go does not warn about a dropped return value -- so this pins the
+// one in advance(), which the contract change originally missed.
+func TestAdvanceAbortsWhenTheOrderCannotBePersisted(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
+
+	fake.orders = []legoacme.ExtendedOrder{{
+		Order:    legoacme.Order{Status: "pending", Finalize: "https://ca.test/finalize/1"},
+		Location: "https://ca.test/order/1",
+	}}
+
+	o := &state.Order{CertName: cert.Name, OrderURL: "https://ca.test/order/1", Status: "pending"}
+	st := &state.CertState{Name: cert.Name}
+
+	// Closing the store makes every write fail, which is the situation the error
+	// return exists for. recordFailure joins its own write error onto this one, so
+	// the original message has to survive into what the caller sees.
+	if err := store.Close(); err != nil {
+		t.Fatalf("closing the store: %v", err)
+	}
+
+	err := m.advance(context.Background(), cert, st, o)
+	if err == nil {
+		t.Fatal("a failed order write must abort the step; discarding it means recovery resumes from stale state")
+	}
+	if !strings.Contains(err.Error(), "order state") {
+		t.Errorf("want the error to name the failed order write, got: %v", err)
+	}
 }
