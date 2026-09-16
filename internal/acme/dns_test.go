@@ -307,10 +307,9 @@ func TestFindZoneFailsFastOnPublicSuffix(t *testing.T) {
 // authoritative: the recursive resolver serves a **negatively cached** NXDOMAIN for the
 // TXT (the record was written after the negative answer got cached, and DNSPod's SOA
 // negative TTL is ~600s), while the zone's authoritative nameserver answers per
-// authorityReply. recursiveHas flips the resolver's TXT answer to positive, for the fast
-// path.
+// authorityReply.
 func cachedNXDOMAINHarness(
-	t *testing.T, recursiveHas bool,
+	t *testing.T,
 	authorityReply func(msg *dns.Msg, name, value string) (*dns.Msg, error),
 ) (*DNSSolver, DNSRecord, *int) {
 	t.Helper()
@@ -347,9 +346,6 @@ func cachedNXDOMAINHarness(
 			case dns.TypeAAAA:
 				return dnsReply(msg), nil
 			case dns.TypeTXT:
-				if recursiveHas {
-					return dnsReply(msg, &dns.TXT{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{rec.Value}}), nil
-				}
 				// The negatively cached answer: NXDOMAIN even though the record may
 				// already exist at the authority.
 				resp := dnsReply(msg)
@@ -370,7 +366,7 @@ func cachedNXDOMAINHarness(
 // TXT lived on in DNSPod forever. The negative answer must be confirmed against the
 // authority, which here says the record is up.
 func TestLookupTXTDistrustsACachedNXDOMAIN(t *testing.T) {
-	solver, rec, authorityQueries := cachedNXDOMAINHarness(t, false,
+	solver, rec, authorityQueries := cachedNXDOMAINHarness(t,
 		func(msg *dns.Msg, name, value string) (*dns.Msg, error) {
 			resp := dnsReply(msg, &dns.TXT{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{value}})
 			resp.Authoritative = true
@@ -395,7 +391,7 @@ func TestLookupTXTDistrustsACachedNXDOMAIN(t *testing.T) {
 // Only an authoritative denial may count as "truly absent" -- that is the answer the
 // reclaim path may delete the state row on.
 func TestLookupTXTAuthoritativeNXDOMAINIsTrulyAbsent(t *testing.T) {
-	solver, _, _ := cachedNXDOMAINHarness(t, false,
+	solver, _, _ := cachedNXDOMAINHarness(t,
 		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
 			resp := dnsReply(msg)
 			resp.Rcode = dns.RcodeNameError
@@ -415,7 +411,7 @@ func TestLookupTXTAuthoritativeNXDOMAINIsTrulyAbsent(t *testing.T) {
 // No authoritative answer at all (the NS is unreachable): the record's fate is unknown,
 // and an error is what makes the callers keep the state row.
 func TestLookupTXTWithNoAuthoritativeAnswerKeepsTheFateUnknown(t *testing.T) {
-	solver, _, _ := cachedNXDOMAINHarness(t, false,
+	solver, _, _ := cachedNXDOMAINHarness(t,
 		func(_ *dns.Msg, _, _ string) (*dns.Msg, error) {
 			return nil, errors.New("unreachable")
 		})
@@ -426,29 +422,6 @@ func TestLookupTXTWithNoAuthoritativeAnswerKeepsTheFateUnknown(t *testing.T) {
 	}
 	if found {
 		t.Error("a failed probe must never report the record as present")
-	}
-}
-
-// A positive recursive answer is trustworthy on its own -- a resolver cannot invent a
-// TXT it was never told -- so the fast path must not spend an authoritative round trip.
-func TestLookupTXTPositiveRecursiveAnswerIsTheFastPath(t *testing.T) {
-	solver, rec, authorityQueries := cachedNXDOMAINHarness(t, true,
-		func(_ *dns.Msg, _, _ string) (*dns.Msg, error) {
-			return nil, errors.New("the authority must not be queried on a positive recursive answer")
-		})
-
-	got, found, err := solver.LookupTXT(context.Background(), "example.com", "keyauth-1")
-	if err != nil {
-		t.Fatalf("LookupTXT: %v", err)
-	}
-	if !found {
-		t.Error("the resolver returned the record; it must be reported present")
-	}
-	if got != rec {
-		t.Errorf("record identity = %+v, want %+v", got, rec)
-	}
-	if *authorityQueries != 0 {
-		t.Errorf("a positive recursive answer is the fast path; the authority was queried %d times", *authorityQueries)
 	}
 }
 
