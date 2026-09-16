@@ -59,7 +59,21 @@ const (
 const (
 	DNSProviderDNSPod       = "dnspod"
 	DNSProviderTencentCloud = "tencentcloud"
+	// DNSProviderLego selects any provider from lego's registry by name (dns.legoProvider).
+	// It requires a binary built with -tags lego_dns; see internal/acme/provider_notags.go for
+	// why the registry is not compiled in by default.
+	DNSProviderLego = "lego"
 )
+
+// acmeSupportsLegoProviders reports whether this binary was built with lego's provider registry.
+//
+// A variable rather than a constant because the acme package owns the build tag that decides it,
+// and config must not import acme's dependency graph merely to ask.
+var acmeSupportsLegoProviders = false
+
+// SetLegoProviderSupport is called by the acme package at init, so config validation can tell an
+// operator to rebuild with -tags lego_dns instead of failing later when the solver is built.
+func SetLegoProviderSupport(available bool) { acmeSupportsLegoProviders = available }
 
 // profileMaxNames is the maximum identifier count each profile allows.
 // classic allows 100, but the newer tlsserver / shortlived only 25 — reject
@@ -561,6 +575,10 @@ type ACME struct {
 type DNS struct {
 	Provider string `yaml:"provider"`
 
+	// LegoProvider names a provider from lego's registry, used only when Provider is "lego".
+	// Its credentials come from the environment, in lego's own variable names.
+	LegoProvider string `yaml:"legoProvider,omitempty"`
+
 	// Required when provider=dnspod.
 	// This is DNSPod's own API Token (of the form "12345,abcdef0123456789..."),
 	// not a Tencent Cloud CAM SecretId/SecretKey.
@@ -729,9 +747,21 @@ func (c *Config) normalize() error {
 	case "":
 		c.DNS.Provider = DNSProviderDNSPod
 	case DNSProviderDNSPod, DNSProviderTencentCloud:
+	case DNSProviderLego:
+		if c.DNS.LegoProvider == "" {
+			return fmt.Errorf("dns.provider=%q requires dns.legoProvider to name one of lego's DNS "+
+				"providers (e.g. cloudflare, route53, alidns); that provider then reads its own "+
+				"credentials from the environment, using lego's documented variable names",
+				DNSProviderLego)
+		}
+		if !acmeSupportsLegoProviders {
+			return fmt.Errorf("dns.provider=%q needs a binary built with -tags lego_dns: the default "+
+				"build carries only the native dnspod and tencentcloud providers, because lego's "+
+				"registry pulls in hundreds of third-party SDKs", DNSProviderLego)
+		}
 	default:
-		return fmt.Errorf("dns.provider must be %q or %q, got %q",
-			DNSProviderDNSPod, DNSProviderTencentCloud, c.DNS.Provider)
+		return fmt.Errorf("dns.provider must be %q, %q or %q, got %q",
+			DNSProviderDNSPod, DNSProviderTencentCloud, DNSProviderLego, c.DNS.Provider)
 	}
 	if c.DNS.Provider == DNSProviderDNSPod && c.DNS.LoginToken == "" {
 		return fmt.Errorf("dns.provider=dnspod requires dns.loginToken " +
