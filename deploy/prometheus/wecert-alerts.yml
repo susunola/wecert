@@ -1,0 +1,264 @@
+# Prometheus alerting rules for wecert.
+#
+# Why this file ships with the program instead of living in the documentation. The metrics are
+# documented as *the* operational signal -- "alert on not_after, not on whether the renewal job
+# errored", because the error path stays silent when the program is quietly broken -- and yet the
+# only PromQL in the repository was two lines in a markdown table. An operator had to transcribe
+# thresholds out of prose, which is how thresholds drift from the code that defines them.
+#
+# Load with:
+#
+#   rule_files:
+#     - /etc/wecert/alerts.yml
+#
+# Thresholds are NOT invented here: they are `config.ExpiryWarningThreshold`, which is a quarter of
+# each profile's validity -- 22.5 days for classic (90d), 11.25 for tlsserver (45d), 40 hours for
+# shortlived (160h). A fixed window was tried and rejected: 21 days is most of a shortlived
+# certificate's life, so that profile alerted from issuance onwards and trained people to ignore it.
+
+groups:
+  - name: wecert.expiry
+    rules:
+      # The primary signal. Three rules rather than one, because the profiles have genuinely
+      # different lifetimes and a single threshold would either be late for shortlived or noise for
+      # classic.
+      #
+      # `> 0` guards the series being absent rather than zero. The metric is now deleted for a
+      # certificate that has never been issued -- exporting 0 made this comparison true at roughly
+      # -20,700 days, so every new certificate paged someone about a certificate that did not exist
+      # yet. The guard is defence in depth for anyone re-implementing the exporter.
+      - alert: WecertCertificateExpiringClassic
+        expr: |
+          (wecert_certificate_not_after_timestamp_seconds > 0)
+          and
+          (wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 22.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "certificate {{ $labels.cert }} expires in under 22.5 days"
+          description: >-
+            The classic profile renews 30 days ahead, so reaching this point means renewal has been
+            failing for at least a week. Check wecert_certificate_consecutive_failures and the
+            daemon's log for this certificate.
+
+      - alert: WecertCertificateExpiringTLSServer
+        expr: |
+          (wecert_certificate_not_after_timestamp_seconds > 0)
+          and
+          (wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 11.25
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "certificate {{ $labels.cert }} expires in under 11.25 days"
+          description: >-
+            The tlsserver profile renews 15 days ahead; this is a week past that.
+
+      - alert: WecertCertificateExpiringShortLived
+        expr: |
+          (wecert_certificate_not_after_timestamp_seconds > 0)
+          and
+          (wecert_certificate_not_after_timestamp_seconds - time()) / 3600 < 40
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "certificate {{ $labels.cert }} expires in under 40 hours"
+          description: >-
+            A short-lived certificate renews 48 hours ahead, so 40 hours left means renewal is
+            already failing. This profile is used precisely where a lapse is immediate.
+
+      # Deployed but not serving the certificate wecert deployed.
+      #
+      # This is the failure the state database cannot see: the API said the rebind succeeded, and
+      # the TLS handshake serves something else. It is the reason the probe exists.
+      - alert: WecertServedCertificateIsNotTheDeployedOne
+        expr: wecert_certificate_probe_match == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.host }} is not serving the deployed certificate"
+          description: >-
+            Either the rebind did not take effect or another certificate is winning SNI. Check
+            wecert_certificate_probe_not_after_timestamp_seconds against
+            wecert_certificate_not_after_timestamp_seconds for the same host.
+
+      # The probe could not run. This is an environment problem, not a certificate problem, and
+      # keeping the two apart is why they are separate metrics.
+      - alert: WecertProbeCannotReachTheEndpoints
+        expr: increase(wecert_certificate_probe_errors_total[1h]) > 3
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "the probe cannot reach {{ $labels.host }}"
+          description: >-
+            Resolve, dial or handshake failed repeatedly. If wecert runs where it cannot reach the
+            VIP, either disable probe.enabled or run wecert-probe from a host that can; leaving it on
+            produces this alert and no useful evidence.
+
+  - name: wecert.convergence
+    rules:
+      # Renewal is failing and has been for a while. The severity escalates with the failure count
+      # because the backoff is exponential: five consecutive failures is already hours of waiting.
+      - alert: WecertRenewalFailing
+        expr: wecert_certificate_consecutive_failures >= 5
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "renewal for {{ $labels.cert }} has failed {{ $value }} times in a row"
+          description: >-
+            Check the daemon log and `wecert_preflight -domain` for this certificate. If the failure
+            is a DNS authorization, the identifier ledger is what the pre-expiry fallback uses to
+            decide which names to drop.
+
+      - alert: WecertFallbackIsDroppingNames
+        expr: wecert_certificate_fallback_active == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.cert }} is serving a certificate missing {{ $value }} name(s)"
+          description: >-
+            A partial certificate is in production: some names are covered and others are not. The
+            cause is a name whose authorizations keep failing. wecert_desired_state_* and the log
+            name the dropped identifiers.
+
+      # "Nothing is happening" is its own failure mode, and no error counter sees it: the daemon can
+      # be up, healthy-looking, and issuing nothing.
+      #
+      # This used to read wecert_reconcile_total_created_timestamp, which is not a series that
+      # exists: the exposition is the classic text format, which carries no _created timestamps at
+      # all. The alert could never fire.
+      - alert: WecertHasNotReconciledRecently
+        expr: (time() - wecert_last_reconcile_timestamp_seconds) > 7200
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "no reconcile pass has finished in over 2 hours"
+          description: >-
+            The daemon converges hourly by default. Either it is not running, or it is running and
+            stuck: wecert_last_reconcile_timestamp_seconds is stamped when a pass finishes and never
+            when one starts, so a hung pass goes stale exactly like a dead process. 0 means no pass
+            has finished since startup. This alert is deliberately not derived from an error counter:
+            silence is the failure it is looking for.
+
+      - alert: WecertDocumentsAreStale
+        expr: wecert_desired_state_age_seconds > 172800
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "the desired-state document has not been refreshed in over 48 hours"
+          description: >-
+            wecert keeps renewing from the old document, so nothing looks broken -- but no newly
+            declared name will ever be picked up. The generator (wecert-onboard) has probably stopped
+            running.
+
+      - alert: WecertDocumentSourceIsFailing
+        expr: increase(wecert_desired_state_errors_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "the desired-state source could not be read"
+          description: >-
+            A source failure freezes the previous revision rather than emptying it, so this is safe
+            but not healthy: no configuration change takes effect until it is readable again.
+
+      - alert: WecertStateIsFrozen
+        expr: wecert_desired_state_frozen == 1
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "the desired state has been frozen for over 2 hours"
+          description: >-
+            A freeze is deliberate -- an abrupt declaration drop, an over-cap group, an unreadable
+            document -- and it means configuration changes are not being applied. Identify the reason
+            from the log, fix it, and re-run the generator.
+
+  - name: wecert.integrity
+    rules:
+      # A recovered panic is always a bug, never routine churn. The pass survived, which is the
+      # design working, but something in the state machine is wrong.
+      - alert: WecertReconcilePanicked
+        expr: increase(wecert_reconcile_panics_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "a reconcile pass panicked for {{ $labels.cert }}"
+          description: >-
+            The panic was recovered so other certificates are unaffected, and the daemon logged a
+            stack trace. This is a bug: report it with that trace. The affected pass was retried on
+            its usual backoff.
+
+      - alert: WecertOrphanedCertificates
+        expr: wecert_orphaned_certificates > 0
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} certificate(s) are in the state store but not the desired state"
+          description: >-
+            They will not be renewed and will expire, and their DNS challenge records were reclaimed.
+            If that was not intended, restore the declaration and re-run wecert-onboard.
+
+      # The CA refused a request and told us when it will listen again. That instant is
+      # authoritative -- it accounts for every other account spending the same global bucket, which
+      # the local estimate cannot see.
+      - alert: WecertRateLimitBlocked
+        expr: wecert_ratelimit_blocked == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.limit }} is refusing requests until the CA's deadline"
+          description: >-
+            Issuance for the affected scope is paused until then. The exact-set limit (5 per 7 days)
+            has no override; the per-account order and per-registered-domain limits can be raised
+            through Let's Encrypt's rate-limit adjustment form, which takes weeks.
+
+      - alert: WecertRateLimitNearlyExhausted
+        expr: wecert_ratelimit_remaining_tokens < 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.limit }} has under 5 tokens left (lower bound)"
+          description: >-
+            This is a LOWER BOUND: it counts only this program's spend, while the per-domain and
+            per-exact-set limits are global across accounts. The real remaining allowance can be
+            smaller, never larger. Stop configuration churn until it refills.
+
+      # A revocation the CA has not accepted is an outstanding security action, not a background
+      # task: it exists because someone decided a certificate must stop being trusted.
+      - alert: WecertRevocationPending
+        expr: wecert_revocation_pending > 0
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} revocation(s) have not been accepted by the CA"
+          description: >-
+            The decision is durable and retried every pass, so this is a failing request rather than a
+            lost one. Check the daemon log for the CA's response; a rejected reason code will never
+            succeed on its own.
+
+      # wecert_revocation_pending holds its last value when the read behind it fails, so a store
+      # problem freezes that gauge instead of zeroing it. This is the alert that says the gauge is no
+      # longer trustworthy -- without it, a daemon that has been unable to look at its own revocation
+      # queue for a week looks exactly like one with nothing to do.
+      - alert: WecertRevocationQueueUnreadable
+        expr: increase(wecert_revocation_query_errors_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "wecert cannot read its outstanding revocations; wecert_revocation_pending is stale"
+          description: >-
+            The reconciler could not list the outstanding revocation requests, so it skipped the retry
+            for this pass and left wecert_revocation_pending at its previous value. Check state.db and
+            the disk it lives on. If that gauge is non-zero it is still a real outstanding revocation;
+            if it is zero it means "unknown", not "clear".

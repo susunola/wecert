@@ -78,10 +78,11 @@ type CertManager interface {
 	// production manager has one.
 	PublishQuota(scopes map[string]string)
 
-	// HasPendingRevocations is the cheap gate for RetryPendingRevocations.
-	HasPendingRevocations() bool
 	// RetryPendingRevocations re-attempts every revocation the CA has not accepted yet.
 	RetryPendingRevocations(ctx context.Context)
+	// PendingRevocations reports how many are still outstanding. Used both as the gate for the
+	// retry and as the value of wecert_revocation_pending, so the two cannot disagree.
+	PendingRevocations() (int, error)
 
 	// CleanupOrphan reclaims the in-flight order and the challenge TXT records
 	// of a certificate that has left the desired state. It must exist on this
@@ -515,6 +516,14 @@ func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
 func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 	var rep RunReport
 
+	// Stamped on the way out, so the value means "a pass finished", never "a pass started". A pass
+	// that hangs has to be able to go stale, otherwise a wedged daemon looks busy forever -- and
+	// "nothing is happening" is invisible to every error counter in this package.
+	//
+	// Exclusively this function. StartAll, the webhook path, reconciles named certificates without
+	// running a pass, so stamping it there would let an API caller mask a dead timer loop.
+	defer metrics.LastReconcile.SetToCurrentTime()
+
 	res := r.resolve(ctx)
 	if res == nil {
 		// Reap retired certificates even when the desired state is unreadable: they
@@ -596,14 +605,34 @@ func (r *Reconciler) publishQuota(res *spec.Result) {
 	r.manager.PublishQuota(scopes)
 }
 
-// retryRevocations re-attempts outstanding revocations, gated on there being any.
+// retryRevocations re-attempts outstanding revocations and publishes how many remain.
 //
 // Revocation is unbounded in time on purpose: a request recorded because a key leaked must keep
 // being attempted until the CA accepts it, and it must not be forgotten because the process
-// restarted or the CA was briefly unavailable. The gate keeps the common case free -- most
-// deployments have none outstanding, and this runs on every pass.
+// restarted or the CA was briefly unavailable.
+//
+// Both halves live here, off one query, because they answer the same question. The retry used to be
+// gated on a separate HasPendingRevocations() call to keep the common case cheap; once the gauge
+// also had to be maintained, that gate saved nothing and only created a second place for the two
+// answers to disagree.
 func (r *Reconciler) retryRevocations(ctx context.Context) {
-	if !r.manager.HasPendingRevocations() {
+	pending, err := r.manager.PendingRevocations()
+	if err != nil {
+		// Leave the gauge where it is. Reporting 0 here would be a confident all-clear on the one
+		// signal that means "a certificate that should no longer be trusted still is", and a stale
+		// number is recoverable where a false zero pages nobody. The counter is what makes the
+		// staleness visible.
+		metrics.RevocationQueryErrors.Inc()
+		r.log.Warn("cannot read outstanding revocations; wecert_revocation_pending is now stale",
+			"err", err)
+		return
+	}
+	// Published from the same read that gates the retry, so the number the gauge shows is exactly
+	// the number of requests the retry was asked to work through. A request this pass succeeds in
+	// clearing therefore stays visible until the next pass; erring towards "still pending" is the
+	// safe direction for a security signal.
+	defer metrics.RevocationPending.Set(float64(pending))
+	if pending == 0 {
 		return
 	}
 	r.manager.RetryPendingRevocations(ctx)

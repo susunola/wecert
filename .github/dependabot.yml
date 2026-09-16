@@ -1,0 +1,43 @@
+# Dependency updates, on a schedule that matches how this program is deployed.
+#
+# Why this file exists: wecert holds private keys and talks to two cloud APIs, so its security
+# posture is largely the posture of its dependencies. Without automation the practical outcome is
+# that the lockfile is updated when somebody remembers, which is to say after a CVE.
+#
+# Weekly, not daily, and without grouping. A certificate renewer runs as a daemon on a host nobody
+# wants to babysit: a stream of daily PRs would be merged unread or ignored, and both are worse than
+# a weekly batch that gets looked at. One dependency per PR (Dependabot's default) rather than a
+# combined group, because the two dependencies that can break correctness -- lego and the Tencent
+# SDK -- deserve to be read individually rather than buried in a batch of transitive bumps:
+#
+#   - lego: its error STRINGS are parsed (a refused ARI `replaces` is recognised by matching text),
+#     and its provider cleanup deletes every TXT record at a challenge name.
+#   - tencentcloud-sdk-go: `DeployStatus` semantics decide whether a rebind is believed to have
+#     happened, and `DeployRecordId`'s type differs between same-named SDK fields.
+#
+# `open-pull-requests-limit` is the noise control, deliberately low: five concurrent PRs is a
+# reviewable week, and a full queue is itself a signal that the backlog needs attention.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "chore(ci)"
