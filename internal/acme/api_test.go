@@ -86,6 +86,14 @@ type fakeAPI struct {
 	// assert not only what was sent but that it was retried without it.
 	newOrderReplaces []string
 
+	// revoked records RevokeCertificate calls, and revokeErr makes the next ones fail.
+	revoked   []revokedCall
+	revokeErr error
+
+	// getOrderErr, when set, makes every GetOrder fail. It models an order URL that the CA
+	// will never serve again (a purged order, or a different ACME directory).
+	getOrderErr error
+
 	// newOrderErr, when set, is returned by the next NewOrder call and then cleared. It
 	// scripts "the CA refused this order" without making the fake stateful.
 	newOrderErr error
@@ -102,7 +110,10 @@ type fakeAPI struct {
 	// earlier pass of the same test.
 	certNotAfter   time.Time
 	certNotAfterFn func() time.Time
-	certDomains    []string
+	// certNotBefore overrides the issued certificate's NotBefore (default: an hour ago). A
+	// test that must tell "issued later" apart from "expires later" sets it explicitly.
+	certNotBefore time.Time
+	certDomains   []string
 
 	// orderKeyPEM lets the fake read the private key the flow generated for its order, so a
 	// pass that resumes an order finalized in an earlier process still gets a usable
@@ -182,6 +193,9 @@ func (f *fakeAPI) GetOrder(string) (legoacme.ExtendedOrder, error) {
 	f.enter("GetOrder")
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getOrderErr != nil {
+		return legoacme.ExtendedOrder{}, f.getOrderErr
+	}
 	if len(f.orders) == 0 {
 		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: GetOrder has no scripted orders")
 	}
@@ -312,10 +326,14 @@ func (f *fakeAPI) issueForCSR() []byte {
 	}
 	// tls.X509KeyPair-style self-signature: the fake CA is its own issuer, and nothing in
 	// the download path verifies the chain (the network probe does that separately).
+	notBefore := time.Now().Add(-time.Hour)
+	if !f.certNotBefore.IsZero() {
+		notBefore = f.certNotBefore
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		DNSNames:     names,
-		NotBefore:    time.Now().Add(-time.Hour),
+		NotBefore:    notBefore,
 		NotAfter:     notAfter,
 		// A real CA always sets the Authority Key Identifier, and CertID needs it: without
 		// one the ARI certID cannot be built and the next renewal loses its rate-limit
@@ -339,6 +357,24 @@ func (f *fakeAPI) issueForCSR() []byte {
 
 // GetRenewalInfo errors by default: ARI is optional, and an unscripted ARI call usually
 // means the test's throttling is wrong. Failing loudly is easier to debug than an empty response.
+// revoked records every RevokeCertificate call, so a test can assert that a revocation was
+// attempted, with which reason, and how many times.
+func (f *fakeAPI) RevokeCertificate(der []byte, reason int) error {
+	f.enter("RevokeCertificate")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revoked = append(f.revoked, revokedCall{Reason: reason, DERLen: len(der)})
+	if f.revokeErr != nil {
+		return f.revokeErr
+	}
+	return nil
+}
+
+type revokedCall struct {
+	Reason int
+	DERLen int
+}
+
 func (f *fakeAPI) GetRenewalInfo(string) (*http.Response, error) {
 	f.enter("GetRenewalInfo")
 	f.mu.Lock()

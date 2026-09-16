@@ -722,3 +722,63 @@ certificates:
 		}
 	}
 }
+
+const minimalWithDNS = `
+statePath: /tmp/wecert-test.db
+acme:
+  directory: https://acme-staging-v02.api.letsencrypt.org/directory
+  email: ops@example.com
+tencent:
+  credentialMode: static
+  secretId: id
+  secretKey: key
+  regions: [ap-guangzhou]
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`
+
+// dns.provider "lego" must be validated where the operator can act on it.
+//
+// The full lego provider registry is behind a build tag (see internal/acme/provider_notags.go),
+// so a config that asks for it in a default binary has to be rejected at load time carrying the
+// rebuild instruction -- not accepted and then failing when the solver is constructed, which is
+// after the ACME account has already been touched.
+func TestLegoProviderRequiresAName(t *testing.T) {
+	path := writeConfig(t, minimalWithDNS+`
+dns:
+  provider: lego
+`)
+	if _, err := Load(path); err == nil {
+		t.Error("dns.provider=lego without dns.legoProvider must be rejected")
+	}
+}
+
+func TestLegoProviderInADefaultBuildSaysHowToEnableIt(t *testing.T) {
+	path := writeConfig(t, minimalWithDNS+`
+dns:
+  provider: lego
+  legoProvider: cloudflare
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Skip("this binary was built with -tags lego_dns, so the provider is available")
+	}
+	if !strings.Contains(err.Error(), "lego_dns") {
+		t.Errorf("the error must name the build tag that enables it, got %q", err)
+	}
+}
+
+// A provider name that is not one of wecert's own must not fall through to a default: silently
+// issuing with dnspod credentials because someone wrote "cloudflare" is the kind of mistake that
+// only surfaces when a challenge fails.
+func TestUnknownProviderDoesNotFallThroughToADefault(t *testing.T) {
+	path := writeConfig(t, minimalWithDNS+`
+dns:
+  provider: cloudflare
+  loginToken: token
+`)
+	if _, err := Load(path); err == nil {
+		t.Error("an unknown dns.provider must be rejected")
+	}
+}

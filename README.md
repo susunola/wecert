@@ -169,6 +169,28 @@ ARI-coordinated renewals are **exempt from every Let's Encrypt rate limit** — 
 
 The tables behind these diagrams — data ownership, failure semantics and the rate-limit arithmetic — are in [The certificate lifecycle](README.reference.md#the-certificate-lifecycle), alongside the same six figures. There is also a single interactive page at [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html), with links between the figures and a print/PDF button.
 
+## Revocation
+
+Revoking is an explicit operator action, never something wecert decides on its own:
+
+```bash
+wecert -config /etc/wecert/config.yaml -revoke example-com -revoke-reason keyCompromise
+```
+
+It asks you to type the certificate name back (skip with `-yes`), then records the decision in
+`state.db` **before** contacting the CA. That order is the point: revocation is unbounded in
+time — a leaked private key does not stop being leaked because the CA returned a 503 — so a
+failed attempt leaves a durable request that the daemon retries on **every** pass until the CA
+accepts it. A synchronous-only command would leave the failure on someone's terminal and no
+record that the operator ever asked.
+
+`-revoke-reason` takes the RFC 5280 codes that make sense here: `unspecified` (the default, which
+omits the reason), `keyCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`.
+
+Two limits worth knowing: the certificate came from `state.db`, so a certificate issued before
+wecert started archiving material can only be revoked at the CA; and revocation does **not**
+restore rate-limit quota — the resources were consumed when the certificate was issued.
+
 ## Event-driven
 
 By default wecert converges on a timer. Configure `webhook` and it can also be triggered on demand — by CI right after a domain is added, say, instead of waiting for the next tick:
@@ -215,6 +237,8 @@ Deletion is deliberately an order of magnitude more conservative than addition, 
 - [Field notes and pitfalls](README.reference.md#field-notes-and-pitfalls) — the CLB SNI trap, `DescribeListeners` not reading bindings back, the DNSPod TTL floor, the lego API traps.
 - [Desired state](docs/desired-state.md) — declaring domains as `_wecert` DNS records, generating the desired-state document, and switching wecert over to it. Design rationale: [desired-state-providers.md](docs/desired-state-providers.md).
 - [The certificate lifecycle](README.reference.md#the-certificate-lifecycle) — seven diagrams, from the problem this exists to solve through to retiring the old certificate, plus data ownership, failure semantics and the rate-limit arithmetic. Interactive version: [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html).
+- [Availability](docs/availability.md) — what a restart already survives (`Restart=on-failure`, resumable orders), why a second process on the same host would be redundant and useless, and the three real options with what each actually costs.
+- [Challenge types](docs/challenge-types.md) — why DNS-01 is the right default for a deployment where the CLB terminates TLS, what HTTP-01 would additionally require, and why TLS-ALPN-01 cannot work here at all.
 - [Lifecycle acceptance case](docs/lifecycle-acceptance.md) — the executable acceptance checklist for a certificate's whole life against real DNSPod + Let's Encrypt **staging**: issuance, SAN drift, the shared wildcard/apex TXT name, concurrent certificates, the ARI and fallback renewal paths, crash recovery, and the declaration → document → enforce handover.
 - [Roadmap](README.reference.md#roadmap) · [Development](README.reference.md#development).
 

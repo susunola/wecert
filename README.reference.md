@@ -552,6 +552,36 @@ Deletion is deliberately an order of magnitude more conservative than addition: 
 | `probe` | no | enabled | Network-side verification that the deployed certificate is the one actually being served |
 | `certificates` | static/observe only | — | At least one. Must be **empty** when `desiredState.mode` is `enforce` |
 
+### DNS providers
+
+Two providers are built in, and they cover the deployment this program exists for:
+
+| `dns.provider` | Credentials | Notes |
+|---|---|---|
+| `dnspod` | `dns.loginToken` (a DNSPod API token, not a CAM key) | The original path; the token never expires |
+| `tencentcloud` | Tencent Cloud CAM (`tencent.*`), including a CVM role | Rebuilds the client per call, so it never uses expired credentials |
+
+**Any of lego's ~198 DNS providers is available behind a build tag.** Set `dns.provider: lego`
+and `dns.legoProvider: <name>` (e.g. `cloudflare`, `route53`, `alidns`); the provider then reads
+its own credentials from the environment using lego's documented variable names, which is why no
+per-provider configuration exists here — a generic credential map would have to mirror 198
+different schemas that lego already defines.
+
+```bash
+make build-lego-dns        # or: go build -tags lego_dns ./cmd/wecert
+```
+
+The tag is opt-in rather than the default, and the reason is dependency surface rather than
+effort: lego's registry imports all 198 provider packages, and between them they pull in hundreds
+of third-party modules (the Azure and AWS SDKs, Huawei, Yandex, Oracle, Akamai, …). Compiling
+them in multiplies the size of the default binary and adds all of that code to the supply chain
+of a program whose job is holding private keys. The first tagged build therefore needs
+`go mod tidy` to record the new dependencies in `go.sum` — if a module is missing, the build says
+so rather than silently omitting the provider.
+
+A default binary asked for `dns.provider: lego` fails at config load with the rebuild
+instruction, not later when the solver is constructed.
+
 ### `acme`
 
 | Field | Required | Description |
@@ -823,17 +853,37 @@ sudo systemctl enable --now wecert-once.timer
 
 The timer's `Unit=` is not decorative: without it, systemd resolves the service of the same name, so if the file is ever renamed to `wecert.timer` the timer silently points at the **daemon** and timer mode stops working while appearing fine.
 
+### Rate-limit quota
+
+Let's Encrypt publishes its limits and their token-bucket refill rates but offers **no endpoint
+to query the remaining allowance** — so "do 40 more issuances fit in this week's 50?" cannot be
+answered by asking. wecert answers it two ways, and the difference matters:
+
+- **Locally, from what it spent** (`wecert_ratelimit_remaining_tokens`). Every event that
+  consumes quota goes through wecert, and the buckets refill at published rates, so the
+  remainder can be reconstructed exactly — for this program. It is a **lower bound**: the
+  per-registered-domain and per-exact-set limits are global, and another account spending them
+  is invisible here. Read it as "at least this much is left".
+- **From the CA, when it refuses** (`wecert_ratelimit_blocked`). A rate-limited request returns
+  a documented message ending in `retry after <instant>`, and when several limits are exceeded
+  at once the CA reports the one that resets *furthest* in the future. That instant is
+  authoritative — it accounts for every other spend the estimate cannot see — so it is stored
+  and reported until it passes.
+
+The accounting lives in `internal/ratelimit` (pure arithmetic, no dependencies) and persists one
+row per bucket in `rate_buckets`: the bucket model is its own memory, so no event log is needed.
+
 ### Metrics and alerting
 
 `/metrics` exposes:
 
 | Metric | Use |
 |---|---|
-| `wecert_certificate_not_after_timestamp_seconds` | **Primary expiry signal** |
+| `wecert_certificate_not_after_timestamp_seconds` | **Primary expiry signal.** The series is **absent** until a certificate has actually been issued — a never-issued certificate has no expiry to compare, and exporting `0` made the rule below fire at roughly -20,700 days |
 | `wecert_certificate_deployed` | `1` only when the certificate is confirmed live on a cloud resource; `0` while merely uploaded and awaiting the manual bind |
 | `wecert_certificate_consecutive_failures` | Persistently > 0 means manual intervention |
 | `wecert_certificate_ari_window_start_timestamp_seconds` | Start of the ARI window |
-| `wecert_reconcile_total{cert,result}` | Reconcile pass counter |
+| `wecert_reconcile_total{cert,result}` | Reconcile pass counter. `result` is `ok`, `error`, or `skipped` — the last means the pass deliberately did not run because the certificate is inside its retry backoff window |
 | `wecert_certificate_probe_match{host}` | 1 when the certificate served is the one deployed; 0 when a rebind did not take effect or another certificate is winning SNI |
 | `wecert_certificate_probe_not_after_timestamp_seconds{host}` | `notAfter` read back over the network — compare against the state-store value |
 | `wecert_certificate_probe_errors_total{host}` | The probe could not run at all. An environment problem, not a certificate problem |
@@ -841,6 +891,8 @@ The timer's `Unit=` is not decorative: without it, systemd resolves the service 
 | `wecert_certificate_fallback_dropped_names{cert}` | How many names that partial certificate is missing |
 | `wecert_desired_state_age_seconds` | Age of the desired-state document. A growing value means `wecert-onboard` stopped running |
 | `wecert_orphaned_certificates` | Certificates in the state store but absent from the desired state. They will not be renewed |
+| `wecert_ratelimit_remaining_tokens{limit,scope}` | Estimated tokens left in a published CA rate limit. **A lower bound**: it counts only what wecert spent, while *certs per registered domain* and *certs per exact set of identifiers* are global across all accounts |
+| `wecert_ratelimit_blocked{limit,scope}` | `1` while the CA has refused a request against this limit and reported when it will accept one again |
 
 Alert on `not_after`, **not** on "did the renewal job error" — the latter stays silent when the program is quietly broken:
 

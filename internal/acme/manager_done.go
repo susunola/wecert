@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"time"
@@ -61,9 +62,31 @@ func (m *Manager) download(
 	if err := VerifyCoverage(leaf, c.Domains); err != nil {
 		return m.recordFailure(st, err)
 	}
-	if !st.NotAfter.IsZero() && !leaf.NotAfter.After(st.NotAfter) {
+	// Reject a certificate that is not actually a REPLACEMENT for the live one.
+	//
+	// This used to be "the new notAfter must be strictly later", which is wrong whenever the
+	// new certificate legitimately lives LESS long than the old one. Two ordinary ways that
+	// happens:
+	//
+	//   - the operator switches profile, e.g. classic (90d) -> shortlived (160h). At the
+	//     moment ARI asks for renewal the live classic certificate still has weeks left, so
+	//     every attempt is refused, and the refusal repeats on every pass until the live
+	//     certificate has decayed below 160h. The profile change silently fails to take
+	//     effect, consecutive_failures sits at its cap, and the renewal collapses into the
+	//     last few days of validity instead of happening 30 days early;
+	//   - the CA shortens lifetimes. Let's Encrypt has announced 90 -> 45 -> 6 days, so
+	//     "the replacement must expire later" would break every certificate in the fleet on
+	//     the day the CA switches.
+	//
+	// In both cases the new certificate is unambiguously newer: it was issued after the live
+	// one. That is the property worth testing. notAfter remains the fallback for when the
+	// live certificate's material is unavailable or unparseable, where "later expiry" is the
+	// only evidence available.
+	if !st.NotAfter.IsZero() && !leaf.NotAfter.After(st.NotAfter) && !certIsNewer(leaf, st) {
 		return m.recordFailure(st, fmt.Errorf(
-			"the new certificate's notAfter (%s) is not later than the current one (%s); refusing to deploy", leaf.NotAfter, st.NotAfter))
+			"the new certificate's notAfter (%s) is not later than the current one (%s), and it was not "+
+				"issued after it either, so it is not a replacement; refusing to deploy",
+			leaf.NotAfter, st.NotAfter))
 	}
 	if len(o.KeyPEM) == 0 {
 		return m.recordFailure(st, errors.New("the order has no private key; cannot deploy"))
@@ -261,7 +284,7 @@ func (m *Manager) download(
 	if !c.Deploy.Enabled {
 		m.log.Info("certificate issued and recorded locally (cloud deploy is off)",
 			"cert", c.Name, "notAfter", st.NotAfter,
-			"daysLeft", int(time.Until(st.NotAfter).Hours()/24))
+			"daysLeft", config.DaysUntil(st.NotAfter, m.now()))
 	} else if !st.DeployConfirmed {
 		m.log.Info("certificate uploaded; waiting for a one-time manual bind in the CLB console",
 			"cert", c.Name, "notAfter", st.NotAfter,
@@ -270,7 +293,7 @@ func (m *Manager) download(
 	} else {
 		m.log.Info("certificate renewed and live",
 			"cert", c.Name, "notAfter", st.NotAfter,
-			"daysLeft", int(time.Until(st.NotAfter).Hours()/24),
+			"daysLeft", config.DaysUntil(st.NotAfter, m.now()),
 			"deployedCertId", deployedID, "ariCertId", ariCertID != "")
 	}
 	return nil
@@ -338,6 +361,15 @@ func (m *Manager) recordFailure(st *state.CertState, err error) error {
 	st.NextAttemptAt = m.now().Add(backoff)
 
 	if perr := m.store.PutCert(st); perr != nil {
+		// The deadline computed above cannot be persisted, so hold it in memory as well.
+		//
+		// Without this the failure is forgotten the moment this function returns: the next
+		// pass reads the OLD row, which has no NextAttemptAt, runs immediately and fails
+		// again. When the cause is a full disk -- exactly when PutCert fails -- that pass
+		// creates another order at the CA, so the order rate follows the pass rate instead of
+		// the backoff: 1440 a day at a 1-minute interval, against "300 new orders per account
+		// per 3 hours", which blocks every certificate on the account rather than just this one.
+		m.setTransientBackoff(st.Name, st.NextAttemptAt)
 		return errors.Join(err, perr)
 	}
 
@@ -470,4 +502,30 @@ func (m *Manager) recordOrphanCert(newID, liveID, certName string) {
 	}
 	m.log.Info("the certificate uploaded during the failed deploy has been recorded for reclaim and will be deleted later",
 		"cert", certName, "certId", newID)
+}
+
+// certIsNewer reports whether the freshly issued leaf was issued after the certificate
+// currently in effect.
+//
+// Two sources, in order of directness:
+//
+//  1. The live certificate's own NotBefore, parsed from the stored PEM. This is the real
+//     issuance instant and needs no bookkeeping.
+//  2. CertState.IssuedAt, the record wecert wrote when it deployed that certificate. It is
+//     the fallback for a stored PEM that cannot be parsed, and it is why the field exists --
+//     it was being persisted on every issuance and read by nothing.
+//
+// A false result is not "the certificate is bad": it means there is no evidence this is a
+// replacement, which is exactly when the caller should keep refusing.
+func certIsNewer(fresh *x509.Certificate, st *state.CertState) bool {
+	if fresh == nil {
+		return false
+	}
+	if live, err := ParseLeaf(st.CertPEM); err == nil && live != nil {
+		return fresh.NotBefore.After(live.NotBefore)
+	}
+	if !st.IssuedAt.IsZero() {
+		return fresh.NotBefore.After(st.IssuedAt)
+	}
+	return false
 }

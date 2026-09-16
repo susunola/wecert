@@ -32,9 +32,31 @@ var (
 		Help: "Start of the ARI-suggested renewal window in unix seconds; 0 means not yet obtained.",
 	}, []string{"cert"})
 
+	// RateLimitRemaining reports how much of a published CA rate limit is left, as a LOWER
+	// BOUND.
+	//
+	// The value counts only what this program spent, while "certs per registered domain" and
+	// "certs per exact set of identifiers" are global across all accounts, so the true
+	// remainder can be smaller -- never larger. It is published anyway because the number an
+	// operator needs before a bulk change ("do 40 issuances still fit in this week's 50?") was
+	// previously unavailable from anywhere: Let's Encrypt documents the limits and their token
+	// bucket refill rates but offers no endpoint to query the remainder.
+	RateLimitRemaining = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_ratelimit_remaining_tokens",
+		Help: "Estimated tokens left in a published CA rate limit, counting only this program's own spend (a lower bound; the per-domain limits are global across accounts).",
+	}, []string{"limit", "scope"})
+
+	// RateLimitBlocked reports 1 while the CA has reported a deadline for a limit, which is
+	// authoritative in a way the estimate cannot be: it accounts for every other spend the
+	// estimate cannot see.
+	RateLimitBlocked = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_ratelimit_blocked",
+		Help: "1 when the CA has refused a request against this rate limit and reported when it will accept one again.",
+	}, []string{"limit", "scope"})
+
 	ReconcileTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "wecert_reconcile_total",
-		Help: "Reconcile passes, with result being ok or error.",
+		Help: "Reconcile passes. result=ok when a pass ran and succeeded, error when it ran and failed, skipped when it deliberately did not run because the certificate is inside its retry backoff window.",
 	}, []string{"cert", "result"})
 
 	ReconcilePanics = promauto.NewCounterVec(prometheus.CounterOpts{

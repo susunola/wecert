@@ -3,6 +3,7 @@ package acme
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -12,9 +13,11 @@ import (
 	"time"
 
 	legoacme "github.com/go-acme/lego/v4/acme"
+	_ "modernc.org/sqlite"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -247,20 +250,24 @@ func (d *recordingDeployer) Deploy(_ context.Context, _ string, oldID string, _,
 func (d *recordingDeployer) Delete(context.Context, string) error          { return nil }
 func (d *recordingDeployer) Bindings(context.Context, string) (int, error) { return 0, nil }
 
-// A domain-set change must not carry ARI's `replaces`.
+// A drift reissue must still succeed even when the identifier sets share nothing.
 //
-// Let's Encrypt answers `malformed: Could not validate ARI 'replaces' field: identifiers
-// in this order do not match any identifiers in the certificate being replaced` when the
-// two identifier sets do not overlap, and that error comes back from newOrder -- so no
-// order is created, and every later round sends the same value and is refused the same
-// way. A certificate moved to a wholly different domain set would then never issue again.
+// This is where the "never send replaces on a changed set" rule came from, found by running
+// the lifecycle acceptance case against real Let's Encrypt staging: with two wholly disjoint
+// sets the CA refuses `replaces`, that refusal comes back from newOrder, and -- before
+// issue() learned to retry -- no order was created and every later round was refused
+// identically, so a certificate moved to a different domain set never issued again.
 //
-// Found by running the lifecycle acceptance case against real Let's Encrypt staging.
-func TestDriftReissueSendsNoReplaces(t *testing.T) {
+// The refusal is the NO-overlap case, not "any change". Let's Encrypt's published rule is
+// that an ARI order is exempt when it includes AT LEAST ONE identifier matching the
+// certificate it replaces, and an ordinary config change keeps most of the set -- so the
+// blanket "never send it" gave up a real exemption to avoid a case the retry now handles.
+// The safety property to pin is therefore not "no replaces" but "a disjoint set can never
+// wedge the renewal": the order is still created, on the retry.
+func TestDriftReissueSurvivesADisjointIdentifierSet(t *testing.T) {
 	store, m, fake, cert := newAPITestHarness(t, []string{"new.example.com"})
 
-	// The live certificate covers something else entirely, and its ARI certID is known:
-	// that is exactly the value the old code would have sent.
+	// The live certificate covers something else entirely, and its ARI certID is known.
 	notAfter := time.Now().Add(80 * 24 * time.Hour)
 	if err := store.PutCert(&state.CertState{
 		Name:      cert.Name,
@@ -272,7 +279,59 @@ func TestDriftReissueSendsNoReplaces(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Already valid, so the pass goes straight to the download.
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+	// The CA behaves as Let's Encrypt does for a disjoint set: it refuses the replaces and
+	// the order is never created.
+	fake.beforeCall = func(call string) {
+		if call != "NewOrder" {
+			return
+		}
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		if len(fake.newOrderReplaces) > 0 && fake.newOrderReplaces[len(fake.newOrderReplaces)-1] != "" {
+			fake.newOrderErr = errors.New("acme: error: 400 :: urn:ietf:params:acme:error:malformed :: " +
+				"Could not validate ARI 'replaces' field :: identifiers in this order do not match " +
+				"any identifiers in the certificate being replaced")
+		}
+	}
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("a disjoint identifier set must never wedge the renewal; got %v", err)
+	}
+
+	// Two attempts: the exempting one, then the retry that gets the order created.
+	if len(fake.newOrderReplaces) != 2 {
+		t.Fatalf("expected the replaces attempt plus one retry, got %v", fake.newOrderReplaces)
+	}
+	if fake.newOrderReplaces[0] != "oldAki.oldSerial" {
+		t.Errorf("the first attempt should try to keep the ARI exemption, sent %q", fake.newOrderReplaces[0])
+	}
+	if fake.newOrderReplaces[1] != "" {
+		t.Errorf("the retry must drop replaces, sent %q", fake.newOrderReplaces[1])
+	}
+}
+
+// A config change that KEEPS most of the set must keep `replaces`, because Let's Encrypt
+// exempts an ARI order sharing at least one identifier. Dropping it there spends one of the
+// 50-certificates-per-registered-domain-per-7-days allowance for nothing.
+func TestDriftReissueWithAnOverlappingSetKeepsTheExemption(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t,
+		[]string{"a.example.com", "b.example.com", "c.example.com"})
+
+	// Live certificate covers two of the three configured names.
+	notAfter := time.Now().Add(80 * 24 * time.Hour)
+	if err := store.PutCert(&state.CertState{
+		Name:      cert.Name,
+		NotAfter:  notAfter,
+		CertPEM:   selfSignedCertPEM(t, notAfter, "a.example.com", "b.example.com"),
+		KeyPEM:    []byte("old-key"),
+		ARICertID: "oldAki.oldSerial",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
 	fake.orders = []legoacme.ExtendedOrder{
 		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
 	}
@@ -284,52 +343,402 @@ func TestDriftReissueSendsNoReplaces(t *testing.T) {
 	if len(fake.newOrderReplaces) != 1 {
 		t.Fatalf("expected exactly one order attempt, got %v", fake.newOrderReplaces)
 	}
-	if got := fake.newOrderReplaces[0]; got != "" {
-		t.Errorf("a changed identifier set must not send replaces (got %q): the CA rejects "+
-			"it outright, and because no order is created the failure repeats forever", got)
+	if got := fake.newOrderReplaces[0]; got != "oldAki.oldSerial" {
+		t.Errorf("an overlapping identifier set qualifies for the ARI exemption, so replaces must be "+
+			"sent (got %q); dropping it consumes the 50-per-registered-domain quota for nothing", got)
 	}
 }
 
-// A refused `replaces` is retried once without it, on the renewal path too.
-//
-// Losing the rate-limit exemption costs one quota slot; failing to renew costs the
-// certificate. This is the guard that makes the second outcome impossible.
 func TestRefusedReplacesIsRetriedWithoutIt(t *testing.T) {
+	// Every wording a real CA uses to refuse a `replaces` field. Only the last one contains
+	// the literal string "replaces", which is what the original guard matched on -- so the
+	// first three used to fall through to a permanent failure and the certificate NEVER
+	// renewed. Boulder reports the first two, Pebble the third (an ACME server is free to
+	// word its errors however it likes, so message matching cannot be made correct).
+	wordings := []struct {
+		name string
+		msg  string
+	}{
+		{"boulder-ari-certid", "acme: error: 400 :: urn:ietf:params:acme:error:malformed :: parsing ARI CertID failed"},
+		{"boulder-account", "acme: error: 403 :: urn:ietf:params:acme:error:unauthorized :: " +
+			"requester account did not request the certificate being replaced by this order"},
+		{"pebble-no-order", "acme: error: 404 :: urn:ietf:params:acme:error:malformed :: " +
+			"could not find an order for the given certificate"},
+		{"le-no-overlap", "acme: error: 400 :: urn:ietf:params:acme:error:malformed :: " +
+			"Could not validate ARI 'replaces' field :: identifiers in this order do not match " +
+			"any identifiers in the certificate being replaced"},
+	}
+
+	for _, w := range wordings {
+		t.Run(w.name, func(t *testing.T) {
+			store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+
+			// Due for renewal through the ARI window, so `replaces` is non-empty.
+			notAfter := m.now().Add(20 * 24 * time.Hour)
+			if err := store.PutCert(&state.CertState{
+				Name:           cert.Name,
+				NotAfter:       notAfter,
+				CertPEM:        selfSignedCertPEM(t, notAfter, "example.com"),
+				KeyPEM:         []byte("old-key"),
+				ARICertID:      "oldAki.oldSerial",
+				ARIWindowStart: m.now().Add(-2 * time.Hour),
+				ARIWindowEnd:   m.now().Add(-time.Hour),
+				ARICheckedAt:   m.now(), // fresh, so the window above is not refetched
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			fake.orders = []legoacme.ExtendedOrder{
+				terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+			}
+			fake.newOrderErr = errors.New(w.msg)
+
+			if err := m.Reconcile(context.Background(), cert); err != nil {
+				t.Fatalf("the pass must recover by dropping replaces (this error wording is the CA's "+
+					"choice, so it cannot be the thing that decides whether a renewal happens), got: %v", err)
+			}
+
+			want := []string{"oldAki.oldSerial", ""}
+			if len(fake.newOrderReplaces) != len(want) {
+				t.Fatalf("expected a retry without replaces, got attempts %v", fake.newOrderReplaces)
+			}
+			for i := range want {
+				if fake.newOrderReplaces[i] != want[i] {
+					t.Errorf("attempt %d sent replaces=%q, want %q", i, fake.newOrderReplaces[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+// A failure with NO replaces set must not be retried: there is nothing to drop, and retrying
+// would double the order rate for an error that will repeat identically.
+func TestOrderFailureWithoutReplacesIsNotRetried(t *testing.T) {
 	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
 
-	// Due for renewal through the ARI window, so `replaces` is non-empty.
-	notAfter := time.Now().Add(20 * 24 * time.Hour)
-	if err := store.PutCert(&state.CertState{
-		Name:           cert.Name,
-		NotAfter:       notAfter,
-		CertPEM:        selfSignedCertPEM(t, notAfter, "example.com"),
-		KeyPEM:         []byte("old-key"),
-		ARICertID:      "oldAki.oldSerial",
-		ARIWindowStart: time.Now().Add(-2 * time.Hour),
-		ARIWindowEnd:   time.Now().Add(-time.Hour),
-		ARICheckedAt:   time.Now(), // fresh, so the window above is not refetched
-	}); err != nil {
-		t.Fatal(err)
+	// No certificate state at all: first issuance, so replaces is empty.
+	_ = store
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+	fake.newOrderErr = errors.New("acme: error: 500 :: server internal error")
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("a genuine order-creation failure must be reported, not hidden")
+	}
+	if len(fake.newOrderReplaces) != 1 {
+		t.Errorf("an error with no replaces to drop must not be retried, got %d attempts",
+			len(fake.newOrderReplaces))
+	}
+}
+
+// A failure to RECORD a created order must still schedule a backoff.
+//
+// This was a bare `return err`, the worst of both worlds: the order exists at the CA but not
+// in the state store, so the next pass has no order URL to resume and creates ANOTHER one --
+// and because recordFailure never ran, no backoff was scheduled either. The order rate then
+// follows the pass rate instead of the backoff: at a 1-minute interval that is 1440 orders a
+// day against "300 new orders per account per 3 hours", and hitting that ceiling blocks every
+// certificate on the account, not just this one.
+func TestFailedOrderPersistSchedulesABackoff(t *testing.T) {
+	// Opened here rather than through newAPITestHarness so the path is known: the test needs a
+	// second connection to install the trigger.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("open state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	certs := []config.Certificate{{
+		Name: "example-com", Domains: []string{"example.com"},
+		Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+		Deploy: config.Deploy{Enabled: false},
+	}}
+	if err := config.NormalizeCertificates(certs); err != nil {
+		t.Fatalf("normalize certificate: %v", err)
+	}
+	cert := &certs[0]
+
+	fake := &fakeAPI{}
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	now := fixed
+	m.now = func() time.Time { return now }
+
+	// Block only order INSERTs, so the certificate row (where the backoff lives) still writes.
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open second connection: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER block_order_insert BEFORE INSERT ON orders
+		BEGIN SELECT RAISE(FAIL, 'order insert blocked by test'); END;`); err != nil {
+		t.Fatalf("block order inserts: %v", err)
 	}
 
 	fake.orders = []legoacme.ExtendedOrder{
 		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
 	}
-	fake.newOrderErr = errors.New("acme: error: 400 :: urn:ietf:params:acme:error:malformed :: " +
-		"Could not validate ARI 'replaces' field :: identifiers in this order do not match " +
-		"any identifiers in the certificate being replaced")
 
-	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("the pass must recover by dropping replaces, got: %v", err)
+	// First issuance, so the pass goes straight to issue().
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("failing to record the order must be reported")
+	}
+	if len(fake.newOrderReplaces) != 1 {
+		t.Fatalf("expected one order attempt, got %d", len(fake.newOrderReplaces))
 	}
 
-	want := []string{"oldAki.oldSerial", ""}
-	if len(fake.newOrderReplaces) != len(want) {
-		t.Fatalf("expected a retry without replaces, got attempts %v", fake.newOrderReplaces)
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for i := range want {
-		if fake.newOrderReplaces[i] != want[i] {
-			t.Errorf("attempt %d sent replaces=%q, want %q", i, fake.newOrderReplaces[i], want[i])
+	if st == nil || st.NextAttemptAt.IsZero() {
+		t.Fatal("a failed order-record must schedule a retry; without one the next pass runs " +
+			"immediately and creates another order, so the rate follows the pass rate")
+	}
+	if st.ConsecutiveFailures == 0 {
+		t.Error("the failure must be counted")
+	}
+
+	// And the scheduled window must actually hold the next pass off.
+	if err := m.Reconcile(context.Background(), cert); !errors.Is(err, state.ErrBackoff) {
+		t.Errorf("the next pass must wait for the backoff, got %v", err)
+	}
+	if len(fake.newOrderReplaces) != 1 {
+		t.Errorf("the backoff window must prevent a second order, got %d attempts",
+			len(fake.newOrderReplaces))
+	}
+}
+
+// An order URL that can never be fetched again must not block renewal until it expires.
+//
+// The order branch keeps advancing a persisted order instead of creating a new one, and
+// renewal is only decided AFTER that branch -- so an order whose URL is permanently gone
+// stalls every later renewal for the order's whole TTL (7 days by default). Reachable without
+// anything exotic: accounts are keyed by ACME directory while orders are not, so pointing
+// wecert at staging and back leaves orders naming a directory that no longer serves them.
+// Observed before the fix: a certificate 5 days from expiry sat through 24 passes and 24
+// GetOrder failures, fell to 21 hours left, and issued only once the order expired.
+func TestDeadOrderURLIsDiscardedInsteadOfBlockingRenewal(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	now := fixed
+	m.now = func() time.Time { return now }
+
+	// A live certificate well inside its renewal window, with a persisted order whose URL
+	// the CA will never serve again.
+	notAfter := fixed.Add(5 * 24 * time.Hour)
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: notAfter,
+		CertPEM: selfSignedCertPEM(t, notAfter, "example.com"),
+		KeyPEM:  []byte("live-key"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutOrder(&state.Order{
+		CertName: cert.Name, OrderURL: "https://ca.test/order/gone",
+		FinalizeURL: "https://ca.test/finalize/gone", Status: "pending",
+		Identifiers: cert.DomainKey(),
+		ExpiresAt:   fixed.Add(7 * 24 * time.Hour), // a week away
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every GetOrder fails; the fake is only consulted once the order row is gone.
+	fake.orderErr = nil
+	fake.getOrderErr = errors.New("acme: error: 404 :: urn:ietf:params:acme:error:malformed :: no order found")
+
+	var discarded bool
+	for i := 0; i < maxOrderFetchFailures+2; i++ {
+		_ = m.Reconcile(context.Background(), cert)
+		o, err := store.GetOrder(cert.Name)
+		if err != nil {
+			t.Fatal(err)
 		}
+		if o == nil {
+			discarded = true
+			t.Logf("order discarded after %d attempt(s)", i+1)
+			break
+		}
+		// Clear the backoff so the next attempt is not simply skipped.
+		st, err := store.GetCert(cert.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st != nil {
+			st.NextAttemptAt = time.Time{}
+			if err := store.PutCert(st); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if !discarded {
+		t.Fatalf("an order that cannot be fetched must be discarded after %d consecutive failures, "+
+			"otherwise renewal waits for the order to expire (%s away)",
+			maxOrderFetchFailures, time.Until(fixed.Add(7*24*time.Hour)).Round(time.Hour))
+	}
+}
+
+// A name whose authorization just failed must not be ordered again inside the failure window.
+//
+// The certificate backoff starts at a minute and doubles, so the first hour of a persistently
+// failing name costs six attempts (1+2+4+8+16+32 minutes) against "5 authorization failures
+// per identifier per hour". That budget belongs to the IDENTIFIER, not the certificate, so N
+// certificates sharing the name attack the same five -- at ten certificates, sixty failures in
+// the first hour, of which at most five could have produced a different answer. Past the limit
+// every further order for that name is rejected outright, so the extra attempts bought nothing
+// while the consecutive-failure counter (which feeds an account pause requiring manual portal
+// action) kept climbing.
+func TestIdentifierCooldownSuppressesFurtherOrders(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"broken.example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	now := fixed
+	m.now = func() time.Time { return now }
+
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+
+	// Everything except the identifier cooldown must be permissive, or this test would pass
+	// for the wrong reason. Two things have to be re-armed before each pass: the certificate
+	// backoff (cleared) and the renewal window. A successful issuance replaces the live
+	// certificate with a fresh 90-day one, which is NOT due for renewal -- so the expiry is
+	// reset too, leaving the cooldown as the only thing that can stop an order.
+	dueForRenewal := func(t *testing.T) {
+		t.Helper()
+		if err := store.PutCert(&state.CertState{
+			Name: cert.Name, NotAfter: fixed.Add(20 * 24 * time.Hour),
+			CertPEM: selfSignedCertAt(t, fixed.Add(-70*24*time.Hour),
+				fixed.Add(20*24*time.Hour), "broken.example.com"),
+			KeyPEM: []byte("live-key"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DeleteOrder(cert.Name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Pass 1: due for renewal, no cooldown, so an order is placed.
+	dueForRenewal(t)
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(fake.newOrderReplaces) != 1 {
+		t.Fatalf("expected one order, got %d", len(fake.newOrderReplaces))
+	}
+
+	// The CA reports the name's authorization as failed, starting its cooldown.
+	m.noteIdentifierFailure("broken.example.com")
+
+	// Pass 2: renewal is due and the backoff is clear, so only the cooldown can stop it.
+	dueForRenewal(t)
+	_ = m.Reconcile(context.Background(), cert)
+	if n := len(fake.newOrderReplaces); n != 1 {
+		t.Errorf("an identifier inside its failure cooldown must not be ordered again, got %d orders "+
+			"in total; retrying inside the window cannot succeed and spends the budget every other "+
+			"certificate for this name depends on", n)
+	}
+
+	// Pass 3, past the window: a cooldown is a delay, not a blacklist. A permanent one would
+	// turn a transient DNS problem into an outage.
+	now = fixed.Add(identifierCooldownFor + time.Minute)
+	dueForRenewal(t)
+	_ = m.Reconcile(context.Background(), cert)
+	if n := len(fake.newOrderReplaces); n != 2 {
+		t.Errorf("after the cooldown expires the name must be retried, got %d orders in total", n)
+	}
+}
+
+// The quota accounting must count what this program actually spends.
+//
+// Let's Encrypt documents its limits and their token-bucket refill rates but has NO endpoint to
+// query the remaining allowance -- the only way to answer "do 40 more issuances fit in this
+// week's 50?" is to account for what was spent. Before this, the answer was unavailable from
+// anywhere, and the first signal was an error after the quota was already gone.
+func TestPlacingAnOrderSpendsAccountQuota(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	before, ok := m.quota.Remaining(ratelimit.NewOrdersPerAccount, "")
+	if !ok {
+		t.Fatal("the account limit must be readable")
+	}
+
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	after, ok := m.quota.Remaining(ratelimit.NewOrdersPerAccount, "")
+	if !ok {
+		t.Fatal("the account limit must be readable after an order")
+	}
+	if after != before-1 {
+		t.Errorf("one order must spend exactly one token: before=%v after=%v", before, after)
+	}
+
+	// The quota must survive a restart, since the bucket is persisted: a fresh Manager over the
+	// same store sees the spend rather than a full bucket.
+	fresh := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fresh.SetNow(func() time.Time { return fixed })
+	restarted, ok := fresh.quota.Remaining(ratelimit.NewOrdersPerAccount, "")
+	if !ok {
+		t.Fatal("the account limit must be readable from a fresh manager")
+	}
+	if restarted != after {
+		t.Errorf("a restart must not forget the spend: %v, want %v", restarted, after)
+	}
+}
+
+// A CA-reported deadline must be recorded, and must be visible to an operator.
+//
+// The message shape is the one Let's Encrypt documents, and the instant inside it is
+// authoritative: it accounts for every other account spending the same global bucket, which
+// the local estimate cannot see.
+func TestRateLimitErrorRecordsTheCAsDeadline(t *testing.T) {
+	_, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	fake.newOrderErr = errors.New("acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: " +
+		"too many new orders recently, retry after 2026-09-16 15:00:00 UTC")
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("a rate-limited order must be reported as a failure")
+	}
+
+	at, reason, blocked := m.quota.BlockedUntil(ratelimit.NewOrdersPerAccount, "")
+	if !blocked {
+		t.Fatal("the CA reported when it will accept requests again; that deadline must be recorded")
+	}
+	want := time.Date(2026, 9, 16, 15, 0, 0, 0, time.UTC)
+	if !at.Equal(want) {
+		t.Errorf("deadline = %s, want %s", at, want)
+	}
+	if reason != ratelimit.NewOrdersPerAccount.Name {
+		t.Errorf("the deadline must name the limit, got %q", reason)
+	}
+
+	// And it must appear in the report an operator or metric reader sees.
+	var found bool
+	for _, rep := range m.QuotaStatus(nil) {
+		if rep.Limit == ratelimit.NewOrdersPerAccount.Name {
+			found = true
+			if !rep.Blocked || !rep.BlockedUntil.Equal(want) {
+				t.Errorf("the report must carry the deadline, got %+v", rep)
+			}
+		}
+	}
+	if !found {
+		t.Error("the account limit must be in the quota report")
 	}
 }

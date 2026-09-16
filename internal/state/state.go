@@ -76,6 +76,25 @@ type Store struct {
 // This is not an anomaly, it is a gate that has to exist. See the Store.lock comment.
 var ErrLocked = errors.New("the state database is already held by another wecert process")
 
+// ErrBackoff means a certificate is inside the retry window an earlier failure scheduled,
+// so the pass deliberately did not run.
+//
+// It lives here rather than in the acme or reconcile package because BOTH need it and they
+// do not import each other -- reconcile drives the manager through an interface on purpose
+// (see reconcile.CertManager), so the shared vocabulary for "this certificate is not
+// actionable right now" belongs in the layer they have in common. `NextAttemptAt` is
+// persisted state, so this is the retry state's natural home.
+//
+// Why it exists: Reconcile used to return nil when it skipped a pass for backoff, which made
+// the caller count the pass as result="ok" and POST a success notification for a certificate
+// that was in failure backoff -- the opposite of the truth, on the signal an operator uses to
+// decide whether anything is progressing.
+//
+// It is deliberately not a failure: nothing went wrong, and treating it as an error would
+// inflate the error rate and emit a failure every interval for a certificate that is simply
+// waiting.
+var ErrBackoff = errors.New("inside the retry backoff window; this pass did not run")
+
 // CertState is the runtime state of one certificate (the status of config.Certificate).
 type CertState struct {
 	Name string
@@ -649,6 +668,49 @@ CREATE TABLE IF NOT EXISTS cert_fallback (
     dropped   TEXT NOT NULL DEFAULT '',
     since     INTEGER NOT NULL DEFAULT 0,
     reason    TEXT NOT NULL DEFAULT ''
+);
+
+-- Rate-limit bucket snapshots.
+--
+-- Let's Encrypt publishes its limits and their token-bucket refill rates but offers no way
+-- to query the remaining allowance, so the only way to answer "how much is left" is to
+-- account for what this program spent. A bucket needs no event log: the model is the memory,
+-- so one row per (limit, scope) holding the last known level and when it was observed can be
+-- rolled forward to any later instant.
+--
+-- scope_id is empty for account-wide limits and holds the registered domain / identifier
+-- otherwise. reset_at is an AUTHORITATIVE instant the CA reported ("retry after ..."), which
+-- beats the local estimate because the estimate cannot see other accounts spending the same
+-- global bucket.
+-- Revocation requests that have not succeeded yet.
+--
+-- A row here means "an operator decided this certificate must be revoked, and the CA has not
+-- accepted it yet". Persisted rather than attempted once because revocation can fail for
+-- entirely transient reasons (network, CA 5xx) and the decision must not be lost with the
+-- process: a leaked private key does not stop being leaked because the request timed out.
+--
+-- The alternative -- only revoking synchronously from a CLI -- leaves a failed attempt as a
+-- message on someone's terminal, with no record that the operator ever asked.
+--
+-- reason is the RFC 5280 CRLReason code, so the reason the operator chose survives into every
+-- retry rather than being lost after the first attempt.
+CREATE TABLE IF NOT EXISTS revoke_requests (
+    cert_name   TEXT PRIMARY KEY,
+    reason      INTEGER NOT NULL DEFAULT 0,
+    requested_at INTEGER NOT NULL DEFAULT 0,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT NOT NULL DEFAULT '',
+    last_attempt_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS rate_buckets (
+    limit_name TEXT NOT NULL,
+    scope_id   TEXT NOT NULL DEFAULT '',
+    tokens     REAL NOT NULL DEFAULT 0,
+    observed_at INTEGER NOT NULL DEFAULT 0,
+    reset_at   INTEGER NOT NULL DEFAULT 0,
+    reset_reason TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (limit_name, scope_id)
 );
 `
 	_, err := s.db.Exec(schema)
