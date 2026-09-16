@@ -538,6 +538,39 @@ func TestWaitDeployRecordDiagnosesAnEmptyTaskAfterTheGracePeriod(t *testing.T) {
 	}
 }
 
+// The deadline branch reports the last *successful* answer, not whatever the final poll
+// returned. When the last polls all errored, reading per-iteration counters would leave
+// zeros there and misdiagnose a task that showed progress as "no resource bound" -- the
+// one error message that sends the operator off checking a listener that is fine.
+func TestWaitDeployRecordDeadlineUsesLastKnownCounters(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var calls int
+	fake := &fakeSSLAPI{
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			calls++
+			if calls == 1 {
+				// Progress is seen once, then every poll errors until the deadline.
+				return detailResp(0, 0, 1), nil
+			}
+			return nil, errors.New("throttled")
+		},
+	}
+
+	err := d.waitDeployRecord(context.Background(), fake, 7, "old-id")
+	if err == nil {
+		t.Fatal("a task that never finishes must not be treated as success")
+	}
+	if strings.Contains(err.Error(), "no resource appears to be bound") {
+		t.Errorf("err = %v, progress was seen before the errors, so the no-binding diagnosis is wrong", err)
+	}
+	if !strings.Contains(err.Error(), "did not finish within 3m") || !strings.Contains(err.Error(), "running=1") {
+		t.Errorf("err = %v, want the timeout with the last known counters", err)
+	}
+}
+
 // ── recovery: a switch that happened but was not recorded ───────────────────
 
 func stubCreateTask(certID, taskID string) func(context.Context, *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error) {

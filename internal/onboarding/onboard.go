@@ -237,6 +237,14 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	if src.Rules == nil {
+		// The deletion path then never fires: the reference check cannot run, so
+		// every grace-expired name is carried forever. That is survivable (names
+		// accumulate, nothing breaks), but nobody should discover it from a report
+		// months later.
+		log.Warn("no CLB rule source is configured: the deletion reference check cannot run, " +
+			"so no name will ever be removed once declared")
+	}
 
 	// Normalize the allowlist to registered domains too, so nobody writes
 	// "www.example.com" expecting it to match all of example.com.
@@ -366,6 +374,13 @@ func (o *Onboarder) Commit(rep *Report) error {
 		return nil
 	}
 
+	// The document goes first, the state second. A failure between the two leaves
+	// the state one revision *behind* the document, which is the direction that
+	// heals itself: the next round recomputes the same content and the revision
+	// comparison in budget() recognises the document already carries it, counting
+	// the round as unchanged instead of spending budget again. The reverse order
+	// would leave the state ahead of the document -- claiming a revision that was
+	// never written -- and no later round could ever detect that.
 	if err := spec.WriteDocument(o.opts.DocumentPath, rep.Document); err != nil {
 		return err
 	}
@@ -499,11 +514,23 @@ func (r *run) parse(raw []RawDeclaration) {
 	r.reasons = map[string]string{}
 	byHost := map[string]*Declaration{}
 	byHostRecord := map[string]string{}
+	// rejected holds hostnames already thrown out by the conflict check, so a
+	// later record for the same hostname cannot come back as a fresh first-seen.
+	rejected := map[string]bool{}
 
 	for _, rec := range raw {
 		d, err := ParseDeclaration(rec.Zone, rec.Record, rec.Values)
 		if err != nil {
 			r.reject(hostnameFromRecord(rec.Record), fmt.Sprintf("unparseable declaration: %v", err))
+			continue
+		}
+		if rejected[d.Hostname] {
+			// Once two records for one hostname disagreed, the hostname is poisoned
+			// for the round: accepting a third record would let whoever writes last
+			// silently win the conflict.
+			r.reject(d.Hostname, fmt.Sprintf(
+				"conflicting declarations for the same name: %s repeats a hostname already rejected for conflicting declarations",
+				d.Record))
 			continue
 		}
 		if prev, dup := byHost[d.Hostname]; dup {
@@ -515,6 +542,7 @@ func (r *run) parse(raw []RawDeclaration) {
 				r.reject(d.Hostname, fmt.Sprintf(
 					"conflicting declarations for the same name (%s and %s): they disagree on wildcard/profile/keytype/deploy",
 					byHostRecord[d.Hostname], d.Record))
+				rejected[d.Hostname] = true
 				delete(byHost, d.Hostname)
 				delete(byHostRecord, d.Hostname)
 				continue
@@ -568,10 +596,16 @@ func hostnameFromRecord(record string) string {
 
 // fuse is §5.2: the abrupt desired-state change fuse.
 //
-// It compares the **declaration set itself**, not the result after guards and
-// grouping. Because what it catches is "upstream returned incomplete data", whereas
-// shrinking caused by guard filtering, the grace period or a grouping failure is our
-// own, recorded decision.
+// It compares the **declaration set itself** (LastDeclared), not the result
+// after guards and grouping. Because what it catches is "upstream returned
+// incomplete data", whereas shrinking caused by guard filtering, the grace
+// period or a grouping failure is our own, recorded decision.
+//
+// The covered set (LastNames) would be the wrong baseline: it includes
+// grace-carried names, so a staged decommission (10 -> 7 -> 6 declarations)
+// would see its own carries as "still declared" -- every step re-trips the fuse
+// and MarkAbsent never runs again, wedging the round into a self-sustaining
+// freeze.
 //
 // A normal decommission does not remove a third of the declarations. Losing a third
 // at once is almost certainly an upstream fault (incomplete API response, changed
@@ -582,7 +616,7 @@ func (r *run) fuse() {
 		return
 	}
 
-	prev := r.st.LastNameSet()
+	prev := r.st.LastDeclaredNameSet()
 	if len(prev) == 0 {
 		return // No baseline to compare against; the first run should write normally.
 	}
@@ -715,6 +749,13 @@ func (r *run) applyGrace() {
 				"a declaration can flap, and a flap would otherwise cost two issuances",
 				humanDuration(age), humanDuration(r.o.opts.GracePeriod)))
 
+		case r.o.src.Rules == nil:
+			// No rule source means the reference check cannot run at all. Unlike a
+			// guard outage this is configuration, not weather, so the reason says
+			// which -- "a CLB rule still references it" would be a lie here.
+			r.carry(n, fmt.Sprintf("no longer declared and absent for %s, but no CLB rule source is configured, "+
+				"so the reference check cannot run", humanDuration(age)))
+
 		case r.referenced(n):
 			r.carry(n, fmt.Sprintf("no longer declared and absent for %s, but a CLB rule still references it",
 				humanDuration(age)))
@@ -748,8 +789,9 @@ func (r *run) carry(name, reason string) {
 
 // referenced reports whether a name is still referenced by some CLB rule.
 //
-// With the guard unavailable it always counts as referenced: the conservative
-// direction is to keep, not to delete.
+// "Cannot tell" counts as referenced: the conservative direction is to keep, not
+// to delete. applyGrace handles the no-rule-source case itself, so the carry
+// reason can say *why* it cannot tell instead of claiming a rule exists.
 func (r *run) referenced(name string) bool {
 	if r.guardUnavailable || r.o.src.Rules == nil {
 		return true
@@ -945,7 +987,16 @@ func (r *run) budget() {
 	rev := spec.Revision(r.certs)
 	r.rep.Revision = rev
 
-	changed := rev != r.st.LastRevision
+	// The state revision is normally authoritative, but Commit writes the document
+	// before the state: if the state save failed, the document on disk already
+	// carries this revision while the state still holds the previous one. Trusting
+	// the state alone would double-count the budget and restart grace clocks on the
+	// retry, so the loaded document's own revision counts as "already written" too.
+	prevRev := ""
+	if r.prev != nil {
+		prevRev = r.prev.Revision
+	}
+	changed := rev != r.st.LastRevision && rev != prevRev
 	if !changed {
 		r.rep.Mode = ModeUnchanged
 		return
@@ -981,6 +1032,15 @@ func (r *run) assemble() {
 	r.st.SetLastNames(names)
 	r.st.LastRevision = r.rep.Revision
 	r.st.UpdatedAt = r.now
+
+	// The fuse's baseline is the pure declaration set, kept apart from LastNames
+	// on purpose -- see State.LastDeclared for why comparing against the covered
+	// set wedges a staged decommission.
+	declared := make([]string, 0, len(r.declarations)*2)
+	for _, d := range r.declarations {
+		declared = append(declared, d.Names()...)
+	}
+	r.st.SetLastDeclared(declared)
 
 	r.rep.Document = &spec.Document{
 		APIVersion:   spec.APIVersionV1,

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // ── fetchCVMRoleCredential against a local metadata service ─────────────────
@@ -149,5 +150,36 @@ func TestFetchCVMRoleCredentialRejectsAnEmptyRoleName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "roleName") {
 		t.Errorf("err = %v, want it to name the missing setting", err)
+	}
+}
+
+// truncate must never leave invalid UTF-8 behind: the metadata error body is free-form
+// text, and a cut landing inside a multi-byte rune would put mojibake into the state
+// database and every log line built from it.
+func TestTruncate(t *testing.T) {
+	cases := []struct {
+		name string
+		s    string
+		n    int
+		want string
+	}{
+		{"short string untouched", "hello", 10, "hello"},
+		{"exactly at the limit", "hello", 5, "hello"},
+		{"ascii cut", "hello world", 5, "hello..."},
+		// "é" is two bytes, so cutting at byte 5 would split the rune; the cut must
+		// back up to its start.
+		{"multi-byte rune backed up", "abcléfg", 5, "abcl..."},
+		{"multi-byte rune at boundary", "abcdéfg", 4, "abcd..."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncate(tc.s, tc.n)
+			if got != tc.want {
+				t.Errorf("truncate(%q, %d) = %q, want %q", tc.s, tc.n, got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("truncate(%q, %d) = %q, not valid UTF-8", tc.s, tc.n, got)
+			}
+		})
 	}
 }

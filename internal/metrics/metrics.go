@@ -124,6 +124,10 @@ func DeleteCertSeries(name string) {
 	} {
 		v.DeleteLabelValues(name)
 	}
+	// ReconcileTotal carries a second label (result), so a full-label delete
+	// cannot name it; a partial match on cert covers every result value.
+	ReconcileTotal.DeletePartialMatch(prometheus.Labels{"cert": name})
+	ReconcilePanics.DeleteLabelValues(name)
 }
 
 // DeleteProbeSeries removes every per-host probe series for a host that is no longer

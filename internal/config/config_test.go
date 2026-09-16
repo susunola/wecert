@@ -451,6 +451,7 @@ certificates:
 		{"dropThreshold above 1", "onboarding:\n  dropThreshold: 1.5\n"},
 		{"dropThreshold exactly 1 (can never be exceeded)", "onboarding:\n  dropThreshold: 1\n"},
 		{"negative dropThreshold", "onboarding:\n  dropThreshold: -0.1\n"},
+		{"dropThreshold NaN slips past every comparison", "onboarding:\n  dropThreshold: .nan\n"},
 		{"negative budget", "onboarding:\n  budget: -1\n"},
 		{"negative maxNames", "onboarding:\n  maxNames: -5\n"},
 		{"unknown profile", "onboarding:\n  profile: tls-server\n"},
