@@ -37,6 +37,9 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
       # -race matters more than usual here: on a certificate with many SANs the
       # DNS probing and the authorization polling are both concurrent, and a data
       # race shows up as "one domain's validation failed for no reason" — the

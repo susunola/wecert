@@ -4,8 +4,9 @@ Least-privilege CAM policies for running wecert and for the e2e environment.
 
 | File | Purpose |
 |---|---|
-| `cam-policy-test.json` | Runtime permissions for the wecert binary itself (SSL certificate service + DNSPod record management). |
-| `cam-policy-stage-ab.json` | The e2e stage A/B run: wecert runtime + Terraform-managed CLB/VPC/tag permissions, split into separate statements by concern. |
+| `cam-policy-runtime.json` | Attach this to the CVM role that runs `wecert`. SSL upload/rebind plus DNSPod record writes. |
+| `cam-policy-test.json` | Same runtime actions as above; kept as the historical name used by preflight/docs. |
+| `cam-policy-stage-ab.json` | **Not a runtime policy.** The e2e stage A/B run: wecert runtime + Terraform-managed CLB/VPC/tag create and delete. Do not attach this to the production `wecert` role. |
 
 ## Why every statement uses `resource: "*"`
 
