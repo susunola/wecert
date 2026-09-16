@@ -434,6 +434,7 @@ Deletion is deliberately an order of magnitude more conservative than addition: 
 | `webhook` | no | — | Event trigger and outbound notifications; see below |
 | `desiredState` | no | `mode: static` | Where the desired state comes from; see below |
 | `onboarding` | no | — | Policy for `wecert-onboard`. **wecert itself never reads this section.** |
+| `probe` | no | enabled | Network-side verification that the deployed certificate is the one actually being served |
 | `certificates` | static/observe only | — | At least one. Must be **empty** when `desiredState.mode` is `enforce` |
 
 ### `acme`
@@ -588,6 +589,27 @@ Policy for the `wecert-onboard` binary. These numbers decide how fast quota is s
 
 See [Desired state](desired-state.md) for the `_wecert` declaration syntax, the five fuses, the systemd units and the troubleshooting table.
 
+### `probe`
+
+Every pass, wecert dials a real TLS connection to each deployed certificate's first few names and reads back the certificate the far end **actually serves**. This is the only evidence in the system that does not trust the cloud control plane — and the gap between "the API says the rebind succeeded" and "the browser gets this certificate" is exactly where CLB problems live: the rebind is asynchronous (measured ~15s), and another certificate can be winning SNI.
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Turn the probe off if wecert runs somewhere that cannot reach the VIP |
+| `port` | `443` | TCP port to dial |
+| `timeout` | `10s` | Per-attempt timeout. Cross-AZ handshakes routinely take 3–5s; too small a value causes false alarms, and false alarms train people to ignore alarms |
+| `maxHostsPerCert` | `3` | Names probed per certificate. Not exhaustive on purpose: 25 handshakes per pass has linearly growing cost and diminishing returns |
+| `minValidFor` | unset | Fail when the served certificate has less than this left. Redundant with the expiry alarm, but it asserts *the served* certificate is valid, not *the recorded* one |
+
+Wildcards are skipped — `*.example.com` has no address of its own to dial. A certificate that is entirely wildcards is therefore never probed, and is logged at debug level when that happens.
+
+Two metrics keep the failure modes apart:
+
+- `wecert_certificate_probe_errors_total{host}` — the probe could not run at all (resolve, dial or handshake failed). This is an environment problem, not a certificate problem.
+- `wecert_certificate_probe_match{host}` — the probe completed and compares what was served against what was deployed. `0` means a rebind did not take effect, or another certificate is winning SNI.
+
+> **The comparison is against what was deployed, not "some valid certificate".** `wecert_certificate_probe_not_after_timestamp_seconds` (read over the network) sitting next to `wecert_certificate_not_after_timestamp_seconds` (read from the state store) is what makes "the rebind silently did nothing" visible.
+
 ### `certificates[]`
 
 | Field | Required | Default | Description |
@@ -654,6 +676,11 @@ The timer's `Unit=` is not decorative: without it, systemd resolves the service 
 | `wecert_certificate_consecutive_failures` | Persistently > 0 means manual intervention |
 | `wecert_certificate_ari_window_start_timestamp_seconds` | Start of the ARI window |
 | `wecert_reconcile_total{cert,result}` | Reconcile pass counter |
+| `wecert_certificate_probe_match{host}` | 1 when the certificate served is the one deployed; 0 when a rebind did not take effect or another certificate is winning SNI |
+| `wecert_certificate_probe_not_after_timestamp_seconds{host}` | `notAfter` read back over the network — compare against the state-store value |
+| `wecert_certificate_probe_errors_total{host}` | The probe could not run at all. An environment problem, not a certificate problem |
+| `wecert_desired_state_age_seconds` | Age of the desired-state document. A growing value means `wecert-onboard` stopped running |
+| `wecert_orphaned_certificates` | Certificates in the state store but absent from the desired state. They will not be renewed |
 
 Alert on `not_after`, **not** on "did the renewal job error" — the latter stays silent when the program is quietly broken:
 
@@ -665,7 +692,7 @@ Alert on `not_after`, **not** on "did the renewal job error" — the latter stay
 (wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 10
 ```
 
-Also add an **external black-box probe**: dial 443 from another machine and read `notAfter`. That catches "the program thinks it succeeded but nothing took effect" — the most insidious failure. Trusting only your own state database is not enough.
+**The black-box probe is built in.** Every pass, wecert dials 443 for each deployed certificate's first few names and reads back the certificate that is actually served — that is the `probe` section above. It catches "the program thinks it succeeded but nothing took effect", which is the most insidious failure, and trusting only your own state database cannot see it. If wecert runs somewhere that cannot reach the VIP, either disable `probe.enabled` or run `wecert-probe` on a schedule from a machine that can; leaving it on from a machine that cannot is harmless but useless, and shows up as `probe_errors` climbing while `probe_match` stays put.
 
 > `wecert_certificate_deployed` reflects `deploy_confirmed`, not "has this ever been uploaded". Uploading is not binding: on first issuance somebody still has to bind it in the CLB console, and until then it reads 0. Without that distinction the gauge turns green while the certificate is not actually serving.
 
@@ -902,10 +929,13 @@ Runs a full issuance against staging with a throwaway state database, refusing t
   - independently confirmed from the CLB API (asynchronous task, ~15s)
   - validated the core assumption: **Tencent Cloud finds the bound resources itself, so wecert maintains no listener inventory**
 
+**Done:**
+
+- [x] **Desired-state providers: issue when a domain is added, not only on expiry.** Lands in `internal/spec` (the contract and providers), `internal/group` (wildcard-first grouping), `internal/onboarding` (declaration parsing plus the five safety invariants) and `cmd/wecert-onboard`. Migration path is `static → observe → enforce`. Rationale: [docs/desired-state-providers.md](docs/desired-state-providers.md) · operator guide: [docs/desired-state.md](docs/desired-state.md) · diagrams: [docs/certificate-lifecycle.html](docs/certificate-lifecycle.html).
+- [x] **External black-box probe (dial 443 and check the effective `notAfter`).** Lands in `internal/probe` and `cmd/wecert-probe`: every pass dials the first few names of each deployed certificate and compares what is *actually served* against what was *deployed*. "The API says the rebind succeeded" and "the browser gets this certificate" are two different things — the rebind is asynchronous, and another certificate can be winning SNI. Neither is visible through the control plane. See the `probe` section above.
+
 **Outstanding:**
 
-- [ ] **Desired-state providers: issue when a domain is added, not only on expiry.** A domain added *somewhere* (DNS / CLB rules / an internal registry) should end up in a certificate automatically, safely. Design draft, including why "DNS ∩ CLB" is the right instinct but not the best architecture, the five safety invariants, and the rate-limit arithmetic: [docs/desired-state-providers.md](docs/desired-state-providers.md).
-- [ ] External black-box probe (dial 443 and check the effective `notAfter`)
 - [ ] Read the DNSPod token from a file or systemd `LoadCredential`, so it isn't plaintext in `config.yaml`
 - [ ] Switch to `profile: tlsserver` (45 days) and run a complete renewal cycle fully automatically
 - [ ] Test the SNI multi-certificate case with `multi_cert_info` ("replacing one doesn't disturb another")
