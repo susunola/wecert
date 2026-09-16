@@ -216,7 +216,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	// on the CA's door.
 	if !st.NextAttemptAt.IsZero() && m.now().Before(st.NextAttemptAt) {
 		m.log.Debug("inside the backoff window; skipping", "cert", c.Name, "nextAttemptAt", st.NextAttemptAt)
-		return nil
+		return state.ErrBackoff
 	}
 
 	// The configured (full) set, captured before applyFallback may reduce it. Only the

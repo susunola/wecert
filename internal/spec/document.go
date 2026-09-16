@@ -156,10 +156,23 @@ func LoadDocument(path string) (*Document, error) {
 	return doc, nil
 }
 
-// maxGeneratedAtSkew is how far in the future generatedAt may be before it is rejected.
-// Generous enough for clock skew between the onboarding host and this one, far short of
-// the days-or-years a value would need to silence the staleness alarm.
-const maxGeneratedAtSkew = 15 * time.Minute
+// maxGeneratedAtSkew is how far in the future generatedAt may be before Validate rejects the
+// document.
+//
+// The property being protected: a future-dated document must not be able to hide its own
+// staleness. The alarm is "age > maxStaleness" (48h by default), so any tolerance well under
+// that keeps the alarm meaningful -- once the clock catches up, real age exceeds the
+// threshold and the alarm fires.
+//
+// The value is an hour rather than a few minutes, and that is the whole point of this
+// comment. A tolerance tight enough to reject ordinary clock movement is not a safety
+// feature, it is an outage: a corrected RTC or a VM snapshot restore steps the clock
+// backwards, the document the generator just wrote then looks future-dated, and a rejected
+// document is not a warning -- in enforce mode the daemon refuses to start and
+// wecert-onboard refuses its round, so both halves stop at once and the cause looks exactly
+// like a corrupt file. An hour absorbs every realistic correction while still refusing the
+// "a day ahead" case that would silence the alarm.
+const maxGeneratedAtSkew = time.Hour
 
 // maxDocumentBytes bounds a document read. A desired-state document for even a few
 // thousand names is far below this; the cap is here so a runaway generator cannot make
@@ -243,17 +256,26 @@ func (d *Document) Validate() error {
 	}
 	// A future timestamp is not a harmless clock skew: the staleness alarm is
 	// "time.Since(generatedAt) > maxStaleness", so a date far enough ahead makes that
-	// comparison false forever. It is the one signal this architecture has for "the
+	// comparison false indefinitely. It is the one signal this architecture has for "the
 	// onboarding component died and no new name will ever be picked up", and a
 	// machine-written field that a human can edit must not be able to switch it off
 	// silently -- especially since Revision deliberately covers only the certificates, so
 	// changing generatedAt alone trips no other check.
 	//
-	// A little slack is allowed for clock skew between the generator and this process.
+	// The tolerance is therefore derived from the staleness threshold rather than being a
+	// small fixed number. A tight limit (this used to be 15 minutes) turns an ordinary NTP
+	// correction or a VM snapshot restore into a rejected document, and a rejected document
+	// is not a warning: the daemon refuses to start in enforce mode, and wecert-onboard
+	// refuses its round, so both halves of the system stop at once -- a multi-day outage
+	// from a clock step, with no way to distinguish it from a genuinely corrupt file.
+	//
+	// The invariant worth keeping is the one above: the document must not be able to hide
+	// its own staleness. Tolerating up to `limit` of future skew does that, because the
+	// alarm still fires once the clock catches up and real age exceeds maxStaleness.
 	if skew := time.Until(d.GeneratedAt); skew > maxGeneratedAtSkew {
 		return fmt.Errorf(
-			"generatedAt (%s) is %s in the future; that would disable the document staleness alarm, "+
-				"so it is rejected (allow at most %s of clock skew)",
+			"generatedAt (%s) is %s in the future; that is far enough ahead to hide the document "+
+				"staleness alarm, so it is rejected (allow at most %s)",
 			d.GeneratedAt.UTC().Format(time.RFC3339), skew.Round(time.Minute), maxGeneratedAtSkew)
 	}
 

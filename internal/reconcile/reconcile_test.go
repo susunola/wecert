@@ -1211,3 +1211,112 @@ func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 		t.Errorf("after the claim is released the orphan must be reaped exactly once, got %v", cleaned)
 	}
 }
+
+// A pass skipped for backoff must not be reported as a success, and must not notify.
+//
+// Manager.Reconcile returns state.ErrBackoff when the certificate is inside the retry
+// window an earlier failure scheduled. That is neither a success nor a failure, and
+// reporting it as either misleads the operator: result="ok" hid a certificate stuck in
+// backoff behind a healthy-looking counter, and the documented notification contract is
+// "every renewal ATTEMPT emits" -- a skip is the absence of an attempt, so emitting
+// result:"ok" for it asserts a renewal that never ran.
+func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
+	const name = "backing-off"
+
+	mgr := &fakeManager{failWith: map[string]error{name: state.ErrBackoff}}
+	notifier := newFakeNotifier()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	r.RunAll(context.Background())
+
+	// No notification: nothing was attempted.
+	select {
+	case ev := <-notifier.events:
+		t.Errorf("a backoff skip must not emit a renewal notification, got cert=%q err=%v", ev.cert, ev.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "ok"}); n != 0 {
+		t.Errorf("a skipped pass must not be counted as ok, got %v -- a certificate in failure "+
+			"backoff looked healthy on the counter an operator watches", n)
+	}
+	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "skipped"}); n != 1 {
+		t.Errorf("a skipped pass must be counted as skipped, got %v", n)
+	}
+	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "error"}); n != 0 {
+		t.Errorf("a backoff skip is not a failure; got error count %v", n)
+	}
+}
+
+// The control: a genuine failure still counts as an error and still notifies, so the fix
+// cannot be satisfied by never notifying or never counting.
+func TestGenuineFailureStillCountsAndNotifies(t *testing.T) {
+	const name = "really-failing"
+
+	mgr := &fakeManager{failWith: map[string]error{name: errors.New("boom")}}
+	notifier := newFakeNotifier()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	r.RunAll(context.Background())
+
+	select {
+	case ev := <-notifier.events:
+		if ev.err == nil {
+			t.Error("a failed pass must carry its error into the notification")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a genuine failure must still notify")
+	}
+	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "error"}); n != 1 {
+		t.Errorf("a genuine failure must count as error, got %v", n)
+	}
+}
+
+// counterValue reads one counter out of the default registry.
+func counterValue(t *testing.T, metric string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != metric {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			got := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				got[lp.GetName()] = lp.GetValue()
+			}
+			match := true
+			for k, v := range labels {
+				if got[k] != v {
+					match = false
+					break
+				}
+			}
+			if match {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
