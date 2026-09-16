@@ -371,7 +371,10 @@ func startWebhookServer(
 			"failed to listen on the webhook port %s: %w (already in use?)", cfg.Webhook.Listen, err)
 	}
 
-	api := webhook.New(rec, store, cfg.Webhook.Token, ctx, log)
+	api, err := webhook.New(rec, store, cfg.Webhook.Token, ctx, log)
+	if err != nil {
+		return fmt.Errorf("failed to initialise the webhook server: %w", err)
+	}
 
 	srv := &http.Server{
 		Handler:           api.Handler(),

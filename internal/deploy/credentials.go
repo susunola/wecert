@@ -18,7 +18,9 @@ import (
 // instance metadata service.
 // Using a role instead of writing SecretId/SecretKey into the config file keeps the
 // secrets off disk.
-const cvmMetadataURL = "http://metadata.tencentyun.com/latest/meta-data/cam/security-credentials/"
+// It is a variable rather than a constant so tests can point it at an httptest server;
+// production code never reassigns it.
+var cvmMetadataURL = "http://metadata.tencentyun.com/latest/meta-data/cam/security-credentials/"
 
 // CredentialFunc fetches a fresh credential every time.
 // The lack of caching is deliberate: temporary credentials expire, and deployment only

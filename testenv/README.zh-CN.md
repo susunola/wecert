@@ -297,8 +297,8 @@ CVM 上的 python 后端读 `Host` 头返回不同页面：
 因为 `test.alpha` / `test.beta` 根本没有解析记录。
 建了 A 记录之后浏览器直接就能打开。
 
-注意 `alpha` / `beta` **不是独立 zone**，只是 `atomwangnus.com` 下的子域，
-所以记录建在 `atomwangnus.com` 里，`sub_domain` 写成 `test.alpha`。
+注意 `alpha` / `beta` **不是独立 zone**，只是 `dns_zone` 顶级域下的子域，
+所以记录建在该 zone 里，`sub_domain` 写成 `test.alpha`。
 
 ### CLB 安全组：默认放开，是有意的
 
