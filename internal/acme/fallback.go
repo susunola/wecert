@@ -33,6 +33,11 @@ func (m *Manager) SetFallbackPolicy(p config.FailureFallback) { m.fallback = &p 
 // expired and still refuses to issue" does it drop the names that keep failing -- those
 // 24 names that were fine should not expire alongside the 1 name with broken DNS.
 func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *config.Certificate {
+	// Stop waiting for names that can never come back, before anything else looks at the
+	// record. This runs first, and separately from the metrics block below, so the two
+	// concerns stay independent: what the record should contain, and what the gauges say.
+	m.pruneFallback(c)
+
 	kept, dropped, reason := m.fallbackDomains(c, st)
 
 	if len(dropped) == 0 {
@@ -76,6 +81,98 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 		m.log.Warn("cannot record the fallback state", "cert", c.Name, "err", err)
 	}
 	return &cp
+}
+
+// pruneFallback removes from the record the names that are no longer part of the desired set,
+// clearing the record entirely when nothing is left to wait for.
+//
+// A dropped name that has since been removed from the configuration can never come back, so
+// the record must stop waiting for it -- and "this name will not validate, drop it from the
+// configuration" is the expected response to what a fallback reports. Without this, the record
+// never satisfies the condition that clears it, which is "a round ordered the full desired set
+// and the issuance succeeded": download tests `containsAll(c.Domains, fb.Dropped)`, and a
+// dropped name that is absent from c.Domains makes that permanently false.
+//
+// The consequence is not merely a stale row. wecert_certificate_fallback_active means "a
+// certificate missing names is serving right now", and it would stay set for the life of the
+// certificate -- a degradation alert that can never clear is worse than no alert, because it
+// teaches whoever reads it to ignore the signal.
+//
+// c is the certificate as configured, before applyFallback reduces it: this is the only point
+// in a pass that holds both the record and the full desired set.
+func (m *Manager) pruneFallback(c *config.Certificate) {
+	if c == nil {
+		return
+	}
+	fb, err := m.store.GetFallback(c.Name)
+	if err != nil {
+		// Not fatal: the caller's metrics block treats an unreadable record as "leave the
+		// gauges alone", and a prune that cannot read has nothing to prune.
+		m.log.Warn("cannot read the fallback record to prune it", "cert", c.Name, "err", err)
+		return
+	}
+	if fb == nil || len(fb.Dropped) == 0 {
+		return
+	}
+
+	kept := stillConfigured(fb.Dropped, c.Domains)
+	if len(kept) == len(fb.Dropped) {
+		return
+	}
+	gone := entriesOfNotIn(fb.Dropped, kept)
+
+	if len(kept) == 0 {
+		if err := m.store.ClearFallback(c.Name); err != nil {
+			m.log.Warn("cannot clear the fallback record; it would keep reporting a degradation that ended",
+				"cert", c.Name, "err", err)
+			return
+		}
+		m.log.Info("every name dropped by an earlier fallback has left the desired set; clearing the record",
+			"cert", c.Name, "wasDropping", gone)
+		return
+	}
+
+	pruned := &state.Fallback{CertName: c.Name, Dropped: kept, Since: fb.Since, Reason: fb.Reason}
+	if err := m.store.PutFallback(pruned); err != nil {
+		m.log.Warn("cannot update the fallback record", "cert", c.Name, "err", err)
+		return
+	}
+	m.log.Info("a name dropped by an earlier fallback has left the desired set and can never come back; "+
+		"it is no longer waited for",
+		"cert", c.Name, "removed", gone, "stillDropping", kept)
+}
+
+// stillConfigured keeps only the entries of want that are also in have, preserving order.
+func stillConfigured(want, have []string) []string {
+	if len(want) == 0 {
+		return nil
+	}
+	present := make(map[string]bool, len(have))
+	for _, h := range have {
+		present[h] = true
+	}
+	out := make([]string, 0, len(want))
+	for _, w := range want {
+		if present[w] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// entriesOfNotIn returns the entries of want that are not in have, preserving order.
+func entriesOfNotIn(want, have []string) []string {
+	present := make(map[string]bool, len(have))
+	for _, h := range have {
+		present[h] = true
+	}
+	var out []string
+	for _, w := range want {
+		if !present[w] {
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 // fallbackDomains decides whether to degrade, and which names to drop.
