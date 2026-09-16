@@ -463,6 +463,7 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 | `webhook` | 否 | — | 事件触发与出站通知，见下 |
 | `desiredState` | 否 | `mode: static` | 期望状态从哪里来，见下 |
 | `onboarding` | 否 | — | `wecert-onboard` 的策略。**wecert 自己不读这一节。** |
+| `probe` | 否 | 开启 | 从网络侧验证"部署下去的那张证书确实在服务" |
 | `certificates` | 仅 static/observe | — | 至少一张。`desiredState.mode: enforce` 时必须为空 |
 
 ### `acme`
@@ -692,6 +693,11 @@ timer 里的 `Unit=` 不是装饰：不写这行时 systemd 会解析成同名�
 | `wecert_certificate_consecutive_failures` | 持续 > 0 需要人工介入 |
 | `wecert_certificate_ari_window_start_timestamp_seconds` | ARI 窗口起点 |
 | `wecert_reconcile_total{cert,result}` | 收敛轮次计数 |
+| `wecert_certificate_probe_match{host}` | 1 = 服务的就是部署的那张；0 = 换绑没生效，或另一张证书在赢 SNI |
+| `wecert_certificate_probe_not_after_timestamp_seconds{host}` | 从网络读回的 `notAfter` —— 和状态库那个对比着看 |
+| `wecert_certificate_probe_errors_total{host}` | 探测根本没跑成。是环境问题，不是证书问题 |
+| `wecert_desired_state_age_seconds` | 期望状态文档的年龄。持续增长说明 `wecert-onboard` 没在跑 |
+| `wecert_orphaned_certificates` | 状态库里有、期望状态里没有的证书。它们不会再被续期 |
 
 到期告警应该基于 `not_after` 做，而**不要**基于"续期任务有没有报错" —— 后者会在程序静默失效时保持沉默：
 
@@ -703,7 +709,7 @@ timer 里的 `Unit=` 不是装饰：不写这行时 systemd 会解析成同名�
 (wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 10
 ```
 
-强烈建议再加一个**外部黑盒探测**：从另一台机器拨 443 读 `notAfter`。这能抓出"程序以为成功、但实际没生效"这类最隐蔽的故障 —— 只信自己的状态库是不够的。
+**黑盒探测已经内建。** 每一轮 wecert 都会对每张已部署证书的头几个名字拨 443，读回实际在服务的证书 —— 就是上面 `probe` 那一节。它能抓出"程序以为成功、实际没生效"这类最隐蔽的故障，而只信自己的状态库永远看不见它。如果 wecert 跑在一台拨不到 VIP 的机器上，要么关掉 `probe.enabled`，要么改从别的机器定时跑 `wecert-probe`；开着但拨不通是无害的，只是没用，表现是 `probe_errors` 涨而 `probe_match` 不动。
 
 > `wecert_certificate_deployed` 反映的是 `deploy_confirmed`，不是"有没有上传过"。
 > 上传成功 ≠ 已经绑到监听器上：首次签发上传完还要人工绑一次，那之前它是 0。
@@ -1035,8 +1041,6 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
 
 **待办：**
 
-- [ ] **期望状态来源：域名新增即签发，而不只是过期续签。** 在某处（DNS / CLB 规则 / 内部登记）新增域名后，证书应安全地自动跟上。设计草案，含"为什么 DNS ∩ CLB 方向对但不是最优架构"、五条安全不变量、以及速率限制的算术：[docs/desired-state-providers.md](docs/desired-state-providers.md)。
-- [ ] 外部黑盒探测（拨 443 校验实际生效的 `notAfter`）
 - [ ] DNSPod token 支持从文件 / systemd `LoadCredential` 读取，避免 config.yaml 里放明文
 - [ ] 切 `profile: tlsserver`（45 天）并验证 ARI 全自动跑满一个完整续期周期
 - [ ] 用 `multi_cert_info` 测 SNI 多证书场景（"换一张不误伤另一张"）
@@ -1049,6 +1053,21 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
 - [ ] `state.Store` 缺少事务能力，`download()` 收尾的
       "提升新证书 → 记录退役证书 → 丢弃订单" 三步是各自独立提交的；
       中间失败会留下孤儿云证书或一次假故障告警
+
+**已完成：**
+
+- [x] **期望状态来源：域名新增即签发，而不只是过期续签。** 落在 `internal/spec`
+      （契约与 Provider）、`internal/group`（通配符优先分组）、`internal/onboarding`
+      （声明解析 + 五条安全不变量）、`cmd/wecert-onboard`，
+      迁移路径 `static → observe → enforce`。设计取舍见
+      [docs/desired-state-providers.md](docs/desired-state-providers.md)，
+      操作手册见 [docs/desired-state.md](docs/desired-state.md)，
+      全景图见 [docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)。
+- [x] **外部黑盒探测（拨 443 校验实际生效的 `notAfter`）。** 落在 `internal/probe` +
+      `cmd/wecert-probe`：每一轮自动拨已部署证书的头几个名字，比对"实际在服务的"和
+      "我以为部署的"。云 API 说绑定成功、和浏览器真的能拿到这张证书，是两件事 ——
+      换绑是异步的，SNI 上也可能有另一张证书在赢，这两件事控制面都看不出来。
+      见 `probe` 配置节。
 
 ## License
 

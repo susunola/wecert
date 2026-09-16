@@ -25,6 +25,7 @@ import (
 	"github.com/susunola/wecert/internal/acme"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/probe"
 	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
@@ -95,6 +96,19 @@ func run() error {
 		return err
 	}
 
+	// 网络侧探测器也在这里就构造好：它只读配置、不碰网络，
+	// 而"探测到底开着没有、拨哪个端口"是切换配置时最该确认的事情之一。
+	//
+	// 它是唯一不信任云控制面的证据，所以默认开着。但它可能不适用 ——
+	// 比如 wecert 跑在一台拨不到 CLB VIP 的机器上。那种情况下的表现是
+	// probe_errors 涨，而 probe_match 不动，不会让证书看起来是坏的。
+	var prober *probe.Runner
+	if cfg.Probe.EnabledOr(true) {
+		prober = probe.NewRunner(
+			probe.Options{Port: cfg.Probe.Port, Timeout: cfg.Probe.TimeoutDur},
+			cfg.Probe.MinValidDur, log)
+	}
+
 	httpClient := acme.NewHTTPClient(60 * time.Second)
 	core, err := acme.EnsureAccount(cfg, store, httpClient)
 	if err != nil {
@@ -102,10 +116,16 @@ func run() error {
 	}
 
 	if *dryRun {
+		probeState := "off"
+		if prober != nil {
+			probeState = fmt.Sprintf("on (port %d, timeout %s, max %d hosts/cert)",
+				cfg.Probe.Port, cfg.Probe.TimeoutDur, cfg.Probe.MaxHostsPerCert)
+		}
 		log.Info("dry run finished: the config, the ACME account and the desired-state source are all fine",
 			"mode", cfg.DesiredState.Mode,
 			"provider", spec.KindOf(provider),
-			"certificates", len(cfg.Certificates))
+			"certificates", len(cfg.Certificates),
+			"probing", probeState)
 		return nil
 	}
 
@@ -135,6 +155,17 @@ func run() error {
 
 	manager := acme.NewManager(store, core, solver, deployer, log)
 	reconciler := reconcile.New(cfg, provider, store, manager, notifier, log)
+
+	// 网络侧探测：拨一个真实的 TLS 连接，确认线上服务的确实是部署的那张证书。
+	reconciler.SetProber(prober)
+	if prober != nil {
+		log.Info("network-side certificate probing is on",
+			"port", cfg.Probe.Port, "timeout", cfg.Probe.TimeoutDur,
+			"maxHostsPerCert", cfg.Probe.MaxHostsPerCert)
+	} else {
+		log.Warn("network-side certificate probing is off: nothing will verify that the " +
+			"certificate the cloud API reports as deployed is the one actually being served")
+	}
 
 	// 先求值一次并缓存。这样只读端点（webhook 的名字解析、诊断端点）
 	// 在第一次收敛跑完之前就能给出正确答案，而不是先返回一个空列表 ——

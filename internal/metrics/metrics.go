@@ -89,4 +89,45 @@ var (
 		Name: "wecert_orphaned_certificates",
 		Help: "Certificates present in the state store but absent from the desired state. They will not be renewed and will eventually expire.",
 	})
+
+	// ── 网络侧探测 ──────────────────────────────────────────────────────────
+	//
+	// 这一组是唯一不信任云控制面的证据：云 API 说"绑定成功"，
+	// 和浏览器真的能拿到这张证书，是两件事。
+
+	// CertificateProbeMatch 表示拨过去拿到的证书是不是我们部署的那一张。
+	//
+	// 1 = 是。0 = 名字能过但服务的是别的证书（换绑没生效、
+	// 或者 SNI 上有另一张在赢），或者覆盖面与部署的不一致。
+	CertificateProbeMatch = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_certificate_probe_match",
+		Help: "1 when the certificate actually served for this host is the one that was deployed, 0 otherwise. Only set after a probe that completed.",
+	}, []string{"host"})
+
+	// CertificateProbeNotAfter 是网络侧读回来的到期时间。
+	//
+	// 和 wecert_certificate_not_after_timestamp_seconds 的区别很关键：
+	// 那个来自状态库（"我以为部署了什么"），这个来自一次真实握手
+	// （"实际在服务什么"）。两个对不上才是问题的形状。
+	CertificateProbeNotAfter = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_certificate_probe_not_after_timestamp_seconds",
+		Help: "notAfter read back from a real TLS handshake, in unix seconds. Compare against wecert_certificate_not_after_timestamp_seconds to see whether the rebind actually took effect.",
+	}, []string{"host"})
+
+	// CertificateProbeTrusted 表示这条链能否用系统根证书验通。
+	// 0 不一定有问题（内网 CA 是合法的），但浏览器里会红。
+	CertificateProbeTrusted = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_certificate_probe_trusted",
+		Help: "1 when the served chain validates against the system roots. 0 is not necessarily broken (an internal CA is legitimate) but browsers will warn.",
+	}, []string{"host"})
+
+	// CertificateProbeErrors 统计"探测根本没跑成"的次数。
+	//
+	// 和 probe_match=0 是两件事：那个是"跑成了，但服务的不对"，
+	// 这个是"连都没连上"。从运行 wecert 的机器拨不出去时涨的是这个，
+	// 而不是让你的证书看起来是坏的。
+	CertificateProbeErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "wecert_certificate_probe_errors_total",
+		Help: "Probes that could not be completed at all (resolve, dial or handshake failed). Distinct from probe_match=0, which means the probe succeeded and found the wrong certificate.",
+	}, []string{"host"})
 )
