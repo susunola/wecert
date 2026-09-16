@@ -50,6 +50,11 @@ type fakeAPI struct {
 	orders   []legoacme.ExtendedOrder
 	orderIdx int
 
+	// authzByURL overrides GetAuthorization per authorization URL. URLs left out keep the
+	// default "everything is valid" answer, so only the tests that need a failing -- or a
+	// wildcard -- authorization have to populate it.
+	authzByURL map[string]legoacme.Authorization
+
 	certPEM []byte
 	certErr error
 
@@ -116,8 +121,13 @@ func (f *fakeAPI) UpdateOrderForCSR(finalizeURL string, csr []byte) (legoacme.Ex
 	return f.orders[len(f.orders)-1], nil
 }
 
-func (f *fakeAPI) GetAuthorization(string) (legoacme.Authorization, error) {
+func (f *fakeAPI) GetAuthorization(authzURL string) (legoacme.Authorization, error) {
 	f.enter("GetAuthorization")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if a, ok := f.authzByURL[authzURL]; ok {
+		return a, nil
+	}
 	return legoacme.Authorization{Status: "valid", Identifier: legoacme.Identifier{Value: "a.example.com"}}, nil
 }
 

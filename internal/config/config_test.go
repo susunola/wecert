@@ -399,3 +399,52 @@ certificates:
 		t.Errorf("webhook config was not parsed correctly: %+v", cfg.Webhook)
 	}
 }
+
+// The onboarding knobs configure the safety invariants, so an out-of-range value
+// has to be rejected at load time rather than quietly switching the guard off.
+//
+// DropThreshold is the sharpest case. It is compared against a loss ratio that is
+// always <= 1, so a percentage written as `30` -- or any value >= 1 -- makes the
+// comparison unsatisfiable and the abrupt-change fuse silently never fires. That
+// fuse is the documented protection against "the upstream returned partial data and
+// we stripped every SAN"; nothing else reports it, so a typo removes the guard with
+// no error anywhere.
+func TestOnboardingPolicyValuesAreRangeChecked(t *testing.T) {
+	minimalCert := `
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`
+
+	bad := []struct{ name, body string }{
+		{"dropThreshold written as a percentage", "onboarding:\n  dropThreshold: 30\n"},
+		{"dropThreshold above 1", "onboarding:\n  dropThreshold: 1.5\n"},
+		{"dropThreshold exactly 1 (can never be exceeded)", "onboarding:\n  dropThreshold: 1\n"},
+		{"negative dropThreshold", "onboarding:\n  dropThreshold: -0.1\n"},
+		{"negative budget", "onboarding:\n  budget: -1\n"},
+		{"negative maxNames", "onboarding:\n  maxNames: -5\n"},
+		{"unknown profile", "onboarding:\n  profile: tls-server\n"},
+		{"unknown keyType", "onboarding:\n  keyType: rsa-2048\n"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, minimalPrefix+tc.body+minimalCert)); err == nil {
+				t.Fatalf("Load accepted %s; the guard this configures would be silently disabled", tc.name)
+			}
+		})
+	}
+
+	good := []string{
+		"onboarding:\n  dropThreshold: 0.3\n",
+		"onboarding:\n  dropThreshold: 0\n", // 0 means "use the default"
+		"onboarding:\n  budget: 25\n",
+		"onboarding:\n  maxNames: 25\n",
+		"onboarding:\n  profile: tlsserver\n  keyType: rsa2048\n",
+		"", // no onboarding block at all
+	}
+	for _, body := range good {
+		if _, err := Load(writeConfig(t, minimalPrefix+body+minimalCert)); err != nil {
+			t.Errorf("Load rejected a valid setting %q: %v", body, err)
+		}
+	}
+}
