@@ -209,7 +209,11 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 <section id="problem">
   <h2><span class="num">图 ⓪</span>部署形态：免费证书在 CLB 上自动轮转</h2>
   <p class="cap">
-    最上面那条带子是这套系统要解决的场景：<b>免费证书只有 90 天，必须自动轮转</b>。
+    最上面那条带子是这套系统要解决的场景：<b>免费证书只有 90 天，必须自动轮转</b>；
+    以及为什么选 Let's Encrypt 而不是腾讯云自带的免费 DV ——
+    <b>后者是单域名证书，既不支持 SAN 也不支持通配符</b>，
+    域名一多就得为每个域名单独维护一条轮转，而 Let's Encrypt 一张证书能装 100 个名字、
+    还支持通配符，多个域名可以合成一张、只轮转一条。
     下面两条是它落到腾讯云上的形态——上面是请求路径，下面是这张证书是怎么来的。
     关键的一层关系在中间：
     <b>SNI 决定 CLB 用哪张证书，证书的 SAN 决定它能对哪些域名完成握手</b> ——
@@ -218,62 +222,80 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 
   <figure>
   <div class="scroll">
-  <svg viewBox="0 0 1228 965" role="img" aria-label="wecert 的部署形态：免费证书由 Let's Encrypt 自动轮转（免费签发 → 自动换绑 → 服务 90 天 → 到期前自动再签），客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池">
+  <svg viewBox="0 0 1228 1084" role="img" aria-label="wecert 的部署形态：免费证书由 Let's Encrypt 自动轮转（免费签发 → 自动换绑 → 服务 90 天 → 到期前自动再签）；选它而不是腾讯云自带的免费 DV，是因为后者单域名、不支持 SAN 也不支持通配符。客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池">
     <defs>
       <marker id="a0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-edge" d="M0 0 L10 5 L0 10 z"/></marker>
       <marker id="a0d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-ink" d="M0 0 L10 5 L0 10 z"/></marker>
     </defs>
 
     <!-- ── band 0: the scenario, and why it has to rotate ── -->
-    <rect class="zone" x="24" y="44" width="1180" height="184" rx="14"/>
+    <rect class="zone" x="24" y="44" width="1180" height="304" rx="14"/>
     <text class="zone-title" x="36" y="34">场景 · 免费证书（Let's Encrypt）+ 自动轮转</text>
 
-    <foreignObject x="40" y="50" width="1156" height="28">
+    <foreignObject x="40" y="50" width="1156" height="26">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo left" style="font-size:12px">
         Let's Encrypt 不收费，代价是有效期只有 90 天 —— 一年至少要轮 4 次，靠人记着做迟早会漏。
       </div>
     </foreignObject>
 
-    <rect class="bx-ext" x="56" y="88" width="243" height="96" rx="8"/>
-    <foreignObject x="56" y="88" width="243" height="96">
+    <rect class="bx-ext" x="56" y="84" width="243" height="92" rx="8"/>
+    <foreignObject x="56" y="84" width="243" height="92">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">免费签发
         <span class="s">Let's Encrypt · ACME</span>
         <span class="s">不花钱，但只有 90 天</span>
       </div>
     </foreignObject>
 
-    <rect class="bx-ext" x="347" y="88" width="243" height="96" rx="8"/>
-    <foreignObject x="347" y="88" width="243" height="96">
+    <rect class="bx-ext" x="347" y="84" width="243" height="92" rx="8"/>
+    <foreignObject x="347" y="84" width="243" height="92">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">自动换绑
         <span class="s">上传到腾讯云 SSL</span>
         <span class="s">再绑定到 CLB 监听器</span>
       </div>
     </foreignObject>
 
-    <rect class="bx" x="638" y="88" width="243" height="96" rx="8"/>
-    <foreignObject x="638" y="88" width="243" height="96">
+    <rect class="bx" x="638" y="84" width="243" height="92" rx="8"/>
+    <foreignObject x="638" y="84" width="243" height="92">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">线上服务
         <span class="s">SNI 按域名选证书</span>
         <span class="s">这张证书只剩 90 天</span>
       </div>
     </foreignObject>
 
-    <rect class="bx-local" x="929" y="88" width="243" height="96" rx="8"/>
-    <foreignObject x="929" y="88" width="243" height="96">
+    <rect class="bx-local" x="929" y="84" width="243" height="92" rx="8"/>
+    <foreignObject x="929" y="84" width="243" height="92">
       <div xmlns="http://www.w3.org/1999/xhtml" class="fo">到期前自动再签
         <span class="s">ARI 给出建议窗口</span>
         <span class="s">全程无人值守</span>
       </div>
     </foreignObject>
 
-    <path class="edge" d="M299 136 H347" marker-end="url(#a0)"/>
-    <path class="edge" d="M590 136 H638" marker-end="url(#a0)"/>
-    <path class="edge" d="M881 136 H929" marker-end="url(#a0)"/>
-    <path class="edge" d="M1051 184 V208 H178 V184" marker-end="url(#a0)"/>
-    <rect class="elab-bg" x="536" y="200" width="156" height="16" rx="3"/>
-    <text class="elab" x="614" y="212" text-anchor="middle">到期前自动回到第 1 步</text>
+    <path class="edge" d="M299 130 H347" marker-end="url(#a0)"/>
+    <path class="edge" d="M590 130 H638" marker-end="url(#a0)"/>
+    <path class="edge" d="M881 130 H929" marker-end="url(#a0)"/>
+    <path class="edge" d="M1051 176 V198 H178 V176" marker-end="url(#a0)"/>
+    <rect class="elab-bg" x="536" y="190" width="156" height="16" rx="3"/>
+    <text class="elab" x="614" y="202" text-anchor="middle">到期前自动回到第 1 步</text>
 
-    <g transform="translate(0,214)">
+    <text class="zone-title" x="36" y="232">为什么用 Let's Encrypt，而不是腾讯云自带的免费 DV</text>
+
+    <rect class="bx-danger" x="56" y="244" width="540" height="88" rx="8"/>
+    <foreignObject x="56" y="244" width="540" height="88">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">腾讯云免费 DV
+        <span class="s">单域名 · 不支持 SAN · 不支持通配符</span>
+        <span class="s">3 个域名 = 3 张证书 = 3 条轮转要维护</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-ext" x="632" y="244" width="540" height="88" rx="8"/>
+    <foreignObject x="632" y="244" width="540" height="88">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Let's Encrypt
+        <span class="s">一张证书最多 100 个 SAN · 支持通配符</span>
+        <span class="s">3 个域名（含 *.example.com）= 1 张证书 = 1 条轮转</span>
+      </div>
+    </foreignObject>
+
+    <g transform="translate(0,334)">
 
     <!-- ── band 1: the request path ── -->
     <rect class="zone" x="24" y="44" width="1180" height="296" rx="14"/>
