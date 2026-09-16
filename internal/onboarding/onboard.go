@@ -1317,6 +1317,18 @@ func (r *run) declaredNames() []string {
 
 // assemble builds the document and state.
 func (r *run) assemble() {
+	// Age the change ledger on EVERY round that reaches here.
+	//
+	// ChangesWithin both counts and prunes, and it used to be reached only on the path that
+	// records a change -- so the -force path (which records without counting) and the
+	// unchanged path (which does neither) never pruned. The ledger then grew without bound on
+	// a deployment whose name set never changed, which is the common steady state: one entry
+	// per pass that took either of those two paths.
+	//
+	// Calling it here means pruning is unconditional. The count is discarded because this is
+	// not the decision point; the budget check below calls it again for the value.
+	_ = r.st.ChangesWithin(r.o.opts.BudgetWindow, r.now)
+
 	names := make([]string, 0, len(r.eligible))
 	for n := range r.eligible {
 		names = append(names, n)
