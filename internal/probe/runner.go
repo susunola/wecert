@@ -2,7 +2,9 @@ package probe
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +29,10 @@ const (
 type Runner struct {
 	opts Options
 
+	// Keep probeAll injectable so multi-address aggregation can be tested without
+	// relying on real DNS; production instances always use ProbeAll.
+	probeAll func(context.Context, string, Options) ([]Attempt, error)
+
 	// minValidFor is "how much validity must at least remain"; 0 means do not check.
 	minValidFor time.Duration
 
@@ -44,6 +50,7 @@ func NewRunner(opts Options, minValidFor time.Duration, log *slog.Logger) *Runne
 	}
 	return &Runner{
 		opts:        opts,
+		probeAll:    ProbeAll,
 		minValidFor: minValidFor,
 		log:         log,
 		last:        make(map[string]string),
@@ -56,7 +63,7 @@ func NewRunner(opts Options, minValidFor time.Duration, log *slog.Logger) *Runne
 // It returns the verdict for callers to use, but **whether to alert is decided here** --
 // this is the only place that holds "what the last state was".
 func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict {
-	res, err := Probe(ctx, host, r.opts)
+	attempts, err := r.probeAll(ctx, host, r.opts)
 	if err != nil {
 		metrics.CertificateProbeErrors.WithLabelValues(host).Inc()
 
@@ -69,13 +76,6 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		return Verdict{Problems: []string{err.Error()}}
 	}
 
-	metrics.CertificateProbeNotAfter.WithLabelValues(host).Set(float64(res.NotAfter.Unix()))
-	if res.Trusted {
-		metrics.CertificateProbeTrusted.WithLabelValues(host).Set(1)
-	} else {
-		metrics.CertificateProbeTrusted.WithLabelValues(host).Set(0)
-	}
-
 	if e.Now.IsZero() {
 		e.Now = time.Now()
 	}
@@ -83,22 +83,70 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		e.MinValidFor = r.minValidFor
 	}
 
-	v := res.Verify(e)
-	if v.OK {
-		metrics.CertificateProbeMatch.WithLabelValues(host).Set(1)
-		r.transition(host, stateOK, "the certificate being served is the one that was deployed",
-			"notAfter", res.NotAfter, "daysLeft", res.DaysLeft(e.Now), "issuer", res.Issuer,
-			"trusted", res.Trusted, "handshakeMs", res.HandshakeMS)
-		return v
+	var (
+		first       *Result
+		problems    []string
+		attemptErrs []string
+	)
+	for _, attempt := range attempts {
+		if attempt.Err != nil {
+			metrics.CertificateProbeErrors.WithLabelValues(host).Inc()
+			attemptErrs = append(attemptErrs, fmt.Sprintf("%s: %v", attempt.Address, attempt.Err))
+			continue
+		}
+		if attempt.Result == nil {
+			continue
+		}
+		if first == nil {
+			first = attempt.Result
+		}
+		if v := attempt.Result.Verify(e); !v.OK {
+			for _, p := range v.Problems {
+				problems = append(problems, fmt.Sprintf("%s: %s", attempt.Address, p))
+			}
+		}
 	}
 
-	metrics.CertificateProbeMatch.WithLabelValues(host).Set(0)
-	// List every problem at once. Making someone dial a second time to discover the other
-	// problems multiplies the troubleshooting cost by the number of problems.
-	r.transition(host, stateMismatch, "the certificate being served is not the one that was deployed",
-		"problems", v.Problems, "servedNotAfter", res.NotAfter,
-		"sans", res.SANs, "issuer", res.Issuer, "remoteAddr", res.RemoteAddr)
-	return v
+	if first == nil {
+		msg := "no resolved address completed a TLS handshake"
+		if len(attemptErrs) > 0 {
+			msg += ": " + strings.Join(attemptErrs, " | ")
+		}
+		r.transition(host, stateUnreachable,
+			"cannot reach this name to check which certificate it serves", "err", msg)
+		return Verdict{Problems: []string{msg}}
+	}
+
+	// Metrics are labelled by host rather than address, so retain the first
+	// successful result here. A differing later address sets probe_match to 0
+	// and is named in the log below.
+	metrics.CertificateProbeNotAfter.WithLabelValues(host).Set(float64(first.NotAfter.Unix()))
+	if first.Trusted {
+		metrics.CertificateProbeTrusted.WithLabelValues(host).Set(1)
+	} else {
+		metrics.CertificateProbeTrusted.WithLabelValues(host).Set(0)
+	}
+
+	if len(problems) > 0 {
+		metrics.CertificateProbeMatch.WithLabelValues(host).Set(0)
+		r.transition(host, stateMismatch, "the certificate being served is not the one that was deployed",
+			"problems", problems, "servedNotAfter", first.NotAfter,
+			"sans", first.SANs, "issuer", first.Issuer, "remoteAddr", first.RemoteAddr)
+		return Verdict{Problems: problems}
+	}
+
+	if len(attemptErrs) > 0 {
+		msg := "some resolved addresses could not be probed: " + strings.Join(attemptErrs, " | ")
+		r.transition(host, stateUnreachable,
+			"some addresses could not be reached to check which certificate they serve", "err", msg)
+		return Verdict{Problems: []string{msg}}
+	}
+
+	metrics.CertificateProbeMatch.WithLabelValues(host).Set(1)
+	r.transition(host, stateOK, "the certificate being served is the one that was deployed",
+		"notAfter", first.NotAfter, "daysLeft", first.DaysLeft(e.Now), "issuer", first.Issuer,
+		"trusted", first.Trusted, "handshakeMs", first.HandshakeMS)
+	return Verdict{OK: true}
 }
 
 // LastState returns the previous state for a name, mainly for diagnostics.

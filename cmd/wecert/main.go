@@ -401,6 +401,18 @@ func startWebhookServer(
 }
 
 func newDeployer(cfg *config.Config, log *slog.Logger) (deploy.Deployer, error) {
+	// Enforce is driven by a document that may change while this process is
+	// running. Its config-level certificate list is deliberately empty, so
+	// scanning it would permanently select Noop even when the document enables
+	// deploy. Keep a lazily initialised cloud deployer available instead.
+	if cfg.DesiredState.Mode == config.ModeEnforce {
+		log.Info("Tencent Cloud deploy is available for enforce-mode desired-state certificates",
+			"credentialMode", cfg.Tencent.CredentialMode,
+			"resourceTypes", cfg.Tencent.ResourceTypes,
+			"regions", cfg.Tencent.Regions)
+		return deploy.NewLazyTencentCLB(cfg.Tencent, log), nil
+	}
+
 	enabled := false
 	for _, c := range cfg.Certificates {
 		if c.Deploy.Enabled {
