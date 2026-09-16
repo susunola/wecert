@@ -13,8 +13,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // pure Go driver: no CGO, which keeps static builds easy
@@ -31,6 +34,21 @@ const maxLastErrorBytes = 512
 // Store is the state store layered on top of SQLite.
 type Store struct {
 	db *sql.DB
+
+	// mu serialises whole operations, not individual statements.
+	//
+	// The pool is capped at one connection, which serialises statements but NOT a
+	// read-modify-write sequence: two goroutines can both read a row, both modify their
+	// copy, and both write it back, losing an update. It is not hypothetical -- a scratch
+	// run of 50 concurrent GetCert/++/PutCert cycles landed as 3.
+	//
+	// Fixing the sequence is not something the store can do to a caller that hand-rolls it,
+	// so UpdateCert exists for exactly this: it holds mu across read, mutate and write. The
+	// mutex here additionally guarantees that nothing in this package can interleave with a
+	// multi-statement operation, and that adding a second writer later cannot corrupt state
+	// silently -- a guarantee that belongs with the data rather than with one caller's
+	// discipline.
+	mu sync.Mutex
 
 	// lock is the cross-process exclusive lock.
 	//
@@ -209,7 +227,20 @@ func open(path string, exclusive bool) (*Store, error) {
 		}
 	}
 
-	s, err := openFiles(path, lock)
+	// Did a state database exist before this call? Asked before the pre-create below,
+	// because afterwards the answer is always yes.
+	//
+	// This is the only signal available for "the file vanished": a lock file beside it
+	// means some earlier run created one, and losing the database is the documented
+	// disaster (order URLs, ARI certIDs and the ACME account key all gone, so orders are
+	// re-placed straight into the exact-set rate limit). Starting a fresh one silently
+	// would be the wrong answer.
+	_, statErr := os.Stat(path)
+	existedBefore := statErr == nil
+	_, lockStatErr := os.Stat(path + ".lock")
+	lockExisted := lockStatErr == nil
+
+	s, err := openFiles(path, lock, existedBefore, lockExisted)
 	if err != nil {
 		_ = lock.release()
 		return nil, err
@@ -224,7 +255,10 @@ func open(path string, exclusive bool) (*Store, error) {
 // derived from the process umask, and those files are copies of the private keys.
 // The post-hoc chmod at the end stays as a backstop -- and as the fix-up for
 // databases created before the umask was tightened.
-func openFiles(path string, lock *fileLock) (*Store, error) {
+//
+// existedBefore/lockExisted are the two facts open() has to sample before the
+// pre-create below makes them unanswerable; see missingDatabaseWarning.
+func openFiles(path string, lock *fileLock, existedBefore, lockExisted bool) (*Store, error) {
 	restore := restrictiveUmask()
 	defer restore()
 
@@ -237,7 +271,16 @@ func openFiles(path string, lock *fileLock) (*Store, error) {
 	}
 	_ = f.Close()
 
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
+	if !existedBefore && lockExisted {
+		// See missingDatabaseWarning: a lock file with no database is what "someone deleted
+		// state.db" looks like. Warn rather than refuse -- a first run after restoring a
+		// backup, or an operator deliberately starting clean, are both legitimate -- but it
+		// must be loud, because the account key and every in-flight order are gone and the
+		// next issuance re-places orders.
+		fmt.Fprintf(os.Stderr, "wecert: WARNING: %s\n", missingDatabaseWarning(path))
+	}
+
+	dsn := sqliteDSN(path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open state db: %w", err)
@@ -245,7 +288,48 @@ func openFiles(path string, lock *fileLock) (*Store, error) {
 	// modernc sqlite is a single-writer model, so cap connections to avoid SQLITE_BUSY.
 	db.SetMaxOpenConns(1)
 
+	// Ask the driver which file it actually opened instead of trusting that the
+	// path survived the DSN round trip.
+	//
+	// Every metacharacter of the URI form ('?', '#', '%XX') is also a legal
+	// character in a filename, so a statePath containing one used to make SQLite
+	// open a *truncated* path -- a different file, created by SQLite with the
+	// process umask (0644 on a default machine) rather than by the 0600
+	// pre-create above. The chmod loop below then tightened the configured path,
+	// which stayed a zero-byte decoy, while the account key and every certificate
+	// private key sat in a world-readable -wal. sqliteDSN now escapes the path, but
+	// the driver is the authority on what it opened, so the permission contract is
+	// enforced against that answer and not against our own arithmetic.
+	realPath, diverged, err := databaseFilePath(db, path)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if diverged {
+		// The escaping above is supposed to keep these equal. A driver that still
+		// normalises (symlinks, a doubled separator) is acceptable -- we chmod the
+		// real file -- but a mismatch is also the exact signature of the bug this
+		// check replaced, so it must not pass silently.
+		fmt.Fprintf(os.Stderr,
+			"wecert: state database opened as %s (configured statePath %q); permissions are being enforced on %s\n",
+			realPath, path, realPath)
+	}
+
 	s := &Store{db: db, lock: lock}
+
+	// Verify the file is a usable database before anything writes to it.
+	//
+	// Without this, a truncated or overwritten state.db fails later and deeper: the first
+	// query returns "database disk image is malformed (11)" or "file is not a database
+	// (26)" from inside a migration or a read, with no hint that the file itself is the
+	// problem or what to do about it. quick_check is the cheap form (it skips the
+	// index-vs-table comparison integrity_check does) and it is the difference between
+	// "see docs/recovery.md" and a SQLite error code.
+	if err := verifyDatabaseIntact(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -253,14 +337,182 @@ func openFiles(path string, lock *fileLock) (*Store, error) {
 
 	// -wal / -shm only really appear after migrate, so tighten all permissions once.
 	// The WAL file is a copy of the private keys, so its permissions must be managed
-	// along with the rest.
+	// along with the rest. databaseFilePath has already made the main file 0600, and
+	// SQLite derives the sidecar modes from the main file, so this is the belt to
+	// that pair of braces.
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if err := os.Chmod(path+suffix, 0o600); err != nil && !os.IsNotExist(err) {
+		if err := os.Chmod(realPath+suffix, 0o600); err != nil && !os.IsNotExist(err) {
 			db.Close()
-			return nil, fmt.Errorf("chmod state file %s: %w", path+suffix, err)
+			// chmod names the file it actually touched (realPath), not the configured
+			// path: they differ exactly when the operator needs to know which file the
+			// driver opened.
+			return nil, fmt.Errorf("chmod state file %s: %w", realPath+suffix, err)
 		}
 	}
 	return s, nil
+}
+
+// missingDatabaseWarning words the "there was a database here and now there is not" case.
+//
+// Split out so the decision and the message are testable without capturing stderr from
+// open(), which needs a real file layout.
+func missingDatabaseWarning(path string) string {
+	return fmt.Sprintf(
+		"%s did not exist but its lock file did -- a state database was probably deleted or lost. "+
+			"Starting from an empty one: the ACME account key and every in-flight order URL are gone, "+
+			"so a new account will be registered and orders will be re-placed (which counts against "+
+			"the exact-set rate limit). If you have a backup, stop and restore it before continuing "+
+			"(see docs/recovery.md).", path)
+}
+
+// isCorruptDatabaseError reports whether a driver error means "this file is not a usable
+// database", as opposed to any other I/O or permission problem.
+//
+// modernc.org/sqlite returns these as plain errors carrying SQLite's own message; matching
+// the message is unpleasant but it is what the driver exposes, and the alternative --
+// treating every failure the same -- is what produced the unhelpful error this replaces.
+func isCorruptDatabaseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"file is not a database",
+		"database disk image is malformed",
+		"database disk image is corrupt",
+		"malformed database schema",
+		"file is encrypted or is not a database",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// corruptDatabaseError words the corrupted-file case so the operator knows what to do.
+//
+// There is no in-place repair for a malformed SQLite file, and the data at stake (the ACME
+// account key, every in-flight order URL, the ARI certID of every live certificate) is not
+// reproducible: a fresh database means a new account and re-placed orders, which count
+// against the exact-set rate limit. So the message refuses clearly and points at the
+// recovery procedure rather than pretending to recover.
+func corruptDatabaseError(path string, cause error) error {
+	return fmt.Errorf(
+		"the state database %s is corrupt: %v\n"+
+			"       wecert will not start against a database it cannot read. Restore the backup that "+
+			"docs/recovery.md describes (state.db together with its -wal), or move the damaged file "+
+			"aside to start from an empty database -- which registers a new ACME account and re-places "+
+			"orders, so prefer the backup. See docs/recovery.md.",
+		path, cause)
+}
+
+// verifyDatabaseIntact runs SQLite's cheap consistency check and turns a failure into an
+// actionable error.
+//
+// It runs before migrate so the operator is told the file is corrupt, not that some
+// migration statement failed. An empty (newly created) file passes: quick_check reports
+// "ok" for a database with no pages yet.
+func verifyDatabaseIntact(db *sql.DB) error {
+	var result string
+	if err := db.QueryRow(`PRAGMA quick_check(1)`).Scan(&result); err != nil {
+		return fmt.Errorf(
+			"the state database is unreadable: %w\n"+
+				"       wecert will not start against a database it cannot trust. Restore a backup of "+
+				"state.db (and its -wal) if you have one, or move the damaged file aside to start from an "+
+				"empty one -- losing it means a new ACME account and re-placed orders. See docs/recovery.md.",
+			err)
+	}
+	if result != "ok" {
+		return fmt.Errorf(
+			"the state database failed its consistency check: %s\n"+
+				"       Restore a backup of state.db if you have one, or move the damaged file aside to "+
+				"start from an empty one -- losing it means a new ACME account and re-placed orders. "+
+				"See docs/recovery.md.",
+			result)
+	}
+	return nil
+}
+
+// The path is escaped rather than pasted in: a statePath is operator-supplied and
+// may legally contain any of the URI's own metacharacters.
+func sqliteDSN(path string) string {
+	// url.URL.EscapedPath escapes '?', '#', '%' and friends while leaving '/' as a
+	// separator, which is exactly the set the URI form treats specially. An empty
+	// Host is what keeps the result in the "file:/abs/path" form SQLite expects
+	// (url.String() would otherwise emit "//" before an absolute path).
+	u := url.URL{Path: path}
+	return "file:" + u.EscapedPath() +
+		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+}
+
+// databaseFilePath reports the filesystem path the connection actually opened, and
+// enforces the 0600 contract on it.
+//
+// It returns the configured path as a second value so the caller can tell the
+// operator when the two disagree -- which is the signature of a DSN that was
+// misparsed (or of a driver that normalised the path).
+//
+// A driver that answers with nothing (or with an in-memory database) is a hard
+// error: the alternative is to keep going without knowing whether the private keys
+// are readable by every local user, which is the failure this function exists to
+// make impossible.
+func databaseFilePath(db *sql.DB, configured string) (actual string, diverged bool, err error) {
+	rows, err := db.Query(`PRAGMA database_list`)
+	if err != nil {
+		// This is where a corrupt state file surfaces first: the pragma has to read the
+		// header, so it fails with "file is not a database" or "database disk image is
+		// malformed" before any of the checks below -- including the quick_check in open --
+		// ever run. Reporting the raw driver error here sends the operator looking at the
+		// DSN instead of at their state file.
+		if isCorruptDatabaseError(err) {
+			return "", false, corruptDatabaseError(configured, err)
+		}
+		return "", false, fmt.Errorf("query the opened database file: %w", err)
+	}
+	defer rows.Close()
+
+	var path string
+	for rows.Next() {
+		var (
+			seq  int
+			name string
+			file string
+		)
+		if err := rows.Scan(&seq, &name, &file); err != nil {
+			return "", false, fmt.Errorf("scan database_list: %w", err)
+		}
+		if name == "main" {
+			path = file
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, fmt.Errorf("read database_list: %w", err)
+	}
+	if path == "" {
+		return "", false, fmt.Errorf(
+			"cannot determine which file the state database was opened as (configured statePath %q); "+
+				"refusing to continue without being able to guarantee its permissions", configured)
+	}
+
+	// Tighten before anyone can read it, and verify: a failure here is not cosmetic.
+	// Note this runs on the path the driver reported, not on the configured string,
+	// which is the whole point: the two differ exactly when the DSN was misparsed.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", false, fmt.Errorf("chmod state file %s: %w", path, err)
+	}
+
+	// A plain symlink (macOS's /var -> /private/var, say) makes the reported path
+	// differ from the configured one without anything being wrong: the two names
+	// reach the same file. Only a difference that survives that resolution is
+	// evidence that the DSN named a different file -- the failure this check exists
+	// to make impossible.
+	if path != configured {
+		if real, rerr := filepath.EvalSymlinks(configured); rerr != nil || real != path {
+			return path, true, nil
+		}
+	}
+	return path, false, nil
 }
 
 // Close closes the state database and releases the cross-process lock.
@@ -335,10 +587,21 @@ CREATE TABLE IF NOT EXISTS authorizations (
 -- Cloud certificates that are retired but not yet deleted. Kept for a while to allow
 -- rollback, then they must be reclaimed: Tencent Cloud accounts have a quota on the
 -- number of uploaded certificates.
+--
+-- cert_pem / key_pem are the archived material for the retired certificate, so it can be
+-- re-uploaded and re-bound during the retention window.
+--
+-- This table used to hold only the CertId, and the retired certificate's key was
+-- overwritten in the certificates row at the moment of renewal -- so "rollback" meant
+-- "whatever the cloud still has", and after the retention period deleted it, wecert had
+-- nothing to restore from. The comment here and in the deployer claimed rollback was the
+-- point; now the material is actually retained, and pruned with the row.
 CREATE TABLE IF NOT EXISTS retired_certificates (
     cert_id    TEXT PRIMARY KEY,
     cert_name  TEXT NOT NULL,
-    retired_at INTEGER NOT NULL
+    retired_at INTEGER NOT NULL,
+    cert_pem   BLOB,
+    key_pem    BLOB
 );
 
 -- Per-identifier authorization failure ledger.
@@ -387,6 +650,11 @@ CREATE TABLE IF NOT EXISTS cert_fallback (
 		{"certificates", "deploy_confirmed", "INTEGER NOT NULL DEFAULT 0"},
 		{"orders", "identifiers", "TEXT NOT NULL DEFAULT ''"},
 		{"orders", "deployment_cert_id", "TEXT NOT NULL DEFAULT ''"},
+		// Rollback material. Legacy rows keep NULL: there is nothing to recover for a
+		// certificate retired before wecert started archiving, and inventing an empty
+		// value would look like a usable (empty) certificate.
+		{"retired_certificates", "cert_pem", "BLOB"},
+		{"retired_certificates", "key_pem", "BLOB"},
 	} {
 		if err := s.ensureColumn(m.table, m.column, m.decl); err != nil {
 			return err
@@ -464,6 +732,8 @@ func fromUnix(v int64) time.Time {
 
 // GetAccount reads the account; returns (nil, nil) when it does not exist.
 func (s *Store) GetAccount(directory string) (*Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	row := s.db.QueryRow(
 		`SELECT directory, kid, private_key_pem FROM accounts WHERE directory = ?`, directory)
 	a := &Account{}
@@ -477,8 +747,28 @@ func (s *Store) GetAccount(directory string) (*Account, error) {
 	return a, nil
 }
 
+// PutAccountWithoutKey writes an account row whose private key is empty.
+//
+// Only for tests and for reproducing a legacy row. It cannot be written as NULL --
+// private_key_pem is declared NOT NULL, which is the point of checking the length rather than
+// nil-ness in the loader: a row from a database written before that constraint existed reads
+// back as nil, and an empty blob reads back the same way. Both mean "no usable key".
+func (s *Store) PutAccountWithoutKey(directory, kid string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO accounts (directory, kid, private_key_pem, updated_at) VALUES (?, ?, x'', ?)`,
+		directory, kid, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("put account %s without a key: %w", directory, err)
+	}
+	return nil
+}
+
 // PutAccount writes the account.
 func (s *Store) PutAccount(a *Account) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`
 		INSERT INTO accounts (directory, kid, private_key_pem, updated_at)
 		VALUES (?, ?, ?, ?)
@@ -501,6 +791,8 @@ func (s *Store) PutAccount(a *Account) error {
 // gone from the desired state will never be renewed again and will quietly expire.
 // Making this set visible is the only backstop for that failure path.
 func (s *Store) ListCertNames() ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	rows, err := s.db.Query(`SELECT name FROM certificates ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list certificate names: %w", err)
@@ -518,8 +810,40 @@ func (s *Store) ListCertNames() ([]string, error) {
 	return out, rows.Err()
 }
 
+// UpdateCert applies fn to one certificate's state and writes the result back, all while
+// holding the store lock.
+//
+// This is the form callers should prefer over GetCert followed by PutCert: the read and
+// the write have to be one operation or a concurrent writer's change is silently lost.
+// fn must not call back into the Store.
+//
+// A missing row is an error rather than an upsert: a name typo should surface, not create
+// a phantom certificate that then appears in the orphan report.
+func (s *Store) UpdateCert(name string, fn func(*CertState) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st, err := s.getCertLocked(name)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return fmt.Errorf("update cert %s: no such certificate in the state store", name)
+	}
+	if err := fn(st); err != nil {
+		return err
+	}
+	return s.putCertLocked(st)
+}
+
 // GetCert reads certificate state; returns (nil, nil) when it does not exist.
 func (s *Store) GetCert(name string) (*CertState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCertLocked(name)
+}
+
+func (s *Store) getCertLocked(name string) (*CertState, error) {
 	row := s.db.QueryRow(`
 		SELECT name, not_after, cert_url, cert_pem, key_pem, issued_at,
 		       ari_cert_id, ari_window_start, ari_window_end, ari_checked_at, ari_retry_after_ns,
@@ -558,6 +882,12 @@ func (s *Store) GetCert(name string) (*CertState, error) {
 
 // PutCert writes certificate state.
 func (s *Store) PutCert(c *CertState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.putCertLocked(c)
+}
+
+func (s *Store) putCertLocked(c *CertState) error {
 	_, err := s.db.Exec(`
 		INSERT INTO certificates (
 			name, not_after, cert_url, cert_pem, key_pem, issued_at,
@@ -604,6 +934,8 @@ func (s *Store) PutCert(c *CertState) error {
 
 // GetOrder reads the in-flight order; returns (nil, nil) when it does not exist.
 func (s *Store) GetOrder(certName string) (*Order, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	row := s.db.QueryRow(`
 		SELECT cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers, deployment_cert_id
 		FROM orders WHERE cert_name = ?`, certName)
@@ -624,6 +956,8 @@ func (s *Store) GetOrder(certName string) (*Order, error) {
 
 // PutOrder writes the in-flight order.
 func (s *Store) PutOrder(o *Order) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`
 		INSERT INTO orders (
 			cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers, deployment_cert_id, updated_at
@@ -649,6 +983,8 @@ func (s *Store) PutOrder(o *Order) error {
 
 // DeleteOrder discards the current order (it expired or was abandoned).
 func (s *Store) DeleteOrder(certName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM orders WHERE cert_name = ?`, certName)
 	if err != nil {
 		return fmt.Errorf("delete order for %s: %w", certName, err)
@@ -660,6 +996,8 @@ func (s *Store) DeleteOrder(certName string) error {
 
 // ListAuthorizations lists every authorization under a certificate's order.
 func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	rows, err := s.db.Query(`
 		SELECT cert_name, authz_url, identifier, status, challenge_url, challenge_token,
 		       txt_name, txt_value, presented, challenge_sent
@@ -691,6 +1029,8 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 // cannot see, and a cleanup for a different certificate sharing the name would delete it.
 // Re-registering from here before any cleanup closes that window.
 func (s *Store) ListPresentedAuthorizations() ([]*Authorization, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	rows, err := s.db.Query(`
 		SELECT cert_name, authz_url, identifier, status, challenge_url, challenge_token,
 		       txt_name, txt_value, presented, challenge_sent
@@ -715,6 +1055,8 @@ func (s *Store) ListPresentedAuthorizations() ([]*Authorization, error) {
 
 // PutAuthorization writes a single authorization.
 func (s *Store) PutAuthorization(a *Authorization) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`
 		INSERT INTO authorizations (
 			cert_name, authz_url, identifier, status, challenge_url, challenge_token,
@@ -744,6 +1086,8 @@ func (s *Store) PutAuthorization(a *Authorization) error {
 // then deletes rows. This method is a backstop for cases that genuinely need the whole
 // table cleared (tests or manual intervention, for example).
 func (s *Store) DeleteAuthorizations(certName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM authorizations WHERE cert_name = ?`, certName)
 	if err != nil {
 		return fmt.Errorf("delete authorizations for %s: %w", certName, err)
@@ -755,6 +1099,8 @@ func (s *Store) DeleteAuthorizations(certName string) error {
 // Used to clean up leftover authorization rows whose TXT has already been reclaimed
 // and no longer needs tracking.
 func (s *Store) DeleteAuthorization(certName, authzURL string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(
 		`DELETE FROM authorizations WHERE cert_name = ? AND authz_url = ?`, certName, authzURL)
 	if err != nil {
@@ -766,18 +1112,31 @@ func (s *Store) DeleteAuthorization(certName, authzURL string) error {
 // ---------- RetiredCert ----------
 
 // RetiredCert is a cloud certificate taken out of service and kept briefly for rollback.
+//
+// CertPEM/KeyPEM are the archived material, so the rollback the type's name promises is
+// actually possible: without them "rollback" only ever meant "whatever the cloud still
+// has", and the cloud copy is deleted at the end of the retention period.
 type RetiredCert struct {
 	CertID    string
 	CertName  string
 	RetiredAt time.Time
+	CertPEM   []byte
+	KeyPEM    []byte
 }
 
-// AddRetiredCert records a retired certificate.
-func (s *Store) AddRetiredCert(certID, certName string) error {
+// AddRetiredCert records a retired certificate together with its archived key material.
+//
+// certPEM and keyPEM may be nil when there is nothing to archive (the orphan path records a
+// certificate wecert never held a copy of). The row is still useful then: the reaper must
+// delete it from the cloud either way.
+func (s *Store) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`
-		INSERT INTO retired_certificates (cert_id, cert_name, retired_at) VALUES (?, ?, ?)
+		INSERT INTO retired_certificates (cert_id, cert_name, retired_at, cert_pem, key_pem)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(cert_id) DO NOTHING`,
-		certID, certName, time.Now().Unix())
+		certID, certName, time.Now().Unix(), certPEM, keyPEM)
 	if err != nil {
 		return fmt.Errorf("add retired cert %s: %w", certID, err)
 	}
@@ -786,8 +1145,11 @@ func (s *Store) AddRetiredCert(certID, certName string) error {
 
 // ListRetiredCertsBefore lists certificates retired before cutoff, for reclamation.
 func (s *Store) ListRetiredCertsBefore(cutoff time.Time) ([]*RetiredCert, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	rows, err := s.db.Query(`
-		SELECT cert_id, cert_name, retired_at FROM retired_certificates WHERE retired_at < ?`,
+		SELECT cert_id, cert_name, retired_at, cert_pem, key_pem
+		FROM retired_certificates WHERE retired_at < ?`,
 		cutoff.Unix())
 	if err != nil {
 		return nil, fmt.Errorf("list retired certs: %w", err)
@@ -798,7 +1160,7 @@ func (s *Store) ListRetiredCertsBefore(cutoff time.Time) ([]*RetiredCert, error)
 	for rows.Next() {
 		r := &RetiredCert{}
 		var retiredAt int64
-		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt); err != nil {
+		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt, &r.CertPEM, &r.KeyPEM); err != nil {
 			return nil, fmt.Errorf("scan retired cert: %w", err)
 		}
 		r.RetiredAt = fromUnix(retiredAt)
@@ -810,6 +1172,8 @@ func (s *Store) ListRetiredCertsBefore(cutoff time.Time) ([]*RetiredCert, error)
 // DeleteRetiredCert removes an entry from the reclamation list (called after the
 // cloud-side delete succeeds).
 func (s *Store) DeleteRetiredCert(certID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM retired_certificates WHERE cert_id = ?`, certID)
 	if err != nil {
 		return fmt.Errorf("delete retired cert %s: %w", certID, err)

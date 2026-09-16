@@ -60,7 +60,7 @@ func TestRecordSuccessDecaysFailures(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		l.recordFailure("1.2.3.4", limiterT0)
 	}
-	l.recordSuccess("1.2.3.4")
+	l.recordSuccess("1.2.3.4", limiterT0)
 
 	t1 := limiterT0.Add(time.Minute)
 	for i := 0; i < 5; i++ {
@@ -86,7 +86,7 @@ func TestSustainedBruteForceLocksOutDespiteSuccesses(t *testing.T) {
 	for i := 0; i < authMaxFailures-1; i++ {
 		l.recordFailure("1.2.3.4", limiterT0)
 	}
-	l.recordSuccess("1.2.3.4")
+	l.recordSuccess("1.2.3.4", limiterT0)
 
 	// Second identical burst: the residual carries over, so it locks out well
 	// before the burst ends. With wipe-on-success semantics this loop could
@@ -108,7 +108,7 @@ func TestRecordSuccessForgivesBelowTheFloor(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		l.recordFailure("1.2.3.4", limiterT0)
 	}
-	l.recordSuccess("1.2.3.4")
+	l.recordSuccess("1.2.3.4", limiterT0)
 
 	for i := 0; i < authMaxFailures-1; i++ {
 		l.recordFailure("1.2.3.4", limiterT0.Add(time.Minute))
@@ -147,5 +147,43 @@ func TestGcIsAmortizedOnceTheMapIsLarge(t *testing.T) {
 
 	if got := len(l.byAddr); got > 2 {
 		t.Errorf("the sweep must reclaim expired entries after the interval, %d left", got)
+	}
+}
+
+// A burst of failed authentications must not leave the limiter map populated forever.
+//
+// gc used to be reached only from recordFailure, so once the failures stopped nothing
+// ever swept the entries the burst created -- there is no background ticker, and
+// recordSuccess did not call it either. A client with an IPv6 /64 can produce unbounded
+// distinct source addresses, so the map is not bounded by "the number of attackers".
+func TestSuccessSweepsExpiredLimiterState(t *testing.T) {
+	l := newAuthLimiter()
+
+	// Fill past the sweep threshold with entries that are already outside the window.
+	// They are written directly because recordFailure would stamp them with `now`.
+	old := limiterT0.Add(-2 * authWindow)
+	for i := 0; i < authLimiterGCThreshold+10; i++ {
+		addr := fmt.Sprintf("10.0.%d.%d", i/256, i%256)
+		l.byAddr[addr] = &authLimiterState{windowStart: old, failures: 1}
+	}
+
+	// A single successful authentication is enough to trigger the sweep.
+	l.recordSuccess("192.0.2.1", limiterT0.Add(time.Minute))
+
+	if got := len(l.byAddr); got > 1 {
+		t.Errorf("limiter map holds %d entries after a success swept it; expired state must not accumulate", got)
+	}
+}
+
+// The hard cap bounds the map even while every entry is still inside the window, which
+// is the state a flood produces (the time-based sweep deliberately keeps those).
+func TestLimiterMapIsCapped(t *testing.T) {
+	l := newAuthLimiter()
+	for i := 0; i < authLimiterMaxEntries+100; i++ {
+		addr := fmt.Sprintf("2001:db8::%x", i)
+		l.recordFailure(addr, limiterT0.Add(time.Duration(i)*time.Millisecond))
+	}
+	if got := len(l.byAddr); got > authLimiterMaxEntries {
+		t.Errorf("limiter map holds %d entries, want at most %d", got, authLimiterMaxEntries)
 	}
 }

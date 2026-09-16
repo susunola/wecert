@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -280,11 +281,11 @@ func TestListPresentedAuthorizationsIsExhaustiveAndReadsEveryColumn(t *testing.T
 func TestRetiredCerts(t *testing.T) {
 	s := openTestStore(t)
 
-	if err := s.AddRetiredCert("old-1", "example-com"); err != nil {
+	if err := s.AddRetiredCert("old-1", "example-com", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Adding twice should be ignored rather than erroring (idempotent).
-	if err := s.AddRetiredCert("old-1", "example-com"); err != nil {
+	if err := s.AddRetiredCert("old-1", "example-com", nil, nil); err != nil {
 		t.Fatalf("adding a retired cert twice should be idempotent: %v", err)
 	}
 
@@ -308,6 +309,59 @@ func TestRetiredCerts(t *testing.T) {
 	}
 	if got, _ := s.ListRetiredCertsBefore(time.Now().Add(time.Minute)); len(got) != 0 {
 		t.Errorf("want empty after reclamation, got %d rows", len(got))
+	}
+}
+
+// A retired certificate must keep its archived key material.
+//
+// The row used to hold only a CertId, while the private key was overwritten in the
+// certificates row the moment the renewal succeeded. That made "kept for rollback" mean
+// "whatever the cloud still has": once the retention period expired and the reaper deleted
+// the cloud copy, there was nothing left to re-upload, so the rollback the comment promised
+// did not exist. The material is now archived with the row and pruned with it.
+func TestRetiredCertArchivesItsKeyMaterial(t *testing.T) {
+	s := openTestStore(t)
+
+	if err := s.AddRetiredCert("cert-old", "example-com",
+		[]byte("-----BEGIN CERTIFICATE-----\nOLD\n"), []byte("-----BEGIN PRIVATE KEY-----\nOLDKEY\n")); err != nil {
+		t.Fatalf("AddRetiredCert: %v", err)
+	}
+
+	// Read it back through the reaper's own query, so the test exercises the path that
+	// actually has to recover it.
+	retired, err := s.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListRetiredCertsBefore: %v", err)
+	}
+	if len(retired) != 1 {
+		t.Fatalf("expected 1 retired certificate, got %d", len(retired))
+	}
+	got := retired[0]
+	if !strings.Contains(string(got.CertPEM), "CERTIFICATE") {
+		t.Errorf("the retired certificate's PEM was not archived: %q", got.CertPEM)
+	}
+	if !strings.Contains(string(got.KeyPEM), "PRIVATE KEY") {
+		t.Errorf("the retired certificate's private key was not archived: %q", got.KeyPEM)
+	}
+}
+
+// The orphan path records a certificate wecert never held a copy of, so nil material must
+// be accepted rather than rejected or stored as an empty non-nil value.
+func TestRetiredCertWithoutMaterialIsAccepted(t *testing.T) {
+	s := openTestStore(t)
+
+	if err := s.AddRetiredCert("orphan-1", "example-com", nil, nil); err != nil {
+		t.Fatalf("AddRetiredCert with no material: %v", err)
+	}
+	retired, err := s.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retired) != 1 || retired[0].CertID != "orphan-1" {
+		t.Fatalf("expected the orphan row, got %+v", retired)
+	}
+	if len(retired[0].KeyPEM) != 0 {
+		t.Errorf("no material was archived, so KeyPEM should be empty, got %q", retired[0].KeyPEM)
 	}
 }
 
@@ -404,5 +458,96 @@ func TestOpenReturnsThePrecreateError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "state.db") {
 		t.Errorf("the error must name the state file, got %v", err)
+	}
+}
+
+// The Store must serialise whole read-modify-write operations, not just single
+// statements.
+//
+// The connection pool is capped at one, which is easy to mistake for "the store is
+// serialised". It is not: two goroutines can both read a row, both modify their copy, and
+// both write it back, losing one update. A scratch run of 50 concurrent raw
+// GetCert/++/PutCert cycles landed as 3.
+//
+// The supported way to do this is UpdateCert, which holds the lock across the whole
+// sequence. Callers that hand-roll the pair are still racy -- that is inherent to the
+// pattern, not something the store can fix -- so the contract this pins is "use
+// UpdateCert".
+func TestConcurrentUpdateCertDoesNotLoseUpdates(t *testing.T) {
+	s := openTestStore(t)
+	const name = "example-com"
+
+	if err := s.PutCert(&CertState{Name: name}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const workers = 50
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.UpdateCert(name, func(c *CertState) error {
+				c.ConsecutiveFailures++
+				return nil
+			}); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("worker: %v", err)
+	}
+
+	st, err := s.GetCert(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ConsecutiveFailures != workers {
+		t.Errorf("consecutive_failures = %d after %d concurrent increments: updates were lost, "+
+			"so a flag like DeployConfirmed can silently revert",
+			st.ConsecutiveFailures, workers)
+	}
+}
+
+// And the guarded operation itself must not deadlock. UpdateCert is the supported way to
+// do a read-modify-write against one row.
+func TestUpdateCertSerialisesAndApplies(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.PutCert(&CertState{Name: "x", ConsecutiveFailures: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpdateCert("x", func(c *CertState) error {
+		c.DeployConfirmed = true
+		c.DeployedCertID = "cert-1"
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateCert: %v", err)
+	}
+
+	st, err := s.GetCert("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.DeployConfirmed || st.DeployedCertID != "cert-1" || st.ConsecutiveFailures != 1 {
+		t.Errorf("UpdateCert produced %+v", st)
+	}
+}
+
+// UpdateCert must not create a row that was not there: "update" that silently inserts is
+// how a typo in a certificate name becomes a phantom certificate.
+func TestUpdateCertReportsAMissingRow(t *testing.T) {
+	s := openTestStore(t)
+	called := false
+	err := s.UpdateCert("nope", func(*CertState) error { called = true; return nil })
+	if err == nil {
+		t.Fatal("UpdateCert on a missing certificate must report an error")
+	}
+	if called {
+		t.Error("the update function must not run for a row that does not exist")
 	}
 }

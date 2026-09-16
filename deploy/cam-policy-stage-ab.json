@@ -21,7 +21,10 @@
       "sid": "StageB_WecertRebindClb",
       "effect": "allow",
       "action": [
-        "ssl:UpdateCertificateInstance"
+        "ssl:UpdateCertificateInstance",
+        "ssl:DescribeHostUpdateRecordDetail",
+        "ssl:CreateCertificateBindResourceSyncTask",
+        "ssl:DescribeCertificateBindResourceTaskResult"
       ],
       "resource": ["*"]
     },

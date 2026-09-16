@@ -111,22 +111,41 @@ Flags:
 
 	opts := probe.Options{Port: *port, Timeout: *timeout}
 
-	// Worst result for the summary: a mismatch deserves to stop a script more than an
-	// unreachable host does, so it wins.
 	worst := exitOK
 	for _, host := range hosts {
-		code := checkOne(ctx, host, opts, e, *wait, *asJSON)
-		if code == exitMismatch {
-			worst = exitMismatch
-		} else if code == exitUnreachable && worst == exitOK {
-			worst = exitUnreachable
-		}
+		worst = worseExitCode(worst, checkOne(ctx, host, opts, e, *wait, *asJSON, probe.Probe))
 	}
 	return worst
 }
 
+// worseExitCode folds one host's result into the summary.
+//
+// A mismatch outranks an unreachable host: it deserves to stop a script more than "could not
+// dial" does, because the second is usually an environment problem on the machine running the
+// probe while the first means production is serving the wrong certificate.
+func worseExitCode(current, next int) int {
+	if current == exitMismatch || next == exitMismatch {
+		return exitMismatch
+	}
+	if current == exitUnreachable || next == exitUnreachable {
+		return exitUnreachable
+	}
+	return exitOK
+}
+
+// retryInterval is how long to wait between attempts under -wait.
+//
+// The comment used to read "only 'not in effect yet' is worth waiting for", which contradicted
+// attemptOnce: it returns retry=true for an unreachable host too, and that is right -- a VIP
+// that is not up yet, a DNS record mid-propagation and a momentary network blip all look exactly
+// like that, and -wait exists to ride them out. What must not happen is waiting LONGER than
+// asked.
+//
+// A package variable only so tests can shorten it; production never reassigns it.
+var retryInterval = 5 * time.Second
+
 // checkOne probes one name, polling while there is time, and returns its exit code.
-func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expectation, wait time.Duration, asJSON bool) int {
+func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expectation, wait time.Duration, asJSON bool, prober func(context.Context, string, probe.Options) (*probe.Result, error)) int {
 	deadline := time.Time{}
 	if wait > 0 {
 		deadline = time.Now().Add(wait)
@@ -135,7 +154,7 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 	attempt := 0
 	for {
 		attempt++
-		code, retry := attemptOnce(ctx, host, opts, e, asJSON, attempt)
+		code, retry := attemptOnce(ctx, host, opts, e, asJSON, attempt, prober)
 
 		// Retry on both outcomes. An unreachable host may be a network blip, a VIP that is not
 		// up yet or DNS that has not propagated; a mismatch is the normal shape for roughly 15
@@ -145,11 +164,27 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 		// (This comment used to claim the opposite -- that unreachable and wrong-cert "won't fix
 		// themselves". They do, which is why -wait exists; the stale wording invited removing
 		// the retry.)
-		if !retry || deadline.IsZero() || time.Now().After(deadline) {
+		if !retry || deadline.IsZero() {
+			return code
+		}
+
+		// Never sleep past the deadline.
+		//
+		// This used to be a flat `time.After(5 * time.Second)` with the deadline only checked
+		// before the sleep, so -wait bounded the number of attempts but not the time: with
+		// -wait 30ms the command still blocked for five seconds, and any -wait shorter than
+		// the interval overshot by up to the whole interval. A CI step that asks for a 10s
+		// wait to catch a rebind would sit there for up to 15.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return code
 		}
 		if ctx.Err() != nil {
 			return code
+		}
+		sleep := retryInterval
+		if remaining < sleep {
+			sleep = remaining
 		}
 		if !asJSON {
 			fmt.Fprintf(os.Stderr, "  ... not there yet, retrying until %s\n",
@@ -158,14 +193,14 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 		select {
 		case <-ctx.Done():
 			return code
-		case <-time.After(5 * time.Second):
+		case <-time.After(sleep):
 		}
 	}
 }
 
 // attemptOnce probes once. A true retry means "waiting a little longer might help".
-func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.Expectation, asJSON bool, attempt int) (code int, retry bool) {
-	res, err := probe.Probe(ctx, host, opts)
+func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.Expectation, asJSON bool, attempt int, prober func(context.Context, string, probe.Options) (*probe.Result, error)) (code int, retry bool) {
+	res, err := prober(ctx, host, opts)
 	if err != nil {
 		if asJSON {
 			emitJSON(map[string]any{"host": host, "error": err.Error()})

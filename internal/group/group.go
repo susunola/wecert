@@ -89,6 +89,18 @@ func RegisteredDomain(host string) string {
 // Decoding is unambiguous -- scan for `--` first (a literal dash); a lone `-`
 // was a dot -- which is what makes the map injective. Registered domains
 // without a hyphen are named exactly as before.
+//
+// Two caveats, both outside the injection argument above rather than violations of
+// it, recorded here so the claim is not read as stronger than it is:
+//
+//   - `:` is replaced by `-` as well, and a colon is invalid in a hostname
+//     (validateDomain rejects it), so no two *registered domains* collide over it.
+//     For an arbitrary string -- RegisteredDomain falls back to the raw input for a
+//     single-label host -- the mapping is not injective: "a.co:uk" and "a.co-uk" both
+//     become "a--co--uk". Every caller passes a hostname, so this is unreachable
+//     today; if that ever stops being true, the colon rule needs its own escape.
+//   - a leading/trailing dash is trimmed, which maps distinct malformed inputs onto
+//     one name for the same reason.
 func CertName(registered string) string {
 	s := strings.ReplaceAll(strings.ToLower(registered), "-", "--")
 	s = strings.NewReplacer(".", "-", ":", "-").Replace(s)

@@ -105,6 +105,18 @@ type Reconciler struct {
 	// A pointer is required: the diagnostic endpoint reads it from another
 	// goroutine.
 	last atomic.Pointer[spec.Result]
+
+	// probedHosts records every host this round actually probed, so the per-host metric
+	// series of hosts that are no longer probed can be reclaimed.
+	//
+	// Without it those series live forever: they are labelled by host, so
+	// metrics.DeleteCertSeries (which is labelled by certificate) cannot reach them, and
+	// nothing else revisits a host after its certificate leaves the desired state. The
+	// visible symptom is a wecert_certificate_probe_match{host} frozen at its last value
+	// -- and the documentation tells operators to alert on that being 0, so a stale 0 is a
+	// permanent false alarm.
+	probeMu     sync.Mutex
+	probedHosts map[string]struct{}
 }
 
 // prober is the network-side probe capability the reconciler needs.
@@ -138,14 +150,15 @@ func (r *Reconciler) SetProber(p *probe.Runner) {
 // that is exactly why switching sources requires no changes here.
 func New(cfg *config.Config, provider spec.Provider, store *state.Store, manager CertManager, notifier Notifier, log *slog.Logger) *Reconciler {
 	return &Reconciler{
-		cfg:        cfg,
-		provider:   provider,
-		store:      store,
-		manager:    manager,
-		notifier:   notifier,
-		log:        log,
-		running:    make(map[string]struct{}),
-		startSlots: make(chan struct{}, maxConcurrentStarts),
+		cfg:         cfg,
+		provider:    provider,
+		store:       store,
+		manager:     manager,
+		notifier:    notifier,
+		log:         log,
+		running:     make(map[string]struct{}),
+		startSlots:  make(chan struct{}, maxConcurrentStarts),
+		probedHosts: map[string]struct{}{},
 	}
 }
 
@@ -245,9 +258,18 @@ func (r *Reconciler) publishDesired(res *spec.Result) {
 		}
 	}
 
-	if res.Shadow != nil && res.Shadow.Error == "" {
-		metrics.DesiredStateShadowDiff.Set(float64(len(res.Shadow.AddCertificates) +
-			len(res.Shadow.RemoveCertificates) + len(res.Shadow.ChangeCertificates)))
+	if res.Shadow != nil {
+		if res.Shadow.Error == "" {
+			metrics.DesiredStateShadowDiff.Set(float64(len(res.Shadow.AddCertificates) +
+				len(res.Shadow.RemoveCertificates) + len(res.Shadow.ChangeCertificates)))
+			metrics.DesiredStateShadowLastRead.Set(float64(time.Now().Unix()))
+		} else {
+			// No comparison was produced. Leaving the gauge at its previous value (often
+			// 0) while incrementing nothing is how "we could not tell" reads as "they
+			// agree" -- and the gauge's own help text tells operators to gate the switch
+			// to enforce on that 0.
+			metrics.DesiredStateShadowErrors.Inc()
+		}
 	}
 }
 
@@ -383,7 +405,44 @@ func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
 	}
 
 	r.manager.ReapRetired(ctx)
+	r.reclaimStaleProbeSeries()
 	return skipped
+}
+
+// reclaimStaleProbeSeries drops the per-host probe metric series of hosts that are no
+// longer probed.
+//
+// The probe vectors are labelled by host while DeleteCertSeries is labelled by
+// certificate, so a certificate leaving the desired state -- or simply losing a name from
+// its SAN set -- strands that host's series at its last value forever. Since
+// wecert_certificate_probe_match{host} == 0 is documented as "a rebind did not take
+// effect", a frozen 0 is a permanent false alert, and host churn makes it unbounded series
+// growth as well.
+//
+// The set of hosts that ever ran a probe comes from the runner, which records a state for
+// every host it checks; this round's set is recorded by probeCert. Only the difference is
+// reclaimed, so a host that simply was not probed this round (an unconfirmed deployment,
+// a failed pass) keeps its series rather than flickering.
+func (r *Reconciler) reclaimStaleProbeSeries() {
+	if r.prober == nil {
+		return
+	}
+	all, ok := r.prober.(interface{ ProbedHosts() []string })
+	if !ok {
+		return
+	}
+
+	r.probeMu.Lock()
+	current := r.probedHosts
+	r.probedHosts = map[string]struct{}{}
+	r.probeMu.Unlock()
+
+	for _, h := range all.ProbedHosts() {
+		if _, live := current[h]; live {
+			continue
+		}
+		metrics.DeleteProbeSeries(h)
+	}
 }
 
 // RunOnce is a compatibility alias for RunAll.
@@ -411,6 +470,55 @@ func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 	defer r.release(name)
 
 	return r.reconcileOne(ctx, found)
+}
+
+// StartNamed processes a list of named certificates asynchronously, resolving the desired
+// state ONCE.
+//
+// StartCert resolves the desired state itself, which is right for the single-name case
+// (the caller has nothing resolved yet) and wrong for a caller looping over names:
+// resolve() re-reads the file, decodes the YAML, validates it and hashes the document, so
+// an N-name trigger paid that N times, all synchronously inside one HTTP request. This is
+// the same N+1 the full-trigger path already fixed; the per-name path was left behind.
+//
+// The returned maps mirror what the caller needs to answer with: started, alreadyRunning,
+// unknown. A non-nil error means the desired state could not be read, so nothing started
+// and the buckets are meaningless.
+func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
+	started, alreadyRunning, unknown []string, err error,
+) {
+	res := r.resolve(ctx)
+	if res == nil {
+		// No desired state: every name is unanswerable rather than unknown. Reporting
+		// them as unknown would tell the caller to give up on certificates that may well
+		// exist, so this is the transient-failure case, exactly as in StartAll -- the
+		// caller must not answer 202 "accepted" for a convergence that cannot happen.
+		return nil, nil, nil, fmt.Errorf(
+			"%w, so none of %d requested certificate(s) was processed",
+			ErrDesiredStateUnavailable, len(names))
+	}
+
+	// Dedupe while preserving order: a caller that lists the same name twice should not
+	// get the second one back as "already running" purely because of its own duplicate.
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
+		found := res.Find(name)
+		if found == nil {
+			unknown = append(unknown, name)
+			continue
+		}
+		if err := r.startCert(ctx, res, found); err != nil {
+			alreadyRunning = append(alreadyRunning, name)
+			continue
+		}
+		started = append(started, name)
+	}
+	return started, alreadyRunning, unknown, nil
 }
 
 // StartCert processes one certificate asynchronously.
@@ -602,6 +710,11 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 						"host", h, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
 				}
 			}()
+			// Record the host before probing it: the series is about to be written, so it is
+			// live from this moment on even if the probe itself fails.
+			r.probeMu.Lock()
+			r.probedHosts[h] = struct{}{}
+			r.probeMu.Unlock()
 			r.prober.Check(ctx, h, e)
 		}(host)
 	}

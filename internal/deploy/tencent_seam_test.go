@@ -28,6 +28,7 @@ type fakeSSLAPI struct {
 	updateFn     func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error)
 	detailFn     func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error)
 	deleteFn     func(context.Context, *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error)
+	deleteTaskFn func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error)
 	createTaskFn func(context.Context, *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error)
 	taskResultFn func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error)
 }
@@ -72,6 +73,13 @@ func (f *fakeSSLAPI) DescribeCertificateBindResourceTaskResultWithContext(ctx co
 		panic("unexpected DescribeCertificateBindResourceTaskResult call")
 	}
 	return f.taskResultFn(ctx, req)
+}
+
+func (f *fakeSSLAPI) DescribeDeleteCertificatesTaskResultWithContext(ctx context.Context, req *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+	if f.deleteTaskFn == nil {
+		panic("unexpected DescribeDeleteCertificatesTaskResult call")
+	}
+	return f.deleteTaskFn(ctx, req)
 }
 
 // fakeClock lets timeout tests advance time without real sleeping. Only the test
@@ -691,6 +699,62 @@ func TestWaitDeployRecordDeadlineUsesLastKnownCounters(t *testing.T) {
 
 // ── recovery: a switch that happened but was not recorded ───────────────────
 
+// bindingsFor builds cert-aware stubs for the two bind-resource calls.
+//
+// The cert awareness is not decoration. bindingsWith is called for two *different*
+// certificates on the recovery path -- the new one and the old one -- and a stub that
+// answers both with the same response cannot tell the wedge ("the new certificate is
+// bound, the old one is not") from a partial failure ("the new certificate is bound and so
+// is the old one"). The earlier version of these tests answered any certificate ID with a
+// single cert's task, and the old-certificate lookup then found no task at all and read as
+// zero bindings -- so the two cases were indistinguishable in the fixtures, which is
+// exactly the distinction the production check exists to make.
+func bindingsFor(t *testing.T, byCert map[string]uint64) (
+	func(context.Context, *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error),
+	func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error),
+) {
+	t.Helper()
+	taskByCert := make(map[string]string, len(byCert))
+	totalByTask := make(map[string]uint64, len(byCert))
+	for certID, total := range byCert {
+		taskID := "task-" + certID
+		taskByCert[certID] = taskID
+		totalByTask[taskID] = total
+	}
+	create := func(_ context.Context, req *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error) {
+		out := &ssl.CreateCertificateBindResourceSyncTaskResponse{
+			Response: &ssl.CreateCertificateBindResourceSyncTaskResponseParams{},
+		}
+		for _, id := range req.CertificateIds {
+			if id == nil {
+				continue
+			}
+			taskID, ok := taskByCert[*id]
+			if !ok {
+				continue
+			}
+			out.Response.CertTaskIds = append(out.Response.CertTaskIds, &ssl.CertTaskId{
+				CertId: common.StringPtr(*id),
+				TaskId: common.StringPtr(taskID),
+			})
+		}
+		return out, nil
+	}
+	result := func(_ context.Context, req *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+		if len(req.TaskIds) == 0 || req.TaskIds[0] == nil {
+			t.Errorf("the result query carried no task id")
+			return bindingsResp("", 0), nil
+		}
+		taskID := *req.TaskIds[0]
+		total, ok := totalByTask[taskID]
+		if !ok {
+			t.Errorf("the result query asked about an unknown task %q", taskID)
+		}
+		return bindingsResp(taskID, total), nil
+	}
+	return create, result
+}
+
 func stubCreateTask(certID, taskID string) func(context.Context, *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error) {
 	return func(context.Context, *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error) {
 		return &ssl.CreateCertificateBindResourceSyncTaskResponse{
@@ -736,6 +800,7 @@ func TestDeployTreatsAnAlreadyBoundNewCertificateAsSuccess(t *testing.T) {
 	orig := newSSLClient
 	t.Cleanup(func() { newSSLClient = orig })
 
+	createTask, taskResult := bindingsFor(t, map[string]uint64{"new-id": 3, "old-id": 0})
 	fake := &fakeSSLAPI{
 		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
 			return &ssl.UploadCertificateResponse{
@@ -746,10 +811,8 @@ func TestDeployTreatsAnAlreadyBoundNewCertificateAsSuccess(t *testing.T) {
 			// The old certificate has no bindings left, which is the wedge.
 			return updateResp(42, 0), nil
 		},
-		createTaskFn: stubCreateTask("new-id", "task-1"),
-		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
-			return bindingsResp("task-1", 3), nil
-		},
+		createTaskFn: createTask,
+		taskResultFn: taskResult,
 	}
 
 	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
@@ -761,6 +824,58 @@ func TestDeployTreatsAnAlreadyBoundNewCertificateAsSuccess(t *testing.T) {
 	}
 	if id != "new-id" {
 		t.Errorf("Deploy returned %q, want new-id", id)
+	}
+}
+
+// When the one-click update settles having switched only SOME listeners, that is a
+// partial failure, not a success.
+//
+// The recovery path asks "is anything bound to the new certificate?" before believing a
+// failure. That question cannot tell a half-done switch from a clean one: the listeners
+// that did migrate make the answer "yes", so Deploy used to return success, the state
+// anchored on the new CertId, and the listeners still serving the old certificate were
+// never revisited -- they would run to expiry in production.
+func TestDeployDoesNotReportPartialRebindAsSuccess(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	var updateCalls int
+	// The listener that did switch is enough to make "is the new cert bound?" say yes, but
+	// the listener still on the old certificate makes the old anchor non-zero -- which is
+	// exactly what separates this from the wedge case above.
+	createTask, taskResult := bindingsFor(t, map[string]uint64{"new-id": 1, "old-id": 2})
+	fake := &fakeSSLAPI{
+		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
+			return &ssl.UploadCertificateResponse{
+				Response: &ssl.UploadCertificateResponseParams{CertificateId: common.StringPtr("new-id")},
+			}, nil
+		},
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			updateCalls++
+			// One listener is bound to the old certificate, so the task exists.
+			return updateResp(42, 1), nil
+		},
+		// ...but it settles having switched one and failed two.
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			return detailResp(1, 2, 0), nil
+		},
+		createTaskFn: createTask,
+		taskResultFn: taskResult,
+	}
+
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	id, err := d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if err == nil {
+		t.Fatal("2 of 3 resources failed to rebind, but Deploy reported success: the state would " +
+			"anchor on the new certificate and those listeners would never be updated again")
+	}
+	if id != "new-id" {
+		t.Errorf("the uploaded id must still be returned for reclamation, got %q", id)
+	}
+	if updateCalls == 0 {
+		t.Error("the update was never attempted")
 	}
 }
 
@@ -795,4 +910,232 @@ func TestDeployKeepsTheErrorWhenNothingIsBoundToEitherCertificate(t *testing.T) 
 	if id != "new-id" {
 		t.Errorf("the uploaded id must still be returned for reclamation, got %q", id)
 	}
+}
+
+// ── Delete ──────────────────────────────────────────────────────────────────
+
+func derefBool(p *bool) bool { return p != nil && *p }
+
+func deleteResp(result bool, taskID string) *ssl.DeleteCertificateResponse {
+	params := &ssl.DeleteCertificateResponseParams{DeleteResult: common.BoolPtr(result)}
+	if taskID != "" {
+		params.TaskId = common.StringPtr(taskID)
+	}
+	return &ssl.DeleteCertificateResponse{Response: params}
+}
+
+func deleteTaskResp(taskID string, status uint64, errMsg string) *ssl.DescribeDeleteCertificatesTaskResultResponse {
+	r := &ssl.DeleteTaskResult{
+		TaskId: common.StringPtr(taskID),
+		Status: common.Uint64Ptr(status),
+	}
+	if errMsg != "" {
+		r.Error = common.StringPtr(errMsg)
+	}
+	return &ssl.DescribeDeleteCertificatesTaskResultResponse{
+		Response: &ssl.DescribeDeleteCertificatesTaskResultResponseParams{DeleteTaskResult: []*ssl.DeleteTaskResult{r}},
+	}
+}
+
+// IsCheckResource=true makes DeleteCertificate asynchronous: the SDK documents that the
+// call returns a task ID and that DescribeDeleteCertificatesTaskResult is what says
+// whether the delete happened. Treating "accepted" as "deleted" made ReapRetired drop
+// its reclaim record, leaking the certificate in the cloud account forever -- and status
+// 4 ("a cloud resource still references it") is exactly the answer that must keep it.
+func TestDeleteWaitsForTheAsyncTask(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+	// The poll interval is real seconds; drive it with the fake clock so this test does
+	// not spend two of them asleep.
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+
+	var polls int
+	fake := &fakeSSLAPI{
+		deleteFn: func(_ context.Context, req *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error) {
+			if !derefBool(req.IsCheckResource) {
+				t.Error("IsCheckResource must stay true: the server-side reference check is the last guard " +
+					"between a bookkeeping cleanup and an HTTPS outage")
+			}
+			return deleteResp(true, "del-task-1"), nil
+		},
+		deleteTaskFn: func(_ context.Context, req *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			polls++
+			if got := derefStr(req.TaskIds[0]); got != "del-task-1" {
+				t.Errorf("polled task %q, want del-task-1", got)
+			}
+			if polls < 3 {
+				return deleteTaskResp("del-task-1", 0, ""), nil // still running
+			}
+			return deleteTaskResp("del-task-1", 1, ""), nil
+		},
+	}
+
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	if err := d.Delete(context.Background(), "cert-1"); err != nil {
+		t.Fatalf("a successful delete task must be reported as success, got %v", err)
+	}
+	if polls < 3 {
+		t.Errorf("Delete returned after %d poll(s) without waiting for the task to finish", polls)
+	}
+}
+
+// Status 4 is the server refusing because a resource still references the certificate.
+// That must surface as an error so ReapRetired keeps its reclaim record and retries.
+func TestDeleteReportsAResourceStillBound(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	fake := &fakeSSLAPI{
+		deleteFn: func(context.Context, *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error) {
+			return deleteResp(true, "del-task-1"), nil
+		},
+		deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			return deleteTaskResp("del-task-1", 4, "certificate is still bound to a cloud resource"), nil
+		},
+	}
+
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	err := d.Delete(context.Background(), "cert-1")
+	if err == nil {
+		t.Fatal("a delete refused because a resource still references the certificate must not report success")
+	}
+	if !strings.Contains(err.Error(), "status 4") {
+		t.Errorf("the error should name the status so the operator can look it up, got %v", err)
+	}
+}
+
+// A synchronous answer (no task ID) is complete on its own, so it must not start polling.
+func TestDeleteWithoutATaskDoesNotPoll(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	fake := &fakeSSLAPI{
+		deleteFn: func(context.Context, *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error) {
+			return deleteResp(true, ""), nil
+		},
+		deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			t.Error("there is no task to poll")
+			return nil, nil
+		},
+	}
+
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	if err := d.Delete(context.Background(), "cert-1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+}
+
+// DeleteResult=false is the API refusing outright.
+func TestDeleteHonoursAnExplicitFalseResult(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	fake := &fakeSSLAPI{
+		deleteFn: func(context.Context, *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error) {
+			return deleteResp(false, ""), nil
+		},
+	}
+
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	if err := d.Delete(context.Background(), "cert-1"); err == nil {
+		t.Fatal("DeleteResult=false must be reported as a failure")
+	}
+}
+
+// DeployStatus == 0 means "a task is already in progress, this request created nothing,
+// and the returned DeployRecordId is that task's". The SDK says so explicitly.
+//
+// Adopting it blindly is how a switch for a *different* certificate gets reported as this
+// one's success: waitDeployRecord returns nil when that task completes, and Deploy then
+// hands back newID while the cloud is serving whatever that task switched to. The answer
+// that settles it is "is THIS certificate bound?".
+func TestUpdateInstanceVerifiesAnAdoptedTask(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+
+	fake := &fakeSSLAPI{
+		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
+			return &ssl.UploadCertificateResponse{
+				Response: &ssl.UploadCertificateResponseParams{CertificateId: common.StringPtr("new-id")},
+			}, nil
+		},
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			// A pre-existing task, not ours.
+			return updateRespWithStatus(42, 1, 0), nil
+		},
+		// That task is for a different switch and finishes successfully right away.
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			return detailResp(1, 0, 0), nil
+		},
+		createTaskFn: stubCreateTask("new-id", "task-1"),
+		// And this certificate is bound to nothing.
+		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			return bindingsResp("task-1", 0), nil
+		},
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(clock.now)
+	if _, err := d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key")); err == nil {
+		t.Fatal("the in-progress task belonged to another switch and this certificate is bound to nothing; " +
+			"reporting success would record a deploy that never happened")
+	}
+}
+
+// The same adopted task, but this time it really did bind our certificate, so the answer
+// is success.
+func TestUpdateInstanceAcceptsAnAdoptedTaskThatBoundUs(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+
+	fake := &fakeSSLAPI{
+		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
+			return &ssl.UploadCertificateResponse{
+				Response: &ssl.UploadCertificateResponseParams{CertificateId: common.StringPtr("new-id")},
+			}, nil
+		},
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			return updateRespWithStatus(42, 1, 0), nil
+		},
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			return detailResp(1, 0, 0), nil
+		},
+		createTaskFn: stubCreateTask("new-id", "task-1"),
+		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			return bindingsResp("task-1", 2), nil
+		},
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(clock.now)
+	id, err := d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if err != nil {
+		t.Fatalf("the adopted task did bind this certificate, so this is a success: %v", err)
+	}
+	if id != "new-id" {
+		t.Errorf("id = %q, want new-id", id)
+	}
+}
+
+// updateRespWithStatus is updateResp plus an explicit DeployStatus, so a test can say
+// "this request created the task" (1) or "a task was already running" (0).
+func updateRespWithStatus(recordID uint64, bound, status int64) *ssl.UpdateCertificateInstanceResponse {
+	resp := updateResp(recordID, bound)
+	resp.Response.DeployStatus = common.Int64Ptr(status)
+	return resp
 }

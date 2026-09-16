@@ -77,16 +77,33 @@ func NewDNSPodDeclarations(cfg config.Tencent, zones []string, log *slog.Logger)
 	return &DNSPodDeclarations{credential: src, zones: clean, log: log}, nil
 }
 
-func (d *DNSPodDeclarations) client(ctx context.Context) (*dnssdk.Client, error) {
-	cred, err := d.credential(ctx)
-	if err != nil {
-		return nil, err
-	}
+// dnspodAPI is the narrower slice of the DNSPod client this package uses.
+//
+// The SDK returns concrete structs with no interface seam, which left the whole enumeration --
+// paging, filtering, and the "an empty zone list is not an empty declaration set" check --
+// untestable without network access. Declaring only the used methods lets tests substitute a
+// fake while production keeps the real client.
+type dnspodAPI interface {
+	DescribeDomainListWithContext(ctx context.Context, req *dnssdk.DescribeDomainListRequest) (*dnssdk.DescribeDomainListResponse, error)
+	DescribeRecordListWithContext(ctx context.Context, req *dnssdk.DescribeRecordListRequest) (*dnssdk.DescribeRecordListResponse, error)
+}
+
+// newDNSPodClient builds the DNSPod client. A package variable so tests can substitute a fake;
+// production code never reassigns it.
+var newDNSPodClient = func(cred common.CredentialIface) (dnspodAPI, error) {
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "dnspod.tencentcloudapi.com"
 	cpf.HttpProfile.ReqTimeout = 30
 	// DNSPod is a global service in the Tencent Cloud API, so Region is empty.
 	return dnssdk.NewClient(cred, "", cpf)
+}
+
+func (d *DNSPodDeclarations) client(ctx context.Context) (dnspodAPI, error) {
+	cred, err := d.credential(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newDNSPodClient(cred)
 }
 
 // ListDeclarations implements DeclarationLister.
@@ -123,7 +140,7 @@ func (d *DNSPodDeclarations) ListDeclarations(ctx context.Context) ([]RawDeclara
 	return out, nil
 }
 
-func (d *DNSPodDeclarations) listZones(ctx context.Context, client *dnssdk.Client) ([]string, error) {
+func (d *DNSPodDeclarations) listZones(ctx context.Context, client dnspodAPI) ([]string, error) {
 	if len(d.zones) > 0 {
 		return d.zones, nil
 	}
@@ -163,7 +180,7 @@ func (d *DNSPodDeclarations) listZones(ctx context.Context, client *dnssdk.Clien
 // record names is not consistent across API versions, and missing one declaration
 // shows up as "I declared it but nothing was issued", far more expensive than a
 // few extra pages. Filtering by prefix locally is deterministic.
-func (d *DNSPodDeclarations) listTXTRecords(ctx context.Context, client *dnssdk.Client, zone string) ([]RawDeclaration, error) {
+func (d *DNSPodDeclarations) listTXTRecords(ctx context.Context, client dnspodAPI, zone string) ([]RawDeclaration, error) {
 	byName := map[string]*RawDeclaration{}
 
 	var offset uint64
@@ -272,7 +289,7 @@ func (r *CLBRules) ListRuleDomains(ctx context.Context) ([]string, error) {
 		cpf.HttpProfile.Endpoint = "clb.tencentcloudapi.com"
 		cpf.HttpProfile.ReqTimeout = 30
 
-		client, err := clbsdk.NewClient(cred, region, cpf)
+		client, err := newCLBClient(cred, region, cpf)
 		if err != nil {
 			return nil, fmt.Errorf("region %s: build CLB client: %w", region, err)
 		}
@@ -300,8 +317,19 @@ func (r *CLBRules) ListRuleDomains(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+// clbAPI is the narrower slice of the CLB client this package uses. See dnspodAPI.
+type clbAPI interface {
+	DescribeLoadBalancersWithContext(ctx context.Context, req *clbsdk.DescribeLoadBalancersRequest) (*clbsdk.DescribeLoadBalancersResponse, error)
+	DescribeListenersWithContext(ctx context.Context, req *clbsdk.DescribeListenersRequest) (*clbsdk.DescribeListenersResponse, error)
+}
+
+// newCLBClient builds a regional CLB client. A package variable so tests can substitute a fake.
+var newCLBClient = func(cred common.CredentialIface, region string, cpf *profile.ClientProfile) (clbAPI, error) {
+	return clbsdk.NewClient(cred, region, cpf)
+}
+
 // listLoadBalancers returns every layer-7 (HTTP/HTTPS) load balancer in the region.
-func (r *CLBRules) listLoadBalancers(ctx context.Context, client *clbsdk.Client) ([]string, error) {
+func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI) ([]string, error) {
 	var out []string
 	var offset int64
 	for {
@@ -339,7 +367,7 @@ func (r *CLBRules) listLoadBalancers(ctx context.Context, client *clbsdk.Client)
 //
 // They live in the Listener.Rules returned by DescribeListeners, so no separate
 // DescribeRules call is needed (this API version does not have it either).
-func (r *CLBRules) listRuleDomainsFor(ctx context.Context, client *clbsdk.Client, lbID string) ([]string, error) {
+func (r *CLBRules) listRuleDomainsFor(ctx context.Context, client clbAPI, lbID string) ([]string, error) {
 	req := clbsdk.NewDescribeListenersRequest()
 	req.LoadBalancerId = common.StringPtr(lbID)
 
