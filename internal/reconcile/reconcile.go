@@ -266,8 +266,12 @@ func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
 			skipped = append(skipped, c.Name)
 			continue
 		}
-		r.reconcileOne(ctx, c)
-		r.release(c.Name)
+		// defer inside the loop body so a panic in reconcileOne cannot leak the slot
+		// and wedge every later pass with ErrAlreadyRunning.
+		func() {
+			defer r.release(c.Name)
+			r.reconcileOne(ctx, c)
+		}()
 	}
 
 	r.manager.ReapRetired(ctx)
