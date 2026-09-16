@@ -86,6 +86,10 @@ type fakeAPI struct {
 	// assert not only what was sent but that it was retried without it.
 	newOrderReplaces []string
 
+	// getOrderErr, when set, makes every GetOrder fail. It models an order URL that the CA
+	// will never serve again (a purged order, or a different ACME directory).
+	getOrderErr error
+
 	// newOrderErr, when set, is returned by the next NewOrder call and then cleared. It
 	// scripts "the CA refused this order" without making the fake stateful.
 	newOrderErr error
@@ -185,6 +189,9 @@ func (f *fakeAPI) GetOrder(string) (legoacme.ExtendedOrder, error) {
 	f.enter("GetOrder")
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getOrderErr != nil {
+		return legoacme.ExtendedOrder{}, f.getOrderErr
+	}
 	if len(f.orders) == 0 {
 		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: GetOrder has no scripted orders")
 	}
