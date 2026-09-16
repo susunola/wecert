@@ -137,6 +137,23 @@ func Remaining(s Snapshot, l Limit, now time.Time) float64 {
 		return l.Capacity
 	}
 	tokens := s.Tokens
+	// A limit with no refill interval has no meaningful rate, and the arithmetic below divides
+	// by it: `elapsed / 0` panicked with "integer divide by zero". This is unreachable through
+	// today's callers -- every Limit comes from the table in this file, whose intervals are
+	// published constants -- but Remaining takes a Limit, so it is reachable through the API,
+	// and "no caller does that yet" is the assumption that stops being true when one does.
+	//
+	// Treating it as a bucket that never refills is the conservative reading: fewer tokens
+	// available means less issuance, never more.
+	if l.Refill <= 0 {
+		if s.Tokens > l.Capacity {
+			return l.Capacity
+		}
+		if s.Tokens < 0 {
+			return 0
+		}
+		return s.Tokens
+	}
 	if now.After(s.At) {
 		// Computed as whole refills plus a fraction of the next one, rather than as
 		// elapsed x (1/Refill). The inverse form rounds: 34h as a float, multiplied back by
@@ -170,6 +187,13 @@ func Remaining(s Snapshot, l Limit, now time.Time) float64 {
 // so an over-spend is not silently forgiven. The CA would have rejected that request, so a
 // negative bucket is itself a signal worth keeping.
 func Spend(s Snapshot, l Limit, cost float64, now time.Time) Snapshot {
+	// A negative cost is not a credit, and treating it as one is how a caller's sign error
+	// silently hands back quota: `tokens - (-c)` is `tokens + c`, so a bug in the caller would
+	// *increase* the reported allowance. The API records consumption, so the only defensible
+	// reading of a negative cost is "nothing was consumed".
+	if cost < 0 {
+		cost = 0
+	}
 	tokens := Remaining(s, l, now) - cost
 	// Clamp the debt. Without a floor, one catastrophic burst (or a clock jump) could leave a
 	// bucket so negative that it takes longer than the window to recover and the estimate
@@ -220,6 +244,14 @@ func ParseRetryAfter(msg string) (time.Time, bool) {
 
 	for _, layout := range []string{"2006-01-02 15:04:05 MST", "2006-01-02 15:04:05.999999999 MST"} {
 		if t, err := time.Parse(layout, rest); err == nil {
+			if t.IsZero() {
+				// "0001-01-01 00:00:00 UTC" parses successfully and is the zero time, which is
+				// exactly the value callers use for "no deadline". Reporting it as a successful
+				// parse would hand back a deadline that means "not blocked" while looking like a
+				// real one -- the failure mode this whole function exists to avoid. The fuzzer
+				// found it; a human reading the documented format would not have.
+				return time.Time{}, false
+			}
 			return t.UTC(), true
 		}
 	}
