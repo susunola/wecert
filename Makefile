@@ -26,7 +26,7 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # yet; keep this list in sync when it lands.
 CMDS := wecert wecert-onboard
 
-.PHONY: build build-lego-dns sbom repro-check tools release test test-race vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
+.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
@@ -203,6 +203,19 @@ check-alerts:
 #	go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
 test-pebble:
 	$(GO) test -tags pebble -count=1 -timeout 5m ./internal/acme/ -run TestPebble -v
+
+# Property and fuzz testing. Separate from `check` because each target runs for a bounded
+# wall-clock budget rather than to completion, so it belongs in a scheduled job as well as a
+# pre-merge run.
+#
+# FUZZTIME defaults to 30s per target: long enough to explore well past the seed corpus (the
+# runs that found the divide-by-zero executed ~30 million inputs) and short enough to sit in CI.
+FUZZTIME ?= 30s
+fuzz:
+	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzRemainingStaysWithinItsBucket -fuzztime $(FUZZTIME)
+	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzSpendNeverCreatesTokens -fuzztime $(FUZZTIME)
+	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzLimitWithDegenerateRefill -fuzztime $(FUZZTIME)
+	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzParseRetryAfter -fuzztime $(FUZZTIME)
 
 check: check-english fmt-check vet test-race check-scripts check-alerts
 
