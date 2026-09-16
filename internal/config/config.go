@@ -1006,3 +1006,43 @@ func splitResolverAddress(v string) (host, port string, err error) {
 	}
 	return v, "", nil
 }
+
+// profileValidity is each profile's nominal certificate lifetime as Let's Encrypt
+// issues it. It is not used to decide anything -- ARI and renewBefore own that -- only
+// to scale the local "approaching expiry" warning below.
+var profileValidity = map[string]time.Duration{
+	ProfileClassic:    90 * 24 * time.Hour,
+	ProfileTLSServer:  45 * 24 * time.Hour,
+	ProfileShortLived: 160 * time.Hour,
+}
+
+// ExpiryWarningThreshold is how close to expiry a certificate has to get before the
+// daemon logs a warning about it.
+//
+// Scaled to the profile rather than fixed. A fixed 21 days is most of a `shortlived`
+// certificate's 160-hour life, so that profile warned from the moment it was issued --
+// on every pass, for its whole life, which is exactly the kind of alarm that trains
+// people to ignore logs. A quarter of the validity is early enough to act on and late
+// enough to mean something. The metrics remain the primary expiry signal; this is a
+// secondary log line.
+func ExpiryWarningThreshold(profile string) time.Duration {
+	v, ok := profileValidity[profile]
+	if !ok {
+		v = profileValidity[ProfileClassic]
+	}
+	return v / 4
+}
+
+// DaysUntil is the whole number of days left before notAfter, rounded **up**.
+//
+// Rounded up, because truncation makes "23 hours left" read as 0 days, and 0 days is a
+// meaningless thing to report for a certificate that is still valid -- a consumer that
+// treats 0 as expired reads a healthy certificate as down. probe.DaysLeft uses the same
+// rule; keep the two in step.
+func DaysUntil(notAfter, now time.Time) int {
+	left := notAfter.Sub(now)
+	if left <= 0 {
+		return 0
+	}
+	return int((left + 24*time.Hour - 1) / (24 * time.Hour))
+}
