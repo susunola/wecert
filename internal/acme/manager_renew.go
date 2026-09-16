@@ -166,7 +166,25 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		Identifiers: c.DomainKey(),
 	}
 	if err := m.store.PutOrder(o); err != nil {
-		return err
+		// A bare return here (which is what this used to be) is the worst of both worlds: the
+		// order was created at the CA but not recorded, so the next pass has no order URL to
+		// resume and creates ANOTHER one -- and because recordFailure never ran, no backoff
+		// was scheduled either. The order rate then follows the pass rate instead of the
+		// backoff: at a 1-minute interval that is 1440 orders a day against
+		// "300 new orders per account per 3 hours", and hitting that ceiling blocks EVERY
+		// certificate on the account, not just this one.
+		//
+		// recordFailure is what makes the next attempt wait, so a state-store failure cannot
+		// turn into a rate-limit incident. Note that it also has to be able to record: if the
+		// disk is full enough that PutOrder failed, PutCert may fail too, which is why
+		// recordFailure's own persistence error is logged rather than fatal (see there).
+		//
+		// The order URL is logged because it is the only remaining handle on the order that
+		// now exists at the CA and nowhere else -- an operator reading the log can still
+		// recover it by hand.
+		return m.recordFailure(st, fmt.Errorf(
+			"record the new order (the CA has it as %s, and it is not in the state store, so the next "+
+				"attempt will create another one): %w", order.Location, err))
 	}
 
 	m.log.Info("ACME order created",
