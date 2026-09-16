@@ -95,7 +95,7 @@ func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
 
 // issue creates an order. Mind the order of operations: persist the order (including the
 // private key generated here) first, and only then advance it.
-func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.CertState, replaces string) error {
+func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.CertState, replaces string, rd round) error {
 	key, err := GenerateKey(c.KeyType)
 	if err != nil {
 		return m.recordFailure(st, err)
@@ -156,7 +156,7 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 	m.log.Info("ACME order created",
 		"cert", c.Name, "status", order.Status, "expiresAt", expiresAt,
 		"names", len(c.Domains), "profile", order.Profile, "replaces", replaces != "")
-	return m.advance(ctx, c, st, o)
+	return m.advance(ctx, c, st, o, rd)
 }
 
 // mentionsReplaces reports whether an order-creation error is the CA refusing the ARI

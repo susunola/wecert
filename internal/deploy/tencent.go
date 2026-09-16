@@ -681,7 +681,18 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready 
 	listed := 0
 	answered := 0
 	for _, p := range progress {
+		// The SDK hands back []*T; a nil element is not a "region with no count", it is a
+		// missing entry, and dereferencing it panics inside updateInstance -- after the
+		// certificate was already uploaded. reconcileOne recovers the panic, so the process
+		// survives, but recordFailure never runs: no backoff, no last_error, and the deploy
+		// never completes. Every other SDK list in this file is guarded; these two were not.
+		if p == nil {
+			continue
+		}
 		for _, r := range p.UpdateSyncProgressRegions {
+			if r == nil {
+				continue
+			}
 			listed++
 			if r.TotalCount != nil {
 				answered++
@@ -711,7 +722,13 @@ func formatProgress(progress []*ssl.UpdateSyncProgress) string {
 	}
 	var parts []string
 	for _, p := range progress {
+		if p == nil {
+			continue
+		}
 		for _, r := range p.UpdateSyncProgressRegions {
+			if r == nil {
+				continue
+			}
 			parts = append(parts,
 				fmt.Sprintf("%s/%s total=%d status=%d",
 					derefStr(p.ResourceType), derefStr(r.Region), derefI64(r.TotalCount), derefI64(r.Status)))

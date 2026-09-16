@@ -1145,3 +1145,69 @@ func (panickingProber) Check(context.Context, string, probe.Expectation) probe.V
 }
 
 func (panickingProber) Forget(string) {}
+
+// An orphan must not be torn down while its own pass is still running.
+//
+// Removing a certificate from the desired state while it is being issued is exactly when
+// this matters: the running pass may be parked in WaitAll for minutes waiting on DNS
+// propagation, holding challenge leases and an order URL. The teardown deletes the
+// authorization rows and fires delete-all at the challenge TXT name, so doing it underneath
+// the running pass makes that pass fail with a propagation error (or, if it already called
+// AcceptChallenge, sends the CA to validate a vanished record and books an identifier
+// failure that feeds the failure fallback), and the deleted order URL means its retry
+// re-orders into the "5 certificates per exact set of identifiers / 7 days" limit.
+//
+// The claim is held here directly rather than by racing a real pass, so the assertion is
+// deterministic: publishOrphans runs at the top of RunAll, before the loop that claims.
+func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
+	const (
+		gone = "in-flight-cert"
+		kept = "kept-cert"
+	)
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if err := store.PutCert(&state.CertState{
+		Name: gone, NotAfter: time.Now().Add(48 * time.Hour),
+	}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	if err := store.PutOrder(&state.Order{
+		CertName: gone, OrderURL: "https://acme.example/order/inflight", Status: "pending",
+	}); err != nil {
+		t.Fatalf("PutOrder: %v", err)
+	}
+
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: kept})
+	cfg := &config.Config{}
+	cfg.Certificates = []config.Certificate{{Name: kept}}
+
+	mgr := &fakeManager{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, mgr, nil, log)
+
+	// The pass for `gone` is in flight and has not released its claim.
+	if !r.acquire(gone) {
+		t.Fatal("acquiring the claim should succeed on a fresh reconciler")
+	}
+
+	r.RunAll(context.Background())
+
+	if cleaned := mgr.orphanCleaned(); len(cleaned) != 0 {
+		t.Errorf("the orphan teardown ran for a certificate with a pass in flight (%v); "+
+			"that deletes the TXT records and order the running pass is waiting on", cleaned)
+	}
+
+	// Once the pass releases, the next round must reap it -- skipping must not mean losing.
+	r.release(gone)
+	r.RunAll(context.Background())
+
+	if cleaned := mgr.orphanCleaned(); len(cleaned) != 1 || cleaned[0] != gone {
+		t.Errorf("after the claim is released the orphan must be reaped exactly once, got %v", cleaned)
+	}
+}
