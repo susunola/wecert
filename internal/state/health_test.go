@@ -155,3 +155,95 @@ func errString(s string) error {
 type plainError struct{ s string }
 
 func (e *plainError) Error() string { return e.s }
+
+// captureStderr runs fn with os.Stderr redirected and returns what was written.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		var sb strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := r.Read(buf)
+			if n > 0 {
+				sb.Write(buf[:n])
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		done <- sb.String()
+	}()
+
+	fn()
+
+	os.Stderr = orig
+	_ = w.Close()
+	out := <-done
+	_ = r.Close()
+	return out
+}
+
+// A brand-new deployment must open its state directory without being told that a database
+// was "probably deleted or lost".
+//
+// The check is "a lock file exists but the database does not". acquireLock CREATES the lock
+// file, so sampling lockExisted after taking the lock made it true on every call -- and the
+// first run of a fresh install printed the disaster warning. That is the worst possible
+// false positive: the warning exists to make an operator stop and restore a backup, and one
+// that fires when nothing is wrong trains them to ignore it.
+func TestFreshStateDirectoryDoesNotWarnAboutALostDatabase(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+
+	var openErr error
+	out := captureStderr(t, func() {
+		s, err := Open(path)
+		openErr = err
+		if s != nil {
+			_ = s.Close()
+		}
+	})
+
+	if openErr != nil {
+		t.Fatalf("opening a fresh state directory must succeed, got %v", openErr)
+	}
+	if strings.Contains(out, "probably deleted or lost") {
+		t.Errorf("a fresh state directory must not be reported as a lost database; stderr was:\n%s", out)
+	}
+}
+
+// The warning must still fire in the case it was written for: the lock file survives but the
+// database is gone. This is the control that keeps the test above from being satisfied by
+// simply deleting the check.
+func TestMissingDatabaseBesideALockFileStillWarns(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+
+	// A lock file with no database: exactly what a deleted state.db looks like.
+	if err := os.WriteFile(path+".lock", nil, 0o600); err != nil {
+		t.Fatalf("creating the lock file: %v", err)
+	}
+
+	var openErr error
+	out := captureStderr(t, func() {
+		s, err := Open(path)
+		openErr = err
+		if s != nil {
+			_ = s.Close()
+		}
+	})
+
+	if openErr != nil {
+		t.Fatalf("opening must still succeed, got %v", openErr)
+	}
+	if !strings.Contains(out, "probably deleted or lost") {
+		t.Errorf("a lock file with no database must warn; stderr was:\n%s", out)
+	}
+}

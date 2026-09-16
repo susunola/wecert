@@ -38,7 +38,7 @@ func TestFallbackGaugeIsNotResetWhenTheRecordCannotBeRead(t *testing.T) {
 
 	// The policy is off, so this pass uses the full set and the read is what decides.
 	st := &state.CertState{Name: cert.Name, NotAfter: now.Add(24 * time.Hour)}
-	if got := m.applyFallback(cert, st); len(got.Domains) != len(cert.Domains) {
+	if got, _ := m.applyFallback(cert, st, round{}); len(got.Domains) != len(cert.Domains) {
 		t.Fatalf("with the policy off the full set must be used, got %v", got.Domains)
 	}
 
@@ -62,7 +62,7 @@ func TestFallbackGaugeFollowsTheRecordWhenItCanBeRead(t *testing.T) {
 
 	// No record: healthy.
 	metrics.CertificateFallbackActive.WithLabelValues(cert.Name).Set(1)
-	m.applyFallback(cert, st)
+	m.applyFallback(cert, st, round{})
 	if got := testutil.ToFloat64(metrics.CertificateFallbackActive.WithLabelValues(cert.Name)); got != 0 {
 		t.Errorf("with no fallback record the gauge must read 0, got %v", got)
 	}
@@ -73,7 +73,7 @@ func TestFallbackGaugeFollowsTheRecordWhenItCanBeRead(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	m.applyFallback(cert, st)
+	m.applyFallback(cert, st, round{})
 	if got := testutil.ToFloat64(metrics.CertificateFallbackActive.WithLabelValues(cert.Name)); got != 1 {
 		t.Errorf("with a fallback record the gauge must read 1, got %v", got)
 	}

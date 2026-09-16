@@ -29,12 +29,21 @@ type fakeDNSPod struct {
 
 	domainErr error
 	recordErr error
+
+	// nilResponse makes both calls answer a well-formed HTTP 200 whose body carries no
+	// result object. The SDK leaves the typed Response pointer nil in that case (its own
+	// error check only fires when Error.Code is set, and ErrorResponse.Response is an
+	// inline struct), so this is what a version mismatch or a proxy looks like.
+	nilResponse bool
 }
 
 func (f *fakeDNSPod) DescribeDomainListWithContext(_ context.Context, req *dnssdk.DescribeDomainListRequest) (*dnssdk.DescribeDomainListResponse, error) {
 	f.domainCalls++
 	if f.domainErr != nil {
 		return nil, f.domainErr
+	}
+	if f.nilResponse {
+		return &dnssdk.DescribeDomainListResponse{}, nil
 	}
 	offset, limit := int64(0), int64(dnsPageSize)
 	if req.Offset != nil {
@@ -59,6 +68,9 @@ func (f *fakeDNSPod) DescribeRecordListWithContext(_ context.Context, req *dnssd
 	f.recordCalls++
 	if f.recordErr != nil {
 		return nil, f.recordErr
+	}
+	if f.nilResponse {
+		return &dnssdk.DescribeRecordListResponse{}, nil
 	}
 	zone := ""
 	if req.Domain != nil {
@@ -341,11 +353,22 @@ type fakeCLB struct {
 
 	lbErr   error
 	ruleErr error
+
+	// nilResponse mirrors fakeDNSPod.nilResponse for the CLB calls.
+	nilResponse bool
+
+	// forward records the generation filter the last DescribeLoadBalancers call sent, so a
+	// test can assert that none is sent.
+	forward *int64
 }
 
-func (f *fakeCLB) DescribeLoadBalancersWithContext(_ context.Context, _ *clbsdk.DescribeLoadBalancersRequest) (*clbsdk.DescribeLoadBalancersResponse, error) {
+func (f *fakeCLB) DescribeLoadBalancersWithContext(_ context.Context, req *clbsdk.DescribeLoadBalancersRequest) (*clbsdk.DescribeLoadBalancersResponse, error) {
+	f.forward = req.Forward
 	if f.lbErr != nil {
 		return nil, f.lbErr
+	}
+	if f.nilResponse {
+		return &clbsdk.DescribeLoadBalancersResponse{}, nil
 	}
 	var out []*clbsdk.LoadBalancer
 	for _, v := range f.lbs {
@@ -361,6 +384,9 @@ func (f *fakeCLB) DescribeLoadBalancersWithContext(_ context.Context, _ *clbsdk.
 func (f *fakeCLB) DescribeListenersWithContext(_ context.Context, req *clbsdk.DescribeListenersRequest) (*clbsdk.DescribeListenersResponse, error) {
 	if f.ruleErr != nil {
 		return nil, f.ruleErr
+	}
+	if f.nilResponse {
+		return &clbsdk.DescribeListenersResponse{}, nil
 	}
 	id := ""
 	if req.LoadBalancerId != nil {
@@ -542,4 +568,106 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+// A well-formed 200 whose body carries no result must be an error, never a panic.
+//
+// The SDK's typed Response field is a pointer and its own error check only inspects
+// Error.Code, so `{"Response":null}` reaches wecert as (resp, nil). wecert-onboard has no
+// recover, so dereferencing it kills the process -- and the round writes no desired state,
+// bypassing the freeze path that exists to make a bad round harmless. All four enumeration
+// calls are checked here because all four dereferenced the response.
+func TestEnumerationRejectsANilResultInsteadOfPanicking(t *testing.T) {
+	t.Run("dns zones", func(t *testing.T) {
+		fake := &fakeDNSPod{nilResponse: true}
+		stubDNSPod(t, fake)
+		if _, err := newDeclarations(t, nil).ListDeclarations(context.Background()); err == nil {
+			t.Error("a response with no result must be an error, not an empty zone list")
+		}
+	})
+
+	t.Run("txt records", func(t *testing.T) {
+		fake := &fakeDNSPod{nilResponse: true}
+		stubDNSPod(t, fake)
+		d := newDeclarations(t, []string{"example.com"})
+		if _, err := d.ListDeclarations(context.Background()); err == nil {
+			t.Error("a response with no result must be an error, not an empty declaration set")
+		}
+	})
+
+	t.Run("load balancers", func(t *testing.T) {
+		fake := &fakeCLB{nilResponse: true}
+		stubCLB(t, fake)
+		if _, err := newRules(t, nil).ListRuleDomains(context.Background()); err == nil {
+			t.Error("a response with no result must be an error, not an empty rule set")
+		}
+	})
+
+	t.Run("listeners", func(t *testing.T) {
+		fake := &fakeCLB{nilResponse: true, lbs: map[string][]*clbsdk.LoadBalancer{
+			"ap-guangzhou": {{LoadBalancerId: common.StringPtr("lb-1")}},
+		}}
+		stubCLB(t, fake)
+		if _, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background()); err == nil {
+			t.Error("a response with no result must be an error, not an empty rule set")
+		}
+	})
+}
+
+// A nil element inside an otherwise valid list must be skipped, not dereferenced.
+func TestEnumerationSkipsNilListElements(t *testing.T) {
+	t.Run("dns zones", func(t *testing.T) {
+		fake := &fakeDNSPod{domains: []*dnssdk.DomainListItem{
+			nil, {Name: common.StringPtr("example.com")},
+		}}
+		stubDNSPod(t, fake)
+		d := newDeclarations(t, []string{"example.com"})
+		recs, err := d.ListDeclarations(context.Background())
+		if err != nil {
+			t.Fatalf("a nil element must be skipped, got %v", err)
+		}
+		if len(recs) != 0 {
+			t.Errorf("the nil zone element must contribute nothing, got %v", recs)
+		}
+	})
+
+	t.Run("load balancers and rules", func(t *testing.T) {
+		fake := &fakeCLB{
+			lbs: map[string][]*clbsdk.LoadBalancer{
+				"ap-guangzhou": {nil, {LoadBalancerId: common.StringPtr("lb-1")}},
+			},
+			rules: map[string][]string{"lb-1": {"api.example.com"}},
+		}
+		stubCLB(t, fake)
+		got, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
+		if err != nil {
+			t.Fatalf("a nil element must be skipped, got %v", err)
+		}
+		if len(got) != 1 || got[0] != "api.example.com" {
+			t.Errorf("got %v, want the rule of the non-nil load balancer only", got)
+		}
+	})
+}
+
+// The load-balancer enumeration must not filter by instance generation.
+//
+// `Forward` reads like a layer-7 selector but the SDK documents it as the instance
+// GENERATION: 1 = general, 0 = classic, omitted = both. Sending 1 hides every classic
+// instance, and that list supplies the CLB guard -- which REJECTS a declaration when no
+// rule serves its name. A name fronted by a classic instance would be judged unreferenced
+// and dropped from the desired state: silent, and in the direction that removes coverage.
+func TestLoadBalancerEnumerationDoesNotFilterByInstanceGeneration(t *testing.T) {
+	fake := &fakeCLB{lbs: map[string][]*clbsdk.LoadBalancer{
+		"ap-guangzhou": {{LoadBalancerId: common.StringPtr("lb-1")}},
+	}}
+	stubCLB(t, fake)
+
+	if _, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background()); err != nil {
+		t.Fatalf("ListRuleDomains: %v", err)
+	}
+	if fake.forward != nil {
+		t.Errorf("DescribeLoadBalancers sent Forward=%d; that is the instance generation, not a "+
+			"layer-7 filter, so it hides classic load balancers and their rule domains with them",
+			*fake.forward)
+	}
 }

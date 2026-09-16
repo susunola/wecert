@@ -529,3 +529,57 @@ func TestCoverageDriftDetailPointsBothDirections(t *testing.T) {
 		}
 	}
 }
+
+// CleanupOrphan is the seam the reconcile loop calls for a certificate that left the
+// desired state mid-issuance, and until now only the fake manager on the other side of that
+// seam was tested -- reconcile_test asserted "CleanupOrphan was called once" against a
+// double, so the real implementation had no coverage at all.
+//
+// The ordering the method documents is the thing worth pinning: the TXT records must come
+// down BEFORE the authorization rows go away, because those rows hold the only record of
+// which names to delete.
+func TestManagerCleanupOrphanReclaimsTXTThenRows(t *testing.T) {
+	solver := &fakeSolver{}
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "gone-cert", AuthzURL: "authz-1", Identifier: "a.example.com",
+		ChallengeToken: "tok-1", TxtName: "_acme-challenge.a.example.com.",
+		TxtValue: "v1", Presented: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutOrder(&state.Order{
+		CertName: "gone-cert", OrderURL: "https://ca.test/order/1", Status: "pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.CleanupOrphan(context.Background(), "gone-cert"); err != nil {
+		t.Fatalf("CleanupOrphan: %v", err)
+	}
+
+	if got := solver.cleanCount(); got != 1 {
+		t.Errorf("the leaked challenge TXT record must be reclaimed, cleanCount=%d", got)
+	}
+	if as, err := store.ListAuthorizations("gone-cert"); err != nil || len(as) != 0 {
+		t.Errorf("authorization rows must be gone, got %d, err=%v", len(as), err)
+	}
+	if o, err := store.GetOrder("gone-cert"); err != nil || o != nil {
+		t.Errorf("the order row must be gone, got %+v, err=%v", o, err)
+	}
+}
+
+// A certificate with nothing in flight is a no-op, not an error: the reconcile loop calls
+// this for every name that leaves the desired state, including ones that never issued.
+func TestManagerCleanupOrphanIsANoOpWithNothingInFlight(t *testing.T) {
+	solver := &fakeSolver{}
+	m, _ := newTestManager(t, solver, fakeKeyAuth{})
+
+	if err := m.CleanupOrphan(context.Background(), "never-issued"); err != nil {
+		t.Fatalf("CleanupOrphan on a certificate with no order and no authorizations must be a no-op, got %v", err)
+	}
+	if got := solver.cleanCount(); got != 0 {
+		t.Errorf("no DNS call belongs in a no-op cleanup, got %d", got)
+	}
+}
