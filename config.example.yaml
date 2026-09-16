@@ -56,7 +56,22 @@ dns:
   provider: tencentcloud
 
   # Required when provider=dnspod. Looks like "12345,abcdef0123456789..."
+  #
+  # Prefer ONE of the two below over this: a token written here is a token in every backup of
+  # this file and every time somebody pastes it while debugging.
+  #
+  #   loginTokenFile  reads it from a file (0600), and the path is environment-expanded, so
+  #                   systemd's LoadCredential works:
+  #                       # /etc/systemd/system/wecert.service.d/credentials.conf
+  #                       [Service]
+  #                       LoadCredential=dnspod-token:/etc/wecert/dnspod.token
+  #                   with `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token` here.
+  #
+  #   DNSPOD_LOGIN_TOKEN in the environment is also accepted when neither is set, for a container
+  #   or an EnvironmentFile= that is itself 0600.
+  #
   # loginToken: ""
+  # loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token
 
   # TTL of the TXT record.
   # ⚠️ The DNSPod free tier has a TTL floor of 600; a value of 60 is rejected by
@@ -86,6 +101,11 @@ tencent:
   # credentialMode: static
   # secretId: "REPLACE_ME"
   # secretKey: "REPLACE_ME"
+  #
+  # File variants, for the same reason as loginTokenFile above; both paths are
+  # environment-expanded so LoadCredential works:
+  # secretIdFile: ${CREDENTIALS_DIRECTORY}/tencent-secret-id
+  # secretKeyFile: ${CREDENTIALS_DIRECTORY}/tencent-secret-key
 
   # Resource types that UpdateCertificateInstance supports.
   # clb is the most common; cdn, waf, tke, apigateway and others also work.

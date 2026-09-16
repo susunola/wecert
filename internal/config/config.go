@@ -603,6 +603,12 @@ type DNS struct {
 	// not a Tencent Cloud CAM SecretId/SecretKey.
 	LoginToken string `yaml:"loginToken"`
 
+	// LoginTokenFile reads the token from a file instead: a 0600 file, a systemd credential, or
+	// anything else that keeps it out of config.yaml. Environment-expanded, so
+	// ${CREDENTIALS_DIRECTORY}/dnspod-token works under LoadCredential. Mutually exclusive with
+	// loginToken.
+	LoginTokenFile string `yaml:"loginTokenFile,omitempty"`
+
 	// TTL is the value used when writing the _acme-challenge TXT record.
 	//
 	// The default is 600, not 60: on DNSPod's free tier the TTL floor is 600, and
@@ -625,12 +631,17 @@ type DNS struct {
 
 // Tencent is the Tencent Cloud credential and deployment target configuration.
 type Tencent struct {
-	CredentialMode string   `yaml:"credentialMode"`
-	SecretID       string   `yaml:"secretId"`
-	SecretKey      string   `yaml:"secretKey"`
-	RoleName       string   `yaml:"roleName"`
-	ResourceTypes  []string `yaml:"resourceTypes"`
-	Regions        []string `yaml:"regions"`
+	CredentialMode string `yaml:"credentialMode"`
+	SecretID       string `yaml:"secretId"`
+	SecretKey      string `yaml:"secretKey"`
+	// SecretIDFile / SecretKeyFile are the file variants of the two above, for the same reason as
+	// LoginTokenFile. With credentialMode=cvm-role they are unnecessary: the role is read from the
+	// instance metadata service and no static key exists at all.
+	SecretIDFile  string   `yaml:"secretIdFile,omitempty"`
+	SecretKeyFile string   `yaml:"secretKeyFile,omitempty"`
+	RoleName      string   `yaml:"roleName"`
+	ResourceTypes []string `yaml:"resourceTypes"`
+	Regions       []string `yaml:"regions"`
 }
 
 // Metrics is the Prometheus exposition configuration.
@@ -730,6 +741,12 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Resolve file- and environment-backed secrets before validation, so the validation rules see
+	// the credential that will actually be used rather than the field the operator left empty.
+	if err := cfg.resolveSecretFiles(); err != nil {
+		return nil, err
+	}
+
 	if err := cfg.normalize(); err != nil {
 		return nil, err
 	}
@@ -783,7 +800,8 @@ func (c *Config) normalize() error {
 			DNSProviderDNSPod, DNSProviderTencentCloud, DNSProviderLego, c.DNS.Provider)
 	}
 	if c.DNS.Provider == DNSProviderDNSPod && c.DNS.LoginToken == "" {
-		return fmt.Errorf("dns.provider=dnspod requires dns.loginToken " +
+		return fmt.Errorf("dns.provider=dnspod requires dns.loginToken, dns.loginTokenFile or " +
+			"$" + EnvDNSPodLoginToken + " " +
 			"(a DNSPod API token, not a Tencent Cloud SecretId/SecretKey;" +
 			"to use Tencent Cloud CAM credentials instead, set dns.provider=tencentcloud)")
 	}
@@ -1321,3 +1339,85 @@ func DaysUntil(notAfter, now time.Time) int {
 	}
 	return int((left + 24*time.Hour - 1) / (24 * time.Hour))
 }
+
+// ── secrets from files ──────────────────────────────────────────────────────────────
+//
+// A credential in config.yaml is a credential in every backup, every paste into a chat window and
+// every `cat` while debugging. These three fields let an operator keep them out of the file
+// entirely, which is the difference between "rotate the token" and "rotate the token and also
+// rewrite every copy of the config that ever existed".
+//
+// The shape follows systemd's LoadCredential, which is what the shipped unit can use:
+//
+//	# deploy/systemd/wecert.service.d/credentials.conf
+//	[Service]
+//	LoadCredential=dnspod-token:/etc/wecert/dnspod.token
+//
+// systemd then exposes the file at $CREDENTIALS_DIRECTORY/dnspod-token, and the config says
+// `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token`. That is why the path is
+// environment-expanded: CREDENTIALS_DIRECTORY only exists once systemd has started the unit, so a
+// literal path cannot express it.
+
+// resolveSecretFiles fills in the *_file variants, and the environment fallbacks.
+//
+// Called from Load, before validation, so a typo'd path is reported while the operator is looking
+// at it rather than after an order has been placed and a challenge has failed -- a rate-limited
+// failure is much more expensive than a config error.
+//
+// Every configured path is read, even one the chosen provider does not use. A config that names a
+// file which is not there is wrong whether or not today's provider reads it, and failing now is
+// cheaper than failing on the day the provider changes.
+func (c *Config) resolveSecretFiles() error {
+	resolve := func(field, value, file string, envs []string, target *string) error {
+		if value != "" && file != "" {
+			return fmt.Errorf("%s and its file variant are both set; keep one of them so it is "+
+				"unambiguous which one is in use", field)
+		}
+		if value != "" {
+			return nil
+		}
+		if file != "" {
+			// Environment-expanded so ${CREDENTIALS_DIRECTORY} works: systemd sets it only after
+			// the unit starts, so the path cannot be written literally in the file.
+			path := os.ExpandEnv(file)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return fmt.Errorf("read %s from %s: %w (the path is environment-expanded, so "+
+					"${CREDENTIALS_DIRECTORY} is only set when systemd runs this)", field, path, err)
+			}
+			secret := strings.TrimSpace(string(raw))
+			if secret == "" {
+				return fmt.Errorf("%s file %s is empty; a blank credential would be sent to the "+
+					"provider as an empty string and rejected there, far from the cause", field, path)
+			}
+			*target = secret
+			return nil
+		}
+		for _, env := range envs {
+			if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+				*target = v
+				return nil
+			}
+		}
+		return nil
+	}
+
+	if err := resolve("dns.loginToken", c.DNS.LoginToken, c.DNS.LoginTokenFile,
+		[]string{EnvDNSPodLoginToken}, &c.DNS.LoginToken); err != nil {
+		return err
+	}
+	if err := resolve("tencent.secretId", c.Tencent.SecretID, c.Tencent.SecretIDFile,
+		[]string{"TENCENTCLOUD_SECRET_ID"}, &c.Tencent.SecretID); err != nil {
+		return err
+	}
+	if err := resolve("tencent.secretKey", c.Tencent.SecretKey, c.Tencent.SecretKeyFile,
+		[]string{"TENCENTCLOUD_SECRET_KEY"}, &c.Tencent.SecretKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+// EnvDNSPodLoginToken is the environment variable read when neither dns.loginToken nor
+// dns.loginTokenFile is set. It exists so a container or a systemd EnvironmentFile can supply the
+// token without touching the config at all.
+const EnvDNSPodLoginToken = "DNSPOD_LOGIN_TOKEN"

@@ -851,3 +851,106 @@ func TestTencentListsAreNormalised(t *testing.T) {
 		t.Errorf("a blank region must be rejected rather than sent to the cloud API, got %v", err)
 	}
 }
+
+// A credential in config.yaml is a credential in every backup and every scrollback. These tests
+// pin the three ways out of that: a file, a systemd credential, and the environment.
+func TestDNSLoginTokenCanComeFromAFileOrTheEnvironment(t *testing.T) {
+	const token = "12345,abcdef0123456789"
+
+	t.Run("from a file", func(t *testing.T) {
+		dir := t.TempDir()
+		secret := filepath.Join(dir, "dnspod.token")
+		if err := os.WriteFile(secret, []byte(token+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginTokenFile: "+secret+"\n", 1)
+		cfg, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`))
+		if err != nil {
+			t.Fatalf("a token read from a file must be accepted: %v", err)
+		}
+		if cfg.DNS.LoginToken != token {
+			t.Errorf("LoginToken = %q, want the file's contents with the newline trimmed", cfg.DNS.LoginToken)
+		}
+	})
+
+	t.Run("from a systemd credential path", func(t *testing.T) {
+		// The path is environment-expanded because CREDENTIALS_DIRECTORY only exists once systemd
+		// has started the unit -- a literal path cannot express it.
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "dnspod-token"), []byte(token), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("CREDENTIALS_DIRECTORY", dir)
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token\n", 1)
+		cfg, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`))
+		if err != nil {
+			t.Fatalf("a LoadCredential path must be accepted: %v", err)
+		}
+		if cfg.DNS.LoginToken != token {
+			t.Errorf("LoginToken = %q, want the credential's contents", cfg.DNS.LoginToken)
+		}
+	})
+
+	t.Run("from the environment", func(t *testing.T) {
+		t.Setenv(EnvDNSPodLoginToken, token)
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n", "", 1)
+		cfg, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`))
+		if err != nil {
+			t.Fatalf("an environment token must be accepted: %v", err)
+		}
+		if cfg.DNS.LoginToken != token {
+			t.Errorf("LoginToken = %q, want the environment value", cfg.DNS.LoginToken)
+		}
+	})
+
+	// Each of these is a mistake that would otherwise be discovered by the provider, after an order
+	// had already been placed.
+	t.Run("a typo'd path fails where the operator can fix it", func(t *testing.T) {
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginTokenFile: /nonexistent/dnspod.token\n", 1)
+		if _, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)); err == nil || !strings.Contains(err.Error(), "dnspod.token") {
+			t.Errorf("an unreadable secret file must be a config error naming the path, got %v", err)
+		}
+	})
+
+	t.Run("an empty file is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		empty := filepath.Join(dir, "empty.token")
+		if err := os.WriteFile(empty, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginTokenFile: "+empty+"\n", 1)
+		if _, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)); err == nil || !strings.Contains(err.Error(), "empty") {
+			t.Errorf("a blank credential must be refused here, not by the provider, got %v", err)
+		}
+	})
+
+	t.Run("setting both is ambiguous and refused", func(t *testing.T) {
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginToken: token\n  loginTokenFile: /etc/wecert/dnspod.token\n", 1)
+		if _, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)); err == nil || !strings.Contains(err.Error(), "both set") {
+			t.Errorf("two sources for one secret must be refused, got %v", err)
+		}
+	})
+}
