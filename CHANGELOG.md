@@ -2,41 +2,6 @@
 
 ## Unreleased
 
-### Fixed
-
-- **`ratelimit`: integer divide by zero on a limit with no refill interval.** `Remaining` divides
-  by `Limit.Refill`, so a zero (or negative) interval panicked. Unreachable through today's
-  callers — every `Limit` comes from the published table in that file — but reachable through the
-  public API, which is what a fuzzer checks and a review does not. A degenerate interval is now
-  read as "never refills", the conservative direction.
-- **`ratelimit`: a negative cost credited the bucket.** `Spend` computed `tokens - cost`, so
-  passing a negative cost *increased* the reported allowance. The API records consumption, so a
-  negative cost is now "nothing was consumed" rather than a credit.
-- **`ratelimit`: `ParseRetryAfter` reported the zero instant as a parsed deadline.**
-  `"retry after 0001-01-01 00:00:00 UTC"` parses cleanly and equals `time.Time{}`, which is the
-  value callers use for "no deadline" — so a malformed instant would have silently disabled the
-  block that protects the rate-limit budget while looking like a successful parse.
-- **`wecert_revocation_pending` can no longer report a false all-clear.** `PendingRevocations` used
-  to swallow a store error and return `0`, which is a meaningful answer ("nothing outstanding") — so
-  a database that could not be read looked exactly like a deployment with no outstanding revocation.
-  It now returns the error, and the reconciler leaves the gauge at its last value and counts the pass
-  in the new `wecert_revocation_query_errors_total` instead. A pending revocation is an outstanding
-  security action: the row exists because someone decided a certificate must stop being trusted.
-- **`WecertHasNotReconciledRecently` could never fire.** The rule was written against
-  `wecert_reconcile_total_created_timestamp`, which is not a series: the exposition is the classic
-  text format, which carries no `_created` timestamps at all. The expression parsed perfectly, so
-  nothing complained, and "the daemon is up and converging nothing" had no alert. It now uses the new
-  `wecert_last_reconcile_timestamp_seconds` gauge.
-- `UploadCertificate` now reads `RepeatCertId`. The SDK documents that once the same
-  certificate has been uploaded more than 5000 times the API ignores `Repeatable=true` and
-  returns the existing copy's ID there instead of creating another one; reading only
-  `CertificateId` turned that into "UploadCertificate returned no CertificateId", an error that
-  names neither the cause nor the fix. The duplicate's ID is the same certificate, so it is a
-  usable answer.
-
-All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The first two came from a
-30-second run over 387 lines of pure arithmetic.
-
 ### Added
 
 - Property and fuzz targets for `internal/ratelimit` (`internal/ratelimit/fuzz_test.go`,
@@ -80,7 +45,51 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
 - `wecert-preflight`'s `-prune-certs` documentation now states that it bypasses the
   server-side reference check on purpose. (Earlier in this release.)
 
+### Changed
+
+- `run-stage-ab.sh` extracts credentials with or without a leading `export`,
+  so a file that is only meant to be sourced interactively is no longer
+  reported as "not set".
+- Deployment retries persist an uploaded Tencent Cloud certificate ID before starting
+  its asynchronous rebind. A restart or timeout now resumes that same certificate
+  instead of repeatedly uploading new copies; partial rebind failures remain failures.
+- Failure fallback remains reported while a full-name restoration attempt is pending or
+  fails; it clears only after a verified full certificate is promoted.
+
 ### Fixed
+
+- **`ratelimit`: integer divide by zero on a limit with no refill interval.** `Remaining` divides
+  by `Limit.Refill`, so a zero (or negative) interval panicked. Unreachable through today's
+  callers — every `Limit` comes from the published table in that file — but reachable through the
+  public API, which is what a fuzzer checks and a review does not. A degenerate interval is now
+  read as "never refills", the conservative direction.
+- **`ratelimit`: a negative cost credited the bucket.** `Spend` computed `tokens - cost`, so
+  passing a negative cost *increased* the reported allowance. The API records consumption, so a
+  negative cost is now "nothing was consumed" rather than a credit.
+- **`ratelimit`: `ParseRetryAfter` reported the zero instant as a parsed deadline.**
+  `"retry after 0001-01-01 00:00:00 UTC"` parses cleanly and equals `time.Time{}`, which is the
+  value callers use for "no deadline" — so a malformed instant would have silently disabled the
+  block that protects the rate-limit budget while looking like a successful parse.
+- **`wecert_revocation_pending` can no longer report a false all-clear.** `PendingRevocations` used
+  to swallow a store error and return `0`, which is a meaningful answer ("nothing outstanding") — so
+  a database that could not be read looked exactly like a deployment with no outstanding revocation.
+  It now returns the error, and the reconciler leaves the gauge at its last value and counts the pass
+  in the new `wecert_revocation_query_errors_total` instead. A pending revocation is an outstanding
+  security action: the row exists because someone decided a certificate must stop being trusted.
+- **`WecertHasNotReconciledRecently` could never fire.** The rule was written against
+  `wecert_reconcile_total_created_timestamp`, which is not a series: the exposition is the classic
+  text format, which carries no `_created` timestamps at all. The expression parsed perfectly, so
+  nothing complained, and "the daemon is up and converging nothing" had no alert. It now uses the new
+  `wecert_last_reconcile_timestamp_seconds` gauge.
+- `UploadCertificate` now reads `RepeatCertId`. The SDK documents that once the same
+  certificate has been uploaded more than 5000 times the API ignores `Repeatable=true` and
+  returns the existing copy's ID there instead of creating another one; reading only
+  `CertificateId` turned that into "UploadCertificate returned no CertificateId", an error that
+  names neither the cause nor the fix. The duplicate's ID is the same certificate, so it is a
+  usable answer.
+
+All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The first two came from a
+30-second run over 387 lines of pure arithmetic.
 
 - A **corrupt or truncated `state.db`** now fails with an actionable error naming the file and
   pointing at `docs/recovery.md`, instead of a raw SQLite code ("database disk image is
@@ -96,29 +105,6 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
   period expired and the reaper deleted the cloud copy, there was nothing left to re-upload.
   The fullchain and key are now archived with the row, so the rollback is real, and they are
   pruned with it. Existing databases gain the columns on upgrade; legacy rows keep NULL.
-
-### Security
-
-- `statePath` is escaped before it is placed in the SQLite DSN, and the 0600
-  permission contract is now enforced against the file the driver reports it
-  opened rather than against the configured string. A `?`, `#` or `%XX` in the
-  path is a DSN metacharacter, so SQLite opened a *truncated* path and created
-  it with the process umask (0644 on a default machine): the ACME account key
-  and every certificate private key landed in a world-readable `-wal` while
-  `chmod` tightened a zero-byte decoy, and a backup of `statePath` restored
-  nothing.
-- The desired-state document is opened with `O_NOFOLLOW`, validated as the file
-  that is actually read (owner included), and its parent directory must not be
-  group- or world-writable. The previous `Lstat`-then-`ReadFile` sequence left a
-  TOCTOU window, never checked the owner, and never looked at the directory --
-  which is what decides whether someone else can replace the document by rename.
-- The webhook auth limiter is swept on successful authentication as well as
-  failed ones, and has a hard ceiling on tracked addresses. It was only ever
-  collected from the failure path, so a burst of failed attempts left its
-  entries behind forever; an IPv6 /64 makes that unbounded.
-
-### Fixed
-
 - **The failure fallback no longer oscillates.** A successful issuance for the
   reduced subset used to reset `consecutive_failures` and clear the identifier
   ledger, the pre-expiry window was re-evaluated as "the danger is over" once a
@@ -194,36 +180,6 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
 - The webhook per-name path and the probe-series reclamation are covered by
   tests; so are the fallback hold, both deploy failure paths, the async delete,
   the `UpdateCert` contract, and the document trust checks.
-
-### Security
-
-- The challenge-lease registry is re-seeded from the state store before any
-  cleanup. The registry only knows the TXT values the *current process*
-  wrote, and lego's provider cleanup deletes every TXT at the challenge name,
-  so a row recovered from a process that died mid-pass was invisible: a
-  cleanup for a different certificate sharing the name found "no other live
-  values" and deleted a challenge that was still pending. Every presented
-  authorization row is now registered first, and the two recovery paths
-  (`removeAuthzTXT`, `reclaimUnpresentedTXT`) register their own value before
-  asking for cleanup.
-- `LookupTXT` asks the zone's authoritative nameservers instead of a
-  recursive resolver, and reports three distinct outcomes: confirmed
-  present, authoritatively absent, and "cannot tell". Only authoritative
-  absence licenses deleting the authorization row. A recursive resolver's
-  "no such record" is not evidence of absence -- a cached negative (DNSPod's
-  600s TTL floor applies to the negative entry too) or a cached answer
-  holding only some of the values at a shared challenge name previously read
-  as "the write never happened", and the row carrying the only record of the
-  value was deleted.
-- `webhook.notifySecret` is a real option now. `NewSignedNotifier` existed
-  with no way to set a secret -- `NewNotifier` always passed `""` -- so
-  `X-Wecert-Signature` was dead code and the notify target had no way to tell
-  a genuine event from anything else that could reach its URL. The secret is
-  validated at load time (>= 32 characters, requires `notifyURL`) and each
-  event is signed with HMAC-SHA256 over the raw body.
-
-### Fixed
-
 - A certificate moved to a wholly different domain set can be issued again.
   The coverage-drift path passed the live certificate's ARI certID as `replaces`
   unconditionally, and Let's Encrypt refuses an order whose identifiers do not
@@ -282,7 +238,6 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
   the size threshold, every failed authentication scanned the whole map, so
   one failed request from each of many source addresses made the total work
   grow with the square of the request count.
-
 - The download path verifies that the issued certificate belongs to the private
   key the order was placed with. `VerifyCoverage` and the `notAfter` check both
   pass a certificate for a different key -- same names, same lifetime -- and the
@@ -292,28 +247,51 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
   every download-path test exercises the check rather than only the one written
   for it.
 
-### Changed
-
-- `run-stage-ab.sh` extracts credentials with or without a leading `export`,
-  so a file that is only meant to be sourced interactively is no longer
-  reported as "not set".
-
-- Deployment retries persist an uploaded Tencent Cloud certificate ID before starting
-  its asynchronous rebind. A restart or timeout now resumes that same certificate
-  instead of repeatedly uploading new copies; partial rebind failures remain failures.
-- Failure fallback remains reported while a full-name restoration attempt is pending or
-  fails; it clears only after a verified full certificate is promoted.
-
-## 0.4.2 - 2026-09-16
-
 ### Security
 
-- The webhook authentication lockout is actually wired in. `ratelimit.go`'s
-  `authLimiter` landed without a single caller, so the endpoint that triggers
-  real issuance (and consumes Let's Encrypt quota) accepted unlimited
-  token-guessing attempts. `Server.auth()` now checks the limiter first and
-  answers 429 with `Retry-After`, keyed by client IP; a window reset can no
-  longer clear an active block.
+- `statePath` is escaped before it is placed in the SQLite DSN, and the 0600
+  permission contract is now enforced against the file the driver reports it
+  opened rather than against the configured string. A `?`, `#` or `%XX` in the
+  path is a DSN metacharacter, so SQLite opened a *truncated* path and created
+  it with the process umask (0644 on a default machine): the ACME account key
+  and every certificate private key landed in a world-readable `-wal` while
+  `chmod` tightened a zero-byte decoy, and a backup of `statePath` restored
+  nothing.
+- The desired-state document is opened with `O_NOFOLLOW`, validated as the file
+  that is actually read (owner included), and its parent directory must not be
+  group- or world-writable. The previous `Lstat`-then-`ReadFile` sequence left a
+  TOCTOU window, never checked the owner, and never looked at the directory --
+  which is what decides whether someone else can replace the document by rename.
+- The webhook auth limiter is swept on successful authentication as well as
+  failed ones, and has a hard ceiling on tracked addresses. It was only ever
+  collected from the failure path, so a burst of failed attempts left its
+  entries behind forever; an IPv6 /64 makes that unbounded.
+- The challenge-lease registry is re-seeded from the state store before any
+  cleanup. The registry only knows the TXT values the *current process*
+  wrote, and lego's provider cleanup deletes every TXT at the challenge name,
+  so a row recovered from a process that died mid-pass was invisible: a
+  cleanup for a different certificate sharing the name found "no other live
+  values" and deleted a challenge that was still pending. Every presented
+  authorization row is now registered first, and the two recovery paths
+  (`removeAuthzTXT`, `reclaimUnpresentedTXT`) register their own value before
+  asking for cleanup.
+- `LookupTXT` asks the zone's authoritative nameservers instead of a
+  recursive resolver, and reports three distinct outcomes: confirmed
+  present, authoritatively absent, and "cannot tell". Only authoritative
+  absence licenses deleting the authorization row. A recursive resolver's
+  "no such record" is not evidence of absence -- a cached negative (DNSPod's
+  600s TTL floor applies to the negative entry too) or a cached answer
+  holding only some of the values at a shared challenge name previously read
+  as "the write never happened", and the row carrying the only record of the
+  value was deleted.
+- `webhook.notifySecret` is a real option now. `NewSignedNotifier` existed
+  with no way to set a secret -- `NewNotifier` always passed `""` -- so
+  `X-Wecert-Signature` was dead code and the notify target had no way to tell
+  a genuine event from anything else that could reach its URL. The secret is
+  validated at load time (>= 32 characters, requires `notifyURL`) and each
+  event is signed with HMAC-SHA256 over the raw body.
+
+## 0.4.2 - 2026-09-16
 
 ### Fixed
 
@@ -375,41 +353,16 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
   comment mentioning acme-staging no longer passes it), and credential
   extraction in `run-stage-ab.sh` no longer uses `eval`.
 
-## 0.4.1 - 2026-09-16
-
 ### Security
 
-- Build with Go 1.26.6. The pinned 1.26.5 carried five standard-library
-  vulnerabilities reachable from this code (`net/url`, `crypto/tls`, `net/http`
-  twice, `encoding/asn1`), including one on the TLS handshake path every probe
-  uses. `govulncheck` now reports none.
-- `.gitignore` now covers `config.yaml` and `e2e-config.yaml`. Both are copies of
-  the committed examples filled in with a DNSPod token (full record write over
-  the account) and CAM credentials, and neither was ignored -- the reference
-  readme claimed otherwise. The `*.example.yaml` and `e2e-config-*.yaml` fixtures
-  stay committable.
-- Bound `last_error` at the point it is persisted. It carries upstream text
-  verbatim (lego embeds whole non-JSON ACME error bodies; the metadata path
-  echoes response bodies), and `/hook/status` serves it while `notifyURL` posts
-  it off-host.
-- Stop printing a prefix of `TENCENTCLOUD_SECRET_ID` in `run-stage-ab.sh`. The
-  same line was already removed from `wecert-preflight` for the same reason.
-- `install.sh` verifies the binary against the `SHA256SUMS` that `make release`
-  writes beside it. Nothing read that file: whatever was passed in became a
-  root-owned binary that systemd runs with the CAM credentials and the
-  private-key database. A mismatch or an unlisted artifact is refused; a missing
-  sums file warns loudly rather than refusing, because copying a single binary to
-  a CVM is a legitimate workflow.
-- URL-escape `tencent.roleName` in the metadata credential request. It is
-  concatenated into the URL, so an unescaped `../` walked out of the
-  `security-credentials` path and read other metadata entries, whose bodies are
-  echoed back in the error string.
-- An empty `tencent.roleName` is rejected up front instead of requesting the
-  credential *directory* and failing later with a JSON parse error.
-- Documented the `LEGO_DEBUG_DNS_API_HTTP_CLIENT` hazard at the point the DNSPod
-  provider is built. lego's debug dumper redacts only Authorization/Token/Api-Key
-  headers, and dnspod-go sends the credential in the POST *body*, so setting that
-  variable on the service writes a never-expiring DNSPod token into the journal.
+- The webhook authentication lockout is actually wired in. `ratelimit.go`'s
+  `authLimiter` landed without a single caller, so the endpoint that triggers
+  real issuance (and consumes Let's Encrypt quota) accepted unlimited
+  token-guessing attempts. `Server.auth()` now checks the limiter first and
+  answers 429 with `Retry-After`, keyed by client IP; a window reset can no
+  longer clear an active block.
+
+## 0.4.1 - 2026-09-16
 
 ### Added
 
@@ -420,6 +373,36 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
   `waitDeployRecord` failure/timeout branches) and the CVM metadata credential
   fetch, via a narrow `sslAPI` seam; deploy coverage rises from ~11% to ~52%.
 
+### Changed
+
+- Replace the author's personal domain/IP defaults in `testenv/` with neutral
+  placeholders (`wecert-test.invalid`); `clb_public_ip` now defaults to empty
+  and the DNS record is skipped until it is set.
+- Remove hardcoded personal paths from `scripts/run-stage-ab.sh`
+  (`WECERT_CREDS` for the credentials file, `TF_PLUGIN_CACHE_DIR` left to the
+  environment).
+- Add the missing "When domains are declared elsewhere" section to
+  `README.zh-CN.md`.
+- The "certificate approaching expiry" warning scales with the profile instead of a
+  fixed 21 days. 21 days is most of a `shortlived` certificate's 160-hour life, so
+  that profile warned from the moment it was issued -- every pass, for its whole
+  life -- which is the kind of alarm that trains people to ignore logs. A quarter of
+  the profile's validity is the new threshold.
+- `daysLeft` rounds **up** everywhere, matching `wecert-probe`. Truncation made
+  "23 hours left" read as 0 days, which a caller treating 0 as expired reads as a
+  down certificate.
+- The `/hook/status` field `deployed` is renamed `uploaded`. It always meant "we
+  hold a CertId", while the metric of the same name means "confirmed bound" -- the
+  exact distinction that metric's help text was written to prevent.
+
+### Removed
+
+- `probe.Runner.LastState` had no callers, and `probeTXT` in `internal/acme` was left
+  unused by the `...WithExchange` refactor that replaced it. `dns01.ToFqdn` (deprecated)
+  is replaced by `dns.Fqdn`, which is what it forwarded to.
+- The trailing newline on `wecert-preflight`'s NS error, so `staticcheck` is now
+  completely clean.
+
 ### Fixed
 
 - Keep retired cloud certificates queued when deployment is disabled, clear
@@ -429,7 +412,6 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
   hostname's profile, key type, or deployment flag by sort order.
 - Use one configurable recursive resolver view for DNS CNAME/SOA/NS discovery,
   then require authoritative answers when checking challenge TXT propagation.
-
 - Reject `DropThreshold >= 1` in `onboarding.New` so the CLI `-drop-threshold`
   flag can no longer bypass the config layer's `[0,1)` check and silently
   disable the abrupt-change fuse. `NaN` is rejected too: every comparison against
@@ -503,34 +485,45 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
   `null` and exited 0, so the `||` fallback could never run.
 - Corrected the `Options.MaxNames` comment: 0 means the fixed default of 25, not
   the profile's own cap.
-
-### Changed
-
-- Replace the author's personal domain/IP defaults in `testenv/` with neutral
-  placeholders (`wecert-test.invalid`); `clb_public_ip` now defaults to empty
-  and the DNS record is skipped until it is set.
-- Remove hardcoded personal paths from `scripts/run-stage-ab.sh`
-  (`WECERT_CREDS` for the credentials file, `TF_PLUGIN_CACHE_DIR` left to the
-  environment).
-- Add the missing "When domains are declared elsewhere" section to
-  `README.zh-CN.md`.
-
-### Changed
-
-- The "certificate approaching expiry" warning scales with the profile instead of a
-  fixed 21 days. 21 days is most of a `shortlived` certificate's 160-hour life, so
-  that profile warned from the moment it was issued -- every pass, for its whole
-  life -- which is the kind of alarm that trains people to ignore logs. A quarter of
-  the profile's validity is the new threshold.
-- `daysLeft` rounds **up** everywhere, matching `wecert-probe`. Truncation made
-  "23 hours left" read as 0 days, which a caller treating 0 as expired reads as a
-  down certificate.
-- The `/hook/status` field `deployed` is renamed `uploaded`. It always meant "we
-  hold a CertId", while the metric of the same name means "confirmed bound" -- the
-  exact distinction that metric's help text was written to prevent.
+- The "is this certificate bound yet?" lookup is throttled to once every six hours
+  instead of every pass. Only a human can change the answer, and the lookup is a
+  two-call enumeration that polls asynchronously for up to 30 seconds inside the
+  serial convergence loop -- for an unbound certificate that can sit that way for
+  its whole 90-day life. Measured: five passes used to cost five enumerations.
 
 ### Security
 
+- Build with Go 1.26.6. The pinned 1.26.5 carried five standard-library
+  vulnerabilities reachable from this code (`net/url`, `crypto/tls`, `net/http`
+  twice, `encoding/asn1`), including one on the TLS handshake path every probe
+  uses. `govulncheck` now reports none.
+- `.gitignore` now covers `config.yaml` and `e2e-config.yaml`. Both are copies of
+  the committed examples filled in with a DNSPod token (full record write over
+  the account) and CAM credentials, and neither was ignored -- the reference
+  readme claimed otherwise. The `*.example.yaml` and `e2e-config-*.yaml` fixtures
+  stay committable.
+- Bound `last_error` at the point it is persisted. It carries upstream text
+  verbatim (lego embeds whole non-JSON ACME error bodies; the metadata path
+  echoes response bodies), and `/hook/status` serves it while `notifyURL` posts
+  it off-host.
+- Stop printing a prefix of `TENCENTCLOUD_SECRET_ID` in `run-stage-ab.sh`. The
+  same line was already removed from `wecert-preflight` for the same reason.
+- `install.sh` verifies the binary against the `SHA256SUMS` that `make release`
+  writes beside it. Nothing read that file: whatever was passed in became a
+  root-owned binary that systemd runs with the CAM credentials and the
+  private-key database. A mismatch or an unlisted artifact is refused; a missing
+  sums file warns loudly rather than refusing, because copying a single binary to
+  a CVM is a legitimate workflow.
+- URL-escape `tencent.roleName` in the metadata credential request. It is
+  concatenated into the URL, so an unescaped `../` walked out of the
+  `security-credentials` path and read other metadata entries, whose bodies are
+  echoed back in the error string.
+- An empty `tencent.roleName` is rejected up front instead of requesting the
+  credential *directory* and failing later with a JSON parse error.
+- Documented the `LEGO_DEBUG_DNS_API_HTTP_CLIENT` hazard at the point the DNSPod
+  provider is built. lego's debug dumper redacts only Authorization/Token/Api-Key
+  headers, and dnspod-go sends the credential in the POST *body*, so setting that
+  variable on the service writes a never-expiring DNSPod token into the journal.
 - The desired-state document is refused rather than followed when it is a symlink,
   when it is group- or world-writable, or when it is not a regular file. In enforce
   mode that file *is* the desired state: anyone who can write it decides which
@@ -545,22 +538,6 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
   `MemoryDenyWriteExecute` -- the last is safe because the binary is built
   `CGO_ENABLED=0` and links statically, so there is no JIT to break.
 - `golang.org/x/net` 0.57.0 → 0.59.0.
-
-### Fixed
-
-- The "is this certificate bound yet?" lookup is throttled to once every six hours
-  instead of every pass. Only a human can change the answer, and the lookup is a
-  two-call enumeration that polls asynchronously for up to 30 seconds inside the
-  serial convergence loop -- for an unbound certificate that can sit that way for
-  its whole 90-day life. Measured: five passes used to cost five enumerations.
-
-### Removed
-
-- `probe.Runner.LastState` had no callers, and `probeTXT` in `internal/acme` was left
-  unused by the `...WithExchange` refactor that replaced it. `dns01.ToFqdn` (deprecated)
-  is replaced by `dns.Fqdn`, which is what it forwarded to.
-- The trailing newline on `wecert-preflight`'s NS error, so `staticcheck` is now
-  completely clean.
 
 ### Tests
 
