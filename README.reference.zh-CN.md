@@ -936,6 +936,7 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
 
 **待办：**
 
+- [ ] **期望状态来源：域名新增即签发，而不只是过期续签。** 在某处（DNS / CLB 规则 / 内部登记）新增域名后，证书应安全地自动跟上。设计草案，含"为什么 DNS ∩ CLB 方向对但不是最优架构"、五条安全不变量、以及速率限制的算术：[docs/desired-state-providers.md](docs/desired-state-providers.md)。
 - [ ] 外部黑盒探测（拨 443 校验实际生效的 `notAfter`）
 - [ ] DNSPod token 支持从文件 / systemd `LoadCredential` 读取，避免 config.yaml 里放明文
 - [ ] 切 `profile: tlsserver`（45 天）并验证 ARI 全自动跑满一个完整续期周期
