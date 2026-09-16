@@ -43,7 +43,7 @@ func (s *Store) RecordIdentifierFailure(certName, identifier, errMsg string, now
 			failures       = failures + 1,
 			last_error     = excluded.last_error,
 			last_failed_at = excluded.last_failed_at`,
-		certName, identifier, truncate(errMsg, 512), now.Unix())
+		certName, identifier, truncate(errMsg, maxLastErrorBytes), now.Unix())
 	if err != nil {
 		return fmt.Errorf("record identifier failure %s/%s: %w", certName, identifier, err)
 	}
@@ -114,7 +114,7 @@ func (s *Store) PutFallback(f *Fallback) error {
 			dropped = excluded.dropped,
 			since   = excluded.since,
 			reason  = excluded.reason`,
-		f.CertName, strings.Join(dropped, ","), f.Since.Unix(), truncate(f.Reason, 512))
+		f.CertName, strings.Join(dropped, ","), f.Since.Unix(), truncate(f.Reason, maxLastErrorBytes))
 	if err != nil {
 		return fmt.Errorf("put fallback for %s: %w", f.CertName, err)
 	}
