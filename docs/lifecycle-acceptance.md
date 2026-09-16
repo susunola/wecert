@@ -365,10 +365,26 @@ sans lifecycle
 **同一个** `_acme-challenge.$APEX` 上，必须**同时存在**。
 任何"写一条 → 验证一条 → 删一条"的实现，在这里必然失败。
 
-**方法**：不靠掐时间，而是**制造**一次中断：把递归解析器指向黑洞地址
-（`192.0.2.1` 是 TEST-NET-1，永远不可达）。进程会正常写完 TXT、
-持久化完授权行，然后在传播确认那一步失败退出 ——
-落盘状态和"进程被杀"完全一样，但可复现。
+**方法**：在**传播确认之后、验证完成之前**把进程杀掉。
+
+为什么不用"把递归解析器指向黑洞地址"这种看似更干净的做法：`dns.recursiveNameservers`
+会被灌进 lego 的全局解析器（`internal/acme/dns.go` 里的 `dns01.AddRecursiveNameservers`），
+而 lego 的 provider 在写记录**之前**要用它查一次 zone。黑洞地址会让 provider 直接失败
+（`failed to get hosted zone: could not find zone`），TXT 根本没写下去 ——
+想要的"记录在 DNS 里、进程已经死掉"那一刻永远不会出现。实测踩过这个坑。
+
+**窗口有多大**（实测一次完整签发）：
+
+```
+TXT presented    t+0.0s
+TXT propagated   t+5.7s     <- 就绪检查通过
+证书落地          t+29.2s     <- 这一轮结束
+```
+
+从 `TXT presented` 到这一轮结束有**约 29 秒**，其中 23 秒是 LE 自己的验证时间。
+所以做法是：后台启动、盯着日志等 `TXT presented`，立刻 `kill -9`。
+**杀完必须验证前置态**（授权行 `presented=1` 且 TXT 真在 DNS 里）：
+若那一轮在信号到达前就跑完了，前置态不成立，删掉残留记录重来一次即可（步骤幂等）。
 
 > ⚠️ **必须用一对从未验证过的标识。**
 > Let's Encrypt 会**复用仍然有效的授权**（同账号 + 同 identifier，约 30 天），
@@ -383,23 +399,25 @@ sans lifecycle
 **操作（制造中断）**
 
 ```bash
-# 1) 配置改成一对全新的子域 + 它的通配
+# 1) 配置改成一对全新的子域 + 它的通配（见上面的告警）
 #    domains:
 #      - wild.$APEX
 #      - "*.wild.$APEX"
 
-# 2) 复制一份配置，插入黑洞递归解析器
-sed 's/^dns:/dns:\n  recursiveNameservers: ["192.0.2.1:53"]/' \
-    "$A_CFG" > /tmp/wecert-lifecycle/a-blackhole.yaml
+# 2) 后台跑一轮，看到第二条 TXT presented 就 kill -9
+rm -f /tmp/a4-interrupt.log
+./bin/wecert -config "$A_CFG" -state "$DB" -once -log-level debug > /tmp/a4-interrupt.log 2>&1 &
+PID=$!
+for i in $(seq 1 1200); do
+  n=$(grep -c 'TXT presented' /tmp/a4-interrupt.log 2>/dev/null || true)
+  [ "${n:-0}" -ge 2 ] && break
+  kill -0 $PID 2>/dev/null || break     # 进程自己跑完了 → 前置态不成立，重来
+  sleep 0.1
+done
+kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null
 
-# 3) 这一轮会失败，但会把 TXT 写下去（每个查询 3s 超时，很快返回）
-./bin/wecert -config /tmp/wecert-lifecycle/a-blackhole.yaml -state "$DB" -once -log-level debug 2>&1 | tee /tmp/a4-interrupt.log
-
-# 注意：-once 的退出码是 0，即使这一轮失败了。
-# RunAll 刻意丢弃单张证书的错误（"一张失败不能拖住其它"），所以失败要看这三处：
-grep -c 'pass failed; a retry has been scheduled' /tmp/a4-interrupt.log   # 期望 ≥1
-q "SELECT consecutive_failures FROM certificates WHERE name='lifecycle';"  # 期望 1
-grep -c 'TXT propagated' /tmp/a4-interrupt.log                            # 期望 0
+# 3) 先确认前置态成立，再往下断言（不成立就删掉残留记录重跑第 2 步）
+grep -c 'TXT propagated' /tmp/a4-interrupt.log            # 期望 0：验证还没走完
 ```
 
 **期望（中断态）**
@@ -421,10 +439,10 @@ q "SELECT consecutive_failures, datetime(next_attempt_at,'unixepoch') FROM certi
 | `txt` 查询 | 返回**两条** TXT 值 |
 | `orders` | 1 行，仍在（订单没做完） |
 | `certificates.not_after` | 未变（还停在 A3 的结果） |
-| `consecutive_failures` | 1 |
-| `next_attempt_at` | ≈ 现在 + 1 分钟（`recordFailure` 的 1<<0 退避） |
-| 日志 | `TXT presented` ×2，然后是 `pass failed; a retry has been scheduled` |
-| `-once` 退出码 | **0**（单张证书失败不会让进程退出非 0） |
+| `consecutive_failures` | **0**（`kill -9` 什么都没来得及记） |
+| `next_attempt_at` | 0（同上：没有退避，恢复轮不需要清） |
+| 日志 | `TXT presented` ×2，且**没有** `TXT propagated` |
+| 退出码 | 被杀时是 137。**顺带记住**：`-once` 即使这一轮失败也是 **0**（`RunAll` 刻意丢弃单张证书的错误），所以永远不要用退出码判断单张证书的成败 |
 
 **这一条是整个 A4 的核心**：直接看到"一个名字下两条 TXT 并存"，
 而不是靠"签发成功"去反推。
@@ -432,8 +450,7 @@ q "SELECT consecutive_failures, datetime(next_attempt_at,'unixepoch') FROM certi
 **操作（恢复）**
 
 ```bash
-# 退避会把下一轮直接跳过，先清掉它（这是 A4 的测试动作，不是生产操作）
-clear_backoff lifecycle
+# kill 不留下退避；只有上一轮是"自己失败"的（例如手工试过黑洞变体）才需要 clear_backoff
 
 ./bin/wecert -config "$A_CFG" -state "$DB" -once -log-level debug 2>&1 | tee /tmp/a4-resume.log
 sans lifecycle
@@ -525,6 +542,21 @@ grep 'resuming the existing order' /tmp/a4-resume.log
 说明配置的规范化形式（`config.DomainKey`）与订单里存的不一致 ——
 常见原因是域名大小写/顺序/通配写法被改动过。
 
+**已知的真实竞态，别误判成缺陷**：恢复轮有可能在 LE 那边失败，报
+
+```
+validation failed for identifier ...: DNS problem: NXDOMAIN looking up TXT for
+_acme-challenge.<名字> - check that a DNS record exists for this domain
+```
+
+而同一时刻我们的权威探测**明明看到记录在**。原因是 DNSPod 的 NS 最终一致：
+就绪检查按设计容忍**从本机不可达**的 NS（否则永远无法就绪），而 LE 能到达它们 ——
+它们可能还没同步，于是对 LE 回 NXDOMAIN。实测 10 个 NS 地址里有 4 个从本机不可达。
+
+处理方式就是重试：这一轮记一次失败并退避 1 分钟；重试时 LE 已把那次授权判为
+`invalid`，wecert 会丢弃订单（日志 `order became invalid`）并清掉 TXT，下一轮用新订单重来。
+**没有 wecert 侧缺陷**，但这一步的判据要等到"最终签发成功"，不要在第一轮失败时就下结论。
+
 ---
 
 ### A6 — 并发双证书：同名 TXT 不互相删
@@ -566,8 +598,7 @@ q "UPDATE certificates SET ari_cert_id='', ari_window_start=0, ari_window_end=0,
    WHERE name IN ('lifecycle','lifecycle-b');"
 
 # 5) 记录触发前的 not_after，作为"真的跑完了"的判据
-BEFORE_NA="$(q "SELECT group_concat(not_after) FROM
-                  (SELECT not_after FROM certificates WHERE name IN ('lifecycle','lifecycle-b') ORDER BY name);")"
+BEFORE_MAX="$(q "SELECT coalesce(max(not_after),0) FROM certificates WHERE name IN ('lifecycle','lifecycle-b');")"
 
 # 6) 触发并发收敛
 TOKEN=0123456789abcdef0123456789abcdef
@@ -576,10 +607,12 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application
 echo
 
 # 7) 等两张的 not_after 都推进（只看 consecutiveFailures 会在续期还没做之前就满足）
+# 必须逐张判断：把两行拼成一个字符串再比 !=，第一张跑完就会跳出，
+# 把第二张在半途杀掉（实测踩过这个坑）。
 for i in $(seq 1 90); do
-  NOW_NA="$(q "SELECT group_concat(not_after) FROM
-                 (SELECT not_after FROM certificates WHERE name IN ('lifecycle','lifecycle-b') ORDER BY name);")"
-  [ "$NOW_NA" != "$BEFORE_NA" ] && break
+  DONE="$(q "SELECT count(*) FROM certificates
+             WHERE name IN ('lifecycle','lifecycle-b') AND not_after > $BEFORE_MAX;")"
+  [ "$DONE" = "2" ] && break
   sleep 5
 done
 # 状态接口是给人看的，顺手留一份记录（缩进 JSON，冒号后面有空格）
@@ -722,10 +755,16 @@ q "UPDATE certificates SET
 #        domains: [orphan.$APEX]
 #        deploy: { enabled: false }
 
-# 2) 重新生成黑洞配置（内容来自更新后的 a.yaml），跑一轮
-sed 's/^dns:/dns:\n  recursiveNameservers: ["192.0.2.1:53"]/' \
-    "$A_CFG" > /tmp/wecert-lifecycle/a-blackhole.yaml
-./bin/wecert -config /tmp/wecert-lifecycle/a-blackhole.yaml -state "$DB" -once -log-level debug 2>&1 | tee /tmp/a9-interrupt.log
+# 2) 用 A4 的 kill 手法制造一次中断（后台跑，看到 orphan 的 TXT presented 就 kill -9）
+rm -f /tmp/a9-interrupt.log
+./bin/wecert -config "$A_CFG" -state "$DB" -once -log-level debug > /tmp/a9-interrupt.log 2>&1 &
+PID=$!
+for i in $(seq 1 1200); do
+  grep -q 'TXT presented.*cert=orphan' /tmp/a9-interrupt.log 2>/dev/null && break
+  kill -0 $PID 2>/dev/null || break
+  sleep 0.1
+done
+kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null
 
 # 3) 确认这次确实写了 TXT 但没做完
 q "SELECT identifier, txt_name, presented, challenge_token != '' AS has_token
@@ -735,6 +774,7 @@ txt "_acme-challenge.orphan.$APEX"
 # 4) 构造"订单已经没了、授权行还在、而且没持久化"的状态
 q "DELETE FROM orders WHERE cert_name='orphan';"
 q "UPDATE authorizations SET presented=0 WHERE cert_name='orphan';"
+# kill 不留退避；若上一轮是自己失败的，清掉它免得恢复轮被跳过
 clear_backoff orphan
 
 # 5) 恢复正常解析器，跑一轮
@@ -962,6 +1002,13 @@ grep 'SANs no longer match' /tmp/b3.log
 这三道闸依次生效。**注意这是域名级下线（该证书的 SAN 收缩），不是证书级下线** ——
 `alpha` 还在，所以 `example-com` 这张证书仍然存在。
 
+> ⚠️ **声明条数会影响这一阶段能否跑通。** 熔断的阈值是"单轮跌幅 > 30%"，
+> 所以只有 3 条声明时删掉 1 条就是 **33% > 30% → 那一轮直接冻结**（实测就是这样：
+> `the declared name set dropped from 3 to 2 (33%, threshold 30%)`，文档不动）。
+> 两种做法：**声明 4 条以上**（删 1 条 = 25%，默认阈值下就能过，最忠实），
+> 或者像下面这样**显式放宽** `-drop-threshold 0.5` —— 那等于人工声明"这次是故意的"。
+> 顺带：那个 33% 的冻结本身就是一个**应当确认**的行为（熔断按设计工作），值得单独跑一次留证。
+
 **操作**
 
 ```bash
@@ -969,13 +1016,13 @@ grep 'SANs no longer match' /tmp/b3.log
 
 # 2) 第一次 onboard：标记缺失，但还在宽限期内，应当被保留（carry）
 ./bin/wecert-onboard -config "$B_CFG" -out "$DOC" -require-clb=false -allow "$APEX" \
-  -grace 30s -json | grep -E 'beta|carried'
+  -grace 30s -drop-threshold 0.5 -json | grep -E 'beta|carried'
 grep -c "beta.$APEX" "$DOC"        # 期望仍然在文档里
 
 # 3) 等过宽限期，再跑一次
 sleep 35
 ./bin/wecert-onboard -config "$B_CFG" -out "$DOC" -require-clb=false -allow "$APEX" \
-  -grace 30s -json | grep -E 'beta|removed'
+  -grace 30s -drop-threshold 0.5 -json | grep -E 'beta|removed'
 grep -c "beta.$APEX" "$DOC"        # 期望 0
 
 # 4) wecert 侧：确认它真的把 SAN 收缩了
@@ -989,6 +1036,7 @@ sansb example-com
 | 步骤 | 检查 | 期望 |
 |---|---|---|
 | 2 | 决策 | `beta.$APEX` 被 **carry**，理由里带 `grace period` |
+| 2 | 报告 | `mode` 不是 `frozen`（是宽限期在保护，不是熔断） |
 | 2 | 文档 | 仍然包含 `beta.$APEX` |
 | 3 | 决策 | `beta.$APEX` 被 **removed**，理由为 `removed: confirmed absent for …, past the … grace period, and no CLB rule references it` |
 | 3 | 文档 | 不再包含 `beta.$APEX` |
@@ -1025,8 +1073,8 @@ echo "$REV_BEFORE"; grep -m1 '^revision:' "$DOC"
 
 # wecert 侧确认指标
 ./bin/wecert -config "$B_CFG" -state "$BDB" -once -log-level debug 2>&1 | tee /tmp/b5a-wecert.log
-grep 'frozen on the last good revision' /tmp/b5a-wecert.log
-curl -sS http://127.0.0.1:9800/metrics | grep 'wecert_desired_state_frozen'
+curl -sS http://127.0.0.1:9800/metrics \
+  | grep -E 'wecert_desired_state_(frozen|age_seconds|certificates)'
 ```
 
 **判据**
@@ -1036,10 +1084,10 @@ curl -sS http://127.0.0.1:9800/metrics | grep 'wecert_desired_state_frozen'
 | `wecert-onboard` 退出码 | **2** |
 | 输出 | `FROZEN: the previous desired state is untouched`（注意：`-json` 模式不会打印这一行，只有 JSON） |
 | `$DOC` | 内容与操作前**完全相同**（行数与 `revision` 都没变） |
-| `$DOC.report.json` | 存在，`"mode": "frozen"`，`freezeReasons` 里说明"期望状态为空" |
-| `wecert` 日志 | `frozen on the last good revision` |
-| `wecert_desired_state_frozen` | **1** |
+| `$DOC.report.json` | 存在，`"mode": "frozen"`，`freezeReasons` 说明**为什么**冻结。实测先被熔断拦下：`the declared name set dropped from 2 to 0 (100%, threshold 30%)`；"空期望状态永不落盘"那道网就在它后面一层，两者都指向"不接受空文档"这个结论 |
 | `wecert` 行为 | 仍然按旧文档续期（不是停止工作） |
+| `wecert_desired_state_frozen` | **0** —— wecert 只看到"文档仍然有效"，它**无从知道** onboard 那一轮冻结了。别把这一项当成 onboard 的冻结信号（实测确认） |
+| `wecert_desired_state_age_seconds` | 持续增长 —— 这才是"onboarding 停了/冻了"的运维信号，应当据此告警 |
 
 **失败说明**：如果文档真被清空了 → 这是最严重的等级：下一次巡检会把所有证书
 重建为"无域名"。**立即停止测试**，先修 `assemble` 之前的那道空值判断。
@@ -1197,7 +1245,7 @@ staging 签发的证书**不需要**吊销，也不占生产配额。若 `deploy
 
 | 事项 | 说明 |
 |---|---|
-| 真实崩溃（`kill -9`） | 本用例用"黑洞递归解析器"制造中断，落库状态与崩溃**完全一致**且可复现。想额外验一次真信号：看到 `TXT presented` 后立刻 `kill -STOP`，再 `kill -9`；只要前置态（`presented`、DNS 有记录）成立，测试就有效 |
+| 中断的制造方式 | A4/A9 用 `kill -9`（窗口实测约 29 秒，见 A4）。**不要**改用"黑洞递归解析器"：它会连带打断 lego provider 自己的 zone 查找，TXT 根本写不下去 |
 | 退避窗口 | 中断阶段会留下 `consecutive_failures=1` 与约 1 分钟的 `next_attempt_at`（`recordFailure` 的 `1<<0` 退避）。用例里显式用 SQL 清掉它，是为了让恢复步骤立刻能跑，而不是绕过这条设计。**顺带**：`inside the backoff window; skipping` 本身就是个值得确认的日志 |
 | 部署 / CLB 绑定 | 不在本用例内。见 `testenv/README.md` Stage B / B2 / B3 |
 | `presented=1` 的孤儿行 | A9 用 SQL 构造 `presented=0` 的形态。反过来（行说 presented=1 但 DNS 已被手工删掉）表现为 delete-all 被推迟，最终由 `cleanupOrphanTXT` 收敛；这条由单元测试覆盖（`internal/acme/cleanup_test.go`） |
