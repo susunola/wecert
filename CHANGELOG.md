@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+## 0.4.2 - 2026-09-16
+
+### Security
+
+- The webhook authentication lockout is actually wired in. `ratelimit.go`'s
+  `authLimiter` landed without a single caller, so the endpoint that triggers
+  real issuance (and consumes Let's Encrypt quota) accepted unlimited
+  token-guessing attempts. `Server.auth()` now checks the limiter first and
+  answers 429 with `Retry-After`, keyed by client IP; a window reset can no
+  longer clear an active block.
+
+### Fixed
+
+- A missing rebind progress detail is not "nothing is bound": the first
+  response carrying a `DeployRecordId` routinely has no progress detail yet,
+  and reading that as "no resource bound" failed a rebind the cloud completed
+  seconds later -- a failure that then repeated every round, uploading an
+  orphan certificate each time. An unpopulated sync progress defers to the
+  deploy record, and a null `TotalCount` is no longer treated as zero bound
+  resources. The zero-resource verdict additionally waits for a short grace
+  period so a just-created task reporting all-zero counters is not
+  misdiagnosed.
+- A cancelled or failed `renewalDecision` no longer reads as "renew now". Its
+  error exits return a zero `renewAt`, which `Reconcile` treated as long
+  overdue -- a reconcile pass during shutdown (or after a state-write failure)
+  placed a real ACME order nobody would advance. The error is returned
+  instead.
+- One certificate's challenge cleanup can no longer delete another
+  certificate's live TXT record. lego's dnspod/tencentcloud `CleanUp` deletes
+  every TXT at the name (the comment claiming value-scoped deletion was
+  wrong); per-FQDN challenge leases now skip the delete-all while another
+  value is live.
+- The onboarding abrupt-change fuse compares against the pure declaration set
+  (new `State.LastDeclared`) instead of the eligible set including
+  grace-carried names. A staged decommission (10 -> 7 -> 6 names) previously
+  wedged the round into a self-sustaining freeze that only `-force` escaped.
+- The preflight delegation check requires every returned NS to point at
+  DNSPod. A single match previously printed "all pointing at DNSPod" -- the
+  exact mid-migration state the check exists to catch.
+- ACME flow: an order in `processing` waits for `valid` directly instead of
+  falling into the pending branch and recording a spurious failure;
+  `Present` is idempotent across an interrupted pass and orphan-TXT cleanup
+  probes DNS before deleting a row, closing the zombie-record path;
+  `findZone` fails fast on a public-suffix zone instead of burning the whole
+  propagation budget against TLD nameservers for a typo'd domain.
+- Webhook: an explicitly empty `certs` list is rejected with 400 instead of
+  triggering a full convergence; `handleDesired` logs store read errors
+  instead of silently reporting `issued: false`.
+- Metrics: `DeleteCertSeries` also reclaims the `ReconcileTotal` and
+  `ReconcilePanics` per-certificate series.
+- Onboarding: a hostname rejected for conflicting declarations stays rejected
+  when a third declaration arrives; a state-save failure no longer
+  double-counts the change budget or resets grace clocks; a missing CLB rule
+  source carries names with an honest reason (and warns at startup) instead
+  of claiming a rule still references them.
+- Reconcile: `RunCert` propagates the pass error instead of reporting success
+  on failure.
+- Config: a NaN `onboarding.dropThreshold` is rejected at load time (YAML
+  `.nan` slipped past the range check while `wecert-onboard` refused it).
+- State: a failed 0600 pre-create of the state file surfaces its own error
+  instead of a confusing `sql.Open` failure.
+- Deploy: `waitDeployRecord` reports the last known counters at the deadline
+  instead of zeros from a final errored poll; error-body truncation is
+  rune-aware and can no longer write invalid UTF-8 into `last_error`.
+- Preflight: certificate pruning pages past the first 100 certificates.
+- `clbverify`: the missing-argument message now matches the documented
+  first-listener behavior.
+- Scripts: the e2e staging gate is anchored to the `directory:` key (a
+  comment mentioning acme-staging no longer passes it), and credential
+  extraction in `run-stage-ab.sh` no longer uses `eval`.
+
 ## 0.4.1 - 2026-09-16
 
 ### Security
