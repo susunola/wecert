@@ -47,6 +47,13 @@ dns:
   propagationTimeout: 5m
   pollingInterval: 5s
 
+  # Optional trusted recursive resolvers used consistently for CNAME, SOA and
+  # NS discovery before wecert queries the discovered authoritative NS directly.
+  # Leave empty to read /etc/resolv.conf. Use IP literals (optionally :port),
+  # not hostnames, so resolver discovery cannot silently fall back to another
+  # local DNS view (VPN / split-horizon / captive resolver).
+  # recursiveNameservers: ["1.1.1.1", "8.8.8.8"]
+
 tencent:
   # cvm-role: fetch temporary credentials from the instance metadata service
   #           (recommended; no key ever touches disk)

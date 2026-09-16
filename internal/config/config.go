@@ -9,8 +9,10 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -475,6 +477,13 @@ type DNS struct {
 	TTL                int    `yaml:"ttl"`
 	PropagationTimeout string `yaml:"propagationTimeout"`
 	PollingInterval    string `yaml:"pollingInterval"`
+
+	// RecursiveNameservers is the trusted recursive resolver set used to find
+	// CNAME targets, SOA and NS delegation before querying authoritative servers
+	// directly. Entries must be IP literals, optionally with an explicit port.
+	// Empty means the nameservers from /etc/resolv.conf are used.
+	RecursiveNameservers []string `yaml:"recursiveNameservers"`
+
 	// Parsed durations, filled in by normalize.
 	Propagation time.Duration `yaml:"-"`
 	Polling     time.Duration `yaml:"-"`
@@ -615,6 +624,13 @@ func (c *Config) normalize() error {
 		// 60 is rejected by the API with LimitExceeded.RecordTtlLimit. Paid tiers may
 		// go lower, but the default must hold on every tier.
 		c.DNS.TTL = 600
+	}
+	if len(c.DNS.RecursiveNameservers) > 0 {
+		resolvers, err := normalizeRecursiveNameservers(c.DNS.RecursiveNameservers)
+		if err != nil {
+			return err
+		}
+		c.DNS.RecursiveNameservers = resolvers
 	}
 
 	if c.Metrics.Listen == "" {
@@ -932,4 +948,56 @@ func parseDuration(s string, def time.Duration, field string) (time.Duration, er
 		return 0, fmt.Errorf("%s must be positive, got %s", field, s)
 	}
 	return d, nil
+}
+
+// normalizeRecursiveNameservers accepts IP literals with an optional UDP/TCP
+// port. Resolver hostnames are deliberately rejected: resolving the resolver
+// name through the system resolver would reintroduce the trust ambiguity this
+// setting exists to remove.
+func normalizeRecursiveNameservers(in []string) ([]string, error) {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			return nil, fmt.Errorf("dns.recursiveNameservers contains an empty resolver")
+		}
+		host, port, err := splitResolverAddress(v)
+		if err != nil {
+			return nil, fmt.Errorf("dns.recursiveNameservers entry %q: %w", raw, err)
+		}
+		if net.ParseIP(host) == nil {
+			return nil, fmt.Errorf("dns.recursiveNameservers entry %q must use an IP address, not a hostname", raw)
+		}
+		if port == "" {
+			port = "53"
+		}
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || n == 0 {
+			return nil, fmt.Errorf("dns.recursiveNameservers entry %q has an invalid port", raw)
+		}
+		addr := net.JoinHostPort(host, port)
+		if !seen[addr] {
+			seen[addr] = true
+			out = append(out, addr)
+		}
+	}
+	return out, nil
+}
+
+func splitResolverAddress(v string) (host, port string, err error) {
+	if ip := net.ParseIP(v); ip != nil {
+		return v, "", nil
+	}
+	host, port, err = net.SplitHostPort(v)
+	if err == nil {
+		if host == "" || port == "" {
+			return "", "", fmt.Errorf("host and port are both required when a port is specified")
+		}
+		return host, port, nil
+	}
+	if strings.Contains(v, ":") {
+		return "", "", fmt.Errorf("must be an IP literal optionally followed by a numeric port")
+	}
+	return v, "", nil
 }

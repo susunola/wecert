@@ -5,7 +5,15 @@
 // handful of Tencent Cloud API calls.
 package deploy
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrDeploymentDisabled distinguishes a deliberately local-only configuration
+// from a successful remote deletion. Callers must keep retry state when this is
+// returned: nothing has been deleted from Tencent Cloud.
+var ErrDeploymentDisabled = errors.New("cloud deployment is disabled")
 
 // Deployer abstracts the deployment target.
 //
@@ -52,8 +60,15 @@ func (Noop) Deploy(_ context.Context, _ string, oldID string, _, _ []byte) (stri
 	return oldID, nil
 }
 
-// Delete does nothing.
-func (Noop) Delete(_ context.Context, _ string) error { return nil }
+// Delete does not claim success: an existing cloud certificate cannot be
+// reclaimed while deployment is disabled. Returning nil here would make the
+// reaper forget its queue entry while leaking the cloud certificate forever.
+func (Noop) Delete(_ context.Context, certID string) error {
+	if certID == "" {
+		return nil
+	}
+	return ErrDeploymentDisabled
+}
 
 // Bindings is always 0: Noop deploys nowhere, so there is nothing to bind.
 func (Noop) Bindings(_ context.Context, _ string) (int, error) { return 0, nil }
