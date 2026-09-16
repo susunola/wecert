@@ -224,6 +224,7 @@ CA/Browser Forum 已排期 **2027-03-15 起证书 ≤100 天，2029-03-15 起 �
 - [实测踩过的坑](README.reference.zh-CN.md#实测踩过的坑) —— CLB 的 SNI 陷阱、`DescribeListeners` 不回读绑定、DNSPod 的 TTL 下限、lego 的 API 陷阱。
 - [期望状态](docs/desired-state.md) —— 用 `_wecert` DNS 声明域名、生成期望状态文档、以及把 wecert 切过去。设计取舍见 [desired-state-providers.md](docs/desired-state-providers.md)。
 - [证书生命周期](README.reference.zh-CN.md#证书生命周期) —— 七张图，从"它要解决什么问题"一路画到旧证书退役，另附数据所有权、失败语义和限速算术。可交互版本：[docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)。
+- [证书全生命周期验收用例](docs/lifecycle-acceptance.md) —— 可执行的验收清单：在真实 DNSPod + Let's Encrypt **staging** 上，从首签、SAN 增删、wildcard 与 apex 共享 TXT 名、并发双证书，到 ARI 与回退两条续期路径、中断自愈，以及声明 → 期望状态文档 → enforce 的交接，逐阶段给出可观测判据。
 - [现状与下一步](README.reference.zh-CN.md#现状与下一步) · [开发](README.reference.zh-CN.md#开发)。
 
 <details>
