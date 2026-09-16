@@ -148,6 +148,57 @@ func TestHealthzNeedsNoAuth(t *testing.T) {
 	}
 }
 
+// ── Rate limiting ────────────────────────────────────────────────────────────────────
+
+// Repeated token failures from one address must end in a lockout, or the
+// endpoint can be brute-forced at wire speed.
+func TestAuthLockoutAfterFailures(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	s, _ := newTestServer(t, rec)
+
+	bad := map[string]string{"Authorization": "Bearer wrong"}
+	for i := 0; i < authMaxFailures; i++ {
+		w := do(t, s, http.MethodPost, "/hook/reconcile", "", bad)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: should return 401, got %d", i+1, w.Code)
+		}
+	}
+
+	// Once locked out, even the *correct* token gets a 429: the block is on the
+	// address, not on the credentials presented.
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer())
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("a locked-out address should return 429, got %d", w.Code)
+	}
+	if ra := w.Header().Get("Retry-After"); ra == "" {
+		t.Error("a 429 should carry a Retry-After header")
+	}
+	if len(rec.started) != 0 {
+		t.Errorf("a locked-out address should trigger nothing, got %v", rec.started)
+	}
+}
+
+// A good token proves the address is the legitimate caller, so its failure
+// counter is forgiven.
+func TestAuthSuccessForgivesFailures(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	s, _ := newTestServer(t, rec)
+
+	bad := map[string]string{"Authorization": "Bearer wrong"}
+	for i := 0; i < authMaxFailures-1; i++ {
+		do(t, s, http.MethodPost, "/hook/reconcile", "", bad)
+	}
+	if w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer()); w.Code != http.StatusAccepted {
+		t.Fatalf("a good token should still work before the limit, got %d", w.Code)
+	}
+
+	// Had the earlier failures not been forgiven, this one would hit the limit.
+	w := do(t, s, http.MethodPost, "/hook/reconcile", "", bad)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("one failure after a success should be a plain 401, got %d", w.Code)
+	}
+}
+
 // ── Triggering ────────────────────────────────────────────────────────────────────
 
 func TestTriggerAllWhenBodyEmpty(t *testing.T) {
@@ -245,6 +296,21 @@ func TestTriggerRejectsBadJSON(t *testing.T) {
 	w := do(t, s, http.MethodPost, "/hook/reconcile", `{not json`, bearer())
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("bad JSON should return 400, got %d", w.Code)
+	}
+}
+
+// An explicit "certs": [] asks for nothing; silently widening it into a full
+// convergence would burn issuance quota the caller never asked for.
+func TestTriggerRejectsEmptyCerts(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"certs":[]}`, bearer())
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("an explicit empty certs list should return 400, got %d", w.Code)
+	}
+	if len(rec.started) != 0 {
+		t.Errorf("nothing should be triggered, got %v", rec.started)
 	}
 }
 

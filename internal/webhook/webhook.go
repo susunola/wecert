@@ -17,7 +17,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +31,11 @@ import (
 // errBothForms rejects requests that send both cert and certs — ambiguous, so
 // refuse outright.
 var errBothForms = errors.New("cert and certs are mutually exclusive")
+
+// errEmptyCerts rejects an explicit "certs": []. It asks for nothing, and
+// treating it like an absent body would silently widen it into a full
+// convergence the caller never asked for.
+var errEmptyCerts = errors.New("certs must not be empty; omit the body to process everything")
 
 // Reconciler is the convergence capability the webhook needs. Defined at the
 // consumer for easy test substitution.
@@ -60,6 +67,7 @@ type Server struct {
 	baseCtx context.Context
 	log     *slog.Logger
 	now     func() time.Time
+	limiter *authLimiter
 }
 
 // New builds the webhook server.
@@ -79,6 +87,7 @@ func New(rec Reconciler, store *state.Store, token string, baseCtx context.Conte
 		baseCtx: baseCtx,
 		log:     log,
 		now:     time.Now,
+		limiter: newAuthLimiter(),
 	}, nil
 }
 
@@ -104,15 +113,41 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Key strictly by client IP: this endpoint sits behind no trusted proxy
+		// in the default deployment, so RemoteAddr is the honest source.
+		addr := clientIP(r)
+
+		if ok, retryAfter := s.limiter.allowed(addr, s.now()); !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+			writeJSON(w, http.StatusTooManyRequests,
+				map[string]string{"error": "too many failed authentication attempts"})
+			return
+		}
+
 		if !s.tokenMatches(r) {
+			s.limiter.recordFailure(addr, s.now())
 			s.log.Warn("webhook authentication failed",
 				"remote", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
 			writeJSON(w, http.StatusUnauthorized,
 				map[string]string{"error": "missing or invalid token"})
 			return
 		}
+
+		// A good token proves this address is the legitimate caller rather than
+		// the attacker hammering it, so forgive the accumulated failures.
+		s.limiter.recordSuccess(addr)
 		next(w, r)
 	}
+}
+
+// clientIP strips the port from RemoteAddr. It always carries one for HTTP
+// requests, but fall back to the raw value rather than keying on "" if not.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // tokenMatches accepts both forms and compares in constant time.
@@ -140,9 +175,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 // reconcileRequest is the trigger request body. It may be omitted entirely — no
 // body means "process everything".
+//
+// Certs is a pointer so "field absent" (full trigger) is distinguishable from
+// an explicit "certs": [], which asks for nothing and is rejected.
 type reconcileRequest struct {
-	Cert  string   `json:"cert"`
-	Certs []string `json:"certs"`
+	Cert  string    `json:"cert"`
+	Certs *[]string `json:"certs"`
 }
 
 type reconcileResponse struct {
@@ -218,8 +256,11 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return req, err
 	}
-	if req.Cert != "" && len(req.Certs) > 0 {
+	if req.Cert != "" && req.Certs != nil && len(*req.Certs) > 0 {
 		return req, errBothForms
+	}
+	if req.Certs != nil && len(*req.Certs) == 0 {
+		return req, errEmptyCerts
 	}
 	return req, nil
 }
@@ -231,9 +272,11 @@ func (s *Server) resolveTargets(req reconcileRequest) (targets, unknown []string
 		known[n] = struct{}{}
 	}
 
-	wanted := req.Certs
+	var wanted []string
 	if req.Cert != "" {
 		wanted = []string{req.Cert}
+	} else if req.Certs != nil {
+		wanted = *req.Certs
 	}
 
 	for _, n := range wanted {
@@ -387,7 +430,10 @@ func (s *Server) handleDesired(dr DesiredReader) http.HandlerFunc {
 				KeyType: c.KeyType,
 				Deploy:  c.Deploy.Enabled,
 			}
-			if st, err := s.store.GetCert(c.Name); err == nil && st != nil && !st.NotAfter.IsZero() {
+			st, err := s.store.GetCert(c.Name)
+			if err != nil {
+				s.log.Warn("failed to read the certificate state", "cert", c.Name, "err", err)
+			} else if st != nil && !st.NotAfter.IsZero() {
 				dc.Issued = true
 				dc.NotAfter = st.NotAfter.UTC().Format(time.RFC3339)
 				days := int(st.NotAfter.Sub(now).Hours() / 24)

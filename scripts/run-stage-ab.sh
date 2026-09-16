@@ -69,7 +69,18 @@ fi
 # and the like), and sourcing it would push all of them into the current shell for
 # child processes to inherit — terraform and wecert have no need for them, so
 # there is no reason to hand them over.
-eval "$(grep -E '^[[:space:]]*(export[[:space:]]+)?(TENCENTCLOUD_SECRET_ID|TENCENTCLOUD_SECRET_KEY)=' "${CREDS}")"
+#
+# This used to be eval "$(grep ...)", which is only marginally safer than sourcing:
+# eval executes any command substitution a value happens to contain, and a credentials
+# file is data, not code. Extract the values with sed instead and strip one layer of
+# surrounding quotes.
+cred_value() {
+	sed -n "s/^[[:space:]]*export[[:space:]][[:space:]]*$1=\(.*\)/\1/p" "${CREDS}" |
+		head -n 1 |
+		sed -e 's/^["'"'"']//' -e 's/["'"'"']$//'
+}
+TENCENTCLOUD_SECRET_ID="$(cred_value TENCENTCLOUD_SECRET_ID)"
+TENCENTCLOUD_SECRET_KEY="$(cred_value TENCENTCLOUD_SECRET_KEY)"
 export TENCENTCLOUD_SECRET_ID TENCENTCLOUD_SECRET_KEY
 
 if [[ -z "${TENCENTCLOUD_SECRET_ID:-}" || -z "${TENCENTCLOUD_SECRET_KEY:-}" ]]; then
@@ -159,8 +170,10 @@ sed -e "s|REPLACE_ME|${DOMAIN}|g" \
 	-e "s|^  email: .*|  email: ${EMAIL}|" \
 	"${ROOT}/e2e-config-wildcard.yaml" > "${CONFIG}"
 
-# Force staging: one wrong character here burns real production quota.
-grep -q 'acme-staging' "${CONFIG}" || { echo "Error: the config is not staging" >&2; exit 1; }
+# Force staging: one wrong character here burns real production quota. Anchored to the
+# directory key, because a bare "acme-staging" match could come from a comment while the
+# real directory points at production.
+grep -qE '^[[:space:]]*directory:.*acme-staging' "${CONFIG}" || { echo "Error: the config is not staging" >&2; exit 1; }
 
 "${ROOT}/bin/wecert" -config "${CONFIG}" -state "${STATE_DB}" -dry-run
 echo

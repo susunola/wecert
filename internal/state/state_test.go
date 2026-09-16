@@ -1,6 +1,8 @@
 package state
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -326,5 +328,31 @@ func TestPutCertBoundsLastError(t *testing.T) {
 	}
 	if got.LastError != "acme: rate limited" {
 		t.Errorf("a short last_error must round-trip unchanged, got %q", got.LastError)
+	}
+}
+
+// The 0600 pre-create is part of the security contract (private keys live in
+// this file), so its failure must come back wrapped -- not swallowed, leaving
+// the sql.Open below to fail with a message that points at SQLite instead of
+// the real permission problem.
+func TestOpenReturnsThePrecreateError(t *testing.T) {
+	dir := t.TempDir()
+	ro := filepath.Join(dir, "ro")
+	if err := os.Mkdir(ro, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(ro, 0o700) })
+
+	// OpenUnlocked because the exclusive lock file lives in the same directory
+	// and would fail even earlier, masking the branch under test.
+	_, err := OpenUnlocked(filepath.Join(ro, "state.db"))
+	if err == nil {
+		t.Fatal("opening a state database in an unwritable directory must fail")
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Errorf("the pre-create error must be wrapped, not swallowed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "state.db") {
+		t.Errorf("the error must name the state file, got %v", err)
 	}
 }

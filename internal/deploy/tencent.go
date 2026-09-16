@@ -302,11 +302,19 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 // while nothing actually took effect" -- into the state database.
 func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, recordID uint64, oldID string) error {
 	deadline := d.now().Add(3 * time.Minute)
+
+	// The counters live outside the loop and are updated only on a successful query, so
+	// they always hold the last *known* state. If the final polls before the deadline all
+	// errored, the deadline branch below must still see that state -- reading zeros there
+	// misdiagnoses a task that was making progress as "no resource bound to the old
+	// certificate" and sends the operator off to check a listener that is fine.
+	var success, failed, running, pending int64
 	for {
-		success, failed, running, pending, err := d.describeDeployRecord(ctx, client, recordID)
+		s, f, r, p, err := d.describeDeployRecord(ctx, client, recordID)
 		if err != nil {
 			d.log.Warn("failed to query the deploy record; retrying shortly", "deployRecordId", recordID, "err", err)
 		} else {
+			success, failed, running, pending = s, f, r, p
 			d.log.Info("one-click update progress",
 				"deployRecordId", recordID,
 				"success", success, "failed", failed, "running", running, "pending", pending)

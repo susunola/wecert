@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
 	"log/slog"
 	"math/big"
@@ -337,5 +338,36 @@ func TestReconcileDiscardStaleOrderDoesNotForceReissue(t *testing.T) {
 	}
 	if n := fake.newOrders.Load(); n != 0 {
 		t.Errorf("certificate already matches the config and no renewal window was reached: created %d orders", n)
+	}
+}
+
+// A cancelled context must never turn into an order.
+//
+// renewalDecision's error exits return a zero renewAt, and the zero time reads as "long
+// overdue": without the guard, cancelling the shutdown context mid-round made Reconcile
+// log the ARI error and then place a **real** new order -- spending exact-set rate-limit
+// quota as the process was going down. The round must stop with the error instead.
+func TestReconcileCancelledContextDoesNotPlaceOrder(t *testing.T) {
+	domains := []string{"a.example.com", "b.example.com"}
+	m, store, fake, cert := newReconcileHarness(t, domains, domains)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := m.Reconcile(ctx, cert)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled round must return the context error, got %v", err)
+	}
+	if n := fake.newOrders.Load(); n != 0 {
+		t.Errorf("a cancelled round placed %d orders -- the zero renewAt was misread as 'overdue'", n)
+	}
+
+	// A cancellation is not a business failure: no backoff may be recorded either.
+	st, gerr := store.GetCert("many-sans")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if st.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0 for a cancelled round", st.ConsecutiveFailures)
 	}
 }

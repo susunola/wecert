@@ -40,7 +40,7 @@ func run() error {
 	flag.Parse()
 
 	if *region == "" || *lbID == "" {
-		return fmt.Errorf("-region and -clb are required (-listener is optional; omit it to list every listener)")
+		return fmt.Errorf("-region and -clb are required (-listener is optional; when omitted, the first listener on that CLB is used)")
 	}
 
 	cred := common.NewCredential(
