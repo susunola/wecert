@@ -410,6 +410,14 @@ A certificate may carry many SANs, and that set changes. Three things exist spec
 >
 > If you churn identifiers frequently, watch that ceiling. Splitting unrelated services across different registered domains keeps them from competing for the same budget. This is logged as a warning on the drift path.
 
+### Declaring domains dynamically
+
+Everything above assumes the domain set lives in the config file. When domains are added by other people or other systems, `wecert-onboard` moves that judgement out of wecert entirely: domains are declared as `_wecert` TXT records in the DNS zone, the binary turns them into a reviewable desired-state document, and wecert only reads that document. wecert itself never infers anything.
+
+The payoff is quota arithmetic. With `*.example.com` declared, adding `foo.example.com` changes nothing and costs **zero** issuances — against 50 re-issuances for a 50-subdomain import without a wildcard, which is the entire weekly allowance.
+
+Deletion is deliberately an order of magnitude more conservative than addition: a name leaves the certificate only when it has been *confirmed* absent, for longer than the grace period, **and** no CLB rule still references it. See [Desired state](desired-state.md).
+
 ## Configuration reference
 
 `config.example.yaml` carries the annotated version.
@@ -423,7 +431,10 @@ A certificate may carry many SANs, and that set changes. Three things exist spec
 | `dns` | yes | — | See below |
 | `tencent` | yes | — | See below |
 | `metrics` | no | `127.0.0.1:9800` | Prometheus listen address |
-| `certificates` | yes | — | At least one; see below |
+| `webhook` | no | — | Event trigger and outbound notifications; see below |
+| `desiredState` | no | `mode: static` | Where the desired state comes from; see below |
+| `onboarding` | no | — | Policy for `wecert-onboard`. **wecert itself never reads this section.** |
+| `certificates` | static/observe only | — | At least one. Must be **empty** when `desiredState.mode` is `enforce` |
 
 ### `acme`
 
@@ -534,6 +545,48 @@ With `notifyURL` set, every renewal attempt emits:
 ```
 
 `result` is `ok` or `error` (with an `error` field). Delivery is **asynchronous and best-effort**: a slow or dead notification target must never slow down renewal — that is the same class of coupling error as one certificate's failure blocking the others.
+
+### `desiredState`
+
+Which side has the final say over what should exist. The difference between the modes is **authority**, not "how many files get read".
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `mode` | no | `static` | `static` \| `observe` \| `enforce` |
+| `path` | observe/enforce | — | Desired-state document. Rejected in `static` mode, because an unused path is almost always a half-finished switch |
+| `maxStaleness` | no | `48h` | Warn once the document has not been refreshed for this long |
+
+| Mode | Converges on | Use it for |
+|---|---|---|
+| `static` | `certificates` in the config | The original behaviour, zero risk |
+| `observe` | still `certificates`, **plus** a diff report against the document | The migration window |
+| `enforce` | the document | Dynamic issuance |
+
+**Do not jump from `static` to `enforce`.** `observe` signs nothing and only answers "if the document were authoritative, what would be added and what would be removed". The drift data it produces is what tells you how large the debounce window, the group size and the fuses should be — guessing those costs account-level rate limiting.
+
+The document is machine-written and refuses several things on purpose: an empty `certificates` list (indistinguishable from a failed generation, and acting on it would strip every name from every certificate), a `revision` that does not match its contents (hand-edited), and a certificate whose `name` is not derived from its registered domain.
+
+> **Why the name rule is enforced at the contract boundary.** If a certificate name followed the domain set, adding one domain would create a brand-new state row while the old row's order URL, ARI certID and deployed CertID all became orphans. The "at most one in-flight order per certificate" invariant would fail with it, and both orders would fly at once — straight into *5 certificates per exact set of identifiers / 7 days*, which has no override.
+
+### `onboarding`
+
+Policy for the `wecert-onboard` binary. These numbers decide how fast quota is spent and how conservative deletion is, so they live in the config rather than in the code — and they are meant to be tuned from real drift data.
+
+| Field | Default | Description |
+|---|---|---|
+| `zones` | every visible zone | DNS zones to enumerate for `_wecert` declarations |
+| `requireCLBRule` | `true` | Guard 1: a declaration only counts when a CLB rule serves the name |
+| `allowlist` | no restriction | Registered domains that may be issued for. Normalised to eTLD+1 |
+| `maxNames` | `25` | Max SAN entries per certificate. Aligned with `tlsserver` so switching profiles later needs no redesign |
+| `profile` / `keyType` | `classic` / `ecdsa-p256` | Defaults for generated certificates |
+| `deploy` | `true` | Default deploy flag for generated certificates |
+| `gracePeriod` | `24h` | How long a name must be **confirmed** absent before it may be removed |
+| `budget` / `budgetWindow` | `25` / `168h` | Name-set changes allowed per window. Let's Encrypt allows 50 per registered domain per 7 days, shared across accounts; half of that is the budget |
+| `dropThreshold` | `0.30` | Freeze when the declared name set shrinks by more than this fraction |
+| `statePath` | `<out>.state.json` | Grace-period and budget bookkeeping. Must be persistent: an in-memory grace period never elapses across runs |
+| `reportPath` | `<out>.report.json` | Per-hostname decision report |
+
+See [Desired state](desired-state.md) for the `_wecert` declaration syntax, the five fuses, the systemd units and the troubleshooting table.
 
 ### `certificates[]`
 

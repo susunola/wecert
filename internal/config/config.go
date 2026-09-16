@@ -79,7 +79,154 @@ type Config struct {
 	Tencent      Tencent       `yaml:"tencent"`
 	Metrics      Metrics       `yaml:"metrics"`
 	Webhook      Webhook       `yaml:"webhook"`
+	DesiredState DesiredState  `yaml:"desiredState"`
+	Onboarding   Onboarding    `yaml:"onboarding"`
 	Certificates []Certificate `yaml:"certificates"`
+}
+
+// Onboarding 配置期望状态的生成策略，供 wecert-onboard 使用。
+//
+// wecert 自己不读这一节 —— 这是刻意的：生成策略会反复调，而收敛必须稳。
+// 放在配置里而不是写成常量，是因为这些数字只能从真实漂移数据里来：
+// 先跑 observe 攒数据，再回来调它们。
+type Onboarding struct {
+	// Zones 限定枚举哪些 DNS zone。留空表示账号下所有 zone。
+	Zones []string `yaml:"zones"`
+
+	// RequireCLBRule 表示声明必须同时有 CLB 规则才生效（守卫 1）。默认 true。
+	//
+	// 用指针是因为 false 是有意义的值，而 Go 的零值分不出"没写"和"写了 false"。
+	RequireCLBRule *bool `yaml:"requireCLBRule"`
+
+	// Allowlist 限定允许签发证书的注册域。留空表示不限制。
+	Allowlist []string `yaml:"allowlist"`
+
+	// MaxNames 是单证书 SAN 上限，默认 25（与 tlsserver 对齐，
+	// 将来切 profile 不用改架构）。
+	MaxNames int `yaml:"maxNames"`
+
+	Profile string `yaml:"profile"`
+	KeyType string `yaml:"keyType"`
+	Deploy  *bool  `yaml:"deploy"`
+
+	// GracePeriod 是删除宽限期，默认 24h。
+	GracePeriod string `yaml:"gracePeriod"`
+
+	// Budget / BudgetWindow 是配额预算，默认 25 次 / 7 天。
+	Budget       int    `yaml:"budget"`
+	BudgetWindow string `yaml:"budgetWindow"`
+
+	// DropThreshold 是骤变熔断阈值，默认 0.30。
+	DropThreshold float64 `yaml:"dropThreshold"`
+
+	StatePath  string `yaml:"statePath"`
+	ReportPath string `yaml:"reportPath"`
+
+	// 解析后的时长，由 normalize 填充。
+	GraceDur  time.Duration `yaml:"-"`
+	BudgetDur time.Duration `yaml:"-"`
+}
+
+// RequireCLBRuleOr 返回守卫开关，未设置时用 def。
+func (o *Onboarding) RequireCLBRuleOr(def bool) bool {
+	if o.RequireCLBRule == nil {
+		return def
+	}
+	return *o.RequireCLBRule
+}
+
+// DeployOr 返回部署默认值，未设置时用 def。
+func (o *Onboarding) DeployOr(def bool) bool {
+	if o.Deploy == nil {
+		return def
+	}
+	return *o.Deploy
+}
+
+func (o *Onboarding) normalize() error {
+	var err error
+	if o.GraceDur, err = parseDuration(o.GracePeriod, 24*time.Hour, "onboarding.gracePeriod"); err != nil {
+		return err
+	}
+	if o.BudgetDur, err = parseDuration(o.BudgetWindow, 7*24*time.Hour, "onboarding.budgetWindow"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// DesiredState 的三种模式。
+//
+// 区别是**谁有最终解释权**，不是"读几个文件"。
+const (
+	// ModeStatic：配置里的 certificates 就是期望状态。历史行为，零风险。
+	ModeStatic = "static"
+
+	// ModeObserve：仍然按 certificates 收敛，但同时读文档并报告差异。
+	//
+	// 这是从 static 迁到 enforce 之间的必经阶段：它不签发任何东西，
+	// 只回答"如果真的按文档来，会加什么、会删什么"。
+	ModeObserve = "observe"
+
+	// ModeEnforce：文档就是期望状态。
+	ModeEnforce = "enforce"
+)
+
+// DesiredState 配置期望状态的来源。
+//
+// 为什么不把推断放进 wecert 自己：这个系统所有已知的坑（限速、误删、
+// 状态漂移）都出在"判断"上，而判断逻辑必然会反复改；证书生命周期必须稳。
+// 拆开之后，来源故障的失败模式是"期望状态不更新"（安全），
+// 而不是"域名看起来消失了"（灾难）。
+type DesiredState struct {
+	// Mode 是 static / observe / enforce。
+	Mode string `yaml:"mode"`
+
+	// Path 是期望状态文档的路径。observe 与 enforce 必填。
+	Path string `yaml:"path"`
+
+	// MaxStaleness 是文档多久没被刷新就告警，默认 48h。
+	//
+	// 这是这套架构新引入的失败模式：onboarding 组件挂掉之后，wecert 会一直
+	// 按旧文档正常续期，一切看起来都正常，但新域名再也不会进来。
+	// 没有这个告警，那种状态能一直持续到有人想起来加域名为止。
+	MaxStaleness string `yaml:"maxStaleness"`
+
+	// 解析后的时长，由 normalize 填充。
+	MaxStalenessDur time.Duration `yaml:"-"`
+}
+
+func (d *DesiredState) normalize(hasCertificates bool) error {
+	if d.Mode == "" {
+		d.Mode = ModeStatic
+	}
+
+	var err error
+	if d.MaxStalenessDur, err = parseDuration(d.MaxStaleness, 48*time.Hour, "desiredState.maxStaleness"); err != nil {
+		return err
+	}
+
+	switch d.Mode {
+	case ModeStatic:
+		if d.Path != "" {
+			return fmt.Errorf("desiredState.path is set but desiredState.mode is %q: "+
+				"an unused path is almost always a half-finished switch to observe/enforce, "+
+				"so it is rejected instead of silently ignored", ModeStatic)
+		}
+	case ModeObserve, ModeEnforce:
+		if d.Path == "" {
+			return fmt.Errorf("desiredState.mode=%q requires desiredState.path", d.Mode)
+		}
+	default:
+		return fmt.Errorf("desiredState.mode must be %q, %q or %q, got %q",
+			ModeStatic, ModeObserve, ModeEnforce, d.Mode)
+	}
+
+	if d.Mode == ModeEnforce && hasCertificates {
+		return fmt.Errorf("desiredState.mode=%q but certificates is not empty: "+
+			"in enforce mode the document is the single source of truth, "+
+			"and leaving a stale certificates block behind means editing it would silently do nothing", d.Mode)
+	}
+	return nil
 }
 
 // ACME 是 ACME 账号与目录配置。
@@ -151,22 +298,22 @@ const WebhookTokenMinLen = 16
 
 // Certificate 是一张证书的期望状态。
 type Certificate struct {
-	Name        string   `yaml:"name"`
-	Domains     []string `yaml:"domains"`
-	Profile     string   `yaml:"profile"`
-	KeyType     string   `yaml:"keyType"`
-	RenewBefore string   `yaml:"renewBefore"`
-	Deploy      Deploy   `yaml:"deploy"`
+	Name        string   `yaml:"name" json:"name"`
+	Domains     []string `yaml:"domains" json:"domains"`
+	Profile     string   `yaml:"profile" json:"profile"`
+	KeyType     string   `yaml:"keyType" json:"keyType"`
+	RenewBefore string   `yaml:"renewBefore,omitempty" json:"renewBefore,omitempty"`
+	Deploy      Deploy   `yaml:"deploy" json:"deploy"`
 
 	// 解析后的时长，由 normalize 填充。
-	RenewBeforeDur time.Duration `yaml:"-"`
+	RenewBeforeDur time.Duration `yaml:"-" json:"-"`
 }
 
 // Deploy 描述签出来的证书要部署到哪里。
 // 首次签发时腾讯云侧还没有绑定关系，需要人工绑一次；
 // 之后每 90/45 天续期都由 UpdateCertificateInstance 自动换。
 type Deploy struct {
-	Enabled bool `yaml:"enabled"`
+	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
 // MaxNames 返回该证书 profile 允许的最大域名数。
@@ -269,17 +416,23 @@ func (c *Config) normalize() error {
 		return fmt.Errorf("tencent.regions is required (CLB is regional; list every region you have CLBs in)")
 	}
 
-	if len(c.Certificates) == 0 {
-		return fmt.Errorf("at least one certificate is required")
+	if err := c.DesiredState.normalize(len(c.Certificates) > 0); err != nil {
+		return err
+	}
+	if err := c.Onboarding.normalize(); err != nil {
+		return err
 	}
 
-	seen := map[string]bool{}
-	for i := range c.Certificates {
-		if err := c.Certificates[i].normalize(seen); err != nil {
-			return err
-		}
+	// static 和 observe 都要用 certificates 收敛，所以非空是硬要求。
+	// enforce 模式下 certificates 必须为空（上面已经拦过），文档才是唯一来源。
+	if c.DesiredState.Mode != ModeEnforce && len(c.Certificates) == 0 {
+		return fmt.Errorf("at least one certificate is required "+
+			"(desiredState.mode=%q still converges on this list; "+
+			"set desiredState.mode=%q to take the whole list from the desired-state document instead)",
+			c.DesiredState.Mode, ModeEnforce)
 	}
-	return nil
+
+	return NormalizeCertificates(c.Certificates)
 }
 
 func (w *Webhook) normalize() error {
@@ -441,6 +594,26 @@ func DiffDomains(want, have []string) (missing, extra []string) {
 //
 // 为什么不交给 CA 报错：每个被拒的订单都要消耗一次订单配额，
 // 而 SAN 多的证书一旦有个手误，代价是整张证书重来一遍。本地拦下更便宜。
+// ValidateDomain 校验一个域名，允许最左侧一个通配符标签。
+//
+// 导出是为了让期望状态来源复用同一套规则：如果来源接受了 wecert 会拒掉的名字，
+// 收敛就会卡在一个永远修不好的错误上，而报错点离真正的原因很远。
+func ValidateDomain(d string) error { return validateDomain(d) }
+
+// NormalizeCertificates 校验并规范化一组证书：补默认值、去重名字、校验域名与数量上限。
+//
+// 静态配置和期望状态文档都走这一个入口，避免两条路径的宽松程度不一致
+// —— 那是"文档里能过、配置里过不了"这类诡异差异的来源。
+func NormalizeCertificates(certs []Certificate) error {
+	seen := make(map[string]bool, len(certs))
+	for i := range certs {
+		if err := certs[i].normalize(seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func validateDomain(d string) error {
 	if d == "" {
 		return fmt.Errorf("empty domain")
