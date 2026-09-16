@@ -17,6 +17,7 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -650,5 +651,94 @@ func TestIdentifierCooldownSuppressesFurtherOrders(t *testing.T) {
 	_ = m.Reconcile(context.Background(), cert)
 	if n := len(fake.newOrderReplaces); n != 2 {
 		t.Errorf("after the cooldown expires the name must be retried, got %d orders in total", n)
+	}
+}
+
+// The quota accounting must count what this program actually spends.
+//
+// Let's Encrypt documents its limits and their token-bucket refill rates but has NO endpoint to
+// query the remaining allowance -- the only way to answer "do 40 more issuances fit in this
+// week's 50?" is to account for what was spent. Before this, the answer was unavailable from
+// anywhere, and the first signal was an error after the quota was already gone.
+func TestPlacingAnOrderSpendsAccountQuota(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	before, ok := m.quota.Remaining(ratelimit.NewOrdersPerAccount, "")
+	if !ok {
+		t.Fatal("the account limit must be readable")
+	}
+
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	after, ok := m.quota.Remaining(ratelimit.NewOrdersPerAccount, "")
+	if !ok {
+		t.Fatal("the account limit must be readable after an order")
+	}
+	if after != before-1 {
+		t.Errorf("one order must spend exactly one token: before=%v after=%v", before, after)
+	}
+
+	// The quota must survive a restart, since the bucket is persisted: a fresh Manager over the
+	// same store sees the spend rather than a full bucket.
+	fresh := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fresh.SetNow(func() time.Time { return fixed })
+	restarted, ok := fresh.quota.Remaining(ratelimit.NewOrdersPerAccount, "")
+	if !ok {
+		t.Fatal("the account limit must be readable from a fresh manager")
+	}
+	if restarted != after {
+		t.Errorf("a restart must not forget the spend: %v, want %v", restarted, after)
+	}
+}
+
+// A CA-reported deadline must be recorded, and must be visible to an operator.
+//
+// The message shape is the one Let's Encrypt documents, and the instant inside it is
+// authoritative: it accounts for every other account spending the same global bucket, which
+// the local estimate cannot see.
+func TestRateLimitErrorRecordsTheCAsDeadline(t *testing.T) {
+	_, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	fake.newOrderErr = errors.New("acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: " +
+		"too many new orders recently, retry after 2026-09-16 15:00:00 UTC")
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("a rate-limited order must be reported as a failure")
+	}
+
+	at, reason, blocked := m.quota.BlockedUntil(ratelimit.NewOrdersPerAccount, "")
+	if !blocked {
+		t.Fatal("the CA reported when it will accept requests again; that deadline must be recorded")
+	}
+	want := time.Date(2026, 9, 16, 15, 0, 0, 0, time.UTC)
+	if !at.Equal(want) {
+		t.Errorf("deadline = %s, want %s", at, want)
+	}
+	if reason != ratelimit.NewOrdersPerAccount.Name {
+		t.Errorf("the deadline must name the limit, got %q", reason)
+	}
+
+	// And it must appear in the report an operator or metric reader sees.
+	var found bool
+	for _, rep := range m.QuotaStatus(nil) {
+		if rep.Limit == ratelimit.NewOrdersPerAccount.Name {
+			found = true
+			if !rep.Blocked || !rep.BlockedUntil.Equal(want) {
+				t.Errorf("the report must carry the deadline, got %+v", rep)
+			}
+		}
+	}
+	if !found {
+		t.Error("the account limit must be in the quota report")
 	}
 }
