@@ -115,6 +115,11 @@ type Order struct {
 	// stalls until the order expires 7 days later -- and during that window no domain
 	// change for that certificate can take effect.
 	Identifiers string
+
+	// DeploymentCertID is an uploaded certificate whose asynchronous rebind has not
+	// completed yet. Keeping it with the order makes retry idempotent across restarts:
+	// never upload a second copy while the first task may still finish.
+	DeploymentCertID string
 }
 
 // Authorization is one identifier authorization inside an order.
@@ -309,6 +314,7 @@ CREATE TABLE IF NOT EXISTS orders (
     key_pem      BLOB,
     -- The identifier set submitted at newOrder time (canonical form, see config.DomainKey).
     identifiers  TEXT NOT NULL DEFAULT '',
+	deployment_cert_id TEXT NOT NULL DEFAULT '',
     updated_at   INTEGER NOT NULL DEFAULT 0
 );
 
@@ -380,6 +386,7 @@ CREATE TABLE IF NOT EXISTS cert_fallback (
 	for _, m := range []struct{ table, column, decl string }{
 		{"certificates", "deploy_confirmed", "INTEGER NOT NULL DEFAULT 0"},
 		{"orders", "identifiers", "TEXT NOT NULL DEFAULT ''"},
+		{"orders", "deployment_cert_id", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.ensureColumn(m.table, m.column, m.decl); err != nil {
 			return err
@@ -598,13 +605,13 @@ func (s *Store) PutCert(c *CertState) error {
 // GetOrder reads the in-flight order; returns (nil, nil) when it does not exist.
 func (s *Store) GetOrder(certName string) (*Order, error) {
 	row := s.db.QueryRow(`
-		SELECT cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers
+		SELECT cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers, deployment_cert_id
 		FROM orders WHERE cert_name = ?`, certName)
 
 	o := &Order{}
 	var expiresAt int64
 	err := row.Scan(&o.CertName, &o.OrderURL, &o.FinalizeURL, &o.CertURL, &expiresAt,
-		&o.Status, &o.KeyPEM, &o.Identifiers)
+		&o.Status, &o.KeyPEM, &o.Identifiers, &o.DeploymentCertID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -619,9 +626,9 @@ func (s *Store) GetOrder(certName string) (*Order, error) {
 func (s *Store) PutOrder(o *Order) error {
 	_, err := s.db.Exec(`
 		INSERT INTO orders (
-			cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers, updated_at
+			cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers, deployment_cert_id, updated_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(cert_name) DO UPDATE SET
 			order_url    = excluded.order_url,
 			finalize_url = excluded.finalize_url,
@@ -630,9 +637,10 @@ func (s *Store) PutOrder(o *Order) error {
 			status       = excluded.status,
 			key_pem      = excluded.key_pem,
 			identifiers  = excluded.identifiers,
+			deployment_cert_id = excluded.deployment_cert_id,
 			updated_at   = excluded.updated_at`,
 		o.CertName, o.OrderURL, o.FinalizeURL, o.CertURL, toUnix(o.ExpiresAt), o.Status,
-		o.KeyPEM, o.Identifiers, time.Now().Unix())
+		o.KeyPEM, o.Identifiers, o.DeploymentCertID, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("put order for %s: %w", o.CertName, err)
 	}
