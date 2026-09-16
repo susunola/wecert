@@ -37,8 +37,10 @@ if [[ ! -f "${CONFIG}" ]]; then
 	exit 1
 fi
 
-# Safety gate: never run the test against production.
-if ! grep -q 'acme-staging' "${CONFIG}"; then
+# Safety gate: never run the test against production. The pattern is anchored to the
+# directory key: a bare "acme-staging" anywhere in the file -- a comment mentioning
+# staging, say -- would pass the gate while the real directory points at production.
+if ! grep -qE '^[[:space:]]*directory:.*acme-staging' "${CONFIG}"; then
 	echo "Error: acme.directory in ${CONFIG} is not staging, refusing to run." >&2
 	echo "      The end-to-end test must use staging; otherwise failed retries burn real production quota." >&2
 	exit 1

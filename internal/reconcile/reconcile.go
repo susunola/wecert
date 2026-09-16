@@ -304,7 +304,9 @@ func (r *Reconciler) RunOnce(ctx context.Context) {
 }
 
 // RunCert processes exactly one named certificate. An unknown name returns an
-// error; one already being processed returns ErrAlreadyRunning.
+// error; one already being processed returns ErrAlreadyRunning. Unlike RunAll,
+// the pass's own error is propagated: a caller that asked for one specific
+// certificate needs to hear that it failed, not a bare "accepted".
 func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 	res := r.resolve(ctx)
 	if res == nil {
@@ -320,8 +322,7 @@ func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 	}
 	defer r.release(name)
 
-	r.reconcileOne(ctx, found)
-	return nil
+	return r.reconcileOne(ctx, found)
 }
 
 // StartCert processes one certificate asynchronously.
@@ -398,8 +399,10 @@ func (r *Reconciler) StartAll(ctx context.Context) []string {
 }
 
 // reconcileOne processes one certificate and mirrors the result into metrics
-// and notifications.
-func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) {
+// and notifications. The pass's error is returned for callers that need it
+// (RunCert); RunAll and startCert deliberately discard it -- one failing
+// certificate must not stall the others.
+func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) error {
 	err := r.manager.Reconcile(ctx, c)
 	if err != nil {
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
@@ -415,6 +418,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) {
 	if r.notifier != nil {
 		r.notifier.Renewal(ctx, c.Name, err)
 	}
+	return err
 }
 
 // probeCert dials a real TLS connection to confirm the live endpoint really
