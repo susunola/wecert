@@ -9,6 +9,45 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
+// splitList parses the comma- or space-separated flag values (-zones, -allow). Sorted output is
+// deliberate: an unsorted allowlist makes Onboarding's binary search miss entries, which silently
+// drops names from certificates.
+func TestSplitListParsesSortsAndDropsBlanks(t *testing.T) {
+	got := splitList(" b.example.com, a.example.com ,, \t , c.example.com ")
+	want := []string{"a.example.com", "b.example.com", "c.example.com"}
+	if len(got) != len(want) {
+		t.Fatalf("splitList = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("splitList = %v, want %v (sorted)", got, want)
+		}
+	}
+	// Whitespace alone separates too, since both are documented as accepted.
+	if got := splitList("x.example.com y.example.com"); len(got) != 2 {
+		t.Errorf("space-separated values must parse, got %v", got)
+	}
+	if got := splitList(""); len(got) != 0 {
+		t.Errorf("splitList(\"\") = %v, want empty", got)
+	}
+}
+
+// firstNonEmpty is what makes "flag beats config beats default" work for the enum options.
+func TestFirstNonEmptyPrefersTheFirstSetValue(t *testing.T) {
+	if got := firstNonEmpty("", "config", "default"); got != "config" {
+		t.Errorf("got %q, want config", got)
+	}
+	if got := firstNonEmpty("flag", "config", "default"); got != "flag" {
+		t.Errorf("got %q, want the flag to win", got)
+	}
+	if got := firstNonEmpty("", "", "default"); got != "default" {
+		t.Errorf("got %q, want the default", got)
+	}
+	if got := firstNonEmpty("", ""); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
 // writeConfig writes the smallest config Load accepts: enforce mode (so no
 // certificates block is needed) with dummy static credentials. TencentSources only
 // constructs API clients, so with these nothing leaves the process before the lock

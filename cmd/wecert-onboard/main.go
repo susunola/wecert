@@ -92,7 +92,7 @@ Flags:
 		budgetWindow = fs.Duration("budget-window", 0, "the budget window (default 168h)")
 		drop         = fs.Float64("drop-threshold", 0, "freeze when the declared name set shrinks by more than this fraction (default 0.30)")
 
-		force   = fs.Bool("force", false, "skip the fuse, the budget and the grace period; only for a change you made on purpose")
+		force   = fs.Bool("force", false, "skip the fuse, the budget, the grace period AND the CLB reference check; only for a change you made on purpose")
 		dryRun  = fs.Bool("dry-run", false, "compute everything but write nothing")
 		asJSON  = fs.Bool("json", false, "print the report as JSON instead of a human summary")
 		quiet   = fs.Bool("quiet", false, "only print the final one-line summary")

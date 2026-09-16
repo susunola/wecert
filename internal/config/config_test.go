@@ -567,3 +567,158 @@ func TestExpiryWarningThresholdScalesWithTheProfile(t *testing.T) {
 		t.Errorf("unknown profile = %v, want the classic threshold %v", got, classic)
 	}
 }
+
+// renewBefore must be shorter than the profile's own validity.
+//
+// The renewal instant is notAfter - renewBefore. A value at or beyond the validity puts
+// that instant in the past the moment the certificate is issued, so every pass decides
+// "renew now" -- and since the same identifier set is ordered each time, the account's
+// 5-per-exact-set/7-day quota is gone within days. ARI normally hides it (its window owns
+// the decision and always sits inside the lifetime), so the mistake only bites when ARI
+// is unavailable.
+func TestLoadRejectsRenewBeforeLongerThanTheValidity(t *testing.T) {
+	path := writeConfig(t, minimalPrefix+`
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+    renewBefore: 2400h
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("classic validity is 90d; a 100d renewBefore must be rejected")
+	}
+	if !strings.Contains(err.Error(), "renewBefore") {
+		t.Errorf("the error should name the field, got %v", err)
+	}
+}
+
+// A sane value still loads, so the bound cannot be satisfied by rejecting everything.
+func TestLoadAcceptsAReasonableRenewBefore(t *testing.T) {
+	path := writeConfig(t, minimalPrefix+`
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+    renewBefore: 480h
+`)
+	if _, err := Load(path); err != nil {
+		t.Fatalf("a 20d renewBefore on the 90d classic profile must load: %v", err)
+	}
+}
+
+// A negative failureFallback count is a typo, not "unset". It used to be silently
+// replaced by the default while every sibling knob in the same block rejects
+// out-of-range values.
+func TestLoadRejectsNegativeFailureFallbackCounts(t *testing.T) {
+	for _, body := range []string{
+		"failureFallback:\n  enabled: true\n  afterFailures: -5\n",
+		"failureFallback:\n  enabled: true\n  minIdentifierFailures: -2\n",
+		"failureFallback:\n  enabled: true\n  minNames: -1\n",
+	} {
+		path := writeConfig(t, minimalPrefix+body+`
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)
+		if _, err := Load(path); err == nil {
+			t.Errorf("a negative value must be rejected rather than silently defaulted:\n%s", body)
+		}
+	}
+}
+
+// A second YAML document is dropped by a single Decode call. KnownFields catches a
+// misspelled key but says nothing about everything after a stray "---", so half a config
+// silently never takes effect -- typically after a copy-paste or a template edit.
+func TestLoadRejectsASecondYAMLDocument(t *testing.T) {
+	path := writeConfig(t, minimalPrefix+`
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+---
+certificates:
+  - name: other-com
+    domains: ["other.com"]
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("a config with two YAML documents must be rejected, not half-ignored")
+	}
+	if !strings.Contains(err.Error(), "more than one YAML document") {
+		t.Errorf("the error should explain the cause, got %v", err)
+	}
+}
+
+// Two certificates asking for the same identifier set share one quota bucket and cover
+// the same names, so the second buys nothing. The desired-state path already rejected
+// this shape via checkNameStability; static and observe mode did not.
+func TestNormalizeRejectsTwoCertificatesWithTheSameIdentifierSet(t *testing.T) {
+	certs := []Certificate{
+		{Name: "a-com", Domains: []string{"a.example.com", "b.example.com"}},
+		{Name: "b-com", Domains: []string{"b.example.com", "a.example.com"}},
+	}
+	err := NormalizeCertificates(certs)
+	if err == nil {
+		t.Fatal("two certificates with the same identifier set must be rejected")
+	}
+	if !strings.Contains(err.Error(), "same identifier set") {
+		t.Errorf("the error should say why, got %v", err)
+	}
+}
+
+// The snapshot interval has a floor. Snapshots are a recovery mechanism, not a change log,
+// and a short interval just fills the disk with near-identical copies of a file holding
+// private keys.
+func TestStateBackupIntervalHasAFloor(t *testing.T) {
+	path := writeConfig(t, minimalPrefix+`
+stateBackup:
+  interval: 5s
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("a 5s snapshot interval must be rejected")
+	}
+	if !strings.Contains(err.Error(), "stateBackup.interval") {
+		t.Errorf("the error should name the field, got %v", err)
+	}
+}
+
+// Defaults must be usable without any stateBackup block at all: the whole point is that
+// backups happen even when nobody configured them.
+func TestStateBackupDefaults(t *testing.T) {
+	path := writeConfig(t, minimalPrefix+`
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.StateBackup.EnabledOr(true) {
+		t.Error("snapshots should be on by default")
+	}
+	if cfg.StateBackup.IntervalDur != DefaultBackupInterval {
+		t.Errorf("interval = %s, want %s", cfg.StateBackup.IntervalDur, DefaultBackupInterval)
+	}
+	if cfg.StateBackup.Keep != DefaultBackupKeep {
+		t.Errorf("keep = %d, want %d", cfg.StateBackup.Keep, DefaultBackupKeep)
+	}
+}
+
+// Retention bounds must reject values that mean nothing sensible.
+func TestStateBackupKeepIsBounded(t *testing.T) {
+	for _, keep := range []string{"-1", "500"} {
+		path := writeConfig(t, minimalPrefix+`
+stateBackup:
+  keep: `+keep+`
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)
+		if _, err := Load(path); err == nil {
+			t.Errorf("keep: %s must be rejected", keep)
+		}
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // The upgrade path must work in place on a database that **already holds data**.
@@ -142,6 +143,86 @@ func TestStateFileIsNotWorldReadable(t *testing.T) {
 		if perm := st.Mode().Perm(); perm&0o077 != 0 {
 			t.Errorf("%s has mode %o: group/other users can access it (want 0600)", filepath.Base(p), perm)
 		}
+	}
+}
+
+// A statePath is operator-supplied, so it may legally contain the SQLite URI's own
+// metacharacters. Before the path was escaped, any '?' truncated the filename at the
+// DSN boundary: SQLite then opened a *different* file and created it with the process
+// umask (0644 under a default umask), while the chmod loop tightened the configured
+// path -- a zero-byte decoy. The account key and every certificate private key ended
+// up in a world-readable -wal.
+func TestStatePathMetacharactersDoNotEscapeThePermissionContract(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no POSIX permission assertions on Windows")
+	}
+
+	// A looser umask than the secure default, so a file created by SQLite itself would
+	// visibly be 0644 rather than 0600-through-luck.
+	old := setUmask(0)
+	defer setUmask(old)
+
+	for _, name := range []string{"state?x.db", "state#x.db", "state%20x.db"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, name)
+
+			s, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open(%q) failed: %v", name, err)
+			}
+			// A private key in the row is what makes a permission slip a leak rather
+			// than an inconvenience.
+			if err := s.PutCert(&CertState{Name: "x", KeyPEM: []byte("SUPERSECRET")}); err != nil {
+				t.Fatalf("PutCert: %v", err)
+			}
+			if err := s.PutAccount(&Account{
+				Directory: "https://acme.test/d", KID: "kid", PrivateKeyPEM: []byte("ACCOUNTKEY"),
+			}); err != nil {
+				t.Fatalf("PutAccount: %v", err)
+			}
+			defer s.Close()
+
+			// Every file this store created must be 0600, and the WAL is the one that
+			// actually carries the key material.
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("ReadDir: %v", err)
+			}
+			for _, e := range entries {
+				if e.IsDir() || filepath.Ext(e.Name()) == ".lock" {
+					continue // the lock file is pre-created 0600 by acquireLock
+				}
+				info, err := e.Info()
+				if err != nil {
+					t.Fatalf("stat %s: %v", e.Name(), err)
+				}
+				if perm := info.Mode().Perm(); perm&0o077 != 0 {
+					t.Errorf("%s has mode %o: the private keys are readable by group/other "+
+						"(a metacharacter in statePath used to make SQLite open a different, "+
+						"world-readable file)", e.Name(), perm)
+				}
+			}
+
+			// The configured path must be the file that actually holds the data: if it
+			// is a zero-byte decoy, a backup of statePath restores nothing.
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat configured statePath: %v", err)
+			}
+			if info.Size() == 0 {
+				t.Errorf("the configured statePath %q is empty: the data went to a different file", name)
+			}
+
+			// And the pragmas must have survived the escaping.
+			var busy int
+			if err := s.db.QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil {
+				t.Fatalf("read busy_timeout: %v", err)
+			}
+			if busy != 5000 {
+				t.Errorf("busy_timeout = %d, want 5000: the DSN pragmas were not applied", busy)
+			}
+		})
 	}
 }
 
@@ -334,5 +415,51 @@ func TestMigrateAddsDeployConfirmedToLegacyDB(t *testing.T) {
 	}
 	if !got.DeployConfirmed {
 		t.Error("deploy_confirmed did not round-trip after the migration")
+	}
+}
+
+// A legacy retired_certificates table has no archived material, and upgrading must add the
+// columns without losing the reclaim rows: those rows are the only record that a cloud
+// certificate still has to be deleted, so dropping them would leak quota forever.
+func TestMigrateAddsArchiveColumnsToLegacyRetiredTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE retired_certificates (
+			cert_id    TEXT PRIMARY KEY,
+			cert_name  TEXT NOT NULL,
+			retired_at INTEGER NOT NULL
+		);
+		INSERT INTO retired_certificates (cert_id, cert_name, retired_at)
+		VALUES ('cloud-old', 'legacy', 1000000);
+	`)
+	if err != nil {
+		t.Fatalf("building the legacy table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a legacy db failed: %v", err)
+	}
+	defer s.Close()
+
+	// The reclaim row must survive, with empty material rather than an invented value.
+	retired, err := s.ListRetiredCertsBefore(time.Unix(2000000, 0))
+	if err != nil {
+		t.Fatalf("ListRetiredCertsBefore: %v", err)
+	}
+	if len(retired) != 1 || retired[0].CertID != "cloud-old" {
+		t.Fatalf("the legacy reclaim row was lost: %+v", retired)
+	}
+	if len(retired[0].CertPEM) != 0 || len(retired[0].KeyPEM) != 0 {
+		t.Errorf("a legacy row has no archive; got cert=%q key=%q",
+			retired[0].CertPEM, retired[0].KeyPEM)
 	}
 }

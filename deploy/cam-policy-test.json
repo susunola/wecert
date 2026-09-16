@@ -6,10 +6,12 @@
       "effect": "allow",
       "action": [
         "ssl:UploadCertificate",
-        "ssl:DescribeCertificate",
         "ssl:DescribeCertificates",
         "ssl:DeleteCertificate",
-        "ssl:UpdateCertificateInstance"
+        "ssl:UpdateCertificateInstance",
+        "ssl:DescribeHostUpdateRecordDetail",
+        "ssl:CreateCertificateBindResourceSyncTask",
+        "ssl:DescribeCertificateBindResourceTaskResult"
       ],
       "resource": ["*"]
     },

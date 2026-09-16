@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
+	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	dnspod "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
 )
@@ -272,5 +273,48 @@ func TestListAllPagesPropagatesFetchErrors(t *testing.T) {
 		return certPage{}, boom
 	}); err == nil {
 		t.Fatal("a fetch failure must be returned")
+	}
+}
+
+// ── error classification ─────────────────────────────────────────────────────────────
+
+// isNoRecord decides whether a DNS failure means "there is no such record" (fine) or "the call
+// failed" (not fine). Reading a permission error as "no record" would make the delegation check
+// pass on a zone that is not delegated at all.
+func TestIsNoRecordOnlyMatchesTheAbsenceCode(t *testing.T) {
+	for _, tc := range []struct {
+		code string
+		want bool
+	}{
+		{"ResourceNotFound.NoDataOfRecord", true},
+		// A real failure must never be swallowed as "no record".
+		{"AuthFailure.SignatureFailure", false},
+		{"RequestLimitExceeded", false},
+		{"InternalError", false},
+		// A near-miss code is still not the absence code.
+		{"ResourceNotFound", false},
+		{"InvalidParameter.DomainNotExist", false},
+	} {
+		var err error
+		if tc.code != "" {
+			err = tcerrors.NewTencentCloudSDKError(tc.code, "message", "request-1")
+		}
+		if got := isNoRecord(err); got != tc.want {
+			t.Errorf("isNoRecord(%q) = %v, want %v", tc.code, got, tc.want)
+		}
+	}
+}
+
+// A non-SDK error still gets the substring check, which is what a wrapped or re-worded error
+// from a different layer looks like.
+func TestIsNoRecordFallsBackToTheSubstring(t *testing.T) {
+	if !isNoRecord(errors.New("dnspod: ResourceNotFound.NoDataOfRecord")) {
+		t.Error("a non-SDK error carrying the code should still be recognised")
+	}
+	if isNoRecord(errors.New("dnspod: something else went wrong")) {
+		t.Error("an unrelated error must not be read as an absent record")
+	}
+	if isNoRecord(nil) {
+		t.Error("nil must not be read as an absent record")
 	}
 }

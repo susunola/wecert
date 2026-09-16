@@ -58,6 +58,11 @@ type fakeAPI struct {
 	orders   []legoacme.ExtendedOrder
 	orderIdx int
 
+	// orderErr, when a beforeCall hook sets it, makes NewOrder fail. It models a CA that
+	// refuses an order outright (an invalid authorization), which is a different failure
+	// from a scripted order that later turns out invalid.
+	orderErr error
+
 	// authzByURL overrides GetAuthorization per authorization URL. URLs left out keep the
 	// default "everything is valid" answer, so only the tests that need a failing -- or a
 	// wildcard -- authorization have to populate it.
@@ -90,8 +95,14 @@ type fakeAPI struct {
 
 	// certNotAfter and certDomains shape an issued certificate. An unset certNotAfter means
 	// 90 days; an empty certDomains means "the names the order was placed for".
-	certNotAfter time.Time
-	certDomains  []string
+	//
+	// certNotAfterFn is the dynamic form, for tests whose clock moves: a renewal has to
+	// come back with a certificate that is newer than the one already deployed, and a
+	// pinned notAfter cannot express that once the live certificate was issued by an
+	// earlier pass of the same test.
+	certNotAfter   time.Time
+	certNotAfterFn func() time.Time
+	certDomains    []string
 
 	// orderKeyPEM lets the fake read the private key the flow generated for its order, so a
 	// pass that resumes an order finalized in an earlier process still gets a usable
@@ -134,9 +145,11 @@ func (f *fakeAPI) callLog() []string {
 }
 
 func (f *fakeAPI) NewOrder(domains []string, opts *api.OrderOptions) (legoacme.ExtendedOrder, error) {
-	f.enter("NewOrder")
+	// Record the arguments BEFORE enter(), so a beforeCall hook observes the same
+	// identifier set this call is ordering. Hooks that emulate a CA rejecting a
+	// particular name need exactly that; a hook that only asserts "which call came
+	// first" is unaffected either way.
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.newOrderDomains = append([]string(nil), domains...)
 	f.newOrderOpts = opts
 	replaces := ""
@@ -144,10 +157,20 @@ func (f *fakeAPI) NewOrder(domains []string, opts *api.OrderOptions) (legoacme.E
 		replaces = opts.ReplacesCertID
 	}
 	f.newOrderReplaces = append(f.newOrderReplaces, replaces)
+	f.orderErr = nil
+	f.mu.Unlock()
+
+	f.enter("NewOrder")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.newOrderErr != nil {
 		err := f.newOrderErr
 		f.newOrderErr = nil
 		return legoacme.ExtendedOrder{}, err
+	}
+	if f.orderErr != nil {
+		return legoacme.ExtendedOrder{}, f.orderErr
 	}
 	if len(f.orders) == 0 {
 		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: NewOrder has no scripted orders")
@@ -281,6 +304,9 @@ func (f *fakeAPI) issueForCSR() []byte {
 	}
 
 	notAfter := f.certNotAfter
+	if f.certNotAfterFn != nil {
+		notAfter = f.certNotAfterFn()
+	}
 	if notAfter.IsZero() {
 		notAfter = time.Now().Add(90 * 24 * time.Hour)
 	}
