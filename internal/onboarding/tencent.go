@@ -156,8 +156,18 @@ func (d *DNSPodDeclarations) listZones(ctx context.Context, client dnspodAPI) ([
 		if err != nil {
 			return nil, fmt.Errorf("list DNS zones: %w", err)
 		}
+		// The typed Response is a pointer the SDK leaves nil when the body carries no
+		// result, so this must be checked before it is dereferenced. Without it a
+		// well-formed HTTP 200 with `{"Response":null}` -- or an API/version mismatch --
+		// panics the whole onboarding command, and no desired state is written that round.
+		if resp == nil || resp.Response == nil {
+			return nil, fmt.Errorf("list DNS zones: the API returned no result")
+		}
 		list := resp.Response.DomainList
 		for _, z := range list {
+			if z == nil {
+				continue
+			}
 			if z.Name != nil && *z.Name != "" {
 				zones = append(zones, strings.ToLower(*z.Name))
 			}
@@ -195,10 +205,13 @@ func (d *DNSPodDeclarations) listTXTRecords(ctx context.Context, client dnspodAP
 		if err != nil {
 			return nil, fmt.Errorf("list TXT records: %w", err)
 		}
+		if resp == nil || resp.Response == nil {
+			return nil, fmt.Errorf("list TXT records: the API returned no result")
+		}
 
 		list := resp.Response.RecordList
 		for _, rec := range list {
-			if rec.Type == nil || !strings.EqualFold(*rec.Type, "TXT") || rec.Name == nil {
+			if rec == nil || rec.Type == nil || !strings.EqualFold(*rec.Type, "TXT") || rec.Name == nil {
 				continue
 			}
 			full := joinRecordName(*rec.Name, zone)
@@ -328,15 +341,27 @@ var newCLBClient = func(cred common.CredentialIface, region string, cpf *profile
 	return clbsdk.NewClient(cred, region, cpf)
 }
 
-// listLoadBalancers returns every layer-7 (HTTP/HTTPS) load balancer in the region.
+// listLoadBalancers returns every load balancer in the region, of either instance
+// generation.
 func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI) ([]string, error) {
 	var out []string
 	var offset int64
 	for {
 		req := clbsdk.NewDescribeLoadBalancersRequest()
-		// Forward=1 fetches application (layer-7) only. Layer-4 instances have no
-		// rule domains, and pulling them in just adds calls that always fail.
-		req.Forward = common.Int64Ptr(1)
+		// Forward is deliberately NOT set. Despite the name it is not "layer 7 only": the
+		// SDK documents it as the instance GENERATION -- 1 is a general instance, 0 is a
+		// classic one, and omitting it returns both. The code here used to send 1 with a
+		// comment claiming it meant "application (layer-7) only".
+		//
+		// That mattered because of what the result feeds: listLoadBalancers supplies the
+		// ids whose listener rules become the CLB guard, and guard 1 REJECTS a declaration
+		// when no rule serves its name ("guard 1 not satisfied"). A name fronted by a
+		// classic instance would therefore be invisible, judged unreferenced, and dropped
+		// from the desired state -- the dangerous direction, and silent.
+		//
+		// Asking for both costs one extra DescribeListeners per classic instance, and that
+		// call is already tolerated: a layer-4 instance simply has no rules, so it
+		// contributes nothing rather than failing.
 		req.Offset = common.Int64Ptr(offset)
 		req.Limit = common.Int64Ptr(clbPageSize)
 
@@ -344,8 +369,14 @@ func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI) ([]stri
 		if err != nil {
 			return nil, fmt.Errorf("describe load balancers: %w", err)
 		}
+		if resp == nil || resp.Response == nil {
+			return nil, fmt.Errorf("describe load balancers: the API returned no result")
+		}
 		list := resp.Response.LoadBalancerSet
 		for _, lb := range list {
+			if lb == nil {
+				continue
+			}
 			if lb.LoadBalancerId != nil && *lb.LoadBalancerId != "" {
 				out = append(out, *lb.LoadBalancerId)
 			}
@@ -375,11 +406,17 @@ func (r *CLBRules) listRuleDomainsFor(ctx context.Context, client clbAPI, lbID s
 	if err != nil {
 		return nil, fmt.Errorf("describe listeners: %w", err)
 	}
+	if resp == nil || resp.Response == nil {
+		return nil, fmt.Errorf("describe listeners: the API returned no result")
+	}
 
 	var out []string
 	for _, l := range resp.Response.Listeners {
+		if l == nil {
+			continue
+		}
 		for _, rule := range l.Rules {
-			if rule.Domain == nil {
+			if rule == nil || rule.Domain == nil {
 				continue
 			}
 			if d := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(*rule.Domain), ".")); d != "" {

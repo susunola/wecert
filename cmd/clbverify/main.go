@@ -211,22 +211,6 @@ func noListenersError(lbID, listenerID string) error {
 	return fmt.Errorf("CLB %s has no listeners", lbID)
 }
 
-// fetchCertID queries the listener's currently bound primary certificate ID once.
-//
-// With an empty listenerID it takes the first listener, the same way the main path does
-// -- passing an empty ListenerIds makes the API error out, which the wait loop would then
-// retry as though it were a network blip.
-func fetchCertID(ctx context.Context, client *clb.Client, lbID, listenerID string) (string, error) {
-	ids, err := fetchBoundCertIDs(ctx, client, lbID, listenerID)
-	if err != nil {
-		return "", err
-	}
-	if len(ids) == 0 {
-		return "", fmt.Errorf("no certificate bound")
-	}
-	return ids[0], nil
-}
-
 // fetchBoundCertIDs returns every certificate the listener carries, primary first.
 //
 // The assertions need the whole set, not just the primary: a listener may serve the

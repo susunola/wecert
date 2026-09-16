@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,12 @@ type Notifier struct {
 	client *http.Client
 	log    *slog.Logger
 	sem    chan struct{}
+
+	// mu guards draining, which is only ever set once.
+	mu sync.Mutex
+	// draining stops new notifications from being accepted, so Drain has a fixed set of
+	// in-flight sends to wait for instead of racing a moving target.
+	draining bool
 }
 
 type RenewalEvent struct {
@@ -66,6 +73,14 @@ func (n *Notifier) Renewal(ctx context.Context, certName string, reconcileErr er
 		ev.Result = "error"
 		ev.Error = reconcileErr.Error()
 	}
+	n.mu.Lock()
+	if n.draining {
+		n.mu.Unlock()
+		n.log.Warn("dropping a renewal notification; the notifier is shutting down", "cert", ev.Cert)
+		return
+	}
+	n.mu.Unlock()
+
 	ctx = context.WithoutCancel(ctx)
 	select {
 	case n.sem <- struct{}{}:
@@ -111,4 +126,36 @@ func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
 		return
 	}
 	n.log.Debug("renewal notification delivered", "cert", ev.Cert, "result", ev.Result)
+}
+
+// Drain waits for the notifications already in flight, up to the context's deadline.
+//
+// Delivery is fire-and-forget: Renewal hands the POST to a goroutine and returns, so
+// nothing waited for it. That is fine while the daemon keeps running, but a one-shot run
+// (-once) or a shutdown can exit with the POST still in flight, and the notification is
+// then simply lost -- including the "result":"error" one, which is the notification an
+// operator most needs. The 10s per-send timeout means the wait is bounded even if the
+// receiver never answers.
+//
+// The wait is expressed through the semaphore rather than a WaitGroup because the
+// semaphore already exists and is held for exactly the duration of a send: filling it means
+// every holder has released, that is, every send has finished.
+func (n *Notifier) Drain(ctx context.Context) {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	n.draining = true
+	n.mu.Unlock()
+
+	// Filling the buffer means every holder released. The first acquisition cannot block
+	// for long even when nothing is in flight (a free slot is taken immediately); the loop
+	// is what makes it a barrier rather than a single probe.
+	for i := 0; i < maxNotifyInFlight; i++ {
+		select {
+		case n.sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
