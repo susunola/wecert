@@ -9,6 +9,8 @@
 > | 本文 | 分层策略、覆盖基线、缺口优先级、发布判据 |
 > | [`docs/lifecycle-acceptance.md`](lifecycle-acceptance.md) | 端到端验收用例 TC-LIFECYCLE-01（Part A 生命周期 A0–A9 / Part B 声明层 B0–B5b） |
 > | [`testenv/README.md`](../testenv/README.md) | 部署侧 Stage A / B / B2 / B3 / C，含真实 CLB 与 SNI |
+> | [`docs/stage-c-cvm-systemd.md`](stage-c-cvm-systemd.md) | L4 · Stage C：真机 + systemd + CVM 角色（**未跑**） |
+> | [`docs/sni-multicert.md`](sni-multicert.md) | L4 · SNI 多证书互不干扰 + `scripts/e2e-sni.sh`（**未跑**） |
 
 ---
 
@@ -40,6 +42,8 @@
 | **L3 端到端（staging）** | 真实 ACME + 真实 DNSPod 的全流程 | `docs/lifecycle-acceptance.md`、`scripts/e2e-test.sh` | 本地，人工 | 发版前 / 改动触及状态机时 |
 | **L3 端到端（staging，自动化）** | 同上，但由 `wecert-onboard` 驱动声明、`wecert-probe` 独立佐证 | `scripts/e2e.sh` 输出的 [实跑报告](e2e-run-2026-09-17.html) | 本地，人工 | 同上 |
 | **L4 部署验收** | 真实 CLB 绑定、SNI、TLS 实际握手、CVM 角色 | `testenv/`（Terraform）、`scripts/run-stage-ab.sh`、`scripts/validate-cloudinit.py` | 腾讯云测试账号，人工 | 发版前 / 改动触及部署时 |
+| **L4 部署验收 · Stage C（未跑）** | 真机 + systemd + **CVM 角色**（不落任何静态密钥）一路跑到一次真续期 | [`docs/stage-c-cvm-systemd.md`](stage-c-cvm-systemd.md)、`testenv/`（`create_cvm=true` + `enable_cvm_role=true`）、`install.sh`、`deploy/systemd/*.unit` | 腾讯云测试账号 + 测试域名 + 公网出口，**人工 / 需要账号** | 发版前 / 改动触及 systemd、安装脚本或凭证路径时 |
+| **L4 部署验收 · SNI 多证书（未跑）** | 同一 listener 上两张证书，续期其中一张不能动另一张 | [`docs/sni-multicert.md`](sni-multicert.md)、`scripts/e2e-sni.sh`、`bin/wecert-clbverify` | 腾讯云测试账号（`clb:DescribeListeners`）+ 一个多证书 SNI listener，**人工 / 需要账号** | 发版前 / 改动触及部署、`UpdateCertificateInstance` 调用或 CLB 行为时 |
 | **L5 线上巡检** | 生产上"证书真的在服务" | `wecert-probe`、`tatrun`、Prometheus 指标 | 生产 | 持续 |
 
 **L3/L4 是人工的，这不是偷懒，是结构性的** —— 见第 6 节。
@@ -336,7 +340,9 @@ spec / 熔断      ██████░░░░░░░░░░░░░░ 
 - [ ] **覆盖率不低于上一版本**（P0-3 落地后自动校验）
 - [ ] **`CHANGELOG.md` 已更新**，且 `Tests` 段落如实反映新增测试
 - [ ] 改动触及**订单状态机 / DNS 挑战 / 清理** → 必须跑 **L3 的 8 条最小 PASS 判据**
-- [ ] 改动触及**部署 / CLB / SNI** → 必须跑 **L4 Stage B 或 B2**
+- [ ] 改动触及**部署 / CLB / SNI** → 必须跑 **L4 Stage B 或 B2**；改动触及 **systemd / 安装脚本 /
+  凭证路径** → 跑 **L4 Stage C**；改动触及 `UpdateCertificateInstance` 的调用方式 → 跑
+  **L4 SNI 多证书**（`scripts/e2e-sni.sh`）
 - [ ] 改动触及**声明层 / desired state** → 必须跑 **Part B（至少 B4 + B5a）**
 - [ ] 若本次修的是"绿灯下的慢性病"（配额泄漏、DNS 垃圾、覆盖丢失）→ 回归测试必须包含**已被验证过会失败的用例**
 
@@ -391,10 +397,25 @@ cp e2e-config.example.yaml e2e-config.yaml      # 填 token 与测试域名
 ./scripts/run-stage-ab.sh <域名> <邮箱> --yes    # 真正创建资源
 make validate-cloudinit                          # cloud-init 本地校验
 
+# L4 · Stage C：真机 + systemd + CVM 角色（完整跑法见 docs/stage-c-cvm-systemd.md）
+cd testenv
+terraform plan  -input=false -out=tfplan \
+  -var create_cvm=true -var enable_cvm_role=true -var cam_role_name=wecert-test-role
+terraform apply -input=false tfplan
+
+# L4 · SNI 多证书：续期 A 不能动 B（需要账号，缺凭据直接退非 0，不 skip）
+make build tools
+./scripts/e2e-sni.sh <region> <clb-id> <listener-id> <cert-id-A> <cert-id-B>   # 不加 --yes 只打印计划
+./scripts/e2e-sni.sh <region> <clb-id> <listener-id> <cert-id-A> <cert-id-B> --yes
+
 # 其它门禁
 make check-english     # 源码里不许有中文（.md 除外）
 make diagrams-check    # 图表是否过期/溢出
+make check-scripts     # shell 脚本的自测（目前只覆盖 e2e-wildcard）
 ```
+
+> `scripts/e2e-sni.sh` 目前**不在** `make check-scripts` 里：它的断言需要真实 listener，
+> 本机没有凭据时按设计直接失败。用哪个 shell 门禁覆盖它待定（`shellcheck scripts/e2e-sni.sh` 是干净的）。
 
 ---
 
@@ -403,3 +424,4 @@ make diagrams-check    # 图表是否过期/溢出
 | 日期 | 变更 |
 |---|---|
 | 2026-09-16 | 首版。基线 `c6d6a51` / v0.4.2：总覆盖率 61.0%，384 个用例，识别出 4 个 P0 缺口 |
+| 2026-09-17 | 第 2 节新增两条 L4 行：Stage C（真机 + systemd + CVM 角色）与 SNI 多证书，均**未跑**、人工 / 需要账号；配套 `docs/stage-c-cvm-systemd.md`、`docs/sni-multicert.md`、`scripts/e2e-sni.sh` |
