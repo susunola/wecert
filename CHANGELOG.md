@@ -31,6 +31,19 @@
 
 ### Fixed
 
+- A certificate moved to a wholly different domain set can be issued again.
+  The coverage-drift path passed the live certificate's ARI certID as `replaces`
+  unconditionally, and Let's Encrypt refuses an order whose identifiers do not
+  overlap the certificate it would replace:
+  `malformed :: Could not validate ARI 'replaces' field`. That error comes back
+  from `newOrder`, so no order is created -- and because `ari_cert_id` only
+  changes after a successful issuance, every later round sends the same value and
+  is refused the same way. The certificate could never be reissued at all. The
+  drift path no longer sends `replaces` (a changed identifier set is not a
+  same-set renewal and gets no ARI exemption anyway), and `issue` now retries
+  once without it if a CA refuses the field for any other reason, so no refused
+  `replaces` can ever be a dead end. Found by running the lifecycle acceptance
+  case against real Let's Encrypt staging.
 - A `{"certs": null}` trigger is rejected with 400 instead of escalating to a
   full-fleet convergence. `json.Unmarshal` leaves both an absent `certs` key
   and `"certs": null` as a nil pointer, and null is what a Go caller
