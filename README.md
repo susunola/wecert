@@ -314,4 +314,4 @@ Exit codes: `0` served as expected · `1` could not complete a probe · `2` prob
 
 ## License
 
-No license file is present, which means all rights reserved by default. **Add one before distributing or accepting external contributions.**
+[MIT](LICENSE)

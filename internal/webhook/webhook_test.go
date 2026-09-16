@@ -52,7 +52,11 @@ func newTestServer(t *testing.T, rec Reconciler) (*Server, *state.Store) {
 	t.Cleanup(func() { _ = store.Close() })
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(rec, store, testToken, context.Background(), log), store
+	srv, err := New(rec, store, testToken, context.Background(), log)
+	if err != nil {
+		t.Fatalf("failed to build the webhook server: %v", err)
+	}
+	return srv, store
 }
 
 func do(t *testing.T, s *Server, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -100,6 +104,20 @@ func TestAuthIsRequired(t *testing.T) {
 	}
 	if len(rec.started) != 0 {
 		t.Errorf("auth failure should trigger nothing, got %v", rec.started)
+	}
+}
+
+// An empty configured token must be rejected at construction: "Bearer " would
+// otherwise compare equal to it.
+func TestNewRejectsEmptyToken(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("failed to open the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := New(rec, store, "", context.Background(), nil); err == nil {
+		t.Fatal("New with an empty token should fail")
 	}
 }
 

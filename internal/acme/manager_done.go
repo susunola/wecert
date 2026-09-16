@@ -266,7 +266,10 @@ func parseOrderExpires(raw string, now time.Time) (time.Time, error) {
 	return fallback, fmt.Errorf("cannot parse expires %q", raw)
 }
 
-func (m *Manager) persistOrder(o *state.Order, order legoacme.ExtendedOrder) {
+// persistOrder returns the write error instead of only logging it: a failed
+// PutOrder means the crash-recovery path would resume from stale state, which
+// contradicts the order-persistence invariants this package is built around.
+func (m *Manager) persistOrder(o *state.Order, order legoacme.ExtendedOrder) error {
 	o.Status = order.Status
 	// Never overwrite a persisted finalize URL with an empty value -- losing it makes
 	// submitting the CSR impossible later.
@@ -277,8 +280,9 @@ func (m *Manager) persistOrder(o *state.Order, order legoacme.ExtendedOrder) {
 		o.CertURL = order.Certificate
 	}
 	if err := m.store.PutOrder(o); err != nil {
-		m.log.Warn("failed to update the order state", "cert", o.CertName, "err", err)
+		return fmt.Errorf("update the order state: %w", err)
 	}
+	return nil
 }
 
 func pickDNS01(authz legoacme.Authorization) (legoacme.Challenge, error) {

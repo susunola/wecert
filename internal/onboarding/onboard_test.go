@@ -269,6 +269,23 @@ func TestSourceFailureDoesNotAdvanceTheGraceClock(t *testing.T) {
 
 // ── §5.2 abrupt desired-state fuse ─────────────────────────────────────────
 
+// A DropThreshold at or above 1 can never be exceeded, so the fuse would never
+// fire. The config layer rejects it, but the CLI -drop-threshold flag reaches
+// Options directly -- the constructor must hold the same line.
+func TestDropThresholdAtOrAboveOneIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		DocumentPath:  filepath.Join(dir, "desired-state.yaml"),
+		StatePath:     filepath.Join(dir, "onboard-state.json"),
+		ReportPath:    filepath.Join(dir, "report.json"),
+		DropThreshold: 30,
+	}
+	_, err := New(Sources{Declarations: &fakeDeclarations{}, Rules: &fakeRules{}}, opts, testLogger())
+	if err == nil {
+		t.Fatal("DropThreshold >= 1 must be rejected: the abrupt-change fuse would never fire")
+	}
+}
+
 // A normal decommission does not remove a third of the set. Losing a third at once
 // is almost certainly an upstream fault (incomplete API response, changed
 // permissions, zone read failure). Acting on it strips SANs in bulk.

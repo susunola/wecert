@@ -327,9 +327,9 @@ Previously the only way to test was `curl --resolve` or `openssl -connect` with 
 IP, because `test.alpha` / `test.beta` had no resolution records at all. Once the A
 records exist, a browser can open them directly.
 
-Note that `alpha` / `beta` are **not separate zones**, only subdomains of
-`atomwangnus.com`, so the records are created in `atomwangnus.com` with
-`sub_domain` written as `test.alpha`.
+Note that `alpha` / `beta` are **not separate zones**, only subdomains of the
+`dns_zone` apex, so the records are created in that zone with `sub_domain`
+written as `test.alpha`.
 
 ### CLB security group: open by default, on purpose
 
