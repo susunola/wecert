@@ -3,12 +3,22 @@ package webhook
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"time"
 )
+
+// maxNotifyInFlight caps outstanding notification POSTs.
+//
+// Renewal is asynchronous so a dead target cannot stall convergence, but
+// without a cap a flapping URL plus a large certificate list grows
+// unbounded goroutines.
+const maxNotifyInFlight = 8
 
 // Notifier pushes renewal results to an external URL.
 //
@@ -17,8 +27,10 @@ import (
 // should only know "someone wants to know the result", not how it is sent.
 type Notifier struct {
 	url    string
+	secret string
 	client *http.Client
 	log    *slog.Logger
+	sem    chan struct{}
 }
 
 // RenewalEvent is the event body pushed outward.
@@ -31,16 +43,18 @@ type RenewalEvent struct {
 }
 
 // NewNotifier builds a notifier. An empty url returns nil; callers treat nil as
-// a no-op.
-func NewNotifier(url string, log *slog.Logger) *Notifier {
+// a no-op. secret, when non-empty, HMAC-SHA256-signs the body.
+func NewNotifier(url, secret string, log *slog.Logger) *Notifier {
 	if url == "" {
 		return nil
 	}
 	return &Notifier{
-		url: url,
+		url:    url,
+		secret: secret,
 		// Notifications are best-effort, so keep the timeout short.
 		client: &http.Client{Timeout: 10 * time.Second},
 		log:    log,
+		sem:    make(chan struct{}, maxNotifyInFlight),
 	}
 }
 
@@ -69,7 +83,18 @@ func (n *Notifier) Renewal(ctx context.Context, certName string, reconcileErr er
 	// cancelled here, but "the renewal succeeded" is still worth sending.
 	ctx = context.WithoutCancel(ctx)
 
-	go n.send(ctx, ev)
+	select {
+	case n.sem <- struct{}{}:
+	default:
+		n.log.Warn("dropping a renewal notification; too many already in flight",
+			"cert", ev.Cert, "limit", maxNotifyInFlight)
+		return
+	}
+
+	go func() {
+		defer func() { <-n.sem }()
+		n.send(ctx, ev)
+	}()
 }
 
 func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
@@ -88,6 +113,11 @@ func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if n.secret != "" {
+		mac := hmac.New(sha256.New, []byte(n.secret))
+		_, _ = mac.Write(body)
+		req.Header.Set("X-Wecert-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	}
 
 	resp, err := n.client.Do(req)
 	if err != nil {
