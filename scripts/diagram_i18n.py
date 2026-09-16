@@ -185,8 +185,8 @@ LABELS = {
 PROSE: dict[str, str] = {
     '证书从"有人在 DNS 里加了一行"到"从云上删掉"':
         'From “somebody added a line to a DNS zone” to “deleted from the cloud”',
-    '这套系统唯一的核心纪律是：wecert 永远不推断。 某个东西负责推断意图，并把结论写成一份可 diff 的文件；wecert 只读那份文件做收敛。 下面六张图从系统全景一路下钻到单个订单的状态机。':
-        'The one rule everything else follows: <strong>wecert never infers.</strong>\n    Something else works out what should exist and writes it down; wecert only reads that document and converges.\n    The six diagrams below go from the system map down to the state machine of a single order.',
+    '这套系统唯一的核心纪律是：wecert 永远不推断。 某个东西负责推断意图，并把结论写成一份可 diff 的文件；wecert 只读那份文件做收敛。 下面七张图从要解决的问题一路下钻到单个订单的状态机。':
+        'The one rule everything else follows: <strong>wecert never infers.</strong>\n    Something else works out what should exist and writes it down; wecert only reads that document and converges.\n    The seven diagrams below go from the problem it solves down to the state machine of a single order.',
     '默认模式 static 迁移路径 static → observe → enforce 当前版本 v0.5.0 Go 1.26.5':
         '<span class="badge">default mode <b>static</b></span>\n    <span class="badge">migration <b>static → observe → enforce</b></span>\n    <span class="badge">version <b>v0.5.0</b></span>\n    <span class="badge">Go <b>1.26.5</b></span>',
     '图 ①系统全景：谁拥有什么，谁只读什么':
@@ -583,4 +583,84 @@ PROSE: dict[str, str] = {
         'last updated 2026-09-16 · for v0.5.0',
     'wecert · 证书生命周期架构图 源码 github.com/susunola/wecert':
         '<strong>wecert</strong> · certificate lifecycle<br/>\n      source <code>github.com/susunola/wecert</code>',
+    '⓪ 要解决的场景':
+        'ⓐ The problem',
+    '图 ⓪要解决的问题：证书不在业务机器上':
+        '<span class="num">diagram ⓐ</span>The problem: the certificate is not on the business machines',
+    '图 ⓪':
+        'diagram ⓐ',
+    '这不是"再写一个证书自动续期工具"的场景。TLS 在 CLB 上终结，业务机器上根本没有证书文件 —— 常规做法的前提在这里不成立。下面三块分别是部署形态、为什么现成办法都不行、以及钉死了一切设计的硬约束。':
+        'This is not “yet another certificate renewal tool”. TLS terminates at the CLB and the business machines hold no certificate file at all — so the premise every conventional approach rests on does not hold here. Below: the deployment shape, why the off-the-shelf tools do not fit, and the hard limits that shaped every other decision.',
+    '部署形态 · 证书不在业务机器上':
+        'Deployment shape · the certificate is not on the business machines',
+    '浏览器 / 客户端':
+        'Browser / client',
+    '只认证书，不关心它在哪':
+        'only checks the certificate, never where it lives',
+    '腾讯云 CLB':
+        'Tencent Cloud CLB',
+    'TLS 在这里终结 · SNI · multi_cert_info':
+        'TLS <b>terminates here</b> · SNI · multi_cert_info',
+    '证书挂在监听器上，是一份云端资源':
+        'the certificate is bound to a listener — a cloud resource',
+    'CVM 池':
+        'CVM pool',
+    '只跑业务 · 明文 HTTP':
+        'business only · plain HTTP',
+    'ACME · 90 天 · 速率限制':
+        'ACME · 90 days · rate limits',
+    '证书必须挂在这里 —— 业务机器上没有证书文件可分发':
+        'The certificate has to live here — there is no certificate file on the business machines to distribute',
+    '所以"把证书文件铺到节点上"这个前提，在这个形态下不成立':
+        'so “copy the certificate file onto every node” has no meaning in this shape',
+    '明文 HTTP':
+        'plain HTTP',
+    '所以现成的办法都不成立':
+        'So none of the off-the-shelf approaches fit',
+    'certbot 装在每台 CVM 上':
+        'certbot on every CVM',
+    'TLS 不在 CVM 终结，签出来也没地方用；而且每台机器各自签一次，配额按台数翻倍':
+        'TLS does not terminate on the CVMs, so a certificate there is useless — and each machine would issue its own, multiplying the quota',
+    '这里没有 K8s，只有 CLB 和几台 CVM；而证书最终要挂到 CLB 监听器上，不是一个 Secret':
+        'There is no Kubernetes here, just a CLB and a few CVMs — and the certificate ends up on a <b>CLB listener</b>, not in a Secret',
+    '把证书文件分发到各个节点':
+        'Distribute the certificate file to each node',
+    '节点根本不读证书 —— 解密发生在 LB，铺文件只是把密钥多复制了几份':
+        'The nodes never read a certificate — decryption happens at the LB, so this only makes more copies of the private key',
+    '手工申请 → 上传 → 绑定':
+        'Apply → upload → bind, by hand',
+    '每 90 天一次，全靠人记得；而忘了的表现是线上直接握手失败，不是一条告警':
+        'Once every 90 days, entirely on someone remembering — and forgetting shows up as <b>a broken handshake in production</b>, not as an alert',
+    '硬约束 · 这些数字决定了一切设计':
+        'Hard limits · these numbers shaped every design decision',
+    '90 天 → 47 天':
+        '90 days → 47 days',
+    '2029-03-15 起证书有效期上限':
+        'the validity ceiling from 2029-03-15',
+    '续期频率只会更高':
+        'renewal only gets more frequent',
+    '50 / 7 天':
+        '50 / 7 days',
+    '每注册域的新证书数':
+        'new certificates per registered domain',
+    '跨账号共享，留一半余量':
+        'shared across accounts — keep half in reserve',
+    '5 / 7 天':
+        '5 / 7 days',
+    '精确 identifier 集合':
+        'the exact identifier set',
+    '没有 override，撞了等满一周':
+        'no override; hit it and you wait a week',
+    'ARI 豁免全部限速':
+        'ARI exempts all of them',
+    '前提是同名续期':
+        'but only for a <b>same-name renewal</b>',
+    '域名集合一变，这次签发就重新计入配额':
+        'change the name set and this issuance counts again',
+    '这四张约束里最要命的是最后一张。它意味着改一次域名集合就等于烧掉一次配额， 而"域名随时会变"恰恰是这个项目的前提。所以整套设计绕着一个问题转： 怎么让"加一个域名"这件事尽量不产生新的签发 —— 答案就是通配符优先（见 图 ②）。':
+        'The last of those four is the one that bites: <strong>changing the name set once burns one issuance</strong>, and “domains change all the time” is this project’s premise. So the whole design turns on one question — how to make “add a domain” <strong>avoid producing a new issuance</strong> as often as possible. The answer is wildcard-first (see <a href="#intent">diagram ②</a>).',
+    '图 ②':
+        'diagram ②',
+    'wecert 要解决的场景：CLB 终结 TLS，业务机器上没有证书文件':
+        "wecert's problem scenario: TLS terminates at the CLB and the business machines hold no certificate",
 }

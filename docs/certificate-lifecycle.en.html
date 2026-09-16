@@ -139,6 +139,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 .elab{font:600 11px/1 var(--mono);fill:var(--muted)}
 .elab-bg{fill:var(--card)}
 .elab-danger{font:600 11px/1 var(--mono);fill:var(--danger)}
+.mark-x{font:700 16px/1 var(--mono);fill:var(--danger)}
 .life{stroke:var(--rule-2);stroke-width:1.5;stroke-dasharray:5 5}
 .seq-num{font:700 12px/1 var(--mono);fill:var(--local)}
 .lifelbl{font:700 13px/1 var(--mono);fill:var(--ink)}
@@ -180,7 +181,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
   <h1>From “somebody added a line to a DNS zone” to “deleted from the cloud”</h1>
   <p class="lede">The one rule everything else follows: <strong>wecert never infers.</strong>
     Something else works out what should exist and writes it down; wecert only reads that document and converges.
-    The six diagrams below go from the system map down to the state machine of a single order.</p>
+    The seven diagrams below go from the problem it solves down to the state machine of a single order.</p>
   <div class="badges">
     <span class="badge">default mode <b>static</b></span>
     <span class="badge">migration <b>static → observe → enforce</b></span>
@@ -191,6 +192,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 </header>
 
 <nav class="toc">
+  <a href="#problem">ⓐ The problem</a>
   <a href="#map">① System map</a>
   <a href="#intent">② Intent → contract</a>
   <a href="#decide">③ Reconcile decisions</a>
@@ -202,6 +204,134 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
   <a href="#limits">Rate-limit arithmetic</a>
   <a href="#gotchas">Pitfalls</a>
 </nav>
+
+<!-- ══════════════════════════════════════════════════════════ ⓪ -->
+<section id="problem">
+  <h2><span class="num">diagram ⓐ</span>The problem: the certificate is not on the business machines</h2>
+  <p class="cap">This is not “yet another certificate renewal tool”. TLS terminates at the CLB and the business machines hold no certificate file at all — so the premise every conventional approach rests on does not hold here. Below: the deployment shape, why the off-the-shelf tools do not fit, and the hard limits that shaped every other decision.</p>
+
+  <figure>
+  <div class="scroll">
+  <svg viewBox="0 0 1228 690" role="img" aria-label="wecert's problem scenario: TLS terminates at the CLB and the business machines hold no certificate">
+    <defs>
+      <marker id="a0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-edge" d="M0 0 L10 5 L0 10 z"/></marker>
+    </defs>
+
+    <!-- ── 带 1：部署形态 ── -->
+    <rect class="zone" x="24" y="44" width="1180" height="232" rx="14"/>
+    <text class="zone-title" x="36" y="34">Deployment shape · the certificate is not on the business machines</text>
+
+    <rect class="bx" x="44" y="100" width="176" height="64" rx="8"/>
+    <foreignObject x="44" y="100" width="176" height="64">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Browser / client<span class="s">only checks the certificate, never where it lives</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-local" x="336" y="80" width="340" height="104" rx="8"/>
+    <foreignObject x="336" y="80" width="340" height="104">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Tencent Cloud CLB<span class="s">TLS <b>terminates here</b> · SNI · multi_cert_info</span>
+        <span class="s">the certificate is bound to a listener — a cloud resource</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx" x="790" y="100" width="200" height="64" rx="8"/>
+    <foreignObject x="790" y="100" width="200" height="64">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">CVM pool<span class="s">business only · plain HTTP</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-ext" x="336" y="204" width="340" height="56" rx="8"/>
+    <foreignObject x="336" y="204" width="340" height="56">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">Let's Encrypt
+        <span class="s">ACME · 90 days · rate limits</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-danger" x="730" y="188" width="460" height="88" rx="8"/>
+    <foreignObject x="730" y="188" width="460" height="88">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">The certificate has to live here — there is no certificate file on the business machines to distribute<span class="s">so “copy the certificate file onto every node” has no meaning in this shape</span>
+      </div>
+    </foreignObject>
+
+    <path class="edge" d="M220 132 H336" marker-end="url(#a0)"/>
+    <path class="edge" d="M676 132 H790" marker-end="url(#a0)"/>
+    <path class="edge-dash" d="M506 184 V204" marker-end="url(#a0)"/>
+
+    <rect class="elab-bg" x="238" y="118" width="80" height="16" rx="3"/>
+    <text class="elab" x="278" y="130" text-anchor="middle">HTTPS</text>
+    <rect class="elab-bg" x="694" y="118" width="78" height="16" rx="3"/>
+    <text class="elab" x="733" y="130" text-anchor="middle">plain HTTP</text>
+
+    <!-- ── 带 2：现成办法为什么不成立 ── -->
+    <rect class="zone" x="24" y="304" width="1180" height="196" rx="14"/>
+    <text class="zone-title" x="36" y="294">So none of the off-the-shelf approaches fit</text>
+
+    <rect class="bx" x="44" y="330" width="1140" height="36" rx="8"/>
+    <text class="mark-x" x="62" y="353">✗</text>
+    <foreignObject x="84" y="330" width="1084" height="36">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">certbot on every CVM<span class="s">TLS does not terminate on the CVMs, so a certificate there is useless — and each machine would issue its own, multiplying the quota</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx" x="44" y="374" width="1140" height="36" rx="8"/>
+    <text class="mark-x" x="62" y="397">✗</text>
+    <foreignObject x="84" y="374" width="1084" height="36">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">cert-manager + Kubernetes
+        <span class="s">There is no Kubernetes here, just a CLB and a few CVMs — and the certificate ends up on a <b>CLB listener</b>, not in a Secret</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx" x="44" y="418" width="1140" height="36" rx="8"/>
+    <text class="mark-x" x="62" y="441">✗</text>
+    <foreignObject x="84" y="418" width="1084" height="36">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">Distribute the certificate file to each node<span class="s">The nodes never read a certificate — decryption happens at the LB, so this only makes more copies of the private key</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx" x="44" y="462" width="1140" height="36" rx="8"/>
+    <text class="mark-x" x="62" y="485">✗</text>
+    <foreignObject x="84" y="462" width="1084" height="36">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo left">Apply → upload → bind, by hand<span class="s">Once every 90 days, entirely on someone remembering — and forgetting shows up as <b>a broken handshake in production</b>, not as an alert</span>
+      </div>
+    </foreignObject>
+
+    <!-- ── 带 3：硬约束 ── -->
+    <rect class="zone" x="24" y="528" width="1180" height="140" rx="14"/>
+    <text class="zone-title" x="36" y="518">Hard limits · these numbers shaped every design decision</text>
+
+    <rect class="bx-danger" x="44" y="548" width="276" height="100" rx="8"/>
+    <foreignObject x="44" y="548" width="276" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">90 days → 47 days<span class="s">the validity ceiling from 2029-03-15</span>
+        <span class="s">renewal only gets more frequent</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-human" x="345" y="548" width="276" height="100" rx="8"/>
+    <foreignObject x="345" y="548" width="276" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">50 / 7 days<span class="s">new certificates per registered domain</span>
+        <span class="s">shared across accounts — keep half in reserve</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-danger" x="646" y="548" width="276" height="100" rx="8"/>
+    <foreignObject x="646" y="548" width="276" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">5 / 7 days<span class="s">the exact identifier set</span>
+        <span class="s">no override; hit it and you wait a week</span>
+      </div>
+    </foreignObject>
+
+    <rect class="bx-ext" x="947" y="548" width="276" height="100" rx="8"/>
+    <foreignObject x="947" y="548" width="276" height="100">
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo">ARI exempts all of them<span class="s">but only for a <b>same-name renewal</b></span>
+        <span class="s">change the name set and this issuance counts again</span>
+      </div>
+    </foreignObject>
+  </svg>
+  </div>
+  </figure>
+
+  <p>The last of those four is the one that bites: <strong>changing the name set once burns one issuance</strong>, and “domains change all the time” is this project’s premise. So the whole design turns on one question — how to make “add a domain” <strong>avoid producing a new issuance</strong> as often as possible. The answer is wildcard-first (see <a href="#intent">diagram ②</a>).</p>
+</section>
 
 <!-- ══════════════════════════════════════════════════════════ ① -->
 <section id="map">
