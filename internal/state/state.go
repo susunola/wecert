@@ -431,6 +431,9 @@ func isCorruptDatabaseError(err error) bool {
 // against the exact-set rate limit. So the message refuses clearly and points at the
 // recovery procedure rather than pretending to recover.
 func corruptDatabaseError(path string, cause error) error {
+
+	//lint:ignore ST1005 the second paragraph of a multi-line operator instruction is a sentence;
+	// capitalising it is the point, and the first paragraph still starts lowercase.
 	return fmt.Errorf(
 		"the state database %s is corrupt: %v\n"+
 			"       wecert will not start against a database it cannot read. Restore the backup that "+
@@ -449,6 +452,8 @@ func corruptDatabaseError(path string, cause error) error {
 func verifyDatabaseIntact(db *sql.DB) error {
 	var result string
 	if err := db.QueryRow(`PRAGMA quick_check(1)`).Scan(&result); err != nil {
+		//lint:ignore ST1005 the second paragraph of a multi-line operator instruction is a sentence;
+		// capitalising it is the point, and the first paragraph still starts lowercase.
 		return fmt.Errorf(
 			"the state database is unreadable: %w\n"+
 				"       wecert will not start against a database it cannot trust. Restore a backup of "+
@@ -457,6 +462,8 @@ func verifyDatabaseIntact(db *sql.DB) error {
 			err)
 	}
 	if result != "ok" {
+		//lint:ignore ST1005 the second paragraph of a multi-line operator instruction is a sentence;
+		// capitalising it is the point, and the first paragraph still starts lowercase.
 		return fmt.Errorf(
 			"the state database failed its consistency check: %s\n"+
 				"       Restore a backup of state.db if you have one, or move the damaged file aside to "+

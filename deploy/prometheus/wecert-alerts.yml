@@ -23,6 +23,13 @@ groups:
       # different lifetimes and a single threshold would either be late for shortlived or noise for
       # classic.
       #
+      # Each threshold is a quarter of the profile's nominal validity -- the same number the daemon
+      # logs a warning at (config.ExpiryWarningThreshold), so the log line and the alert agree.
+      # They are calibrated to the profile DEFAULTS, and Prometheus cannot see the config: a
+      # certificate whose renewBefore was set shorter than its threshold will trip this before its
+      # renewal is due, and ARI can move the renewal window later still. The descriptions below
+      # therefore say what to check rather than asserting that renewal has failed.
+      #
       # `> 0` guards the series being absent rather than zero. The metric is now deleted for a
       # certificate that has never been issued -- exporting 0 made this comparison true at roughly
       # -20,700 days, so every new certificate paged someone about a certificate that did not exist
@@ -38,9 +45,11 @@ groups:
         annotations:
           summary: "certificate {{ $labels.cert }} expires in under 22.5 days"
           description: >-
-            The classic profile renews 30 days ahead, so reaching this point means renewal has been
-            failing for at least a week. Check wecert_certificate_consecutive_failures and the
-            daemon's log for this certificate.
+            The classic profile renews 30 days ahead by default and this fires at 22.5 days, so with
+            the default it means renewal is a week overdue. Check
+            wecert_certificate_consecutive_failures: if that is climbing, renewal is failing; if it
+            is 0, this certificate's renewBefore is shorter than 22.5 days and the alert is simply
+            early.
 
       - alert: WecertCertificateExpiringTLSServer
         expr: |
@@ -53,7 +62,8 @@ groups:
         annotations:
           summary: "certificate {{ $labels.cert }} expires in under 11.25 days"
           description: >-
-            The tlsserver profile renews 15 days ahead; this is a week past that.
+            The tlsserver profile renews 15 days ahead by default; this is a week past that. If
+            wecert_certificate_consecutive_failures is 0 the renewal is merely not due yet.
 
       - alert: WecertCertificateExpiringShortLived
         expr: |
@@ -66,8 +76,9 @@ groups:
         annotations:
           summary: "certificate {{ $labels.cert }} expires in under 40 hours"
           description: >-
-            A short-lived certificate renews 48 hours ahead, so 40 hours left means renewal is
-            already failing. This profile is used precisely where a lapse is immediate.
+            A short-lived certificate renews 48 hours ahead by default, so 40 hours left is past
+            that. This profile is used precisely where a lapse is immediate, so treat it as urgent
+            even if wecert_certificate_consecutive_failures is still 0.
 
       # Deployed but not serving the certificate wecert deployed.
       #
