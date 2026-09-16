@@ -331,6 +331,43 @@ func (o *Onboarding) normalize() error {
 	if o.BudgetDur, err = parseDuration(o.BudgetWindow, 7*24*time.Hour, "onboarding.budgetWindow"); err != nil {
 		return err
 	}
+
+	// These knobs configure the safety invariants, so an out-of-range value has to
+	// be rejected here rather than quietly switching the guard off.
+	//
+	// DropThreshold is a *fraction*: the abrupt-change fuse freezes the round when
+	// the declared name set loses more than this much, and the ratio it is compared
+	// against is always <= 1. Anything at or above 1 can never be exceeded, so the
+	// fuse would never fire -- which is the "upstream returned partial data, mass SAN
+	// deletion" case it exists for. A percentage written as `30` is the common typo.
+	if o.DropThreshold < 0 || o.DropThreshold >= 1 {
+		return fmt.Errorf(
+			"onboarding.dropThreshold is a fraction in [0,1): 0.3 means 30%%, and 0 uses the default 0.3; got %v "+
+				"(a value of 1 or more can never be exceeded, so the abrupt-change fuse would never fire)",
+			o.DropThreshold)
+	}
+	if o.Budget < 0 {
+		return fmt.Errorf("onboarding.budget must not be negative, got %d", o.Budget)
+	}
+	if o.MaxNames < 0 {
+		return fmt.Errorf("onboarding.maxNames must not be negative, got %d", o.MaxNames)
+	}
+	// Profile and keyType are copied into every generated certificate, so a typo
+	// here is not a local failure: the document fails validation on every round and
+	// nothing is ever written again. Catch it at load time instead.
+	if o.Profile != "" {
+		if _, ok := profileMaxNames[o.Profile]; !ok {
+			return fmt.Errorf("onboarding.profile: unknown profile %q (want %s/%s/%s)",
+				o.Profile, ProfileClassic, ProfileTLSServer, ProfileShortLived)
+		}
+	}
+	if o.KeyType != "" {
+		switch o.KeyType {
+		case KeyTypeECDSAP256, KeyTypeECDSAP384, KeyTypeRSA2048, KeyTypeRSA4096:
+		default:
+			return fmt.Errorf("onboarding.keyType: unknown keyType %q", o.KeyType)
+		}
+	}
 	return nil
 }
 

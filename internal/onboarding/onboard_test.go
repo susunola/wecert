@@ -501,6 +501,59 @@ func TestAllowlistLimitsWhichRegisteredDomainsMayBeIssuedFor(t *testing.T) {
 	}
 }
 
+// The allowlist is matched with a binary search, so it has to be sorted -- and
+// normalising each entry to its registered domain can *reorder* it, so sorting the
+// caller's input is not enough and sorting must happen inside New.
+//
+// Unsorted, the binary search misses entries that really are on the allowlist, and
+// the names are rejected with the misleading reason `registered domain "x" is not
+// in the allowlist` -- naming a domain that is in fact listed.
+func TestAllowlistIsSortedAfterNormalization(t *testing.T) {
+	// Normalising these two gives ["example.com", "b.co.uk"], which is not in
+	// ascending order even though the input was.
+	h := newHarness(t, Options{Allowlist: []string{"a.example.com", "b.co.uk"}})
+
+	h.decls.raw = []RawDeclaration{
+		{Zone: "example.com", Record: DeclarationPrefix + "example.com", Values: []string{""}},
+		{Zone: "b.co.uk", Record: DeclarationPrefix + "b.co.uk", Values: []string{""}},
+	}
+	h.rules.domains = []string{"example.com", "b.co.uk"}
+
+	// Assert on the decisions before reading the document, so a regression fails
+	// with the real reason instead of "the document does not exist".
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	for _, want := range []string{"example.com", "b.co.uk"} {
+		if d, ok := decisionFor(rep, want); ok && !d.Included {
+			t.Errorf("%s is on the allowlist but was excluded: %s", want, d.Reason)
+		}
+	}
+
+	if err := h.ob.Commit(rep); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	// Two registered domains means two certificates, so collect across all of them.
+	var got []string
+	for _, c := range h.document(t).Certificates {
+		got = append(got, c.Domains...)
+	}
+	for _, want := range []string{"example.com", "b.co.uk"} {
+		found := false
+		for _, g := range got {
+			if g == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s is on the allowlist but is not in any certificate: %v", want, got)
+		}
+	}
+}
+
 // ── §6.1 wildcard-first ────────────────────────────────────────────────────
 
 // This is the most valuable rule in the whole design: once *.example.com is
