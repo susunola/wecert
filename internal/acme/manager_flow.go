@@ -26,7 +26,7 @@ const authzFetchConcurrency = 8
 func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.CertState, o *state.Order) error {
 	order, err := m.core.Orders.Get(o.OrderURL)
 	if err != nil {
-		return m.recordFailure(st, fmt.Errorf("查询订单: %w", err))
+		return m.recordFailure(st, fmt.Errorf("get order: %w", err))
 	}
 	m.persistOrder(o, order)
 
@@ -36,7 +36,7 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 
 	case "invalid":
 		// 订单废了。清理掉，让下一轮从头决策（此时会走退避）。
-		err := fmt.Errorf("订单已失效: %v", order.Err())
+		err := fmt.Errorf("order became invalid: %v", order.Err())
 		if derr := m.discardOrder(ctx, c.Name); derr != nil {
 			return errors.Join(err, derr)
 		}
@@ -114,7 +114,7 @@ func (m *Manager) fetchAuthzs(ctx context.Context, authzs []*state.Authorization
 
 	for i, err := range errs {
 		if err != nil {
-			return nil, fmt.Errorf("查询授权 %s: %w", authzs[i].AuthzURL, err)
+			return nil, fmt.Errorf("get authorization %s: %w", authzs[i].AuthzURL, err)
 		}
 	}
 	return out, nil
@@ -156,11 +156,11 @@ func (m *Manager) solveChallenges(
 			// 写失败不掩盖主因（授权失效才是要报的），但必须留痕 ——
 			// 静默吞掉 DB 错误会让后续排障失去线索。
 			if perr := m.store.PutAuthorization(a); perr != nil {
-				m.log.Warn("记录授权失效状态失败",
+				m.log.Warn("failed to record the invalidated authorization",
 					"cert", c.Name, "identifier", a.Identifier, "err", perr)
 			}
 			return false, m.recordFailure(st, fmt.Errorf(
-				"identifier %s 的授权已失效: %s", a.Identifier, authzError(cur)))
+				"the authorization for identifier %s is invalid: %s", a.Identifier, authzError(cur)))
 		}
 
 		if !a.Presented {
@@ -170,7 +170,7 @@ func (m *Manager) solveChallenges(
 			}
 			keyAuth, err := m.keyAuth.GetKeyAuthorization(chlg.Token)
 			if err != nil {
-				return false, m.recordFailure(st, fmt.Errorf("计算 key authorization: %w", err))
+				return false, m.recordFailure(st, fmt.Errorf("compute the key authorization: %w", err))
 			}
 
 			// 只写入，不等待传播 —— 等所有 TXT 都写完之后统一等一次。
@@ -178,7 +178,7 @@ func (m *Manager) solveChallenges(
 			// （DNSPod 免费套餐一轮传播要 2 分钟以上，这一下就是几分钟）。
 			rec, err := m.dns.Present(ctx, a.Identifier, chlg.Token, keyAuth)
 			if err != nil {
-				return false, m.recordFailure(st, fmt.Errorf("写入 TXT (%s): %w", a.Identifier, err))
+				return false, m.recordFailure(st, fmt.Errorf("present TXT (%s): %w", a.Identifier, err))
 			}
 
 			a.ChallengeURL = chlg.URL
@@ -186,7 +186,7 @@ func (m *Manager) solveChallenges(
 			a.TxtName = rec.FQDN
 			a.TxtValue = rec.Value
 			a.Presented = true
-			m.log.Info("TXT 已写入",
+			m.log.Info("TXT presented",
 				"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName)
 		}
 
@@ -207,7 +207,7 @@ func (m *Manager) solveChallenges(
 	// 阶段 2：所有 TXT 都写完之后，统一等一次权威 NS 传播。
 	// WaitAll 内部按 zone 去重，同一个 zone 只解析一次 NS 列表。
 	if err := m.dns.WaitAll(ctx, records); err != nil {
-		return false, m.recordFailure(st, fmt.Errorf("等待 TXT 传播: %w", err))
+		return false, m.recordFailure(st, fmt.Errorf("wait for TXT propagation: %w", err))
 	}
 
 	// 阶段 3：传播确认之后，才逐个通知 CA 开始验证。
@@ -216,7 +216,7 @@ func (m *Manager) solveChallenges(
 			continue
 		}
 		if _, err := m.core.Challenges.New(a.ChallengeURL); err != nil {
-			return false, m.recordFailure(st, fmt.Errorf("触发验证 (%s): %w", a.Identifier, err))
+			return false, m.recordFailure(st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
 		}
 		a.ChallengeSent = true
 		if err := m.store.PutAuthorization(a); err != nil {
@@ -278,7 +278,7 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 			switch cur.Status {
 			case "valid":
 			case "invalid":
-				return fmt.Errorf("identifier %s 验证失败: %s", a.Identifier, authzError(cur))
+				return fmt.Errorf("validation failed for identifier %s: %s", a.Identifier, authzError(cur))
 			default:
 				allValid = false
 			}
@@ -287,7 +287,7 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 			return nil
 		}
 		if m.now().After(deadline) {
-			return fmt.Errorf("授权在 %s 内未完成验证，订单保留待下一轮继续", authzWaitTimeout)
+			return fmt.Errorf("authorizations did not complete within %s; keeping the order for the next pass", authzWaitTimeout)
 		}
 		select {
 		case <-ctx.Done():
@@ -303,7 +303,7 @@ func (m *Manager) cleanup(ctx context.Context, certName string, authzs []*state.
 		cleaned, err := m.removeAuthzTXT(ctx, a)
 		if err != nil {
 			// 保留 Presented=true，下一轮（或收尾时的 cleanupOrphanTXT）还会再试一次。
-			m.log.Warn("清理 TXT 失败",
+			m.log.Warn("failed to clean up TXT",
 				"cert", certName, "identifier", a.Identifier, "name", a.TxtName, "err", err)
 			continue
 		}
@@ -313,7 +313,7 @@ func (m *Manager) cleanup(ctx context.Context, certName string, authzs []*state.
 		}
 		a.Presented = false
 		if err := m.store.PutAuthorization(a); err != nil {
-			m.log.Warn("更新授权状态失败", "cert", certName, "identifier", a.Identifier, "err", err)
+			m.log.Warn("failed to update the authorization state", "cert", certName, "identifier", a.Identifier, "err", err)
 		}
 	}
 }
@@ -329,16 +329,16 @@ func (m *Manager) removeAuthzTXT(ctx context.Context, a *state.Authorization) (c
 		return true, nil
 	}
 	if a.ChallengeToken == "" || a.Identifier == "" {
-		m.log.Warn("授权缺少 token，无法定位要清理的 TXT（保留记录以便人工排查）",
+		m.log.Warn("the authorization has no token, so the TXT record cannot be located (keeping the row for manual investigation)",
 			"cert", a.CertName, "identifier", a.Identifier, "name", a.TxtName)
 		return false, nil
 	}
 	keyAuth, err := m.keyAuth.GetKeyAuthorization(a.ChallengeToken)
 	if err != nil {
-		return false, fmt.Errorf("计算 key authorization: %w", err)
+		return false, fmt.Errorf("compute the key authorization: %w", err)
 	}
 	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
-		return false, fmt.Errorf("清理 TXT %s: %w", a.TxtName, err)
+		return false, fmt.Errorf("clean up TXT %s: %w", a.TxtName, err)
 	}
 	return true, nil
 }
@@ -361,14 +361,14 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 		if !a.Presented {
 			// 没写进 DNS 的行直接清掉，不留垃圾。
 			if err := m.store.DeleteAuthorization(certName, a.AuthzURL); err != nil {
-				m.log.Warn("删除授权行失败", "cert", certName, "authz", a.AuthzURL, "err", err)
+				m.log.Warn("failed to delete authorization rows", "cert", certName, "authz", a.AuthzURL, "err", err)
 			}
 			continue
 		}
 
 		ok, err := m.removeAuthzTXT(ctx, a)
 		if err != nil {
-			m.log.Warn("回收残留 TXT 失败",
+			m.log.Warn("failed to reclaim a leftover TXT record",
 				"cert", certName, "identifier", a.Identifier, "name", a.TxtName, "err", err)
 			continue
 		}
@@ -379,17 +379,17 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 		}
 		cleaned++
 		if err := m.store.DeleteAuthorization(certName, a.AuthzURL); err != nil {
-			m.log.Warn("删除授权行失败", "cert", certName, "authz", a.AuthzURL, "err", err)
+			m.log.Warn("failed to delete authorization rows", "cert", certName, "authz", a.AuthzURL, "err", err)
 		}
 	}
 
 	if cleaned > 0 {
-		m.log.Info("已回收残留的 _acme-challenge TXT", "cert", certName, "count", cleaned)
+		m.log.Info("reclaimed a leftover _acme-challenge TXT record", "cert", certName, "count", cleaned)
 	}
 	if stuck > 0 {
-		m.log.Warn("有残留 TXT 无法自动清理，需要人工去 DNS 后台处理",
+		m.log.Warn("some TXT records could not be reclaimed automatically; clean them up in the DNS console",
 			"cert", certName, "count", stuck,
-			"hint", "缺少 challenge token，程序定位不到具体记录")
+			"hint", "no challenge token, so the specific record cannot be located")
 	}
 	return nil
 }
@@ -400,7 +400,7 @@ func (m *Manager) finalize(
 ) error {
 	key, err := ParsePrivateKeyPEM(o.KeyPEM)
 	if err != nil {
-		return m.recordFailure(st, fmt.Errorf("加载订单私钥: %w", err))
+		return m.recordFailure(st, fmt.Errorf("load the order's private key: %w", err))
 	}
 	csr, err := CreateCSRDER(key, c.Domains)
 	if err != nil {
@@ -408,7 +408,7 @@ func (m *Manager) finalize(
 	}
 
 	if o.FinalizeURL == "" {
-		return m.recordFailure(st, errors.New("订单缺少 finalize URL，无法提交 CSR"))
+		return m.recordFailure(st, errors.New("the order has no finalize URL; cannot submit the CSR"))
 	}
 
 	// RFC 8555 §7.4：CSR 必须 POST 到 order 的 finalize URL。
@@ -417,7 +417,7 @@ func (m *Manager) finalize(
 	// 传 order URL 会被 LE 当成 POST-as-GET 并报
 	// "POST-as-GET requests must have an empty payload"。
 	if _, err := m.core.Orders.UpdateForCSR(o.FinalizeURL, csr); err != nil {
-		return m.recordFailure(st, fmt.Errorf("提交 CSR (finalize): %w", err))
+		return m.recordFailure(st, fmt.Errorf("submit CSR (finalize): %w", err))
 	}
 
 	final, err := m.awaitOrderStatus(ctx, o.OrderURL, "valid", orderWaitTimeout)
@@ -437,7 +437,7 @@ func (m *Manager) awaitOrderStatus(
 	for {
 		o, err := m.core.Orders.Get(orderURL)
 		if err != nil {
-			return last, fmt.Errorf("轮询订单: %w", err)
+			return last, fmt.Errorf("poll order: %w", err)
 		}
 		last = o
 
@@ -445,11 +445,11 @@ func (m *Manager) awaitOrderStatus(
 		case want, "valid":
 			return o, nil
 		case "invalid":
-			return o, fmt.Errorf("订单已失效: %v", o.Err())
+			return o, fmt.Errorf("order became invalid: %v", o.Err())
 		}
 
 		if m.now().After(deadline) {
-			return last, fmt.Errorf("订单在 %s 内未达到 %q（当前 %q）", timeout, want, o.Status)
+			return last, fmt.Errorf("the order did not reach %q within %s (currently %q)", timeout, want, o.Status)
 		}
 		select {
 		case <-ctx.Done():

@@ -97,7 +97,7 @@ func (d *TencentCLB) upload(ctx context.Context, client *ssl.Client, certName st
 		return "", fmt.Errorf("UploadCertificate: %w", err)
 	}
 	if resp.Response == nil || resp.Response.CertificateId == nil || *resp.Response.CertificateId == "" {
-		return "", errors.New("UploadCertificate 未返回 CertificateId")
+		return "", errors.New("UploadCertificate returned no CertificateId")
 	}
 	return *resp.Response.CertificateId, nil
 }
@@ -132,19 +132,19 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client *ssl.Client, old
 			// 它是判断一键更新到底有没有生效的唯一权威依据，
 			// 因为 CLB 的 DescribeListeners 并不回读证书绑定。
 			bound := progressBoundCount(resp.Response.UpdateSyncProgress)
-			d.log.Info("一键更新任务已创建",
+			d.log.Info("one-click update task created",
 				"oldCertId", oldID, "newCertId", newID,
 				"deployRecordId", recordID,
 				"boundResources", bound,
 				"progress", formatProgress(resp.Response.UpdateSyncProgress))
 			if bound == 0 {
-				return fmt.Errorf("UpdateCertificateInstance 未找到任何绑定了旧证书 %s 的资源（regions=%v）；拒绝把新证书标为已部署。请确认 CLB 监听器已绑定该证书（SNI 监听器必须走 multi_cert_info，主 certificate_id 会被静默忽略）",
+				return fmt.Errorf("UpdateCertificateInstance found no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
 					oldID, d.regions)
 			}
 			return d.waitDeployRecord(ctx, client, recordID)
 		}
 		if d.now().After(deadline) {
-			return fmt.Errorf("UpdateCertificateInstance 任务在 2m 内未创建成功（可能一直有进行中的任务）")
+			return fmt.Errorf("the UpdateCertificateInstance task was not created within 2m (there may be one already running)")
 		}
 		select {
 		case <-ctx.Done():
@@ -164,20 +164,20 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client *ssl.Client, r
 	for {
 		success, failed, running, err := d.describeDeployRecord(ctx, client, recordID)
 		if err != nil {
-			d.log.Warn("查询部署记录失败，稍后重试", "deployRecordId", recordID, "err", err)
+			d.log.Warn("failed to query the deploy record; retrying shortly", "deployRecordId", recordID, "err", err)
 		} else {
-			d.log.Info("一键更新进度",
+			d.log.Info("one-click update progress",
 				"deployRecordId", recordID,
 				"success", success, "failed", failed, "running", running)
 			if running == 0 && (success+failed) > 0 {
 				if failed > 0 {
-					return fmt.Errorf("一键更新完成但有 %d 个资源失败（成功 %d）", failed, success)
+					return fmt.Errorf("one-click update finished with %d resources failed (%d succeeded)", failed, success)
 				}
 				return nil
 			}
 		}
 		if d.now().After(deadline) {
-			return fmt.Errorf("一键更新任务 %d 在 3m 内未完成（success=%d failed=%d running=%d）",
+			return fmt.Errorf("one-click update task %d did not finish within 3m (success=%d failed=%d running=%d)",
 				recordID, success, failed, running)
 		}
 		select {
@@ -197,7 +197,7 @@ func (d *TencentCLB) describeDeployRecord(ctx context.Context, client *ssl.Clien
 		return 0, 0, 0, err
 	}
 	if resp.Response == nil {
-		return 0, 0, 0, errors.New("DescribeHostUpdateRecordDetail 空响应")
+		return 0, 0, 0, errors.New("DescribeHostUpdateRecordDetail returned an empty response")
 	}
 	return derefI64(resp.Response.SuccessTotalCount),
 		derefI64(resp.Response.FailedTotalCount),
@@ -269,7 +269,7 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) int64 {
 // formatProgress 把 UpdateCertificateInstance 的进度摘要成一行。
 func formatProgress(progress []*ssl.UpdateSyncProgress) string {
 	if len(progress) == 0 {
-		return "(服务端未返回进度)"
+		return "(the server returned no progress detail)"
 	}
 	var parts []string
 	for _, p := range progress {
@@ -280,7 +280,7 @@ func formatProgress(progress []*ssl.UpdateSyncProgress) string {
 		}
 	}
 	if len(parts) == 0 {
-		return fmt.Sprintf("(资源类型 %d 个，但无地域明细)", len(progress))
+		return fmt.Sprintf("(%d resource types, but no per-region detail)", len(progress))
 	}
 	return strings.Join(parts, "; ")
 }

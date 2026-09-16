@@ -44,11 +44,11 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 	if acc != nil && len(acc.PrivateKeyPEM) > 0 {
 		key, err := ParsePrivateKeyPEM(acc.PrivateKeyPEM)
 		if err != nil {
-			return nil, fmt.Errorf("解析已存的账号私钥: %w", err)
+			return nil, fmt.Errorf("parse the stored account key: %w", err)
 		}
 		core, err := api.New(httpClient, userAgent, directory, acc.KID, key)
 		if err != nil {
-			return nil, fmt.Errorf("初始化 ACME 客户端: %w", err)
+			return nil, fmt.Errorf("initialise the ACME client: %w", err)
 		}
 		return core, nil
 	}
@@ -56,12 +56,12 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 	// 首次运行：生成账号私钥并注册账号。
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("生成账号私钥: %w", err)
+		return nil, fmt.Errorf("generate the account key: %w", err)
 	}
 
 	core, err := api.New(httpClient, userAgent, directory, "", key)
 	if err != nil {
-		return nil, fmt.Errorf("初始化 ACME 客户端: %w", err)
+		return nil, fmt.Errorf("initialise the ACME client: %w", err)
 	}
 
 	reg, err := core.Accounts.New(legoacme.Account{
@@ -69,10 +69,10 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 		TermsOfServiceAgreed: true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("注册 ACME 账号: %w", err)
+		return nil, fmt.Errorf("register the ACME account: %w", err)
 	}
 	if reg.Location == "" {
-		return nil, fmt.Errorf("注册 ACME 账号: 服务器未返回账号 URL (kid)")
+		return nil, fmt.Errorf("register the ACME account: the server returned no account URL (kid)")
 	}
 
 	keyPEM, err := MarshalPrivateKeyPEM(key)

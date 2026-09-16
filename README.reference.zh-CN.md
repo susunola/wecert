@@ -70,6 +70,10 @@
 
 ---
 
+> **注意：程序的日志与错误信息是英文的。** 本文档保留中文说明，但所有
+> 日志、CLI 帮助和错误文本都直接用程序的实际输出（英文），以免文档与实现不一致。
+
+
 ## 为什么是这么设计的
 
 Let's Encrypt 的速率限制里，最要命的不是那 100 个 SAN 上限，而是：
@@ -223,7 +227,7 @@ directory: https://acme-v02.api.letsencrypt.org/directory
 首次签发时腾讯云侧还没有"旧证书 → 云资源"的绑定关系可查，所以 wecert 只会上传证书并打印出 CertId：
 
 ```
-证书已上传，等待在 CLB 上手动绑定一次 cert=example-com uploadedCertId=xxxxxxxx
+certificate uploaded; waiting for a one-time manual bind in the CLB console cert=example-com uploadedCertId=xxxxxxxx
 ```
 
 去 CLB 控制台绑定一次即可。之后每次续期都由 [`UpdateCertificateInstance`](https://www.tencentcloud.com/zh/document/product/1007/57981) 自动完成 —— 腾讯云自己会去找绑定了旧证书的 CLB 监听器并换掉。
@@ -233,7 +237,7 @@ directory: https://acme-v02.api.letsencrypt.org/directory
 重绑定确认生效后，日志变成：
 
 ```
-证书已续期并生效 cert=example-com notAfter=… deployedCertId=xxxxxxxx
+certificate renewed and live cert=example-com notAfter=… deployedCertId=xxxxxxxx
 ```
 
 > 腾讯云另有一个 `UploadUpdateCertificateInstance`，能让证书 ID 保持不变、内容原地替换，但**需要提工单开白名单**且只支持 CLB。属于锦上添花，不必等 —— 公开的 `UpdateCertificateInstance` 已经够用。

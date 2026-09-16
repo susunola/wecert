@@ -78,7 +78,7 @@ Run **one** of the two modes per machine. They share one state database, and the
 **4. Bind the certificate once.** On first issuance Tencent Cloud has no "old certificate → cloud resource" binding to look up, so wecert only uploads it:
 
 ```
-证书已上传，等待在 CLB 上手动绑定一次 cert=example-com uploadedCertId=xxxxxxxx
+certificate uploaded; waiting for a one-time manual bind in the CLB console cert=example-com uploadedCertId=xxxxxxxx
 ```
 
 Bind it in the CLB console. Every renewal after that is automatic — `UpdateCertificateInstance` makes Tencent Cloud find the listeners bound to the old certificate and swap them. **There is no listener inventory to maintain**, and other certificates on the same listener (SNI) are untouched.

@@ -55,7 +55,7 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 			PollingInterval:    dnsCfg.Polling,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("初始化 dnspod provider: %w", err)
+			return nil, fmt.Errorf("initialise the dnspod provider: %w", err)
 		}
 		// DNSPod 自有 Token 不会过期，复用一个实例即可。
 		newProvider = func(context.Context) (challenge.Provider, error) { return p, nil }
@@ -83,7 +83,7 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		}
 
 	default:
-		return nil, fmt.Errorf("未知的 dns.provider %q", dnsCfg.Provider)
+		return nil, fmt.Errorf("unknown dns.provider %q", dnsCfg.Provider)
 	}
 
 	return &DNSSolver{
@@ -112,11 +112,11 @@ type DNSRecord struct {
 func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) (DNSRecord, error) {
 	provider, err := s.newProvider(ctx)
 	if err != nil {
-		return DNSRecord{}, fmt.Errorf("获取 DNS provider: %w", err)
+		return DNSRecord{}, fmt.Errorf("get the DNS provider: %w", err)
 	}
 
 	if err := provider.Present(domain, token, keyAuth); err != nil {
-		return DNSRecord{}, fmt.Errorf("写入 TXT: %w", err)
+		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
 	}
 
 	info := dns01.GetChallengeInfo(domain, keyAuth)
@@ -142,7 +142,7 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 
 		zone, err := dns01.FindZoneByFqdn(r.FQDN)
 		if err != nil {
-			return fmt.Errorf("定位 %s 所属 zone: %w", r.FQDN, err)
+			return fmt.Errorf("find the zone for %s: %w", r.FQDN, err)
 		}
 		byZone[zone] = append(byZone[zone], r)
 	}
@@ -243,15 +243,15 @@ func (s *DNSSolver) waitZone(
 		}
 
 		if len(pending) == 0 {
-			s.log.Info("TXT 已传播开",
+			s.log.Info("TXT propagated",
 				"zone", zone, "nameservers", len(servers), "records", len(recs))
 			return nil
 		}
 
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf(
-				"TXT 未确认传播：已等待 %s（预算 %s），zone=%s，ns=%d，"+
-					"仍有 %d/%d 条未就绪：%s",
+				"TXT propagation not confirmed: waited %s (budget %s), zone=%s, ns=%d, "+
+					"%d/%d records still not ready: %s",
 				time.Since(start).Round(time.Second), s.timeout,
 				zone, len(servers), len(pending), len(recs),
 				strings.Join(pending, " | "))
@@ -332,7 +332,7 @@ func probeReady(servers []string, fqdn, want string) (bool, string) {
 		}
 	}
 
-	summary := fmt.Sprintf("确认 %d / 否认 %d / 不可达 %d (共 %d)",
+	summary := fmt.Sprintf("confirmed %d / denied %d / unreachable %d (of %d)",
 		confirmed, missing, unreachable, len(results))
 
 	// 有任一可达 NS 否认 → 还没传播开。
@@ -359,7 +359,7 @@ func probeReady(servers []string, fqdn, want string) (bool, string) {
 func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) error {
 	provider, err := s.newProvider(ctx)
 	if err != nil {
-		return fmt.Errorf("获取 DNS provider: %w", err)
+		return fmt.Errorf("get the DNS provider: %w", err)
 	}
 	return provider.CleanUp(domain, token, keyAuth)
 }
@@ -368,17 +368,17 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string, error) {
 	names, err := net.DefaultResolver.LookupNS(ctx, dns01.UnFqdn(zone))
 	if err != nil {
-		return nil, fmt.Errorf("查询 %s 的 NS: %w", zone, err)
+		return nil, fmt.Errorf("lookup NS for %s: %w", zone, err)
 	}
 	if len(names) == 0 {
-		return nil, fmt.Errorf("%s 没有 NS 记录", zone)
+		return nil, fmt.Errorf("%s has no NS records", zone)
 	}
 
 	var servers []string
 	for _, ns := range names {
 		ips, err := net.DefaultResolver.LookupHost(ctx, strings.TrimSuffix(ns.Host, "."))
 		if err != nil {
-			s.log.Warn("权威 NS 解析失败，跳过", "ns", ns.Host, "err", err)
+			s.log.Warn("could not resolve an authoritative nameserver; skipping it", "ns", ns.Host, "err", err)
 			continue
 		}
 		for _, ip := range ips {
@@ -386,7 +386,7 @@ func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string,
 		}
 	}
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("%s 的 NS 全部无法解析成地址", zone)
+		return nil, fmt.Errorf("none of %s's nameservers resolve to an address", zone)
 	}
 	return servers, nil
 }
