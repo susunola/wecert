@@ -295,3 +295,110 @@ func TestReclaimStaleProbeSeriesKeepsHostsOfAClaimedCertificate(t *testing.T) {
 			r.prober.(*fakeProber).forgotten)
 	}
 }
+
+// ── expiry-metric contract ──────────────────────────────────────────────────────────
+
+// A certificate that was never issued must not report an expiry at all.
+//
+// README.reference.md documents the primary expiry alert as
+//
+//	(wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 21
+//
+// A never-issued certificate stored not_after = 0 (which the state schema defines as
+// "never issued"), and this exported the zero through — so the rule evaluated to about
+// -20,700 days and fired. The first deployment of every new certificate therefore paged
+// someone about a certificate that did not exist yet, with an "overdue by 57 years" value,
+// on the one signal the docs tell operators to trust.
+//
+// Absent is the honest answer: a certificate with no expiry has nothing to compare.
+func TestNeverIssuedCertificateExportsNoExpirySeries(t *testing.T) {
+	const certName = "brand-new-cert"
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: certName})
+	cfg := &config.Config{}
+	cfg.Certificates = []config.Certificate{{Name: certName}}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, &fakeManager{}, nil, log)
+
+	// A row that exists but has never had a certificate issued for it, which is the state
+	// right after the first upload attempt or before it.
+	if err := store.PutCert(&state.CertState{Name: certName}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+
+	r.publish(&config.Certificate{Name: certName})
+
+	if v, ok := gaugeValue(t, "wecert_certificate_not_after_timestamp_seconds", certName); ok {
+		t.Errorf("a never-issued certificate must not export an expiry, got %v (%.0f days from now); "+
+			"the documented alert rule compares this against time() and would fire",
+			v, (v-float64(time.Now().Unix()))/86400)
+	}
+}
+
+// The control: an issued certificate must export its expiry, so the fix cannot be satisfied
+// by simply never publishing the series.
+func TestIssuedCertificateExportsItsExpiry(t *testing.T) {
+	const certName = "issued-cert"
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: certName})
+	cfg := &config.Config{}
+	cfg.Certificates = []config.Certificate{{Name: certName}}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, &fakeManager{}, nil, log)
+
+	notAfter := time.Now().Add(90 * 24 * time.Hour).Truncate(time.Second)
+	if err := store.PutCert(&state.CertState{Name: certName, NotAfter: notAfter}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+
+	r.publish(&config.Certificate{Name: certName})
+
+	v, ok := gaugeValue(t, "wecert_certificate_not_after_timestamp_seconds", certName)
+	if !ok {
+		t.Fatal("an issued certificate must export its expiry; the expiry alert is the primary signal")
+	}
+	if int64(v) != notAfter.Unix() {
+		t.Errorf("expiry gauge = %d, want %d", int64(v), notAfter.Unix())
+	}
+	// And the documented rule must NOT fire for a healthy 90-day certificate.
+	if days := (v - float64(time.Now().Unix())) / 86400; days < 21 {
+		t.Errorf("a 90-day certificate must not trip the 21-day rule, got %.0f days", days)
+	}
+}
+
+// gaugeValue reads one label combination out of the default registry. ok=false means the
+// series is absent (as opposed to present with a value).
+func gaugeValue(t *testing.T, metric, label string) (float64, bool) {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != metric {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "cert" && lp.GetValue() == label {
+					return m.GetGauge().GetValue(), true
+				}
+			}
+		}
+	}
+	return 0, false
+}

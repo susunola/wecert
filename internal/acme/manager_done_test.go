@@ -295,41 +295,84 @@ func TestDriftReissueSendsNoReplaces(t *testing.T) {
 // Losing the rate-limit exemption costs one quota slot; failing to renew costs the
 // certificate. This is the guard that makes the second outcome impossible.
 func TestRefusedReplacesIsRetriedWithoutIt(t *testing.T) {
-	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
-
-	// Due for renewal through the ARI window, so `replaces` is non-empty.
-	notAfter := time.Now().Add(20 * 24 * time.Hour)
-	if err := store.PutCert(&state.CertState{
-		Name:           cert.Name,
-		NotAfter:       notAfter,
-		CertPEM:        selfSignedCertPEM(t, notAfter, "example.com"),
-		KeyPEM:         []byte("old-key"),
-		ARICertID:      "oldAki.oldSerial",
-		ARIWindowStart: time.Now().Add(-2 * time.Hour),
-		ARIWindowEnd:   time.Now().Add(-time.Hour),
-		ARICheckedAt:   time.Now(), // fresh, so the window above is not refetched
-	}); err != nil {
-		t.Fatal(err)
+	// Every wording a real CA uses to refuse a `replaces` field. Only the last one contains
+	// the literal string "replaces", which is what the original guard matched on -- so the
+	// first three used to fall through to a permanent failure and the certificate NEVER
+	// renewed. Boulder reports the first two, Pebble the third (an ACME server is free to
+	// word its errors however it likes, so message matching cannot be made correct).
+	wordings := []struct {
+		name string
+		msg  string
+	}{
+		{"boulder-ari-certid", "acme: error: 400 :: urn:ietf:params:acme:error:malformed :: parsing ARI CertID failed"},
+		{"boulder-account", "acme: error: 403 :: urn:ietf:params:acme:error:unauthorized :: " +
+			"requester account did not request the certificate being replaced by this order"},
+		{"pebble-no-order", "acme: error: 404 :: urn:ietf:params:acme:error:malformed :: " +
+			"could not find an order for the given certificate"},
+		{"le-no-overlap", "acme: error: 400 :: urn:ietf:params:acme:error:malformed :: " +
+			"Could not validate ARI 'replaces' field :: identifiers in this order do not match " +
+			"any identifiers in the certificate being replaced"},
 	}
 
+	for _, w := range wordings {
+		t.Run(w.name, func(t *testing.T) {
+			store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+
+			// Due for renewal through the ARI window, so `replaces` is non-empty.
+			notAfter := m.now().Add(20 * 24 * time.Hour)
+			if err := store.PutCert(&state.CertState{
+				Name:           cert.Name,
+				NotAfter:       notAfter,
+				CertPEM:        selfSignedCertPEM(t, notAfter, "example.com"),
+				KeyPEM:         []byte("old-key"),
+				ARICertID:      "oldAki.oldSerial",
+				ARIWindowStart: m.now().Add(-2 * time.Hour),
+				ARIWindowEnd:   m.now().Add(-time.Hour),
+				ARICheckedAt:   m.now(), // fresh, so the window above is not refetched
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			fake.orders = []legoacme.ExtendedOrder{
+				terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+			}
+			fake.newOrderErr = errors.New(w.msg)
+
+			if err := m.Reconcile(context.Background(), cert); err != nil {
+				t.Fatalf("the pass must recover by dropping replaces (this error wording is the CA's "+
+					"choice, so it cannot be the thing that decides whether a renewal happens), got: %v", err)
+			}
+
+			want := []string{"oldAki.oldSerial", ""}
+			if len(fake.newOrderReplaces) != len(want) {
+				t.Fatalf("expected a retry without replaces, got attempts %v", fake.newOrderReplaces)
+			}
+			for i := range want {
+				if fake.newOrderReplaces[i] != want[i] {
+					t.Errorf("attempt %d sent replaces=%q, want %q", i, fake.newOrderReplaces[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+// A failure with NO replaces set must not be retried: there is nothing to drop, and retrying
+// would double the order rate for an error that will repeat identically.
+func TestOrderFailureWithoutReplacesIsNotRetried(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+
+	// No certificate state at all: first issuance, so replaces is empty.
+	_ = store
 	fake.orders = []legoacme.ExtendedOrder{
 		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
 	}
-	fake.newOrderErr = errors.New("acme: error: 400 :: urn:ietf:params:acme:error:malformed :: " +
-		"Could not validate ARI 'replaces' field :: identifiers in this order do not match " +
-		"any identifiers in the certificate being replaced")
+	fake.newOrderErr = errors.New("acme: error: 500 :: server internal error")
 
-	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("the pass must recover by dropping replaces, got: %v", err)
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("a genuine order-creation failure must be reported, not hidden")
 	}
-
-	want := []string{"oldAki.oldSerial", ""}
-	if len(fake.newOrderReplaces) != len(want) {
-		t.Fatalf("expected a retry without replaces, got attempts %v", fake.newOrderReplaces)
-	}
-	for i := range want {
-		if fake.newOrderReplaces[i] != want[i] {
-			t.Errorf("attempt %d sent replaces=%q, want %q", i, fake.newOrderReplaces[i], want[i])
-		}
+	if len(fake.newOrderReplaces) != 1 {
+		t.Errorf("an error with no replaces to drop must not be retried, got %d attempts",
+			len(fake.newOrderReplaces))
 	}
 }

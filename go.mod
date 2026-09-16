@@ -6,6 +6,7 @@ require (
 	github.com/go-acme/lego/v4 v4.35.2
 	github.com/miekg/dns v1.1.73
 	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_model v0.6.2
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb v1.3.176
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.180
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod v1.3.131
@@ -29,7 +30,6 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/nrdcg/dnspod-go v0.4.0 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect

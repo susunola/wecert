@@ -76,6 +76,25 @@ type Store struct {
 // This is not an anomaly, it is a gate that has to exist. See the Store.lock comment.
 var ErrLocked = errors.New("the state database is already held by another wecert process")
 
+// ErrBackoff means a certificate is inside the retry window an earlier failure scheduled,
+// so the pass deliberately did not run.
+//
+// It lives here rather than in the acme or reconcile package because BOTH need it and they
+// do not import each other -- reconcile drives the manager through an interface on purpose
+// (see reconcile.CertManager), so the shared vocabulary for "this certificate is not
+// actionable right now" belongs in the layer they have in common. `NextAttemptAt` is
+// persisted state, so this is the retry state's natural home.
+//
+// Why it exists: Reconcile used to return nil when it skipped a pass for backoff, which made
+// the caller count the pass as result="ok" and POST a success notification for a certificate
+// that was in failure backoff -- the opposite of the truth, on the signal an operator uses to
+// decide whether anything is progressing.
+//
+// It is deliberately not a failure: nothing went wrong, and treating it as an error would
+// inflate the error rate and emit a failure every interval for a certificate that is simply
+// waiting.
+var ErrBackoff = errors.New("inside the retry backoff window; this pass did not run")
+
 // CertState is the runtime state of one certificate (the status of config.Certificate).
 type CertState struct {
 	Name string
