@@ -599,10 +599,38 @@ PROSE: dict[str, str] = {
         'diagram ②',
     '⓪ 部署形态':
         'ⓐ Deployment',
-    '图 ⓪部署形态：SNI 多域名 → 一张多 SAN 证书 → 后端 RS 池':
-        '<span class="num">diagram ⓐ</span>Deployment shape: SNI for several domains → one multi-SAN certificate → a backend RS pool',
-    '上半是请求路径，下半是这张证书是怎么来的。关键的一层关系在中间： SNI 决定 CLB 用哪张证书，证书的 SAN 决定它能对哪些域名完成握手 —— 所以多个域名共用一张证书时，它们是生死与共的。':
-        'The top half is the request path; the bottom half is where that certificate comes from. The relationship in the middle is the one that matters: <b>SNI decides which certificate the CLB uses, and that certificate’s SAN decides which domains it can complete a handshake for</b> — so domains sharing one certificate share its fate.',
+    '图 ⓪部署形态：免费证书在 CLB 上自动轮转':
+        '<span class="num">diagram ⓐ</span>Deployment shape: a free certificate rotating itself on the CLB',
+    '最上面那条带子是这套系统要解决的场景：免费证书只有 90 天，必须自动轮转。 下面两条是它落到腾讯云上的形态——上面是请求路径，下面是这张证书是怎么来的。 关键的一层关系在中间： SNI 决定 CLB 用哪张证书，证书的 SAN 决定它能对哪些域名完成握手 —— 所以多个域名共用一张证书时，它们是生死与共的。':
+        'The band on top is the scenario this system exists for: <b>a free certificate is valid for 90 days, so it has to rotate automatically</b>. The two bands below are what that scenario looks like on Tencent Cloud — the request path on top, and where the certificate comes from underneath. The relationship in the middle is the one that matters: <b>SNI decides which certificate the CLB uses, and that certificate’s SAN decides which domains it can complete a handshake for</b> — so domains sharing one certificate share its fate.',
+    '场景 · 免费证书（Let\'s Encrypt）+ 自动轮转':
+        'The scenario · a free certificate (Let’s Encrypt), rotating automatically',
+    'Let\'s Encrypt 不收费，代价是有效期只有 90 天 —— 一年至少要轮 4 次，靠人记着做迟早会漏。':
+        'Let’s Encrypt costs nothing; the price is a 90-day validity — at least four rotations a year, and a human remembering each one will eventually miss.',
+    '免费签发':
+        'Issued for free',
+    '不花钱，但只有 90 天':
+        'no cost, but only 90 days',
+    '自动换绑':
+        'Rebound automatically',
+    '上传到腾讯云 SSL':
+        'uploaded to Tencent Cloud SSL',
+    '再绑定到 CLB 监听器':
+        'then bound to the CLB listener',
+    '线上服务':
+        'Serving traffic',
+    'SNI 按域名选证书':
+        'SNI picks the certificate',
+    '这张证书只剩 90 天':
+        'only 90 days left on it',
+    '到期前自动再签':
+        'Reissued before expiry',
+    'ARI 给出建议窗口':
+        'ARI suggests the window',
+    '全程无人值守':
+        'nobody has to be involved',
+    '到期前自动回到第 1 步':
+        'before expiry, back to step 1 automatically',
     '请求路径 · SNI 选证书，证书的 SAN 决定它能服务哪些域名':
         'Request path · SNI picks the certificate, the certificate’s SAN decides which domains it can serve',
     'CLB · 监听器 443 · SNI 开启':
@@ -669,6 +697,6 @@ PROSE: dict[str, str] = {
         'DNS-01 sequence: a wildcard and its apex sharing one TXT',
     '证书生命周期时间线':
         'certificate lifetime timeline',
-    "wecert 的部署形态：客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池；wecert 从 DNSPod 与 Let's Encrypt 取得证书并换绑到 CLB":
-        "wecert's deployment shape: clients reach the CLB over SNI, one multi-SAN certificate routes to a backend RS pool, and wecert obtains it from DNSPod and Let's Encrypt and rebinds it to the CLB",
+    "wecert 的部署形态：免费证书由 Let's Encrypt 自动轮转（免费签发 → 自动换绑 → 服务 90 天 → 到期前自动再签），客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池":
+        "wecert's deployment shape: a free certificate rotated automatically by Let's Encrypt (issued for free → rebound automatically → serving for 90 days → reissued before expiry), with clients reaching the CLB over SNI and one multi-SAN certificate routing to a backend RS pool",
 }
