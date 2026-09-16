@@ -81,14 +81,13 @@ func (m *Manager) RevocationReasonCode(code int) (int, error) {
 		"5 cessationOfOperation)", code)
 }
 
-// HasPendingRevocations reports whether any request is outstanding, so a pass can skip the
-// query on the overwhelming majority of passes that have none.
-func (m *Manager) HasPendingRevocations() bool { return m.PendingRevocations() > 0 }
-
 // RetryPendingRevocations attempts every outstanding request. Called once per pass.
 //
-// A failure is logged and counted, never fatal to the pass: a certificate that cannot be
-// revoked right now must not stop the other certificates from renewing.
+// A failure is logged and recorded, never fatal to the pass: a certificate that cannot be revoked
+// right now must not stop the other certificates from renewing. Every failed attempt is persisted,
+// so "how long has this been failing" is answerable, and the request stays outstanding -- which is
+// what keeps wecert_revocation_pending non-zero and its alert firing. Being unable to read the list
+// at all is counted by the caller instead, as wecert_revocation_query_errors_total.
 func (m *Manager) RetryPendingRevocations(ctx context.Context) {
 	reqs, err := m.store.ListRevokeRequests()
 	if err != nil {
@@ -105,13 +104,19 @@ func (m *Manager) RetryPendingRevocations(ctx context.Context) {
 	}
 }
 
-// PendingRevocations reports how many requests are outstanding, for metrics.
-func (m *Manager) PendingRevocations() int {
+// PendingRevocations reports how many requests are outstanding. The reconciler uses it both as
+// the gate for the retry and as the value of wecert_revocation_pending.
+//
+// The error is returned instead of being folded into a zero count. Zero is a meaningful answer
+// here -- "nothing outstanding" -- so a store that cannot be read must not be able to produce it:
+// that would turn a database failure into a confident all-clear on the one signal that says a
+// certificate which should no longer be trusted still is.
+func (m *Manager) PendingRevocations() (int, error) {
 	reqs, err := m.store.ListRevokeRequests()
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	return len(reqs)
+	return len(reqs), nil
 }
 
 // processRevocation performs one attempt for a recorded request.

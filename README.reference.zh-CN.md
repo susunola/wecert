@@ -846,6 +846,9 @@ timer 里的 `Unit=` 不是装饰：不写这行时 systemd 会解析成同名�
 | `wecert_certificate_consecutive_failures` | 持续 > 0 需要人工介入 |
 | `wecert_certificate_ari_window_start_timestamp_seconds` | ARI 窗口起点 |
 | `wecert_reconcile_total{cert,result}` | 收敛轮次计数 |
+| `wecert_last_reconcile_timestamp_seconds` | 上一轮**完整收敛结束**的时刻。只在结束时打点、从不在开始时打点，所以卡住的一轮和死掉的进程一样会变陈旧；`0` 表示启动后还没跑完过一轮。这是"进程活着但什么都没在收敛"唯一可见的方式 —— 上面那个计数器在"没到期"和"循环卡死"两种情况下都不动 |
+| `wecert_revocation_pending` | 已记录、但 CA 还没接受的吊销请求数。**非 0 是一件悬而未决的安全动作**，不是后台任务：这条记录存在，是因为有人判定某张证书不该再被信任 |
+| `wecert_revocation_query_errors_total` | 读不出待处理吊销请求的轮次数。读失败时 `wecert_revocation_pending` 保持上一次的值而不是谎报 `0`，所以只有这个计数器能区分"队列真的是空的"和"我们已经很久没能看了" |
 | `wecert_certificate_probe_match{host}` | 1 = 服务的就是部署的那张；0 = 换绑没生效，或另一张证书在赢 SNI |
 | `wecert_certificate_probe_not_after_timestamp_seconds{host}` | 从网络读回的 `notAfter` —— 和状态库那个对比着看 |
 | `wecert_certificate_probe_errors_total{host}` | 探测根本没跑成。是环境问题，不是证书问题 |
@@ -853,6 +856,8 @@ timer 里的 `Unit=` 不是装饰：不写这行时 systemd 会解析成同名�
 | `wecert_certificate_fallback_dropped_names{cert}` | 那张证书少了几个名字 |
 | `wecert_desired_state_age_seconds` | 期望状态文档的年龄。持续增长说明 `wecert-onboard` 没在跑 |
 | `wecert_orphaned_certificates` | 状态库里有、期望状态里没有的证书。它们不会再被续期 |
+| `wecert_ratelimit_remaining_tokens{limit,scope}` | CA 已公布限额的估算剩余额度。**这是下界**：只统计 wecert 自己花掉的，而"每个注册域名的证书数"和"每组完全相同标识符的证书数"是全账号共享的 |
+| `wecert_ratelimit_blocked{limit,scope}` | `1` = CA 已针对该限额拒绝过请求，并告知何时会重新接受 |
 
 到期告警应该基于 `not_after` 做，而**不要**基于"续期任务有没有报错" —— 后者会在程序静默失效时保持沉默：
 
@@ -863,6 +868,8 @@ timer 里的 `Unit=` 不是装饰：不写这行时 systemd 会解析成同名�
 # tlsserver（45 天）提前 10 天告警
 (wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 10
 ```
+
+**其余规则随仓库一起提供。** `deploy/prometheus/wecert-alerts.yml` 是一份可以直接加载的 Prometheus 规则文件 —— 三个分组（`wecert.expiry`、`wecert.convergence`、`wecert.integrity`）共 17 条规则，每条阈值上方都写了这个数字是怎么来的。把 `rule_files:` 指过去，到期窗口按自己的口味改：上面那两条是"窗口属于业务决策"的规则，而随仓库发的是在任何窗口下都不对的那些 —— CA 还没接受的吊销、两小时没跑完一轮收敛、正在服务的不是部署的那张证书。
 
 **黑盒探测已经内建。** 每一轮 wecert 都会对每张已部署证书的头几个名字拨 443，读回实际在服务的证书 —— 就是上面 `probe` 那一节。它能抓出"程序以为成功、实际没生效"这类最隐蔽的故障，而只信自己的状态库永远看不见它。如果 wecert 跑在一台拨不到 VIP 的机器上，要么关掉 `probe.enabled`，要么改从别的机器定时跑 `wecert-probe`；开着但拨不通是无害的，只是没用，表现是 `probe_errors` 涨而 `probe_match` 不动。
 
@@ -1122,31 +1129,41 @@ DNSPod 免费套餐 TTL 下限 600、9 台权威 NS、实测传播 78s ——
 ## 开发
 
 ```bash
-make check      # 提交前的完整门禁：fmt-check + vet + test -race
+make check      # 提交前的完整门禁：gofmt + vet + 英文检查 + test -race + e2e 自测 + 告警规则
 make test       # 单元测试
 make test-race  # 带竞态检测（DNS 探测与授权轮询都是并发的）
-make fmt-check  # 只检查不修改，CI 用的就是这个
+make fmt-check  # 只检查不修改
 make vet        # 静态检查
 make build      # 产出 bin/wecert
 make release    # 交叉编译 linux/amd64、linux/arm64、darwin/arm64
+make fuzz       # 属性/模糊测试目标，每个目标跑 FUZZTIME（随 PR #55 一起进）
+make test-pebble  # 对着本地 CA 跑一遍真实 ACME 生命周期（需要 pebble 二进制）
 make cover      # 覆盖率
 ```
 
-CI（`.github/workflows/ci.yml`）跑 `gofmt` + `vet` + `test -race` + 交叉编译。
-`gofmt` 单独设门禁是必要的：`go vet` 不检查格式。更实际的理由是，
-一个类型错误就能让 9 个包里的 4 个编译不过（含主程序），而 `go vet` / `go test` 会一起失败 ——
-没有 CI 就没人会发现。
+CI（`.github/workflows/ci.yml`）跑 `gofmt` + 英文检查 + `vet` + `govulncheck` + `test -race` +
+`make build` + `make release`。`gofmt` 单独设门禁是必要的：`go vet` 不检查格式。
+更实际的理由是，一个类型错误会让所有依赖它的包一起编译不过（含主程序），
+`go vet` / `go test` 会跟着一起失败。
+CI **没有**跑 `check-scripts`、`check-alerts`、`make fuzz` 和 `make test-pebble` —— 这四样得自己跑。
 
 ### 测试分布
 
-13 个测试文件、69 个用例。
+18 个包、60 个测试文件、633 个测试函数
+（`go test ./... -list 'Test.*' | grep -c '^Test'`）：
 
-| 方向 | 文件 |
-|---|---|
-| ACME 状态机 | `ari_test.go`、`manager_test.go`、`reconcile_test.go`、`cleanup_test.go`、`dns_test.go` |
-| 配置 / 域名 | `config_test.go`、`domains_test.go` |
-| 状态库 | `state_test.go`、`migrate_test.go`、`deploy_confirmed_test.go`、`umask_*_test.go` |
-| 部署 | `tencent_test.go` |
+| 包 | 文件数 | 覆盖什么 |
+|---|---|---|
+| `internal/acme` | 20 | 签发状态机 |
+| `internal/config` | 5 | 校验、域名规范化、profile |
+| `internal/deploy` | 6 | 上传、绑定确认、替换 |
+| `internal/state` | 7 | 表结构、权限、备份 |
+| `internal/onboarding` | 4 | 文档生成与 CLB guard |
+| `internal/reconcile` | 2 | 到底要不要下单，以及指标写入 |
+| `internal/webhook` | 2 | 触发参数解析、token 校验 |
+| `internal/ratelimit` | 4 | 令牌算术，含模糊测试目标 |
+| `internal/spec`、`internal/probe`、`internal/group`、`internal/metrics` | 各 1 | 来源选择、黑盒探测、分组、指标注册表 |
+| `cmd/*` | 6 | 各工具的参数处理与退出码 |
 
 ### 测试钉住了什么
 

@@ -26,7 +26,7 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # yet; keep this list in sync when it lands.
 CMDS := wecert wecert-onboard
 
-.PHONY: build build-lego-dns tools release test test-race vet cover clean fmt validate-cloudinit check-english fmt-check check diagrams diagrams-check
+.PHONY: build build-lego-dns sbom repro-check tools release test test-race vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
@@ -99,6 +99,49 @@ release:
 	@cd dist && (command -v sha256sum >/dev/null 2>&1 && sha256sum wecert* || shasum -a 256 wecert*) > SHA256SUMS
 	@echo && echo "=== artifacts ===" && ls -lh dist/ && echo && cat dist/SHA256SUMS
 
+# A CycloneDX SBOM for the release, generated from the module graph.
+#
+# Why it ships: this program holds private keys and links two cloud SDKs plus a TLS stack, so "what
+# exactly is in the binary" is a question operators and reviewers are entitled to answer without
+# reading go.mod and resolving the transitive tree by hand.
+#
+# `-licenses` is deliberately NOT used: it needs every module present in the local cache, and when
+# one is missing it logs a warning and produces an SBOM with that field silently absent. A
+# completeness claim that quietly degrades is worse than not making it.
+SBOM := dist/wecert-sbom.cdx.json
+sbom: build
+	@command -v cyclonedx-gomod >/dev/null 2>&1 || { \
+		echo "cyclonedx-gomod not found; install with:"; \
+		echo "  go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest"; \
+		exit 1; }
+	@mkdir -p dist
+	cyclonedx-gomod mod -output $(SBOM) -json
+	@echo "SBOM: $(SBOM) ($$(wc -c < $(SBOM) | tr -d ' ') bytes)"
+
+# Verify that the release binaries can be rebuilt bit-for-bit from the same source.
+#
+# This is what makes "the artifact was built from this commit" checkable rather than asserted, and it
+# is the precondition for anyone else reproducing a release to compare against ours. `-trimpath` is
+# already in the build; the remaining variables are the Go toolchain and GOOS/GOARCH, which is why
+# the comparison is per-platform and per-toolchain rather than universal.
+repro-check:
+	@rm -rf /tmp/wecert-repro && mkdir -p /tmp/wecert-repro
+	@for p in $(PLATFORMS); do \
+		os=$${p%%/*}; arch=$${p##*/}; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath \
+			-ldflags "-s -w -X main.version=$(VERSION)" \
+			-o /tmp/wecert-repro/a ./cmd/wecert || exit 1; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath \
+			-ldflags "-s -w -X main.version=$(VERSION)" \
+			-o /tmp/wecert-repro/b ./cmd/wecert || exit 1; \
+		if cmp -s /tmp/wecert-repro/a /tmp/wecert-repro/b; then \
+			printf 'reproducible  %s/%s\n' $$os $$arch; \
+		else \
+			printf 'NOT REPRODUCIBLE  %s/%s\n' $$os $$arch; exit 1; \
+		fi; \
+	done
+	@rm -rf /tmp/wecert-repro
+
 # Check the syntax of the scripts inside the cloud-init user_data before apply.
 # This class of error only shows up after the machine boots, and what you see is a
 # CLB 502, which is easily misdiagnosed as a network problem.
@@ -147,6 +190,12 @@ fmt-check:
 check-scripts:
 	@bash scripts/test-e2e-wildcard.sh
 
+# The shipped Prometheus rules are the only thing watching several failures that are silent by
+# construction, so a rule that cannot fire is worse than no rule: the operator believes they are
+# covered. One of them could not fire, and this is what now catches that class.
+check-alerts:
+	python3 scripts/check-alerts.py
+
 # A real ACME lifecycle against pebble (plus a real account, real order, real CSR finalize and
 # real chain download). Behind a build tag because it needs a pebble binary, and it skips with
 # instructions when the binary is absent rather than failing the build.
@@ -155,7 +204,7 @@ check-scripts:
 test-pebble:
 	$(GO) test -tags pebble -count=1 -timeout 5m ./internal/acme/ -run TestPebble -v
 
-check: check-english fmt-check vet test-race check-scripts
+check: check-english fmt-check vet test-race check-scripts check-alerts
 
 clean:
 	rm -rf bin dist coverage.out
