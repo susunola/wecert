@@ -26,7 +26,7 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # yet; keep this list in sync when it lands.
 CMDS := wecert wecert-onboard
 
-.PHONY: build tools release test vet cover clean fmt validate-cloudinit check-english fmt-check check diagrams diagrams-check
+.PHONY: build tools release test test-race vet cover clean fmt validate-cloudinit check-english fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
