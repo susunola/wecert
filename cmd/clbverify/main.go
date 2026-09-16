@@ -1,9 +1,10 @@
-// Command clbverify 查询 CLB 监听器当前绑定的证书，用于端到端测试断言。
+// Command clbverify queries the certificate bound to a CLB listener, for end-to-end assertions.
 //
-// 为什么需要单独一个工具：wecert 调完 UpdateCertificateInstance 之后，
-// 唯一的权威事实是"监听器上的 CertId 到底变了没有"。
-// 只信 wecert 自己的日志是不够的 —— 那正是"程序以为成功、实际没生效"
-// 这类最隐蔽故障的盲区。这个工具从腾讯云侧独立取证。
+// Why it is its own tool: after wecert calls UpdateCertificateInstance, the only
+// authoritative fact is whether the listener's CertId actually changed. Trusting wecert's
+// own logs is not enough -- that is the blind spot of "the program believed it succeeded but
+// nothing took effect", the most insidious failure class. This tool gathers independent
+// evidence from the Tencent Cloud side.
 package main
 
 import (
@@ -63,9 +64,9 @@ func run() error {
 
 	req := clb.NewDescribeListenersRequest()
 	req.LoadBalancerId = common.StringPtr(*lbID)
-	// 不传 ListenerIds 时返回该 CLB 下的全部监听器。
-	// 排障中发现：带了 ListenerIds 过滤，返回里可能不带 Certificate 字段，
-	// 所以留出"不带过滤"这条路用于交叉验证。
+	// With no ListenerIds, every listener on the CLB comes back.
+	// Observed while debugging: filtering by ListenerIds can return entries without the
+	// Certificate field, so the unfiltered path is kept for cross-checking.
 	if *listenerID != "" {
 		req.ListenerIds = []*string{common.StringPtr(*listenerID)}
 	}
@@ -79,8 +80,8 @@ func run() error {
 	}
 
 	if *raw {
-		// 排障用：原样打出服务端返回的内容，
-		// 避免"我们以为的字段名"和"API 实际返回的"对不上时瞎猜。
+		// For troubleshooting: print the server's response verbatim, so that a mismatch
+		// between the field names we assume and what the API really returns is not a guess.
 		b, err := json.MarshalIndent(resp.Response, "", "  ")
 		if err != nil {
 			return fmt.Errorf("encode response: %w", err)
@@ -99,8 +100,8 @@ func run() error {
 	certID := *l.Certificate.CertId
 	fmt.Printf("  primary certificate: %s\n", certID)
 
-	// SNI 扩展证书：这正是"换一张证书时容易误伤别的证书"的地方，
-	// 所以单独打出来。
+	// SNI extension certificates: this is exactly where rotating one certificate can
+	// clobber another, so they are printed separately.
 	if n := len(l.Certificate.ExtCertIds); n > 0 {
 		fmt.Printf("  SNI certificates  : %d\n", n)
 		for _, e := range l.Certificate.ExtCertIds {
@@ -110,15 +111,15 @@ func run() error {
 		fmt.Printf("  SNI certificates  : none\n")
 	}
 
-	// UpdateCertificateInstance 是异步 API：调用返回只代表任务创建成功，
-	// 真正的重绑定要等后台跑完（实测约 15 秒）。所以断言必须带等待。
+	// UpdateCertificateInstance is asynchronous: a return means only that the task was
+	// created; the real rebind waits on the backend (~15s measured), so the assertion must wait.
 	if *expect != "" && *wait > 0 && certID != *expect {
-		// 等待循环必须用自己的、足够长的 ctx。
+		// The wait loop needs its own, long-enough ctx.
 		//
-		// 复用上面那个 30 秒的 ctx 会让 -wait 超过 30s 时每次请求都立刻
-		// 返回 deadline exceeded，而下面的 continue 又把错误吞掉 ——
-		// 结果就是空转到超时，然后报"仍未变成期望值"的假失败。
-		// 而那恰好是这个工具唯一存在的场景。
+		// Reusing the 30-second ctx above makes every request return deadline exceeded once
+		// -wait exceeds 30s, while the continue below swallows the error -- so it spins until
+		// the deadline and then falsely reports "still not the expected value", which is
+		// precisely the one scenario this tool exists for.
 		waitCtx, cancelWait := context.WithTimeout(context.Background(), *wait+30*time.Second)
 		defer cancelWait()
 
@@ -128,8 +129,8 @@ func run() error {
 			time.Sleep(5 * time.Second)
 			cur, err := fetchCertID(waitCtx, client, *lbID, *listenerID)
 			if err != nil {
-				// 不能再静默 continue：查询本身失败和"还没换过来"
-				// 是两件完全不同的事，必须让人看得见。
+				// No more silent continue: the query itself failing and "not switched over
+				// yet" are two completely different things, and both must be visible.
 				lastErr = err
 				fmt.Printf("  ...query failed, retrying shortly: %v\n", err)
 				continue
@@ -160,10 +161,11 @@ func run() error {
 	return nil
 }
 
-// fetchCertID 单独查一次监听器当前绑定的主证书 ID。
+// fetchCertID queries the listener's currently bound primary certificate ID once.
 //
-// listenerID 为空时按主流程一致的方式取第一个监听器 —— 传一个空的
-// ListenerIds 进去会让 API 直接报错，然后被等待循环当成"网络抖动"重试。
+// With an empty listenerID it takes the first listener, the same way the main path does
+// -- passing an empty ListenerIds makes the API error out, which the wait loop would then
+// retry as though it were a network blip.
 func fetchCertID(ctx context.Context, client *clb.Client, lbID, listenerID string) (string, error) {
 	req := clb.NewDescribeListenersRequest()
 	req.LoadBalancerId = common.StringPtr(lbID)

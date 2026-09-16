@@ -13,7 +13,7 @@ func TestDeployConfirmedRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !got.DeployConfirmed || got.DeployedCertID != "apXXXX" {
-		t.Fatalf("DeployConfirmed 未恢复: %+v", got)
+		t.Fatalf("DeployConfirmed was not restored: %+v", got)
 	}
 
 	got.DeployConfirmed = false
@@ -25,7 +25,7 @@ func TestDeployConfirmedRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.DeployConfirmed {
-		t.Fatal("DeployConfirmed 应为 false")
+		t.Fatal("DeployConfirmed should be false")
 	}
 }
 
@@ -36,7 +36,7 @@ func TestDeployConfirmedMigratesOnOldSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got != nil {
-		t.Fatalf("不存在的证书应返回 nil: %+v", got)
+		t.Fatalf("a missing certificate should return nil: %+v", got)
 	}
 	if err := s.PutCert(&CertState{Name: "fresh"}); err != nil {
 		t.Fatal(err)
@@ -46,6 +46,6 @@ func TestDeployConfirmedMigratesOnOldSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.DeployConfirmed {
-		t.Fatal("新行 DeployConfirmed 默认应为 false")
+		t.Fatal("DeployConfirmed on a new row should default to false")
 	}
 }

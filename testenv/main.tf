@@ -1,11 +1,12 @@
 ###############################################################################
-# wecert 测试环境
+# wecert test environment
 #
-# 分阶段创建，全部资源由 Terraform 管理，`terraform destroy` 一键清干净。
+# Created in stages; every resource is managed by Terraform, so `terraform destroy`
+# cleans it all up in one shot.
 #
-#   阶段 A：wildcard 签发 —— 不需要云资源，本模块都不用 apply
-#   阶段 B：create_clb = true（默认）—— VPC + CLB + HTTPS 监听器 + 占位证书
-#   阶段 C：create_cvm = true 且 enable_cvm_role = true —— 再加一台 CVM
+#   Stage A: wildcard issuance — needs no cloud resources, this module is not even applied
+#   Stage B: create_clb = true (default) — VPC + CLB + HTTPS listener + placeholder cert
+#   Stage C: create_cvm = true and enable_cvm_role = true — adds one CVM on top
 #
-# 详见 README.md
+# See README.md for details
 ###############################################################################

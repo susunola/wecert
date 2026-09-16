@@ -14,26 +14,34 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// fakeDeployer 只实现 Bindings —— 本文件测的是"确认绑定"这一步。
+// fakeDeployer implements only Bindings -- this file tests the "confirm binding" step.
 type fakeDeployer struct {
 	bindings int
 	bindErr  error
 	calls    int
+
+	// deleted records the CertIds Delete was called with, and deleteErr makes it
+	// fail, so the reclamation path can be pinned in both directions.
+	deleted   []string
+	deleteErr error
 }
 
 func (f *fakeDeployer) Deploy(_ context.Context, _, oldID string, _, _ []byte) (string, error) {
 	return oldID, nil
 }
-func (f *fakeDeployer) Delete(_ context.Context, _ string) error { return nil }
+func (f *fakeDeployer) Delete(_ context.Context, certID string) error {
+	f.deleted = append(f.deleted, certID)
+	return f.deleteErr
+}
 func (f *fakeDeployer) Bindings(_ context.Context, _ string) (int, error) {
 	f.calls++
 	return f.bindings, f.bindErr
 }
 
-// newConfirmHarness 造出"证书已签发并上传、但尚未确认绑定"的状态。
+// newConfirmHarness builds the state "issued and uploaded, binding not confirmed yet".
 //
-// 刻意让证书距离续期窗口还很远、且不带 ARI —— 这样 Reconcile 走到
-// 确认这一步之后不会再碰 ACME 客户端，用例可以纯单测。
+// The certificate is deliberately far from its renewal window and has no ARI, so
+// Reconcile never touches the ACME client after the confirmation step -- a pure unit test.
 func newConfirmHarness(
 	t *testing.T, dep deploy.Deployer, mutate func(*state.CertState, *config.Certificate),
 ) (*Manager, *state.Store, *config.Certificate) {
@@ -61,7 +69,7 @@ func newConfirmHarness(
 		CertURL:  "https://acme.example/cert/1",
 		CertPEM:  []byte("x"),
 		KeyPEM:   []byte("x"),
-		// 首次签发只上传，所以有 CertId 但 DeployConfirmed 为 false。
+		// The first issuance only uploads, so a CertId exists but DeployConfirmed is false.
 		DeployedCertID:  "ap-uploaded",
 		DeployConfirmed: false,
 	}
@@ -75,18 +83,18 @@ func newConfirmHarness(
 	return m, store, cert
 }
 
-// 这是本次修复的核心：人工在 CLB 控制台绑好之后，
-// 收敛必须能自己发现并置位，而不是干等到下次续期（最长 90 天）。
+// This is the heart of the fix: after a human binds it in the CLB console,
+// convergence must set the flag on its own rather than wait up to 90 days for renewal.
 func TestReconcileConfirmsBindingOnceBound(t *testing.T) {
 	dep := &fakeDeployer{bindings: 2}
 	m, store, cert := newConfirmHarness(t, dep, nil)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("Reconcile 不该报错: %v", err)
+		t.Fatalf("Reconcile should not fail: %v", err)
 	}
 
 	if dep.calls != 1 {
-		t.Fatalf("应当查询一次绑定关系，实际 %d 次", dep.calls)
+		t.Fatalf("should query the bindings once, got %d calls", dep.calls)
 	}
 
 	got, err := store.GetCert(cert.Name)
@@ -94,18 +102,18 @@ func TestReconcileConfirmsBindingOnceBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !got.DeployConfirmed {
-		t.Error("查到绑定了 2 个资源，DeployConfirmed 应当被置位")
+		t.Error("2 resources are bound, DeployConfirmed should be set")
 	}
 }
 
-// 查不到绑定是"等人去绑"的正常状态，不是错误 ——
-// 不能记失败、更不能进指数退避，否则人工绑好之前会被退避挡住。
+// Finding no binding is the normal "waiting for a human" state, not an error -- it must
+// not count as a failure or enter exponential backoff, which would block it until bound.
 func TestReconcileUnboundStaysUnconfirmedWithoutFailure(t *testing.T) {
 	dep := &fakeDeployer{bindings: 0}
 	m, store, cert := newConfirmHarness(t, dep, nil)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("没绑上不该报错: %v", err)
+		t.Fatalf("an unbound certificate should not fail: %v", err)
 	}
 
 	got, err := store.GetCert(cert.Name)
@@ -113,23 +121,23 @@ func TestReconcileUnboundStaysUnconfirmedWithoutFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.DeployConfirmed {
-		t.Error("没有任何绑定时不该置位")
+		t.Error("the flag should not be set when nothing is bound")
 	}
 	if got.ConsecutiveFailures != 0 {
-		t.Errorf("这不算失败，ConsecutiveFailures 应为 0，实际 %d", got.ConsecutiveFailures)
+		t.Errorf("this is not a failure, so ConsecutiveFailures should be 0, got %d", got.ConsecutiveFailures)
 	}
 	if !got.NextAttemptAt.IsZero() {
-		t.Errorf("不该进入退避，NextAttemptAt 应为零值，实际 %s", got.NextAttemptAt)
+		t.Errorf("this should not enter backoff, NextAttemptAt should be zero, got %s", got.NextAttemptAt)
 	}
 }
 
-// 查询故障不能拖住续期主线：Reconcile 仍然成功返回。
+// A query failure must not hold up the renewal mainline: Reconcile still returns success.
 func TestReconcileBindingQueryErrorDoesNotFailThePass(t *testing.T) {
-	dep := &fakeDeployer{bindErr: errors.New("API 抖了一下")}
+	dep := &fakeDeployer{bindErr: errors.New("API blip")}
 	m, store, cert := newConfirmHarness(t, dep, nil)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("查询失败不该让整轮失败: %v", err)
+		t.Fatalf("a query failure should not fail the whole pass: %v", err)
 	}
 
 	got, err := store.GetCert(cert.Name)
@@ -137,15 +145,15 @@ func TestReconcileBindingQueryErrorDoesNotFailThePass(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.DeployConfirmed {
-		t.Error("查询没成功就不该置位")
+		t.Error("the flag should not be set when the query failed")
 	}
 	if got.ConsecutiveFailures != 0 {
-		t.Errorf("确认动作的故障不该记成续期失败，实际 %d", got.ConsecutiveFailures)
+		t.Errorf("a confirmation failure is not a renewal failure, got %d", got.ConsecutiveFailures)
 	}
 }
 
-// 已经确认过的证书不该每次收敛都去查一遍 —— 那是白花的 API 调用，
-// 而这个状态一旦为真就不会再变回假。
+// An already-confirmed certificate should not be queried on every convergence pass --
+// that is a wasted API call, and once this is true it never flips back to false.
 func TestReconcileSkipsQueryWhenAlreadyConfirmed(t *testing.T) {
 	dep := &fakeDeployer{bindings: 3}
 	m, _, cert := newConfirmHarness(t, dep, func(st *state.CertState, _ *config.Certificate) {
@@ -153,14 +161,14 @@ func TestReconcileSkipsQueryWhenAlreadyConfirmed(t *testing.T) {
 	})
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("Reconcile 不该报错: %v", err)
+		t.Fatalf("Reconcile should not fail: %v", err)
 	}
 	if dep.calls != 0 {
-		t.Errorf("已确认的证书不该再查绑定，实际查了 %d 次", dep.calls)
+		t.Errorf("an already confirmed certificate should not query bindings again, queried %d times", dep.calls)
 	}
 }
 
-// 没开 deploy 的证书根本不会上传，也就无所谓确认。
+// A certificate with deploy disabled is never uploaded, so there is nothing to confirm.
 func TestReconcileSkipsQueryWhenDeployDisabled(t *testing.T) {
 	dep := &fakeDeployer{bindings: 1}
 	m, _, cert := newConfirmHarness(t, dep, func(st *state.CertState, c *config.Certificate) {
@@ -169,14 +177,14 @@ func TestReconcileSkipsQueryWhenDeployDisabled(t *testing.T) {
 	})
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("Reconcile 不该报错: %v", err)
+		t.Fatalf("Reconcile should not fail: %v", err)
 	}
 	if dep.calls != 0 {
-		t.Errorf("未开启部署时不该查绑定，实际查了 %d 次", dep.calls)
+		t.Errorf("bindings should not be queried when deploy is off, queried %d times", dep.calls)
 	}
 }
 
-// 还没有 CertId 说明连上传都还没发生，没有可查的对象。
+// Without a CertId the upload has not even happened yet, so there is nothing to query.
 func TestReconcileSkipsQueryWhenNoCertID(t *testing.T) {
 	dep := &fakeDeployer{bindings: 1}
 	m, _, cert := newConfirmHarness(t, dep, func(st *state.CertState, _ *config.Certificate) {
@@ -184,15 +192,15 @@ func TestReconcileSkipsQueryWhenNoCertID(t *testing.T) {
 	})
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
-		t.Fatalf("Reconcile 不该报错: %v", err)
+		t.Fatalf("Reconcile should not fail: %v", err)
 	}
 	if dep.calls != 0 {
-		t.Errorf("没有 CertId 时不该查绑定，实际查了 %d 次", dep.calls)
+		t.Errorf("bindings should not be queried without a CertId, queried %d times", dep.calls)
 	}
 }
 
-// 确认之后必须落盘：重启不能让这个结论丢掉，
-// 否则每次重启都会退回"未部署"，而指标正是读它。
+// Confirmation must be persisted: a restart must not lose this conclusion, otherwise
+// every restart falls back to "not deployed" -- and the metrics read exactly this flag.
 func TestConfirmedBindingIsPersisted(t *testing.T) {
 	dep := &fakeDeployer{bindings: 1}
 	m, _, cert := newConfirmHarness(t, dep, nil)
@@ -200,22 +208,102 @@ func TestConfirmedBindingIsPersisted(t *testing.T) {
 	if err := m.Reconcile(context.Background(), cert); err != nil {
 		t.Fatal(err)
 	}
-	// 再跑一轮：此时应已确认，不该再查第二次。
+	// Run one more pass: it is confirmed by now, so it must not query a second time.
 	if err := m.Reconcile(context.Background(), cert); err != nil {
 		t.Fatal(err)
 	}
 	if dep.calls != 1 {
-		t.Errorf("置位后应当落盘，第二轮不该再查；实际共查 %d 次", dep.calls)
+		t.Errorf("the flag must be persisted, so pass two must not query again; queried %d times total", dep.calls)
 	}
 }
 
-// Noop 部署器（未开启云端部署时用）应恒为 0，且不报错。
+// The Noop deployer (used when cloud deploy is off) must always report 0 and never fail.
 func TestNoopDeployerReportsNoBindings(t *testing.T) {
 	n, err := deploy.Noop{}.Bindings(context.Background(), "ap-whatever")
 	if err != nil {
-		t.Fatalf("Noop.Bindings 不该报错: %v", err)
+		t.Fatalf("Noop.Bindings should not fail: %v", err)
 	}
 	if n != 0 {
-		t.Errorf("Noop.Bindings 应恒为 0，得到 %d", n)
+		t.Errorf("Noop.Bindings must always report 0, got %d", n)
 	}
+}
+
+// ── reclamation: every uploaded CertId must end up somewhere ────────────────
+
+// A certificate uploaded during a failed deploy is bound to nothing, so no later
+// renewal will ever replace it: it occupies the account's uploaded-certificate
+// quota until it is deleted. Recording it at the moment the deploy fails is the
+// only thing that ever gets it back -- and losing that record is a slow,
+// account-wide failure whose first symptom is "renewal stopped working".
+func TestFailedDeployIsRecordedForReclaimAndThenReaped(t *testing.T) {
+	dep := &fakeDeployer{}
+	m, store, cert := newConfirmHarness(t, dep, nil)
+
+	// The deploy failed after the upload, so the new CertId is an orphan.
+	m.recordOrphanCert("ap-new", "ap-live", cert.Name)
+
+	if got := listRetired(t, store, m, time.Hour); len(got) != 1 || got[0].CertID != "ap-new" {
+		t.Fatalf("the orphaned certificate must be recorded for reclaim, got %+v", got)
+	}
+
+	// Inside the retention window nothing is deleted: that certificate is still the
+	// rollback target if the new one goes wrong.
+	m.ReapRetired(context.Background())
+	if len(dep.deleted) != 0 {
+		t.Fatalf("a certificate inside the retention window must not be deleted, got %v", dep.deleted)
+	}
+
+	// Past the window it is reclaimed, and the record goes with it so the next pass
+	// does not attempt the same delete forever.
+	base := time.Now()
+	m.now = func() time.Time { return base.Add(2 * m.retention) }
+	m.ReapRetired(context.Background())
+
+	if len(dep.deleted) != 1 || dep.deleted[0] != "ap-new" {
+		t.Fatalf("want the orphan deleted exactly once, got %v", dep.deleted)
+	}
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 0 {
+		t.Errorf("a reclaimed certificate must leave no record behind, got %+v", got)
+	}
+}
+
+// A failed Delete must keep the record: the certificate still occupies quota, so
+// the next pass has to try again.
+func TestReapingKeepsTheRecordWhenDeleteFails(t *testing.T) {
+	dep := &fakeDeployer{deleteErr: errors.New("API blip")}
+	m, store, cert := newConfirmHarness(t, dep, nil)
+
+	m.recordOrphanCert("ap-new", "ap-live", cert.Name)
+	base := time.Now()
+	m.now = func() time.Time { return base.Add(2 * m.retention) }
+	m.ReapRetired(context.Background())
+
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 1 {
+		t.Fatalf("a failed reclaim must leave the record for the next pass, got %+v", got)
+	}
+}
+
+// Recording the certificate that is actually serving traffic would schedule the
+// live certificate for deletion.
+func TestRecordOrphanCertIgnoresTheLiveCertificate(t *testing.T) {
+	dep := &fakeDeployer{}
+	m, store, cert := newConfirmHarness(t, dep, nil)
+
+	m.recordOrphanCert("ap-live", "ap-live", cert.Name) // same id as live
+	m.recordOrphanCert("", "ap-live", cert.Name)        // nothing was uploaded
+
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 0 {
+		t.Fatalf("the live certificate (or an empty id) must never be recorded for reclaim, got %+v", got)
+	}
+}
+
+// listRetired reads the reclaim records further into the future than any retention
+// window, so a record is returned whether or not it is due yet.
+func listRetired(t *testing.T, store *state.Store, m *Manager, ahead time.Duration) []*state.RetiredCert {
+	t.Helper()
+	got, err := store.ListRetiredCertsBefore(m.now().Add(ahead))
+	if err != nil {
+		t.Fatalf("ListRetiredCertsBefore: %v", err)
+	}
+	return got
 }

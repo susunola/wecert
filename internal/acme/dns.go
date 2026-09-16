@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -19,35 +20,49 @@ import (
 	"github.com/susunola/wecert/internal/deploy"
 )
 
-// DNSSolver 在 lego 的 DNS provider 之上补了一步：
-// "等该 zone 的所有权威 NS 都返回这条 TXT"。
+// DNSSolver adds one step on top of lego's DNS providers: "wait until every
+// authoritative NS for the zone returns this TXT".
 //
-// 为什么不能省：Let's Encrypt 会从多个 vantage point 校验，并要求全部一致。
-// 只查本地递归解析器会被缓存骗过，结果本地以为好了、LE 那头验证失败。
-// 而验证失败是按 identifier 计费限速的（5 次/小时），代价很实在。
+// Why it cannot be skipped: Let's Encrypt validates from several vantage points and
+// demands that all of them agree. Querying only the local recursive resolver is fooled
+// by its cache, so locally everything looks ready while LE's validation fails. And a
+// failed validation is rate limited per identifier (5 per hour) -- a very real cost.
 //
-// 这一步对 CNAME 委派同样成立：GetChallengeInfo 会跟随 CNAME 给出
-// EffectiveFQDN，我们查的就是委派之后真正承载 TXT 的那个 zone。
+// The step holds for CNAME delegation too: GetChallengeInfo follows the CNAME and
+// reports the EffectiveFQDN, so what we query is the zone that really carries the TXT
+// after delegation.
 type DNSSolver struct {
-	// newProvider 每次使用时取一个新的 provider 实例。
-	// tencentcloud 走 CAM 临时凭证，会过期，所以不能长期持有。
+	// newProvider fetches a fresh provider instance on every use. The tencentcloud path
+	// goes through CAM temporary credentials that expire, so it must not be held long
+	// term.
 	newProvider func(ctx context.Context) (challenge.Provider, error)
 
-	timeout  time.Duration
-	interval time.Duration
-	log      *slog.Logger
+	timeout              time.Duration
+	interval             time.Duration
+	log                  *slog.Logger
+	recursiveNameservers []string
+	exchange             func(ctx context.Context, msg *dns.Msg, server string) (*dns.Msg, error)
 }
 
-// NewDNSSolver 按 dns.provider 选择实现。
+// NewDNSSolver picks an implementation from dns.provider.
 //
-// 两种实现的凭证体系完全不同：
-//   - dnspod       用 DNSPod 自有 API Token（不过期，构造一次复用）
-//   - tencentcloud 用腾讯云 CAM 凭证，与证书部署共用（支持 CVM 角色临时凭证）
+// The two implementations use completely different credential systems:
+//   - dnspod       uses a DNSPod-native API token (never expires, build once, reuse)
+//   - tencentcloud uses Tencent Cloud CAM credentials, shared with certificate
+//     deployment (supports temporary credentials from a CVM role)
 func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger) (*DNSSolver, error) {
 	var newProvider func(ctx context.Context) (challenge.Provider, error)
 
 	switch dnsCfg.Provider {
 	case config.DNSProviderDNSPod:
+		// Hazard: lego wraps this provider's HTTP client in its debug dumper, which is
+		// enabled by LEGO_DEBUG_DNS_API_HTTP_CLIENT. It redacts Authorization/Token/
+		// Api-Key *headers*, but dnspod-go puts the credential in the POST *body* as
+		// `login_token=...`, which no redaction rule matches -- so setting that variable
+		// on the service writes a never-expiring DNSPod token (record write over every
+		// zone in the account) into stdout, which under systemd means the journal.
+		//
+		// Keep it out of the unit and out of any drop-in; debug DNS locally instead.
 		p, err := dnspod.NewDNSProviderConfig(&dnspod.Config{
 			LoginToken:         dnsCfg.LoginToken,
 			TTL:                dnsCfg.TTL,
@@ -57,7 +72,7 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		if err != nil {
 			return nil, fmt.Errorf("initialise the dnspod provider: %w", err)
 		}
-		// DNSPod 自有 Token 不会过期，复用一个实例即可。
+		// A DNSPod-native token never expires, so one reused instance is enough.
 		newProvider = func(context.Context) (challenge.Provider, error) { return p, nil }
 
 	case config.DNSProviderTencentCloud:
@@ -65,8 +80,9 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		if err != nil {
 			return nil, err
 		}
-		// 每次现取现建。provider 构造只是创建一个 SDK client，代价可忽略，
-		// 换来的是永远不会拿着过期凭证去调 API。
+		// Fetch and build on the spot every time. Constructing a provider only creates
+		// an SDK client, a negligible cost, and what we get for it is never calling the
+		// API with expired credentials.
 		newProvider = func(ctx context.Context) (challenge.Provider, error) {
 			cred, err := creds(ctx)
 			if err != nil {
@@ -86,29 +102,33 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		return nil, fmt.Errorf("unknown dns.provider %q", dnsCfg.Provider)
 	}
 
-	return &DNSSolver{
-		newProvider: newProvider,
-		timeout:     dnsCfg.Propagation,
-		interval:    dnsCfg.Polling,
-		log:         log,
-	}, nil
+	resolvers, err := recursiveNameservers(dnsCfg.RecursiveNameservers)
+	if err != nil {
+		return nil, err
+	}
+	if err := dns01.AddRecursiveNameservers(resolvers)(&dns01.Challenge{}); err != nil {
+		return nil, fmt.Errorf("configure lego recursive nameservers: %w", err)
+	}
+	return &DNSSolver{newProvider: newProvider, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS}, nil
 }
 
-// DNSRecord 是一条待写入 / 待验证的 _acme-challenge TXT 记录。
+// DNSRecord is one _acme-challenge TXT record that is to be written or verified.
 type DNSRecord struct {
 	FQDN  string
 	Value string
 }
 
-// Present 把 TXT 写进 DNS，但**不等待传播**。
+// Present writes the TXT into DNS but **does not wait for propagation**.
 //
-// 把"写入"和"等待"分开是有意的，两个原因：
+// Splitting "write" from "wait" is deliberate, for two reasons:
 //
-//  1. 正确性：wildcard + apex 会写到同一个 _acme-challenge 名字上，
-//     两条记录必须同时存在。逐条"写完就等、等完再写第二条"虽然也能用，
-//     但把写入全部前置更不容易出错。
-//  2. 性能：等待传播是整条链路最慢的一步 —— DNSPod 免费套餐 TTL 下限 600、
-//     有 9 个权威 NS，一轮传播要 2 分钟以上。逐条等待会让同名记录白等两遍。
+//  1. Correctness: a wildcard + its apex write to the same _acme-challenge name, so
+//     both records must exist at the same time. "Write, wait, then write the second"
+//     works too, but hoisting every write up front is harder to get wrong.
+//  2. Performance: waiting for propagation is the slowest step in the whole chain --
+//     DNSPod's free tier has a 600s TTL floor and 9 authoritative NS, so one
+//     propagation round takes over 2 minutes. Waiting per record makes records on the
+//     same name wait twice for nothing.
 func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) (DNSRecord, error) {
 	provider, err := s.newProvider(ctx)
 	if err != nil {
@@ -126,9 +146,9 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 	}, nil
 }
 
-// WaitAll 等到所有记录在所属 zone 的全部权威 NS 都可见。
+// WaitAll waits until every record is visible on all authoritative NS of its zone.
 //
-// 同 (FQDN, Value) 去重；同一个 zone 只解析一次权威 NS 列表。
+// It deduplicates by (FQDN, Value), and resolves each zone's authoritative NS list once.
 func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 	byZone := map[string][]DNSRecord{}
 	seen := map[string]bool{}
@@ -140,7 +160,7 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 		}
 		seen[key] = true
 
-		zone, err := dns01.FindZoneByFqdn(r.FQDN)
+		zone, err := s.findZone(ctx, r.FQDN)
 		if err != nil {
 			return fmt.Errorf("find the zone for %s: %w", r.FQDN, err)
 		}
@@ -151,9 +171,10 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 		return nil
 	}
 
-	// 预算是全局的：所有 zone 共享同一个 deadline，所以整体等待时间
-	// 不会因为 zone 变多而线性膨胀。下面报错时会带上真实已等待时长，
-	// 免得后处理的 zone 报出"在 5m 内未确认"却其实只等了几秒。
+	// The budget is global: every zone shares one deadline, so the overall wait does not
+	// inflate linearly as zones are added. The error below carries the real elapsed
+	// time, so that a zone handled later cannot report "not confirmed within 5m" when it
+	// actually waited a few seconds.
 	start := time.Now()
 	deadline := start.Add(s.timeout)
 
@@ -169,27 +190,28 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 	return nil
 }
 
-// maxProbeConcurrency 限制同时在飞的记录探测数量。
+// maxProbeConcurrency caps how many record probes are in flight at once.
 //
-// 每条记录内部还会并发探它所属 zone 的全部权威 NS，所以真实并发是
-// 这个数 × NS 台数。取得太大会瞬间打出上千条 DNS 查询，
-// 反而容易被对端限速或丢包。
+// Each record then probes all the authoritative NS of its zone concurrently, so real
+// concurrency is this number x the NS count. Set it too high and we fire off thousands
+// of DNS queries in an instant, which is exactly how you get rate limited or dropped.
 const maxProbeConcurrency = 8
 
-// recordProbe 是一条记录的探测结果。
+// recordProbe is the probe result for one record.
 type recordProbe struct {
 	record  DNSRecord
 	ready   bool
 	summary string
 }
 
-// probeRecords 并发探测多条记录，结果的顺序与入参一致。
+// probeRecords probes several records concurrently; results keep the input order.
 //
-// 必须并发：一条记录一轮要问 zone 的全部权威 NS（DNSPod 是 9 台），
-// 串行处理 100 个域名就是 100 次轮询，每轮最坏 3 秒 —— 一轮下来远超
-// 5 秒的轮询间隔。那样传播等待会退化成"每 5 秒只前进一点"，
-// 5 分钟的预算连几轮都跑不完。
-func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
+// Concurrency is mandatory: one round for a single record asks every authoritative NS
+// in its zone (9 for DNSPod), so handling 100 domains serially is 100 polling rounds at
+// up to 3 seconds each -- one round then runs far past the 5-second polling interval.
+// Propagation waiting would degrade into "advance a little every 5 seconds", and a
+// 5-minute budget would not survive even a few rounds.
+func probeRecordsWithExchange(servers []string, recs []DNSRecord, exchange func(*dns.Msg, string) (*dns.Msg, error)) []recordProbe {
 	out := make([]recordProbe, len(recs))
 	if len(recs) == 0 {
 		return out
@@ -210,8 +232,8 @@ func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			ready, summary := probeReady(servers, r.FQDN, r.Value)
-			// 每个 goroutine 只写自己的下标，互不重叠，不需要再加锁。
+			ready, summary := probeReadyWithExchange(servers, r.FQDN, r.Value, exchange)
+			// Each goroutine writes only its own index; no overlap, so no lock is needed.
 			out[i] = recordProbe{record: r, ready: ready, summary: summary}
 		}(i, r)
 	}
@@ -220,19 +242,28 @@ func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
 	return out
 }
 
-// waitZone 轮询 zone 的权威 NS，直到确认记录已经传播开。
+func probeRecords(servers []string, recs []DNSRecord) []recordProbe {
+	return probeRecordsWithExchange(servers, recs, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		client := &dns.Client{Timeout: 3 * time.Second}
+		resp, _, err := client.Exchange(msg, server)
+		return resp, err
+	})
+}
+
+// waitZone polls the zone's authoritative NS until the records are confirmed propagated.
 func (s *DNSSolver) waitZone(
 	ctx context.Context, zone string, servers []string, recs []DNSRecord,
 	start, deadline time.Time,
 ) error {
 	for {
-		results := probeRecords(servers, recs)
+		results := s.probeRecords(servers, recs)
 
-		// 只汇总**还没就绪**的那几条。
+		// Summarise only the records that are **not ready yet**.
 		//
-		// 以前这里无条件用最后一条记录的摘要，于是 wildcard + apex 两个同名
-		// TXT 只要第二条好了，超时报错就会打出"确认 9 / 否认 0 / 不可达 0"
-		// 这种看起来一切正常的摘要 —— 恰好是最费解的那种日志。
+		// This used to unconditionally reuse the last record's summary, so with the two
+		// same-name TXT records of wildcard + apex, as soon as the second one was ready
+		// the timeout error printed "confirmed 9 / denied 0 / unreachable 0" -- a summary
+		// that looks perfectly healthy, and is the most baffling kind of log there is.
 		var pending []string
 		for _, res := range results {
 			if res.ready {
@@ -265,17 +296,19 @@ func (s *DNSSolver) waitZone(
 	}
 }
 
-// nsProbe 是单台权威 NS 的探测结果。
+// nsProbe is the probe result for one authoritative NS.
 type nsProbe struct {
-	server   string
-	hasValue bool
-	err      error // 非 nil 表示这台 NS 从我们这里根本连不上
+	server        string
+	hasValue      bool
+	authoritative bool
+	err           error // non-nil means this NS is simply unreachable from here
 }
 
-// probeTXT 并发探测所有权威 NS。
+// probeTXT probes every authoritative NS concurrently.
 //
-// 并发是必要的：9 台串行、每台 5 秒超时，一轮最坏要 45 秒。
-func probeTXT(servers []string, fqdn, want string) []nsProbe {
+// Concurrency is necessary here: 9 servers in series with a 5-second timeout each makes
+// a worst-case round of 45 seconds.
+func probeTXTWithExchange(servers []string, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) []nsProbe {
 	results := make([]nsProbe, len(servers))
 
 	var wg sync.WaitGroup
@@ -285,17 +318,17 @@ func probeTXT(servers []string, fqdn, want string) []nsProbe {
 			defer wg.Done()
 			results[i] = nsProbe{server: server}
 
-			c := &dns.Client{Timeout: 3 * time.Second}
 			m := new(dns.Msg)
 			m.SetQuestion(fqdn, dns.TypeTXT)
 			m.RecursionDesired = false
 
-			resp, _, err := c.Exchange(m, server)
+			resp, err := exchange(m, server)
 			if err != nil {
 				results[i].err = err
 				return
 			}
-			results[i].hasValue = responseHasTXT(resp, want)
+			results[i].authoritative = resp != nil && resp.Authoritative
+			results[i].hasValue = results[i].authoritative && responseHasTXT(resp, want)
 		}(i, server)
 	}
 	wg.Wait()
@@ -303,28 +336,42 @@ func probeTXT(servers []string, fqdn, want string) []nsProbe {
 	return results
 }
 
-// probeReady 判断记录是否已经可以认为传播开了，并给出一句人话摘要。
-//
-// 判定标准：**没有任何一台可达的 NS 否认该值**，且至少有一台确认；
-// zone 有多台权威时还要求至少 2 台独立确认，避免"只连上一台"就放行。
-//
-// 不要求 9 台全部可达是有意的：任何一台从我们这里网络不通，
-// 都会让"全部一致"这个条件永远无法满足 —— 而这跟记录有没有传播开
-// 根本是两件事。LE 是从它自己的多个位置去校验的，
-// 我们这里连不上的 NS 对 LE 可能是通的。
-//
-// 反过来，只要有一台可达的 NS 明确说"没有这个值"，就绝不能放行 ——
-// 那才是真正的传播未完成，放行会白白消耗一次验证失败配额（5 次/小时）。
-//
-// 单台权威的 zone 必须能通过：要求 2 台确认会让这种 zone 永远等不到传播完成。
-func probeReady(servers []string, fqdn, want string) (bool, string) {
-	results := probeTXT(servers, fqdn, want)
+func probeTXT(servers []string, fqdn, want string) []nsProbe {
+	return probeTXTWithExchange(servers, fqdn, want, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		client := &dns.Client{Timeout: 3 * time.Second}
+		resp, _, err := client.Exchange(msg, server)
+		return resp, err
+	})
+}
 
-	var confirmed, missing, unreachable int
+// probeReady decides whether a record can count as propagated, and returns a
+// plain-language summary.
+//
+// The rule: **no reachable NS denies the value**, and at least one confirms it. When the
+// zone has multiple authorities, at least 2 must confirm independently, so "only one
+// server was reachable" cannot slip through.
+//
+// Not requiring all 9 to be reachable is deliberate: any single NS being unreachable
+// from here would make "everything agrees" permanently unsatisfiable -- and that has
+// nothing to do with whether the record propagated. LE validates from several of its own
+// locations, so an NS we cannot reach may be reachable for LE.
+//
+// Conversely, if even one reachable NS plainly says "no such value", we must never let it
+// through -- that really is propagation incomplete, and letting it through burns a
+// failed-validation quota slot (5 per hour) for nothing.
+//
+// A single-authority zone has to be able to pass: requiring 2 confirmations would leave
+// such a zone waiting for propagation forever.
+func probeReadyWithExchange(servers []string, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) (bool, string) {
+	results := probeTXTWithExchange(servers, fqdn, want, exchange)
+
+	var confirmed, missing, nonAuthoritative, unreachable int
 	for _, r := range results {
 		switch {
 		case r.err != nil:
 			unreachable++
+		case !r.authoritative:
+			nonAuthoritative++
 		case r.hasValue:
 			confirmed++
 		default:
@@ -332,30 +379,38 @@ func probeReady(servers []string, fqdn, want string) (bool, string) {
 		}
 	}
 
-	summary := fmt.Sprintf("confirmed %d / denied %d / unreachable %d (of %d)",
-		confirmed, missing, unreachable, len(results))
+	summary := fmt.Sprintf("confirmed %d / denied %d / non-authoritative %d / unreachable %d (of %d)", confirmed, missing, nonAuthoritative, unreachable, len(results))
 
-	// 有任一可达 NS 否认 → 还没传播开。
+	// Any reachable NS denies it -> not propagated yet.
 	if missing > 0 {
 		return false, summary
 	}
-	// 一台都没确认（全是不可达）→ 不能放行。
+	// Not a single confirmation (everything unreachable) -> must not let it through.
 	if confirmed == 0 {
 		return false, summary
 	}
-	// 多台权威时要求至少 2 台独立确认，避免"只连上一台"就放行。
-	// 只有 1 台权威的 zone 不适用这条。
+	// With multiple authorities require at least 2 independent confirmations, so
+	// "only one server was reachable" cannot slip through.
+	// A zone with a single authority is exempt from this rule.
 	if len(results) >= 2 && confirmed < 2 {
 		return false, summary
 	}
 	return true, summary
 }
 
-// CleanUp 删除本次写入的那条 TXT。
+func probeReady(servers []string, fqdn, want string) (bool, string) {
+	return probeReadyWithExchange(servers, fqdn, want, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		client := &dns.Client{Timeout: 3 * time.Second}
+		resp, _, err := client.Exchange(msg, server)
+		return resp, err
+	})
+}
+
+// CleanUp deletes the TXT record this call wrote.
 //
-// provider 是按 (domain, token, keyAuth) 精确定位记录的，所以
-// wildcard 和 apex 共用一个 _acme-challenge 名字时，删掉其中一条
-// 不会误伤另一条。
+// The provider locates the record by the exact (domain, token, keyAuth) triple, so when
+// a wildcard and its apex share one _acme-challenge name, deleting one of them does not
+// take out the other.
 func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) error {
 	provider, err := s.newProvider(ctx)
 	if err != nil {
@@ -364,25 +419,60 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	return provider.CleanUp(domain, token, keyAuth)
 }
 
-// authoritativeNS 解析 zone 的权威 NS，并把它们解析成 "ip:53"。
+func (s *DNSSolver) findZone(ctx context.Context, fqdn string) (string, error) {
+	for _, domain := range domainSequence(fqdn) {
+		msg := new(dns.Msg)
+		msg.SetQuestion(domain, dns.TypeSOA)
+		msg.RecursionDesired = true
+		resp, err := s.queryRecursive(ctx, msg)
+		if err != nil || resp == nil || resp.Rcode == dns.RcodeNameError {
+			continue
+		}
+		if resp.Rcode != dns.RcodeSuccess {
+			return "", fmt.Errorf("SOA lookup for %s returned %s", domain, dns.RcodeToString[resp.Rcode])
+		}
+		for _, rr := range resp.Answer {
+			if soa, ok := rr.(*dns.SOA); ok {
+				return dns.Fqdn(soa.Hdr.Name), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("could not find an SOA for %s via recursive resolvers %s", fqdn, strings.Join(s.recursiveNameservers, ","))
+}
+
+// authoritativeNS resolves the public NS delegation through the configured recursive resolver set.
 func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string, error) {
-	names, err := net.DefaultResolver.LookupNS(ctx, dns01.UnFqdn(zone))
+	msg := new(dns.Msg)
+	msg.SetQuestion(zone, dns.TypeNS)
+	msg.RecursionDesired = true
+	resp, err := s.queryRecursive(ctx, msg)
 	if err != nil {
 		return nil, fmt.Errorf("lookup NS for %s: %w", zone, err)
+	}
+	var names []string
+	for _, rr := range resp.Answer {
+		if ns, ok := rr.(*dns.NS); ok {
+			names = append(names, dns.Fqdn(ns.Ns))
+		}
 	}
 	if len(names) == 0 {
 		return nil, fmt.Errorf("%s has no NS records", zone)
 	}
 
 	var servers []string
+	seen := make(map[string]bool)
 	for _, ns := range names {
-		ips, err := net.DefaultResolver.LookupHost(ctx, strings.TrimSuffix(ns.Host, "."))
+		ips, err := s.lookupHost(ctx, ns)
 		if err != nil {
-			s.log.Warn("could not resolve an authoritative nameserver; skipping it", "ns", ns.Host, "err", err)
+			s.log.Warn("could not resolve an authoritative nameserver; skipping it", "ns", ns, "err", err)
 			continue
 		}
 		for _, ip := range ips {
-			servers = append(servers, net.JoinHostPort(ip, "53"))
+			server := net.JoinHostPort(ip, "53")
+			if !seen[server] {
+				seen[server] = true
+				servers = append(servers, server)
+			}
 		}
 	}
 	if len(servers) == 0 {
@@ -391,13 +481,106 @@ func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string,
 	return servers, nil
 }
 
+func (s *DNSSolver) probeRecords(servers []string, recs []DNSRecord) []recordProbe {
+	return probeRecordsWithExchange(servers, recs, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		return s.exchange(ctx, msg, server)
+	})
+}
+
+func (s *DNSSolver) queryRecursive(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
+	var errs []error
+	for _, resolver := range s.recursiveNameservers {
+		resp, err := s.exchange(ctx, msg.Copy(), resolver)
+		if err == nil && resp != nil && (resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError) {
+			return resp, nil
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", resolver, err))
+		} else if resp == nil {
+			errs = append(errs, fmt.Errorf("%s: empty response", resolver))
+		} else {
+			errs = append(errs, fmt.Errorf("%s: DNS response %s", resolver, dns.RcodeToString[resp.Rcode]))
+		}
+	}
+	return nil, fmt.Errorf("all configured recursive resolvers failed: %w", errors.Join(errs...))
+}
+
+func (s *DNSSolver) lookupHost(ctx context.Context, host string) ([]string, error) {
+	var ips []string
+	var errs []error
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		msg := new(dns.Msg)
+		msg.SetQuestion(host, qtype)
+		msg.RecursionDesired = true
+		resp, err := s.queryRecursive(ctx, msg)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, rr := range resp.Answer {
+			switch r := rr.(type) {
+			case *dns.A:
+				ips = append(ips, r.A.String())
+			case *dns.AAAA:
+				ips = append(ips, r.AAAA.String())
+			}
+		}
+	}
+	if len(ips) == 0 {
+		if len(errs) == 0 {
+			return nil, errors.New("no A or AAAA records")
+		}
+		return nil, fmt.Errorf("no A or AAAA records: %w", errors.Join(errs...))
+	}
+	return ips, nil
+}
+
+func recursiveNameservers(configured []string) ([]string, error) {
+	if len(configured) > 0 {
+		return append([]string(nil), configured...), nil
+	}
+	resolv, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+	if err != nil {
+		return nil, fmt.Errorf("read recursive nameservers from /etc/resolv.conf: %w", err)
+	}
+	if len(resolv.Servers) == 0 {
+		return nil, errors.New("/etc/resolv.conf contains no nameservers")
+	}
+	servers := make([]string, 0, len(resolv.Servers))
+	for _, server := range resolv.Servers {
+		servers = append(servers, net.JoinHostPort(server, resolv.Port))
+	}
+	return servers, nil
+}
+
+func exchangeDNS(ctx context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+	client := &dns.Client{Timeout: 3 * time.Second}
+	resp, _, err := client.ExchangeContext(ctx, msg, server)
+	if err == nil && resp != nil && resp.Truncated {
+		tcp := &dns.Client{Net: "tcp", Timeout: 3 * time.Second}
+		resp, _, err = tcp.ExchangeContext(ctx, msg, server)
+	}
+	return resp, err
+}
+
+func domainSequence(fqdn string) []string {
+	labels := dns.SplitDomainName(dns.Fqdn(fqdn))
+	out := make([]string, 0, len(labels))
+	for i := range labels {
+		out = append(out, strings.Join(labels[i:], ".")+".")
+	}
+	return out
+}
+
 func responseHasTXT(resp *dns.Msg, want string) bool {
 	for _, rr := range resp.Answer {
 		txt, ok := rr.(*dns.TXT)
 		if !ok {
 			continue
 		}
-		// TXT 记录可能被切成多个字符串片段，拼接后再比较。
+		// A TXT record can be split into several string segments; join them, then compare.
 		if strings.Join(txt.Txt, "") == want {
 			return true
 		}

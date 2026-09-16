@@ -1,42 +1,49 @@
-# wecert 测试环境
+# wecert test environment
 
-用 Terraform 管理测试资源。**所有资源都在这个模块里，`terraform destroy` 一击清空，不留孤儿计费项。**
+<a href="README.zh-CN.md">简体中文</a> · <b>English</b>
 
-分三个阶段，成本递增。**先跑通 A 再决定要不要往下走。**
+Test resources managed with Terraform. **Everything lives in this module, so a
+single `terraform destroy` wipes it clean and leaves no orphaned billables.**
+
+Three stages, increasing in cost. **Get stage A working before deciding whether to
+go further.**
 
 ---
 
-## 阶段 A：wildcard 签发 —— 不需要任何云资源
+## Stage A: wildcard issuance — needs no cloud resources
 
-这是反直觉但很重要的一点：**测通配符证书不需要 CLB，也不需要 CVM。**
+This is counter-intuitive but important: **testing a wildcard certificate needs
+neither a CLB nor a CVM.**
 
-通配符只能走 DNS-01，也就是：
-- 写一条 `_acme-challenge.<domain>` 的 TXT
-- 等它传播到全部权威 NS
-- 告诉 LE 来验证
+A wildcard can only use DNS-01, which means:
+- write one `_acme-challenge.<domain>` TXT record
+- wait for it to propagate to every authoritative NS
+- tell LE to validate
 
-全程只有 DNS API 调用。证书签出来之后上传到腾讯云 SSL 证书服务，同样只是 API 调用 —— **不需要绑定到任何东西**。
+The whole run is DNS API calls. Once the certificate is issued, uploading it to
+Tencent Cloud SSL Certificate Service is likewise just API calls — **nothing needs
+to be bound to it**.
 
 ```bash
-# 用专门的 wildcard 配置（domain 要同时包含 apex 和通配符）
+# use the dedicated wildcard config (domain must include both the apex and the wildcard)
 ./scripts/e2e-test.sh example.com e2e-config-wildcard.yaml
 ```
 
-这个阶段验证的东西其实是最多的：
+This stage actually verifies the most:
 
-| 验证点 | 为什么重要 |
+| What is verified | Why it matters |
 |---|---|
-| **wildcard + apex 共用同一个 TXT 名字** | `example.com` 和 `*.example.com` 的 challenge 值都写在 `_acme-challenge.example.com` 上，必须同时存在。这是 DNS-01 实现里最容易写错的地方 |
-| **权威 NS 传播等待** | LE 从多个 vantage point 校验并要求全部一致 |
-| **ARI certID 构造** | 构造不出来就拿不到"豁免全部速率限制"的待遇 |
-| **幂等性** | 再跑一轮不能产生新订单 |
-| **CNAME 委派**（如已配置） | `EffectiveFQDN` 跟随 CNAME 到集中 zone |
+| **wildcard + apex share one TXT name** | the challenge values for `example.com` and `*.example.com` both go on `_acme-challenge.example.com` and must exist at the same time. This is the easiest place to get a DNS-01 implementation wrong |
+| **waiting for propagation to authoritative NS** | LE validates from multiple vantage points and requires all of them to agree |
+| **ARI certID construction** | without it there is no "exempt from all rate limits" treatment |
+| **idempotency** | another round must not create a new order |
+| **CNAME delegation** (if configured) | `EffectiveFQDN` follows the CNAME to the central zone |
 
-本模块 **不需要 apply**。
+This module **does not need to be applied**.
 
 ---
 
-## 阶段 B：验证 `UpdateCertificateInstance` 重绑定 CLB
+## Stage B: verify that `UpdateCertificateInstance` rebinds the CLB
 
 ```bash
 export TENCENTCLOUD_SECRET_ID=...
@@ -45,106 +52,118 @@ export TF_PLUGIN_CACHE_DIR=/Users/atom/Documents/dsh/.terraform-plugin-cache
 
 cd testenv
 terraform init
-terraform plan      # 先看要建什么
+terraform plan      # look at what would be created first
 terraform apply
 ```
 
-创建的资源：
+Resources created:
 
-| 资源 | 规格 | 说明 |
+| Resource | Spec | Notes |
 |---|---|---|
-| `tencentcloud_vpc` | 10.99.0.0/16 | 免费 |
-| `tencentcloud_subnet` | 10.99.1.0/24 | 免费 |
-| `tencentcloud_clb_instance` | **内网型** | 不开公网带宽，省掉 EIP 费用 |
-| `tencentcloud_clb_listener` | HTTPS:443，开 SNI | 绑占位证书 |
-| `tencentcloud_ssl_certificate` | 自签名占位证书 | apply 时生成，私钥不落盘 |
+| `tencentcloud_vpc` | 10.99.0.0/16 | free |
+| `tencentcloud_subnet` | 10.99.1.0/24 | free |
+| `tencentcloud_clb_instance` | **internal** | no public bandwidth, so no EIP charges |
+| `tencentcloud_clb_listener` | HTTPS:443, SNI on | bound to the placeholder certificate |
+| `tencentcloud_ssl_certificate` | self-signed placeholder | generated at apply time; the private key never touches disk |
 
-### 怎么测
+### How to test
 
-Terraform 建的占位证书绑在监听器上，模拟"**wecert 管的证书当前正在线上服务**"。然后把它的 CertId 预置进 wecert 状态库：
+The placeholder certificate Terraform creates is bound to the listener, simulating
+"**the certificate wecert manages is currently serving live traffic**". Then seed
+its CertId into the wecert state store:
 
 ```bash
 PLACEHOLDER_ID=$(terraform output -raw placeholder_cert_id)
 
-# 预置：让 wecert 以为这张证书已经绑上去了
+# seed it: make wecert believe this certificate is already bound
 sqlite3 /tmp/wecert-e2e/state.db \
   "UPDATE certificates SET deployed_cert_id='${PLACEHOLDER_ID}' WHERE name='e2e-test';"
 
-# 跑一轮，wecert 会签发新证书并调 UpdateCertificateInstance(OldCertificateId=占位证书)
+# run one round; wecert issues a new certificate and calls
+# UpdateCertificateInstance(OldCertificateId=<placeholder>)
 ./bin/wecert -config e2e-config.yaml -state /tmp/wecert-e2e/state.db -once
 ```
 
-### 断言
+### Assertion
 
 ```bash
-# 监听器的 certificate_id 应该变成新证书，而不是占位证书
+# the listener's certificate_id should become the new certificate, not the placeholder
 tccli clb DescribeListeners --LoadBalancerId "$(terraform output -raw clb_id)" \
   --region "$(terraform output -raw region)"
 ```
 
-**这一步验证的是整个项目最关键的设计假设**：腾讯云自己去找"哪些资源绑了旧证书"并逐个更新，所以我们不需要维护监听器清单，也就不会误伤同一监听器上的其它 SNI 证书。
+**What this step verifies is the single most important design assumption in the
+whole project**: Tencent Cloud itself finds "which resources have the old
+certificate bound" and updates them one by one, so we do not maintain a listener
+inventory and therefore cannot accidentally damage other SNI certificates on the
+same listener.
 
 ---
 
-## 阶段 C：验证 systemd + CVM 角色
+## Stage C: verify systemd + the CVM role
 
 ```bash
 terraform apply -var create_cvm=true -var enable_cvm_role=true
 ```
 
-| 资源 | 规格 | 说明 |
+| Resource | Spec | Notes |
 |---|---|---|
-| `tencentcloud_instance` | S5.MEDIUM2（2C2G） | 按量计费 |
-| `tencentcloud_security_group` | 无入站规则 | TAT 是 agent 主动出网，不需要开端口 |
-| 公网 IP | 1 Mbps，按流量 | 仅够 TAT 通信 |
+| `tencentcloud_instance` | S5.MEDIUM2 (2C2G) | pay-as-you-go |
+| `tencentcloud_security_group` | no inbound rules | TAT is an agent that dials out, so no port needs to be opened |
+| public IP | 1 Mbps, traffic-based | just enough for TAT |
 
-验证点：
-- systemd unit 能正常拉起、`StateDirectory` 权限正确
-- **CVM 角色凭证路径**：wecert 从 `metadata.tencentyun.com` 现取临时凭证，密钥不落盘
-- 长驻守护模式下没有凭证过期问题（这是 `dns.provider=tencentcloud` 每次重建 provider 的原因）
+What is verified:
+- the systemd unit starts cleanly and `StateDirectory` permissions are correct
+- **the CVM role credential path**: wecert fetches temporary credentials from `metadata.tencentyun.com`; no key ever touches disk
+- no credential-expiry problem in long-running daemon mode (this is why `dns.provider=tencentcloud` rebuilds the provider every time)
 
-不需要 SSH 密钥 —— 用 TAT（自动化助手）远程执行命令。
+No SSH key is needed — TAT (Automation Tools) runs commands remotely.
 
 ---
 
-## 成本
+## Cost
 
-| 资源 | 计费 | 量级 |
+| Resource | Billing | Order of magnitude |
 |---|---|---|
-| VPC / 子网 / 安全组 | 免费 | ¥0 |
-| 内网型 CLB | 按小时实例费 | 每天几毛量级 |
-| CVM（阶段 C） | 按小时 | 每天几元量级 |
-| 公网 IP（阶段 C） | 按流量 | 仅 TAT 通信，几乎为 0 |
-| SSL 证书服务 | 上传证书免费 | ¥0 |
-| Let's Encrypt | 免费 | ¥0 |
+| VPC / subnet / security group | free | ¥0 |
+| internal CLB | hourly instance fee | a few tenths of a yuan per day |
+| CVM (stage C) | hourly | a few yuan per day |
+| public IP (stage C) | traffic-based | TAT traffic only, essentially 0 |
+| SSL Certificate Service | uploading certificates is free | ¥0 |
+| Let's Encrypt | free | ¥0 |
 
-> ⚠️ 具体单价随地域和活动变化，**请以控制台结算页为准**。上表只是量级参考。
-> 建议在控制台设一个费用告警再开始。
+> ⚠️ Actual prices vary by region and promotion, **so treat the console billing
+> page as authoritative**. The table above is only an order-of-magnitude guide.
+> Set up a cost alert in the console before you start.
 
-## 清理
+## Cleanup
 
 ```bash
 terraform destroy
 ```
 
-**每次测试结束后务必执行。** 所有资源都带统一 tag（`project=wecert`, `purpose=acme-e2e-test`），可以在控制台按 tag 核对是否还有残留。
+**Run this after every test session.** All resources carry uniform tags
+(`project=wecert`, `purpose=acme-e2e-test`), so you can check by tag in the console
+whether anything is left behind.
 
-另外记得清理 wecert 上传到 SSL 证书服务的测试证书 —— 它们不受 Terraform 管理（wecert 自己创建的），数量多了会撞账号配额：
+Also remember to clean up the test certificates wecert uploaded to SSL Certificate
+Service — they are not managed by Terraform (wecert created them), and enough of
+them will hit the account quota:
 
 ```bash
-tccli ssl DescribeCertificates --region ap-guangzhou   # 找出 Alias 以 wecert/ 开头的
+tccli ssl DescribeCertificates --region ap-guangzhou   # find the ones whose Alias starts with wecert/
 ```
 
-## 需要的最小 CAM 权限
+## Minimum CAM permissions required
 
-阶段 A（wildcard）需要：
+Stage A (wildcard) needs:
 
 ```
 ssl:UploadCertificate / DescribeCertificate / DeleteCertificate
 dnspod:DescribeDomainList / DescribeRecordList / CreateRecord / ModifyRecord / DeleteRecord
 ```
 
-阶段 B 额外需要：
+Stage B additionally needs:
 
 ```
 ssl:UpdateCertificateInstance
@@ -153,97 +172,105 @@ clb:CreateListener / DescribeListeners / ModifyListener / DeleteListener
 vpc:CreateVpc / CreateSubnet / DescribeVpcs / DescribeSubnets / DeleteVpc / DeleteSubnet
 ```
 
-阶段 C 额外需要：
+Stage C additionally needs:
 
 ```
 cvm:RunInstances / DescribeInstances / TerminateInstances
 tat:RunCommand / DescribeCommands / DescribeInvocationTasks
-cam:PassRole                       # 把角色关联给 CVM
+cam:PassRole                       # attach the role to the CVM
 ```
 
-`deploy/cam-policy-test.json` 只覆盖了阶段 A。要跑 B/C 需要额外加权限。
+`deploy/cam-policy-test.json` only covers stage A. Running B/C needs extra
+permissions.
 
 ---
 
-## 阶段 B2：2-SAN wildcard + SNI + CVM 后端（实测记录）
+## Stage B2: 2-SAN wildcard + SNI + CVM backend (observed in practice)
 
-比阶段 B 更严格的一组场景：**一张证书带 2 个 wildcard SAN**，
-绑在**开了 SNI 的监听器**上，后面挂**真实 CVM 后端**，
-从公网做端到端 TLS 验证。
+A stricter set of scenarios than stage B: **one certificate with 2 wildcard SANs**,
+bound to a **listener with SNI enabled**, sitting behind a **real CVM backend**,
+with end-to-end TLS verification from the public internet.
 
 ```bash
 terraform apply -var create_cvm=true
 ```
 
-搭出来的东西：
+What gets built:
 
 ```
-CLB（公网型）
-└── 监听器 HTTPS:443（SniSwitch=1）
-    ├── 规则 test.alpha.<域名>  → 证书 + CVM
-    └── 规则 test.beta.<域名>   → 证书 + CVM（同一个）
+CLB (public)
+└── listener HTTPS:443 (SniSwitch=1)
+    ├── rule test.alpha.<domain>  -> certificate + CVM
+    └── rule test.beta.<domain>   -> certificate + CVM (the same one)
 ```
 
-### 结论（全部通过）
+### Conclusion (all passed)
 
-- 一张证书覆盖 `*.alpha` + `*.beta`，SAN 完全正确
-- 从公网做 TLS 握手，两个 SNI 域名都读到新证书
-- 两个域名都能通过 CLB 走到同一个 CVM 后端（HTTP 200）
-- **`UpdateCertificateInstance` 确实重绑定了两条规则**
+- one certificate covers `*.alpha` + `*.beta` with exactly the right SANs
+- a TLS handshake from the public internet reads the new certificate on both SNI domains
+- both domains reach the same CVM backend through the CLB (HTTP 200)
+- **`UpdateCertificateInstance` did rebind both rules**
 
-### 一个重要的产品级发现：重绑定不是原子的
+### One important product-level finding: the rebind is not atomic
 
-实测时间线：
+Observed timeline:
 
-| 时刻 | test.alpha | test.beta |
+| Time | test.alpha | test.beta |
 |---|---|---|
-| 调用返回后 30s | 新证书 ✅ | **旧占位证书** ❌ |
-| 60s 后 | 新证书 ✅ | 新证书 ✅ |
-| 90s / 120s | 稳定 | 稳定 |
+| 30s after the call returned | new certificate ✅ | **old placeholder cert** ❌ |
+| after 60s | new certificate ✅ | new certificate ✅ |
+| 90s / 120s | stable | stable |
 
-一次调用会重绑定所有资源，但**各资源生效时间不同**，存在
-30~60 秒的窗口，期间不同端点服务的证书版本不一致。
+A single call rebinds every resource, but **each resource takes effect at a
+different time**, leaving a 30-60 second window in which different endpoints serve
+different certificate versions.
 
-续期场景下无害（新旧证书都有效），但如果依赖"重绑定瞬间完成"
-就会出错 —— 比如首次签发一个全新域名时，那个窗口内该域名
-可能还拿不到证书。
+In a renewal scenario this is harmless (both the old and the new certificate are
+valid), but anything that relies on "the rebind completes instantly" will be wrong
+— for example, when a brand-new domain is issued for the first time, it may not get
+the certificate within that window.
 
-**做外部黑盒探测时必须带轮询，不能只测一次。**
+**External black-box probing must poll; a single measurement is not enough.**
 
-### 踩过的 8 个坑（全部是真跑才暴露的）
+### The 8 traps hit along the way (none visible until it was really run)
 
-| # | 现象 | 原因 / 修法 |
+| # | Symptom | Cause / fix |
 |---|---|---|
-| 1 | `InvalidZone.MismatchRegion` | 可用区硬编码错了。`ap-guangzhou-3` 该账号下 CVM 不可售，实际是 `-5/-6/-7`。**子网能建出来不代表 CVM 能在那里开机**。用 `data.tencentcloud_availability_zones_by_product` 查 |
-| 2 | `InvalidUserDataFormat` | `user_data` 要求 base64，明文要用 `user_data_raw` |
-| 3 | `do not support to create v1 target group` | 该账号不支持目标组，改用经典的 `tencentcloud_clb_attachment` |
-| 4 | `Lack of parameter Certificate or MultiCertInfo` | 建**规则**时也要带证书 —— CLB 的 SNI 多证书是在规则层配置的 |
-| 5 | `HttpCheckDomain:*.alpha... can't be wildcards` | 规则域名不能是通配符（会被当作健康检查 Host）。用具体主机名，它仍被证书的 wildcard 覆盖 |
-| 6 | `health_check_http_code cannot be higher than 31` | 这个字段是**位掩码**不是 HTTP 状态码，别填 200 |
-| 7 | `uin don't support set L7 custom port for health check` | 该账号不允许给七层规则设自定义健康检查端口 |
-| 8 | `You can't specify SubnetId when create open loadbalancer` | 公网型 CLB 不能指定子网；内网型必须指定 |
+| 1 | `InvalidZone.MismatchRegion` | the availability zone was hard-coded wrong. CVM is not sellable in `ap-guangzhou-3` under this account; it is actually `-5/-6/-7`. **A subnet being creatable does not mean a CVM can boot there.** Use `data.tencentcloud_availability_zones_by_product` to look it up |
+| 2 | `InvalidUserDataFormat` | `user_data` requires base64; plaintext needs `user_data_raw` |
+| 3 | `do not support to create v1 target group` | this account does not support target groups; use the classic `tencentcloud_clb_attachment` |
+| 4 | `Lack of parameter Certificate or MultiCertInfo` | the certificate must be supplied when creating the **rule** too — CLB's multi-certificate SNI is configured at the rule layer |
+| 5 | `HttpCheckDomain:*.alpha... can't be wildcards` | a rule domain cannot be a wildcard (it is used as the health check Host). Use a concrete hostname; the certificate's wildcard still covers it |
+| 6 | `health_check_http_code cannot be higher than 31` | this field is a **bitmask**, not an HTTP status code; do not put 200 in it |
+| 7 | `uin don't support set L7 custom port for health check` | this account does not allow a custom health check port on a layer-7 rule |
+| 8 | `You can't specify SubnetId when create open loadbalancer` | a public CLB cannot specify a subnet; an internal one must |
 
-### 还有一个：公网 CLB 的健康检查源不在 VPC 网段
+### One more: a public CLB's health check source is not in the VPC CIDR
 
-只放通 VPC 网段和 `100.64.0.0/10` 时，健康检查一直失败，
-CLB 对所有请求返回 **504**。
+When only the VPC CIDR and `100.64.0.0/10` are allowed, health checks keep failing
+and the CLB returns **504** for every request.
 
-迷惑点：**TLS 握手是正常的**（`curl` 报 504 而不是连接错误，
-`ssl_verify_result=20` 说明有证书送出），所以很容易误判成"后端挂了"。
-实际后端好好的 —— 直连 CVM 公网 IP 返回 200。
+The confusing part: **the TLS handshake is fine** (`curl` reports 504 rather than a
+connection error, and `ssl_verify_result=20` shows a certificate was sent), so it
+is easily misdiagnosed as "the backend is down". The backend was perfectly healthy
+— connecting straight to the CVM's public IP returned 200.
 
-排查方式：临时放开 `0.0.0.0/0 → 80`，504 立刻消失，从而定位到是安全组。
+How it was tracked down: temporarily opening `0.0.0.0/0 -> 80` made the 504 vanish
+immediately, which pinned it on the security group.
 
-### 最重要的一个：不要让 Terraform 和 wecert 抢同一个字段
+### The most important one: do not let Terraform and wecert fight over the same field
 
-调试安全组时我跑了几次 `terraform apply`，结果**两条规则的证书被悄悄改回了占位证书**，
-而 wecert 状态库还以为部署的是新证书 —— 两边认知完全不一致。
+While debugging the security group I ran `terraform apply` a few times, and
+**the certificates on both rules were quietly reverted to the placeholder**, while
+the wecert state store still believed the new certificate was deployed — the two
+sides disagreed completely.
 
-原因：Terraform 的 `certificate_id` 是**期望状态**，每次 apply 都会强制刷成配置里的值；
-而 wecert 是通过 `UpdateCertificateInstance` 在**带外**改这个字段的。
-两者管理同一个字段，必然打架。
+The cause: Terraform's `certificate_id` is **desired state**, and every apply forces
+it back to the configured value, while wecert changes that field **out of band**
+through `UpdateCertificateInstance`. Two systems managing the same field are bound
+to fight.
 
-修法是让 Terraform 不要碰这个字段：
+The fix is to make Terraform leave the field alone:
 
 ```hcl
 resource "tencentcloud_clb_listener" "https" {
@@ -261,68 +288,80 @@ resource "tencentcloud_clb_listener_rule" "wildcard" {
 }
 ```
 
-代价：Terraform state 里这个字段会**长期停留在旧值**（本项目里就一直是占位证书的 ID），
-`terraform plan` 也不会再报漂移。这是有意为之 —— 这个字段的真相在 wecert 的状态库里，
-不在 Terraform 里。
+The cost: in Terraform state this field **stays at its old value for a long time**
+(in this project it is forever the placeholder certificate's ID), and
+`terraform plan` no longer reports drift. That is deliberate — the truth about this
+field lives in the wecert state store, not in Terraform.
 
-**推广开来：任何"Terraform 管基础设施 + 另一个系统管证书/密钥轮转"的组合都有这个问题。**
-要么让 Terraform 管绑定（那 wecert 就不该调 `UpdateCertificateInstance`），
-要么让 wecert 管绑定（那就必须 `ignore_changes`）。不能两个都管。
+**Generalizing: any combination of "Terraform manages the infrastructure + another
+system manages certificate/key rotation" has this problem.** Either let Terraform
+manage the binding (in which case wecert must not call
+`UpdateCertificateInstance`), or let wecert manage it (in which case
+`ignore_changes` is mandatory). It cannot be both.
 
 ---
 
-## 阶段 B3：按域名分流 + 本机可测
+## Stage B3: per-domain routing + locally testable
 
-在 B2 基础上加了：后端按 Host 返回不同页面、CLB 安全组、以及 DNS 记录。
+On top of B2 this adds: a backend that returns a different page per Host, a CLB
+security group, and DNS records.
 
-### 后端按 Host 分流
+### Backend routing by Host
 
-CVM 上的 python 后端读 `Host` 头返回不同页面：
+The Python backend on the CVM reads the `Host` header and returns a different page:
 
-| 访问 | 页面 |
+| Request | Page |
 |---|---|
-| `https://test.alpha.<域>/` | 大写的 **ALPHA** |
-| `https://test.beta.<域>/` | 大写的 **BETA** |
-| 其它 Host | **UNKNOWN**（红色） |
+| `https://test.alpha.<domain>/` | a large **ALPHA** |
+| `https://test.beta.<domain>/` | a large **BETA** |
+| any other Host | **UNKNOWN** (red) |
 
-这样"CLB 的域名路由到底生效没有"一眼就能看出来 —— 两个域名显示同一个页面就是没生效。
+That makes "is the CLB's domain routing actually working" obvious at a glance — two
+domains showing the same page means it is not.
 
-页面映射在 `var.backend_pages` 里改，不用动脚本。
+The page mapping is changed in `var.backend_pages`; no script edit is needed.
 
-### 为什么要建 DNS 记录
+### Why DNS records are created
 
-之前只能用 `curl --resolve` 或 `openssl -connect` 加 IP 来测，
-因为 `test.alpha` / `test.beta` 根本没有解析记录。
-建了 A 记录之后浏览器直接就能打开。
+Previously the only way to test was `curl --resolve` or `openssl -connect` with an
+IP, because `test.alpha` / `test.beta` had no resolution records at all. Once the A
+records exist, a browser can open them directly.
 
-注意 `alpha` / `beta` **不是独立 zone**，只是 `atomwangnus.com` 下的子域，
-所以记录建在 `atomwangnus.com` 里，`sub_domain` 写成 `test.alpha`。
+Note that `alpha` / `beta` are **not separate zones**, only subdomains of the
+`dns_zone` apex, so the records are created in that zone with `sub_domain`
+written as `test.alpha`.
 
-### CLB 安全组：默认放开，是有意的
+### CLB security group: open by default, on purpose
 
 ```hcl
-clb_allowed_cidrs = ["0.0.0.0/0"]   # 默认
+clb_allowed_cidrs = ["0.0.0.0/0"]   # default
 ```
 
-试过按 IP 白名单收紧，但**出口 IP 不稳定**：会话期间本机出口从
-`121.35.103.225` 变成了 `14.153.66.173`，而且不同探测服务还报出第三个地址。
-再加上浏览器所在网络的出口无从得知，白名单一旦写错就会把自己关在门外。
+Tightening this to an IP allowlist was tried, but **the egress IP is not stable**:
+during one session the local egress changed from `121.35.103.225` to
+`14.153.66.173`, and different probing services reported a third address. On top of
+that there is no way to know the egress of the network the browser sits behind, and
+one mistake in the allowlist locks you out.
 
-而"被安全组挡住"的表现是 **TLS 握手直接被重置**（`SSL_ERROR_SYSCALL`），
-不直观，排查成本高。所以在测试环境默认放开，等你确认固定出口 IP 后
-改成 `["x.x.x.x/32"]` 重新 apply 即可收紧。
+And the symptom of "blocked by the security group" is that **the TLS handshake is
+simply reset** (`SSL_ERROR_SYSCALL`), which is not intuitive and expensive to
+diagnose. So the test environment leaves it open by default; once you have confirmed
+a fixed egress IP, change it to `["x.x.x.x/32"]` and re-apply to tighten it.
 
-### 新增：cloud-init 本地校验
+### New: local cloud-init validation
 
 ```bash
 make validate-cloudinit
 ```
 
-从 `.tf` 源码里抽出 `write_files`，对嵌入的 Python / shell 做语法检查。
+It extracts `write_files` from the `.tf` source and syntax-checks the embedded
+Python / shell.
 
-**这是被一次真实事故逼出来的**：user_data 里的 Python 有个字符串引号不匹配
-（`'...\n"`），CVM 建出来了、cloud-init 也"成功"了，但后端一直不监听 80，
-现象是 CLB 返回 502 —— 很容易误判成网络或安全组问题，白排查很久。
+**This was forced by a real incident**: a Python string in user_data had an
+unmatched quote (`'...\n"`), the CVM came up and cloud-init "succeeded" as well, but
+the backend never listened on port 80, and the symptom was the CLB returning 502 —
+easily misdiagnosed as a network or security-group problem, wasting a long time.
 
-`user_data` 里的脚本只有机器启动后才执行，语法错误在那之前完全不可见，
-所以在 apply 之前先查一遍。加 `--from-state` 可以校验已 apply 的版本。
+The scripts in `user_data` only run after the machine boots, so a syntax error is
+completely invisible before that, which is why it is checked before apply. Add
+`--from-state` to validate the version that was already applied.

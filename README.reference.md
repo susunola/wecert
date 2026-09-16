@@ -129,7 +129,8 @@ Two further deliberate choices:
 
 ## Prerequisites
 
-- **Go 1.26+** to build (the module declares `go 1.26.5`).
+- **Go 1.26+** to build (the module declares `go 1.26.6`, the patch release that
+  fixes the standard-library vulnerabilities listed by `govulncheck`).
 - **A domain hosted on DNSPod** — either the DNSPod product (`dnspod.cn`) or Tencent Cloud DNSPod.
 - **A Tencent Cloud account** with the CLB resources you want the certificate on.
 - **Credentials**, one of:
@@ -374,13 +375,24 @@ Regenerate them with `make diagrams`. The **Chinese page is the source of truth*
 
 The build also *measures* every label in a real browser, in **both** languages, and refuses to render if any of them overflows its box or if two `<text>` labels collide. English runs longer than Chinese, so "fits in Chinese, overflows in English" is a real failure mode — the first run caught exactly that.
 
-### 0. The problem this solves
+### 0. Deployment shape — a free certificate rotating itself on the CLB
 
-![wecert's problem scenario: TLS terminates at the CLB and the business machines hold no certificate](docs/diagrams/en/00-the-problem.png)
+![wecert's deployment shape: a free certificate rotated automatically by Let's Encrypt (issued for free → rebound automatically → serving for 90 days → reissued before expiry); Let's Encrypt is chosen over Tencent Cloud's own free DV because the latter is single-domain and supports neither SAN nor wildcard](docs/diagrams/en/00-deployment-shape.png)
 
-TLS terminates at the CLB and the business machines hold no certificate file at all, so the premise every conventional approach rests on does not hold here: certbot on each CVM has nowhere to put a certificate, cert-manager assumes Kubernetes and produces a Secret rather than a listener binding, and copying the file to each node only makes more copies of a private key that nothing reads.
+The scenario this system exists for is the band on top: **a Let's Encrypt certificate is free, and the price is a 90-day validity** — at least four rotations a year, and a human remembering each one will eventually miss.
 
-What makes it hard rather than merely awkward is the last row. ARI exempts renewals from every rate limit — but **only for a same-name renewal**, so changing the name set once burns one issuance. "Domains change all the time" is this project's premise, so every other design decision follows from making "add a domain" avoid producing a new issuance.
+Tencent Cloud's own free DV is not an alternative. **It is a single-domain certificate: no SAN, no wildcard.** A deployment with a handful of domains would need one certificate and one rotation pipeline per domain. One Let's Encrypt certificate carries up to 100 names and does support wildcards, so several domains — including `*.example.com` — collapse into a single certificate with a single rotation to look after. That is what makes the multi-SAN shape drawn below possible at all.
+
+The point is not that wecert *can* issue; it is that the certificate is already replaced before it expires, with nobody involved.
+
+Requests arrive at the CLB over SNI. The CLB picks the certificate out of `multi_cert_info` using the name the client sent, and the layer-7 rules route by domain to the backend RS pool. `wecert` runs on one of those CVMs; it reads the `_wecert.*` declarations from DNSPod, writes the `_acme-challenge` records, obtains the certificate from Let's Encrypt, uploads it to Tencent Cloud SSL and rebinds the listener.
+
+Two consequences of this shape are easy to miss:
+
+- **The backend RSs take no part in TLS.** Decryption happens at the CLB, so the certificate is a *cloud resource*, not a few files. Putting certbot on every RS buys nothing, and tools that assume the certificate ends up in a Secret have nowhere to land here.
+- **Domains sharing one certificate share their fate.** SNI only decides *which* certificate is used; the certificate's SAN decides which domains it can actually serve. So once `a.example.com` and `b.example.com` are in the same certificate, a DNS problem on one drags the other down with it.
+
+The second point is the constraint everything else is built around — wildcard-first grouping, the desired state, and the failure fallback all exist because of it.
 
 ### 1. System map — who owns what, who only reads
 
@@ -554,6 +566,7 @@ The two providers use completely different credentials. Don't mix them up.
 | `ttl` | no | `600` | TTL for the `_acme-challenge` TXT record. **600 is the floor on DNSPod's free tier** — configuring 60 is rejected with `LimitExceeded.RecordTtlLimit`. Paid tiers can go lower to speed up propagation and cleanup. |
 | `propagationTimeout` | no | `5m` | Upper bound on waiting for all authoritative nameservers to see the record |
 | `pollingInterval` | no | `5s` | Interval between propagation probes |
+| `recursiveNameservers` | no | `/etc/resolv.conf` | Trusted recursive resolver IPs, optionally with ports, used consistently for CNAME, SOA and NS discovery. The TXT check itself still queries the discovered authoritative NS directly and requires an authoritative (`AA`) response. Set this in split-horizon/VPN environments to avoid mixing resolver views. |
 
 #### Strongly recommended: `_acme-challenge` CNAME delegation
 
@@ -682,7 +695,7 @@ Policy for the `wecert-onboard` binary. These numbers decide how fast quota is s
 | `deploy` | `true` | Default deploy flag for generated certificates |
 | `gracePeriod` | `24h` | How long a name must be **confirmed** absent before it may be removed |
 | `budget` / `budgetWindow` | `25` / `168h` | Name-set changes allowed per window. Let's Encrypt allows 50 per registered domain per 7 days, shared across accounts; half of that is the budget |
-| `dropThreshold` | `0.30` | Freeze when the declared name set shrinks by more than this fraction |
+| `dropThreshold` | `0.30` | Freeze when the declared name set shrinks by more than this fraction. Must be **in `[0,1)`** — `0.3` means 30%, and `0` uses the default. The loss ratio can never exceed 1, so a percentage written as `30`, or any value `>= 1`, would leave the fuse unable to fire; `config.Load` rejects those rather than let the guard disappear silently |
 | `statePath` | `<out>.state.json` | Grace-period and budget bookkeeping. Must be persistent: an in-memory grace period never elapses across runs |
 | `reportPath` | `<out>.report.json` | Per-hostname decision report |
 
@@ -1034,7 +1047,9 @@ The `Manager`'s full issuance flow is still not covered end to end — that need
 
 The repository ships `e2e-config.example.yaml` (single domain) and `e2e-config-wildcard.yaml`
 (wildcard + apex, i.e. the shared `_acme-challenge` name case). `e2e-test.sh` defaults to
-`./e2e-config.yaml`, which is gitignored — copy one into place first:
+`./e2e-config.yaml`, which `.gitignore` covers along with `config.yaml` — keep the
+`*.example.yaml` / `e2e-config-*.yaml` names for anything you commit, and copy one into
+place first:
 
 ```bash
 make build tools

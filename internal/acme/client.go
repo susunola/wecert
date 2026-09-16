@@ -16,23 +16,25 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// userAgent 会出现在 ACME 请求里，排障时能对上日志。
+// userAgent shows up in ACME requests, so it lines up with the logs when troubleshooting.
 const userAgent = "wecert/0.1 (+https://github.com/susunola/wecert)"
 
-// NewHTTPClient 构造 ACME 用的 HTTP 客户端。
+// NewHTTPClient builds the HTTP client used for ACME.
 func NewHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout}
 }
 
-// EnsureAccount 加载或注册 ACME 账号，返回可直接使用的低层 api.Core。
+// EnsureAccount loads or registers the ACME account, returning a ready-to-use
+// low-level api.Core.
 //
-// 这里刻意用低层 api.Core，而不是 lego 高层的 certificate.Obtain。
-// 原因：高层会在内部自己 newOrder，我们无法把 order URL 持久化并跨重启复用 ——
-// 进程一崩溃重启就会重新下单，直接撞上
-// "5 certificates per exact set of identifiers / 7 days" 这条限额。
+// We use the low-level api.Core on purpose, not lego's high-level
+// certificate.Obtain: the high-level path calls newOrder internally, so we cannot
+// persist the order URL and reuse it across restarts -- a crash-restart would
+// place a fresh order and walk straight into the
+// "5 certificates per exact set of identifiers / 7 days" rate limit.
 //
-// 账号私钥和 kid 都落 SQLite：丢了就等于换了个新账号，
-// 白白多消耗一份账号维度的配额。
+// The account key and the kid both live in SQLite: losing them means a brand-new
+// account, needlessly burning another slice of the per-account quota.
 func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Client) (*api.Core, error) {
 	directory := cfg.ACME.Directory
 
@@ -53,7 +55,7 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 		return core, nil
 	}
 
-	// 首次运行：生成账号私钥并注册账号。
+	// First run: generate the account private key and register the account.
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate the account key: %w", err)
@@ -90,6 +92,6 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 	return core, nil
 }
 
-// 编译期断言：注册账号用的 ECDSA 私钥必须满足 crypto.PrivateKey，
-// 否则 api.New 在运行时才会报错。
+// Compile-time assertion: the ECDSA private key used to register accounts must
+// satisfy crypto.PrivateKey, otherwise api.New only blows up at runtime.
 var _ crypto.PrivateKey = (*ecdsa.PrivateKey)(nil)

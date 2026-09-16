@@ -1,5 +1,5 @@
 [Unit]
-Description=wecert — ACME 证书自动续期（腾讯云 CLB）
+Description=wecert — automatic ACME certificate renewal (Tencent Cloud CLB)
 Documentation=https://github.com/susunola/wecert
 After=network-online.target time-sync.target systemd-time-wait-sync.service
 Wants=network-online.target
@@ -9,8 +9,8 @@ Type=simple
 User=wecert
 Group=wecert
 
-# 自动创建 /var/lib/wecert 并保证属主正确；state.db 必须持久化，
-# 丢了它就会重复下单并撞上速率限制。
+# Creates /var/lib/wecert with the right owner. state.db has to survive:
+# losing it means re-issuing orders, which runs into the rate limits.
 StateDirectory=wecert
 StateDirectoryMode=0700
 
@@ -18,7 +18,8 @@ ExecStart=/usr/local/bin/wecert -config /etc/wecert/config.yaml
 Restart=on-failure
 RestartSec=30s
 
-# 配置文件里有 DNSPod token，用 ProtectSystem=strict 限制可写范围。
+# The config file holds the DNSPod token, so ProtectSystem=strict bounds what
+# this process can write.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

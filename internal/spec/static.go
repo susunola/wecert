@@ -6,30 +6,31 @@ import (
 	"github.com/susunola/wecert/internal/config"
 )
 
-// Static 是配置里的 certificates 区块。
+// Static is the certificates block from the configuration file.
 //
-// 它同样实现 Provider，好让收敛循环完全不关心期望状态从哪来 ——
-// 这正是从 static 切到 enforce 不需要动收敛代码的原因。
+// It implements Provider too, so the convergence loop does not care where the
+// desired state comes from -- which is exactly why switching from static to
+// enforce needs no change to convergence code.
 type Static struct {
 	certs []config.Certificate
 }
 
-// NewStatic 包装一份静态证书列表。
+// NewStatic wraps a static certificate list.
 func NewStatic(certs []config.Certificate) *Static {
 	cp := make([]config.Certificate, len(certs))
 	copy(cp, certs)
 	return &Static{certs: cp}
 }
 
-// Kind 实现 Named。
+// Kind implements Named.
 func (s *Static) Kind() string { return config.ModeStatic }
 
-// Desired 实现 Provider。
+// Desired implements Provider.
 func (s *Static) Desired(context.Context) ([]config.Certificate, error) {
 	return s.certs, nil
 }
 
-// DesiredWithReasons 实现 ReportingProvider。
+// DesiredWithReasons implements ReportingProvider.
 func (s *Static) DesiredWithReasons(context.Context) (*Result, error) {
 	return &Result{
 		Certificates: s.certs,

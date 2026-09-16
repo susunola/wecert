@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""在真实浏览器里量每张图的标签有没有溢出它的盒子。
+"""Measure in a real browser whether every diagram label overflows its box.
 
-为什么要真测而不是用启发式估算：我先写过一个按字符宽度估算高度的版本，
-它漏掉了 docs/certificate-lifecycle.html 底部注释带被裁掉一整行的情况 ——
-估出来的高度比盒子矮，实际渲染却溢出了。文字宽度和折行的真实行为
-（字距、`.88em` 的 <code>、flex gap、中英混排）不是几十行 Python 能算准的，
-而这里要判断的恰恰是**渲染结果**。
+Why actually measure instead of estimating with a heuristic: a version that
+estimated height from character width was written first, and it missed the case
+where the annotation strip at the bottom of docs/certificate-lifecycle.html has a
+whole line clipped — the estimate came out shorter than the box while the real
+render overflowed. Real text width and line-breaking behavior (letter spacing,
+`.88em` <code>, flex gap, mixed Chinese/English text) cannot be computed
+accurately in a few dozen lines of Python, and what is being judged here is
+precisely the **render result**.
 
-做法：把页面连同一段探针脚本丢给 Chrome，探针量每个 <foreignObject> 里
-子元素的实际外接框，超出容器的收集起来写进 document.title，
-再用 --dump-dom 取回来。
+Approach: hand the page plus a probe script to Chrome. The probe measures the
+actual bounding box of the child elements inside each <foreignObject>, collects
+the ones that stick out of their container, writes them into document.title, and
+--dump-dom brings them back.
 
-用法：
-    python3 scripts/check-diagram-fit.py        # 有问题时退出码 1
+Usage:
+    python3 scripts/check-diagram-fit.py        # exit code 1 when something is wrong
 """
 
 import json
@@ -39,9 +43,10 @@ CHROME_CANDIDATES = [
     "chromium-browser",
 ]
 
-# 探针。用 getBoundingClientRect 而不是 scrollHeight：.fo 是
-# justify-content:center 的 flex 容器，内容溢出时 scrollHeight 的行为
-# 在两侧不对称，而外接框比较是直接、无歧义的。
+# The probe. getBoundingClientRect rather than scrollHeight: .fo is a
+# justify-content:center flex container, so once the content overflows,
+# scrollHeight behaves asymmetrically on the two sides, whereas comparing bounding
+# boxes is direct and unambiguous.
 PROBE = """
 <script>
 (function () {
@@ -77,9 +82,11 @@ PROBE = """
       });
     }
   });
-  // <text> 没有盒子可比，所以换个判据：两两比外接框，压住了就是问题。
-  // 区域标题这类元素在英文下会变长，而它们不在 foreignObject 里 ——
-  // 不单独量的话，"英文标题挤在一起"永远没人发现。
+  // <text> has no box to compare against, so use a different test: compare
+  // bounding boxes pairwise, and an overlap is a problem. Elements like section
+  // headings get longer in English and they are not inside a foreignObject — if
+  // they were not measured separately, "English headings collide" would never be
+  // noticed.
   var texts = Array.prototype.slice.call(document.querySelectorAll('svg text'));
   texts.forEach(function (a, i) {
     var ra = a.getBoundingClientRect();
@@ -115,17 +122,17 @@ def find_chrome() -> str:
                 return c
         elif shutil.which(c):
             return shutil.which(c)
-    sys.exit("找不到 Chrome / Chromium。")
+    sys.exit("Chrome / Chromium not found.")
 
 
 def check(chrome: str, source: Path, quiet: bool = False) -> int:
     if not source.exists():
-        print(f"  {source.name}: 跳过（文件不存在）")
+        print(f"  {source.name}: skipped (file does not exist)")
         return 0
 
     html = source.read_text(encoding="utf-8")
     if "</body>" not in html:
-        sys.exit("源文件结构变了：找不到 </body>，探针注入点失效")
+        sys.exit("the source structure changed: no </body>, so the probe injection point is gone")
 
     probed = html.replace("</body>", PROBE + "</body>")
 
@@ -133,9 +140,10 @@ def check(chrome: str, source: Path, quiet: bool = False) -> int:
         path = Path(tmp) / "probe.html"
         path.write_text(probed, encoding="utf-8")
 
-        # 窗口开足够大，让页面按桌面宽度排版 —— 图本身的宽度是 viewBox
-        # 决定的，不受影响；但 @media(max-width:700px) 里的规则会改 .scroll
-        # 的布局，窗口太小会测出另一套结果。
+        # The window is opened wide enough that the page lays out at desktop
+        # width — the diagrams' own width is set by the viewBox and is unaffected,
+        # but the rules under @media(max-width:700px) change .scroll's layout, so a
+        # too-small window measures a different result.
         res = subprocess.run(
             [chrome, "--headless", "--disable-gpu", "--no-sandbox",
              "--window-size=1400,3000", "--virtual-time-budget=5000",
@@ -145,8 +153,8 @@ def check(chrome: str, source: Path, quiet: bool = False) -> int:
 
     m = re.search(r"<title>FIT(.*?)END</title>", res.stdout, re.S)
     if not m:
-        sys.exit("探针没有回传结果。--dump-dom 的输出里找不到标记，"
-                 "多半是页面脚本报错了。")
+        sys.exit("the probe returned nothing. The marker is missing from the "
+                 "--dump-dom output, which usually means a script error on the page.")
 
     bad = json.loads(m.group(1))
     label = source.name
@@ -154,17 +162,17 @@ def check(chrome: str, source: Path, quiet: bool = False) -> int:
         print(f"  ✓ {label}")
         return 0
 
-    print(f"\n✗ {label}: {len(bad)} 处标签溢出盒子"
-          f"（超出量按 CSS px，图上还会按比例放大）:\n")
+    print(f"\n✗ {label}: {len(bad)} labels overflow their box"
+          f" (overrun in CSS px; it is scaled up again in the image):\n")
     for b in bad:
         bits = []
         if b["overTop"] > 0:
-            bits.append(f"上溢 {b['overTop']}")
+            bits.append(f"over top {b['overTop']}")
         if b["overBottom"] > 0:
-            bits.append(f"下溢 {b['overBottom']}")
+            bits.append(f"over bottom {b['overBottom']}")
         if b["overRight"] > 0:
-            bits.append(f"右溢 {b['overRight']}")
-        print(f"  图{b['svg']}  盒 {b['w']}x{b['h']}  {', '.join(bits)}")
+            bits.append(f"over right {b['overRight']}")
+        print(f"  diagram {b['svg']}  box {b['w']}x{b['h']}  {', '.join(bits)}")
         print(f"        {b['text']}")
     return 1
 
@@ -178,7 +186,7 @@ def main() -> None:
     if failed:
         print()
         sys.exit(1)
-    print("\n✓ 所有 foreignObject 标签都在盒子里")
+    print("\n✓ all foreignObject labels fit inside their box")
 
 
 if __name__ == "__main__":

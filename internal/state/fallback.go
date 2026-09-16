@@ -7,9 +7,10 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// IdentifierFailure 是某个 identifier 的授权失败账本。
+// IdentifierFailure is the authorization failure ledger for one identifier.
 type IdentifierFailure struct {
 	CertName     string
 	Identifier   string
@@ -18,10 +19,12 @@ type IdentifierFailure struct {
 	LastFailedAt time.Time
 }
 
-// Fallback 是"这张证书正服务着一张缺了几个名字的证书"这件事的记录。
+// Fallback records the fact that "this certificate is serving a certificate that is
+// missing some names".
 //
-// 它必须能被看见：降级是在"部分可用"和"全挂"之间做的取舍，
-// 而取舍的结果不能只留在日志里 —— 日志会被轮转掉。
+// It has to be visible: fallback is a trade-off between "partially available" and
+// "completely down", and the result of that trade-off cannot live only in logs --
+// logs get rotated away.
 type Fallback struct {
 	CertName string
 	Dropped  []string
@@ -29,10 +32,10 @@ type Fallback struct {
 	Reason   string
 }
 
-// RecordIdentifierFailure 给某个 identifier 的失败计数加一。
+// RecordIdentifierFailure increments the failure count for one identifier.
 //
-// 这个账本是"到期前降级"唯一的输入：没有它，降级只能随机摘名字，
-// 而随机摘会把本来好的名字也一起牺牲掉。
+// This ledger is the only input to "pre-expiry fallback": without it, fallback could
+// only drop names at random, and dropping at random sacrifices names that were fine.
 func (s *Store) RecordIdentifierFailure(certName, identifier, errMsg string, now time.Time) error {
 	_, err := s.db.Exec(`
 		INSERT INTO identifier_failures (cert_name, identifier, failures, last_error, last_failed_at)
@@ -41,15 +44,15 @@ func (s *Store) RecordIdentifierFailure(certName, identifier, errMsg string, now
 			failures       = failures + 1,
 			last_error     = excluded.last_error,
 			last_failed_at = excluded.last_failed_at`,
-		certName, identifier, truncate(errMsg, 512), now.Unix())
+		certName, identifier, truncate(errMsg, maxLastErrorBytes), now.Unix())
 	if err != nil {
 		return fmt.Errorf("record identifier failure %s/%s: %w", certName, identifier, err)
 	}
 	return nil
 }
 
-// ListIdentifierFailures 返回一张证书下所有 identifier 的失败记录，
-// 按 identifier 排序，保证同样的输入给出同样的输出。
+// ListIdentifierFailures returns the failure records for every identifier under one
+// certificate, sorted by identifier so identical input yields identical output.
 func (s *Store) ListIdentifierFailures(certName string) ([]*IdentifierFailure, error) {
 	rows, err := s.db.Query(`
 		SELECT cert_name, identifier, failures, last_error, last_failed_at
@@ -72,10 +75,11 @@ func (s *Store) ListIdentifierFailures(certName string) ([]*IdentifierFailure, e
 	return out, rows.Err()
 }
 
-// ClearIdentifierFailures 清掉一张证书下所有 identifier 的失败记录。
+// ClearIdentifierFailures clears every identifier failure record for a certificate.
 //
-// 全集签发成功时调用：失败账本的意义是"最近谁在坏"，
-// 而不是"历史上谁坏过"。留着它会让一次早已修好的故障永远把名字摘在外面。
+// Called when the full set issues successfully: the ledger means "who is broken
+// lately", not "who has ever been broken". Keeping it around would let a long-fixed
+// fault keep a name dropped out forever.
 func (s *Store) ClearIdentifierFailures(certName string) error {
 	if _, err := s.db.Exec(`DELETE FROM identifier_failures WHERE cert_name = ?`, certName); err != nil {
 		return fmt.Errorf("clear identifier failures for %s: %w", certName, err)
@@ -83,11 +87,12 @@ func (s *Store) ClearIdentifierFailures(certName string) error {
 	return nil
 }
 
-// PruneIdentifierFailures 丢掉超过 age 没再失败过的记录。
+// PruneIdentifierFailures drops records that have not failed again for longer than age.
 //
-// 让老账本自动过期，而不必等一次成功的全集签发 —— 那些 identifier
-// 已经不在证书里了，它们的授权永远不会再被尝试，也就永远不会有
-// 一次"成功"来清掉它们。
+// This lets old ledger entries expire on their own instead of waiting for a successful
+// full-set issuance -- those identifiers are no longer in the certificate, so their
+// authorizations will never be attempted again and there will never be a "success" that
+// clears them.
 func (s *Store) PruneIdentifierFailures(certName string, now time.Time, age time.Duration) error {
 	cutoff := now.Add(-age)
 	if _, err := s.db.Exec(`
@@ -98,7 +103,7 @@ func (s *Store) PruneIdentifierFailures(certName string, now time.Time, age time
 	return nil
 }
 
-// PutFallback 记录降级状态。
+// PutFallback records fallback state.
 func (s *Store) PutFallback(f *Fallback) error {
 	dropped := append([]string(nil), f.Dropped...)
 	sort.Strings(dropped)
@@ -110,14 +115,14 @@ func (s *Store) PutFallback(f *Fallback) error {
 			dropped = excluded.dropped,
 			since   = excluded.since,
 			reason  = excluded.reason`,
-		f.CertName, strings.Join(dropped, ","), f.Since.Unix(), truncate(f.Reason, 512))
+		f.CertName, strings.Join(dropped, ","), f.Since.Unix(), truncate(f.Reason, maxLastErrorBytes))
 	if err != nil {
 		return fmt.Errorf("put fallback for %s: %w", f.CertName, err)
 	}
 	return nil
 }
 
-// GetFallback 读降级状态；没有记录时返回 (nil, nil)。
+// GetFallback reads fallback state; returns (nil, nil) when there is no record.
 func (s *Store) GetFallback(certName string) (*Fallback, error) {
 	row := s.db.QueryRow(`
 		SELECT cert_name, dropped, since, reason FROM cert_fallback WHERE cert_name = ?`, certName)
@@ -142,7 +147,7 @@ func (s *Store) GetFallback(certName string) (*Fallback, error) {
 	return f, nil
 }
 
-// ClearFallback 清掉降级状态。全集签发成功时调用。
+// ClearFallback clears fallback state. Called when the full set issues successfully.
 func (s *Store) ClearFallback(certName string) error {
 	if _, err := s.db.Exec(`DELETE FROM cert_fallback WHERE cert_name = ?`, certName); err != nil {
 		return fmt.Errorf("clear fallback for %s: %w", certName, err)
@@ -150,13 +155,22 @@ func (s *Store) ClearFallback(certName string) error {
 	return nil
 }
 
-// truncate 把可能很长的错误文本截断。
+// truncate cuts off potentially very long error text at a rune boundary.
 //
-// 这里存的是给人看的诊断信息，不是完整日志 —— 而一个反复失败的
-// ACME 错误可能带上整个响应体，不截断会让状态库无谓地膨胀。
+// What is stored here is human-facing diagnostic information, not a full log -- and a
+// repeatedly failing ACME error can carry an entire response body, so not truncating
+// would bloat the state database for no reason.
+//
+// The cut point is walked back to the start of a rune first: an ACME problem detail
+// or a fallback reason is free-form server text and is not guaranteed to be ASCII, so
+// slicing blindly at byte n can land inside a multi-byte UTF-8 sequence and leave
+// invalid UTF-8 sitting in the state database and every log line built from it.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }

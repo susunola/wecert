@@ -1,52 +1,74 @@
-// Package deploy 负责把签发好的证书推送到真正的消费方。
+// Package deploy pushes issued certificates to the systems that actually consume them.
 //
-// 本项目的形态是"TLS 在腾讯云 CLB 终结"，所以节点上没有任何 agent、
-// 也没有证书文件分发 —— 整个部署动作就是几次腾讯云 API 调用。
+// This project is shaped as "TLS terminates on Tencent Cloud CLB", so there is no agent
+// on any node and no certificate file distribution -- the whole deploy action is a
+// handful of Tencent Cloud API calls.
 package deploy
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
-// Deployer 是部署目标的抽象。
+// ErrDeploymentDisabled distinguishes a deliberately local-only configuration
+// from a successful remote deletion. Callers must keep retry state when this is
+// returned: nothing has been deleted from Tencent Cloud.
+var ErrDeploymentDisabled = errors.New("cloud deployment is disabled")
+
+// Deployer abstracts the deployment target.
 //
-// 之所以做成接口：腾讯云有两条路可以走，控制器不应该关心是哪条。
+// It is an interface because Tencent Cloud offers two routes and the controller should
+// not care which one is in use.
 //
-//   - UpdateCertificateInstance（公开，本项目默认）：
-//     上传新证书拿到新 CertId，再由腾讯云自己去查"哪些 CLB 监听器绑了旧证书"
-//     并换成新的。好处是我们完全不用维护监听器清单，
-//     同一监听器上 SNI 多证书也不会被误覆盖。
+//   - UpdateCertificateInstance (public, this project's default):
+//     upload the new certificate to get a new CertId, then let Tencent Cloud itself
+//     discover which CLB listeners are bound to the old certificate and swap them over.
+//     The win is that we never maintain a listener inventory, and multiple SNI
+//     certificates on one listener cannot be overwritten by mistake.
 //
-//   - UploadUpdateCertificateInstance（需提工单开白名单）：
-//     证书 ID 保持不变、内容原地替换，部署目标仅支持 clb。
-//     唯一的额外好处是省掉一次 CertId 变更，属于锦上添花。
+//   - UploadUpdateCertificateInstance (needs a support ticket to whitelist):
+//     the certificate ID stays the same and the content is replaced in place; the only
+//     deployment target supported is clb.
+//     Its sole extra benefit is skipping one CertId change -- a nice-to-have.
 type Deployer interface {
-	// Deploy 推送新证书，返回部署后应记录的证书标识。
-	// oldID 为空表示首次签发（腾讯云侧还没有绑定关系）。
+	// Deploy pushes the new certificate and returns the certificate identifier that
+	// should be recorded afterwards.
+	// An empty oldID means first issuance (no binding exists on the Tencent Cloud side).
 	Deploy(ctx context.Context, certName, oldID string, certPEM, keyPEM []byte) (newID string, err error)
 
-	// Delete 删除一张已经退役的证书，用于控制腾讯云侧证书数量不无限增长。
+	// Delete removes a retired certificate, keeping the Tencent Cloud certificate count
+	// from growing without bound.
 	Delete(ctx context.Context, certID string) error
 
-	// Bindings 返回这张证书当前绑定到多少个云资源。
+	// Bindings returns how many cloud resources this certificate is currently bound to.
 	//
-	// 只读。存在的理由是首次签发只上传、不绑定，所以 DeployConfirmed
-	// 是 false；人工在控制台绑好之后必须有人回来确认，否则 deployed
-	// 指标会在整个证书周期里报“未部署”。
+	// Read-only. It exists because the first issuance only uploads and does not bind, so
+	// DeployConfirmed is false; after a human binds it in the console someone has to come
+	// back and confirm, otherwise the deployed metric reports "not deployed" for the
+	// certificate's entire lifetime.
 	//
-	// 查不到绑定不代表失败 —— 返回 0 即可。调用方据此区分
-	// “还没绑”和“查不动”。
+	// Finding no binding does not mean failure -- returning 0 is fine. Callers use that to
+	// tell "not bound yet" apart from "cannot query".
 	Bindings(ctx context.Context, certID string) (int, error)
 }
 
-// Noop 在 deploy.enabled=false 时使用：只把证书留在本地状态库里。
+// Noop is used when deploy.enabled=false: certificates stay only in the local state db.
 type Noop struct{}
 
-// Deploy 原样返回 oldID，不做任何远端操作。
+// Deploy returns oldID unchanged and performs no remote operation.
 func (Noop) Deploy(_ context.Context, _ string, oldID string, _, _ []byte) (string, error) {
 	return oldID, nil
 }
 
-// Delete 什么都不做。
-func (Noop) Delete(_ context.Context, _ string) error { return nil }
+// Delete does not claim success: an existing cloud certificate cannot be
+// reclaimed while deployment is disabled. Returning nil here would make the
+// reaper forget its queue entry while leaking the cloud certificate forever.
+func (Noop) Delete(_ context.Context, certID string) error {
+	if certID == "" {
+		return nil
+	}
+	return ErrDeploymentDisabled
+}
 
-// Bindings 恒为 0：Noop 不往任何地方部署，也就无所谓绑定。
+// Bindings is always 0: Noop deploys nowhere, so there is nothing to bind.
 func (Noop) Bindings(_ context.Context, _ string) (int, error) { return 0, nil }

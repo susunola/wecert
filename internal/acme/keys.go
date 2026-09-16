@@ -16,7 +16,8 @@ import (
 	"github.com/susunola/wecert/internal/config"
 )
 
-// GenerateKey 按配置生成证书私钥。默认 ECDSA P-256。
+// GenerateKey generates the certificate private key for the configured type.
+// ECDSA P-256 is the default.
 func GenerateKey(keyType string) (crypto.Signer, error) {
 	switch keyType {
 	case config.KeyTypeECDSAP256:
@@ -32,7 +33,7 @@ func GenerateKey(keyType string) (crypto.Signer, error) {
 	}
 }
 
-// MarshalPrivateKeyPEM 统一用 PKCS#8，避免 EC/RSA 各写一套。
+// MarshalPrivateKeyPEM always writes PKCS#8, so EC and RSA need no separate paths.
 func MarshalPrivateKeyPEM(key crypto.Signer) ([]byte, error) {
 	der, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
@@ -41,7 +42,7 @@ func MarshalPrivateKeyPEM(key crypto.Signer) ([]byte, error) {
 	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }
 
-// ParsePrivateKeyPEM 解析 PKCS#8 / PKCS#1 / SEC1 三种私钥编码。
+// ParsePrivateKeyPEM parses all three private key encodings: PKCS#8, PKCS#1, SEC1.
 func ParsePrivateKeyPEM(data []byte) (crypto.Signer, error) {
 	block, _ := pem.Decode(data)
 	if block == nil {
@@ -64,15 +65,15 @@ func ParsePrivateKeyPEM(data []byte) (crypto.Signer, error) {
 	return nil, errors.New("unrecognized private key encoding (tried PKCS#8, PKCS#1, SEC1)")
 }
 
-// CreateCSRDER 构造证书签名请求，返回 DER 编码。
+// CreateCSRDER builds a certificate signing request and returns it DER-encoded.
 //
-// 为什么是 DER 而不是 PEM：lego 的 api.OrderService.UpdateForCSR 会
-// **自己**对传入的字节做 base64url 编码再塞进 ACME 的 csr 字段。
-// 如果这里给 PEM，LE 收到的是 base64url(PEM 文本)，解出来再按 DER 解析
-// 就会报 "asn1: structure error: tags don't match ... certificateRequest"。
+// Why DER and not PEM: lego's api.OrderService.UpdateForCSR base64url-encodes the
+// bytes it is handed and puts *that* into the ACME csr field. Hand it PEM and the
+// CA receives base64url(PEM text); decoding that and parsing it as DER fails with
+// "asn1: structure error: tags don't match ... certificateRequest".
 //
-// Subject 留空是有意的：classic profile 会把第一个 dNSName 提升为 CN，
-// tlsserver profile 则完全不带 CN。交给 CA 决定即可。
+// An empty Subject is deliberate: the classic profile promotes the first dNSName
+// to CN, the tlsserver profile carries no CN at all. Let the CA decide that.
 func CreateCSRDER(key crypto.Signer, domains []string) ([]byte, error) {
 	tmpl := &x509.CertificateRequest{
 		Subject:  pkix.Name{},
@@ -85,7 +86,7 @@ func CreateCSRDER(key crypto.Signer, domains []string) ([]byte, error) {
 	return der, nil
 }
 
-// ParseLeaf 解析 fullchain 里的第一张证书（叶子）。
+// ParseLeaf parses the first certificate (the leaf) out of a fullchain.
 func ParseLeaf(fullchainPEM []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(fullchainPEM)
 	if block == nil {
@@ -97,15 +98,17 @@ func ParseLeaf(fullchainPEM []byte) (*x509.Certificate, error) {
 	return x509.ParseCertificate(block.Bytes)
 }
 
-// CoverageDrift 比较"配置里期望的域名集合"与"证书实际带的 SAN"。
+// CoverageDrift compares the domain set the config expects against the SANs the
+// certificate actually carries.
 //
-// 返回是否不一致，以及一句可读的差异说明。
+// It returns whether they differ, plus a readable description of the drift.
 //
-// 这是声明式收敛的关键一步：VerifyCoverage 只回答"这张新证书够不够用"，
-// 用在部署前的闸门上；而 CoverageDrift 回答的是"当前生效的证书是不是
-// 还符合配置"，用在每轮的决策里。少了后者，配置里加了域名之后程序
-// 会认为无事可做，要等到下一个续期窗口才带上新域名 —— classic profile 下
-// 最长可能等一整个有效期。
+// This is the key step of declarative convergence: VerifyCoverage only answers
+// "is this new certificate good enough", and gates a deploy; CoverageDrift answers
+// "does the certificate in effect still match the config", and feeds every round's
+// decision. Without the latter, adding a domain to the config looks like nothing to
+// do, and the new domain waits for the next renewal window -- under the classic
+// profile that can be a whole validity period away.
 func CoverageDrift(leaf *x509.Certificate, want []string) (bool, string) {
 	if leaf == nil {
 		return false, ""
@@ -125,10 +128,11 @@ func CoverageDrift(leaf *x509.Certificate, want []string) (bool, string) {
 	return true, strings.Join(parts, "; ")
 }
 
-// VerifyCoverage 确认签回来的证书确实覆盖了我们申请的全部域名。
+// VerifyCoverage confirms the certificate that came back really covers every
+// domain we asked for.
 //
-// 这是部署前的最后一道闸门：不加这一步，一个不完整的订单结果
-// 会被直接推到 CLB 上，把线上打挂。
+// This is the last gate before deploying: without it an incomplete order result
+// would be pushed straight to the CLB and take production down.
 func VerifyCoverage(leaf *x509.Certificate, want []string) error {
 	have := make(map[string]bool, len(leaf.DNSNames))
 	for _, n := range leaf.DNSNames {

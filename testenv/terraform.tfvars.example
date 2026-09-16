@@ -1,16 +1,17 @@
-# 复制成 terraform.tfvars 后按需修改。
-# 凭证不写在这里 —— 用环境变量 TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY。
+# Copy to terraform.tfvars and adjust.
+# Credentials do not belong here — use the environment variables
+# TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY.
 
 region            = "ap-guangzhou"
 availability_zone = "ap-guangzhou-3"
 name_prefix       = "wecert-test"
 
-# 阶段 B：VPC + CLB + HTTPS 监听器 + 占位证书
+# Stage B: VPC + CLB + HTTPS listener + a placeholder certificate
 create_clb         = true
-clb_network_type   = "INTERNAL" # 内网型，省掉 EIP 费用
+clb_network_type   = "INTERNAL" # internal-facing, which avoids EIP charges
 clb_sni_domain     = "placeholder.wecert-test.invalid"
 
-# 阶段 C：再加一台 CVM（默认关闭，最贵的部分）
+# Stage C: add a CVM (off by default; this is the expensive part)
 create_cvm        = false
 enable_cvm_role   = false
 cam_role_name     = "wecert-test-role"

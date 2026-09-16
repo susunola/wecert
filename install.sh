@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# wecert 安装脚本 —— 在目标 CVM 上执行。
+# wecert install script — run this on the target CVM.
 #
 #   sudo ./install.sh /path/to/wecert_linux_amd64
 #
-# 做的事情：建系统用户、装二进制、准备配置目录、装 systemd unit。
-# 不会自动启动服务，也不会替你填 DNSPod token —— 这两步需要你确认。
+# What it does: create the system user, install the binary, prepare the config
+# directory, install the systemd unit.
+# It does not start the service, and it does not fill in the DNSPod token for you
+# — both of those steps need your explicit confirmation.
 set -euo pipefail
 
 BINARY="${1:-}"
@@ -14,58 +16,98 @@ CONFIG_DIR="/etc/wecert"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 
 if [[ -z "${BINARY}" ]]; then
-	echo "用法: sudo $0 <wecert 二进制路径>" >&2
-	echo "例如: sudo $0 ./wecert_linux_amd64" >&2
+	echo "Usage: sudo $0 <path to the wecert binary>" >&2
+	echo "Example: sudo $0 ./wecert_linux_amd64" >&2
 	exit 1
 fi
 
 if [[ ! -f "${BINARY}" ]]; then
-	echo "错误: 找不到文件 ${BINARY}" >&2
+	echo "Error: file not found: ${BINARY}" >&2
 	exit 1
 fi
 
 if [[ "$(id -u)" -ne 0 ]]; then
-	echo "错误: 需要 root 权限运行(sudo)" >&2
+	echo "Error: must be run as root (sudo)" >&2
 	exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "==> 检查二进制架构"
-file "${BINARY}"
-if ! file "${BINARY}" | grep -q 'ELF 64-bit'; then
-	echo "错误: 这不是 Linux ELF 二进制。CVM 上需要 linux/amd64 或 linux/arm64 的产物。" >&2
+echo "==> Checking binary architecture"
+file -- "${BINARY}"
+if ! file -- "${BINARY}" | grep -q 'ELF 64-bit'; then
+	echo "Error: this is not a Linux ELF binary. The CVM needs a linux/amd64 or linux/arm64 build." >&2
 	exit 1
 fi
 
-echo "==> 创建系统用户 wecert"
-if ! id -u wecert >/dev/null 2>&1; then
-	useradd --system --no-create-home --shell /usr/sbin/nologin wecert
-	echo "    已创建"
+# Verify the artifact before installing it as root.
+#
+# `make release` writes dist/SHA256SUMS next to the binaries, and nothing ever read
+# it: whatever file was passed in became a root-owned binary that systemd then runs
+# with the CAM credentials and the private-key database. That is a lot of trust to
+# place in a file that may have crossed a build host, a shared directory or a
+# download.
+#
+# Absent sums file: warn rather than refuse, because copying the single binary to a
+# CVM is a legitimate workflow. Present but mismatched: refuse, because that is the
+# case this check exists for.
+BINARY_DIR="$(cd "$(dirname "${BINARY}")" && pwd)"
+BINARY_NAME="$(basename "${BINARY}")"
+SUMS="${BINARY_DIR}/SHA256SUMS"
+
+if [[ -f "${SUMS}" ]]; then
+	echo "==> Verifying ${BINARY_NAME} against ${SUMS}"
+	expected="$(awk -v f="${BINARY_NAME}" '$2 == f { print $1 }' "${SUMS}")"
+	if [[ -z "${expected}" ]]; then
+		echo "Error: ${BINARY_NAME} is not listed in ${SUMS}. Refusing to install an unlisted artifact." >&2
+		exit 1
+	fi
+	if command -v sha256sum >/dev/null 2>&1; then
+		actual="$(sha256sum -- "${BINARY}" | awk '{ print $1 }')"
+	else
+		actual="$(shasum -a 256 -- "${BINARY}" | awk '{ print $1 }')"
+	fi
+	if [[ "${actual}" != "${expected}" ]]; then
+		echo "Error: checksum mismatch for ${BINARY_NAME}." >&2
+		echo "  expected ${expected}" >&2
+		echo "  actual   ${actual}" >&2
+		exit 1
+	fi
+	echo "    ok"
 else
-	echo "    已存在，跳过"
+	echo "Warning: no SHA256SUMS beside ${BINARY_NAME}, so the artifact cannot be verified." >&2
+	echo "         It will be installed as root and run with the CAM credentials and the" >&2
+	echo "         private-key database. Prefer installing from a 'make release' output." >&2
 fi
 
-echo "==> 安装二进制到 ${INSTALL_PATH}"
-install -m 0755 -o root -g root "${BINARY}" "${INSTALL_PATH}"
+echo "==> Creating system user wecert"
+if ! id -u wecert >/dev/null 2>&1; then
+	useradd --system --no-create-home --shell /usr/sbin/nologin wecert
+	echo "    created"
+else
+	echo "    already exists, skipping"
+fi
 
-echo "==> 准备配置目录 ${CONFIG_DIR}"
+echo "==> Installing binary to ${INSTALL_PATH}"
+install -m 0755 -o root -g root -- "${BINARY}" "${INSTALL_PATH}"
+
+echo "==> Preparing config directory ${CONFIG_DIR}"
 mkdir -p "${CONFIG_DIR}"
 chown root:wecert "${CONFIG_DIR}"
 chmod 0750 "${CONFIG_DIR}"
 
 if [[ -f "${CONFIG_FILE}" ]]; then
-	echo "    配置已存在，保留不覆盖"
+	echo "    config already exists, keeping it as is"
 else
 	if [[ -f "${SCRIPT_DIR}/config.example.yaml" ]]; then
 		install -m 0640 -o root -g wecert "${SCRIPT_DIR}/config.example.yaml" "${CONFIG_FILE}"
-		echo "    已放置示例配置，务必先编辑再启动"
+		echo "    placed the example config; be sure to edit it before starting"
 	else
-		echo "    警告: 未找到 config.example.yaml，请手动创建 ${CONFIG_FILE}"
+		echo "    warning: config.example.yaml not found, create ${CONFIG_FILE} by hand"
 	fi
 fi
 
-echo "==> 安装 systemd unit"
+echo "==> Installing systemd unit"
 for unit in wecert.service wecert-once.service wecert-once.timer; do
 	if [[ -f "${SCRIPT_DIR}/deploy/systemd/${unit}" ]]; then
 		install -m 0644 "${SCRIPT_DIR}/deploy/systemd/${unit}" "/etc/systemd/system/${unit}"
@@ -76,30 +118,33 @@ systemctl daemon-reload
 
 cat <<EOF
 
-==> 安装完成
+==> Installation complete
 
-接下来三步：
+Three steps remain:
 
-1) 编辑配置（填入 DNSPod token；腾讯云走 CVM 角色则无需填密钥）
+1) Edit the config (fill in the DNSPod token; when Tencent Cloud runs with a CVM
+   role, no secret key is needed)
      sudo vi ${CONFIG_FILE}
 
-   acme.directory 默认就是 Let's Encrypt staging，不用改也能跑通全流程。
+   acme.directory already defaults to Let's Encrypt staging, so the whole flow
+   works without changing anything.
 
-2) 先用 staging 验证一遍：
+2) Validate once against staging first:
      sudo -u wecert ${INSTALL_PATH} -config ${CONFIG_FILE} -dry-run
 
-   确认无误后，把 acme.directory 显式改成生产地址：
+   Once that looks right, change acme.directory explicitly to the production URL:
      https://acme-v02.api.letsencrypt.org/directory
 
-3) 启动服务：
+3) Start the service:
      sudo systemctl enable --now wecert
 
-   偏好"跑完就退出"的定时模式则改用：
+   If you prefer the "run once and exit" timer mode, use this instead:
      sudo systemctl enable --now wecert-once.timer
 
-查看日志：
+View the logs:
      journalctl -u wecert -f
 
-注意：首次签发只会把证书上传到腾讯云并打印 CertId，
-需要你去 CLB 控制台手动绑定一次；之后每次续期都是全自动的。
+Note: the first issuance only uploads the certificate to Tencent Cloud and prints
+the CertId. You have to bind it once by hand in the CLB console; every renewal
+after that is fully automatic.
 EOF

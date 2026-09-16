@@ -100,13 +100,24 @@ Full rationale in [Domains that change often](README.reference.md#domains-that-c
 
 The one rule everything else follows: **wecert never infers.** Something else works out what should exist and writes it down; wecert only reads that document and converges. Judgement is inferred once and reviewed as a diff, while the certificate lifecycle stays stable.
 
-### 0. The problem this solves
+### 0. Deployment shape — a free certificate rotating itself on the CLB
 
-![wecert's problem scenario: TLS terminates at the CLB and the business machines hold no certificate](docs/diagrams/en/00-the-problem.png)
+![wecert's deployment shape: a free certificate rotated automatically by Let's Encrypt (issued for free → rebound automatically → serving for 90 days → reissued before expiry); Let's Encrypt is chosen over Tencent Cloud's own free DV because the latter is single-domain and supports neither SAN nor wildcard](docs/diagrams/en/00-deployment-shape.png)
 
-TLS terminates at the CLB and the business machines hold no certificate file at all, so the premise every conventional approach rests on does not hold here: certbot on each CVM has nowhere to put a certificate, cert-manager assumes Kubernetes and produces a Secret rather than a listener binding, and copying the file to each node only makes more copies of a private key that nothing reads.
+The scenario this system exists for is the band on top: **a Let's Encrypt certificate is free, and the price is a 90-day validity** — at least four rotations a year, and a human remembering each one will eventually miss.
 
-What makes it hard rather than merely awkward is the last row. ARI exempts renewals from every rate limit — but **only for a same-name renewal**, so changing the name set once burns one issuance. "Domains change all the time" is this project's premise, so every other design decision follows from making "add a domain" avoid producing a new issuance.
+Tencent Cloud's own free DV is not an alternative. **It is a single-domain certificate: no SAN, no wildcard.** A deployment with a handful of domains would need one certificate and one rotation pipeline per domain. One Let's Encrypt certificate carries up to 100 names and does support wildcards, so several domains — including `*.example.com` — collapse into a single certificate with a single rotation to look after. That is what makes the multi-SAN shape drawn below possible at all.
+
+The point is not that wecert *can* issue; it is that the certificate is already replaced before it expires, with nobody involved.
+
+Requests arrive at the CLB over SNI. The CLB picks the certificate out of `multi_cert_info` using the name the client sent, and the layer-7 rules route by domain to the backend RS pool. `wecert` runs on one of those CVMs; it reads the `_wecert.*` declarations from DNSPod, writes the `_acme-challenge` records, obtains the certificate from Let's Encrypt, uploads it to Tencent Cloud SSL and rebinds the listener.
+
+Two consequences of this shape are easy to miss:
+
+- **The backend RSs take no part in TLS.** Decryption happens at the CLB, so the certificate is a *cloud resource*, not a few files. Putting certbot on every RS buys nothing, and tools that assume the certificate ends up in a Secret have nowhere to land here.
+- **Domains sharing one certificate share their fate.** SNI only decides *which* certificate is used; the certificate's SAN decides which domains it can actually serve. So once `a.example.com` and `b.example.com` are in the same certificate, a DNS problem on one drags the other down with it.
+
+The second point is the constraint everything else is built around — wildcard-first grouping, the desired state, and the failure fallback all exist because of it.
 
 ### 1. System map — who owns what, who only reads
 
@@ -303,4 +314,4 @@ Exit codes: `0` served as expected · `1` could not complete a probe · `2` prob
 
 ## License
 
-No license file is present, which means all rights reserved by default. **Add one before distributing or accepting external contributions.**
+[MIT](LICENSE)
