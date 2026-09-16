@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -34,10 +35,14 @@ func NewCredentialSource(cfg config.Tencent) (CredentialFunc, error) {
 	switch cfg.CredentialMode {
 	case config.CredentialStatic:
 		// Prefer values from the config, then fall back to Tencent Cloud's official
-		// environment variables.
-		// The point of going through the environment is that credentials need not land in
-		// the config file, so both the config file and the systemd unit can be committed
-		// and backed up without worry.
+		// environment variables. The point of the environment is that the credentials
+		// need not land in the config file, so that file can be committed and backed up
+		// freely.
+		//
+		// It does *not* follow that they may go in the systemd unit: install.sh writes
+		// the units 0644 root:root, so an inline Environment= line would make a
+		// long-lived CAM key world-readable. Put them in an EnvironmentFile that is
+		// 0600 root:wecert instead.
 		id, key := cfg.SecretID, cfg.SecretKey
 		if id == "" {
 			id = os.Getenv(EnvSecretID)
@@ -84,7 +89,12 @@ type cvmRoleCredential struct {
 // hardest kind of failure to diagnose -- "it turned out to be expired right when we
 // finally needed it".
 func fetchCVMRoleCredential(ctx context.Context, roleName string) (common.CredentialIface, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cvmMetadataURL+roleName, nil)
+	if roleName == "" {
+		return nil, fmt.Errorf("credentialMode=cvm-role requires tencent.roleName")
+	}
+	// Escaped, not concatenated raw: the role name comes from the config, and an
+	// unescaped "../" would let it reach other metadata paths.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cvmMetadataURL+url.PathEscape(roleName), nil)
 	if err != nil {
 		return nil, fmt.Errorf("build metadata request: %w", err)
 	}
@@ -101,6 +111,11 @@ func fetchCVMRoleCredential(ctx context.Context, roleName string) (common.Creden
 		return nil, fmt.Errorf("read the metadata response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		// The body *is* included, bounded: on a 404 it is the only thing that says
+		// "the role is not attached" rather than just "404", and that is the difference
+		// between an actionable error and a round of guessing. It is safe to bound here
+		// because state.PutCert also caps last_error at 512 bytes, which is where this
+		// string ends up.
 		return nil, fmt.Errorf("the metadata service returned %d; check that this CVM has role %q attached (response: %s)",
 			resp.StatusCode, roleName, truncate(string(body), 256))
 	}

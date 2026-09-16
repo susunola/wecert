@@ -166,3 +166,35 @@ var (
 		Help: "How many names were dropped from the certificate currently served by the failure fallback. The names themselves are in the state store and in the logs.",
 	}, []string{"cert"})
 )
+
+// DeleteCertSeries removes every per-certificate series for a name that is no longer
+// in the desired state.
+//
+// These vecs are only ever written for names in the *current* desired state, so
+// nothing revisits the ones that left it: their series stay exported at their last
+// value forever. The visible symptom is a not_after series frozen at its last value,
+// which the documented expiry rule -- (not_after - now) < 21 days -- turns into a
+// permanent alert for a certificate that no longer exists. Over a long-lived daemon
+// that is also unbounded series growth, since certificate names are derived from
+// registered domains and domains churn by design.
+func DeleteCertSeries(name string) {
+	for _, v := range []*prometheus.GaugeVec{
+		CertNotAfter,
+		CertDeployed,
+		CertConsecutiveFailures,
+		CertARIWindowStart,
+		CertificateFallbackActive,
+		CertificateFallbackDropped,
+	} {
+		v.DeleteLabelValues(name)
+	}
+}
+
+// DeleteProbeSeries removes every per-host probe series for a host that is no longer
+// probed. See DeleteCertSeries for why the reclamation has to be explicit.
+func DeleteProbeSeries(host string) {
+	CertificateProbeMatch.DeleteLabelValues(host)
+	CertificateProbeNotAfter.DeleteLabelValues(host)
+	CertificateProbeTrusted.DeleteLabelValues(host)
+	CertificateProbeErrors.DeleteLabelValues(host)
+}

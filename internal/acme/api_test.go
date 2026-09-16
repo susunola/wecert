@@ -56,6 +56,10 @@ type fakeAPI struct {
 	// wildcard -- authorization have to populate it.
 	authzByURL map[string]legoacme.Authorization
 
+	// authzHits counts GetAuthorization per URL, so a test can tell "polled again"
+	// from "polled once".
+	authzHits map[string]int
+
 	certPEM []byte
 	certErr error
 
@@ -130,10 +134,25 @@ func (f *fakeAPI) GetAuthorization(authzURL string) (legoacme.Authorization, err
 	f.enter("GetAuthorization")
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.authzHits == nil {
+		f.authzHits = make(map[string]int)
+	}
+	f.authzHits[authzURL]++
 	if a, ok := f.authzByURL[authzURL]; ok {
 		return a, nil
 	}
 	return legoacme.Authorization{Status: "valid", Identifier: legoacme.Identifier{Value: "a.example.com"}}, nil
+}
+
+// authorizationHits returns a copy of the per-URL GetAuthorization counts.
+func (f *fakeAPI) authorizationHits() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]int, len(f.authzHits))
+	for k, v := range f.authzHits {
+		out[k] = v
+	}
+	return out
 }
 
 func (f *fakeAPI) AcceptChallenge(challengeURL string) error {
@@ -486,5 +505,61 @@ func TestAdvanceAbortsWhenTheOrderCannotBePersisted(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "order state") {
 		t.Errorf("want the error to name the failed order write, got: %v", err)
+	}
+}
+
+// ── the authorization wait loop must not re-poll what already concluded ─────
+
+// awaitAuthorizations used to fetch and re-persist *every* authorization on every
+// poll round. For a 25-name certificate that takes its whole 3-minute budget that
+// is ~1500 CA round trips and ~1500 upserts, of which only the first 25 ever carry
+// new information -- and each upsert is its own WAL commit.
+func TestAwaitAuthorizationsStopsPollingConcludedAuthorizations(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com", "b.example.com", "c.example.com"})
+
+	const (
+		aURL = "https://ca.test/authz/a"
+		bURL = "https://ca.test/authz/b"
+		cURL = "https://ca.test/authz/c"
+	)
+	fake.orders = []legoacme.ExtendedOrder{{
+		Order: legoacme.Order{
+			Status:         "pending",
+			Finalize:       "https://ca.test/finalize/1",
+			Authorizations: []string{aURL, bURL, cURL},
+		},
+		Location: "https://ca.test/order/1",
+	}}
+	fake.authzByURL = map[string]legoacme.Authorization{
+		aURL: {Status: "valid", Identifier: legoacme.Identifier{Value: "a.example.com"}},
+		bURL: {Status: "valid", Identifier: legoacme.Identifier{Value: "b.example.com"}},
+		// Never concludes, so the loop keeps polling until its budget is gone.
+		cURL: {Status: "pending", Identifier: legoacme.Identifier{Value: "c.example.com"}},
+	}
+
+	// A short budget with a very short interval gives many rounds and no real waiting.
+	m.authzWait = 200 * time.Millisecond
+	m.pollInterval = time.Millisecond
+
+	var authzs []*state.Authorization
+	for _, u := range []string{aURL, bURL, cURL} {
+		a := &state.Authorization{CertName: cert.Name, AuthzURL: u, Status: "pending"}
+		if err := store.PutAuthorization(a); err != nil {
+			t.Fatalf("PutAuthorization: %v", err)
+		}
+		authzs = append(authzs, a)
+	}
+
+	if err := m.awaitAuthorizations(context.Background(), authzs); err == nil {
+		t.Fatal("an authorization that never concludes must exhaust the budget and error")
+	}
+
+	hits := fake.authorizationHits()
+	if hits[aURL] != 1 || hits[bURL] != 1 {
+		t.Errorf("a concluded authorization must be polled exactly once, got a=%d b=%d",
+			hits[aURL], hits[bURL])
+	}
+	if hits[cURL] < 2 {
+		t.Errorf("the pending authorization must keep being polled, got %d", hits[cURL])
 	}
 }

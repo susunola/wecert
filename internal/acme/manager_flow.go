@@ -300,19 +300,33 @@ func (m *Manager) loadAuthorizations(certName string, urls []string) ([]*state.A
 }
 
 func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Authorization) error {
-	deadline := m.now().Add(authzWaitTimeout)
+	deadline := m.now().Add(m.authzWait)
+
+	// Only the still-pending subset is polled, and it shrinks as authorizations
+	// conclude. Polling the whole set every round means a 25-name certificate that
+	// takes the entire budget costs ~1500 CA round trips and ~1500 upserts, of which
+	// only the first 25 ever carry new information -- and each upsert is its own WAL
+	// commit.
+	pending := make([]*state.Authorization, len(authzs))
+	copy(pending, authzs)
+
 	for {
-		current, err := m.fetchAuthzs(ctx, authzs)
+		current, err := m.fetchAuthzs(ctx, pending)
 		if err != nil {
 			return err
 		}
 
-		allValid := true
-		for i, a := range authzs {
+		stillPending := pending[:0]
+		for i, a := range pending {
 			cur := current[i]
-			a.Status = cur.Status
-			if perr := m.store.PutAuthorization(a); perr != nil {
-				return perr
+
+			// Persist a transition only. The row is what the next pass reads to decide
+			// where to resume, so rewriting an unchanged status is pure fsync.
+			if a.Status != cur.Status {
+				a.Status = cur.Status
+				if perr := m.store.PutAuthorization(a); perr != nil {
+					return perr
+				}
 			}
 
 			switch cur.Status {
@@ -320,19 +334,21 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 			case "invalid":
 				return fmt.Errorf("validation failed for identifier %s: %s", a.Identifier, authzError(cur))
 			default:
-				allValid = false
+				stillPending = append(stillPending, a)
 			}
 		}
-		if allValid {
+		pending = stillPending
+
+		if len(pending) == 0 {
 			return nil
 		}
 		if m.now().After(deadline) {
-			return fmt.Errorf("authorizations did not complete within %s; keeping the order for the next pass", authzWaitTimeout)
+			return fmt.Errorf("authorizations did not complete within %s; keeping the order for the next pass", m.authzWait)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(pollInterval):
+		case <-time.After(m.pollInterval):
 		}
 	}
 }
@@ -501,7 +517,7 @@ func (m *Manager) awaitOrderStatus(
 		select {
 		case <-ctx.Done():
 			return last, ctx.Err()
-		case <-time.After(pollInterval):
+		case <-time.After(m.pollInterval):
 		}
 	}
 }

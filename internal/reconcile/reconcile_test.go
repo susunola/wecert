@@ -3,12 +3,16 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/susunola/wecert/internal/config"
@@ -19,6 +23,9 @@ import (
 
 // fakeManager isolates the convergence loop's orchestration logic for testing.
 type fakeManager struct {
+	// Reconcile runs concurrently for a full webhook trigger (one goroutine per
+	// certificate, bounded), so the recording has to be guarded.
+	mu       sync.Mutex
 	calls    []string
 	failWith map[string]error
 
@@ -31,11 +38,21 @@ type fakeManager struct {
 }
 
 func (f *fakeManager) Reconcile(_ context.Context, c *config.Certificate) error {
+	f.mu.Lock()
 	f.calls = append(f.calls, c.Name)
+	f.mu.Unlock()
+
 	if f.onReconcile != nil {
 		f.onReconcile(c.Name)
 	}
 	return f.failWith[c.Name]
+}
+
+// reconciled returns the names Reconcile was called with.
+func (f *fakeManager) reconciled() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
 }
 
 func (f *fakeManager) ReapRetired(_ context.Context) {
@@ -497,5 +514,197 @@ func TestOrphanedCertificatesAreReported(t *testing.T) {
 
 	if got := testutil.ToFloat64(metrics.OrphanedCertificates); got != 1 {
 		t.Errorf("should report 1 orphaned certificate, got %v", got)
+	}
+}
+
+// ── a full trigger must resolve once and stay bounded ──────────────────────
+
+// countingProvider counts Desired calls.
+type countingProvider struct {
+	inner spec.Provider
+	calls atomic.Int64
+}
+
+func (c *countingProvider) Desired(ctx context.Context) ([]config.Certificate, error) {
+	c.calls.Add(1)
+	return c.inner.Desired(ctx)
+}
+
+// StartAll used to resolve the desired state once itself and then once more inside
+// every StartCert: N+1 file reads, YAML decodes, full validations and document
+// hashes, plus an O(n^2) Find over a slice it was already holding.
+func TestStartAllResolvesTheDesiredStateOnce(t *testing.T) {
+	const n = 12
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{}
+	for i := 0; i < n; i++ {
+		cfg.Certificates = append(cfg.Certificates, config.Certificate{Name: fmt.Sprintf("c-%02d", i)})
+	}
+
+	done := make(chan struct{}, n)
+	mgr := &fakeManager{onReconcile: func(string) { done <- struct{}{} }}
+	prov := &countingProvider{inner: spec.NewStatic(cfg.Certificates)}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, mgr, nil, log)
+
+	if skipped := r.StartAll(context.Background()); len(skipped) != 0 {
+		t.Fatalf("nothing should be skipped, got %v", skipped)
+	}
+
+	// Wait for every pass to finish so nothing is still reading the provider.
+	for i := 0; i < n; i++ {
+		<-done
+	}
+
+	if got := prov.calls.Load(); got != 1 {
+		t.Errorf("the desired state was read %d times for one full trigger; want exactly 1", got)
+	}
+	if got := len(mgr.reconciled()); got != n {
+		t.Errorf("every certificate must still be reconciled, got %d of %d", got, n)
+	}
+}
+
+// A full trigger used to start one goroutine per certificate, so a large state
+// fired that many concurrent ACME orders, DNS writes and cloud calls from a single
+// HTTP request. The timer path walks the same certificates strictly one at a time.
+func TestFullTriggerBoundsConcurrentReconciles(t *testing.T) {
+	const n = 40
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{}
+	for i := 0; i < n; i++ {
+		cfg.Certificates = append(cfg.Certificates, config.Certificate{Name: fmt.Sprintf("c-%02d", i)})
+	}
+
+	var inFlight, peak atomic.Int64
+	release := make(chan struct{})
+	mgr := &fakeManager{onReconcile: func(string) {
+		cur := inFlight.Add(1)
+		for {
+			old := peak.Load()
+			if cur <= old || peak.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		<-release
+		inFlight.Add(-1)
+	}}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, log)
+
+	r.StartAll(context.Background())
+
+	// Long enough for every goroutine that can hold a slot to take one and block.
+	time.Sleep(200 * time.Millisecond)
+
+	if got := peak.Load(); got > maxConcurrentStarts {
+		t.Errorf("%d certificates reconciled concurrently; the bound is %d", got, maxConcurrentStarts)
+	}
+	if got := peak.Load(); got == 0 {
+		t.Error("no reconcile started at all")
+	}
+
+	close(release)
+}
+
+// mutableProvider lets a test change the desired state between passes.
+type mutableProvider struct {
+	mu    sync.Mutex
+	certs []config.Certificate
+}
+
+func (m *mutableProvider) Desired(context.Context) ([]config.Certificate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]config.Certificate(nil), m.certs...), nil
+}
+
+func (m *mutableProvider) set(certs ...config.Certificate) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.certs = certs
+}
+
+// hasCertSeries reports whether the not_after gauge currently exports this cert.
+//
+// ToFloat64 cannot answer this: reading a deleted label set creates a fresh child, so
+// it returns 0 either way.
+func hasCertSeries(t *testing.T, name string) bool {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != "wecert_certificate_not_after_timestamp_seconds" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "cert" && l.GetValue() == name {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// A per-certificate gauge is only ever written for names in the *current* desired
+// state, so nothing revisits one that leaves it: the series stays exported at its
+// last value forever. A not_after frozen at its last value then trips the documented
+// expiry rule -- (not_after - now) < 21 days -- permanently, for a certificate that
+// no longer exists, and the vecs grow without bound as domains churn.
+func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: "gone"}, config.Certificate{Name: "kept"})
+
+	cfg := &config.Config{}
+	cfg.Certificates = []config.Certificate{{Name: "gone"}, {Name: "kept"}}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, &fakeManager{}, nil, log)
+
+	// State rows are what publish() reads; without them it returns early.
+	for _, n := range []string{"gone", "kept"} {
+		if err := store.PutCert(&state.CertState{Name: n, NotAfter: time.Now().Add(48 * time.Hour)}); err != nil {
+			t.Fatalf("PutCert: %v", err)
+		}
+	}
+
+	r.RunAll(context.Background())
+	if !hasCertSeries(t, "gone") || !hasCertSeries(t, "kept") {
+		t.Fatal("both certificates should be exported after the first pass")
+	}
+
+	// The declaration disappears.
+	prov.set(config.Certificate{Name: "kept"})
+	cfg.Certificates = []config.Certificate{{Name: "kept"}}
+	r.RunAll(context.Background())
+
+	if hasCertSeries(t, "gone") {
+		t.Error("the removed certificate's series must be reclaimed, or its frozen " +
+			"not_after keeps firing the expiry alert forever")
+	}
+	if !hasCertSeries(t, "kept") {
+		t.Error("the remaining certificate must stay exported")
 	}
 }
