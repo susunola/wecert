@@ -215,6 +215,7 @@ Deletion is deliberately an order of magnitude more conservative than addition, 
 - [Field notes and pitfalls](README.reference.md#field-notes-and-pitfalls) — the CLB SNI trap, `DescribeListeners` not reading bindings back, the DNSPod TTL floor, the lego API traps.
 - [Desired state](docs/desired-state.md) — declaring domains as `_wecert` DNS records, generating the desired-state document, and switching wecert over to it. Design rationale: [desired-state-providers.md](docs/desired-state-providers.md).
 - [The certificate lifecycle](README.reference.md#the-certificate-lifecycle) — seven diagrams, from the problem this exists to solve through to retiring the old certificate, plus data ownership, failure semantics and the rate-limit arithmetic. Interactive version: [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html).
+- [Lifecycle acceptance case](docs/lifecycle-acceptance.md) — the executable acceptance checklist for a certificate's whole life against real DNSPod + Let's Encrypt **staging**: issuance, SAN drift, the shared wildcard/apex TXT name, concurrent certificates, the ARI and fallback renewal paths, crash recovery, and the declaration → document → enforce handover.
 - [Roadmap](README.reference.md#roadmap) · [Development](README.reference.md#development).
 
 <details>
