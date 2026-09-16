@@ -43,7 +43,10 @@
   would otherwise pass the constant-time comparison against it.
 - Propagate order-state persistence errors in the ACME manager instead of only
   logging them; a failed write means crash recovery would resume from stale
-  state.
+  state. All three `persistOrder` call sites now honour the returned error --
+  `advance` initially kept discarding it, and Go does not warn about a dropped
+  return value, so the pass continued past a failed write and only failed later
+  with an unrelated message.
 - Release the per-certificate reconcile slot with `defer` in `RunAll` so a
   panic in `reconcileOne` can no longer wedge every later pass with
   `ErrAlreadyRunning`.
