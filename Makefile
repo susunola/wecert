@@ -11,6 +11,10 @@ TATRUN := bin/wecert-tatrun
 PROBE := bin/wecert-probe
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1.0)
 
+# 图：中文版是手写源，英文版是构建产物。
+SRCHTML := docs/certificate-lifecycle.html
+ENHTML  := docs/certificate-lifecycle.en.html
+
 # 交叉编译目标。腾讯云 CVM 绝大多数是 linux/amd64；
 # ARM 实例用 linux/arm64；darwin/arm64 供本机调试。
 PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
@@ -23,17 +27,25 @@ CMDS := wecert wecert-onboard
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
 
-# readme 里嵌的六张 PNG。先量再渲：量出有标签溢出就停下，不产出坏图。
+# readme 里嵌的两种语言各六张 PNG。
+#
+# 中文版是手写的事实来源，英文版由翻译表生成 —— 所以英文页面是构建产物，
+# 依赖中文源和翻译表，改了哪个都会自动重生成。
 #
 # 之所以要有这条命令而不是手工导一次：PNG 是二进制，代码改了它不会自己跟。
 # 有一条可重跑的路径，「图过期了」才只是一次 `make diagrams` 的事。
 diagrams: diagrams-check
 	python3 scripts/render-diagrams.py
 
-# 只量不渲。在浏览器里真测每个 foreignObject 的标签有没有溢出盒子 ——
-# 按字符宽度估高度是不可靠的，前一版就漏掉过一整行被裁掉的情况。
-diagrams-check:
+# 在真实浏览器里量每个 foreignObject 的标签有没有溢出盒子，两种语言都量。
+#
+# 英文比中文长，所以同一句话在两种语言下可能是"中文放得下、英文溢出" ——
+# 这正是英文版必须单独量一遍的原因（第一次跑就抓到图 6 差 1px）。
+diagrams-check: $(ENHTML)
 	python3 scripts/check-diagram-fit.py
+
+$(ENHTML): $(SRCHTML) scripts/diagram_i18n.py scripts/build-diagram-langs.py
+	python3 scripts/build-diagram-langs.py
 
 # 构建辅助工具（preflight 前置检查、clbverify 监听器绑定取证、probe 网络侧取证）。
 tools:

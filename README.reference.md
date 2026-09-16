@@ -368,19 +368,21 @@ Migrations run on `Open` and add missing columns in place (`PRAGMA table_info` +
 
 ## The certificate lifecycle
 
-Six diagrams covering the whole path, from "somebody added a line to a DNS zone" to "the old certificate is deleted from the cloud". They are also available as a single interactive page — with working links between the figures and a print/PDF button — at [docs/certificate-lifecycle.html](docs/certificate-lifecycle.html); the images below are that same page rendered.
+Six diagrams covering the whole path, from "somebody added a line to a DNS zone" to "the old certificate is deleted from the cloud". They are also available as a single interactive page — with working links between the figures and a print/PDF button — at [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html); the images below are that same page rendered.
 
-Regenerate them with `make diagrams`, which first *measures* every label in a real browser and refuses to render if any of them overflows its box.
+Regenerate them with `make diagrams`. The **Chinese page is the source of truth**; the English page and both sets of images are generated from it through a translation table, and the build fails loudly if anything is left untranslated — so the two languages cannot drift apart silently.
+
+The build also *measures* every label in a real browser, in **both** languages, and refuses to render if any of them overflows its box or if two `<text>` labels collide. English runs longer than Chinese, so "fits in Chinese, overflows in English" is a real failure mode — the first run caught exactly that.
 
 ### 1. System map — who owns what, who only reads
 
-![wecert system map: the declaration layer, the inference layer, the contract, the execution layer, and external services](docs/diagrams/01-system-map.png)
+![wecert system map: the declaration layer, the inference layer, the contract, the execution layer, and external services](docs/diagrams/en/01-system-map.png)
 
 Left to right is the transfer of authority: **intent** (written by a human) → **inference** (disposable) → **contract** (machine-written) → **execution** (must be stable) → **external**. Each layer has a different failure mode, and that is exactly why they are separated.
 
 ### 2. Intent → contract — the inference pipeline
 
-![wecert-onboard pipeline: enumerate, parse and filter, group and cover, gates, assemble, atomic write](docs/diagrams/02-intent-to-contract.png)
+![wecert-onboard pipeline: enumerate, parse and filter, group and cover, gates, assemble, atomic write](docs/diagrams/en/02-intent-to-contract.png)
 
 Note that red is only attached where a freeze actually happens. A bad declaration in stage 2 excludes just that one; a group that exceeds the SAN limit in stage 3 keeps only that group's previous revision. **Neither freezes the whole run** — a single typo must not stop every certificate from being updated.
 
@@ -397,7 +399,7 @@ Note that red is only attached where a freeze actually happens. A bad declaratio
 
 ### 3. Reconcile decisions
 
-![the five ordered checks wecert runs for each certificate](docs/diagrams/03-reconcile-decisions.png)
+![the five ordered checks wecert runs for each certificate](docs/diagrams/en/03-reconcile-decisions.png)
 
 The checks are **ordered**. The first branch that matches decides what this pass does, and if none match the answer is "do nothing" — which is what happens on the overwhelming majority of passes.
 
@@ -405,7 +407,7 @@ The checks are **ordered**. The first branch that matches decides what this pass
 
 ### 4. Order state machine
 
-![the ACME order state machine and where each state is persisted](docs/diagrams/04-order-state-machine.png)
+![the ACME order state machine and where each state is persisted](docs/diagrams/en/04-order-state-machine.png)
 
 The entire point of this state machine is that **the process can be killed at any moment**. Every state has a corresponding column in `state.db`, and those columns are what decide, after a restart, whether to carry on or to place a new order.
 
@@ -415,7 +417,7 @@ The same reasoning explains why an order's identifier set is stored separately: 
 
 ### 5. DNS-01 — a wildcard and its apex share one TXT name
 
-![DNS-01 sequence showing the write-all, verify-all, clean-up-all shape](docs/diagrams/05-dns01-sequence.png)
+![DNS-01 sequence showing the write-all, verify-all, clean-up-all shape](docs/diagrams/en/05-dns01-sequence.png)
 
 This is the easiest part to get wrong and the hardest to notice. `example.com` and `*.example.com` both put their challenge at `_acme-challenge.example.com` — one name, two values.
 
@@ -425,7 +427,7 @@ Propagation checking uses a quorum rather than "every authoritative nameserver r
 
 ### 6. The life of one certificate
 
-![certificate lifetime timeline: issuance, deploy, ARI window, renewBefore fallback, expiry](docs/diagrams/06-certificate-lifetime.png)
+![certificate lifetime timeline: issuance, deploy, ARI window, renewBefore fallback, expiry](docs/diagrams/en/06-certificate-lifetime.png)
 
 The axis is drawn for a `classic` 90-day certificate. What actually decides when renewal happens is ARI's `suggestedWindow`; `renewBefore` below it is only the fallback for when ARI is unavailable.
 
@@ -1053,7 +1055,7 @@ Runs a full issuance against staging with a throwaway state database, refusing t
 
 **Done:**
 
-- [x] **Desired-state providers: issue when a domain is added, not only on expiry.** Lands in `internal/spec` (the contract and providers), `internal/group` (wildcard-first grouping), `internal/onboarding` (declaration parsing plus the five safety invariants) and `cmd/wecert-onboard`. Migration path is `static → observe → enforce`. Rationale: [docs/desired-state-providers.md](docs/desired-state-providers.md) · operator guide: [docs/desired-state.md](docs/desired-state.md) · diagrams: [docs/certificate-lifecycle.html](docs/certificate-lifecycle.html).
+- [x] **Desired-state providers: issue when a domain is added, not only on expiry.** Lands in `internal/spec` (the contract and providers), `internal/group` (wildcard-first grouping), `internal/onboarding` (declaration parsing plus the five safety invariants) and `cmd/wecert-onboard`. Migration path is `static → observe → enforce`. Rationale: [docs/desired-state-providers.md](docs/desired-state-providers.md) · operator guide: [docs/desired-state.md](docs/desired-state.md) · diagrams: [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html).
 - [x] **External black-box probe (dial 443 and check the effective `notAfter`).** Lands in `internal/probe` and `cmd/wecert-probe`: every pass dials the first few names of each deployed certificate and compares what is *actually served* against what was *deployed*. "The API says the rebind succeeded" and "the browser gets this certificate" are two different things — the rebind is asynchronous, and another certificate can be winning SNI. Neither is visible through the control plane. See the `probe` section above.
 - [x] **Cross-process exclusive lock (`flock`) on `state.db`.** Acquired in `state.Open` on `<statePath>.lock`; a second process fails at startup instead of double-ordering. Kernel-managed, so a crash releases it — no stale PID file. See the systemd deployment section above.
 - [x] **Abstract `Manager`'s dependency on `*api.Core` behind a narrow `API` interface.** `internal/acme/api.go` now defines the seven operations the Manager actually needs, plus `NewAPI(core)` as the lego adapter. The payoff is not the indirection — it is that the order state machine can finally be asserted on *call order and arguments*, without an HTTP server. Three invariants now have tests that would have been awkward before: the order URL is on disk before the next ACME call, renewals carry `replaces`, and the CSR is DER posted to the finalize URL.
