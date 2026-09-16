@@ -293,3 +293,84 @@ func TestProbeErrorsWhenNothingIsListening(t *testing.T) {
 		t.Errorf("错误信息应当能看出是哪个名字失败了，实际: %v", err)
 	}
 }
+
+// A successful TCP connection does not mean TLS will complete. A broken endpoint
+// can accept connections yet send no TLS bytes; timeout must include that handshake
+// or the entire reconciliation pass can block until the process exits.
+func TestProbeTimesOutAStalledTLSHandshake(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	port := ln.Addr().(*net.TCPAddr).Port
+	start := time.Now()
+	attempts := probeIPs(context.Background(), "localhost", []string{"127.0.0.1"},
+		Options{Port: port, Timeout: 100 * time.Millisecond})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("a stalled TLS handshake must obey timeout, took %v", elapsed)
+	}
+	if len(attempts) != 1 || attempts[0].Err == nil {
+		t.Fatalf("stalled handshake should be recorded as a failure, got %+v", attempts)
+	}
+
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(time.Second):
+		t.Fatal("test server did not receive the TCP connection")
+	}
+}
+
+// Runner must verify every address. Treating an updated first node as success
+// would hide the critical case where a later node still serves an old certificate.
+func TestRunnerDetectsAMismatchOnAnyResolvedAddress(t *testing.T) {
+	goodCert := makeCert(t, []string{"service.example"},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+	badCert := makeCert(t, []string{"old.example"},
+		time.Now().Add(-time.Hour), time.Now().Add(30*24*time.Hour))
+
+	resultFor := func(cert tls.Certificate, host string) *Result {
+		t.Helper()
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &Result{
+			Host:     host,
+			NotAfter: leaf.NotAfter,
+			SANs:     append([]string(nil), leaf.DNSNames...),
+			cert:     leaf,
+		}
+	}
+
+	r := NewRunner(Options{}, 0, nil)
+	good := resultFor(goodCert, "service.example")
+	bad := resultFor(badCert, "service.example")
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{
+			{Address: "192.0.2.10:443", Result: good},
+			{Address: "192.0.2.11:443", Result: bad},
+		}, nil
+	}
+
+	v := r.Check(context.Background(), "service.example", Expectation{
+		Domains:  []string{"service.example"},
+		NotAfter: good.NotAfter,
+	})
+	if v.OK {
+		t.Fatal("a reachable address serving the wrong certificate must fail")
+	}
+	if !strings.Contains(v.Summary(), "192.0.2.11:443") {
+		t.Errorf("problem should name the stale address, got: %s", v.Summary())
+	}
+}

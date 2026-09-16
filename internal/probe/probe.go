@@ -78,17 +78,68 @@ type Options struct {
 	Timeout time.Duration
 }
 
+// Attempt is the TLS probe result for one resolved IP address.
+//
+// Exactly one of Result and Err is non-nil. Address is the dialled endpoint so
+// a partially updated backend can be distinguished from an ordinary mismatch.
+type Attempt struct {
+	Address string
+	Result  *Result
+	Err     error
+}
+
 // Probe 拨 host:port，用 SNI=host 完成 TLS 握手，读回对端出示的叶证书。
 //
-// 名字解析出多个地址时会逐个尝试，第一个握手成功的胜出 ——
-// 只拨第一个地址会把"部分节点没更新"这种最常见的故障形态藏起来。
+// This is the simple API for the CLI and callers: it tries addresses in order
+// and returns the first successful result. Use ProbeAll to verify every backend;
+// Runner uses it so an updated node cannot hide a node still serving an old cert.
 func Probe(ctx context.Context, host string, opts Options) (*Result, error) {
+	host, ips, opts, err := prepareProbe(ctx, host, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var lastErr error
+	for _, ip := range ips {
+		attempt := probeIP(ctx, host, ip, opts)
+		if attempt.Result != nil {
+			attempt.Result.ResolvedIPs = append([]string(nil), ips...)
+			return attempt.Result, nil
+		}
+		if attempt.Err != nil {
+			lastErr = attempt.Err
+		}
+	}
+	return nil, fmt.Errorf("probe: none of the %d address(es) of %s completed a TLS handshake on port %d "+
+		"(last error: %w)", len(ips), host, opts.Port, lastErr)
+}
+
+// ProbeAll dials every address resolved for host and preserves each result.
+//
+// opts.Timeout is the full per-address budget after DNS resolution, shared by
+// TCP dial and TLS handshake. Limiting dial alone lets a faulty endpoint that
+// accepts TCP but never sends TLS bytes block reconciliation indefinitely.
+func ProbeAll(ctx context.Context, host string, opts Options) ([]Attempt, error) {
+	host, ips, opts, err := prepareProbe(ctx, host, opts)
+	if err != nil {
+		return nil, err
+	}
+	attempts := probeIPs(ctx, host, ips, opts)
+	for i := range attempts {
+		if attempts[i].Result != nil {
+			attempts[i].Result.ResolvedIPs = append([]string(nil), ips...)
+		}
+	}
+	return attempts, nil
+}
+
+func prepareProbe(ctx context.Context, host string, opts Options) (string, []string, Options, error) {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	if host == "" {
-		return nil, errors.New("probe: empty host")
+		return "", nil, opts, errors.New("probe: empty host")
 	}
 	if strings.HasPrefix(host, "*.") {
-		return nil, fmt.Errorf("probe: %q is a wildcard, which has no address of its own to dial; "+
+		return "", nil, opts, fmt.Errorf("probe: %q is a wildcard, which has no address of its own to dial; "+
 			"probe a concrete name that the same certificate covers", host)
 	}
 	if opts.Port == 0 {
@@ -100,37 +151,57 @@ func Probe(ctx context.Context, host string, opts Options) (*Result, error) {
 
 	ips, err := net.DefaultResolver.LookupHost(ctx, host)
 	if err != nil {
-		return nil, fmt.Errorf("probe: resolve %s: %w", host, err)
+		return "", nil, opts, fmt.Errorf("probe: resolve %s: %w", host, err)
 	}
 	if len(ips) == 0 {
-		return nil, fmt.Errorf("probe: %s resolved to no address", host)
+		return "", nil, opts, fmt.Errorf("probe: %s resolved to no address", host)
 	}
 	sort.Strings(ips)
+	return host, ips, opts, nil
+}
 
-	// 刻意不用 tls.DialWithDialer：它不接受 context，
-	// 于是"取消"只能靠超时兜底，在收敛循环里会拖住整轮。
-	dialer := &net.Dialer{Timeout: opts.Timeout}
-
-	var lastErr error
+// probeIPs is ProbeAll's per-address work, separated so multi-address behavior
+// can be tested without depending on local DNS ordering.
+func probeIPs(ctx context.Context, host string, ips []string, opts Options) []Attempt {
+	attempts := make([]Attempt, 0, len(ips))
 	for _, ip := range ips {
-		addr := net.JoinHostPort(ip, strconv.Itoa(opts.Port))
-		res, err := probeAddr(ctx, dialer, addr, host)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		res.ResolvedIPs = ips
-		return res, nil
+		attempts = append(attempts, probeIP(ctx, host, ip, opts))
 	}
+	return attempts
+}
 
-	return nil, fmt.Errorf("probe: none of the %d address(es) of %s completed a TLS handshake on port %d "+
-		"(last error: %w)", len(ips), host, opts.Port, lastErr)
+func probeIP(ctx context.Context, host, ip string, opts Options) Attempt {
+
+	// Do not use tls.DialWithDialer: dial and handshake must share the same
+	// context so every address is bound by the full probe budget.
+	dialer := &net.Dialer{Timeout: opts.Timeout}
+	addr := net.JoinHostPort(ip, strconv.Itoa(opts.Port))
+
+	// A DialContext timeout is not enough: after TCP connects, TLS can wait
+	// forever for peer data. Every IP needs its own full budget.
+	attemptCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+	res, err := probeAddr(attemptCtx, dialer, addr, host)
+	if err != nil {
+		return Attempt{Address: addr, Err: err}
+	}
+	return Attempt{Address: addr, Result: res}
 }
 
 func probeAddr(ctx context.Context, dialer *net.Dialer, addr, sni string) (*Result, error) {
 	raw, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	// HandshakeContext observes cancellation, but an I/O deadline also guards
+	// against transports that are stuck below the TLS state machine. Clear it
+	// after the handshake so the captured connection state can be inspected
+	// without inheriting a stale deadline.
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := raw.SetDeadline(deadline); err != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf("set probe deadline for %s: %w", addr, err)
+		}
 	}
 
 	cfg := &tls.Config{
@@ -149,6 +220,9 @@ func probeAddr(ctx context.Context, dialer *net.Dialer, addr, sni string) (*Resu
 	start := time.Now()
 	if err := conn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("TLS handshake with %s (SNI %s): %w", addr, sni, err)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("clear probe deadline for %s: %w", addr, err)
 	}
 	elapsed := time.Since(start)
 
