@@ -215,8 +215,20 @@ func run() error {
 	// the first renewal window can lose an order: the file holds the ACME account key and
 	// every in-flight order URL, and losing an order URL means re-placing it into the
 	// exact-set rate limit.
-	if cfg.StateBackup.EnabledOr(true) {
+	// "On by default where it can be useful, off where it cannot" (config.StateBackup) is decided
+	// here, because this is the first point that knows the directory. EnabledOr's argument used to
+	// be a literal true, so a deployment with an unwritable snapshot directory stayed enabled and
+	// logged an ERROR every interval forever -- noise that trains the reader to ignore the one line
+	// that means the recovery posture is gone.
+	backupDir := cfg.StateBackup.Dir
+	if backupDir == "" {
+		backupDir = filepath.Dir(cfg.StatePath)
+	}
+	if cfg.StateBackup.EnabledOr(dirIsWritable(backupDir)) {
 		startStateBackups(ctx, store, cfg, log)
+	} else if cfg.StateBackup.Enabled != nil && *cfg.StateBackup.Enabled {
+		log.Error("periodic state database snapshots are ENABLED but the directory is not writable, "+
+			"so none will be taken", "dir", backupDir)
 	} else {
 		log.Warn("periodic state database snapshots are DISABLED: losing state.db means a new ACME " +
 			"account and re-placed orders, and nothing here will be able to restore it")
@@ -246,6 +258,25 @@ func run() error {
 	runDaemon(ctx, reconciler, *interval, log)
 	drainNotifier(notifier, log)
 	return nil
+}
+
+// dirIsWritable reports whether a directory can be written to, creating it first if it does not
+// exist (Snapshot does the same, and the answer has to describe what will actually happen).
+//
+// A probe rather than a permission bit: ownership, ACLs, a read-only mount and a full disk all
+// decide this, and the only honest way to find out is to try.
+func dirIsWritable(dir string) bool {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false
+	}
+	f, err := os.CreateTemp(dir, ".wecert-write-probe-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
 }
 
 // drainNotifier waits briefly for accepted notifications to be delivered.

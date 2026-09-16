@@ -284,6 +284,25 @@ func (b *StateBackup) normalize() error {
 	return nil
 }
 
+// normalizeList trims, lowercases, rejects empties and removes duplicates, preserving order.
+func normalizeList(field string, in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, v := range in {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" {
+			return nil, fmt.Errorf("%s contains an empty entry; every entry must name a value "+
+				"(a blank one would be sent to the cloud API as-is)", field)
+		}
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 // Probe configures network-side certificate probing.
 //
 // The cloud API saying "bound successfully" and a browser actually getting this
@@ -776,6 +795,35 @@ func (c *Config) normalize() error {
 	if c.DNS.Polling, err = parseDuration(c.DNS.PollingInterval, 5*time.Second, "dns.pollingInterval"); err != nil {
 		return err
 	}
+	// Both of these are only checked to be positive by parseDuration, and both are dangerous at
+	// the small end in ways that look harmless in a config file.
+	//
+	// pollingInterval is how long the propagation wait sleeps between rounds, and each round asks
+	// every authoritative nameserver of the zone for every record of that zone. `1ms` is therefore
+	// not "check more often", it is a flood of UDP queries at the operator's own DNS provider --
+	// the exact thing dns.go's own comment warns gets you rate limited or dropped, which then
+	// affects every other DNS user on that host.
+	//
+	// propagationTimeout is the whole budget for a record to appear. Below the zone's own TTL there
+	// is no chance it can: the write is invisible to the resolvers for at least the negative-cache
+	// TTL, measured at ~600s on DNSPod. A small value does not fail fast in a useful way; it turns
+	// each fresh write into a failed round plus an escalating backoff (1m, 2m, 4m ...), which
+	// delays issuance by minutes to hours.
+	if c.DNS.Polling < time.Second {
+		return fmt.Errorf("dns.pollingInterval is %s, which is below the 1s minimum: each round asks "+
+			"every authoritative nameserver of the zone for every record, so a very short interval is "+
+			"a burst of queries at your DNS provider rather than a faster check", c.DNS.Polling)
+	}
+	if c.DNS.Propagation < 30*time.Second {
+		return fmt.Errorf("dns.propagationTimeout is %s, which is below the 30s minimum: a zone's "+
+			"negative caching alone can hide a fresh record for its SOA TTL (about 600s on DNSPod), "+
+			"so a short budget only guarantees a failed round and a backoff", c.DNS.Propagation)
+	}
+	if c.DNS.Polling >= c.DNS.Propagation {
+		return fmt.Errorf("dns.pollingInterval (%s) must be shorter than dns.propagationTimeout (%s): "+
+			"the interval is the sleep between rounds inside that budget, so an interval at or above "+
+			"it means the propagation wait probes once and gives up", c.DNS.Polling, c.DNS.Propagation)
+	}
 	if c.DNS.TTL <= 0 {
 		// The default is 600, not 60: on DNSPod's free tier the TTL floor is 600, and
 		// 60 is rejected by the API with LimitExceeded.RecordTtlLimit. Paid tiers may
@@ -819,6 +867,16 @@ func (c *Config) normalize() error {
 	}
 	if len(c.Tencent.Regions) == 0 {
 		return fmt.Errorf("tencent.regions is required (CLB is regional; list every region you have CLBs in)")
+	}
+	// Both lists are multiplied into the UpdateCertificateInstance request (types x regions) and
+	// into the onboarding rule enumeration, so a duplicate costs a bigger request and a typo is only
+	// found by the cloud API at deploy time -- the expensive place to learn about one. Every other
+	// list in this file is normalised (domains, recursiveNameservers); these two were the exception.
+	if c.Tencent.Regions, err = normalizeList("tencent.regions", c.Tencent.Regions); err != nil {
+		return err
+	}
+	if c.Tencent.ResourceTypes, err = normalizeList("tencent.resourceTypes", c.Tencent.ResourceTypes); err != nil {
+		return err
 	}
 
 	if err := c.StateBackup.normalize(); err != nil {
