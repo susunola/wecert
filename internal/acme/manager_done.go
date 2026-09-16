@@ -361,6 +361,15 @@ func (m *Manager) recordFailure(st *state.CertState, err error) error {
 	st.NextAttemptAt = m.now().Add(backoff)
 
 	if perr := m.store.PutCert(st); perr != nil {
+		// The deadline computed above cannot be persisted, so hold it in memory as well.
+		//
+		// Without this the failure is forgotten the moment this function returns: the next
+		// pass reads the OLD row, which has no NextAttemptAt, runs immediately and fails
+		// again. When the cause is a full disk -- exactly when PutCert fails -- that pass
+		// creates another order at the CA, so the order rate follows the pass rate instead of
+		// the backoff: 1440 a day at a 1-minute interval, against "300 new orders per account
+		// per 3 hours", which blocks every certificate on the account rather than just this one.
+		m.setTransientBackoff(st.Name, st.NextAttemptAt)
 		return errors.Join(err, perr)
 	}
 

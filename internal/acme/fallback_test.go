@@ -799,3 +799,75 @@ func TestStaleCertificateIsStillRefused(t *testing.T) {
 		t.Errorf("the live certificate must be left in place, notAfter = %s, want %s", st.NotAfter, liveNotAfter)
 	}
 }
+
+// A config change during an active fallback must still converge.
+//
+// The drift branch tested only "does a cert_fallback row exist", so while any row was present
+// EVERY config change was deferred to notAfter-renewBefore -- up to a full validity period
+// (~60 days under classic). Adding a name, removing a different name, or an operator who
+// enabled the policy once and switched it off (the row survives) all silently stopped
+// converging, and because the row is only cleared by a successful full-set issuance that the
+// hold itself prevents, the state was self-sustaining.
+//
+// The fix compares the deployed SANs against the set the record describes: configured names
+// minus the dropped ones. That is the degradation; anything else is a config change.
+func TestConfigChangeConvergesWhileAFallbackIsInForce(t *testing.T) {
+	const dropped = "b.example.com"
+
+	build := func(t *testing.T) (*state.Store, *Manager, *fakeAPI, *config.Certificate, time.Time) {
+		t.Helper()
+		store, m, fake, cert := newAPITestHarness(t,
+			[]string{"a.example.com", dropped, "c.example.com"})
+		fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+		m.now = func() time.Time { return fixed }
+		m.SetFallbackPolicy(fallbackPolicy())
+
+		// The degraded set is live: [a, c] -- the record's reduction, exactly.
+		notAfter := fixed.Add(60 * 24 * time.Hour)
+		if err := store.PutCert(&state.CertState{
+			Name: cert.Name, NotAfter: notAfter, CertURL: "https://ca.test/cert/live",
+			CertPEM: selfSignedCertPEM(t, notAfter, "a.example.com", "c.example.com"),
+			KeyPEM:  []byte("live-key"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PutFallback(&state.Fallback{
+			CertName: cert.Name, Dropped: []string{dropped},
+			Since: fixed, Reason: "b keeps failing",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		fake.orders = []legoacme.ExtendedOrder{
+			terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/2"),
+		}
+		return store, m, fake, cert, fixed
+	}
+
+	t.Run("the degradation itself is held", func(t *testing.T) {
+		_, m, fake, cert, _ := build(t)
+
+		if err := m.Reconcile(context.Background(), cert); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if n := len(fake.newOrderReplaces); n != 0 {
+			t.Errorf("the degraded set is serving and the failure evidence is fresh, so this must "+
+				"hold rather than re-order the broken full set; got %d new orders", n)
+		}
+	})
+
+	t.Run("a newly added name converges anyway", func(t *testing.T) {
+		_, m, fake, cert, _ := build(t)
+
+		// The operator adds a name. The deployed [a,c] is still drifted from the config, but
+		// it is no longer the degraded set, so the change must take effect now.
+		cert.Domains = []string{"a.example.com", dropped, "c.example.com", "d.example.com"}
+
+		if err := m.Reconcile(context.Background(), cert); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if n := len(fake.newOrderReplaces); n != 1 {
+			t.Errorf("adding a name during a fallback must reissue immediately, got %d new orders; "+
+				"holding it would delay the change by up to a whole validity period", n)
+		}
+	})
+}
