@@ -29,9 +29,17 @@ type State struct {
 	// LastRevision is the fingerprint of the previously written document.
 	LastRevision string `json:"lastRevision,omitempty"`
 
-	// LastNames is the expanded name set the previous desired state covered, used
-	// by the abrupt-change fuse.
+	// LastNames is the expanded name set the previous desired state covered. It
+	// feeds applyGrace ("who is newly absent") and, for state files written before
+	// LastDeclared existed, serves one round as the fuse's fallback baseline.
 	LastNames []string `json:"lastNames,omitempty"`
+
+	// LastDeclared is the previous round's pure declaration set -- what DNS
+	// actually asked for, before guards, grace carries and grouping. It is the
+	// abrupt-change fuse's baseline: the fuse exists to catch upstream data loss,
+	// so it must compare declarations against declarations, never against a set
+	// our own grace period padded.
+	LastDeclared []string `json:"lastDeclared,omitempty"`
 
 	// Changes holds the times of recent real name-set changes, used for the quota
 	// budget.
@@ -164,4 +172,29 @@ func (s *State) SetLastNames(names []string) {
 	cp := append([]string(nil), names...)
 	sort.Strings(cp)
 	s.LastNames = cp
+}
+
+// LastDeclaredNameSet returns the previous round's declaration name set as a
+// lookup map, for the abrupt-change fuse.
+//
+// State files written before this field existed have no LastDeclared; falling
+// back to the covered set keeps the fuse's old baseline for exactly one round
+// instead of disabling it (or false-firing it) until the next successful write.
+func (s *State) LastDeclaredNameSet() map[string]bool {
+	if len(s.LastDeclared) == 0 {
+		return s.LastNameSet()
+	}
+	out := make(map[string]bool, len(s.LastDeclared))
+	for _, n := range s.LastDeclared {
+		out[n] = true
+	}
+	return out
+}
+
+// SetLastDeclared stores this round's declaration name set, in stable order so
+// diffs stay readable.
+func (s *State) SetLastDeclared(names []string) {
+	cp := append([]string(nil), names...)
+	sort.Strings(cp)
+	s.LastDeclared = cp
 }

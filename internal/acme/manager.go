@@ -30,6 +30,10 @@ type challengeSolver interface {
 	Present(ctx context.Context, domain, token, keyAuth string) (DNSRecord, error)
 	WaitAll(ctx context.Context, records []DNSRecord) error
 	CleanUp(ctx context.Context, domain, token, keyAuth string) error
+	// LookupTXT probes public DNS for this challenge's record. Crash recovery depends on
+	// it: a pass that died between the DNS write and the state persist left the record up
+	// while the authorization row denies it, and only a probe can tell adopt from rewrite.
+	LookupTXT(ctx context.Context, domain, keyAuth string) (DNSRecord, bool, error)
 }
 
 // keyAuthProvider only needs "convert a challenge token into a key authorization".
@@ -235,6 +239,15 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 
 	// Certificate exists -> decide whether renewal is due.
 	renewAt, replaces, ariErr := m.renewalDecision(ctx, c, st)
+	if ariErr != nil && renewAt.IsZero() {
+		// renewalDecision only leaves renewAt zero when the decision itself failed: a
+		// cancelled context, or a PutCert that would not write. There is no fallback
+		// instant to renew against in that case, and the zero value reads as "long
+		// overdue" -- so without this guard a shutdown (or a state-store hiccup) would
+		// place a real new order, burning the exact-set rate-limit quota. Stop the round
+		// instead; the next pass decides again.
+		return ariErr
+	}
 	if ariErr != nil {
 		m.log.Warn("ARI lookup failed; falling back to a time-based threshold", "cert", c.Name, "err", ariErr)
 	}

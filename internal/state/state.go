@@ -184,9 +184,15 @@ func open(path string, exclusive bool) (*Store, error) {
 		}
 	}
 
-	if f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600); err == nil {
-		_ = f.Close()
+	// The 0600 pre-create (see Open) is part of the security contract, so a failure
+	// here is fatal. Swallowing it lets the sql.Open below fail instead -- with a
+	// message that points at SQLite rather than at the real permission problem.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		_ = lock.release()
+		return nil, fmt.Errorf("pre-create state file %s: %w", path, err)
 	}
+	_ = f.Close()
 
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
 	db, err := sql.Open("sqlite", dsn)

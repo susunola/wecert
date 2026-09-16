@@ -15,6 +15,7 @@ import (
 	"github.com/go-acme/lego/v4/providers/dns/dnspod"
 	"github.com/go-acme/lego/v4/providers/dns/tencentcloud"
 	"github.com/miekg/dns"
+	"golang.org/x/net/publicsuffix"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
@@ -135,15 +136,24 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 		return DNSRecord{}, fmt.Errorf("get the DNS provider: %w", err)
 	}
 
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+	rec := DNSRecord{
+		FQDN:  dns01.ToFqdn(info.EffectiveFQDN),
+		Value: info.Value,
+	}
+
+	// Register the lease under the same per-name lock that CleanUp holds across its
+	// delete call, so a cleanup can never slip a delete-all in between "this name has no
+	// live values" and the write landing. See challengeLeases.
+	mu := challengeLeases.lock(rec.FQDN)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if err := provider.Present(domain, token, keyAuth); err != nil {
 		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
 	}
-
-	info := dns01.GetChallengeInfo(domain, keyAuth)
-	return DNSRecord{
-		FQDN:  dns01.ToFqdn(info.EffectiveFQDN),
-		Value: info.Value,
-	}, nil
+	challengeLeases.add(rec.FQDN, rec.Value)
+	return rec, nil
 }
 
 // WaitAll waits until every record is visible on all authoritative NS of its zone.
@@ -159,6 +169,13 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 			continue
 		}
 		seen[key] = true
+
+		// A resumed order reuses records a previous process wrote, so Present never runs
+		// for them in this process and the lease registry would not know they are live.
+		// WaitAll sees every record a round depends on, so this is where those leases get
+		// re-registered -- otherwise a concurrent certificate's cleanup could delete-all
+		// the name right out from under this one (see challengeLeases).
+		challengeLeases.add(r.FQDN, r.Value)
 
 		zone, err := s.findZone(ctx, r.FQDN)
 		if err != nil {
@@ -406,17 +423,129 @@ func probeReady(servers []string, fqdn, want string) (bool, string) {
 	})
 }
 
-// CleanUp deletes the TXT record this call wrote.
+// challengeLeases tracks, per effective challenge FQDN, the TXT values this process
+// currently relies on.
 //
-// The provider locates the record by the exact (domain, token, keyAuth) triple, so when
-// a wildcard and its apex share one _acme-challenge name, deleting one of them does not
-// take out the other.
+// It exists because the comment that used to sit on CleanUp was a lie: lego's
+// dnspod/tencentcloud CleanUp does **not** locate one record by the (domain, token,
+// keyAuth) triple -- it deletes **every** TXT record at the challenge name. Config
+// dedups certificate names, not domains, so two certificates can legitimately share
+// _acme-challenge.example.com; reconciled concurrently (a webhook trigger overlapping a
+// scheduled pass), certificate A's cleanup would then kill certificate B's still-pending
+// challenge record.
+//
+// True value-scoped deletion is not reachable at this layer: lego hands out only the
+// challenge.Provider interface, and the record-level API client behind it is unexported.
+// What this layer can guarantee is that the delete-all call never fires while any value
+// at the name is still live: the last leaver's cleanup removes every record in one call,
+// including the records earlier leavers had to skip. That suffices because the state
+// store's exclusive lock (internal/state) already guarantees a single wecert process per
+// state directory, so every writer of these records passes through this registry.
+//
+// The per-name mutex must be held across the provider call on both sides (Present and
+// CleanUp): without that, a Present could land between CleanUp's "no live values" check
+// and its delete-all, and the fresh record would die with the rest.
+var challengeLeases = newTXTLeases()
+
+type txtLeases struct {
+	// guards both maps; the per-name mutexes below order the provider calls
+	mu     sync.Mutex
+	locks  map[string]*sync.Mutex
+	values map[string]map[string]bool
+}
+
+func newTXTLeases() *txtLeases {
+	return &txtLeases{locks: map[string]*sync.Mutex{}, values: map[string]map[string]bool{}}
+}
+
+func (l *txtLeases) lock(fqdn string) *sync.Mutex {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.locks[fqdn] == nil {
+		l.locks[fqdn] = &sync.Mutex{}
+	}
+	return l.locks[fqdn]
+}
+
+// add records that this process relies on the value staying in DNS. Set semantics: a
+// re-registration (a resumed order re-presenting nothing) must not inflate a count that
+// CleanUp then never balances.
+func (l *txtLeases) add(fqdn, value string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.values[fqdn] == nil {
+		l.values[fqdn] = map[string]bool{}
+	}
+	l.values[fqdn][value] = true
+}
+
+// remove drops one lease and reports whether any other value is still live at the name.
+func (l *txtLeases) remove(fqdn, value string) (othersLive bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	values := l.values[fqdn]
+	delete(values, value)
+	if len(values) == 0 {
+		delete(l.values, fqdn)
+		return false
+	}
+	return true
+}
+
+// CleanUp deletes the TXT record this call wrote -- or defers doing so.
+//
+// lego's provider deletes **every** TXT record at the challenge name, so this wrapper
+// only calls it once no other value is live at the name (see challengeLeases); while
+// another certificate (or this one's wildcard sibling) still needs its record there, the
+// deletion is skipped and left to the last leaver.
+//
+// A skipped record is not leaked: the last CleanUp at the name removes all records in
+// one call, and anything stranded by a crash is reclaimed later by the manager's
+// cleanupOrphanTXT.
 func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) error {
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+	fqdn := dns01.ToFqdn(info.EffectiveFQDN)
+
+	mu := challengeLeases.lock(fqdn)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if challengeLeases.remove(fqdn, info.Value) {
+		s.log.Info("another challenge is still live at the TXT name; leaving its cleanup to the last leaver",
+			"name", fqdn)
+		return nil
+	}
+
 	provider, err := s.newProvider(ctx)
 	if err != nil {
 		return fmt.Errorf("get the DNS provider: %w", err)
 	}
 	return provider.CleanUp(domain, token, keyAuth)
+}
+
+// LookupTXT reports whether this challenge's TXT record is currently visible through the
+// configured recursive resolvers, returning the record's identity either way so callers
+// can persist it.
+//
+// It backs the two crash-recovery probes: a pass that died between the DNS write and the
+// state persist left the record up while the authorization row denies it -- re-Present
+// would duplicate the record, and deleting the row would orphan it. A positive answer
+// lets both paths reconcile instead.
+func (s *DNSSolver) LookupTXT(ctx context.Context, domain, keyAuth string) (DNSRecord, bool, error) {
+	info := dns01.GetChallengeInfo(domain, keyAuth)
+	rec := DNSRecord{
+		FQDN:  dns01.ToFqdn(info.EffectiveFQDN),
+		Value: info.Value,
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion(rec.FQDN, dns.TypeTXT)
+	msg.RecursionDesired = true
+	resp, err := s.queryRecursive(ctx, msg)
+	if err != nil {
+		return rec, false, err
+	}
+	return rec, responseHasTXT(resp, rec.Value), nil
 }
 
 func (s *DNSSolver) findZone(ctx context.Context, fqdn string) (string, error) {
@@ -433,7 +562,19 @@ func (s *DNSSolver) findZone(ctx context.Context, fqdn string) (string, error) {
 		}
 		for _, rr := range resp.Answer {
 			if soa, ok := rr.(*dns.SOA); ok {
-				return dns.Fqdn(soa.Hdr.Name), nil
+				zone := dns.Fqdn(soa.Hdr.Name)
+				if suffix, _ := publicsuffix.PublicSuffix(strings.TrimSuffix(zone, ".")); suffix != "" &&
+					zone == dns.Fqdn(suffix) {
+					// The SOA walk climbed all the way to the public suffix itself (a
+					// typo'd exmaple.com ends up at the com. SOA). That "zone" can never
+					// hold the TXT record, so treating it as found burns the whole
+					// propagation budget querying TLD nameservers for nothing. Fail fast
+					// with the likely cause instead.
+					return "", fmt.Errorf(
+						"%s has no hosted zone: the SOA walk stopped at the public suffix %s; check the domain for typos",
+						fqdn, zone)
+				}
+				return zone, nil
 			}
 		}
 	}

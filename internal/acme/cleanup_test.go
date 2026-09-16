@@ -22,15 +22,23 @@ import (
 type fakeSolver struct {
 	mu        sync.Mutex
 	presented []string // "identifier|token"
-	cleaned   []string // "identifier|keyAuth"
-	cleanErr  error
+	records   []DNSRecord
+	lookups   []string // domains LookupTXT was asked about
+	// lookupFound/lookupErr script LookupTXT: found means "the interrupted pass's record
+	// is still up in DNS", which the idempotent-present and orphan-reclaim paths act on.
+	lookupFound bool
+	lookupErr   error
+	cleaned     []string // "identifier|keyAuth"
+	cleanErr    error
 }
 
 func (f *fakeSolver) Present(_ context.Context, domain, token, keyAuth string) (DNSRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.presented = append(f.presented, domain+"|"+token)
-	return DNSRecord{FQDN: "_acme-challenge." + domain + ".", Value: "txt-" + token}, nil
+	rec := DNSRecord{FQDN: "_acme-challenge." + domain + ".", Value: "txt-" + token}
+	f.records = append(f.records, rec)
+	return rec, nil
 }
 
 func (f *fakeSolver) WaitAll(context.Context, []DNSRecord) error { return nil }
@@ -43,6 +51,16 @@ func (f *fakeSolver) CleanUp(_ context.Context, domain, token, keyAuth string) e
 	}
 	f.cleaned = append(f.cleaned, domain+"|"+keyAuth)
 	return nil
+}
+
+func (f *fakeSolver) LookupTXT(_ context.Context, domain, keyAuth string) (DNSRecord, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lookups = append(f.lookups, domain)
+	if f.lookupErr != nil {
+		return DNSRecord{}, false, f.lookupErr
+	}
+	return DNSRecord{FQDN: "_acme-challenge." + domain + ".", Value: "txt-lookup"}, f.lookupFound, nil
 }
 
 func (f *fakeSolver) cleanCount() int {
@@ -106,12 +124,15 @@ func TestDiscardOrderClearsTXTBeforeDeletingRows(t *testing.T) {
 	solver := &fakeSolver{}
 	m, store := newTestManager(t, solver, fakeKeyAuth{})
 
-	// The wildcard and the apex share one TXT name, but each authorization holds its own value.
+	// The wildcard and the apex share one TXT name, but each authorization holds its own
+	// value. Both identifiers are the bare apex: production stores `cur.Identifier.Value`
+	// (manager_flow.go), and RFC 8555 section 7.1.3 forbids the "*." prefix there --
+	// seeding "*.example.com" here would test a shape the store never actually contains.
 	seedOrderWithAuthzs(t, store, "c", []*state.Authorization{
 		{CertName: "c", AuthzURL: "authz-apex", Identifier: "example.com",
 			ChallengeToken: "tok-apex", TxtName: "_acme-challenge.example.com.",
 			TxtValue: "val-apex", Presented: true, ChallengeSent: true},
-		{CertName: "c", AuthzURL: "authz-wild", Identifier: "*.example.com",
+		{CertName: "c", AuthzURL: "authz-wild", Identifier: "example.com",
 			ChallengeToken: "tok-wild", TxtName: "_acme-challenge.example.com.",
 			TxtValue: "val-wild", Presented: true, ChallengeSent: true},
 	})
@@ -126,8 +147,8 @@ func TestDiscardOrderClearsTXTBeforeDeletingRows(t *testing.T) {
 
 	// Cleanup must use the keyAuth derived from each record's own token; never mix them up.
 	want := map[string]bool{
-		"example.com|keyauth(tok-apex)":   true,
-		"*.example.com|keyauth(tok-wild)": true,
+		"example.com|keyauth(tok-apex)": true,
+		"example.com|keyauth(tok-wild)": true,
 	}
 	for _, c := range solver.cleaned {
 		if !want[c] {
@@ -314,6 +335,87 @@ func TestCleanupMarksUnpresented(t *testing.T) {
 	}
 	if len(as) != 1 || as[0].Presented {
 		t.Errorf("Presented should have been persisted as false: %+v", as)
+	}
+}
+
+// A row that says Presented=false but carries a token is the fingerprint of a pass that
+// died between the DNS write and the state persist: the record may still be up. Deleting
+// the row blind would orphan that TXT for good, so cleanupOrphanTXT must probe first and
+// reclaim what it finds.
+func TestCleanupOrphanTXTProbesAndReclaimsInterruptedPass(t *testing.T) {
+	solver := &fakeSolver{lookupFound: true}
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+		ChallengeToken: "tok-1", Presented: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+	if got := solver.cleanCount(); got != 1 {
+		t.Errorf("the probed-and-found TXT must be reclaimed before the row goes away, got %d cleanups", got)
+	}
+	if as, _ := store.ListAuthorizations("c"); len(as) != 0 {
+		t.Errorf("the row should be deleted once its record is reclaimed, %d remain", len(as))
+	}
+}
+
+// The same row with nothing in DNS under its value: the write genuinely never happened,
+// so no DNS call and the row is deleted.
+func TestCleanupOrphanTXTProbeMissDeletesRow(t *testing.T) {
+	solver := &fakeSolver{lookupFound: false}
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+		ChallengeToken: "tok-1", Presented: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+	if got := solver.cleanCount(); got != 0 {
+		t.Errorf("a probe that finds nothing must not clean anything up, got %d", got)
+	}
+	if as, _ := store.ListAuthorizations("c"); len(as) != 0 {
+		t.Errorf("the row should be deleted when DNS provably holds no record, %d remain", len(as))
+	}
+}
+
+// A failed probe proves nothing either way: keep the row (its token is the only clue to
+// the record's value) and let the next round retry.
+func TestCleanupOrphanTXTProbeErrorKeepsRow(t *testing.T) {
+	solver := &fakeSolver{lookupErr: errors.New("resolvers unreachable")}
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+		ChallengeToken: "tok-1", Presented: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+	if got := solver.cleanCount(); got != 0 {
+		t.Errorf("nothing may be cleaned up on a failed probe, got %d", got)
+	}
+	as, err := store.ListAuthorizations("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(as) != 1 {
+		t.Fatalf("the row must be kept while the record's fate is unknown, %d remain", len(as))
+	}
+	if as[0].ChallengeToken != "tok-1" {
+		t.Error("the kept row must still carry the token, otherwise the record can never be located")
 	}
 }
 

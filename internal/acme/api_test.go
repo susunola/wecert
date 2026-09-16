@@ -56,6 +56,12 @@ type fakeAPI struct {
 	// wildcard -- authorization have to populate it.
 	authzByURL map[string]legoacme.Authorization
 
+	// authzSeq is like authzByURL but scripts a progression: each GetAuthorization call
+	// returns the next entry, and once exhausted keeps returning the last one, so the
+	// polling loop converges ("pending" first, "valid" once validation lands).
+	authzSeq    map[string][]legoacme.Authorization
+	authzSeqIdx map[string]int
+
 	// authzHits counts GetAuthorization per URL, so a test can tell "polled again"
 	// from "polled once".
 	authzHits map[string]int
@@ -138,6 +144,17 @@ func (f *fakeAPI) GetAuthorization(authzURL string) (legoacme.Authorization, err
 		f.authzHits = make(map[string]int)
 	}
 	f.authzHits[authzURL]++
+	if seq, ok := f.authzSeq[authzURL]; ok {
+		if f.authzSeqIdx == nil {
+			f.authzSeqIdx = make(map[string]int)
+		}
+		i := f.authzSeqIdx[authzURL]
+		if i >= len(seq) {
+			i = len(seq) - 1
+		}
+		f.authzSeqIdx[authzURL] = i + 1
+		return seq[i], nil
+	}
 	if a, ok := f.authzByURL[authzURL]; ok {
 		return a, nil
 	}
@@ -581,5 +598,189 @@ func TestAwaitAuthorizationsStopsPollingConcludedAuthorizations(t *testing.T) {
 	}
 	if hits[cURL] < 2 {
 		t.Errorf("the pending authorization must keep being polled, got %d", hits[cURL])
+	}
+}
+
+// ── a processing order goes straight to "wait for valid, download" ──────────
+
+// A "processing" order means the CSR is already with the CA (a previous pass submitted it
+// and died before seeing the result). Falling into the pending branch re-solves challenges
+// that no longer exist and then waits for "ready" -- a state a processing order never
+// revisits -- until orderWaitTimeout, recording a spurious ConsecutiveFailures on an order
+// that was on track the whole time.
+func TestAdvanceProcessingOrderWaitsForValidAndDownloads(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
+
+	key, err := GenerateKey(cert.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := MarshalPrivateKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const orderURL = "https://ca.test/order/7"
+	const finalizeURL = "https://ca.test/finalize/7"
+	const certURL = "https://ca.test/cert/7"
+	if err := store.PutOrder(&state.Order{
+		CertName: cert.Name, OrderURL: orderURL, FinalizeURL: finalizeURL,
+		Status: "processing", KeyPEM: keyPEM, Identifiers: cert.DomainKey(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fake.orders = []legoacme.ExtendedOrder{
+		{
+			Order: legoacme.Order{
+				Status:   "processing",
+				Finalize: finalizeURL,
+				// The authorizations exist but are none of this pass's business any more:
+				// the pending branch would re-fetch and re-solve them, the processing
+				// branch must not touch them at all.
+				Authorizations: []string{"https://ca.test/authz/done"},
+			},
+			Location: orderURL,
+		},
+		terminalOrder(orderURL, finalizeURL, certURL),
+	}
+	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// No challenges may be re-solved and the CSR must not be re-submitted.
+	if hits := fake.authorizationHits(); len(hits) != 0 {
+		t.Errorf("a processing order must not touch authorizations, got %v", hits)
+	}
+	if len(fake.accepted) != 0 {
+		t.Errorf("a processing order must not re-push challenges, got %v", fake.accepted)
+	}
+	if fake.finalizeURL != "" {
+		t.Errorf("the CSR was already submitted by the previous pass; resubmitting went to %q", fake.finalizeURL)
+	}
+
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.NotAfter.IsZero() {
+		t.Error("the certificate was not persisted; the processing order was not seen through to download")
+	}
+	if st.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0: waiting out a healthy processing order is not a failure", st.ConsecutiveFailures)
+	}
+}
+
+// ── idempotent Present: an interrupted pass must not duplicate the TXT ──────
+
+// seedInterruptedPass builds "order pending + authorization row with a challenge token but
+// Presented=false" -- exactly what a crash (or a failed persist) between the DNS write and
+// the state update leaves behind. The DNS write itself already happened; what the next
+// round does about it is what these tests pin down.
+func seedInterruptedPass(t *testing.T, store *state.Store, cert *config.Certificate, authzURL string) {
+	t.Helper()
+
+	key, err := GenerateKey(cert.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := MarshalPrivateKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutOrder(&state.Order{
+		CertName: cert.Name, OrderURL: "https://ca.test/order/8", FinalizeURL: "https://ca.test/finalize/8",
+		Status: "pending", KeyPEM: keyPEM, Identifiers: cert.DomainKey(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: cert.Name, AuthzURL: authzURL, Identifier: "example.com",
+		Status: "pending", ChallengeURL: "https://ca.test/chall/1", ChallengeToken: "tok-1",
+		Presented: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func scriptPendingThenValid(fake *fakeAPI, authzURL string) {
+	pending := legoacme.Authorization{
+		Status:     "pending",
+		Identifier: legoacme.Identifier{Value: "example.com"},
+		Challenges: []legoacme.Challenge{{Type: "dns-01", URL: "https://ca.test/chall/1", Token: "tok-1"}},
+	}
+	valid := pending
+	valid.Status = "valid"
+	fake.authzSeq = map[string][]legoacme.Authorization{authzURL: {pending, valid}}
+	fake.orders = []legoacme.ExtendedOrder{
+		{
+			Order: legoacme.Order{
+				Status:         "pending",
+				Finalize:       "https://ca.test/finalize/8",
+				Authorizations: []string{authzURL},
+			},
+			Location: "https://ca.test/order/8",
+		},
+		terminalOrder("https://ca.test/order/8", "https://ca.test/finalize/8", "https://ca.test/cert/8"),
+	}
+}
+
+// The record from the interrupted pass is still up: adopt it, do not write a duplicate.
+func TestSolveChallengesAdoptsTXTFromInterruptedPass(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	solver := &fakeSolver{lookupFound: true}
+	m.dns = solver
+
+	const authzURL = "https://ca.test/authz/1"
+	seedInterruptedPass(t, store, cert, authzURL)
+	scriptPendingThenValid(fake, authzURL)
+	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	solver.mu.Lock()
+	presented := append([]string(nil), solver.presented...)
+	lookups := append([]string(nil), solver.lookups...)
+	solver.mu.Unlock()
+
+	if len(presented) != 0 {
+		t.Errorf("the old record is already up, so Present must not run -- that duplicates the TXT; got %v", presented)
+	}
+	if len(lookups) == 0 || lookups[0] != "example.com" {
+		t.Errorf("the adoption path must probe for the old record first, got lookups %v", lookups)
+	}
+}
+
+// The probe finds nothing (the write really never happened): write the record. Also pins
+// the computed challenge name: production stores the bare apex as the identifier, and the
+// TXT name must come out as _acme-challenge.example.com.
+func TestSolveChallengesPresentsWhenProbeMisses(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	solver := &fakeSolver{lookupFound: false}
+	m.dns = solver
+
+	const authzURL = "https://ca.test/authz/1"
+	seedInterruptedPass(t, store, cert, authzURL)
+	scriptPendingThenValid(fake, authzURL)
+	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	solver.mu.Lock()
+	presented := append([]string(nil), solver.presented...)
+	records := append([]DNSRecord(nil), solver.records...)
+	solver.mu.Unlock()
+
+	if len(presented) != 1 || presented[0] != "example.com|tok-1" {
+		t.Errorf("a probe miss must write the record exactly once, got %v", presented)
+	}
+	if len(records) != 1 || records[0].FQDN != "_acme-challenge.example.com." {
+		t.Errorf("the computed challenge name must be _acme-challenge.example.com., got %+v", records)
 	}
 }

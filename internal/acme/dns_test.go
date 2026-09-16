@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-acme/lego/v4/challenge"
 	"github.com/miekg/dns"
 )
 
@@ -197,5 +198,103 @@ func TestResponseHasTXT(t *testing.T) {
 
 	if responseHasTXT(txtResponse(), "anything") {
 		t.Error("an empty response must not count as a hit")
+	}
+}
+
+// recordingProvider is a challenge.Provider that records which operations actually reached
+// the DNS API -- the lease registry's whole job is deciding when the delete-all call may fire.
+type recordingProvider struct {
+	presents []string
+	cleanups []string
+}
+
+func (p *recordingProvider) Present(domain, _, _ string) error {
+	p.presents = append(p.presents, domain)
+	return nil
+}
+
+func (p *recordingProvider) CleanUp(domain, _, _ string) error {
+	p.cleanups = append(p.cleanups, domain)
+	return nil
+}
+
+// lego's provider CleanUp deletes **every** TXT record at the challenge name, so it must
+// never run while another value is still live there: two certificates can share one domain
+// (config dedups certificate names, not domains), and cert A's cleanup would otherwise kill
+// cert B's pending challenge. The deletion is deferred to the last leaver, whose single
+// delete-all call removes every record at the name.
+func TestCleanUpDefersDeleteAllWhileAnotherValueIsLive(t *testing.T) {
+	// No network CNAME chase inside GetChallengeInfo; the registry is package state, so
+	// give this test a private one to keep the assertion independent of other tests.
+	t.Setenv("LEGO_DISABLE_CNAME_SUPPORT", "true")
+	saved := challengeLeases
+	challengeLeases = newTXTLeases()
+	t.Cleanup(func() { challengeLeases = saved })
+
+	p := &recordingProvider{}
+	solver := &DNSSolver{
+		newProvider: func(context.Context) (challenge.Provider, error) { return p, nil },
+		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ctx := context.Background()
+
+	// Two certificates (or a wildcard and its apex) share one challenge name; the two key
+	// authorizations hash to two different TXT values.
+	if _, err := solver.Present(ctx, "shared.example.com", "tok-a", "keyauth-a"); err != nil {
+		t.Fatalf("Present A: %v", err)
+	}
+	if _, err := solver.Present(ctx, "shared.example.com", "tok-b", "keyauth-b"); err != nil {
+		t.Fatalf("Present B: %v", err)
+	}
+
+	// A finishes first: the delete-all must NOT fire, B's record would die with it.
+	if err := solver.CleanUp(ctx, "shared.example.com", "tok-a", "keyauth-a"); err != nil {
+		t.Fatalf("CleanUp A: %v", err)
+	}
+	if len(p.cleanups) != 0 {
+		t.Fatalf("cleanup while another value is live must not call the provider, got %v", p.cleanups)
+	}
+
+	// B is the last leaver: one delete-all call removes every record at the name,
+	// including the one A had to skip.
+	if err := solver.CleanUp(ctx, "shared.example.com", "tok-b", "keyauth-b"); err != nil {
+		t.Fatalf("CleanUp B: %v", err)
+	}
+	if len(p.cleanups) != 1 {
+		t.Fatalf("the last leaver must run the delete-all exactly once, got %v", p.cleanups)
+	}
+}
+
+// A typo'd domain (exmaple.com) has no SOA of its own, so the walk climbs to the TLD's SOA.
+// Accepting "com." as the zone burns the whole propagation budget querying TLD nameservers
+// for a record that can never exist -- findZone must fail fast instead.
+func TestFindZoneFailsFastOnPublicSuffix(t *testing.T) {
+	resolver := "192.0.2.53:53"
+	solver := &DNSSolver{
+		recursiveNameservers: []string{resolver},
+		log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	var queries []string
+	solver.exchange = func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
+		name := msg.Question[0].Name
+		queries = append(queries, name)
+		if name == "com." {
+			return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{Name: "com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}, Ns: "a.gtld-servers.net."}), nil
+		}
+		resp := dnsReply(msg)
+		resp.Rcode = dns.RcodeNameError
+		return resp, nil
+	}
+
+	zone, err := solver.findZone(context.Background(), "_acme-challenge.exmaple.com.")
+	if err == nil {
+		t.Fatalf("a zone equal to the public suffix must be treated as not found, got zone %q", zone)
+	}
+	if !strings.Contains(err.Error(), "public suffix") {
+		t.Errorf("the error must say why this is almost certainly a typo, got: %v", err)
+	}
+	// The walk stops at the TLD's SOA; it must never go probing beyond it.
+	if len(queries) > 3 {
+		t.Errorf("the walk should have stopped at the public suffix, but kept querying: %v", queries)
 	}
 }
