@@ -138,7 +138,7 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 	rec := DNSRecord{
-		FQDN:  dns01.ToFqdn(info.EffectiveFQDN),
+		FQDN:  dns.Fqdn(info.EffectiveFQDN),
 		Value: info.Value,
 	}
 
@@ -354,14 +354,6 @@ func probeTXTWithExchange(servers []string, fqdn, want string, exchange func(*dn
 	return results
 }
 
-func probeTXT(servers []string, fqdn, want string) []nsProbe {
-	return probeTXTWithExchange(servers, fqdn, want, func(msg *dns.Msg, server string) (*dns.Msg, error) {
-		client := &dns.Client{Timeout: 3 * time.Second}
-		resp, _, err := client.Exchange(msg, server)
-		return resp, err
-	})
-}
-
 // probeReady decides whether a record can count as propagated, and returns a
 // plain-language summary.
 //
@@ -547,7 +539,7 @@ func (l *txtLeases) remove(fqdn, value string) (othersLive bool) {
 // cleanupOrphanTXT.
 func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) error {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
-	fqdn := dns01.ToFqdn(info.EffectiveFQDN)
+	fqdn := dns.Fqdn(info.EffectiveFQDN)
 
 	mu, release := challengeLeases.lock(fqdn)
 	defer release()
@@ -567,82 +559,82 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	return provider.CleanUp(domain, token, keyAuth)
 }
 
-// LookupTXT reports whether this challenge's TXT record is currently in DNS, returning
-// the record's identity either way so callers can persist it.
+// LookupTXT asks the zone's **authoritative** nameservers whether this challenge's TXT
+// record is currently in DNS, returning the record's identity either way so callers can
+// persist it.
 //
 // It backs the two crash-recovery probes: a pass that died between the DNS write and the
 // state persist left the record up while the authorization row denies it -- re-Present
-// would duplicate the record, and deleting the row would orphan it. A positive answer
-// lets both paths reconcile instead.
+// would duplicate the record, and deleting the row would orphan it.
 //
-// The recursive resolvers are only a fast path, and only for **positive** answers: a
-// resolver cannot invent a TXT it was never told, but it can keep serving a cached
-// NXDOMAIN from before the write for the whole SOA negative TTL (~600s on DNSPod).
-// Trusting that negative answer is fatal here: cleanupOrphanTXT would delete the state
-// row -- the only clue to the record's value -- while the TXT itself lives on in DNSPod
-// forever. So a negative (or failed) recursive answer is confirmed against the zone's
-// authoritative nameservers, the same source of truth WaitAll already uses.
+// The answer is deliberately not taken from the recursive resolvers, even though they are
+// cheaper. "found == false" is what licenses deleting the only row that records a value,
+// and a recursive resolver's "no such record" is not evidence of absence:
+//   - a negative answer can come from its cache, and DNSPod's 600s TTL floor applies to
+//     the negative entry too, so a record written minutes ago can still be hidden;
+//   - one name can carry several TXT values (two certificates, or a wildcard and its
+//     apex, share one challenge name), and the cached answer may hold only some of them.
+//
+// The rules mirror probeReady's:
+//   - confirmed by at least one authoritative server -> found, no error;
+//   - denied by at least one and confirmed by none   -> absent (found=false, no error);
+//   - nothing authoritative answered                 -> error, meaning "cannot tell".
+//
+// The last case must not be folded into "absent": the caller keeps the authorization row,
+// which is the only record of the value, and retries next round.
 func (s *DNSSolver) LookupTXT(ctx context.Context, domain, keyAuth string) (DNSRecord, bool, error) {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 	rec := DNSRecord{
-		FQDN:  dns01.ToFqdn(info.EffectiveFQDN),
+		FQDN:  dns.Fqdn(info.EffectiveFQDN),
 		Value: info.Value,
 	}
 
-	msg := new(dns.Msg)
-	msg.SetQuestion(rec.FQDN, dns.TypeTXT)
-	msg.RecursionDesired = true
-	if resp, err := s.queryRecursive(ctx, msg); err == nil && responseHasTXT(resp, rec.Value) {
-		return rec, true, nil
-	}
-
-	found, err := s.lookupTXTAuthoritative(ctx, rec)
-	return rec, found, err
-}
-
-// lookupTXTAuthoritative decides "is this record really absent" by asking the zone's
-// authoritative nameservers directly -- the one question a cached NXDOMAIN on a
-// recursive resolver cannot answer (see LookupTXT).
-//
-// The contract is exactly what the crash-recovery callers need:
-//   - any authority returns the value           -> the record is there (true)
-//   - authorities answer and none has the value -> authoritative denial: truly absent
-//     (false, nil); NXDOMAIN and NODATA both count, both are the source of truth
-//     saying "not here"
-//   - nothing authoritative answers at all      -> fate unknown (error, and the callers
-//     treat any error as "keep the row")
-func (s *DNSSolver) lookupTXTAuthoritative(ctx context.Context, rec DNSRecord) (bool, error) {
 	zone, err := s.findZone(ctx, rec.FQDN)
 	if err != nil {
-		return false, err
+		return rec, false, fmt.Errorf("find the zone of %s: %w", rec.FQDN, err)
 	}
 	servers, err := s.authoritativeNS(ctx, zone)
 	if err != nil {
-		return false, err
+		return rec, false, fmt.Errorf("list the authoritative nameservers of %s: %w", zone, err)
 	}
 
-	probes := probeTXTWithExchange(servers, rec.FQDN, rec.Value, func(msg *dns.Msg, server string) (*dns.Msg, error) {
-		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		return s.exchange(pctx, msg, server)
-	})
-
-	denied := 0
-	for _, p := range probes {
+	results := probeTXTWithExchange(servers, rec.FQDN, rec.Value, s.authoritativeExchange())
+	var confirmed, denied, unanswered int
+	for _, r := range results {
 		switch {
-		case p.err != nil || !p.authoritative:
-			// Unreachable or non-authoritative: says nothing either way.
-		case p.hasValue:
-			// One authority holding the value is proof enough -- it cannot invent it.
-			return true, nil
+		case r.err != nil, !r.authoritative:
+			unanswered++
+		case r.hasValue:
+			confirmed++
 		default:
 			denied++
 		}
 	}
-	if denied == 0 {
-		return false, fmt.Errorf("no authoritative answer for %s from any of %d nameservers", rec.FQDN, len(servers))
+
+	switch {
+	case confirmed > 0:
+		return rec, true, nil
+	case denied > 0:
+		return rec, false, nil
+	default:
+		return rec, false, fmt.Errorf(
+			"cannot tell whether %s still carries the record: none of its %d authoritative nameservers answered",
+			rec.FQDN, len(results))
 	}
-	return false, nil
+}
+
+// authoritativeExchange is the exchange used for the authoritative probes: a short
+// per-server deadline, and it ignores the caller's context on purpose.
+//
+// It must not inherit a cancelled context: the probes run during cleanup, and a shutdown
+// racing them would turn a knowable answer into "cannot tell", which keeps rows around.
+// The deadline is what bounds them instead.
+func (s *DNSSolver) authoritativeExchange() func(*dns.Msg, string) (*dns.Msg, error) {
+	return func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		return s.exchange(ctx, msg, server)
+	}
 }
 
 func (s *DNSSolver) findZone(ctx context.Context, fqdn string) (string, error) {
@@ -720,11 +712,7 @@ func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]string,
 }
 
 func (s *DNSSolver) probeRecords(servers []string, recs []DNSRecord) []recordProbe {
-	return probeRecordsWithExchange(servers, recs, func(msg *dns.Msg, server string) (*dns.Msg, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		return s.exchange(ctx, msg, server)
-	})
+	return probeRecordsWithExchange(servers, recs, s.authoritativeExchange())
 }
 
 func (s *DNSSolver) queryRecursive(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {

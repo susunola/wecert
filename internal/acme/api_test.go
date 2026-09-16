@@ -2,11 +2,17 @@ package acme
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"database/sql"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -67,8 +73,28 @@ type fakeAPI struct {
 	// from "polled once".
 	authzHits map[string]int
 
+	// certPEM overrides the certificate GetCertificate returns. Left nil, the fake issues
+	// one for the CSR the flow actually finalized, the way a real CA does -- which also
+	// means every flow test exercises "does the leaf belong to the order's key" instead of
+	// only the one test dedicated to it.
 	certPEM []byte
 	certErr error
+
+	// certNotAfter and certDomains shape an issued certificate. An unset certNotAfter means
+	// 90 days; an empty certDomains means "the names the order was placed for".
+	certNotAfter time.Time
+	certDomains  []string
+
+	// orderKeyPEM lets the fake read the private key the flow generated for its order, so a
+	// pass that resumes an order finalized in an earlier process still gets a usable
+	// certificate back. Without it, the fake would have no public key to issue for when no
+	// CSR was submitted in this process.
+	orderKeyPEM func() []byte
+
+	// orderDomains is what the certificate is being issued for, used when the fake has to
+	// issue without a CSR. An empty result falls back to the domains NewOrder was called
+	// with.
+	orderDomains func() []string
 
 	// Arguments captured from the calls.
 	newOrderDomains []string
@@ -186,7 +212,85 @@ func (f *fakeAPI) GetCertificate(_ string, bundle bool) ([]byte, []byte, error) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.certBundle = bundle
-	return f.certPEM, []byte("key"), f.certErr
+	if f.certErr != nil {
+		return nil, nil, f.certErr
+	}
+	if f.certPEM != nil {
+		return f.certPEM, []byte("key"), nil
+	}
+	return f.issueForCSR(), []byte("key"), nil
+}
+
+// issueForCSR signs a certificate for the key this order was placed with, the way a real CA
+// does. The public key comes from the CSR when the flow finalized in this process, and from
+// the order on disk otherwise.
+//
+// It must not be some other key: VerifyKeyMatch rejects anything else, so a fake that
+// invented its own key would fail every flow test for the wrong reason.
+func (f *fakeAPI) issueForCSR() []byte {
+	var csr *x509.CertificateRequest
+	if len(f.finalizeCSR) > 0 {
+		parsed, err := x509.ParseCertificateRequest(f.finalizeCSR)
+		if err != nil {
+			return nil
+		}
+		csr = parsed
+	}
+
+	pub := crypto.PublicKey(nil)
+	names := f.certDomains
+	switch {
+	case csr != nil:
+		pub = csr.PublicKey
+		if len(names) == 0 {
+			names = csr.DNSNames
+		}
+	case f.orderKeyPEM != nil:
+		key, err := ParsePrivateKeyPEM(f.orderKeyPEM())
+		if err != nil {
+			return nil
+		}
+		pub = key.Public()
+	}
+	if pub == nil {
+		return nil
+	}
+	if len(names) == 0 {
+		names = f.newOrderDomains
+	}
+	if len(names) == 0 && f.orderDomains != nil {
+		names = f.orderDomains()
+	}
+
+	notAfter := f.certNotAfter
+	if notAfter.IsZero() {
+		notAfter = time.Now().Add(90 * 24 * time.Hour)
+	}
+	// tls.X509KeyPair-style self-signature: the fake CA is its own issuer, and nothing in
+	// the download path verifies the chain (the network probe does that separately).
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		DNSNames:     names,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     notAfter,
+		// A real CA always sets the Authority Key Identifier, and CertID needs it: without
+		// one the ARI certID cannot be built and the next renewal loses its rate-limit
+		// exemption.
+		AuthorityKeyId:        []byte{0x01, 0x02, 0x03},
+		BasicConstraintsValid: true,
+	}
+	// The signer is a throwaway: the issued certificate's *public* key is the CSR's, which
+	// is all the download path looks at. Nothing here verifies the chain -- the network
+	// probe covers that separately, against its own certificates.
+	signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, signer)
+	if err != nil {
+		return nil
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 // GetRenewalInfo errors by default: ARI is optional, and an unscripted ARI call usually
@@ -240,6 +344,16 @@ func newAPITestHarness(t *testing.T, domains []string) (*state.Store, *Manager, 
 	if err := config.NormalizeCertificates(certs); err != nil {
 		t.Fatalf("normalize certificate: %v", err)
 	}
+	// The certificate the fake returns has to belong to the key the order was placed with,
+	// and that key is generated inside the flow -- so the fake reads it back from the store.
+	fake.orderKeyPEM = func() []byte {
+		o, err := store.GetOrder(certs[0].Name)
+		if err != nil || o == nil {
+			return nil
+		}
+		return o.KeyPEM
+	}
+	fake.orderDomains = func() []string { return certs[0].Domains }
 	return store, m, fake, &certs[0]
 }
 
@@ -261,7 +375,6 @@ func TestOrderURLIsOnDiskBeforeTheNextACMECall(t *testing.T) {
 		},
 		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
 	}
-	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
 
 	var checked bool
 	fake.beforeCall = func(call string) {
@@ -331,7 +444,6 @@ func TestRenewalCarriesTheReplacesCertID(t *testing.T) {
 		},
 		terminalOrder("https://ca.test/order/2", "https://ca.test/finalize/2", "https://ca.test/cert/2"),
 	}
-	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
 
 	_ = m.Reconcile(context.Background(), cert)
 
@@ -390,7 +502,6 @@ func TestCSRIsDERAndGoesToTheFinalizeURL(t *testing.T) {
 		{Order: legoacme.Order{Status: "ready", Finalize: finalizeURL}, Location: orderURL},
 		{Order: legoacme.Order{Status: "valid", Finalize: finalizeURL, Certificate: certURL}, Location: orderURL},
 	}
-	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -478,7 +589,6 @@ func TestChallengesAreAcceptedOncePerAuthorization(t *testing.T) {
 		},
 		terminalOrder("https://ca.test/order/3", "https://ca.test/finalize/3", "https://ca.test/cert/3"),
 	}
-	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -645,7 +755,6 @@ func TestAdvanceProcessingOrderWaitsForValidAndDownloads(t *testing.T) {
 		},
 		terminalOrder(orderURL, finalizeURL, certURL),
 	}
-	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -682,6 +791,11 @@ func TestAdvanceProcessingOrderWaitsForValidAndDownloads(t *testing.T) {
 // round does about it is what these tests pin down.
 func seedInterruptedPass(t *testing.T, store *state.Store, cert *config.Certificate, authzURL string) {
 	t.Helper()
+	seedInterruptedPassWithToken(t, store, cert, authzURL, "tok-1")
+}
+
+func seedInterruptedPassWithToken(t *testing.T, store *state.Store, cert *config.Certificate, authzURL, token string) {
+	t.Helper()
 
 	key, err := GenerateKey(cert.KeyType)
 	if err != nil {
@@ -699,7 +813,7 @@ func seedInterruptedPass(t *testing.T, store *state.Store, cert *config.Certific
 	}
 	if err := store.PutAuthorization(&state.Authorization{
 		CertName: cert.Name, AuthzURL: authzURL, Identifier: "example.com",
-		Status: "pending", ChallengeURL: "https://ca.test/chall/1", ChallengeToken: "tok-1",
+		Status: "pending", ChallengeURL: "https://ca.test/chall/1", ChallengeToken: token,
 		Presented: false,
 	}); err != nil {
 		t.Fatal(err)
@@ -737,7 +851,6 @@ func TestSolveChallengesAdoptsTXTFromInterruptedPass(t *testing.T) {
 	const authzURL = "https://ca.test/authz/1"
 	seedInterruptedPass(t, store, cert, authzURL)
 	scriptPendingThenValid(fake, authzURL)
-	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -756,6 +869,54 @@ func TestSolveChallengesAdoptsTXTFromInterruptedPass(t *testing.T) {
 	}
 }
 
+// The token stored in the row can be stale: an earlier pass recorded the challenge it was
+// solving, and the CA later handed out a different challenge for the same authorization.
+// If the row keeps the old token it no longer hashes to its own TxtValue, and cleanup then
+// derives a value that was never registered -- CleanUp reads that as "another challenge is
+// still live at this name" and the provider's delete-all never fires again for the name,
+// stranding every later TXT record there.
+func TestSolveChallengesRefreshesAStaleChallengeToken(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	solver := &fakeSolver{lookupFound: false}
+	m.dns = solver
+
+	const authzURL = "https://ca.test/authz/1"
+	// The interrupted pass was solving "tok-stale"; the live challenge now carries "tok-1".
+	seedInterruptedPassWithToken(t, store, cert, authzURL, "tok-stale")
+	scriptPendingThenValid(fake, authzURL)
+
+	// solveChallenges rather than Reconcile: a successful Reconcile ends by discarding the
+	// order, which deletes the authorization rows.
+	order := legoacme.ExtendedOrder{
+		Order: legoacme.Order{
+			Status:         "pending",
+			Finalize:       "https://ca.test/finalize/8",
+			Authorizations: []string{authzURL},
+		},
+		Location: "https://ca.test/order/8",
+	}
+	ok, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: cert.Name}, order)
+	if err != nil || !ok {
+		t.Fatalf("solveChallenges = %v, %v", ok, err)
+	}
+
+	rows, err := store.ListAuthorizations(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected one authorization row, got %d", len(rows))
+	}
+	// The row has to describe the challenge this pass actually solved, so its token and
+	// its value agree.
+	if rows[0].ChallengeToken != "tok-1" {
+		t.Errorf("the row must carry the live challenge token, got %q", rows[0].ChallengeToken)
+	}
+	if rows[0].TxtValue != "txt-tok-1" {
+		t.Errorf("TxtValue must be the value written for the live token, got %q", rows[0].TxtValue)
+	}
+}
+
 // The probe finds nothing (the write really never happened): write the record. Also pins
 // the computed challenge name: production stores the bare apex as the identifier, and the
 // TXT name must come out as _acme-challenge.example.com.
@@ -767,7 +928,6 @@ func TestSolveChallengesPresentsWhenProbeMisses(t *testing.T) {
 	const authzURL = "https://ca.test/authz/1"
 	seedInterruptedPass(t, store, cert, authzURL)
 	scriptPendingThenValid(fake, authzURL)
-	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
 		t.Fatalf("Reconcile: %v", err)

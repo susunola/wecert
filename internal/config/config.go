@@ -530,12 +530,23 @@ type Webhook struct {
 	// event to it, to wire "certificate renewed" into downstream flows (triggering
 	// a config reload, for example).
 	NotifyURL string `yaml:"notifyURL"`
+
+	// NotifySecret is optional and only meaningful with NotifyURL. When set, each
+	// notification carries X-Wecert-Signature: sha256=<hex HMAC-SHA256 of the raw
+	// body>, which lets the receiver distinguish a genuine event from anything else
+	// that can reach its URL.
+	NotifySecret string `yaml:"notifySecret"`
 }
 
 // WebhookTokenMinLen is the minimum token length.
 // A short token is no authentication at all on this endpoint — an attacker who
 // triggers issuance can burn the rate-limit quota.
 const WebhookTokenMinLen = 16
+
+// WebhookNotifySecretMinLen is the minimum HMAC secret length.
+// An HMAC key shorter than its hash's output can be recovered by brute force from
+// a single signed event, so a short secret gives a false sense of authenticity.
+const WebhookNotifySecretMinLen = 32
 
 // Certificate is the desired state of one certificate.
 type Certificate struct {
@@ -696,6 +707,21 @@ func (c *Config) normalize() error {
 }
 
 func (w *Webhook) normalize() error {
+	// Checked before the listen-address branch below: NotifySecret is about the
+	// outbound event target, which is independent of the trigger endpoint.
+	if w.NotifySecret != "" {
+		if w.NotifyURL == "" {
+			return fmt.Errorf("webhook.notifySecret is set but webhook.notifyURL is empty: " +
+				"there is no outgoing event for the signature to cover")
+		}
+		if len(w.NotifySecret) < WebhookNotifySecretMinLen {
+			return fmt.Errorf("webhook.notifySecret is too short (%d characters, minimum %d): "+
+				"a key this short can be recovered from a single signed event, so it would not "+
+				"prove the notification came from wecert",
+				len(w.NotifySecret), WebhookNotifySecretMinLen)
+		}
+	}
+
 	// An empty Listen means disabled, in which case Token is not needed either.
 	if w.Listen == "" {
 		if w.Token != "" {
@@ -1005,4 +1031,44 @@ func splitResolverAddress(v string) (host, port string, err error) {
 		return "", "", fmt.Errorf("must be an IP literal optionally followed by a numeric port")
 	}
 	return v, "", nil
+}
+
+// profileValidity is each profile's nominal certificate lifetime as Let's Encrypt
+// issues it. It is not used to decide anything -- ARI and renewBefore own that -- only
+// to scale the local "approaching expiry" warning below.
+var profileValidity = map[string]time.Duration{
+	ProfileClassic:    90 * 24 * time.Hour,
+	ProfileTLSServer:  45 * 24 * time.Hour,
+	ProfileShortLived: 160 * time.Hour,
+}
+
+// ExpiryWarningThreshold is how close to expiry a certificate has to get before the
+// daemon logs a warning about it.
+//
+// Scaled to the profile rather than fixed. A fixed 21 days is most of a `shortlived`
+// certificate's 160-hour life, so that profile warned from the moment it was issued --
+// on every pass, for its whole life, which is exactly the kind of alarm that trains
+// people to ignore logs. A quarter of the validity is early enough to act on and late
+// enough to mean something. The metrics remain the primary expiry signal; this is a
+// secondary log line.
+func ExpiryWarningThreshold(profile string) time.Duration {
+	v, ok := profileValidity[profile]
+	if !ok {
+		v = profileValidity[ProfileClassic]
+	}
+	return v / 4
+}
+
+// DaysUntil is the whole number of days left before notAfter, rounded **up**.
+//
+// Rounded up, because truncation makes "23 hours left" read as 0 days, and 0 days is a
+// meaningless thing to report for a certificate that is still valid -- a consumer that
+// treats 0 as expired reads a healthy certificate as down. probe.DaysLeft uses the same
+// rule; keep the two in step.
+func DaysUntil(notAfter, now time.Time) int {
+	left := notAfter.Sub(now)
+	if left <= 0 {
+		return 0
+	}
+	return int((left + 24*time.Hour - 1) / (24 * time.Hour))
 }

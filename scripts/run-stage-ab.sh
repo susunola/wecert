@@ -74,12 +74,18 @@ fi
 # eval executes any command substitution a value happens to contain, and a credentials
 # file is data, not code. Extract the values with sed instead and strip one layer of
 # surrounding quotes.
+#
+# Both forms are accepted, with or without "export": a credentials file that is only
+# sourced by an interactive shell often omits it, and requiring the keyword here would
+# silently report "not set" for a file that does define the variable.
 cred_value() {
 	# Last definition wins, the way eval would see it. The export prefix is
 	# optional: a plain KEY=value line is just as valid in an env file.
 	local raw
-	raw="$(sed -n -e "s/^[[:space:]]*export[[:space:]][[:space:]]*/ /" \
-		-e "s/^[[:space:]]*$1=\(.*\)/\1/p" "${CREDS}" | tail -n 1)"
+	raw="$(sed -n \
+		-e "s/^[[:space:]]*export[[:space:]][[:space:]]*$1=\(.*\)/\1/p" \
+		-e "s/^[[:space:]]*$1=\(.*\)/\1/p" \
+		"${CREDS}" | tail -n 1)"
 	# Strip the value the way the shell would, not with a blanket
 	# "remove quotes and everything after #": a trailing comment only counts
 	# outside quotes ("KEY=abc # note" is abc, but KEY="abc # note" is not),
