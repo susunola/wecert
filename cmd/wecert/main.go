@@ -226,12 +226,34 @@ func run() error {
 
 	if *once {
 		reconciler.RunOnce(ctx)
+		// The pass has finished, but the notifications it triggered are delivered on
+		// their own goroutines. Returning here would exit with them in flight and lose
+		// them -- including the "result":"error" one, which is the notification an
+		// operator most needs.
+		drainNotifier(notifier, log)
 		return nil
 	}
 
 	log.Info("entering daemon mode", "interval", *interval)
 	runDaemon(ctx, reconciler, *interval, log)
+	drainNotifier(notifier, log)
 	return nil
+}
+
+// drainNotifier waits briefly for accepted notifications to be delivered.
+//
+// The wait is bounded so a receiver that never answers cannot hold shutdown open; each
+// individual send is already bounded by its own 10s timeout, so in practice this returns as
+// soon as the last one finishes.
+func drainNotifier(n reconcile.Notifier, log *slog.Logger) {
+	d, ok := n.(reconcile.Drainer)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	d.Drain(ctx)
+	log.Info("waited for in-flight notifications before exiting")
 }
 
 // newProvider assembles the desired-state source according to desiredState.mode.

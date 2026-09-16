@@ -32,13 +32,13 @@ func (m *Manager) SetFallbackPolicy(p config.FailureFallback) { m.fallback = &p 
 // Almost always it returns the input unchanged. Only when a certificate is "nearly
 // expired and still refuses to issue" does it drop the names that keep failing -- those
 // 24 names that were fine should not expire alongside the 1 name with broken DNS.
-func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *config.Certificate {
+func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState, rd round) (*config.Certificate, round) {
 	// Stop waiting for names that can never come back, before anything else looks at the
 	// record. This runs first, and separately from the metrics block below, so the two
 	// concerns stay independent: what the record should contain, and what the gauges say.
 	m.pruneFallback(c)
 
-	kept, dropped, reason := m.fallbackDomains(c, st)
+	kept, dropped, reason := m.fallbackDomains(c, st, rd.fallbackActive)
 
 	if len(dropped) == 0 {
 		// Three outcomes, not two. Failing to read the record is not evidence that the
@@ -66,17 +66,20 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 			m.fallbackWindow()); perr != nil {
 			m.log.Warn("cannot prune the identifier failure ledger", "cert", c.Name, "err", perr)
 		}
-		return c
+		return c, rd
 	}
 
 	cp := *c
 	cp.Domains = kept
 
-	// Tell the rest of the round that this certificate is being issued short of names.
+	// Tell the rest of THIS pass that the certificate is being issued short of names.
 	// download uses it to keep the failure evidence that justifies the reduction, and
 	// the SAN-drift branch uses it to stop re-ordering the full set on every pass.
-	m.degradedRound = true
-	m.fallbackActive = true
+	//
+	// It is returned rather than stored: two different certificates converge at the same
+	// time, so a Manager field would let a neighbour's pass decide this one's behaviour.
+	rd.degraded = true
+	rd.fallbackActive = true
 
 	// ERROR, not WARN: this is the decision "we deliberately removed names from the
 	// certificate", and it has to be loud enough that nobody can miss it.
@@ -95,7 +98,7 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 	}); err != nil {
 		m.log.Warn("cannot record the fallback state", "cert", c.Name, "err", err)
 	}
-	return &cp
+	return &cp, rd
 }
 
 // pruneFallback removes from the record the names that are no longer part of the desired set,
@@ -222,7 +225,7 @@ func entriesOfNotIn(want, have []string) []string {
 // out (an operator fixed the name, or the ledger expired) -- that is the documented
 // self-healing entry point, and it now costs one attempt per failure window instead of
 // one per reconcile pass.
-func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState) (kept, dropped []string, reason string) {
+func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState, held bool) (kept, dropped []string, reason string) {
 	p := m.fallback
 	if p == nil || !p.EnabledOr(false) {
 		return c.Domains, nil, ""
@@ -270,7 +273,6 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState) (k
 
 	// Decide what this round is: entering a fallback, or continuing one that already
 	// exists. Continuing does not re-check the expiry window, for the reason above.
-	held := m.fallbackActive
 	if !held && left > beforeExpiry {
 		// Not entering: the certificate is not close enough to expiry for the
 		// "keep most names alive" trade-off to be the right one yet.

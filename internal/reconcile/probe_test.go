@@ -2,13 +2,20 @@ package reconcile
 
 import (
 	"context"
+	"io"
+	"log/slog"
+	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/probe"
+	"github.com/susunola/wecert/internal/state"
 )
 
 // A wildcard has no address of its own to dial.
@@ -136,4 +143,155 @@ func probeMatchSeriesExists(t *testing.T, host string) bool {
 		}
 	}
 	return false
+}
+
+// recordingProber captures the expectations probeCert hands out.
+type recordingProber struct {
+	mu   sync.Mutex
+	seen map[string]probe.Expectation
+}
+
+func (p *recordingProber) Check(_ context.Context, host string, e probe.Expectation) probe.Verdict {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.seen == nil {
+		p.seen = map[string]probe.Expectation{}
+	}
+	p.seen[host] = e
+	return probe.Verdict{}
+}
+
+func (p *recordingProber) Forget(string) {}
+
+func (p *recordingProber) expected(host string) (probe.Expectation, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.seen[host]
+	return e, ok
+}
+
+// The probe's "is the served certificate the one I deployed?" comparison must be made
+// against the certificate that is actually stored, not the configured domain set.
+//
+// During a fallback the deployed certificate is deliberately a SUBSET: the dropped names
+// are the ones whose DNS is broken. Comparing against the config made probe.Verify report
+// "the served certificate is missing names that were deployed" for every host, which drove
+// wecert_certificate_probe_match to 0 -- the gauge documented as the actionable "the rebind
+// did not take effect" alert -- and made the prober dial names whose DNS is known broken.
+func TestProbeExpectationFollowsTheDeployedSubsetNotTheConfig(t *testing.T) {
+	const certName = "degraded-cert"
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Deployed: the reduced set (b.example.com was dropped by the fallback).
+	// Configured: the full set, which still lists b.example.com.
+	deployed := []string{"a.example.com", "c.example.com"}
+	configured := []string{"a.example.com", "b.example.com", "c.example.com"}
+	if err := store.PutCert(&state.CertState{
+		Name: certName, NotAfter: time.Now().Add(48 * time.Hour),
+		CertPEM:         selfSignedCertPEM(t, deployed...),
+		DeployConfirmed: true,
+	}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: certName, Domains: configured})
+	cfg := &config.Config{}
+	cfg.Certificates = []config.Certificate{{Name: certName, Domains: configured}}
+	cfg.Probe.MaxHostsPerCert = 10
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, &fakeManager{}, nil, log)
+	rec := &recordingProber{}
+	r.prober = rec
+
+	c := &config.Certificate{Name: certName, Domains: configured, Deploy: config.Deploy{Enabled: true}}
+	r.probeCert(context.Background(), c)
+
+	e, ok := rec.expected("a.example.com")
+	if !ok {
+		t.Fatal("a.example.com should have been probed")
+	}
+	if len(e.Domains) != len(deployed) {
+		t.Errorf("the expectation must describe the deployed set %v, got %v -- comparing against the "+
+			"configured set reports a permanent mismatch on a certificate that is behaving correctly",
+			deployed, e.Domains)
+	}
+	if _, probed := rec.expected("b.example.com"); probed {
+		t.Error("the dropped name was probed; its DNS is broken by definition, so this only adds " +
+			"probe errors for a certificate that is behaving as designed")
+	}
+}
+
+// A host's probe series must survive a round that could not probe it because its
+// certificate's pass was already in flight.
+//
+// RunAll skips a certificate whose claim is held, so that certificate never reaches
+// probeCert and never lands in this round's probed set. Reclaiming on "absent from this
+// round" alone then deletes the series of a host that is being probed right now -- the
+// flicker reclaimStaleProbeSeries exists to avoid, and a false alert for anything paging on
+// wecert_certificate_probe_match.
+func TestReclaimStaleProbeSeriesKeepsHostsOfAClaimedCertificate(t *testing.T) {
+	const (
+		certName = "in-flight-cert"
+		host     = "live.example.com"
+		goneHost = "dropped.example.com"
+	)
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: certName, Domains: []string{host}})
+	cfg := &config.Config{}
+	cfg.Certificates = []config.Certificate{{Name: certName, Domains: []string{host}}}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, &fakeManager{}, nil, log)
+	r.prober = &fakeProber{hosts: []string{host, goneHost}}
+
+	// Both hosts have exported series from an earlier round.
+	for _, h := range []string{host, goneHost} {
+		metrics.CertificateProbeMatch.WithLabelValues(h).Set(1)
+	}
+
+	// The certificate's own pass is still in flight, so this round skips it.
+	if !r.acquire(certName) {
+		t.Fatal("acquiring the claim should succeed on a fresh reconciler")
+	}
+
+	r.reclaimStaleProbeSeries()
+
+	if !probeMatchSeriesExists(t, host) {
+		t.Error("the series of a host whose certificate is still converging was reclaimed; " +
+			"a probe_match value that blinks is a false alert for whoever is paging on it")
+	}
+
+	// Once nothing is in flight, the genuinely stale host must be reclaimed in BOTH places:
+	// the exported series and the runner's transition memory. Reclaiming only the metric
+	// leaks an entry in the runner for every host ever dropped from a SAN set.
+	r.release(certName)
+	r.reclaimStaleProbeSeries()
+
+	if probeMatchSeriesExists(t, goneHost) {
+		t.Error("a host that is no longer probed must have its exported series reclaimed")
+	}
+	var forgotGone bool
+	for _, h := range r.prober.(*fakeProber).forgotten {
+		if h == goneHost {
+			forgotGone = true
+		}
+	}
+	if !forgotGone {
+		t.Errorf("the runner's transition memory must be reclaimed alongside the series, forgot=%v",
+			r.prober.(*fakeProber).forgotten)
+	}
 }

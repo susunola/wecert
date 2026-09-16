@@ -51,6 +51,18 @@ type Notifier interface {
 	Renewal(ctx context.Context, certName string, err error)
 }
 
+// Drainer is the optional capability a notifier has when it can wait for the notifications
+// it has already accepted.
+//
+// Delivery is fire-and-forget: Notifier.Renewal hands the POST to a goroutine and returns.
+// That is right while the process keeps running, but a one-shot run or a shutdown would
+// otherwise exit with the POST in flight and lose it -- and the notification most worth
+// keeping is the "result":"error" one. Optional because a test double should not have to
+// implement a lifecycle it does not have; callers type-assert.
+type Drainer interface {
+	Drain(ctx context.Context)
+}
+
 // CertManager is the capability Reconciler needs.
 //
 // It is an interface rather than a direct *acme.Manager dependency so the
@@ -183,6 +195,19 @@ func (r *Reconciler) release(name string) {
 	delete(r.running, name)
 }
 
+// isClaimable reports whether no pass currently holds this certificate.
+//
+// It reads the claim without taking it, for callers that need to know "is anyone working on
+// this right now" rather than "may I start". Taking the claim instead would be wrong for
+// those callers: the orphan teardown is not a convergence pass, it must not block one, and
+// a claim it failed to acquire would otherwise have to be released on every path.
+func (r *Reconciler) isClaimable(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, busy := r.running[name]
+	return !busy
+}
+
 // ── Desired state ────────────────────────────────────────────────────────────────
 
 // Prime resolves the desired state once and caches it, triggering no
@@ -297,6 +322,29 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		if want[name] {
 			continue
 		}
+
+		// A name can be absent from the desired state while a pass for it is still in
+		// flight -- that is exactly what removing a certificate mid-issuance looks like,
+		// and the pass may be parked in WaitAll for minutes waiting on DNS propagation.
+		//
+		// Tearing it down underneath itself is destructive and pointless. The teardown
+		// deletes the authorization rows and, because the DNS provider's delete removes
+		// EVERY TXT value at the challenge name, fires delete-all at a record the running
+		// pass is waiting on. That pass then fails with a propagation error and backs off,
+		// or -- if it already passed AcceptChallenge -- sends the CA to validate a record
+		// that no longer exists, which books an identifier failure and feeds the failure
+		// fallback. Its order URL is gone too, so the retry re-orders into the
+		// exact-set quota.
+		//
+		// So leave a claimed name alone: its own pass owns the teardown, and the next round
+		// reaps it once the claim is released. This is the same check the convergence loop
+		// below makes; this function used to skip it.
+		if !r.isClaimable(name) {
+			r.log.Info("skipping the orphan teardown: a pass for this certificate is still running",
+				"cert", name)
+			continue
+		}
+
 		orphans++
 
 		st, stErr := r.store.GetCert(name)
@@ -349,7 +397,26 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 // was never issued was also never probed (probing requires a confirmed deploy),
 // so there is nothing to reclaim then.
 func (r *Reconciler) orphanProbeHosts(st *state.CertState) []string {
-	if len(st.CertPEM) == 0 {
+	return probeHosts(r.issuedSANs(st), r.cfg.Probe.MaxHostsPerCert)
+}
+
+// issuedSANs returns the names of the certificate actually stored for this certificate, or
+// nil when there is none to parse.
+//
+// This is the authority on "what was deployed", and the probe comparison has to be made
+// against it rather than against the configured domain set. They differ whenever a
+// degradation is in force: the fallback deliberately issues a subset, so the live
+// certificate is *supposed* to be missing the dropped names. Comparing against the config
+// made probe.Verify report "the served certificate is missing names that were deployed" for
+// every host of a degraded certificate, which drove wecert_certificate_probe_match to 0 --
+// a gauge documented as the actionable "the rebind did not take effect" alert. A permanent
+// false alarm on the metric that exists to catch a real failure is worse than no metric.
+//
+// Reading the certificate also avoids dialling the dropped names, whose DNS is broken by
+// definition, so the probe error counter stops climbing on certificates that are behaving
+// exactly as designed.
+func (r *Reconciler) issuedSANs(st *state.CertState) []string {
+	if st == nil || len(st.CertPEM) == 0 {
 		return nil
 	}
 	block, _ := pem.Decode(st.CertPEM)
@@ -358,10 +425,11 @@ func (r *Reconciler) orphanProbeHosts(st *state.CertState) []string {
 	}
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		r.log.Warn("cannot parse the stored certificate to reclaim its probe series", "cert", st.Name, "err", err)
+		r.log.Warn("cannot parse the stored certificate; falling back to the configured names",
+			"cert", st.Name, "err", err)
 		return nil
 	}
-	return probeHosts(leaf.DNSNames, r.cfg.Probe.MaxHostsPerCert)
+	return leaf.DNSNames
 }
 
 // ── Convergence ────────────────────────────────────────────────────────────────────
@@ -441,8 +509,34 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 		if _, live := current[h]; live {
 			continue
 		}
+		// A host the runner has seen but this round did not probe is only stale if
+		// nothing is still working on the certificate it belongs to.
+		//
+		// This round's probe set is not the whole picture. Two things keep a host out of
+		// it while it is still being probed: a certificate whose pass is in flight right
+		// now is skipped by the loop above, and a pass that has not reached probeCert yet
+		// has not recorded anything. Deleting on that basis makes the series of a live
+		// host disappear and reappear, which is exactly the flicker this function's own
+		// contract says it avoids -- and a probe_match series that blinks is a false
+		// alert for whoever is paging on it.
+		if r.anyPassInFlight() {
+			continue
+		}
 		metrics.DeleteProbeSeries(h)
+		// The runner's transition memory has to go with the series. Its own comment says
+		// both are needed -- otherwise a host that leaves a SAN set leaks an entry there and
+		// strands a gauge here -- and only the gauge was being reclaimed, so `last` grew
+		// with every host ever dropped from a certificate, and certificate names churn by
+		// design.
+		r.prober.Forget(h)
 	}
+}
+
+// anyPassInFlight reports whether any certificate currently holds a convergence claim.
+func (r *Reconciler) anyPassInFlight() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.running) > 0
 }
 
 // RunOnce is a compatibility alias for RunAll.
@@ -674,11 +768,18 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 		return
 	}
 
-	hosts := probeHosts(c.Domains, r.cfg.Probe.MaxHostsPerCert)
+	// Compare against the certificate actually stored, not the configured domain set:
+	// during a fallback the deployed set is deliberately smaller, and using the config
+	// reported every host as a mismatch. See issuedSANs.
+	domains := r.issuedSANs(st)
+	if len(domains) == 0 {
+		domains = c.Domains
+	}
+	hosts := probeHosts(domains, r.cfg.Probe.MaxHostsPerCert)
 	if len(hosts) == 0 {
 		// Every name in this certificate is a wildcard: nothing concrete to dial.
 		r.log.Debug("nothing to probe: every name in this certificate is a wildcard",
-			"cert", c.Name, "domains", c.Domains)
+			"cert", c.Name, "domains", domains)
 		return
 	}
 	if err := ctx.Err(); err != nil {
@@ -686,7 +787,7 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 	}
 
 	e := probe.Expectation{
-		Domains:     c.Domains,
+		Domains:     domains,
 		NotAfter:    st.NotAfter,
 		MinValidFor: r.cfg.Probe.MinValidDur,
 	}

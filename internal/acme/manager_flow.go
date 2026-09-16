@@ -27,7 +27,7 @@ import (
 const authzFetchConcurrency = 8
 
 // advance pushes the order state machine forward.
-func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.CertState, o *state.Order) error {
+func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.CertState, o *state.Order, rd round) error {
 	order, err := m.core.GetOrder(o.OrderURL)
 	if err != nil {
 		return m.recordFailure(st, fmt.Errorf("get order: %w", err))
@@ -42,7 +42,7 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 
 	switch order.Status {
 	case "valid":
-		return m.download(ctx, c, st, o, order)
+		return m.download(ctx, c, st, o, order, rd)
 
 	case "invalid":
 		// The order is dead. Clean it up so the next round decides from scratch (which will
@@ -58,7 +58,7 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		return m.recordFailure(st, err)
 
 	case "ready":
-		return m.finalize(ctx, c, st, o, order)
+		return m.finalize(ctx, c, st, o, order, rd)
 
 	case "processing":
 		// The CSR is already with the CA (a previous pass submitted it and died before
@@ -74,7 +74,7 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		if err := m.persistOrder(o, final); err != nil {
 			return m.recordFailure(st, err)
 		}
-		return m.download(ctx, c, st, o, final)
+		return m.download(ctx, c, st, o, final, rd)
 	}
 
 	// pending: drive the DNS-01 challenges through to the end.
@@ -96,9 +96,9 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		return m.recordFailure(st, err)
 	}
 	if ready.Status == "valid" {
-		return m.download(ctx, c, st, o, ready)
+		return m.download(ctx, c, st, o, ready, rd)
 	}
-	return m.finalize(ctx, c, st, o, ready)
+	return m.finalize(ctx, c, st, o, ready, rd)
 }
 
 // fetchAuthzs fetches the current state of several authorizations concurrently, returning
@@ -659,7 +659,7 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 
 func (m *Manager) finalize(
 	ctx context.Context, c *config.Certificate, st *state.CertState,
-	o *state.Order, order legoacme.ExtendedOrder,
+	o *state.Order, order legoacme.ExtendedOrder, rd round,
 ) error {
 	key, err := ParsePrivateKeyPEM(o.KeyPEM)
 	if err != nil {
@@ -690,7 +690,7 @@ func (m *Manager) finalize(
 	if err := m.persistOrder(o, final); err != nil {
 		return m.recordFailure(st, err)
 	}
-	return m.download(ctx, c, st, o, final)
+	return m.download(ctx, c, st, o, final, rd)
 }
 
 func (m *Manager) awaitOrderStatus(

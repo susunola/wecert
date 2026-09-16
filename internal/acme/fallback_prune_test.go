@@ -46,7 +46,7 @@ func TestFallbackRecordIsClearedWhenEveryDroppedNameLeftTheConfig(t *testing.T) 
 	metrics.CertificateFallbackActive.WithLabelValues(cert.Name).Set(1)
 	metrics.CertificateFallbackDropped.WithLabelValues(cert.Name).Set(1)
 
-	m.applyFallback(cert, &state.CertState{Name: cert.Name, NotAfter: now.Add(24 * time.Hour)})
+	m.applyFallback(cert, &state.CertState{Name: cert.Name, NotAfter: now.Add(24 * time.Hour)}, round{})
 
 	fb, err := store.GetFallback(cert.Name)
 	if err != nil {
@@ -74,7 +74,7 @@ func TestFallbackRecordIsKeptWhileTheDroppedNameIsStillConfigured(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	m.applyFallback(cert, &state.CertState{Name: cert.Name, NotAfter: now.Add(24 * time.Hour)})
+	m.applyFallback(cert, &state.CertState{Name: cert.Name, NotAfter: now.Add(24 * time.Hour)}, round{})
 
 	fb, err := store.GetFallback(cert.Name)
 	if err != nil {
@@ -102,7 +102,7 @@ func TestFallbackRecordIsPrunedToTheNamesStillConfigured(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m.applyFallback(cert, &state.CertState{Name: cert.Name, NotAfter: now.Add(24 * time.Hour)})
+	m.applyFallback(cert, &state.CertState{Name: cert.Name, NotAfter: now.Add(24 * time.Hour)}, round{})
 
 	fb, err := store.GetFallback(cert.Name)
 	if err != nil {
