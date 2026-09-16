@@ -9,6 +9,8 @@ import (
 	legoacme "github.com/go-acme/lego/v4/acme"
 
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -81,7 +83,26 @@ func (m *Manager) download(
 	deployedID := oldDeployedID
 	rebound := false
 	if c.Deploy.Enabled {
-		id, derr := m.deployer.Deploy(ctx, c.Name, oldDeployedID, fullchain, o.KeyPEM)
+		var id string
+		var derr error
+		if o.DeploymentCertID != "" {
+			if retry, ok := m.deployer.(deploy.RetryableDeployer); ok {
+				id, derr = retry.ResumeDeploy(ctx, c.Name, oldDeployedID, o.DeploymentCertID)
+			} else {
+				id, derr = m.deployer.Deploy(ctx, c.Name, oldDeployedID, fullchain, o.KeyPEM)
+			}
+		} else if staged, ok := m.deployer.(deploy.StagedDeployer); ok {
+			id, derr = staged.Upload(ctx, c.Name, fullchain, o.KeyPEM)
+			if derr == nil {
+				o.DeploymentCertID = id
+				if err := m.store.PutOrder(o); err != nil {
+					return err
+				}
+				id, derr = staged.DeployUploaded(ctx, c.Name, oldDeployedID, id)
+			}
+		} else {
+			id, derr = m.deployer.Deploy(ctx, c.Name, oldDeployedID, fullchain, o.KeyPEM)
+		}
 		if derr != nil {
 			// The Deployer contract is: on error it still returns the ID of the certificate
 			// that was uploaded successfully (see Deploy in internal/deploy/tencent.go). That
@@ -89,10 +110,16 @@ func (m *Manager) download(
 			// certificates table nor the retired table, ReapRetired never sees it, and one
 			// failure leaks one certificate in Tencent Cloud until the account quota is hit.
 			// The reclaim machinery exists precisely to prevent that.
-			m.recordOrphanCert(id, oldDeployedID, c.Name)
+			if id != "" {
+				o.DeploymentCertID = id
+				if err := m.store.PutOrder(o); err != nil {
+					return err
+				}
+			}
 			return m.recordFailure(st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
 		}
 		deployedID = id
+		o.DeploymentCertID = ""
 		rebound = oldDeployedID != ""
 	} else {
 		// A local-only renewal must never claim the older cloud certificate is this
@@ -156,6 +183,14 @@ func (m *Manager) download(
 	if err := m.store.PutCert(st); err != nil {
 		return err
 	}
+	if fb, err := m.store.GetFallback(c.Name); err == nil && fb != nil && containsAll(c.Domains, fb.Dropped) {
+		if err := m.store.ClearFallback(c.Name); err != nil {
+			m.log.Warn("cannot clear the recovered fallback state", "cert", c.Name, "err", err)
+		} else {
+			metrics.CertificateFallbackActive.WithLabelValues(c.Name).Set(0)
+			metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(0)
+		}
+	}
 
 	// Only once the switch from the old certificate to the new one is confirmed does the old
 	// one go on the reclaim list. On a first upload nothing is bound to a listener yet, and
@@ -199,6 +234,19 @@ func (m *Manager) download(
 			"deployedCertId", deployedID, "ariCertId", ariCertID != "")
 	}
 	return nil
+}
+
+func containsAll(domains, want []string) bool {
+	available := make(map[string]bool, len(domains))
+	for _, d := range domains {
+		available[d] = true
+	}
+	for _, d := range want {
+		if !available[d] {
+			return false
+		}
+	}
+	return true
 }
 
 // ReapRetired reclaims retired certificates that are past the retention period.

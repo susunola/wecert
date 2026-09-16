@@ -278,8 +278,8 @@ func TestFallbackClearsItselfOnceTheNamesAreHealthy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fb != nil {
-		t.Errorf("the fallback record should be cleared after returning to the full set, got %+v", fb)
+	if fb == nil {
+		t.Error("trying the full set must not clear fallback before a full certificate is issued")
 	}
 }
 
