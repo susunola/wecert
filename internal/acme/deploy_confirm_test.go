@@ -307,3 +307,60 @@ func listRetired(t *testing.T, store *state.Store, m *Manager, ahead time.Durati
 	}
 	return got
 }
+
+// The binding lookup must not run on every pass.
+//
+// Only a human can change the answer -- the certificate was uploaded but not yet bound in
+// the console -- and the lookup is a two-call enumeration that polls asynchronously for
+// up to 30 seconds, inside the serial convergence loop. An unbound certificate can sit
+// that way for its whole 90-day life, so re-asking hourly is ~50-170 cloud calls a day
+// for a fact that cannot have changed.
+func TestBindingCheckIsThrottled(t *testing.T) {
+	dep := &fakeDeployer{}
+	m, _, _ := newConfirmHarness(t, dep, nil)
+
+	m.bindingCheckEvery = time.Hour
+	base := time.Now()
+	m.now = func() time.Time { return base }
+
+	if !m.bindingCheckDue("c") {
+		t.Fatal("the first check must be due")
+	}
+	if m.bindingCheckDue("c") {
+		t.Error("a second check inside the interval must be skipped, or every pass pays the enumeration")
+	}
+
+	// A different certificate has its own clock.
+	if !m.bindingCheckDue("other") {
+		t.Error("each certificate must be throttled independently")
+	}
+
+	base = base.Add(2 * time.Hour)
+	if !m.bindingCheckDue("c") {
+		t.Error("the check must become due again once the interval has passed")
+	}
+}
+
+// The throttle has to be wired into the pass, not just available: five passes over an
+// unconfirmed certificate must cost one enumeration, not five.
+func TestReconcileLooksUpBindingsOncePerInterval(t *testing.T) {
+	dep := &fakeDeployer{}
+	m, _, cert := newConfirmHarness(t, dep, nil)
+
+	m.bindingCheckEvery = time.Hour
+	base := time.Now()
+	m.now = func() time.Time { return base }
+
+	for i := 0; i < 5; i++ {
+		_ = m.Reconcile(context.Background(), cert)
+	}
+	if dep.calls != 1 {
+		t.Errorf("Bindings ran %d times across 5 passes; want 1", dep.calls)
+	}
+
+	base = base.Add(2 * time.Hour)
+	_ = m.Reconcile(context.Background(), cert)
+	if dep.calls != 2 {
+		t.Errorf("Bindings ran %d times; want a second lookup once the interval elapsed", dep.calls)
+	}
+}

@@ -2,6 +2,7 @@ package spec
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -264,5 +265,52 @@ func TestDiffIsEmptyWhenNothingChanged(t *testing.T) {
 	got := Diff(&Result{Certificates: certs}, &Result{Certificates: certs})
 	if !got.Empty() {
 		t.Errorf("no diff must be reported as empty: %+v", got)
+	}
+}
+
+// The desired-state document *is* the desired state: whoever can rewrite it decides
+// which domains are served and which quietly stop being renewed. LoadDocument therefore
+// refuses a symlink rather than following it, and refuses a group- or world-writable
+// file.
+//
+// Readability is deliberately not checked -- the file is written 0644 so an operator can
+// read it, and only the write bits can change what it says.
+func TestLoadDocumentRefusesASymlinkOrAWritableFile(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.yaml")
+	body := "apiVersion: wecert/v1\nkind: DesiredState\ngeneratedAt: 2026-09-16T12:00:00Z\ngenerator: wecert-onboard/test\ncertificates:\n  - name: example-com\n    domains: [example.com]\n"
+	if err := os.WriteFile(good, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 0644 has no write bit for group or other, so this must load.
+	if _, err := LoadDocument(good); err != nil {
+		t.Fatalf("a 0644 document must load: %v", err)
+	}
+
+	// Group- or world-writable must not.
+	for _, perm := range []os.FileMode{0o664, 0o646, 0o666} {
+		p := filepath.Join(dir, fmt.Sprintf("w%o.yaml", perm))
+		if err := os.WriteFile(p, []byte(body), perm); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, perm); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadDocument(p); err == nil {
+			t.Errorf("a %04o document must be refused: anything that can write it decides what is served", perm)
+		}
+	}
+
+	// A symlink must not be followed, however harmless its target.
+	link := filepath.Join(dir, "link.yaml")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadDocument(link)
+	if err == nil {
+		t.Fatal("a symlinked document must be refused rather than followed")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("err = %v, want it to name the symlink", err)
 	}
 }
