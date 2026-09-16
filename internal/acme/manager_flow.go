@@ -47,9 +47,13 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 	case "invalid":
 		// The order is dead. Clean it up so the next round decides from scratch (which will
 		// go through backoff).
+		//
+		// recordFailure must still run even when discardOrder itself fails: returning early
+		// here would skip backoff entirely, so the very next round would retry immediately
+		// with no backoff at all.
 		err := fmt.Errorf("order became invalid: %v", order.Err())
 		if derr := m.discardOrder(ctx, c.Name); derr != nil {
-			return errors.Join(err, derr)
+			err = errors.Join(err, derr)
 		}
 		return m.recordFailure(st, err)
 
