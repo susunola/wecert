@@ -99,6 +99,12 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 			})
 		}
 
+	case config.DNSProviderLego:
+		// Any provider from lego's registry, by name, with its credentials taken from the
+		// environment in lego's own variable names. See the build-tag files for why this is
+		// opt-in rather than always compiled in.
+		newProvider = newLegoProvider(dnsCfg.LegoProvider)
+
 	default:
 		return nil, fmt.Errorf("unknown dns.provider %q", dnsCfg.Provider)
 	}
@@ -176,7 +182,11 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 		// WaitAll sees every record a round depends on, so this is where those leases get
 		// re-registered -- otherwise a concurrent certificate's cleanup could delete-all
 		// the name right out from under this one (see challengeLeases).
-		challengeLeases.add(r.FQDN, r.Value)
+		//
+		// Under the name's mutex, not just the registry lock: CleanUp checks "is any other
+		// value live?" and then deletes while holding that mutex, so an add outside it can
+		// land in the window and have its value deleted (see addUnderLock).
+		challengeLeases.addUnderLock(r.FQDN, r.Value)
 
 		zone, err := s.findZone(ctx, r.FQDN)
 		if err != nil {
@@ -507,6 +517,28 @@ func (l *txtLeases) add(fqdn, value string) {
 		l.entries[fqdn] = e
 	}
 	e.values[value] = true
+}
+
+// addUnderLock records a lease while holding the name's mutex.
+//
+// The plain add() only takes the registry lock, which is enough for the `values` map but NOT
+// enough for the check-then-act that CleanUp performs: CleanUp holds the per-name mutex across
+// "is any other value live?" and the provider's delete-EVERY-TXT call. An add that lands
+// between those two steps is invisible to the check and the value it registered is then
+// deleted -- so the CA is asked to validate a record that no longer exists, which books a
+// billed authorization failure against the 5-per-hour-per-identifier limit and leaves an
+// entry in the identifier ledger that arms the failure fallback.
+//
+// Present() was already safe because it adds while holding the same mutex. The two paths that
+// did NOT were WaitAll (re-registering the records of a resumed order, whose TXT a previous
+// process wrote) and registerRecoveredLeases. Taking the mutex here makes all four paths
+// equivalent.
+func (l *txtLeases) addUnderLock(fqdn, value string) {
+	mu, release := l.lock(fqdn)
+	defer release()
+	mu.Lock()
+	defer mu.Unlock()
+	l.add(fqdn, value)
 }
 
 // remove drops one lease and reports whether any other value is still live at the name.

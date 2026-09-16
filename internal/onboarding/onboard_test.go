@@ -1566,3 +1566,162 @@ func TestLostStateFileDoesNotDeleteNamesWithoutAGracePeriod(t *testing.T) {
 	t.Errorf("d.example.com must still be covered during its grace period, got %v",
 		doc.Certificates[0].Domains)
 }
+
+// A name that is still declared but filtered out by a guard must not also be reported as
+// "no longer declared".
+//
+// The grace period's absent set was built from "covered last round AND not eligible now",
+// which includes names that are declared right now but failed guard 1 (no CLB rule serves
+// them) or the conflict check. Those got a second, factually false decision saying they were
+// no longer declared and only absent for 0s -- and worse, carry() put them back into the
+// eligible set, so the round kept converging on a name the guard had just rejected. That is
+// exactly the certificate-without-a-rule that guard 1 exists to prevent.
+func TestStillDeclaredNameIsNotReportedAsRemoved(t *testing.T) {
+	const served = "served.example.com"
+	const unserved = "unserved.example.com"
+
+	h := newHarness(t, Options{RequireRule: true})
+
+	// Round 1: both names declared AND served by a rule, so both are covered.
+	h.decls.raw = []RawDeclaration{decl(served), decl(unserved)}
+	h.rules.domains = []string{served, unserved}
+	first := h.run(t)
+	if first.Certificates != 1 {
+		t.Fatalf("round 1 should cover both names, got %d certificates", first.Certificates)
+	}
+
+	// Round 2: the rule for `unserved` disappears, but its declaration stays in DNS.
+	// Guard 1 must reject it -- once, with the guard's own reason.
+	h.rules.domains = []string{served}
+	second := h.run(t)
+
+	var rejections, carries int
+	var reasons []string
+	for _, d := range second.Decisions {
+		if d.Hostname != unserved {
+			continue
+		}
+		if d.Included {
+			carries++
+			reasons = append(reasons, "included: "+d.Reason)
+		} else {
+			rejections++
+			reasons = append(reasons, "rejected: "+d.Reason)
+		}
+	}
+	for _, r := range reasons {
+		t.Logf("decision for %s -> %s", unserved, r)
+	}
+
+	if carries > 0 {
+		t.Errorf("%s is still declared but has no CLB rule; it must not be carried forward, "+
+			"because that keeps issuing a certificate for a name guard 1 rejected", unserved)
+	}
+	if rejections != 1 {
+		t.Errorf("%s must get exactly one decision (the guard's), got %d", unserved, rejections)
+	}
+	for _, r := range reasons {
+		if strings.Contains(r, "no longer declared") {
+			t.Errorf("a name that is declared right now was reported as no longer declared: %s", r)
+		}
+	}
+}
+
+// Absence markers must not accumulate forever.
+//
+// MarkAbsent is reached only from the absent set, which comes from the previous round's
+// COVERED names. Once a name has left the covered set and its grace period has expired, it
+// never re-enters that set -- so nothing clears its marker, and MarkPresent only runs for
+// names that come back. One entry therefore accumulated per name ever removed from a
+// certificate, permanently, on a system whose hostnames churn by design.
+//
+// The marker legitimately survives the round that REMOVES the name (that round still has
+// the name in its previous revision), so the guarantee is "reclaimed once the name has left
+// the previous revision", not "reclaimed the moment it is removed".
+func TestAbsenceMarkersAreReclaimedAfterRemoval(t *testing.T) {
+	// The threshold is raised so that dropping one name of two (50%) does not trip the
+	// abrupt-change fuse: this test is about the absence markers, not about freezing.
+	h := newHarness(t, Options{GracePeriod: time.Hour, DropThreshold: 0.9})
+
+	h.decls.raw = []RawDeclaration{decl("keep.example.com"), decl("doomed.example.com")}
+	if r := h.run(t); r.Certificates != 1 {
+		t.Fatalf("round 1 should cover both names, got %d", r.Certificates)
+	}
+
+	// Round 2: `doomed` stops being declared, so the grace clock starts.
+	h.decls.raw = []RawDeclaration{decl("keep.example.com")}
+	h.rules.domains = []string{"keep.example.com"}
+	if r := h.run(t); r.State.AbsentSince["doomed.example.com"].IsZero() {
+		t.Fatal("the grace clock must start for a name that stopped being declared")
+	}
+
+	// Round 3, past the grace period: the name is removed from the document. Its marker is
+	// still needed this round -- it is what carried the elapsed time that justified removal.
+	h.clock.advance(2 * time.Hour)
+	h.run(t)
+
+	// Round 4: `doomed` is no longer part of the previous revision, so its marker describes
+	// nothing. This is where it must go.
+	h.run(t)
+
+	state, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if _, ok := state.AbsentSince["doomed.example.com"]; ok {
+		t.Error("a name that has left the previous revision must not keep an absence marker; " +
+			"otherwise the state file grows with every name ever removed from a certificate")
+	}
+
+	// Control: a name that IS currently absent must still have its marker, so this cannot be
+	// satisfied by clearing the map.
+	h.decls.raw = []RawDeclaration{decl("keep.example.com"), decl("flappy.example.com")}
+	h.rules.domains = []string{"keep.example.com", "flappy.example.com"}
+	h.run(t)
+	h.decls.raw = []RawDeclaration{decl("keep.example.com")}
+	h.run(t)
+
+	state, err = LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if _, ok := state.AbsentSince["flappy.example.com"]; !ok {
+		t.Error("a name that just stopped being declared must still get a grace clock")
+	}
+}
+
+// The quota ledger must be pruned on every round, not only on rounds that consult it.
+//
+// ChangesWithin both counts and prunes, and it used to be reached only from the path that
+// records a change -- so the -force path (records without counting) and the unchanged path
+// (neither) never pruned. The ledger then grew without bound on a deployment whose name set
+// never changed, which is the common steady state.
+func TestQuotaLedgerIsPrunedOnEveryRound(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	h.run(t)
+
+	// Backdate the ledger far beyond the budget window, directly in the persisted state: the
+	// next round finds the declarations unchanged, so it records nothing and never reaches the
+	// budget check -- which was the only pruner before this fix.
+	state, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	state.Changes = []time.Time{h.clock.now().Add(-30 * 24 * time.Hour)}
+	if err := state.Save(h.opts.StatePath); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	h.run(t)
+
+	after, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if n := len(after.Changes); n != 0 {
+		t.Errorf("a change older than the budget window must be pruned even on a round that does "+
+			"not consult the budget, got %d entries", n)
+	}
+}

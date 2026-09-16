@@ -1,7 +1,9 @@
 package acme
 
 import (
+	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/susunola/wecert/internal/config"
@@ -309,4 +311,65 @@ func (m *Manager) fallbackWindow() time.Duration {
 		return m.fallback.FailureWindowDur
 	}
 	return defaultFallbackFailureWindow
+}
+
+// driftIsTheDegradation reports whether the live certificate's SAN drift is exactly the
+// reduction the fallback record describes, rather than some other config change.
+//
+// This distinction is the difference between holding correctly and holding everything. The
+// drift branch used to test `rd.fallbackActive`, which means only "a cert_fallback row
+// exists" -- so while any row was present, EVERY config change was deferred to
+// notAfter-renewBefore, which under the classic profile is up to a full validity period
+// (~60 days). Adding a name, removing a different name, or an operator who once enabled the
+// policy and switched it off (the row survives) all silently stopped converging. The row is
+// only cleared by a successful full-set issuance, which the hold itself prevents, so the
+// state was self-sustaining.
+//
+// The reduction the record describes is precise: the certificate should cover exactly the
+// configured names minus the names the record says were dropped. Comparing that set against
+// the SANs actually deployed answers the real question -- "is this drift the degradation?" --
+// and anything else is a genuine config change that must converge now, as the drift branch
+// exists to guarantee.
+//
+// A later config change to the SAME set also lands here correctly: if the dropped name has
+// since been removed from the config, the record was pruned first (pruneFallback runs before
+// this), so the expected set no longer subtracts it and the SANs match again.
+func driftIsTheDegradation(
+	leaf *x509.Certificate, c *config.Certificate, store *state.Store,
+	certName string, log *slog.Logger,
+) bool {
+	fb, err := store.GetFallback(certName)
+	if err != nil {
+		// An unreadable record is not evidence of a config change. Hold, which is the
+		// conservative direction: it defers one renewal rather than re-ordering a set that
+		// may be the degraded one.
+		log.Warn("cannot read the fallback record to judge the SAN drift; holding", "cert", certName, "err", err)
+		return true
+	}
+	if fb == nil || len(fb.Dropped) == 0 {
+		// No record (or one describing no reduction): there is nothing for this drift to be,
+		// so it is a config change.
+		return false
+	}
+
+	dropped := make(map[string]bool, len(fb.Dropped))
+	for _, d := range fb.Dropped {
+		dropped[d] = true
+	}
+	expected := make([]string, 0, len(c.Domains))
+	for _, d := range c.Domains {
+		if !dropped[d] {
+			expected = append(expected, d)
+		}
+	}
+
+	if config.DomainKey(expected) != config.DomainKey(leaf.DNSNames) {
+		log.Info("the live certificate's SANs do not match the degraded set either, so this is a "+
+			"config change and not the fallback working; reissuing now instead of holding",
+			"cert", certName,
+			"degradedSetWouldBe", expected,
+			"deployed", leaf.DNSNames)
+		return false
+	}
+	return true
 }

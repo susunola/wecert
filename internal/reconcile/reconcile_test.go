@@ -46,6 +46,14 @@ type fakeManager struct {
 
 	reaped int
 
+	// quotaScopes records every PublishQuota call.
+	quotaScopes []map[string]string
+
+	// pendingRevocations drives HasPendingRevocations, and revocationRetries counts the
+	// retry calls, so a test can assert the gate is honoured.
+	pendingRevocations int
+	revocationRetries  int
+
 	// onReconcile fires on every Reconcile, so tests can cancel and so on.
 	onReconcile func(name string)
 
@@ -79,6 +87,26 @@ func (f *fakeManager) orphanCleaned() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.cleaned...)
+}
+
+// PublishQuota records the scopes it was asked about, so a test can assert the loop reports
+// quota at all without depending on the metric registry.
+func (f *fakeManager) HasPendingRevocations() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pendingRevocations > 0
+}
+
+func (f *fakeManager) RetryPendingRevocations(context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revocationRetries++
+}
+
+func (f *fakeManager) PublishQuota(scopes map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.quotaScopes = append(f.quotaScopes, scopes)
 }
 
 func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
@@ -1209,5 +1237,159 @@ func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 
 	if cleaned := mgr.orphanCleaned(); len(cleaned) != 1 || cleaned[0] != gone {
 		t.Errorf("after the claim is released the orphan must be reaped exactly once, got %v", cleaned)
+	}
+}
+
+// A pass skipped for backoff must not be reported as a success, and must not notify.
+//
+// Manager.Reconcile returns state.ErrBackoff when the certificate is inside the retry
+// window an earlier failure scheduled. That is neither a success nor a failure, and
+// reporting it as either misleads the operator: result="ok" hid a certificate stuck in
+// backoff behind a healthy-looking counter, and the documented notification contract is
+// "every renewal ATTEMPT emits" -- a skip is the absence of an attempt, so emitting
+// result:"ok" for it asserts a renewal that never ran.
+func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
+	const name = "backing-off"
+
+	mgr := &fakeManager{failWith: map[string]error{name: state.ErrBackoff}}
+	notifier := newFakeNotifier()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	r.RunAll(context.Background())
+
+	// No notification: nothing was attempted.
+	select {
+	case ev := <-notifier.events:
+		t.Errorf("a backoff skip must not emit a renewal notification, got cert=%q err=%v", ev.cert, ev.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "ok"}); n != 0 {
+		t.Errorf("a skipped pass must not be counted as ok, got %v -- a certificate in failure "+
+			"backoff looked healthy on the counter an operator watches", n)
+	}
+	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "skipped"}); n != 1 {
+		t.Errorf("a skipped pass must be counted as skipped, got %v", n)
+	}
+	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "error"}); n != 0 {
+		t.Errorf("a backoff skip is not a failure; got error count %v", n)
+	}
+}
+
+// The control: a genuine failure still counts as an error and still notifies, so the fix
+// cannot be satisfied by never notifying or never counting.
+func TestGenuineFailureStillCountsAndNotifies(t *testing.T) {
+	const name = "really-failing"
+
+	mgr := &fakeManager{failWith: map[string]error{name: errors.New("boom")}}
+	notifier := newFakeNotifier()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	r.RunAll(context.Background())
+
+	select {
+	case ev := <-notifier.events:
+		if ev.err == nil {
+			t.Error("a failed pass must carry its error into the notification")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a genuine failure must still notify")
+	}
+	if n := counterValue(t, "wecert_reconcile_total", map[string]string{"cert": name, "result": "error"}); n != 1 {
+		t.Errorf("a genuine failure must count as error, got %v", n)
+	}
+}
+
+// counterValue reads one counter out of the default registry.
+func counterValue(t *testing.T, metric string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != metric {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			got := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				got[lp.GetName()] = lp.GetValue()
+			}
+			match := true
+			for k, v := range labels {
+				if got[k] != v {
+					match = false
+					break
+				}
+			}
+			if match {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+// Outstanding revocations must be retried on every pass, and the gate must be honoured.
+//
+// Revocation is unbounded in time: a request recorded because a key leaked has to keep being
+// attempted until the CA accepts it, across restarts and CA outages. The gate exists because
+// this runs on every pass and almost every deployment has nothing outstanding.
+func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: "kept"})
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: "kept"}}}
+	mgr := &fakeManager{}
+	r := New(cfg, prov, store, mgr, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// Nothing outstanding: the pass must not even ask the manager to retry.
+	r.RunAll(context.Background())
+	if mgr.revocationRetries != 0 {
+		t.Errorf("with nothing outstanding the pass must skip the retry entirely, got %d calls",
+			mgr.revocationRetries)
+	}
+
+	// Something outstanding: every pass retries it, so a CA that was briefly unavailable does
+	// not leave a compromised certificate alive.
+	mgr.mu.Lock()
+	mgr.pendingRevocations = 1
+	mgr.mu.Unlock()
+
+	r.RunAll(context.Background())
+	if mgr.revocationRetries != 1 {
+		t.Errorf("an outstanding revocation must be retried on the pass, got %d calls",
+			mgr.revocationRetries)
+	}
+
+	r.RunAll(context.Background())
+	if mgr.revocationRetries != 2 {
+		t.Errorf("it must be retried on every pass until it succeeds, got %d calls",
+			mgr.revocationRetries)
 	}
 }
