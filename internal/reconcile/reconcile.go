@@ -78,6 +78,11 @@ type CertManager interface {
 	// production manager has one.
 	PublishQuota(scopes map[string]string)
 
+	// HasPendingRevocations is the cheap gate for RetryPendingRevocations.
+	HasPendingRevocations() bool
+	// RetryPendingRevocations re-attempts every revocation the CA has not accepted yet.
+	RetryPendingRevocations(ctx context.Context)
+
 	// CleanupOrphan reclaims the in-flight order and the challenge TXT records
 	// of a certificate that has left the desired state. It must exist on this
 	// interface rather than being optional: skipping it leaks _acme-challenge
@@ -517,6 +522,7 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 		// and ignoring them slowly exhausts the cloud certificate quota.
 		rep.DesiredStateUnreadable = true
 		r.manager.ReapRetired(ctx)
+		r.retryRevocations(ctx)
 		return rep
 	}
 	r.publishOrphans(ctx, res)
@@ -556,6 +562,7 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 	}
 
 	r.manager.ReapRetired(ctx)
+	r.retryRevocations(ctx)
 	r.reclaimStaleProbeSeries()
 	r.publishQuota(res)
 	return rep
@@ -587,6 +594,19 @@ func (r *Reconciler) publishQuota(res *spec.Result) {
 		}
 	}
 	r.manager.PublishQuota(scopes)
+}
+
+// retryRevocations re-attempts outstanding revocations, gated on there being any.
+//
+// Revocation is unbounded in time on purpose: a request recorded because a key leaked must keep
+// being attempted until the CA accepts it, and it must not be forgotten because the process
+// restarted or the CA was briefly unavailable. The gate keeps the common case free -- most
+// deployments have none outstanding, and this runs on every pass.
+func (r *Reconciler) retryRevocations(ctx context.Context) {
+	if !r.manager.HasPendingRevocations() {
+		return
+	}
+	r.manager.RetryPendingRevocations(ctx)
 }
 
 // reclaimStaleProbeSeries drops the per-host probe metric series of hosts that are no
