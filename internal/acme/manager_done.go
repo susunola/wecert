@@ -229,7 +229,10 @@ func (m *Manager) download(
 	}
 
 	if err := m.store.PutCert(st); err != nil {
-		return err
+		// Same rule as everywhere else: a store failure is a failed pass. Returning it raw would
+		// leave ConsecutiveFailures at 0 after a successful issuance whose bookkeeping could not be
+		// written, so nothing would back off and nothing would escalate.
+		return m.recordFailure(st, fmt.Errorf("persist the deployed certificate state: %w", err))
 	}
 	// The fallback record is cleared only when THIS round issued the full desired set --
 	// containsAll(c.Domains, fb.Dropped) is exactly that test, and it is why the record is no

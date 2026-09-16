@@ -997,6 +997,127 @@ func TestSolveChallengesRefreshesAStaleChallengeToken(t *testing.T) {
 	}
 }
 
+// A store failure while solving a challenge must still count as a failure.
+//
+// Four PutAuthorization calls inside solveChallenges used to `return false, err` directly, which
+// skips recordFailure: ConsecutiveFailures stays 0, NextAttemptAt stays unset, LastError stays
+// empty. Nothing then backs off and nothing escalates -- a persistent write failure (a full disk, or
+// SQLITE_BUSY while another process holds the write lock) is retried on every single pass forever,
+// and the certificate's own metrics keep reporting a healthy zero failures. The invariant is written
+// down in advance(): returning early "would skip backoff entirely".
+func TestStoreFailureWhileSolvingCountsAsAPassFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("open state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{}
+	m := newManager(store, fake, &fakeSolver{lookupFound: false}, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cert := &config.Certificate{Name: "site-example-com", Domains: []string{"example.com"}}
+	if err := config.NormalizeCertificates([]config.Certificate{*cert}); err != nil {
+		t.Fatal(err)
+	}
+	cert = &config.Certificate{Name: "site-example-com", Domains: []string{"example.com"}, Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256}
+
+	const authzURL = "https://ca.test/authz/1"
+	seedInterruptedPassWithToken(t, store, cert, authzURL, "tok-1")
+	scriptPendingThenValid(fake, authzURL)
+
+	// Fail the write the solver has to make, through a second connection: a BEFORE UPDATE trigger
+	// leaves every other statement working, which is exactly the "one write is broken" case.
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open second connection: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER block_authz_update BEFORE UPDATE ON authorizations
+		BEGIN SELECT RAISE(FAIL, 'authorization update blocked by test'); END;`); err != nil {
+		t.Fatalf("block authorization updates: %v", err)
+	}
+
+	st := &state.CertState{Name: cert.Name}
+	order := legoacme.ExtendedOrder{
+		Order: legoacme.Order{
+			Status:         "pending",
+			Finalize:       "https://ca.test/finalize/8",
+			Authorizations: []string{authzURL},
+		},
+		Location: "https://ca.test/order/8",
+	}
+
+	if ok, err := m.solveChallenges(context.Background(), cert, st, order); err == nil || ok {
+		t.Fatalf("with the store refusing the write this pass cannot have succeeded: ok=%v err=%v", ok, err)
+	}
+
+	after, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after == nil {
+		t.Fatal("no certificate row was written for a pass that failed on a store error, so the " +
+			"failure is not recorded at all: no counter, no backoff, no LastError")
+	}
+	if after.ConsecutiveFailures == 0 {
+		t.Error("a pass that failed on a store error left ConsecutiveFailures at 0, so nothing backs " +
+			"off and nothing escalates: the same write is retried on every pass forever")
+	}
+	if after.NextAttemptAt.IsZero() {
+		t.Error("no backoff was scheduled for a pass that failed on a store error")
+	}
+}
+
+// A refreshed challenge must actually be accepted.
+//
+// ChallengeSent belongs to the challenge it was set for. When the CA hands back a different one for
+// the same authorization, the old "already sent" flag is about a challenge that no longer exists --
+// and phase 3 skips any row whose flag is set, so the new TXT would be written, never announced, and
+// the order would sit pending until it expired (up to the 7-day order TTL) with nothing counting it.
+func TestSolveChallengesAcceptsARefreshedChallenge(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	solver := &fakeSolver{lookupFound: false}
+	m.dns = solver
+
+	const authzURL = "https://ca.test/authz/1"
+	seedInterruptedPassWithToken(t, store, cert, authzURL, "tok-stale")
+
+	// The earlier pass had announced the challenge it held then, so the row says so.
+	rows, err := store.ListAuthorizations(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected one authorization row, got %d", len(rows))
+	}
+	rows[0].ChallengeSent = true
+	if err := store.PutAuthorization(rows[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	// The live challenge now carries a different token, which is what the CA is waiting for.
+	scriptPendingThenValid(fake, authzURL)
+
+	order := legoacme.ExtendedOrder{
+		Order: legoacme.Order{
+			Status:         "pending",
+			Finalize:       "https://ca.test/finalize/8",
+			Authorizations: []string{authzURL},
+		},
+		Location: "https://ca.test/order/8",
+	}
+	ok, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: cert.Name}, order)
+	if err != nil || !ok {
+		t.Fatalf("solveChallenges = %v, %v", ok, err)
+	}
+
+	if len(fake.accepted) == 0 {
+		t.Error("the row was pointing at a challenge the CA has never been told about, so it must be " +
+			"announced; accepting nothing leaves the order pending until it expires")
+	}
+}
+
 // The probe finds nothing (the write really never happened): write the record. Also pins
 // the computed challenge name: production stores the bare apex as the identifier, and the
 // TXT name must come out as _acme-challenge.example.com.

@@ -37,7 +37,9 @@ func (s *stagedDeployer) Deploy(_ context.Context, _, oldID string, _, _ []byte)
 
 func (s *stagedDeployer) Delete(_ context.Context, _ string) error { return nil }
 
-func (s *stagedDeployer) Bindings(_ context.Context, _ string) (int, error) { return 0, nil }
+func (s *stagedDeployer) Bindings(_ context.Context, _ string) (int, bool, error) {
+	return 0, true, nil
+}
 
 func (s *stagedDeployer) Upload(_ context.Context, _ string, _, _ []byte) (string, error) {
 	s.uploads++

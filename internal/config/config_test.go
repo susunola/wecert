@@ -777,3 +777,77 @@ dns:
 		t.Error("an unknown dns.provider must be rejected")
 	}
 }
+
+// Small values for the DNS timings are not "check more often", they are a flood and a guaranteed
+// failure -- and unlike stateBackup.interval, which has had a one-minute floor all along, these two
+// were only checked to be positive.
+func TestDNSTimingsHaveFloors(t *testing.T) {
+	withCert := minimalPrefix + `certificates:
+  - name: example-com
+    domains: ["example.com"]
+`
+	// The timings live inside the existing dns: block, so substitute rather than append: appending
+	// at the end would put them under tencent: (and a second tencent: key is a YAML error, which is
+	// how this test first failed).
+	withTimings := func(body string) string {
+		return strings.Replace(withCert, "  loginToken: token\n", "  loginToken: token\n"+body, 1)
+	}
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"a busy-poll interval", "  pollingInterval: 1ms\n", "dns.pollingInterval"},
+		{"a budget below the zone's own negative-cache TTL", "  propagationTimeout: 1s\n", "dns.propagationTimeout"},
+		{"an interval that leaves no room to poll twice", "  propagationTimeout: 30s\n  pollingInterval: 30s\n", "must be shorter than"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, withTimings(tc.body)))
+			if err == nil {
+				t.Fatalf("this must be rejected: %s", tc.body)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error must name %q, got %q", tc.want, err)
+			}
+		})
+	}
+
+	// The defaults must still load, or the floors would break every existing config.
+	if _, err := Load(writeConfig(t, withCert)); err != nil {
+		t.Fatalf("the defaults must satisfy the floors: %v", err)
+	}
+}
+
+// The two tencent lists are multiplied into the deploy request (types x regions), so a duplicate is
+// a bigger request and a typo only shows up at deploy time. Every other list in this file is
+// normalised; these were the exception.
+func TestTencentListsAreNormalised(t *testing.T) {
+	body := minimalPrefix + `certificates:
+  - name: example-com
+    domains: ["example.com"]
+`
+	withLists := func(lists string) string {
+		return strings.Replace(body, "  regions: [ap-guangzhou]\n", lists, 1)
+	}
+
+	cfg, err := Load(writeConfig(t, withLists(`  regions: ["ap-guangzhou", " ap-guangzhou ", "AP-SHANGHAI"]
+  resourceTypes: ["clb", "clb", "CDN"]
+`)))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := strings.Join(cfg.Tencent.Regions, ","); got != "ap-guangzhou,ap-shanghai" {
+		t.Errorf("regions = %q, want them lowercased, trimmed and deduplicated", got)
+	}
+	if got := strings.Join(cfg.Tencent.ResourceTypes, ","); got != "clb,cdn" {
+		t.Errorf("resourceTypes = %q, want them lowercased and deduplicated", got)
+	}
+
+	_, err = Load(writeConfig(t, withLists(`  regions: ["ap-guangzhou", ""]
+`)))
+	if err == nil || !strings.Contains(err.Error(), "empty entry") {
+		t.Errorf("a blank region must be rejected rather than sent to the cloud API, got %v", err)
+	}
+}
