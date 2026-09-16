@@ -138,6 +138,29 @@ func updateRespNoProgress(recordID uint64) *ssl.UpdateCertificateInstanceRespons
 	}
 }
 
+// updateRespPartialProgress builds the half-answered variant: the task was created and
+// one region already carries a TotalCount, but the other region's is still null. That
+// is no more an answer than no progress at all -- the task may be switching the null
+// region right now, so the populated region's count (even zero) must not be read as
+// the whole truth.
+func updateRespPartialProgress(recordID uint64, bound int64) *ssl.UpdateCertificateInstanceResponse {
+	return &ssl.UpdateCertificateInstanceResponse{
+		Response: &ssl.UpdateCertificateInstanceResponseParams{
+			DeployRecordId: common.Uint64Ptr(recordID),
+			UpdateSyncProgress: []*ssl.UpdateSyncProgress{{
+				ResourceType: common.StringPtr("clb"),
+				UpdateSyncProgressRegions: []*ssl.UpdateSyncProgressRegion{{
+					Region:     common.StringPtr("ap-guangzhou"),
+					TotalCount: common.Int64Ptr(bound),
+				}, {
+					Region:     common.StringPtr("ap-shanghai"),
+					TotalCount: nil,
+				}},
+			}},
+		},
+	}
+}
+
 func detailResp(success, failed, running int64) *ssl.DescribeHostUpdateRecordDetailResponse {
 	return detailRespPending(success, failed, running, 0)
 }
@@ -150,6 +173,15 @@ func detailRespPending(success, failed, running, pending int64) *ssl.DescribeHos
 			RunningTotalCount: common.Int64Ptr(running),
 			PendingTotalCount: common.Int64Ptr(pending),
 		},
+	}
+}
+
+// detailRespUninstrumented is what the record detail looks like before the server
+// instruments the task: the response exists, but every counter field is still null.
+// Null is not zero -- this must read as "no answer yet", never as "nothing bound".
+func detailRespUninstrumented() *ssl.DescribeHostUpdateRecordDetailResponse {
+	return &ssl.DescribeHostUpdateRecordDetailResponse{
+		Response: &ssl.DescribeHostUpdateRecordDetailResponseParams{},
 	}
 }
 
@@ -483,6 +515,92 @@ func TestUpdateInstanceWithNoProgressDetailWaitsForTheTask(t *testing.T) {
 	}
 }
 
+// The half-answered variant of the incident above: one region already carries a
+// TotalCount of zero while another region's is still null. Reading the populated half
+// as the whole answer would fire "nothing is bound" while the task may be switching
+// the null region, so a partially populated progress must defer to the async record
+// exactly like a fully absent one.
+func TestUpdateInstanceWithPartialProgressDetailWaitsForTheTask(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var detailCalls int
+	fake := &fakeSSLAPI{
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			return updateRespPartialProgress(14822, 0), nil
+		},
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			detailCalls++
+			return detailResp(1, 0, 0), nil
+		},
+	}
+
+	if err := d.updateInstance(context.Background(), fake, "old-id", "new-id"); err != nil {
+		t.Fatalf("a partially populated progress must not fail the rebind as unbound: %v", err)
+	}
+	if detailCalls != 1 {
+		t.Errorf("detailCalls = %d, want the decision deferred to the deploy record", detailCalls)
+	}
+}
+
+// The record detail has the same async-population hazard as the sync progress: until
+// the server instruments the task, every counter field is null. Null read as zero past
+// the grace period would fire the no-binding verdict against a task that simply has
+// not been measured yet, so uninstrumented answers must keep the wait going even after
+// the grace expires.
+func TestWaitDeployRecordWaitsForUninstrumentedCounters(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var calls int
+	fake := &fakeSSLAPI{
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			calls++
+			// Four uninstrumented polls at 5s each put the clock well past the 15s
+			// grace -- past the point where populated zeros would be a verdict.
+			if calls < 5 {
+				return detailRespUninstrumented(), nil
+			}
+			return detailResp(1, 0, 0), nil
+		},
+	}
+
+	if err := d.waitDeployRecord(context.Background(), fake, 7, "old-id"); err != nil {
+		t.Fatalf("uninstrumented counters past the grace period are not a verdict, got: %v", err)
+	}
+	if calls != 5 {
+		t.Errorf("calls = %d, want the wait to continue until the task is instrumented and settles", calls)
+	}
+}
+
+// A task whose record is never instrumented at all must end at the deadline with the
+// timeout error, not with the no-binding diagnosis -- the server never answered, so
+// "no resource bound" is a claim nobody made.
+func TestWaitDeployRecordUninstrumentedUntilDeadlineIsNotANoBindingVerdict(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	fake := &fakeSSLAPI{
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			return detailRespUninstrumented(), nil
+		},
+	}
+
+	err := d.waitDeployRecord(context.Background(), fake, 7, "old-id")
+	if err == nil {
+		t.Fatal("a task that never settles must not be treated as success")
+	}
+	if !strings.Contains(err.Error(), "did not finish within 3m") {
+		t.Errorf("err = %v, want the deadline timeout", err)
+	}
+	if strings.Contains(err.Error(), "no resource bound to the old certificate") {
+		t.Errorf("err = %v, the server never answered, so the no-binding diagnosis is wrong", err)
+	}
+}
+
 // Queued-but-not-started resources count as unfinished. Resources are dispatched in
 // batches, so "nothing is running" can be true while most of the task has not begun --
 // and declaring success there retires the old certificate while listeners still serve it.
@@ -563,7 +681,7 @@ func TestWaitDeployRecordDeadlineUsesLastKnownCounters(t *testing.T) {
 	if err == nil {
 		t.Fatal("a task that never finishes must not be treated as success")
 	}
-	if strings.Contains(err.Error(), "no resource appears to be bound") {
+	if strings.Contains(err.Error(), "no resource bound to the old certificate") {
 		t.Errorf("err = %v, progress was seen before the errors, so the no-binding diagnosis is wrong", err)
 	}
 	if !strings.Contains(err.Error(), "did not finish within 3m") || !strings.Contains(err.Error(), "running=1") {

@@ -27,6 +27,9 @@ type fakeReconciler struct {
 	names   []string
 	started []string
 	failFor map[string]error
+
+	// startAllErr simulates "the desired state is unreadable": nothing started.
+	startAllErr error
 }
 
 func (f *fakeReconciler) CertNames() []string { return f.names }
@@ -36,14 +39,18 @@ func (f *fakeReconciler) StartCert(_ context.Context, name string) error {
 	return f.failFor[name]
 }
 
-func (f *fakeReconciler) StartAll(_ context.Context) []string {
-	var skipped []string
+func (f *fakeReconciler) StartAll(ctx context.Context) (accepted, skipped []string, err error) {
+	if f.startAllErr != nil {
+		return nil, nil, f.startAllErr
+	}
 	for _, n := range f.names {
-		if err := f.StartCert(context.Background(), n); err != nil {
+		if err := f.StartCert(ctx, n); err != nil {
 			skipped = append(skipped, n)
+		} else {
+			accepted = append(accepted, n)
 		}
 	}
-	return skipped
+	return accepted, skipped, nil
 }
 
 func newTestServer(t *testing.T, rec Reconciler) (*Server, *state.Store) {
@@ -181,8 +188,8 @@ func TestAuthLockoutAfterFailures(t *testing.T) {
 	}
 }
 
-// A good token proves the address is the legitimate caller, so its failure
-// counter is forgiven.
+// A good token decays the failure counter (see recordSuccess): one success
+// after a few failures must keep the address well clear of the lockout.
 func TestAuthSuccessForgivesFailures(t *testing.T) {
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
@@ -464,6 +471,113 @@ func TestNotifierDoesNotBlockOnDeadEndpoint(t *testing.T) {
 func TestNewNotifierDisabledWhenURLEmpty(t *testing.T) {
 	if n := NewNotifier("", "", slog.New(slog.NewTextHandler(io.Discard, nil))); n != nil {
 		t.Error("an empty url should return nil")
+	}
+}
+
+// When the desired state is unreadable a full trigger starts nothing, so the
+// answer must be 503 -- never 202 with every certificate "accepted" (from the
+// last good cache) for a convergence that will never happen.
+func TestTriggerAllDesiredStateUnavailable(t *testing.T) {
+	rec := &fakeReconciler{
+		names:       []string{"a", "b"},
+		startAllErr: reconcile.ErrDesiredStateUnavailable,
+	}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", "", bearer())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("an unreadable desired state should return 503, got %d", w.Code)
+	}
+	if len(rec.started) != 0 {
+		t.Errorf("nothing should be started, got %v", rec.started)
+	}
+}
+
+// An explicit "cert": "" is indistinguishable from an absent field as a plain
+// string and would silently widen into a full trigger -- the same problem as
+// "certs": [], so it gets the same answer.
+func TestTriggerRejectsEmptyCertString(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":""}`, bearer())
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("an explicit empty cert should return 400, got %d", w.Code)
+	}
+	if len(rec.started) != 0 {
+		t.Errorf("nothing should be triggered, got %v", rec.started)
+	}
+}
+
+// A desired-state read failure behind a single-certificate trigger is a
+// transient internal problem, not "not managed": reporting it in unknown tells
+// the caller to give up on a certificate that may well exist.
+func TestTriggerCertResolveFailureIs503(t *testing.T) {
+	rec := &fakeReconciler{
+		names:   []string{"a"},
+		failFor: map[string]error{"a": reconcile.ErrDesiredStateUnavailable},
+	}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("a resolve failure should return 503, got %d", w.Code)
+	}
+}
+
+// A true not-found still lands in the unknown bucket with a 202 -- that is the
+// one case where "we do not manage this name" is the honest answer.
+func TestTriggerUnknownCertSentinelIsReportedUnknown(t *testing.T) {
+	rec := &fakeReconciler{
+		names:   []string{"a"},
+		failFor: map[string]error{"a": reconcile.ErrUnknownCert},
+	}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("a genuine not-found should still return 202, got %d", w.Code)
+	}
+
+	var resp reconcileResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Unknown) != 1 || resp.Unknown[0] != "a" {
+		t.Errorf("the name should be reported in unknown, got %+v", resp)
+	}
+}
+
+// A duplicated name would otherwise be started twice: the second start reports
+// "already running", and one certificate shows up as both accepted and skipped.
+func TestTriggerDeduplicatesRepeatedNames(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a", "b"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"certs":["a","a"]}`, bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("should return 202, got %d", w.Code)
+	}
+	if len(rec.started) != 1 || rec.started[0] != "a" {
+		t.Errorf("a should be started exactly once, got %v", rec.started)
+	}
+
+	var resp reconcileResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Accepted) != 1 || len(resp.Skipped) != 0 {
+		t.Errorf("a should be accepted once and never skipped, got %+v", resp)
+	}
+}
+
+// An empty certificate list must serialize as [], not null -- clients that
+// iterate the field read null as "no answer".
+func TestStatusEmptyCertificatesSerializesAsEmptyArray(t *testing.T) {
+	s, _ := newTestServer(t, &fakeReconciler{})
+
+	w := do(t, s, http.MethodGet, "/hook/status", "", bearer())
+	if w.Code != http.StatusOK {
+		t.Fatalf("should return 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"certificates": []`) {
+		t.Errorf("an empty list must serialize as [], got %s", w.Body.String())
 	}
 }
 

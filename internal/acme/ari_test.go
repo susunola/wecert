@@ -92,19 +92,32 @@ func TestDeterministicTimeWithinSpread(t *testing.T) {
 // and we never get the "exempt from every rate limit" treatment.
 func TestCertIDFormat(t *testing.T) {
 	aki := []byte{0x01, 0x02, 0x03, 0xff}
-	serial := big.NewInt(0xdeadbeef)
 
-	leaf := &x509.Certificate{AuthorityKeyId: aki, SerialNumber: serial}
-
-	got, err := CertID(leaf)
-	if err != nil {
-		t.Fatalf("CertID returned an error: %v", err)
+	cases := []struct {
+		name    string
+		serial  *big.Int
+		wantDER []byte
+	}{
+		// 0xde has the top bit set: DER must carry a leading 0x00 or the INTEGER reads
+		// as negative. big.Int.Bytes() drops that byte, and pinning the dropped form
+		// here is what let the wrong encoding through review in the first place.
+		{"high-bit serial gets the DER leading zero", big.NewInt(0xdeadbeef), []byte{0x00, 0xde, 0xad, 0xbe, 0xef}},
+		{"low-bit serial stays untouched", big.NewInt(0x1eaf), []byte{0x1e, 0xaf}},
 	}
 
-	want := base64.RawURLEncoding.EncodeToString(aki) + "." +
-		base64.RawURLEncoding.EncodeToString(serial.Bytes())
-	if got != want {
-		t.Errorf("CertID = %q, want %q", got, want)
+	for _, tc := range cases {
+		leaf := &x509.Certificate{AuthorityKeyId: aki, SerialNumber: tc.serial}
+
+		got, err := CertID(leaf)
+		if err != nil {
+			t.Fatalf("%s: CertID returned an error: %v", tc.name, err)
+		}
+
+		want := base64.RawURLEncoding.EncodeToString(aki) + "." +
+			base64.RawURLEncoding.EncodeToString(tc.wantDER)
+		if got != want {
+			t.Errorf("%s: CertID = %q, want %q", tc.name, got, want)
+		}
 	}
 }
 

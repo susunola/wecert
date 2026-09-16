@@ -136,6 +136,11 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 	}
 
 	if len(attemptErrs) > 0 {
+		// Not every resolved address was verified, so "the served certificate is
+		// the deployed one" is unproven. Leaving probe_match at its previous value
+		// would keep reporting a stale 1 while the verdict is non-OK -- exactly the
+		// false green this metric exists to rule out.
+		metrics.CertificateProbeMatch.WithLabelValues(host).Set(0)
 		msg := "some resolved addresses could not be probed: " + strings.Join(attemptErrs, " | ")
 		r.transition(host, stateUnreachable,
 			"some addresses could not be reached to check which certificate they serve", "err", msg)
@@ -147,6 +152,28 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		"notAfter", first.NotAfter, "daysLeft", first.DaysLeft(e.Now), "issuer", first.Issuer,
 		"trusted", first.Trusted, "handshakeMs", first.HandshakeMS)
 	return Verdict{OK: true}
+}
+
+// LastState returns the previous state for a name, mainly for diagnostics.
+// An empty string means it has never been probed.
+func (r *Runner) LastState(host string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.last[host]
+}
+
+// Forget drops the remembered state for a host that will never be probed again
+// (its certificate left the desired state).
+//
+// Without it, last grows with every host ever seen -- and certificate names are
+// derived from domains, which churn by design. The exported metric series have
+// the same problem and are reclaimed separately (metrics.DeleteProbeSeries);
+// both have to happen, or a dropped host leaks memory here and a frozen gauge
+// there.
+func (r *Runner) Forget(host string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.last, host)
 }
 
 func (r *Runner) transition(host, state, msg string, attrs ...any) {
