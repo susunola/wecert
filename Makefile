@@ -18,10 +18,22 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # 随产品发布的命令。webhook 触发的那一半不在这里时，这里也要同步补上。
 CMDS := wecert wecert-onboard
 
-.PHONY: build tools release test vet cover clean fmt validate-cloudinit fmt-check check
+.PHONY: build tools release test vet cover clean fmt validate-cloudinit fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
+
+# readme 里嵌的六张 PNG。先量再渲：量出有标签溢出就停下，不产出坏图。
+#
+# 之所以要有这条命令而不是手工导一次：PNG 是二进制，代码改了它不会自己跟。
+# 有一条可重跑的路径，「图过期了」才只是一次 `make diagrams` 的事。
+diagrams: diagrams-check
+	python3 scripts/render-diagrams.py
+
+# 只量不渲。在浏览器里真测每个 foreignObject 的标签有没有溢出盒子 ——
+# 按字符宽度估高度是不可靠的，前一版就漏掉过一整行被裁掉的情况。
+diagrams-check:
+	python3 scripts/check-diagram-fit.py
 
 # 构建辅助工具（preflight 前置检查、clbverify 监听器绑定取证、probe 网络侧取证）。
 tools:

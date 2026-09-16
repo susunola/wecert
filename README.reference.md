@@ -59,6 +59,7 @@ One machine, one binary, one SQLite file. Because decryption happens at the load
 - [Prerequisites](#prerequisites)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
+- [The certificate lifecycle](#the-certificate-lifecycle)
 - [Domains that change often](#domains-that-change-often)
 - [Configuration reference](#configuration-reference)
 - [Operations](#operations)
@@ -289,43 +290,14 @@ wecert/
 
 ### Reconcile lifecycle
 
-Every certificate follows the same decision path on each pass. **The order of the checks matters:**
+Every certificate follows the same decision path on each pass. **The order of the checks matters** — see [Reconcile decisions](#3-reconcile-decisions) for the diagram.
 
-```
-Reconcile(cert)
-  │
-  ├─ inside backoff window?              → skip (don't knock on the CA's door)
-  │
-  ├─ an in-flight order exists?
-  │    ├─ expired?                       → discard (cleans DNS first), fall through
-  │    ├─ identifiers ≠ config?          → discard (config changed), fall through
-  │    └─ otherwise                      → advance it; never create a new order
-  │
-  ├─ no order: reclaim orphaned TXT from a previous half-finished cleanup
-  │
-  ├─ no certificate yet?                 → issue (first issuance)
-  │
-  ├─ live SANs ≠ config domains?         → issue immediately   ← before the time check
-  │
-  └─ renewalDecision()                   → ARI window, or notAfter − renewBefore
-       └─ window reached?                → issue with `replaces`
-```
+Two things that diagram does not show, because they are about *when* rather than *what*:
 
-`advance` walks the ACME order state machine:
+- **An order's identifier set is fixed when it is created.** If the configuration changes while it is still open, the order is discarded and rebuilt, rather than holding to "never create a new order" and advancing one whose CSR can no longer finalize.
+- **Discarding an order cleans DNS first.** The authorization rows are the only record of which TXT records were written, so deleting them first leaks those records permanently.
 
-```
-Orders.Get
-  ├─ valid    → download → verify → deploy → promote state
-  ├─ ready    → finalize (POST the CSR to the *finalize* URL) → wait valid → download
-  ├─ invalid  → discard order, record failure, back off
-  └─ pending  → solveChallenges ─┬─ write every TXT
-       / processing              ├─ wait for propagation across all zones at once
-                                 ├─ trigger verification for every authorization
-                                 ├─ poll until all valid
-                                 └─ clean up every TXT
-```
-
-The write-all-then-clean-up shape (rather than per authorization) is what makes a wildcard plus its apex work.
+The ACME order state machine is in [Order state machine](#4-order-state-machine).
 
 ### State schema
 
@@ -393,6 +365,123 @@ Migrations run on `Open` and add missing columns in place (`PRAGMA table_info` +
 | `internal/deploy` | The `Deployer` interface, the Tencent CLB implementation, and credential sources (CVM role metadata or static). |
 | `internal/reconcile` | Iterates all certificates; one certificate failing never blocks the others; publishes metrics. |
 | `internal/metrics` | Prometheus collectors. |
+
+## The certificate lifecycle
+
+Six diagrams covering the whole path, from "somebody added a line to a DNS zone" to "the old certificate is deleted from the cloud". They are also available as a single interactive page — with working links between the figures and a print/PDF button — at [docs/certificate-lifecycle.html](docs/certificate-lifecycle.html); the images below are that same page rendered.
+
+Regenerate them with `make diagrams`, which first *measures* every label in a real browser and refuses to render if any of them overflows its box.
+
+### 1. System map — who owns what, who only reads
+
+![wecert system map: the declaration layer, the inference layer, the contract, the execution layer, and external services](docs/diagrams/01-system-map.png)
+
+Left to right is the transfer of authority: **intent** (written by a human) → **inference** (disposable) → **contract** (machine-written) → **execution** (must be stable) → **external**. Each layer has a different failure mode, and that is exactly why they are separated.
+
+### 2. Intent → contract — the inference pipeline
+
+![wecert-onboard pipeline: enumerate, parse and filter, group and cover, gates, assemble, atomic write](docs/diagrams/02-intent-to-contract.png)
+
+Note that red is only attached where a freeze actually happens. A bad declaration in stage 2 excludes just that one; a group that exceeds the SAN limit in stage 3 keeps only that group's previous revision. **Neither freezes the whole run** — a single typo must not stop every certificate from being updated.
+
+**Wildcard-first is where the quota is saved:**
+
+| Action | Without a wildcard | With `*.example.com` declared |
+|---|---|---|
+| Add `foo.example.com` | 1 re-issuance | **0** — the SAN set does not change |
+| Import 50 subdomains | 50 → the weekly allowance is gone | **0** |
+| Add `a.b.example.com` | 1 re-issuance | 1 — needs `*.b.example.com` |
+| Add `example.net` | 1 re-issuance | 1 — a different registered domain is a different certificate |
+
+> **A wildcard is never invented.** Declaring `*.example.com` means the certificate can complete a handshake for *any* subdomain — that is a privilege expansion, and it has to be an explicit declaration rather than something the grouping logic decides on your behalf. For the same reason `*.example.com` does **not** cover `example.com`; both need declaring.
+
+### 3. Reconcile decisions
+
+![the five ordered checks wecert runs for each certificate](docs/diagrams/03-reconcile-decisions.png)
+
+The checks are **ordered**. The first branch that matches decides what this pass does, and if none match the answer is "do nothing" — which is what happens on the overwhelming majority of passes.
+
+> **Three invariants decide that order.** (1) At most one in-flight order per certificate, and the order URL is on disk before anything else happens. (2) Renewals are ARI-first and carry `replaces`. (3) A wildcard and its apex share one `_acme-challenge` name, so the TXT records are written together, verified together and cleaned up together. Breaking any of them runs straight into *5 certificates per exact set of identifiers / 7 days* — and that limit has no override.
+
+### 4. Order state machine
+
+![the ACME order state machine and where each state is persisted](docs/diagrams/04-order-state-machine.png)
+
+The entire point of this state machine is that **the process can be killed at any moment**. Every state has a corresponding column in `state.db`, and those columns are what decide, after a restart, whether to carry on or to place a new order.
+
+> **The order URL must be on disk immediately after `newOrder` returns, before anything else.** That is the whole of the crash-safety story: without it, a process killed during the few minutes of DNS propagation would place a second order whose identifier set is identical to the first — straight into the exact-set limit, with **no override available**.
+
+The same reasoning explains why an order's identifier set is stored separately: it is fixed when the order is created. If the configuration changes in the meantime, the correct action is to **discard and rebuild** the order, not to honour "never create a new order" and keep advancing one whose CSR can no longer finalize.
+
+### 5. DNS-01 — a wildcard and its apex share one TXT name
+
+![DNS-01 sequence showing the write-all, verify-all, clean-up-all shape](docs/diagrams/05-dns01-sequence.png)
+
+This is the easiest part to get wrong and the hardest to notice. `example.com` and `*.example.com` both put their challenge at `_acme-challenge.example.com` — one name, two values.
+
+Handling identifiers one at a time — write, verify, clean, next — means the value written for `*.example.com` gets removed or overwritten before `example.com` is reached. DNSPod allows several TXT records under one name, but the **cleanup has to happen together**, or a challenge that already verified becomes invalid again.
+
+Propagation checking uses a quorum rather than "every authoritative nameserver reachable": in practice one of nine is routinely unreachable (measured: 8 confirm, 0 deny, 1 unreachable). Demanding all of them would never pass. The criterion is **no reachable nameserver denies it, and at least two confirm**.
+
+### 6. The life of one certificate
+
+![certificate lifetime timeline: issuance, deploy, ARI window, renewBefore fallback, expiry](docs/diagrams/06-certificate-lifetime.png)
+
+The axis is drawn for a `classic` 90-day certificate. What actually decides when renewal happens is ARI's `suggestedWindow`; `renewBefore` below it is only the fallback for when ARI is unavailable.
+
+| Profile | Validity | Max Names | Default `renewBefore` |
+|---|---|---|---|
+| `classic` (default) | 90 days | 100 | 30 days |
+| `tlsserver` | 45 days | **25** | 15 days |
+| `shortlived` | 160 hours | 25 | 48 hours |
+
+The CA/Browser Forum has scheduled **≤100 days from 2027-03-15 and ≤47 days from 2029-03-15**, so "90 days plus a manual fallback" stops being an option within two years. The desired-state generator caps a certificate at **25** names by default (aligned with `tlsserver`) so that switching profiles later needs no redesign.
+
+### Data ownership
+
+"Losing it" is the column worth remembering: it decides where each piece of state belongs and whether it needs backing up.
+
+| Thing | Written by | Read by | If it is lost |
+|---|---|---|---|
+| `_wecert.*` TXT declarations | a human / CI | wecert-onboard | **Matters** — after the grace period the names are removed from the certificate |
+| `desired-state.yaml` | wecert-onboard | wecert | **Safe** — wecert freezes on the previous revision and alarms |
+| `onboard-state.json` | wecert-onboard | wecert-onboard | **Matters** — the grace period resets, so deletion becomes aggressive |
+| `desired-state.report.json` | wecert-onboard | a human | **Harmless** — troubleshooting only |
+| `state.db` | wecert | wecert | **Disaster** — order URLs, ARI certIDs and CertIds all gone, so orders are re-placed into the exact-set limit |
+| The ACME account key | wecert | wecert | **Disaster** — accounts are a limited resource (10 per IP per 3 hours) |
+
+### Failure semantics
+
+Every kind of "cannot read it" has a defined reaction. **None of them treats "unreadable" as "gone".**
+
+| Situation | Reaction | Why |
+|---|---|---|
+| Declaration source unreadable | **Freeze the whole run**, document untouched | Empty is not the same as gone; acting on it would reissue a certificate with no names |
+| CLB guard unreadable | **No deletions at all**, and the guard counts as satisfied | Degrading makes safety disappear along with the dependency, precisely when you need it most |
+| Document unreadable (runtime) | Freeze on the last good revision and keep renewing from it | Renewals continue; only new names stop arriving |
+| Document unreadable (startup, `enforce`) | **Hard failure, does not start** | Failing to start is loud; "starts but renews nothing" is silent |
+| Desired state computes to empty | **Refuse to write**, `-force` does not override | A legitimate empty state and a failed generation look identical in the file |
+| Declared set drops by more than 30% | Freeze and alert | A normal decommission does not lose a third of the names |
+| More than 25 name-set changes in 7 days | Freeze and alert | Let's Encrypt allows 50 per registered domain per 7 days, shared across accounts |
+| Removing a name | Only when **confirmed absent, past the 24h grace period, and unreferenced by any CLB rule** | Deletion is an order of magnitude more dangerous than addition |
+| A group exceeds 25 SANs | Keep that group's previous revision | Dropping the group would show wecert a certificate that vanished |
+| One declaration is malformed | Exclude just that one, record the reason | A single typo must not stop every certificate from updating |
+| One certificate fails to issue | Does not affect the others | One misconfigured certificate holding up every renewal is the most dangerous coupling in automation |
+| Near expiry and issuance keeps failing (`failureFallback` on) | Drop the names that keep failing and issue for the rest | Partial availability beats total failure; only names with evidence of individual failure are dropped, and it heals itself |
+
+### The rate-limit arithmetic
+
+| Limit | Allowance | When you hit it | How to avoid it |
+|---|---|---|---|
+| New Orders / account | 300 / 3 hours | Re-placing orders | Persist the order URL and reuse it after a crash |
+| New Certs / registered domain | 50 / 7 days, **shared across accounts** | Frequent changes to the name set | Wildcard-first plus a 25-changes-per-week budget |
+| New Certs / **exact identifier set** | 5 / 7 days, **no override** | Reissuing the same name set repeatedly | At most one in-flight order per certificate |
+| Authorization failures / identifier | 5 / hour | Retrying a name whose DNS is not configured | Backoff, then hand over to a human |
+| **ARI-coordinated renewals** | **exempt from all of the above** | — | The order must carry `replaces` and the identifier set must be unchanged |
+
+That last row is what makes wildcard-first more than an optimisation: **changing the name set makes the issuance a brand-new certificate**, which forfeits the ARI exemption. The cost of "add one domain" therefore has to be driven to nearly zero, and a wildcard is the only way to do that. It is also why the desired-state generator prefers to report "covered by the declared wildcard, 0 issuances" over touching the SAN set.
+
+---
 
 ## Domains that change often
 
