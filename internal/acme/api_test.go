@@ -681,6 +681,11 @@ func TestAdvanceProcessingOrderWaitsForValidAndDownloads(t *testing.T) {
 // round does about it is what these tests pin down.
 func seedInterruptedPass(t *testing.T, store *state.Store, cert *config.Certificate, authzURL string) {
 	t.Helper()
+	seedInterruptedPassWithToken(t, store, cert, authzURL, "tok-1")
+}
+
+func seedInterruptedPassWithToken(t *testing.T, store *state.Store, cert *config.Certificate, authzURL, token string) {
+	t.Helper()
 
 	key, err := GenerateKey(cert.KeyType)
 	if err != nil {
@@ -698,7 +703,7 @@ func seedInterruptedPass(t *testing.T, store *state.Store, cert *config.Certific
 	}
 	if err := store.PutAuthorization(&state.Authorization{
 		CertName: cert.Name, AuthzURL: authzURL, Identifier: "example.com",
-		Status: "pending", ChallengeURL: "https://ca.test/chall/1", ChallengeToken: "tok-1",
+		Status: "pending", ChallengeURL: "https://ca.test/chall/1", ChallengeToken: token,
 		Presented: false,
 	}); err != nil {
 		t.Fatal(err)
@@ -752,6 +757,55 @@ func TestSolveChallengesAdoptsTXTFromInterruptedPass(t *testing.T) {
 	}
 	if len(lookups) == 0 || lookups[0] != "example.com" {
 		t.Errorf("the adoption path must probe for the old record first, got lookups %v", lookups)
+	}
+}
+
+// The token stored in the row can be stale: an earlier pass recorded the challenge it was
+// solving, and the CA later handed out a different challenge for the same authorization.
+// If the row keeps the old token it no longer hashes to its own TxtValue, and cleanup then
+// derives a value that was never registered -- CleanUp reads that as "another challenge is
+// still live at this name" and the provider's delete-all never fires again for the name,
+// stranding every later TXT record there.
+func TestSolveChallengesRefreshesAStaleChallengeToken(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	solver := &fakeSolver{lookupFound: false}
+	m.dns = solver
+
+	const authzURL = "https://ca.test/authz/1"
+	// The interrupted pass was solving "tok-stale"; the live challenge now carries "tok-1".
+	seedInterruptedPassWithToken(t, store, cert, authzURL, "tok-stale")
+	scriptPendingThenValid(fake, authzURL)
+	fake.certPEM = selfSignedCertPEM(t, time.Now().Add(90*24*time.Hour), cert.Domains...)
+
+	// solveChallenges rather than Reconcile: a successful Reconcile ends by discarding the
+	// order, which deletes the authorization rows.
+	order := legoacme.ExtendedOrder{
+		Order: legoacme.Order{
+			Status:         "pending",
+			Finalize:       "https://ca.test/finalize/8",
+			Authorizations: []string{authzURL},
+		},
+		Location: "https://ca.test/order/8",
+	}
+	ok, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: cert.Name}, order)
+	if err != nil || !ok {
+		t.Fatalf("solveChallenges = %v, %v", ok, err)
+	}
+
+	rows, err := store.ListAuthorizations(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected one authorization row, got %d", len(rows))
+	}
+	// The row has to describe the challenge this pass actually solved, so its token and
+	// its value agree.
+	if rows[0].ChallengeToken != "tok-1" {
+		t.Errorf("the row must carry the live challenge token, got %q", rows[0].ChallengeToken)
+	}
+	if rows[0].TxtValue != "txt-tok-1" {
+		t.Errorf("TxtValue must be the value written for the live token, got %q", rows[0].TxtValue)
 	}
 }
 

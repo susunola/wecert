@@ -282,6 +282,12 @@ type Report struct {
 	CarriedForward    int `json:"carriedForward"`
 	Certificates      int `json:"certificates"`
 
+	// DeclarationDrop is how many names the declaration set lost since the previous
+	// round, whatever the verdict. The fuse only freezes above the threshold, so a
+	// run of sub-threshold drops would otherwise erode the set silently; this makes
+	// the pattern alertable.
+	DeclarationDrop int `json:"declarationDrop,omitempty"`
+
 	Revision         string          `json:"revision,omitempty"`
 	PreviousRevision string          `json:"previousRevision,omitempty"`
 	Decisions        []spec.Decision `json:"decisions"`
@@ -611,6 +617,20 @@ func hostnameFromRecord(record string) string {
 // at once is almost certainly an upstream fault (incomplete API response, changed
 // permissions, zone read failure). Acting on that strips SANs in bulk. Freezing is
 // safer than acting.
+//
+// Known limit, and it is deliberate: because the baseline is rebased on every round
+// that passes, the fuse bounds the drop **per round**, not cumulatively. An upstream
+// that loses a slice just under the threshold every round still erodes the set
+// (10 -> 7 -> 5 -> 4 ...). Comparing against a fixed high-water mark instead would
+// catch that, but every variant of it also counts the grace-carried names of a
+// staged decommission as "lost" on each step, which re-trips the fuse, stops
+// MarkAbsent from running, and wedges the round into a self-sustaining freeze --
+// exactly the failure TestStagedDecommissionDoesNotWedgeTheFuse pins down. There is
+// no local rule that separates "the source is eroding" from "the operator is
+// decommissioning in stages": both are the same names staying gone. So the per-round
+// bound is kept, and a sub-threshold drop is **reported** instead (DeclarationDrop)
+// so that a run of them is visible to alerting rather than silent. The grace period
+// and the CLB reference check are what bound the damage of each individual deletion.
 func (r *run) fuse() {
 	if r.o.opts.Force {
 		return
@@ -639,7 +659,18 @@ func (r *run) fuse() {
 	}
 
 	ratio := float64(lost) / float64(len(prev))
+	r.rep.DeclarationDrop = lost
+
 	if ratio <= r.o.opts.DropThreshold {
+		// Below the freeze threshold, so the round proceeds -- but a run of these is
+		// how a source that keeps returning slightly incomplete data erodes the
+		// declaration set without ever tripping the fuse. Log it so the pattern is
+		// visible instead of only showing up as a smaller document over time.
+		r.o.log.Warn("the declared name set shrank, but stayed under the freeze threshold",
+			"was", len(prev), "now", len(now), "lost", lost,
+			"ratio", fmt.Sprintf("%.0f%%", ratio*100),
+			"threshold", fmt.Sprintf("%.0f%%", r.o.opts.DropThreshold*100),
+			"hint", "a one-off is normal; the same shrink every round means the declaration source is losing data")
 		return
 	}
 
