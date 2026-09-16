@@ -31,7 +31,13 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 	if err != nil {
 		return m.recordFailure(st, fmt.Errorf("get order: %w", err))
 	}
-	m.persistOrder(o, order)
+	// Same contract as the other two call sites: persistOrder returns its write
+	// error, and a failed write means crash recovery would resume from stale state.
+	// Discarding it would defeat the point of making it return one, and Go does not
+	// warn about a dropped return value.
+	if err := m.persistOrder(o, order); err != nil {
+		return m.recordFailure(st, err)
+	}
 
 	switch order.Status {
 	case "valid":
