@@ -65,7 +65,9 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 	if err != nil {
 		return m.recordFailure(st, err)
 	}
-	m.persistOrder(o, ready)
+	if err := m.persistOrder(o, ready); err != nil {
+		return m.recordFailure(st, err)
+	}
 	if ready.Status == "valid" {
 		return m.download(ctx, c, st, o, ready)
 	}
@@ -461,7 +463,9 @@ func (m *Manager) finalize(
 	if err != nil {
 		return m.recordFailure(st, err)
 	}
-	m.persistOrder(o, final)
+	if err := m.persistOrder(o, final); err != nil {
+		return m.recordFailure(st, err)
+	}
 	return m.download(ctx, c, st, o, final)
 }
 

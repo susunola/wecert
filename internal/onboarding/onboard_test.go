@@ -270,6 +270,51 @@ func TestSourceFailureDoesNotAdvanceTheGraceClock(t *testing.T) {
 
 // ── §5.2 abrupt desired-state fuse ─────────────────────────────────────────
 
+// A DropThreshold at or above 1 can never be exceeded, so the fuse would never
+// fire. The config layer rejects it, but the CLI -drop-threshold flag reaches
+// Options directly -- the constructor must hold the same line.
+func TestDropThresholdAtOrAboveOneIsRejected(t *testing.T) {
+	// New validates several required paths before it reaches the policy checks, so
+	// they all have to be filled in. Otherwise every case below would fail for an
+	// unrelated reason and the test would pass without the check it exists to pin.
+	base := func() Options {
+		dir := t.TempDir()
+		return Options{
+			DocumentPath: filepath.Join(dir, "desired-state.yaml"),
+			StatePath:    filepath.Join(dir, "onboard-state.json"),
+			ReportPath:   filepath.Join(dir, "report.json"),
+			Generator:    "wecert-onboard/test",
+		}
+	}
+	src := Sources{Declarations: &fakeDeclarations{}, Rules: &fakeRules{}}
+
+	// The fuse compares a loss ratio that can never exceed 1, so a threshold at or
+	// above 1 -- or a percentage written as `30` -- can never be exceeded. NaN is in
+	// the list because every comparison against it is false, so it satisfies both
+	// this bound and the `<= 0` default above.
+	for _, v := range []float64{30, 1.5, 1, math.NaN()} {
+		opts := base()
+		opts.DropThreshold = v
+		_, err := New(src, opts, testLogger())
+		if err == nil {
+			t.Errorf("New accepted DropThreshold=%v; the abrupt-change fuse could never fire", v)
+			continue
+		}
+		if !strings.Contains(err.Error(), "DropThreshold") {
+			t.Errorf("New rejected DropThreshold=%v for the wrong reason: %v", v, err)
+		}
+	}
+
+	// 0 means "use the default", and anything in (0,1) is a real threshold.
+	for _, v := range []float64{0, 0.3, 0.99} {
+		opts := base()
+		opts.DropThreshold = v
+		if _, err := New(src, opts, testLogger()); err != nil {
+			t.Errorf("New rejected a valid DropThreshold=%v: %v", v, err)
+		}
+	}
+}
+
 // A normal decommission does not remove a third of the set. Losing a third at once
 // is almost certainly an upstream fault (incomplete API response, changed
 // permissions, zone read failure). Acting on it strips SANs in bulk.
@@ -700,52 +745,5 @@ func TestGroupSettingsComeFromDeclarations(t *testing.T) {
 	}
 	if c.KeyType != config.KeyTypeECDSAP384 {
 		t.Errorf("keyType must come from the declaration, got %q", c.KeyType)
-	}
-}
-
-// Options is a second entry point into the onboarding policy, independent of
-// config.Load: the -drop-threshold flag overwrites the value *after* the config
-// layer has validated it, so the range check has to live here as well.
-//
-// The fuse compares a loss ratio that can never exceed 1, so a threshold at or
-// above 1 -- or a percentage written as `30` -- can never be exceeded and the fuse
-// never fires. Silently: the generated document still passes validation, so
-// nothing downstream reports it.
-func TestDropThresholdIsRangeCheckedOnTheOptionsPath(t *testing.T) {
-	// New validates several required paths before it reaches the policy checks, so
-	// they all have to be filled in. Otherwise every case below would fail for an
-	// unrelated reason ("a declaration source is required", "DocumentPath is
-	// required") and the test would pass without the check it is meant to pin.
-	base := func() Options {
-		dir := t.TempDir()
-		return Options{
-			DocumentPath: filepath.Join(dir, "desired-state.yaml"),
-			StatePath:    filepath.Join(dir, "onboard-state.json"),
-			ReportPath:   filepath.Join(dir, "report.json"),
-			Generator:    "wecert-onboard/test",
-		}
-	}
-	src := Sources{Declarations: &fakeDeclarations{}}
-
-	for _, v := range []float64{30, 1.5, 1, math.NaN()} {
-		opts := base()
-		opts.DropThreshold = v
-		_, err := New(src, opts, testLogger())
-		if err == nil {
-			t.Errorf("New accepted DropThreshold=%v; the abrupt-change fuse could never fire", v)
-			continue
-		}
-		if !strings.Contains(err.Error(), "DropThreshold") {
-			t.Errorf("New rejected DropThreshold=%v for the wrong reason: %v", v, err)
-		}
-	}
-
-	// 0 means "use the default", and anything in (0,1) is a real threshold.
-	for _, v := range []float64{0, 0.3, 0.99} {
-		opts := base()
-		opts.DropThreshold = v
-		if _, err := New(src, opts, testLogger()); err != nil {
-			t.Errorf("New rejected a valid DropThreshold=%v: %v", v, err)
-		}
 	}
 }

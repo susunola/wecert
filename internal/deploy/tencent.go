@@ -107,13 +107,28 @@ func NewTencentCLB(cfg config.Tencent, log *slog.Logger) (*TencentCLB, error) {
 	}, nil
 }
 
-// client builds a client for the SSL certificate service.
-func (d *TencentCLB) client(ctx context.Context) (*ssl.Client, error) {
-	cred, err := d.credential(ctx)
-	if err != nil {
-		return nil, err
-	}
+// sslAPI is the narrow slice of the Tencent Cloud SSL client this package uses.
+//
+// *ssl.Client is a concrete struct with no interface seam, and client() used to rebuild
+// it on every call -- which left the polling logic in updateInstance and
+// waitDeployRecord (the most failure-prone part of the package) impossible to
+// unit-test. Declaring only the used methods as an interface lets tests substitute a
+// fake while the production implementation stays the real SDK client.
+type sslAPI interface {
+	UploadCertificateWithContext(ctx context.Context, req *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error)
+	UpdateCertificateInstanceWithContext(ctx context.Context, req *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error)
+	DescribeHostUpdateRecordDetailWithContext(ctx context.Context, req *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error)
+	DeleteCertificateWithContext(ctx context.Context, req *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error)
+	CreateCertificateBindResourceSyncTaskWithContext(ctx context.Context, req *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error)
+	DescribeCertificateBindResourceTaskResultWithContext(ctx context.Context, req *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error)
+}
 
+// newSSLClient builds the production SSL API client.
+//
+// It is a package-level variable rather than a parameter of NewTencentCLB: that keeps
+// the exported constructor (and its callers, e.g. internal/acme) unchanged while still
+// letting tests swap in a fake.
+var newSSLClient = func(cred common.CredentialIface) (sslAPI, error) {
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "ssl.tencentcloudapi.com"
 	// The upload request body can be hundreds of KB, so the default timeout is not enough.
@@ -121,6 +136,27 @@ func (d *TencentCLB) client(ctx context.Context) (*ssl.Client, error) {
 
 	// The SSL certificate service is global, so pass an empty Region.
 	return ssl.NewClient(cred, "", cpf)
+}
+
+// client resolves credentials and builds a client for the SSL certificate service.
+func (d *TencentCLB) client(ctx context.Context) (sslAPI, error) {
+	cred, err := d.credential(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newSSLClient(cred)
+}
+
+// waitBetweenPolls sleeps between polling iterations while still honoring context
+// cancellation. It is a variable so tests can advance a fake clock instantly instead
+// of waiting real seconds; production behavior is a plain interruptible sleep.
+var waitBetweenPolls = func(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 // Deploy uploads the new certificate and, when an old one exists, one-click updates every
@@ -152,7 +188,7 @@ func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM
 	return newID, nil
 }
 
-func (d *TencentCLB) upload(ctx context.Context, client *ssl.Client, certName string, certPEM, keyPEM []byte) (string, error) {
+func (d *TencentCLB) upload(ctx context.Context, client sslAPI, certName string, certPEM, keyPEM []byte) (string, error) {
 	req := ssl.NewUploadCertificateRequest()
 	req.CertificatePublicKey = common.StringPtr(string(certPEM))
 	req.CertificatePrivateKey = common.StringPtr(string(keyPEM))
@@ -178,7 +214,7 @@ func (d *TencentCLB) upload(ctx context.Context, client *ssl.Client, certName st
 // means the task is still being created, so the request must be repeated until it is > 0
 // before creation counts as successful.
 // DeployStatus == 0 means "a task is already in progress", which is naturally idempotent.
-func (d *TencentCLB) updateInstance(ctx context.Context, client *ssl.Client, oldID, newID string) error {
+func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, newID string) error {
 	req := ssl.NewUpdateCertificateInstanceRequest()
 	req.OldCertificateId = common.StringPtr(oldID)
 	req.CertificateId = common.StringPtr(newID)
@@ -218,10 +254,8 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client *ssl.Client, old
 		if d.now().After(deadline) {
 			return fmt.Errorf("the UpdateCertificateInstance task was not created within 2m (there may be one already running)")
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(3 * time.Second):
+		if err := waitBetweenPolls(ctx, 3*time.Second); err != nil {
+			return err
 		}
 	}
 }
@@ -232,7 +266,7 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client *ssl.Client, old
 // happens asynchronously in the background. Setting DeployConfirmed without waiting for it
 // to finish writes the most insidious failure mode -- "the program thinks it succeeded
 // while nothing actually took effect" -- into the state database.
-func (d *TencentCLB) waitDeployRecord(ctx context.Context, client *ssl.Client, recordID uint64) error {
+func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, recordID uint64) error {
 	deadline := d.now().Add(3 * time.Minute)
 	for {
 		success, failed, running, err := d.describeDeployRecord(ctx, client, recordID)
@@ -253,16 +287,14 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client *ssl.Client, r
 			return fmt.Errorf("one-click update task %d did not finish within 3m (success=%d failed=%d running=%d)",
 				recordID, success, failed, running)
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		if err := waitBetweenPolls(ctx, 5*time.Second); err != nil {
+			return err
 		}
 	}
 }
 
 // describeDeployRecord queries the resource-level detail of a deploy record once.
-func (d *TencentCLB) describeDeployRecord(ctx context.Context, client *ssl.Client, recordID uint64) (success, failed, running int64, err error) {
+func (d *TencentCLB) describeDeployRecord(ctx context.Context, client sslAPI, recordID uint64) (success, failed, running int64, err error) {
 	req := ssl.NewDescribeHostUpdateRecordDetailRequest()
 	req.DeployRecordId = common.StringPtr(strconv.FormatUint(recordID, 10))
 	resp, err := client.DescribeHostUpdateRecordDetailWithContext(ctx, req)
@@ -445,10 +477,8 @@ func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
 		if d.now().After(deadline) {
 			return 0, fmt.Errorf("the bind-resource enumeration did not finish within 30s (taskId=%s)", taskID)
 		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-time.After(2 * time.Second):
+		if err := waitBetweenPolls(ctx, 2*time.Second); err != nil {
+			return 0, err
 		}
 	}
 }

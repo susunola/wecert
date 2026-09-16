@@ -2,7 +2,7 @@
 #
 # Stage A + B end-to-end orchestration
 #
-#   ./scripts/run-stage-ab.sh <domain> <email> [--skip-apply]
+#   ./scripts/run-stage-ab.sh <domain> <email> [--yes] [--skip-apply]
 #
 # Example:
 #   ./scripts/run-stage-ab.sh example.com ops@example.com
@@ -44,7 +44,7 @@ TESTENV="${ROOT}/testenv"
 STATE_DIR="/tmp/wecert-e2e"
 STATE_DB="${STATE_DIR}/state.db"
 CONFIG="${STATE_DIR}/config.yaml"
-CREDS="${WECERT_CREDS:-/Users/atom/Documents/dsh/.secrets/tencent.env}"
+CREDS="${WECERT_CREDS:-${HOME}/.wecert/tencent.env}"
 
 if [[ -z "${DOMAIN}" || -z "${EMAIL}" ]]; then
 	echo "Usage: $0 <domain> <email> [--yes] [--skip-apply]" >&2
@@ -59,6 +59,7 @@ fi
 if [[ ! -f "${CREDS}" ]]; then
 	echo "Error: credentials file not found: ${CREDS}" >&2
 	echo "      Expected format: export TENCENTCLOUD_SECRET_ID=... / export TENCENTCLOUD_SECRET_KEY=..." >&2
+	echo "      Point WECERT_CREDS at the file to override the default location." >&2
 	exit 1
 fi
 
@@ -87,7 +88,11 @@ done
 [[ -x "${ROOT}/bin/wecert" ]] || { echo "Error: run make build first" >&2; exit 1; }
 [[ -x "${ROOT}/bin/wecert-clbverify" ]] || { echo "Error: build the auxiliary tools first: make tools" >&2; exit 1; }
 
-export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR:-/Users/atom/Documents/dsh/.terraform-plugin-cache}"
+# Only set a cache dir when the caller (or an existing environment) provides one;
+# there is no portable default location.
+if [[ -n "${TF_PLUGIN_CACHE_DIR:-}" ]]; then
+	export TF_PLUGIN_CACHE_DIR
+fi
 export TF_IN_AUTOMATION=1
 
 echo "domain: ${DOMAIN} + *.${DOMAIN}"

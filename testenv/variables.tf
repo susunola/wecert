@@ -71,7 +71,7 @@ variable "clb_network_type" {
 variable "clb_sni_domain" {
   description = "Domain of the placeholder certificate bound to the listener. wecert replaces it on renewal."
   type        = string
-  default     = "placeholder.atomwangnus.com"
+  default     = "placeholder.wecert-test.invalid"
 }
 
 variable "clb_rule_domains" {
@@ -89,7 +89,7 @@ variable "clb_rule_domains" {
     verification.
   EOT
   type        = list(string)
-  default     = ["test.alpha.atomwangnus.com", "test.beta.atomwangnus.com"]
+  default     = ["test.alpha.wecert-test.invalid", "test.beta.wecert-test.invalid"]
 }
 
 variable "backend_pages" {
@@ -101,8 +101,8 @@ variable "backend_pages" {
   EOT
   type        = map(string)
   default = {
-    "test.alpha.atomwangnus.com" = "ALPHA"
-    "test.beta.atomwangnus.com"  = "BETA"
+    "test.alpha.wecert-test.invalid" = "ALPHA"
+    "test.beta.wecert-test.invalid"  = "BETA"
   }
 }
 
@@ -133,7 +133,7 @@ variable "clb_allowed_cidrs" {
 variable "dns_zone" {
   description = "DNSPod apex domain the test domains live in (records are created under this zone)."
   type        = string
-  default     = "atomwangnus.com"
+  default     = "wecert-test.invalid"
 }
 
 variable "create_dns" {
@@ -153,9 +153,11 @@ variable "clb_public_ip" {
     which is more reliable than a CNAME to that domain.
 
     This value has to be updated when the CLB changes or the environment is rebuilt.
+    There is no meaningful default — set it in terraform.tfvars after stage B outputs
+    the CLB address.
   EOT
   type        = string
-  default     = "119.91.16.17"
+  default     = ""
 }
 
 variable "cvm_instance_type" {

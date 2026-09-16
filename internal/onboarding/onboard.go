@@ -208,15 +208,13 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 	if opts.DropThreshold <= 0 {
 		opts.DropThreshold = DefaultDropThreshold
 	} else if math.IsNaN(opts.DropThreshold) || opts.DropThreshold >= 1 {
-		// Validated here rather than only in config.Load, because Options has a
-		// second entry point: the -drop-threshold flag overwrites the value *after*
-		// the config layer has checked it. The fuse compares a loss ratio that can
-		// never exceed 1, so a threshold >= 1 (or a percentage written as `30`) can
-		// never be exceeded and the fuse never fires -- silently, with the generated
-		// document still perfectly valid.
+		// Mirror the config layer's [0,1) check: a CLI -drop-threshold flag reaches
+		// Options directly, bypassing that validation, and a percentage written as
+		// `30` would silently disable the abrupt-change fuse this guard exists for.
 		//
 		// NaN is rejected explicitly: every comparison against it is false, so it
-		// would slip past both guards above.
+		// satisfies this bound and the `<= 0` default above alike and would otherwise
+		// pass straight through.
 		return nil, fmt.Errorf(
 			"onboarding: DropThreshold is a fraction in [0,1): got %v "+
 				"(a value of 1 or more can never be exceeded, so the abrupt-change fuse would never fire)",
