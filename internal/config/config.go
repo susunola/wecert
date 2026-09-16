@@ -81,7 +81,86 @@ type Config struct {
 	Webhook      Webhook       `yaml:"webhook"`
 	DesiredState DesiredState  `yaml:"desiredState"`
 	Onboarding   Onboarding    `yaml:"onboarding"`
+	Probe        Probe         `yaml:"probe"`
 	Certificates []Certificate `yaml:"certificates"`
+}
+
+// Probe 配置网络侧的证书探测。
+//
+// 云 API 说"绑定成功"，和浏览器真的能拿到这张证书，是两件事：
+// 前者走控制面，后者要拨一个真实的 TLS 连接。这个开关决定要不要后者。
+//
+// 默认开着，因为它能挡住一整类控制面看不出来的故障（换绑没生效、
+// CLB 上另一张证书在赢 SNI），而且"探测没跑成"和"证书不对"是分开报的 ——
+// 从这台机器拨不出去只会让 probe_errors 涨，不会让证书看起来是坏的。
+type Probe struct {
+	// Enabled 默认 true。
+	Enabled *bool `yaml:"enabled"`
+
+	// Port 默认 443。
+	Port int `yaml:"port"`
+
+	// Timeout 默认 10s。跨可用区握手慢到 3~5 秒是常态，
+	// 设小了会频繁误报，而误报会训练人忽略告警。
+	Timeout string `yaml:"timeout"`
+
+	// MaxHostsPerCert 是每张证书最多探测几个名字。默认 3。
+	//
+	// 不做全量：一张 25 个名字的证书每轮拨 25 次握手，
+	// 收益递减而成本线性增长。
+	MaxHostsPerCert int `yaml:"maxHostsPerCert"`
+
+	// MinValidFor 是"至少还要剩多久有效期"。留空表示不检查。
+	//
+	// 这个检查是冗余的 —— 到期告警本来就该基于 notAfter。
+	// 但它的失败模式不同：它验的是"线上真的在服务一张没过期的证书"，
+	// 而不是"我以为部署了一张没过期的证书"。
+	MinValidFor string `yaml:"minValidFor"`
+
+	// 解析后的时长，由 normalize 填充。
+	TimeoutDur  time.Duration `yaml:"-"`
+	MinValidDur time.Duration `yaml:"-"`
+}
+
+// ProbeEnabledOr 返回探测开关，未设置时用 def。
+func (p *Probe) EnabledOr(def bool) bool {
+	if p.Enabled == nil {
+		return def
+	}
+	return *p.Enabled
+}
+
+func (p *Probe) normalize() error {
+	var err error
+	if p.TimeoutDur, err = parseDuration(p.Timeout, 10*time.Second, "probe.timeout"); err != nil {
+		return err
+	}
+
+	// minValidFor 不能走 parseDuration：它把"默认值为 0"理解成"必填"，
+	// 而这里留空恰恰是合法且有意义的 —— 表示不检查剩余有效期。
+	if p.MinValidFor != "" {
+		d, err := time.ParseDuration(p.MinValidFor)
+		if err != nil {
+			return fmt.Errorf("probe.minValidFor: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("probe.minValidFor must be positive, got %s", p.MinValidFor)
+		}
+		p.MinValidDur = d
+	}
+	if p.Port == 0 {
+		p.Port = 443
+	}
+	if p.Port < 1 || p.Port > 65535 {
+		return fmt.Errorf("probe.port must be between 1 and 65535, got %d", p.Port)
+	}
+	if p.MaxHostsPerCert == 0 {
+		p.MaxHostsPerCert = 3
+	}
+	if p.MaxHostsPerCert < 0 {
+		return fmt.Errorf("probe.maxHostsPerCert must not be negative, got %d", p.MaxHostsPerCert)
+	}
+	return nil
 }
 
 // Onboarding 配置期望状态的生成策略，供 wecert-onboard 使用。
@@ -420,6 +499,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 	if err := c.Onboarding.normalize(); err != nil {
+		return err
+	}
+	if err := c.Probe.normalize(); err != nil {
 		return err
 	}
 
