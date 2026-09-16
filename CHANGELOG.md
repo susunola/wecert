@@ -4,6 +4,26 @@
 
 ### Added
 
+- **`make test-repeat`** (`-race -shuffle=on -count=3`), and the two defects it found. Two tests in
+  `internal/reconcile` asserted absolute values on process-global counters, which holds only on the
+  first run of a test binary: `go test -count=2 ./internal/reconcile/` failed with "got 2". They now
+  assert the delta, which is both repeatable and the stronger claim — "this pass counted exactly
+  once" rather than "the counter reads 1".
+- **`scripts/test-check-alerts.py`**, wired into `make check-alerts`. `check-alerts.py` was reporting
+  a green tick over files it had not understood, in four different ways — a rule written as a flow
+  mapping, an `expr:` above its `alert:`, an empty `rules:` list, no `groups:` at all — each of which
+  printed "0 alert rules in 0 groups; every series they reference is exported" and exited 0. It now
+  fails when it reads nothing, cross-checks its own parse against a regex count of `alert:` keys, and
+  refuses any list item whose shape it does not recognise; it also checks that a `{{ $labels.x }}` in
+  an annotation names a label the metric actually carries, which previously rendered as an empty
+  string rather than as an error. The self-test asserts that all 11 broken shapes are rejected *and*
+  that two valid files are accepted.
+- **Build-tag tests for the lego provider path** (`internal/acme/lego_build_*_test.go`). Whether
+  `dns.provider: lego` is a valid configuration depends on `-tags lego_dns` reaching `config` through
+  the acme package's `init`, and nothing tested that wiring. The test that looked like it did lived in
+  the `config` package, which cannot import `acme` without a cycle and so could only observe its own
+  zero value — it passed in a tagged binary that would have wrongly rejected a valid configuration.
+  It is replaced by tests that run acme's init by construction and assert both directions.
 - Property and fuzz targets for `internal/ratelimit` (`internal/ratelimit/fuzz_test.go`,
   `fuzz_parse_test.go`), with a committed regression corpus replayed by plain `go test` and a
   `make fuzz` target. **Not yet wired into CI**: the token used for that needs the `workflow`
@@ -58,6 +78,22 @@
 
 ### Fixed
 
+- **The rate-limit gauges leaked a series per retired scope, and the leaked series kept firing an
+  alert.** `PublishQuota` rebuilt `wecert_ratelimit_blocked` from scratch on every pass but only ever
+  *added* to `wecert_ratelimit_remaining_tokens`, and `WithLabelValues` never deletes. The scope
+  label is derived from the desired state — the first certificate's first domain — so an ordinary
+  edit (renaming or dropping that certificate) left the old scope's series frozen at its last value
+  for the life of the process. `WecertRateLimitNearlyExhausted` compares that number against 5, so
+  the result was a permanent warning for a domain this program no longer manages, indistinguishable
+  from a real exhaustion. Both vectors are now rebuilt on every call; absent means "not published",
+  which is the honest answer for a scope that has left the desired state.
+- **Expiry alert descriptions asserted a diagnosis the metrics cannot support.** The thresholds are a
+  quarter of each profile's nominal validity — the same number the daemon logs a warning at — but
+  they are calibrated to the profile *defaults*. `renewBefore` is per-certificate, and ARI can move
+  the renewal window later still, so "reaching this point means renewal has been failing for at least
+  a week" was not always true: a certificate with a short `renewBefore` tripped it before its renewal
+  was due. The descriptions now say what to check (`wecert_certificate_consecutive_failures`) instead
+  of asserting the cause, and the group comment states the calibration.
 - **`ratelimit`: integer divide by zero on a limit with no refill interval.** `Remaining` divides
   by `Limit.Refill`, so a zero (or negative) interval panicked. Unreachable through today's
   callers — every `Limit` comes from the published table in that file — but reachable through the
