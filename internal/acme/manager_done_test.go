@@ -247,20 +247,24 @@ func (d *recordingDeployer) Deploy(_ context.Context, _ string, oldID string, _,
 func (d *recordingDeployer) Delete(context.Context, string) error          { return nil }
 func (d *recordingDeployer) Bindings(context.Context, string) (int, error) { return 0, nil }
 
-// A domain-set change must not carry ARI's `replaces`.
+// A drift reissue must still succeed even when the identifier sets share nothing.
 //
-// Let's Encrypt answers `malformed: Could not validate ARI 'replaces' field: identifiers
-// in this order do not match any identifiers in the certificate being replaced` when the
-// two identifier sets do not overlap, and that error comes back from newOrder -- so no
-// order is created, and every later round sends the same value and is refused the same
-// way. A certificate moved to a wholly different domain set would then never issue again.
+// This is where the "never send replaces on a changed set" rule came from, found by running
+// the lifecycle acceptance case against real Let's Encrypt staging: with two wholly disjoint
+// sets the CA refuses `replaces`, that refusal comes back from newOrder, and -- before
+// issue() learned to retry -- no order was created and every later round was refused
+// identically, so a certificate moved to a different domain set never issued again.
 //
-// Found by running the lifecycle acceptance case against real Let's Encrypt staging.
-func TestDriftReissueSendsNoReplaces(t *testing.T) {
+// The refusal is the NO-overlap case, not "any change". Let's Encrypt's published rule is
+// that an ARI order is exempt when it includes AT LEAST ONE identifier matching the
+// certificate it replaces, and an ordinary config change keeps most of the set -- so the
+// blanket "never send it" gave up a real exemption to avoid a case the retry now handles.
+// The safety property to pin is therefore not "no replaces" but "a disjoint set can never
+// wedge the renewal": the order is still created, on the retry.
+func TestDriftReissueSurvivesADisjointIdentifierSet(t *testing.T) {
 	store, m, fake, cert := newAPITestHarness(t, []string{"new.example.com"})
 
-	// The live certificate covers something else entirely, and its ARI certID is known:
-	// that is exactly the value the old code would have sent.
+	// The live certificate covers something else entirely, and its ARI certID is known.
 	notAfter := time.Now().Add(80 * 24 * time.Hour)
 	if err := store.PutCert(&state.CertState{
 		Name:      cert.Name,
@@ -272,7 +276,59 @@ func TestDriftReissueSendsNoReplaces(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Already valid, so the pass goes straight to the download.
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+	// The CA behaves as Let's Encrypt does for a disjoint set: it refuses the replaces and
+	// the order is never created.
+	fake.beforeCall = func(call string) {
+		if call != "NewOrder" {
+			return
+		}
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		if len(fake.newOrderReplaces) > 0 && fake.newOrderReplaces[len(fake.newOrderReplaces)-1] != "" {
+			fake.newOrderErr = errors.New("acme: error: 400 :: urn:ietf:params:acme:error:malformed :: " +
+				"Could not validate ARI 'replaces' field :: identifiers in this order do not match " +
+				"any identifiers in the certificate being replaced")
+		}
+	}
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("a disjoint identifier set must never wedge the renewal; got %v", err)
+	}
+
+	// Two attempts: the exempting one, then the retry that gets the order created.
+	if len(fake.newOrderReplaces) != 2 {
+		t.Fatalf("expected the replaces attempt plus one retry, got %v", fake.newOrderReplaces)
+	}
+	if fake.newOrderReplaces[0] != "oldAki.oldSerial" {
+		t.Errorf("the first attempt should try to keep the ARI exemption, sent %q", fake.newOrderReplaces[0])
+	}
+	if fake.newOrderReplaces[1] != "" {
+		t.Errorf("the retry must drop replaces, sent %q", fake.newOrderReplaces[1])
+	}
+}
+
+// A config change that KEEPS most of the set must keep `replaces`, because Let's Encrypt
+// exempts an ARI order sharing at least one identifier. Dropping it there spends one of the
+// 50-certificates-per-registered-domain-per-7-days allowance for nothing.
+func TestDriftReissueWithAnOverlappingSetKeepsTheExemption(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t,
+		[]string{"a.example.com", "b.example.com", "c.example.com"})
+
+	// Live certificate covers two of the three configured names.
+	notAfter := time.Now().Add(80 * 24 * time.Hour)
+	if err := store.PutCert(&state.CertState{
+		Name:      cert.Name,
+		NotAfter:  notAfter,
+		CertPEM:   selfSignedCertPEM(t, notAfter, "a.example.com", "b.example.com"),
+		KeyPEM:    []byte("old-key"),
+		ARICertID: "oldAki.oldSerial",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
 	fake.orders = []legoacme.ExtendedOrder{
 		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
 	}
@@ -284,16 +340,12 @@ func TestDriftReissueSendsNoReplaces(t *testing.T) {
 	if len(fake.newOrderReplaces) != 1 {
 		t.Fatalf("expected exactly one order attempt, got %v", fake.newOrderReplaces)
 	}
-	if got := fake.newOrderReplaces[0]; got != "" {
-		t.Errorf("a changed identifier set must not send replaces (got %q): the CA rejects "+
-			"it outright, and because no order is created the failure repeats forever", got)
+	if got := fake.newOrderReplaces[0]; got != "oldAki.oldSerial" {
+		t.Errorf("an overlapping identifier set qualifies for the ARI exemption, so replaces must be "+
+			"sent (got %q); dropping it consumes the 50-per-registered-domain quota for nothing", got)
 	}
 }
 
-// A refused `replaces` is retried once without it, on the renewal path too.
-//
-// Losing the rate-limit exemption costs one quota slot; failing to renew costs the
-// certificate. This is the guard that makes the second outcome impossible.
 func TestRefusedReplacesIsRetriedWithoutIt(t *testing.T) {
 	// Every wording a real CA uses to refuse a `replaces` field. Only the last one contains
 	// the literal string "replaces", which is what the original guard matched on -- so the

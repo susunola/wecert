@@ -345,27 +345,31 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 				"cert", c.Name, "detail", detail,
 				"note", "an order after a domain-set change does not count as a same-name renewal and will consume "+
 					"the Certificates per Registered Domain quota (50 per 7 days, shared across accounts)")
-			// replaces is deliberately **not** sent here, unlike on a renewal.
+			// `replaces` IS sent here, which reverses an earlier decision.
 			//
-			// ARI's `replaces` means "this order replaces that certificate", and the CA
-			// compares the two identifier sets. Let's Encrypt answers
-			// `malformed: Could not validate ARI 'replaces' field: identifiers in this
-			// order do not match any identifiers in the certificate being replaced` when
-			// they do not overlap at all -- and that error comes back from newOrder, so no
-			// order is created and every later round sends the same replaces and fails the
-			// same way. Changing a certificate to a wholly different domain set (moving a
-			// name between certificates, or migrating a service) would then never issue
-			// again, which is the worst failure this system can have.
+			// It used to be dropped on the premise that "the ARI exemption needs an
+			// identical identifier set, so a changed set is a different bucket anyway".
+			// Let's Encrypt's published rule says otherwise: an ARI order is exempt from
+			// ALL rate limits when it "includes at least one identifier matching the
+			// certificate it intends to replace and the certificate has not been
+			// previously replaced using ARI". The error this comment used to quote --
+			// `identifiers in this order do not match any identifiers in the certificate
+			// being replaced` -- is the NO-overlap case.
 			//
-			// It would also buy nothing: the ARI exemption applies to renewals of the
-			// *same* identifier set, and a changed set is a different bucket anyway -- as
-			// the note above says, this order consumes the per-registered-domain quota
-			// regardless. So send no replaces and let the order succeed.
+			// A config change normally keeps most of the set: adding c.example.com to
+			// [a,b] gives [a,b,c], which shares a and b with the certificate being
+			// replaced and therefore qualifies. Omitting `replaces` there spends one of
+			// the 50-certificates-per-registered-domain-per-7-days allowance for nothing.
 			//
-			// The fallback case above reconciles the two concerns: it holds the degraded
-			// set rather than reissuing, so the "changed identifier set" this branch exists
-			// for is a genuine config change, and no replaces is the right call for it.
-			return m.issue(ctx, c, st, "", rd)
+			// The pathological case is a wholly disjoint set (moving a name between
+			// certificates), where the CA may refuse the order. That is no longer a dead
+			// end: issue() retries once without `replaces` on ANY newOrder error, so the
+			// worst outcome is losing the exemption rather than never issuing again.
+			//
+			// The `replaces` value is the certificate actually live now, which is what the
+			// stored ARI certID identifies -- including when the live certificate is the
+			// degraded subset, since the check is for any shared identifier.
+			return m.issue(ctx, c, st, st.ARICertID, rd)
 		}
 	}
 
