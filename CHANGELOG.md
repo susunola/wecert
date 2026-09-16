@@ -77,6 +77,15 @@
   one failed request from each of many source addresses made the total work
   grow with the square of the request count.
 
+- The download path verifies that the issued certificate belongs to the private
+  key the order was placed with. `VerifyCoverage` and the `notAfter` check both
+  pass a certificate for a different key -- same names, same lifetime -- and the
+  result would have replaced a working certificate with one that cannot complete
+  a single handshake. New `VerifyKeyMatch` closes the last gate of that triad.
+  The test doubles now issue for the order's key the way a real CA does, so
+  every download-path test exercises the check rather than only the one written
+  for it.
+
 ### Changed
 
 - `run-stage-ab.sh` extracts credentials with or without a leading `export`,
