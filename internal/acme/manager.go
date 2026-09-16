@@ -37,9 +37,15 @@ type challengeSolver interface {
 	Present(ctx context.Context, domain, token, keyAuth string) (DNSRecord, error)
 	WaitAll(ctx context.Context, records []DNSRecord) error
 	CleanUp(ctx context.Context, domain, token, keyAuth string) error
-	// LookupTXT probes public DNS for this challenge's record. Crash recovery depends on
-	// it: a pass that died between the DNS write and the state persist left the record up
-	// while the authorization row denies it, and only a probe can tell adopt from rewrite.
+	// LookupTXT probes DNS for this challenge's record, asking the zone's authoritative
+	// nameservers rather than a recursive resolver. Crash recovery depends on it: a pass
+	// that died between the DNS write and the state persist left the record up while the
+	// authorization row denies it, and only a probe can tell adopt from rewrite.
+	//
+	// The three outcomes are distinct on purpose: found means "confirmed present", a nil
+	// error with found=false means "authoritatively absent", and a non-nil error means
+	// "cannot tell" -- which is the answer for an empty resolver cache too, because a
+	// cached negative must never be mistaken for proof that nothing was written.
 	LookupTXT(ctx context.Context, domain, keyAuth string) (DNSRecord, bool, error)
 }
 

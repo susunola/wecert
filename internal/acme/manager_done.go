@@ -89,11 +89,30 @@ func (m *Manager) download(
 		deployedID = id
 		rebound = oldDeployedID != ""
 	} else {
-		// A local-only renewal must never inherit "deployed" from an older
-		// configuration. The old cloud certificate may still exist, but it is
-		// not this newly issued certificate; retaining its ID and confirmation
-		// makes metrics green and causes the network probe to compare against a
-		// stale certificate.
+		// A local-only renewal must never claim the older cloud certificate is this
+		// newly issued one: keeping DeployConfirmed would make the deployed metric
+		// green and point the network probe at a certificate that is no longer the
+		// one in state.
+		//
+		// The ID is dropped rather than queued for reclaim. Reclaiming it is
+		// tempting -- it is the only local record that a wecert-uploaded certificate
+		// exists in Tencent Cloud -- but the certificate may still be bound to a
+		// listener, and with deploy switched off wecert has no evidence either way.
+		// The reaper would delete it and rely on IsCheckResource to refuse a bound
+		// certificate; when that check is the only thing between a bookkeeping
+		// cleanup and production HTTPS, the conservative direction is to leave it
+		// alone. See TestLocalOnlyRenewalClearsDeploymentStateWithoutRetiringLiveCloudCert.
+		//
+		// So the ID goes to the journal instead of being lost silently. It is worth
+		// logging: the leak is bounded (oldDeployedID is empty from the next renewal
+		// on, so at most one certificate per name can be stranded), but nothing else
+		// in the system will ever mention it again.
+		if oldDeployedID != "" {
+			m.log.Warn("deploy is disabled for this certificate: the cloud certificate it was previously bound to is now unmanaged, "+
+				"and is left in place because it may still be serving traffic",
+				"cert", c.Name, "certId", oldDeployedID,
+				"hint", "if it is no longer needed, delete it from the Tencent Cloud console or with wecert-preflight prune")
+		}
 		deployedID = ""
 		st.DeployConfirmed = false
 	}
