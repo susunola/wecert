@@ -102,7 +102,10 @@ type fakeAPI struct {
 	// earlier pass of the same test.
 	certNotAfter   time.Time
 	certNotAfterFn func() time.Time
-	certDomains    []string
+	// certNotBefore overrides the issued certificate's NotBefore (default: an hour ago). A
+	// test that must tell "issued later" apart from "expires later" sets it explicitly.
+	certNotBefore time.Time
+	certDomains   []string
 
 	// orderKeyPEM lets the fake read the private key the flow generated for its order, so a
 	// pass that resumes an order finalized in an earlier process still gets a usable
@@ -312,10 +315,14 @@ func (f *fakeAPI) issueForCSR() []byte {
 	}
 	// tls.X509KeyPair-style self-signature: the fake CA is its own issuer, and nothing in
 	// the download path verifies the chain (the network probe does that separately).
+	notBefore := time.Now().Add(-time.Hour)
+	if !f.certNotBefore.IsZero() {
+		notBefore = f.certNotBefore
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		DNSNames:     names,
-		NotBefore:    time.Now().Add(-time.Hour),
+		NotBefore:    notBefore,
 		NotAfter:     notAfter,
 		// A real CA always sets the Authority Key Identifier, and CertID needs it: without
 		// one the ARI certID cannot be built and the next renewal loses its rate-limit

@@ -274,7 +274,15 @@ func (r *Reconciler) publishDesired(res *spec.Result) {
 	// onboarding component dies, wecert keeps renewing from the old document quite
 	// normally, everything looks fine, only no new domain ever enters.
 	if !res.GeneratedAt.IsZero() {
+		// Clamped at zero: a document written moments in the future -- a small NTP
+		// correction between the generator and this process -- otherwise reports a negative
+		// age, which is nonsense on a "how stale is this" gauge and would make the staleness
+		// comparison below look satisfied for longer than it should. The skew itself is
+		// bounded by spec's generatedAt check, so this only absorbs a small clock difference.
 		age := time.Since(res.GeneratedAt)
+		if age < 0 {
+			age = 0
+		}
 		metrics.DesiredStateAge.Set(age.Seconds())
 		if max := r.cfg.DesiredState.MaxStalenessDur; max > 0 && age > max {
 			r.log.Error("the desired-state document is stale: the onboarding component has stopped refreshing it; "+
@@ -380,7 +388,7 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		attrs := []any{"cert", name}
 		if stErr == nil && st != nil && !st.NotAfter.IsZero() {
 			attrs = append(attrs, "notAfter", st.NotAfter,
-				"daysLeft", int(time.Until(st.NotAfter).Hours()/24))
+				"daysLeft", config.DaysUntil(st.NotAfter, time.Now()))
 		}
 		r.log.Error("this certificate is no longer in the desired state, so it will not be renewed "+
 			"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard",
@@ -441,14 +449,69 @@ func (r *Reconciler) issuedSANs(st *state.CertState) []string {
 // dangerous kind of coupling in automation.
 //
 // Certificates already being processed elsewhere are skipped and listed.
+// RunReport summarizes what one full pass actually did.
+//
+// It exists so a caller can tell "everything worked" from "nothing ran" and from
+// "something failed". RunAll deliberately discards the per-certificate errors -- one
+// failing certificate must not stop the others, which is the whole reason the loop is
+// shaped the way it is -- but without this the information was not merely discarded, it
+// was unavailable: a one-shot run exited 0 with every certificate failing, so a systemd
+// timer reported success while the fleet went unmanaged.
+type RunReport struct {
+	// Attempted counts certificates whose pass ran, whether it succeeded or failed.
+	Attempted int
+	// Succeeded counts passes that completed without error.
+	Succeeded int
+	// Backoff counts passes that deliberately did not run because the certificate is
+	// inside its retry window. Not a failure, but not progress either.
+	Backoff int
+	// Failed counts passes that ran and errored.
+	Failed int
+	// Skipped lists certificates whose pass was not started because one was already in
+	// flight, so this round did not converge them. Not an error: the in-flight pass will.
+	Skipped []string
+	// DesiredStateUnreadable reports that the desired state could not be resolved, so no
+	// certificate was considered at all.
+	DesiredStateUnreadable bool
+}
+
+// Trouble reports whether this pass should be treated as a failure by a one-shot run.
+//
+// A plain "Failed > 0" is not enough on its own. A certificate whose retries are all inside
+// a backoff window produces Backoff > 0 and Failed == 0, so a run that attempted nothing
+// and skipped everything would look clean -- which is exactly the state a certificate stuck
+// in a long backoff sits in, and exactly what a caller running once per interval needs to
+// hear about.
+func (rep RunReport) Trouble() bool {
+	if rep.Failed > 0 || rep.DesiredStateUnreadable {
+		return true
+	}
+	return rep.Attempted == 0 && len(rep.Skipped) > 0
+}
+
+// RunAll runs one pass over every certificate.
+//
+// One certificate failing does not abort the pass: otherwise a certificate with
+// a typo in its DNS would stop every other certificate from renewing. The cost is
+// that the caller cannot see the failures from here -- use RunDetailed when the outcome
+// matters.
 func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
+	return r.RunDetailed(ctx).Skipped
+}
+
+// RunDetailed runs one pass and reports what happened, for callers that must react to the
+// outcome (a one-shot timer run, an operator-facing exit code).
+func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
+	var rep RunReport
+
 	res := r.resolve(ctx)
 	if res == nil {
 		// Reap retired certificates even when the desired state is unreadable: they
 		// have already been replaced, reaping them is unrelated to the desired state,
 		// and ignoring them slowly exhausts the cloud certificate quota.
+		rep.DesiredStateUnreadable = true
 		r.manager.ReapRetired(ctx)
-		return nil
+		return rep
 	}
 	r.publishOrphans(ctx, res)
 
@@ -456,25 +519,39 @@ func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
 		c := &res.Certificates[i]
 
 		if err := ctx.Err(); err != nil {
-			return skipped
+			// Cancelled mid-pass: the certificates not reached are neither succeeded nor
+			// failed, and calling them failures would make an ordinary shutdown look like
+			// an incident.
+			return rep
 		}
 
 		if !r.acquire(c.Name) {
 			r.log.Info("skipping: this certificate already has a pass in flight", "cert", c.Name)
-			skipped = append(skipped, c.Name)
+			rep.Skipped = append(rep.Skipped, c.Name)
 			continue
 		}
 		// defer inside the loop body so a panic in reconcileOne cannot leak the slot
 		// and wedge every later pass with ErrAlreadyRunning.
-		func() {
+		err := func() error {
 			defer r.release(c.Name)
-			r.reconcileOne(ctx, c)
+			return r.reconcileOne(ctx, c)
 		}()
+
+		switch {
+		case errors.Is(err, state.ErrBackoff):
+			rep.Backoff++
+		case err != nil:
+			rep.Attempted++
+			rep.Failed++
+		default:
+			rep.Attempted++
+			rep.Succeeded++
+		}
 	}
 
 	r.manager.ReapRetired(ctx)
 	r.reclaimStaleProbeSeries()
-	return skipped
+	return rep
 }
 
 // reclaimStaleProbeSeries drops the per-host probe metric series of hosts that are no
@@ -727,18 +804,30 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 	}()
 
 	err = r.manager.Reconcile(ctx, c)
-	if err != nil {
+	switch {
+	case errors.Is(err, state.ErrBackoff):
+		// The manager deliberately did not run this pass: the certificate is inside the
+		// retry window an earlier failure scheduled. That is neither a success nor a
+		// failure, and reporting it as either is a lie the operator acts on --
+		// result="ok" hid a certificate stuck in backoff behind a healthy-looking counter,
+		// and an error every interval would train people to ignore the channel.
+		metrics.ReconcileTotal.WithLabelValues(c.Name, "skipped").Inc()
+		r.log.Debug("pass skipped: still inside the retry backoff window", "cert", c.Name)
+	case err != nil:
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
 		// manager already logged and scheduled backoff; this is just a summary.
 		r.log.Warn("this pass did not succeed", "cert", c.Name, "err", err)
-	} else {
+	default:
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "ok").Inc()
 	}
 
 	r.publish(c)
 	r.probeCert(ctx, c)
 
-	if r.notifier != nil {
+	// Notified only when the pass actually attempted something: "every renewal attempt
+	// emits" is the documented meaning of this event, and a backoff skip is the absence of
+	// an attempt.
+	if r.notifier != nil && !errors.Is(err, state.ErrBackoff) {
 		r.notifier.Renewal(ctx, c.Name, err)
 	}
 	return err
@@ -851,8 +940,27 @@ func (r *Reconciler) publish(c *config.Certificate) {
 		return
 	}
 
+	// A certificate that was never issued has no expiry, and the series must be ABSENT
+	// rather than zero.
+	//
+	// The state schema documents `not_after = 0` as "never issued", and this exported the
+	// zero straight through — so the series read as 1970-01-01. The alert rule this project
+	// documents as the PRIMARY expiry signal is
+	//
+	//	(wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 21
+	//
+	// and for a never-issued certificate that evaluates to roughly -20,700 days, which is
+	// far below 21: it fires. So the first deployment of every new certificate pages
+	// someone about a certificate that does not exist yet, with an "overdue by 57 years"
+	// value. A false alarm on the one signal documented as the thing to alert on is worse
+	// than no signal, because it teaches the reader to ignore it.
+	//
+	// Deleting the series makes the alert's own arithmetic honest: a certificate with no
+	// expiry has no answer, so it is absent from the comparison instead of being compared
+	// as 1970. "Never issued" remains visible — `wecert_certificate_deployed` is 0 and
+	// `wecert_certificate_consecutive_failures` carries the retry count.
 	if st.NotAfter.IsZero() {
-		metrics.CertNotAfter.WithLabelValues(c.Name).Set(0)
+		metrics.CertNotAfter.DeleteLabelValues(c.Name)
 	} else {
 		metrics.CertNotAfter.WithLabelValues(c.Name).Set(float64(st.NotAfter.Unix()))
 	}
@@ -868,8 +976,11 @@ func (r *Reconciler) publish(c *config.Certificate) {
 
 	metrics.CertConsecutiveFailures.WithLabelValues(c.Name).Set(float64(st.ConsecutiveFailures))
 
+	// Same rule as not_after: an unset ARI window is "no answer", not 1970. A zero here
+	// would make any dashboard or ratio comparing the ARI window against another timestamp
+	// describe a window that opened 57 years ago.
 	if st.ARIWindowStart.IsZero() {
-		metrics.CertARIWindowStart.WithLabelValues(c.Name).Set(0)
+		metrics.CertARIWindowStart.DeleteLabelValues(c.Name)
 	} else {
 		metrics.CertARIWindowStart.WithLabelValues(c.Name).Set(float64(st.ARIWindowStart.Unix()))
 	}
