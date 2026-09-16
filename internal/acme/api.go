@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"encoding/base64"
 	"net/http"
 
 	legoacme "github.com/go-acme/lego/v4/acme"
@@ -59,6 +60,14 @@ type API interface {
 	// fullchain (leaf + intermediates), which is exactly the format CLB needs.
 	GetCertificate(certURL string, bundle bool) ([]byte, []byte, error)
 
+	// RevokeCertificate tells the CA to revoke a certificate (RFC 8555 §7.6).
+	//
+	// It is here rather than left to a higher layer because the low-level api.Core wecert uses
+	// exposes it on CertificateService and nothing in this program called it -- which is the
+	// whole reason wecert had no revocation path. The certificate is passed in DER form,
+	// base64url-encoded, because that is what the protocol field carries.
+	RevokeCertificate(der []byte, reason int) error
+
 	// GetRenewalInfo reads ARI (RFC 9773).
 	//
 	// It returns the raw *http.Response instead of a parsed structure because the
@@ -110,6 +119,20 @@ func (c coreAPI) AcceptChallenge(challengeURL string) error {
 
 func (c coreAPI) GetCertificate(certURL string, bundle bool) ([]byte, []byte, error) {
 	return c.core.Certificates.Get(certURL, bundle)
+}
+
+func (c coreAPI) RevokeCertificate(der []byte, reason int) error {
+	msg := legoacme.RevokeCertMessage{
+		Certificate: base64.RawURLEncoding.EncodeToString(der),
+	}
+	// Reason 0 is "unspecified", which the CA treats as "omit the reasonCode". Pointing at a
+	// zero value here would send reason=0 explicitly, so the field is left nil instead: the
+	// protocol calls it optional and the difference is visible in the CRL entry extension.
+	if reason != 0 {
+		r := uint(reason)
+		msg.Reason = &r
+	}
+	return c.core.Certificates.Revoke(msg)
 }
 
 func (c coreAPI) GetRenewalInfo(certID string) (*http.Response, error) {

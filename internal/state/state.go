@@ -682,6 +682,27 @@ CREATE TABLE IF NOT EXISTS cert_fallback (
 -- otherwise. reset_at is an AUTHORITATIVE instant the CA reported ("retry after ..."), which
 -- beats the local estimate because the estimate cannot see other accounts spending the same
 -- global bucket.
+-- Revocation requests that have not succeeded yet.
+--
+-- A row here means "an operator decided this certificate must be revoked, and the CA has not
+-- accepted it yet". Persisted rather than attempted once because revocation can fail for
+-- entirely transient reasons (network, CA 5xx) and the decision must not be lost with the
+-- process: a leaked private key does not stop being leaked because the request timed out.
+--
+-- The alternative -- only revoking synchronously from a CLI -- leaves a failed attempt as a
+-- message on someone's terminal, with no record that the operator ever asked.
+--
+-- reason is the RFC 5280 CRLReason code, so the reason the operator chose survives into every
+-- retry rather than being lost after the first attempt.
+CREATE TABLE IF NOT EXISTS revoke_requests (
+    cert_name   TEXT PRIMARY KEY,
+    reason      INTEGER NOT NULL DEFAULT 0,
+    requested_at INTEGER NOT NULL DEFAULT 0,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT NOT NULL DEFAULT '',
+    last_attempt_at INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS rate_buckets (
     limit_name TEXT NOT NULL,
     scope_id   TEXT NOT NULL DEFAULT '',
