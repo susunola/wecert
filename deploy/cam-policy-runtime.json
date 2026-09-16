@@ -1,0 +1,29 @@
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "sid": "WecertRuntimeSSL",
+      "effect": "allow",
+      "action": [
+        "ssl:UploadCertificate",
+        "ssl:DescribeCertificate",
+        "ssl:DescribeCertificates",
+        "ssl:DeleteCertificate",
+        "ssl:UpdateCertificateInstance"
+      ],
+      "resource": ["*"]
+    },
+    {
+      "sid": "WecertRuntimeDNS01",
+      "effect": "allow",
+      "action": [
+        "dnspod:DescribeDomainList",
+        "dnspod:DescribeRecordList",
+        "dnspod:CreateRecord",
+        "dnspod:ModifyRecord",
+        "dnspod:DeleteRecord"
+      ],
+      "resource": ["*"]
+    }
+  ]
+}
