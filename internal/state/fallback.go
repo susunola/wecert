@@ -87,7 +87,11 @@ func (s *Store) ListIdentifierFailures(certName string) ([]*IdentifierFailure, e
 func (s *Store) ClearIdentifierFailures(certName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`DELETE FROM identifier_failures WHERE cert_name = ?`, certName); err != nil {
+	return clearIdentifierFailuresExec(s.db, certName)
+}
+
+func clearIdentifierFailuresExec(e execer, certName string) error {
+	if _, err := e.Exec(`DELETE FROM identifier_failures WHERE cert_name = ?`, certName); err != nil {
 		return fmt.Errorf("clear identifier failures for %s: %w", certName, err)
 	}
 	return nil
@@ -169,7 +173,11 @@ func (s *Store) GetFallback(certName string) (*Fallback, error) {
 func (s *Store) ClearFallback(certName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`DELETE FROM cert_fallback WHERE cert_name = ?`, certName); err != nil {
+	return clearFallbackExec(s.db, certName)
+}
+
+func clearFallbackExec(e execer, certName string) error {
+	if _, err := e.Exec(`DELETE FROM cert_fallback WHERE cert_name = ?`, certName); err != nil {
 		return fmt.Errorf("clear fallback for %s: %w", certName, err)
 	}
 	return nil

@@ -32,6 +32,13 @@ import (
 const maxLastErrorBytes = 512
 
 // Store is the state store layered on top of SQLite.
+// execer is the subset of *sql.DB and *sql.Tx the write helpers below use, so one body of SQL can
+// run either on its own or inside a caller's transaction (see tx.go). Without it, every
+// transactional variant would be a copy of the statement, and the copy is what drifts.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
 type Store struct {
 	db *sql.DB
 
@@ -231,6 +238,33 @@ func Open(path string) (*Store, error) { return open(path, true) }
 // than changing it.
 func OpenUnlocked(path string) (*Store, error) { return open(path, false) }
 
+// OpenForTool opens the store for a one-shot command: `-dry-run`, `-revoke`, the diagnostic tools.
+//
+// It asks for the exclusive lock first and falls back to the unlocked path only when another
+// process holds it. That order matters, and getting it wrong broke a documented flow: always
+// opening unlocked made `wecert -dry-run` fail on a fresh installation, because a brand-new state
+// directory needs a schema and the unlocked path refuses to create one. The quick start is
+// "install, edit the config, dry-run" -- and the whole point of the dry run is to check the config
+// before the daemon is ever started.
+//
+// With this order:
+//
+//   - no daemon running (a fresh install, or validation before the first start): the tool takes the
+//     lock, migrates if the schema is behind, and works -- the migration is serialised, so the race
+//     the unlocked path exists to avoid cannot happen;
+//   - a daemon running: the lock is refused, the tool reads without one, and it does NOT migrate --
+//     which is correct, because the running daemon migrated at startup and holds the truth.
+func OpenForTool(path string) (*Store, error) {
+	s, err := Open(path)
+	if err == nil {
+		return s, nil
+	}
+	if !errors.Is(err, ErrLocked) {
+		return nil, err
+	}
+	return OpenUnlocked(path)
+}
+
 // LockFile takes the cross-process exclusive lock described in Store.lock on an
 // arbitrary file and returns the function that releases it.
 //
@@ -388,13 +422,14 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 		//lint:ignore ST1005 the second paragraph of a multi-line operator instruction is a
 		// sentence; capitalising it is the point, and the first paragraph still starts lowercase.
 		return nil, fmt.Errorf(
-			"the state database %s needs a schema update (%s), and this command opens it without "+
-				"the cross-process lock:\n"+
-				"       migrating from here could race the daemon's own migration -- two processes "+
-				"passing the same 'does this column exist?' check is how a database ends up with an "+
-				"opaque 'duplicate column name' error and a half-applied schema.\n"+
-				"       Run the daemon once (it migrates on startup), or stop it and re-run this "+
-				"command. See docs/recovery.md.",
+			"the state database %s needs a schema update (%s), and another process is holding the "+
+				"lock on it:\n"+
+				"       this command asked for the exclusive lock first and could not get it, so it "+
+				"fell back to reading without one -- and an unlocked open must not migrate, because "+
+				"two processes passing the same 'does this column exist?' check is how a database "+
+				"ends up with an opaque 'duplicate column name' error and a half-applied schema.\n"+
+				"       Stop that process, run `wecert -once` (which takes the lock and migrates), "+
+				"then start it again. See docs/recovery.md.",
 			path, strings.Join(pending, ", "))
 	}
 
@@ -512,8 +547,13 @@ func sqliteDSN(path string) string {
 	// Host is what keeps the result in the "file:/abs/path" form SQLite expects
 	// (url.String() would otherwise emit "//" before an absolute path).
 	u := url.URL{Path: path}
+	// _txlock=immediate makes every transaction this connection opens take the write lock at BEGIN
+	// rather than at its first write. In WAL a deferred transaction that reads before it writes can
+	// fail at COMMIT with SQLITE_BUSY -- after all its work, and at the point where the failure
+	// looks like a commit bug rather than a lock conflict. See tx.go.
 	return "file:" + u.EscapedPath() +
-		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+		"?_txlock=immediate" +
+		"&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 }
 
 // databaseFilePath reports the filesystem path the connection actually opened, and
@@ -1027,8 +1067,10 @@ func (s *Store) PutCert(c *CertState) error {
 	return s.putCertLocked(c)
 }
 
-func (s *Store) putCertLocked(c *CertState) error {
-	_, err := s.db.Exec(`
+func (s *Store) putCertLocked(c *CertState) error { return putCertExec(s.db, c) }
+
+func putCertExec(e execer, c *CertState) error {
+	_, err := e.Exec(`
 		INSERT INTO certificates (
 			name, not_after, cert_url, cert_pem, key_pem, issued_at,
 			ari_cert_id, ari_window_start, ari_window_end, ari_checked_at, ari_retry_after_ns,
@@ -1125,8 +1167,11 @@ func (s *Store) PutOrder(o *Order) error {
 func (s *Store) DeleteOrder(certName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM orders WHERE cert_name = ?`, certName)
-	if err != nil {
+	return deleteOrderExec(s.db, certName)
+}
+
+func deleteOrderExec(e execer, certName string) error {
+	if _, err := e.Exec(`DELETE FROM orders WHERE cert_name = ?`, certName); err != nil {
 		return fmt.Errorf("delete order for %s: %w", certName, err)
 	}
 	return nil
@@ -1272,7 +1317,11 @@ type RetiredCert struct {
 func (s *Store) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`
+	return addRetiredCertExec(s.db, certID, certName, certPEM, keyPEM)
+}
+
+func addRetiredCertExec(e execer, certID, certName string, certPEM, keyPEM []byte) error {
+	_, err := e.Exec(`
 		INSERT INTO retired_certificates (cert_id, cert_name, retired_at, cert_pem, key_pem)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(cert_id) DO UPDATE SET
