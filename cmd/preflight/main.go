@@ -130,25 +130,28 @@ func checkDelegation(ctx context.Context, domain string) error {
 	}
 
 	var hosts []string
-	onDNSPod := false
+	allOnDNSPod := true
 	for _, ns := range names {
 		host := strings.TrimSuffix(ns.Host, ".")
 		hosts = append(hosts, host)
 		// DNSPod's authoritative nameserver hostnames look like xxx.dnspod.net / xxx.dnsv1.com.
-		if strings.Contains(host, "dnspod") || strings.Contains(host, "dnsv") {
-			onDNSPod = true
+		if !strings.Contains(host, "dnspod") && !strings.Contains(host, "dnsv") {
+			allOnDNSPod = false
 		}
 	}
 
-	if !onDNSPod {
+	// Every returned NS must be DNSPod's, not just any one of them: with a partial
+	// delegation some resolvers land on the other host and never see the TXT record,
+	// so validation fails intermittently -- the hardest kind to diagnose.
+	if !allOnDNSPod {
 		return fmt.Errorf(
-			"%s's nameservers are not DNSPod: %s\n"+
+			"%s's nameservers are not all DNSPod: %s\n"+
 				"     TXT records written at DNSPod will never be resolved, so CA validation is guaranteed to fail.\n"+
 				"     point the domain's NS at DNSPod first, or switch to the dns.provider for that host\n",
 			domain, strings.Join(hosts, ", "))
 	}
 
-	fmt.Printf("      OK - %d nameservers, all pointing at DNSPod (%s)\n", len(hosts), hosts[0])
+	fmt.Printf("      OK - %d nameservers, all pointing at DNSPod (%s)\n", len(hosts), strings.Join(hosts, ", "))
 	return nil
 }
 
@@ -360,21 +363,36 @@ func pruneCertificates(assumeYes bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	listReq := ssl.NewDescribeCertificatesRequest()
-	listReq.Limit = common.Uint64Ptr(100)
-	listResp, err := client.DescribeCertificatesWithContext(ctx, listReq)
-	if err != nil {
-		return err
-	}
-	if listResp.Response == nil {
-		return fmt.Errorf("DescribeCertificates returned an empty response")
-	}
-
 	const prefix = "wecert/"
 	var doomed []*ssl.Certificates
-	for _, c := range listResp.Response.Certificates {
-		if strings.HasPrefix(deref(c.Alias), prefix) {
-			doomed = append(doomed, c)
+
+	// Page through the whole list: this listing drives deletion, so silently seeing
+	// only the first 100 certificates would leave the rest in place while looking like
+	// a complete cleanup.
+	var offset uint64
+	for {
+		listReq := ssl.NewDescribeCertificatesRequest()
+		listReq.Limit = common.Uint64Ptr(100)
+		listReq.Offset = common.Uint64Ptr(offset)
+		listResp, err := client.DescribeCertificatesWithContext(ctx, listReq)
+		if err != nil {
+			return err
+		}
+		if listResp.Response == nil {
+			return fmt.Errorf("DescribeCertificates returned an empty response")
+		}
+
+		for _, c := range listResp.Response.Certificates {
+			if strings.HasPrefix(deref(c.Alias), prefix) {
+				doomed = append(doomed, c)
+			}
+		}
+
+		offset += uint64(len(listResp.Response.Certificates))
+		// An empty page without reaching TotalCount means the list shifted under us;
+		// stopping there beats looping on a moving target.
+		if len(listResp.Response.Certificates) == 0 || offset >= derefU64(listResp.Response.TotalCount) {
+			break
 		}
 	}
 

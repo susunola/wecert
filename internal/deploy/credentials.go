@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 
@@ -131,9 +132,18 @@ func fetchCVMRoleCredential(ctx context.Context, roleName string) (common.Creden
 	return common.NewTokenCredential(mc.TmpSecretID, mc.TmpSecretKey, mc.Token), nil
 }
 
+// truncate cuts off a potentially very long error body at a rune boundary.
+//
+// The cut point is walked back to the start of a rune first: the metadata service's
+// error body is free-form text and not guaranteed to be ASCII, so slicing blindly at
+// byte n can land inside a multi-byte UTF-8 sequence and leave invalid UTF-8 in the
+// error that ends up in the state database and every log line built from it.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }

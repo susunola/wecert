@@ -54,9 +54,25 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 
 	case "ready":
 		return m.finalize(ctx, c, st, o, order)
+
+	case "processing":
+		// The CSR is already with the CA (a previous pass submitted it and died before
+		// seeing the result): the order goes straight from processing to valid/invalid
+		// and never passes through "ready" again. Falling into the pending branch here
+		// re-solves challenges that no longer exist and then waits for "ready" until
+		// orderWaitTimeout -- recording a spurious failure on an order that is actually
+		// on track. Just wait for the outcome and download.
+		final, err := m.awaitOrderStatus(ctx, o.OrderURL, "valid", orderWaitTimeout)
+		if err != nil {
+			return m.recordFailure(st, err)
+		}
+		if err := m.persistOrder(o, final); err != nil {
+			return m.recordFailure(st, err)
+		}
+		return m.download(ctx, c, st, o, final)
 	}
 
-	// pending / processing: drive the DNS-01 challenges through to the end.
+	// pending: drive the DNS-01 challenges through to the end.
 	allValid, err := m.solveChallenges(ctx, c, st, order)
 	if err != nil {
 		return err
@@ -211,22 +227,56 @@ func (m *Manager) solveChallenges(
 				return false, m.recordFailure(st, fmt.Errorf("compute the key authorization: %w", err))
 			}
 
-			// Write only, do not wait for propagation -- wait once after all TXT are written.
-			// Waiting per record makes a wildcard and its apex wait twice for nothing on the
-			// same TXT name (one propagation round takes over 2 minutes on DNSPod's free tier,
-			// so that is minutes right there).
-			rec, err := m.dns.Present(ctx, a.Identifier, chlg.Token, keyAuth)
-			if err != nil {
-				return false, m.recordFailure(st, fmt.Errorf("present TXT (%s): %w", a.Identifier, err))
+			adopted := false
+			if a.ChallengeToken == "" {
+				// First visit: persist the challenge **before** writing DNS. A pass that
+				// dies between the write and the persist below leaves the record up while
+				// the row still says Presented=false -- and the token is then the only
+				// way to locate that record again (the probe right below relies on it,
+				// and so does cleanupOrphanTXT).
+				a.ChallengeURL = chlg.URL
+				a.ChallengeToken = chlg.Token
+				if err := m.store.PutAuthorization(a); err != nil {
+					return false, err
+				}
+			} else {
+				// Been here before: an earlier pass was interrupted between the DNS write
+				// and marking Presented. Re-Present blindly and the record is duplicated;
+				// probe first and, if the old record is already up, adopt it instead.
+				rec, found, lerr := m.dns.LookupTXT(ctx, a.Identifier, keyAuth)
+				switch {
+				case lerr != nil:
+					// A failed probe proves nothing either way, so write. The worst case
+					// is a duplicate record, and cleanup removes every record at the name
+					// in one call -- twin included.
+					m.log.Warn("could not probe for an existing TXT; writing it anyway",
+						"cert", c.Name, "identifier", a.Identifier, "err", lerr)
+				case found:
+					a.TxtName = rec.FQDN
+					a.TxtValue = rec.Value
+					a.Presented = true
+					adopted = true
+					m.log.Info("the TXT from the interrupted pass is already up; adopting it instead of writing a duplicate",
+						"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName)
+				}
 			}
 
-			a.ChallengeURL = chlg.URL
-			a.ChallengeToken = chlg.Token
-			a.TxtName = rec.FQDN
-			a.TxtValue = rec.Value
-			a.Presented = true
-			m.log.Info("TXT presented",
-				"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName)
+			if !adopted {
+				// Write only, do not wait for propagation -- wait once after all TXT are written.
+				// Waiting per record makes a wildcard and its apex wait twice for nothing on the
+				// same TXT name (one propagation round takes over 2 minutes on DNSPod's free tier,
+				// so that is minutes right there).
+				rec, err := m.dns.Present(ctx, a.Identifier, chlg.Token, keyAuth)
+				if err != nil {
+					return false, m.recordFailure(st, fmt.Errorf("present TXT (%s): %w", a.Identifier, err))
+				}
+
+				a.TxtName = rec.FQDN
+				a.TxtValue = rec.Value
+				a.Presented = true
+				m.log.Info("TXT presented",
+					"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName)
+			}
 		}
 
 		if err := m.store.PutAuthorization(a); err != nil {
@@ -426,7 +476,16 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 	var cleaned, stuck int
 	for _, a := range authzs {
 		if !a.Presented {
-			// Rows that never reached DNS are deleted outright; leave no rubbish behind.
+			// A row carrying a token may still have its record up: the pass that wrote
+			// it died (or its persist failed) before marking Presented. Probe and try to
+			// reclaim before deleting the row -- deleting it blind would orphan that TXT
+			// for good, because the row is the only clue to the record's value.
+			if a.ChallengeToken != "" && !m.reclaimUnpresentedTXT(ctx, a) {
+				stuck++
+				continue
+			}
+			// Rows that provably never reached DNS are deleted outright; leave no
+			// rubbish behind.
 			if err := m.store.DeleteAuthorization(certName, a.AuthzURL); err != nil {
 				m.log.Warn("failed to delete authorization rows", "cert", certName, "authz", a.AuthzURL, "err", err)
 			}
@@ -455,11 +514,43 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 		m.log.Info("reclaimed a leftover _acme-challenge TXT record", "cert", certName, "count", cleaned)
 	}
 	if stuck > 0 {
-		m.log.Warn("some TXT records could not be reclaimed automatically; clean them up in the DNS console",
+		m.log.Warn("some TXT records could not be reclaimed automatically; their rows are kept and retried next round",
 			"cert", certName, "count", stuck,
-			"hint", "no challenge token, so the specific record cannot be located")
+			"hint", "if this persists, clean the records up in the DNS console; the kept rows carry their names")
 	}
 	return nil
+}
+
+// reclaimUnpresentedTXT probes DNS for the record of an authorization whose row says
+// Presented=false but which carries a challenge token -- the fingerprint of a pass that
+// died between the DNS write and the state persist. It returns false when the record's
+// fate is unknown (the probe failed, or the record is up but would not delete), and then
+// the caller must keep the row: its token is the only clue for locating the record again.
+func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorization) bool {
+	keyAuth, err := m.keyAuth.GetKeyAuthorization(a.ChallengeToken)
+	if err != nil {
+		m.log.Warn("cannot compute the key authorization for an unpresented row; keeping it",
+			"cert", a.CertName, "identifier", a.Identifier, "err", err)
+		return false
+	}
+	rec, found, err := m.dns.LookupTXT(ctx, a.Identifier, keyAuth)
+	if err != nil {
+		m.log.Warn("could not probe for the TXT of an interrupted pass; keeping the row",
+			"cert", a.CertName, "identifier", a.Identifier, "err", err)
+		return false
+	}
+	if !found {
+		// Nothing in DNS under this value: the write genuinely never happened.
+		return true
+	}
+	m.log.Info("found the TXT of an interrupted pass; reclaiming it before deleting the row",
+		"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN)
+	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
+		m.log.Warn("failed to reclaim the TXT of an interrupted pass; keeping the row",
+			"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN, "err", err)
+		return false
+	}
+	return true
 }
 
 func (m *Manager) finalize(

@@ -708,3 +708,20 @@ func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
 		t.Error("the remaining certificate must stay exported")
 	}
 }
+
+// RunCert asks for one specific certificate, so its caller must hear the pass's
+// own failure -- reporting success while the pass errored makes a targeted
+// trigger look healthy when it was not. RunAll deliberately stays
+// fire-and-forget: one failing certificate must not stall the others.
+func TestRunCertPropagatesTheReconcileError(t *testing.T) {
+	boom := errors.New("boom")
+	mgr := &fakeManager{failWith: map[string]error{"b": boom}}
+	r, _ := newTestReconciler(t, []string{"a", "b"}, mgr)
+
+	if err := r.RunCert(context.Background(), "b"); !errors.Is(err, boom) {
+		t.Errorf("RunCert must propagate the pass's error, got %v", err)
+	}
+	if err := r.RunCert(context.Background(), "a"); err != nil {
+		t.Errorf("a successful pass must return nil, got %v", err)
+	}
+}

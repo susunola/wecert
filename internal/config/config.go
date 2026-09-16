@@ -9,6 +9,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"sort"
@@ -342,7 +343,11 @@ func (o *Onboarding) normalize() error {
 	// against is always <= 1. Anything at or above 1 can never be exceeded, so the
 	// fuse would never fire -- which is the "upstream returned partial data, mass SAN
 	// deletion" case it exists for. A percentage written as `30` is the common typo.
-	if o.DropThreshold < 0 || o.DropThreshold >= 1 {
+	//
+	// NaN is checked explicitly: every comparison against it is false, so `.nan`
+	// sails past both bounds below and would only be caught later by onboarding.New
+	// -- a config that loads but can never run.
+	if math.IsNaN(o.DropThreshold) || o.DropThreshold < 0 || o.DropThreshold >= 1 {
 		return fmt.Errorf(
 			"onboarding.dropThreshold is a fraction in [0,1): 0.3 means 30%%, and 0 uses the default 0.3; got %v "+
 				"(a value of 1 or more can never be exceeded, so the abrupt-change fuse would never fire)",

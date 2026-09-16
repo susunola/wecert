@@ -43,7 +43,10 @@ func (l *authLimiter) recordFailure(addr string, now time.Time) {
 	defer l.mu.Unlock()
 	l.gc(now)
 	st := l.byAddr[addr]
-	if st == nil || now.Sub(st.windowStart) > authWindow {
+	// Reset the window only when no block is active: resetting it mid-block
+	// would also drop blockedUntil, shrinking the 15-minute lockout to the
+	// 5-minute window under a sustained attack.
+	if st == nil || (now.Sub(st.windowStart) > authWindow && !now.Before(st.blockedUntil)) {
 		st = &authLimiterState{windowStart: now}
 		l.byAddr[addr] = st
 	}

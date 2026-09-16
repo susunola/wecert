@@ -316,6 +316,13 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, recordID uint64, oldID string) error {
 	deadline := d.now().Add(3 * time.Minute)
 
+	// The counters live outside the loop and are updated only on a successful query, so
+	// they always hold the last *known* state. If the final polls before the deadline all
+	// errored, the deadline branch below must still see that state -- reading zeros there
+	// misdiagnoses a task that was making progress as "no resource bound to the old
+	// certificate" and sends the operator off to check a listener that is fine.
+	var success, failed, running, pending int64
+
 	// Between the task being created and the server marking it running, every counter is
 	// zero. Concluding "no resource is bound" from that instant would repeat the very
 	// mistake this path exists to absorb, so the zero-resource verdict waits for a short
@@ -323,12 +330,12 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 	// that a genuinely unbound certificate is still diagnosed promptly rather than after
 	// the full three minutes.
 	graceUntil := d.now().Add(deployRecordGrace)
-
 	for {
-		success, failed, running, pending, err := d.describeDeployRecord(ctx, client, recordID)
+		s, f, r, p, err := d.describeDeployRecord(ctx, client, recordID)
 		if err != nil {
 			d.log.Warn("failed to query the deploy record; retrying shortly", "deployRecordId", recordID, "err", err)
 		} else {
+			success, failed, running, pending = s, f, r, p
 			d.log.Info("one-click update progress",
 				"deployRecordId", recordID,
 				"success", success, "failed", failed, "running", running, "pending", pending)

@@ -1,11 +1,13 @@
 package onboarding
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -787,5 +789,256 @@ func TestGroupSettingsConflictKeepsPreviousCertificate(t *testing.T) {
 	after := h.document(t)
 	if after.Revision != before.Revision || after.Certificates[0].Profile != config.ProfileTLSServer {
 		t.Fatalf("conflicting group settings must keep the previous certificate: before=%+v after=%+v", before.Certificates, after.Certificates)
+	}
+}
+
+// Regression: the fuse used to compare against the *covered* set (LastNames),
+// which includes grace-carried names. A staged decommission (10 -> 7 -> 6
+// declarations) then counted its own carries as still-declared: the second step
+// re-tripped the fuse, MarkAbsent never ran again, and the round wedged into a
+// self-sustaining freeze. The baseline must be the pure declaration set.
+func TestStagedDecommissionDoesNotWedgeTheFuse(t *testing.T) {
+	h := newHarness(t, Options{}) // default threshold 0.30, grace 24h
+
+	names := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	set := func(prefixes []string) {
+		h.decls.raw = nil
+		h.rules.domains = nil
+		for _, n := range prefixes {
+			h.decls.raw = append(h.decls.raw, decl(n+".example.com"))
+			h.rules.domains = append(h.rules.domains, n+".example.com")
+		}
+	}
+
+	set(names)
+	h.run(t)
+
+	// Step 1: 10 -> 7. Exactly 30% lost -- at the threshold, not above it -- so it
+	// must pass; the grace period then keeps the covered set at 10 names.
+	set(names[:7])
+	if rep := h.run(t); rep.Frozen() {
+		t.Fatalf("a 30%% drop is at the threshold, not above it: %v", rep.FreezeReasons)
+	}
+
+	st, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absentSince := map[string]time.Time{}
+	for _, n := range []string{"h", "i", "j"} {
+		since, ok := st.AbsentSince[n+".example.com"]
+		if !ok {
+			t.Fatalf("%s.example.com must be marked absent after step 1", n)
+		}
+		absentSince[n] = since
+	}
+	if got := len(st.LastDeclared); got != 7 {
+		t.Fatalf("the declaration baseline must be 7 after step 1, got %d", got)
+	}
+	if got := len(st.LastNames); got != 10 {
+		t.Fatalf("the covered set must still be 10 (grace carries), got %d", got)
+	}
+
+	// Step 2: 7 -> 6. Against the covered set this would look like a 40% drop and
+	// freeze forever; against the declaration baseline it is 1 of 7.
+	h.clock.advance(time.Hour)
+	set(names[:6])
+	rep := h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("the staged decommission wedged the fuse: %v", rep.FreezeReasons)
+	}
+	if got := len(h.domains(t)); got != 10 {
+		t.Fatalf("everything stays covered inside the grace period, got %d names", got)
+	}
+
+	// The point of the whole exercise: the absence ledger kept running, and the
+	// step-1 timestamps were not reset.
+	st, err = LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n, since := range absentSince {
+		if got := st.AbsentSince[n+".example.com"]; !got.Equal(since) {
+			t.Errorf("%s.example.com's absence time must not reset: %v -> %v", n, since, got)
+		}
+	}
+	if _, ok := st.AbsentSince["g.example.com"]; !ok {
+		t.Error("g.example.com must be marked absent after step 2")
+	}
+}
+
+// State files written before LastDeclared existed have only the covered set.
+// That set must serve as the fuse's baseline for exactly one round -- a big
+// drop must still freeze -- rather than the fuse going quiet until the next
+// successful write.
+func TestFuseFallsBackToLastNamesBeforeLastDeclaredExists(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	for _, n := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"} {
+		h.decls.raw = append(h.decls.raw, decl(n+".example.com"))
+		h.rules.domains = append(h.rules.domains, n+".example.com")
+	}
+	h.run(t)
+
+	// Simulate a pre-upgrade state file: covered set present, LastDeclared absent.
+	st, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.LastDeclared = nil
+	if err := st.Save(h.opts.StatePath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Losing 5 of 10 is far above the threshold and must freeze even without a
+	// LastDeclared baseline.
+	h.decls.raw = h.decls.raw[:5]
+	h.rules.domains = h.rules.domains[:5]
+	if rep := h.run(t); !rep.Frozen() {
+		t.Fatal("without LastDeclared the fuse must fall back to the covered set, not go quiet")
+	}
+}
+
+// Once two records for one hostname disagree, the hostname is out for the
+// round. A third record must not resurrect it as a fresh first-seen -- that
+// would let whoever writes last silently win the conflict.
+func TestThirdDeclarationForAConflictedHostnameIsRejectedToo(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	h.decls.raw = []RawDeclaration{
+		decl("ok.example.com"),
+		decl("fight.example.com", "profile=classic"),
+		decl("fight.example.com", "profile=tlsserver"),
+		// Agrees with the first record; still must not be accepted.
+		decl("fight.example.com", "profile=classic"),
+	}
+	h.rules.domains = []string{"ok.example.com", "fight.example.com"}
+
+	rep := h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("a conflicted hostname must not freeze the round: %v", rep.FreezeReasons)
+	}
+	if got := h.domains(t); len(got) != 1 || got[0] != "ok.example.com" {
+		t.Fatalf("the conflicted hostname must stay out, got %v", got)
+	}
+	rejections := 0
+	for _, d := range rep.Decisions {
+		if d.Hostname == "fight.example.com" && !d.Included &&
+			strings.Contains(d.Reason, "conflicting declarations") {
+			rejections++
+		}
+	}
+	if rejections != 2 {
+		t.Errorf("both the conflict and the later repeat must be rejected, got %d rejections in %+v",
+			rejections, rep.Decisions)
+	}
+}
+
+// Commit writes the document before the state. If the state save fails, the
+// document on disk already carries the new revision while the state still holds
+// the old one. The retry must recognise the document's revision as its own --
+// otherwise every failed save double-counts the budget and restarts grace
+// clocks.
+func TestCommitStateSaveFailureDoesNotDoubleCountBudget(t *testing.T) {
+	stateDir := t.TempDir()
+	h := newHarness(t, Options{StatePath: filepath.Join(stateDir, "onboard-state.json")})
+
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	h.rules.domains = []string{"a.example.com"}
+	h.run(t)
+
+	// Add a name, then make the state save fail while the document write succeeds.
+	h.decls.raw = append(h.decls.raw, decl("b.example.com"))
+	h.rules.domains = append(h.rules.domains, "b.example.com")
+	if err := os.Chmod(stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) })
+
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if rep.Frozen() {
+		t.Fatalf("must not freeze: %v", rep.FreezeReasons)
+	}
+	if err := h.ob.Commit(rep); err == nil {
+		t.Fatal("the state save must fail in an unwritable directory")
+	}
+
+	// Retry with the same input: the computed revision matches the document on
+	// disk, so the round is unchanged -- no new budget entry.
+	rep, err = h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if rep.Mode != ModeUnchanged {
+		t.Errorf("the retry must see the document's revision as its own, got mode %s", rep.Mode)
+	}
+
+	st, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(st.Changes); got != 1 {
+		t.Errorf("the failed save must not double-count the budget: %d changes recorded, want 1", got)
+	}
+	if got := h.domains(t); len(got) != 2 {
+		t.Errorf("the document written before the failure must still cover both names, got %v", got)
+	}
+}
+
+// With no CLB rule source configured the reference check cannot run at all, so
+// nothing is ever deleted. That is the safe direction -- but the carry reason
+// must say the check could not run, not claim a rule still references the name.
+func TestNilRuleSourceCarriesWithAnHonestReason(t *testing.T) {
+	var logBuf bytes.Buffer
+	dir := t.TempDir()
+	c := newClock()
+	decls := &fakeDeclarations{}
+	ob, err := New(Sources{Declarations: decls}, Options{
+		DocumentPath:  filepath.Join(dir, "desired-state.yaml"),
+		StatePath:     filepath.Join(dir, "onboard-state.json"),
+		Generator:     "wecert-onboard/test",
+		DropThreshold: 0.9,
+		Now:           c.now,
+	}, slog.New(slog.NewTextHandler(&logBuf, nil)))
+	if err != nil {
+		t.Fatalf("constructing the onboarder failed: %v", err)
+	}
+	if !strings.Contains(logBuf.String(), "no CLB rule source") {
+		t.Error("New must warn that deletion is disabled without a rule source")
+	}
+
+	run := func() *Report {
+		t.Helper()
+		rep, err := ob.Run(context.Background())
+		if err != nil {
+			t.Fatalf("Run failed: %v", err)
+		}
+		if err := ob.Commit(rep); err != nil {
+			t.Fatalf("Commit failed: %v", err)
+		}
+		return rep
+	}
+
+	decls.raw = []RawDeclaration{decl("a.example.com"), decl("b.example.com")}
+	run()
+
+	decls.raw = []RawDeclaration{decl("a.example.com")}
+	run() // records b's absence for the first time
+
+	c.advance(72 * time.Hour) // past the grace period
+	rep := run()
+
+	d, ok := decisionFor(rep, "b.example.com")
+	if !ok || !d.Included {
+		t.Fatalf("without a rule source nothing may be deleted: %+v", d)
+	}
+	if !strings.Contains(d.Reason, "no CLB rule source is configured") {
+		t.Errorf("the reason must say the reference check cannot run, got %q", d.Reason)
+	}
+	if strings.Contains(d.Reason, "still references") {
+		t.Errorf("the reason must not claim a rule references the name, got %q", d.Reason)
 	}
 }
