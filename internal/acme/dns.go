@@ -145,7 +145,8 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 	// Register the lease under the same per-name lock that CleanUp holds across its
 	// delete call, so a cleanup can never slip a delete-all in between "this name has no
 	// live values" and the write landing. See challengeLeases.
-	mu := challengeLeases.lock(rec.FQDN)
+	mu, release := challengeLeases.lock(rec.FQDN)
+	defer release()
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -439,24 +440,59 @@ func probeReady(servers []string, fqdn, want string) (bool, string) {
 // and its delete-all, and the fresh record would die with the rest.
 var challengeLeases = newTXTLeases()
 
-type txtLeases struct {
-	// guards both maps; the per-name mutexes below order the provider calls
+// txtLease is one challenge name's slot: the mutex that orders the provider calls at
+// the name, the values currently live there, and a count of goroutines that hold (or
+// are about to lock) the mutex.
+type txtLease struct {
 	mu     sync.Mutex
-	locks  map[string]*sync.Mutex
-	values map[string]map[string]bool
+	refs   int
+	values map[string]bool
+}
+
+type txtLeases struct {
+	// guards entries; the per-name mutexes inside order the provider calls
+	mu      sync.Mutex
+	entries map[string]*txtLease
 }
 
 func newTXTLeases() *txtLeases {
-	return &txtLeases{locks: map[string]*sync.Mutex{}, values: map[string]map[string]bool{}}
+	return &txtLeases{entries: map[string]*txtLease{}}
 }
 
-func (l *txtLeases) lock(fqdn string) *sync.Mutex {
+// lock returns the per-name mutex plus a release function; every caller must hold the
+// mutex across its provider call and run release afterwards.
+//
+// The reference count is taken under l.mu **before** the caller locks the per-name
+// mutex, and that is what makes pruning safe: an entry is dropped (in release) only once
+// no goroutine references it, so nobody can be between "got the mutex pointer" and
+// "locked it" when the entry disappears. Pruning without the count would open exactly
+// that window -- the name gets re-created under a **different** mutex while the old one
+// is still in use, and two goroutines then run their provider calls concurrently at the
+// same name, which is the race the mutex exists to prevent.
+func (l *txtLeases) lock(fqdn string) (*sync.Mutex, func()) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.locks[fqdn] == nil {
-		l.locks[fqdn] = &sync.Mutex{}
+	e := l.entries[fqdn]
+	if e == nil {
+		e = &txtLease{values: map[string]bool{}}
+		l.entries[fqdn] = e
 	}
-	return l.locks[fqdn]
+	e.refs++
+	l.mu.Unlock()
+
+	var once sync.Once
+	return &e.mu, func() {
+		once.Do(func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			e.refs--
+			if e.refs == 0 && len(e.values) == 0 {
+				// Nothing live at the name and nobody using the mutex: drop the entry,
+				// so a long-running process does not accumulate one mutex per FQDN
+				// forever.
+				delete(l.entries, fqdn)
+			}
+		})
+	}
 }
 
 // add records that this process relies on the value staying in DNS. Set semantics: a
@@ -465,23 +501,30 @@ func (l *txtLeases) lock(fqdn string) *sync.Mutex {
 func (l *txtLeases) add(fqdn, value string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.values[fqdn] == nil {
-		l.values[fqdn] = map[string]bool{}
+	e := l.entries[fqdn]
+	if e == nil {
+		e = &txtLease{values: map[string]bool{}}
+		l.entries[fqdn] = e
 	}
-	l.values[fqdn][value] = true
+	e.values[value] = true
 }
 
 // remove drops one lease and reports whether any other value is still live at the name.
+//
+// It deliberately does **not** drop the entry itself, even when the last value goes:
+// the caller still holds the per-name mutex across its provider call, and dropping the
+// entry here would let a concurrent Present re-create the name under a different mutex
+// and sneak its write in between this CleanUp's "no live values" check and its
+// delete-all. Pruning is the release function's job (see lock).
 func (l *txtLeases) remove(fqdn, value string) (othersLive bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	values := l.values[fqdn]
-	delete(values, value)
-	if len(values) == 0 {
-		delete(l.values, fqdn)
+	e := l.entries[fqdn]
+	if e == nil {
 		return false
 	}
-	return true
+	delete(e.values, value)
+	return len(e.values) > 0
 }
 
 // CleanUp deletes the TXT record this call wrote -- or defers doing so.
@@ -498,7 +541,8 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 	fqdn := dns.Fqdn(info.EffectiveFQDN)
 
-	mu := challengeLeases.lock(fqdn)
+	mu, release := challengeLeases.lock(fqdn)
+	defer release()
 	mu.Lock()
 	defer mu.Unlock()
 

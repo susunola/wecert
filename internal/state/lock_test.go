@@ -131,6 +131,33 @@ func TestLockIsReleasedWhenTheProcessDiesWithoutClosing(t *testing.T) {
 	}
 }
 
+// LockFile exposes the same flock for sibling state files (wecert-onboard's state
+// file): a second acquisition must fail fast with ErrLocked, and releasing must make
+// the path lockable again.
+func TestLockFileFailsFastAndReleases(t *testing.T) {
+	path := lockTestPath(t) + ".onboard-state.lock"
+
+	unlock, err := LockFile(path)
+	if err != nil {
+		t.Fatalf("first LockFile failed: %v", err)
+	}
+
+	if _, err := LockFile(path); !errors.Is(err, ErrLocked) {
+		t.Fatalf("a held lock must fail fast with ErrLocked, got: %v", err)
+	}
+
+	if err := unlock(); err != nil {
+		t.Fatalf("release failed: %v", err)
+	}
+	unlock2, err := LockFile(path)
+	if err != nil {
+		t.Fatalf("the path should be lockable again after release, got: %v", err)
+	}
+	if err := unlock2(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The lock must be taken before the db file is created: two processes initializing an
 // empty db at once is harder to diagnose than two writing an existing one, because they
 // each end up with a different table schema.

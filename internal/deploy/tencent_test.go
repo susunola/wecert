@@ -68,9 +68,12 @@ func TestProgressBoundCountNullTotalCountIsNotReady(t *testing.T) {
 	}
 }
 
-// A partially populated response still counts as answered: one region carrying a real
-// TotalCount is enough, and the null regions simply contribute nothing.
-func TestProgressBoundCountMixedNullAndValue(t *testing.T) {
+// A partially populated response is *not* an answer either: one region carrying a real
+// TotalCount while another is still null means the server has only reported half the
+// task, and the new task may be switching the null region at that very moment. Summing
+// only the populated regions would report a zero that is not real, so a mixed response
+// defers to the async record exactly like an all-null one.
+func TestProgressBoundCountMixedNullAndValueIsNotReady(t *testing.T) {
 	progress := []*ssl.UpdateSyncProgress{{
 		ResourceType: common.StringPtr("clb"),
 		UpdateSyncProgressRegions: []*ssl.UpdateSyncProgressRegion{{
@@ -81,8 +84,12 @@ func TestProgressBoundCountMixedNullAndValue(t *testing.T) {
 			TotalCount: common.Int64Ptr(1),
 		}},
 	}}
-	if n, ready := progressBoundCount(progress); n != 1 || !ready {
-		t.Fatalf("count = %d, ready = %v; want 1, true", n, ready)
+	n, ready := progressBoundCount(progress)
+	if n != 1 {
+		t.Fatalf("count = %d, want 1: the populated region still contributes its count", n)
+	}
+	if ready {
+		t.Fatal("ready = true, want false: a null TotalCount in any listed region means the answer is incomplete")
 	}
 }
 

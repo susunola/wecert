@@ -74,6 +74,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("RunCommand (check the tat:RunCommand permission, and whether the CVM has the TAT agent installed): %w", err)
 	}
+	// Guard the Response before dereferencing it, the way fetchTask does: the SDK can
+	// return a typed response with a nil Response body, and a blind dereference would
+	// turn a failed submission into a panic instead of a diagnosable error.
+	if runResp.Response == nil {
+		return fmt.Errorf("RunCommand returned an empty response")
+	}
 	invocationID := deref(runResp.Response.InvocationId)
 	if invocationID == "" {
 		return fmt.Errorf("RunCommand returned no InvocationId")
