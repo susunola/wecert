@@ -105,6 +105,11 @@
 - Count queued (`PendingTotalCount`) resources as unfinished when waiting for the
   rebind, so a batched dispatch cannot be judged complete while listeners still
   serve the old certificate.
+- Distinguish a *null* `TotalCount` from a populated zero, per review from
+  @JerryZ529: a response can list regions and still carry no count for any of
+  them, which an "is the progress list empty" test would have missed. Their fix
+  also diagnoses the genuine no-binding case after a short grace period rather
+  than waiting out the full three minutes.
 - Recover a rebind that succeeded without being recorded: when the update reports
   nothing to switch, check whether the *new* certificate is already bound, and treat
   it as done if it is. Without this, a deployment already stuck in that state stays
