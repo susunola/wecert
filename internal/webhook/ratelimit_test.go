@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -64,5 +65,37 @@ func TestRecordSuccessClearsFailures(t *testing.T) {
 	}
 	if ok, _ := l.allowed("1.2.3.4", limiterT0.Add(time.Minute)); !ok {
 		t.Error("failures before a success should not count towards the limit")
+	}
+}
+
+// The sweep must be amortized once the map is large.
+//
+// Sweeping on every failure hands an attacker a quadratic cost: one failed request from
+// each of many source addresses, and every failure scans the whole map. The sweep is
+// therefore rate-limited by time, not only by size.
+func TestGcIsAmortizedOnceTheMapIsLarge(t *testing.T) {
+	l := newAuthLimiter()
+
+	// A map well past the threshold, every entry long expired.
+	for i := 0; i < authLimiterGCThreshold+100; i++ {
+		l.byAddr[fmt.Sprintf("10.0.%d.%d", i/256, i%256)] = &authLimiterState{
+			failures:    1,
+			windowStart: limiterT0.Add(-time.Hour),
+		}
+	}
+	// Pretend a sweep just happened: within the interval, no second sweep may run.
+	l.lastGC = limiterT0
+
+	l.recordFailure("1.2.3.4", limiterT0)
+
+	if got := len(l.byAddr); got <= authLimiterGCThreshold {
+		t.Fatalf("a second sweep ran inside the interval: the map dropped to %d entries", got)
+	}
+
+	// Once the interval has passed, the sweep does run and reclaims the expired entries.
+	l.recordFailure("1.2.3.4", limiterT0.Add(authLimiterGCInterval+time.Second))
+
+	if got := len(l.byAddr); got > 2 {
+		t.Errorf("the sweep must reclaim expired entries after the interval, %d left", got)
 	}
 }

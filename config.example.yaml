@@ -249,6 +249,12 @@ metrics:
 #   # it, to wire "the certificate was renewed" into downstream flows (for example
 #   # triggering a config reload).
 #   # notifyURL: "https://ci.example.com/hooks/wecert"
+#
+#   # Optional, only meaningful with notifyURL, at least 32 characters.
+#   # Each event then carries X-Wecert-Signature: sha256=<hex HMAC-SHA256 of the
+#   # raw body>, so the receiver can tell a genuine event from anything else that
+#   # can reach its URL. Generate one with: openssl rand -hex 32
+#   # notifySecret: "REPLACE_ME_WITH_A_LONG_RANDOM_SECRET"
 
 certificates:
   # ── one certificate = one set of domains that live and die together ──────

@@ -33,9 +33,9 @@ import (
 // refuse outright.
 var errBothForms = errors.New("cert and certs are mutually exclusive")
 
-// errEmptyCerts rejects an explicit "certs": []. It asks for nothing, and
-// treating it like an absent body would silently widen it into a full
-// convergence the caller never asked for.
+// errEmptyCerts rejects an explicit "certs": [] or "certs": null. Both ask for
+// nothing, and treating either like an absent body would silently widen it into
+// a full convergence the caller never asked for.
 var errEmptyCerts = errors.New("certs must not be empty; omit the body to process everything")
 
 // Reconciler is the convergence capability the webhook needs. Defined at the
@@ -178,10 +178,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // body means "process everything".
 //
 // Certs is a pointer so "field absent" (full trigger) is distinguishable from
-// an explicit "certs": [], which asks for nothing and is rejected.
+// an explicit "certs": [], which asks for nothing and is rejected. Presence is
+// tracked separately because a pointer alone cannot make that distinction for a
+// JSON null: encoding/json leaves both "certs" absent and "certs": null as a nil
+// pointer, and null is what a Go caller marshalling a nil []string sends.
 type reconcileRequest struct {
 	Cert  string    `json:"cert"`
 	Certs *[]string `json:"certs"`
+
+	// certsPresent reports that the body carried a "certs" key at all.
+	certsPresent bool
 }
 
 type reconcileResponse struct {
@@ -254,14 +260,27 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return req, nil
 	}
+	// Decode the keys first: whether "certs" appeared at all decides what the
+	// request means, and the struct decode alone would report "absent" for a
+	// "certs": null body. Treating that as "absent" escalates a caller that named
+	// no certificates into a full-fleet convergence, burning issuance quota it
+	// never asked for.
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(body, &keys); err != nil {
+		return req, err
+	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return req, err
 	}
-	if req.Cert != "" && req.Certs != nil && len(*req.Certs) > 0 {
-		return req, errBothForms
-	}
-	if req.Certs != nil && len(*req.Certs) == 0 {
-		return req, errEmptyCerts
+	_, req.certsPresent = keys["certs"]
+
+	if req.certsPresent {
+		if req.Certs == nil || len(*req.Certs) == 0 {
+			return req, errEmptyCerts
+		}
+		if req.Cert != "" {
+			return req, errBothForms
+		}
 	}
 	return req, nil
 }
