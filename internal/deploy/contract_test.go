@@ -94,7 +94,7 @@ func TestLazyTencentCLBReportsAnUnusableCredentialOnFirstUse(t *testing.T) {
 	cfg := config.Tencent{CredentialMode: config.CredentialStatic}
 	d := NewLazyTencentCLB(cfg, quietLog())
 
-	if _, err := d.Bindings(context.Background(), "cert-1"); err == nil {
+	if _, _, err := d.Bindings(context.Background(), "cert-1"); err == nil {
 		t.Fatal("first use with an unusable credential config must fail")
 	}
 	if _, err := d.Deploy(context.Background(), "c", "old", []byte("pem"), []byte("key")); err == nil {
@@ -174,7 +174,7 @@ func TestLazyTencentCLBDefersWorkUntilFirstUse(t *testing.T) {
 	// again -- that is the per-operation credential refresh -- but it must not rebuild the
 	// TencentCLB.
 	inner := d.inner
-	if _, err := d.Bindings(context.Background(), "cert-1"); err != nil {
+	if _, _, err := d.Bindings(context.Background(), "cert-1"); err != nil {
 		t.Fatalf("Bindings: %v", err)
 	}
 	if d.inner != inner {
@@ -297,7 +297,7 @@ func TestBindingsWithAnEmptyIDDoesNotCallTheAPI(t *testing.T) {
 	stubSSLClient(t, &fakeSSLAPI{}) // every method panics if called
 	d := newTestDeployer(time.Now)
 
-	n, err := d.Bindings(context.Background(), "")
+	n, _, err := d.Bindings(context.Background(), "")
 	if err != nil {
 		t.Fatalf("Bindings(\"\") must not fail: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestBindingsReturnsZeroWhenNoTaskIsCreated(t *testing.T) {
 	})
 	d := newTestDeployer(time.Now)
 
-	n, err := d.Bindings(context.Background(), "cert-1")
+	n, _, err := d.Bindings(context.Background(), "cert-1")
 	if err != nil {
 		t.Fatalf("Bindings: %v", err)
 	}
@@ -355,7 +355,7 @@ func TestBindingsPollsUntilTheTaskCompletes(t *testing.T) {
 	})
 	d := newTestDeployer(clock.now)
 
-	n, err := d.Bindings(context.Background(), "cert-1")
+	n, _, err := d.Bindings(context.Background(), "cert-1")
 	if err != nil {
 		t.Fatalf("Bindings: %v", err)
 	}
@@ -384,7 +384,7 @@ func TestBindingsReportsATaskError(t *testing.T) {
 	})
 	d := newTestDeployer(time.Now)
 
-	_, err := d.Bindings(context.Background(), "cert-1")
+	_, _, err := d.Bindings(context.Background(), "cert-1")
 	if err == nil {
 		t.Fatal("an explicit task error must be reported")
 	}

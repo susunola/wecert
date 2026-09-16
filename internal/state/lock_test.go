@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMain doubles as the entry point for the "crashing child process".
@@ -78,11 +79,12 @@ func TestCloseReleasesTheLock(t *testing.T) {
 	}
 }
 
-// The -dry-run path must work while the daemon is running.
+// The unlocked path must work while the daemon is running.
 //
-// It only reads the existing ACME account and initiates no issuance, so skipping the
-// lock is safe; and "you cannot even validate the config because the daemon is running"
-// pushes people into editing the config blindly.
+// The tools that use it are not read-only -- `-revoke` records a revocation request, `-dry-run`
+// registers the ACME account on a first run -- so what makes skipping the lock safe is that none of
+// those writes need serialising against a pass. What does NOT belong on this path is the migration,
+// and that is what the test below this one pins.
 func TestOpenUnlockedIgnoresTheLock(t *testing.T) {
 	path := lockTestPath(t)
 
@@ -172,5 +174,92 @@ func TestLockFileIsCreatedNextToTheDatabase(t *testing.T) {
 
 	if _, err := os.Stat(path + ".lock"); err != nil {
 		t.Fatalf("a lock file should be created: %v", err)
+	}
+}
+
+// An unlocked open must never migrate, and must say what to do instead.
+//
+// `migrate` is CREATE TABLE plus a check-then-act `ALTER TABLE ... ADD COLUMN`, so two unlocked
+// openers racing on an older database can both pass the "does this column exist?" check and the
+// loser aborts the whole open with `duplicate column name: ...` -- reproduced by hand with four
+// concurrent OpenUnlocked calls against a legacy-shaped database. Refusing is the fix: the daemon
+// owns the schema, and this path is not allowed to change it.
+func TestOpenUnlockedRefusesToMigrate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+
+	// A database that needs work: nothing exists yet, so every table is pending.
+	if _, err := OpenUnlocked(path); err == nil {
+		t.Fatal("an unlocked open created a schema; the migration must belong to the exclusive path")
+	} else if !strings.Contains(err.Error(), "schema update") {
+		t.Errorf("the refusal must name the problem, got: %v", err)
+	}
+
+	// The exclusive path does the work, and then the unlocked one is happy.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("the exclusive open must migrate: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unlocked, err := OpenUnlocked(path)
+	if err != nil {
+		t.Fatalf("with the schema current the unlocked path must work: %v", err)
+	}
+	if err := unlocked.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The archived rollback material must survive whichever order the two writers arrive in.
+//
+// The orphan path records a certificate it merely uploaded, with no material; the retirement path
+// records the one that was serving, with the fullchain and key. `ON CONFLICT ... DO NOTHING` let
+// whichever arrived first win, so a row could keep two NULLs and the documented manual rollback in
+// docs/recovery.md had nothing to restore.
+func TestRetiredCertificateMaterialSurvivesEitherWriteOrder(t *testing.T) {
+	cases := []struct {
+		name     string
+		first    [2][]byte
+		second   [2][]byte
+		wantCert []byte
+		wantKey  []byte
+	}{
+		{"empty first, real second", [2][]byte{nil, nil}, [2][]byte{[]byte("cert-pem"), []byte("key-pem")},
+			[]byte("cert-pem"), []byte("key-pem")},
+		{"real first, empty second", [2][]byte{[]byte("cert-pem"), []byte("key-pem")}, [2][]byte{nil, nil},
+			[]byte("cert-pem"), []byte("key-pem")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			s, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+
+			if err := s.AddRetiredCert("cert-1", "name", tc.first[0], tc.first[1]); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.AddRetiredCert("cert-1", "name", tc.second[0], tc.second[1]); err != nil {
+				t.Fatal(err)
+			}
+
+			rows, err := s.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("want one row, got %d", len(rows))
+			}
+			if string(rows[0].CertPEM) != string(tc.wantCert) || string(rows[0].KeyPEM) != string(tc.wantKey) {
+				t.Errorf("archived material = (%q, %q), want (%q, %q): the row the documented manual "+
+					"rollback reads must keep the real material",
+					rows[0].CertPEM, rows[0].KeyPEM, tc.wantCert, tc.wantKey)
+			}
+		})
 	}
 }
