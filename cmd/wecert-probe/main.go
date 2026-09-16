@@ -137,7 +137,14 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 		attempt++
 		code, retry := attemptOnce(ctx, host, opts, e, asJSON, attempt)
 
-		// Only "not in effect yet" is worth waiting for: unreachable and wrong-cert won't fix themselves.
+		// Retry on both outcomes. An unreachable host may be a network blip, a VIP that is not
+		// up yet or DNS that has not propagated; a mismatch is the normal shape for roughly 15
+		// seconds after a rebind, because the old certificate is still the one being served.
+		// Only an OK verdict is final.
+		//
+		// (This comment used to claim the opposite -- that unreachable and wrong-cert "won't fix
+		// themselves". They do, which is why -wait exists; the stale wording invited removing
+		// the retry.)
 		if !retry || deadline.IsZero() || time.Now().After(deadline) {
 			return code
 		}
