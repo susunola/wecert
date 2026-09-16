@@ -69,7 +69,18 @@ func run() error {
 		cfg.StatePath = *statePath
 	}
 
-	store, err := state.Open(cfg.StatePath)
+	// 取状态库的跨进程排他锁。"每张证书最多一个在飞订单"原本只在一个
+	// 进程内成立，而 daemon 与 timer 两种模式同时启用就会并发下单 ——
+	// 撞上的是 7 天不可恢复的 exact-set 限额。
+	//
+	// -dry-run 例外：它几乎总是在 daemon 正在跑的时候被执行，
+	// 而"因为 daemon 在跑所以连配置都校验不了"会把人逼去瞎改配置。
+	// 这条路径只读已有的 ACME 账号、不发起签发。
+	openStore := state.Open
+	if *dryRun {
+		openStore = state.OpenUnlocked
+	}
+	store, err := openStore(cfg.StatePath)
 	if err != nil {
 		return err
 	}

@@ -658,7 +658,17 @@ CA/Browser Forum 已排期 **2027-03-15 起证书 ≤100 天，2029-03-15 起 �
 
 ### systemd 部署
 
-两种模式互斥。**不要同时启用** —— 它们共用一个状态库，而"每张证书最多一个在飞订单"这条保证只在单进程内成立。
+两种模式互斥。**只启用一种** —— 它们共用一个状态库，而"每张证书最多一个在飞订单"这条保证只在单进程内成立。
+
+这一点现在是**强制的，不只是写在文档里**：打开状态库时会在 `<statePath>.lock` 上取一个排他 `flock`，第二个进程启动即失败：
+
+```
+the state database is already held by another wecert process (lock file: /var/lib/wecert/state.db.lock)
+```
+
+没有这道锁的话，daemon 和 timer 同时跑会各自维护一份"每张证书最多一个在飞订单"的局部视图，为同一个精确 identifier 集合下两次单 —— 那是 *5 certificates per exact set of identifiers / 7 days*，一条没有 override 的限额。
+
+锁是建议锁且由内核管理，所以 `kill -9` 会立刻释放它，不存在需要人工清理的陈旧 PID 文件。`-dry-run` 刻意跳过这道锁：它几乎总是在 daemon 正在跑的时候被执行，而且从不发起签发。
 
 **守护模式（默认）：** 每小时收敛一轮，启动时先跑一轮（带抖动）。
 
@@ -1046,8 +1056,6 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
 - [ ] 用 `multi_cert_info` 测 SNI 多证书场景（"换一张不误伤另一张"）
 - [ ] 阶段 C：CVM + systemd + CVM 角色凭证路径（`testenv/` 里已备好，`create_cvm=true`）
 - [ ] 签发失败降级策略：到期前 N 天仍未成功时，自动拆成更小子集先签（部分可用好过全挂）
-- [ ] 给 `state.db` 加跨进程排他锁（`flock`）。现在"每张证书最多一个在飞订单"只在一个进程内成立，
-      daemon 与 timer 两种模式同时启用就会并发下单，而后果是 7 天不可恢复的限额
 - [ ] 把 `Manager` 对 `*api.Core` 的依赖也抽成窄接口，或引入 pebble，
       让完整签发流程进入单测（目前只抽了清理路径需要的窄接口）
 - [ ] `state.Store` 缺少事务能力，`download()` 收尾的
@@ -1068,6 +1076,9 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
       "我以为部署的"。云 API 说绑定成功、和浏览器真的能拿到这张证书，是两件事 ——
       换绑是异步的，SNI 上也可能有另一张证书在赢，这两件事控制面都看不出来。
       见 `probe` 配置节。
+- [x] **给 `state.db` 加跨进程排他锁（`flock`）。** 在 `state.Open` 里对
+      `<statePath>.lock` 取排他锁，第二个进程启动即失败，而不是并发下单。
+      内核管理，崩溃自动释放，不存在陈旧 PID 文件。见上面的 systemd 部署一节。
 
 ## License
 

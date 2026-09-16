@@ -641,7 +641,17 @@ The CA/Browser Forum has scheduled **≤100 days from 2027-03-15 and ≤47 days 
 
 ### systemd deployment
 
-Two mutually exclusive modes. **Do not enable both** — they share one state database, and the "at most one in-flight order" guarantee holds only inside a single process.
+Two mutually exclusive modes. **Enable only one** — they share one state database, and "at most one in-flight order per certificate" holds only inside a single process.
+
+This is **enforced, not just documented**: opening the state database takes an exclusive `flock` on `<statePath>.lock`, and a second process fails at startup with
+
+```
+the state database is already held by another wecert process (lock file: /var/lib/wecert/state.db.lock)
+```
+
+Without it, a daemon and a timer running together would each keep their own view of "one in-flight order per certificate" and place two orders for the same exact identifier set — *5 certificates per exact set of identifiers / 7 days*, a limit with no override.
+
+The lock is advisory and kernel-managed, so a `kill -9` releases it immediately; there is no stale PID file to clean up. `-dry-run` deliberately skips it, because it almost always runs while the daemon is up and it never places an order.
 
 **Daemon mode (default):** reconcile every hour, plus a jittered startup pass.
 
@@ -933,6 +943,7 @@ Runs a full issuance against staging with a throwaway state database, refusing t
 
 - [x] **Desired-state providers: issue when a domain is added, not only on expiry.** Lands in `internal/spec` (the contract and providers), `internal/group` (wildcard-first grouping), `internal/onboarding` (declaration parsing plus the five safety invariants) and `cmd/wecert-onboard`. Migration path is `static → observe → enforce`. Rationale: [docs/desired-state-providers.md](docs/desired-state-providers.md) · operator guide: [docs/desired-state.md](docs/desired-state.md) · diagrams: [docs/certificate-lifecycle.html](docs/certificate-lifecycle.html).
 - [x] **External black-box probe (dial 443 and check the effective `notAfter`).** Lands in `internal/probe` and `cmd/wecert-probe`: every pass dials the first few names of each deployed certificate and compares what is *actually served* against what was *deployed*. "The API says the rebind succeeded" and "the browser gets this certificate" are two different things — the rebind is asynchronous, and another certificate can be winning SNI. Neither is visible through the control plane. See the `probe` section above.
+- [x] **Cross-process exclusive lock (`flock`) on `state.db`.** Acquired in `state.Open` on `<statePath>.lock`; a second process fails at startup instead of double-ordering. Kernel-managed, so a crash releases it — no stale PID file. See the systemd deployment section above.
 
 **Outstanding:**
 
@@ -941,7 +952,6 @@ Runs a full issuance against staging with a throwaway state database, refusing t
 - [ ] Test the SNI multi-certificate case with `multi_cert_info` ("replacing one doesn't disturb another")
 - [ ] Stage C: CVM + systemd + CVM role credential path (`testenv/` is ready, `create_cvm=true`)
 - [ ] Failure fallback: if issuance still hasn't succeeded N days before expiry, split into smaller subsets and sign those first (partial availability beats total failure)
-- [ ] Add a cross-process exclusive lock (`flock`) on `state.db`. Today "at most one in-flight order per certificate" holds only within one process, and enabling both the daemon and the timer will double-order — an unrecoverable 7-day consequence.
 - [ ] Abstract `Manager`'s dependency on `*api.Core` behind narrow interfaces, or adopt pebble, to unit-test the full issuance flow (only the cleanup path has interfaces today).
 - [ ] `state.Store` has no transaction support, so the `download()` epilogue (promote the new certificate → retire the old → discard the order) commits in separate statements. A partial failure leaves an orphaned cloud certificate or a false failure alarm.
 
