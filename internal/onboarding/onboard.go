@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -206,11 +207,18 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 	}
 	if opts.DropThreshold <= 0 {
 		opts.DropThreshold = DefaultDropThreshold
-	} else if opts.DropThreshold >= 1 {
+	} else if math.IsNaN(opts.DropThreshold) || opts.DropThreshold >= 1 {
 		// Mirror the config layer's [0,1) check: a CLI -drop-threshold flag reaches
 		// Options directly, bypassing that validation, and a percentage written as
 		// `30` would silently disable the abrupt-change fuse this guard exists for.
-		return nil, fmt.Errorf("onboarding: DropThreshold is a fraction in [0,1): got %v (a value of 1 or more can never be exceeded, so the abrupt-change fuse would never fire)", opts.DropThreshold)
+		//
+		// NaN is rejected explicitly: every comparison against it is false, so it
+		// satisfies this bound and the `<= 0` default above alike and would otherwise
+		// pass straight through.
+		return nil, fmt.Errorf(
+			"onboarding: DropThreshold is a fraction in [0,1): got %v "+
+				"(a value of 1 or more can never be exceeded, so the abrupt-change fuse would never fire)",
+			opts.DropThreshold)
 	}
 	if opts.GracePeriod <= 0 {
 		opts.GracePeriod = DefaultGracePeriod

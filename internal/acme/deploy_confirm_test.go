@@ -19,12 +19,20 @@ type fakeDeployer struct {
 	bindings int
 	bindErr  error
 	calls    int
+
+	// deleted records the CertIds Delete was called with, and deleteErr makes it
+	// fail, so the reclamation path can be pinned in both directions.
+	deleted   []string
+	deleteErr error
 }
 
 func (f *fakeDeployer) Deploy(_ context.Context, _, oldID string, _, _ []byte) (string, error) {
 	return oldID, nil
 }
-func (f *fakeDeployer) Delete(_ context.Context, _ string) error { return nil }
+func (f *fakeDeployer) Delete(_ context.Context, certID string) error {
+	f.deleted = append(f.deleted, certID)
+	return f.deleteErr
+}
 func (f *fakeDeployer) Bindings(_ context.Context, _ string) (int, error) {
 	f.calls++
 	return f.bindings, f.bindErr
@@ -218,4 +226,84 @@ func TestNoopDeployerReportsNoBindings(t *testing.T) {
 	if n != 0 {
 		t.Errorf("Noop.Bindings must always report 0, got %d", n)
 	}
+}
+
+// ── reclamation: every uploaded CertId must end up somewhere ────────────────
+
+// A certificate uploaded during a failed deploy is bound to nothing, so no later
+// renewal will ever replace it: it occupies the account's uploaded-certificate
+// quota until it is deleted. Recording it at the moment the deploy fails is the
+// only thing that ever gets it back -- and losing that record is a slow,
+// account-wide failure whose first symptom is "renewal stopped working".
+func TestFailedDeployIsRecordedForReclaimAndThenReaped(t *testing.T) {
+	dep := &fakeDeployer{}
+	m, store, cert := newConfirmHarness(t, dep, nil)
+
+	// The deploy failed after the upload, so the new CertId is an orphan.
+	m.recordOrphanCert("ap-new", "ap-live", cert.Name)
+
+	if got := listRetired(t, store, m, time.Hour); len(got) != 1 || got[0].CertID != "ap-new" {
+		t.Fatalf("the orphaned certificate must be recorded for reclaim, got %+v", got)
+	}
+
+	// Inside the retention window nothing is deleted: that certificate is still the
+	// rollback target if the new one goes wrong.
+	m.ReapRetired(context.Background())
+	if len(dep.deleted) != 0 {
+		t.Fatalf("a certificate inside the retention window must not be deleted, got %v", dep.deleted)
+	}
+
+	// Past the window it is reclaimed, and the record goes with it so the next pass
+	// does not attempt the same delete forever.
+	base := time.Now()
+	m.now = func() time.Time { return base.Add(2 * m.retention) }
+	m.ReapRetired(context.Background())
+
+	if len(dep.deleted) != 1 || dep.deleted[0] != "ap-new" {
+		t.Fatalf("want the orphan deleted exactly once, got %v", dep.deleted)
+	}
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 0 {
+		t.Errorf("a reclaimed certificate must leave no record behind, got %+v", got)
+	}
+}
+
+// A failed Delete must keep the record: the certificate still occupies quota, so
+// the next pass has to try again.
+func TestReapingKeepsTheRecordWhenDeleteFails(t *testing.T) {
+	dep := &fakeDeployer{deleteErr: errors.New("API blip")}
+	m, store, cert := newConfirmHarness(t, dep, nil)
+
+	m.recordOrphanCert("ap-new", "ap-live", cert.Name)
+	base := time.Now()
+	m.now = func() time.Time { return base.Add(2 * m.retention) }
+	m.ReapRetired(context.Background())
+
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 1 {
+		t.Fatalf("a failed reclaim must leave the record for the next pass, got %+v", got)
+	}
+}
+
+// Recording the certificate that is actually serving traffic would schedule the
+// live certificate for deletion.
+func TestRecordOrphanCertIgnoresTheLiveCertificate(t *testing.T) {
+	dep := &fakeDeployer{}
+	m, store, cert := newConfirmHarness(t, dep, nil)
+
+	m.recordOrphanCert("ap-live", "ap-live", cert.Name) // same id as live
+	m.recordOrphanCert("", "ap-live", cert.Name)        // nothing was uploaded
+
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 0 {
+		t.Fatalf("the live certificate (or an empty id) must never be recorded for reclaim, got %+v", got)
+	}
+}
+
+// listRetired reads the reclaim records further into the future than any retention
+// window, so a record is returned whether or not it is due yet.
+func listRetired(t *testing.T, store *state.Store, m *Manager, ahead time.Duration) []*state.RetiredCert {
+	t.Helper()
+	got, err := store.ListRetiredCertsBefore(m.now().Add(ahead))
+	if err != nil {
+		t.Fatalf("ListRetiredCertsBefore: %v", err)
+	}
+	return got
 }

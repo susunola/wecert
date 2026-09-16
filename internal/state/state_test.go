@@ -2,6 +2,7 @@ package state
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -286,5 +287,44 @@ func TestStatePersistsAcrossReopen(t *testing.T) {
 	}
 	if got == nil || got.OrderURL != "persisted-url" {
 		t.Fatalf("order lost after reopen: %+v", got)
+	}
+}
+
+// last_error holds upstream text verbatim: lego embeds the entire non-JSON ACME
+// error body in its errors, and the CVM metadata path echoes response bodies. It
+// must be bounded where it is persisted rather than in each producer, or a hostile
+// or merely verbose endpoint controls how much text lands in the database -- and
+// /hook/status serves that text, while notifyURL posts it off-host.
+func TestPutCertBoundsLastError(t *testing.T) {
+	s := openTestStore(t)
+
+	st := &CertState{Name: "c", LastError: strings.Repeat("x", 64*1024)}
+	if err := s.PutCert(st); err != nil {
+		t.Fatalf("PutCert failed: %v", err)
+	}
+
+	got, err := s.GetCert("c")
+	if err != nil {
+		t.Fatalf("GetCert failed: %v", err)
+	}
+	if len(got.LastError) > maxLastErrorBytes+len("...") {
+		t.Fatalf("last_error was stored unbounded: %d bytes", len(got.LastError))
+	}
+	if !strings.HasSuffix(got.LastError, "...") {
+		t.Errorf("truncation should be visible, got the tail %q", got.LastError[max(0, len(got.LastError)-8):])
+	}
+
+	// A short message must survive untouched: truncation must not mangle the
+	// ordinary case, which is what an operator actually reads.
+	st.LastError = "acme: rate limited"
+	if err := s.PutCert(st); err != nil {
+		t.Fatalf("PutCert failed: %v", err)
+	}
+	got, err = s.GetCert("c")
+	if err != nil {
+		t.Fatalf("GetCert failed: %v", err)
+	}
+	if got.LastError != "acme: rate limited" {
+		t.Errorf("a short last_error must round-trip unchanged, got %q", got.LastError)
 	}
 }

@@ -64,6 +64,10 @@ type fakeAPI struct {
 	finalizeURL     string
 	finalizeCSR     []byte
 	accepted        []string
+	// certBundle records the *argument* GetCertificate was called with. Setting it
+	// unconditionally would make the "must ask for fullchain" assertion a tautology:
+	// download could pass bundle=false and the suite would stay green, while the CLB
+	// received a leaf with no intermediates.
 	certBundle      bool
 	renewalInfoHits int
 }
@@ -139,11 +143,11 @@ func (f *fakeAPI) AcceptChallenge(challengeURL string) error {
 	return nil
 }
 
-func (f *fakeAPI) GetCertificate(string, bool) ([]byte, []byte, error) {
+func (f *fakeAPI) GetCertificate(_ string, bundle bool) ([]byte, []byte, error) {
 	f.enter("GetCertificate")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.certBundle = true
+	f.certBundle = bundle
 	return f.certPEM, []byte("key"), f.certErr
 }
 
