@@ -159,6 +159,16 @@ func (m *Manager) solveChallenges(
 				m.log.Warn("failed to record the invalidated authorization",
 					"cert", c.Name, "identifier", a.Identifier, "err", perr)
 			}
+
+			// 逐个 identifier 记账。证书级的 consecutive_failures 只说
+			// "这张证书签不出来"，而到期前降级要回答的是"是哪个名字签不出来" ——
+			// 不知道这个，就只能随机摘名字，那会把好的名字也一起牺牲掉。
+			if rerr := m.store.RecordIdentifierFailure(
+				c.Name, a.Identifier, authzError(cur), m.now()); rerr != nil {
+				m.log.Warn("failed to record the identifier failure",
+					"cert", c.Name, "identifier", a.Identifier, "err", rerr)
+			}
+
 			return false, m.recordFailure(st, fmt.Errorf(
 				"the authorization for identifier %s is invalid: %s", a.Identifier, authzError(cur)))
 		}

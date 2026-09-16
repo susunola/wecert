@@ -265,6 +265,35 @@ CREATE TABLE IF NOT EXISTS retired_certificates (
     cert_name  TEXT NOT NULL,
     retired_at INTEGER NOT NULL
 );
+
+-- 逐个 identifier 的授权失败账本。
+--
+-- 证书级的 consecutive_failures 只告诉你"这张证书签不出来"，
+-- 而到期前降级要回答的是"是**哪个名字**签不出来" —— 不知道这个，
+-- 就只能随机摘名字，那会把本来好的名字也一起牺牲掉。
+--
+-- last_failed_at 同时承担了自愈：失败记录老化之后那个 identifier
+-- 就不再被摘掉，下一轮自然会去重试全集。不需要额外的重试状态。
+CREATE TABLE IF NOT EXISTS identifier_failures (
+    cert_name      TEXT NOT NULL,
+    identifier     TEXT NOT NULL,
+    failures       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT NOT NULL DEFAULT '',
+    last_failed_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (cert_name, identifier)
+);
+
+-- 当前生效的降级状态：这张证书正服务着一张缺了几个名字的证书。
+--
+-- 单独一张表而不是给 certificates 加字段：它不是证书的属性，
+-- 而是一个"正在发生的异常"，生命周期也完全不同 ——
+-- 全集签发成功就该清掉，证书续期却不该碰它。
+CREATE TABLE IF NOT EXISTS cert_fallback (
+    cert_name TEXT PRIMARY KEY,
+    dropped   TEXT NOT NULL DEFAULT '',
+    since     INTEGER NOT NULL DEFAULT 0,
+    reason    TEXT NOT NULL DEFAULT ''
+);
 `
 	_, err := s.db.Exec(schema)
 	if err != nil {

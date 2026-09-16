@@ -73,16 +73,101 @@ var profileRenewBefore = map[string]time.Duration{
 
 // Config 是整份配置。
 type Config struct {
-	StatePath    string        `yaml:"statePath"`
-	ACME         ACME          `yaml:"acme"`
-	DNS          DNS           `yaml:"dns"`
-	Tencent      Tencent       `yaml:"tencent"`
-	Metrics      Metrics       `yaml:"metrics"`
-	Webhook      Webhook       `yaml:"webhook"`
-	DesiredState DesiredState  `yaml:"desiredState"`
-	Onboarding   Onboarding    `yaml:"onboarding"`
-	Probe        Probe         `yaml:"probe"`
-	Certificates []Certificate `yaml:"certificates"`
+	StatePath    string          `yaml:"statePath"`
+	ACME         ACME            `yaml:"acme"`
+	DNS          DNS             `yaml:"dns"`
+	Tencent      Tencent         `yaml:"tencent"`
+	Metrics      Metrics         `yaml:"metrics"`
+	Webhook      Webhook         `yaml:"webhook"`
+	DesiredState DesiredState    `yaml:"desiredState"`
+	Onboarding   Onboarding      `yaml:"onboarding"`
+	Probe        Probe           `yaml:"probe"`
+	Fallback     FailureFallback `yaml:"failureFallback"`
+	Certificates []Certificate   `yaml:"certificates"`
+}
+
+// FailureFallback 配置"到期前拆分子集先签"的降级策略。
+//
+// 它解决的是一个很具体的场景：一张 25 个名字的证书里有 1 个名字的 DNS
+// 配错了，于是整张证书签不出来 —— 而那 24 个本来好的名字会跟着一起过期。
+// 部分可用好过全挂。
+//
+// **默认关闭。** 它会改变证书覆盖什么，那是安全决策，不该由程序替人做。
+type FailureFallback struct {
+	// Enabled 默认 false。
+	Enabled *bool `yaml:"enabled"`
+
+	// AfterFailures 是这张证书连续失败多少次之后才考虑降级。默认 5。
+	AfterFailures int `yaml:"afterFailures"`
+
+	// BeforeExpiry 是"距离到期多久之内"才考虑降级，默认 168h（7 天）。
+	//
+	// 不能设得太大：太早降级等于用一张缺名字的证书换掉一张还完全有效的
+	// 证书，那是净损失。
+	BeforeExpiry string `yaml:"beforeExpiry"`
+
+	// MinIdentifierFailures 是某个 identifier 至少失败多少次才允许把它摘掉。
+	// 默认 3。设成 1 会让一次网络抖动就摘掉一个名字。
+	MinIdentifierFailures int `yaml:"minIdentifierFailures"`
+
+	// FailureWindow 是失败记录多久算过期，默认 24h。
+	//
+	// 它同时是自愈机制：记录老化之后那个 identifier 不再被摘掉，
+	// 下一轮自然就去重试全集。问题修好之后最多等这么久就自动恢复，
+	// 不需要任何额外的重试状态。
+	FailureWindow string `yaml:"failureWindow"`
+
+	// MinNames 是降级之后至少保留几个名字。默认 1。
+	//
+	// 剩下的名字少于这个数就拒绝降级：那是"全挂"换了个样子，
+	// 却让人以为还有部分可用。
+	MinNames int `yaml:"minNames"`
+
+	// 解析后的时长，由 normalize 填充。
+	BeforeExpiryDur  time.Duration `yaml:"-"`
+	FailureWindowDur time.Duration `yaml:"-"`
+}
+
+// EnabledOr 返回降级开关，未设置时用 def。
+func (f *FailureFallback) EnabledOr(def bool) bool {
+	if f.Enabled == nil {
+		return def
+	}
+	return *f.Enabled
+}
+
+// 下面几个 Or 方法在字段未设置（<= 0）时给出默认值。
+// 用 0 表示"没写"在这里是安全的：这几个字段没有哪个合法取值是 0。
+func (f *FailureFallback) AfterFailuresOr(def int) int {
+	if f.AfterFailures <= 0 {
+		return def
+	}
+	return f.AfterFailures
+}
+
+func (f *FailureFallback) MinIdentifierFailuresOr(def int) int {
+	if f.MinIdentifierFailures <= 0 {
+		return def
+	}
+	return f.MinIdentifierFailures
+}
+
+func (f *FailureFallback) MinNamesOr(def int) int {
+	if f.MinNames <= 0 {
+		return def
+	}
+	return f.MinNames
+}
+
+func (f *FailureFallback) normalize() error {
+	var err error
+	if f.BeforeExpiryDur, err = parseDuration(f.BeforeExpiry, 7*24*time.Hour, "failureFallback.beforeExpiry"); err != nil {
+		return err
+	}
+	if f.FailureWindowDur, err = parseDuration(f.FailureWindow, 24*time.Hour, "failureFallback.failureWindow"); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Probe 配置网络侧的证书探测。
@@ -502,6 +587,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 	if err := c.Probe.normalize(); err != nil {
+		return err
+	}
+	if err := c.Fallback.normalize(); err != nil {
 		return err
 	}
 

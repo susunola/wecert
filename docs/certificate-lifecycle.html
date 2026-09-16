@@ -1100,6 +1100,11 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
         <td><span class="pill ok">不影响其它证书</span></td>
         <td>一张配错域名的证书拖住全部续期，是自动化里最危险的耦合</td>
       </tr>
+      <tr>
+        <td>临近到期且反复签发失败（<code>failureFallback</code> 开启时）</td>
+        <td><span class="pill warn">摘掉反复失败的名字先签</span></td>
+        <td>部分可用好过全挂。只摘有逐个授权失败证据的名字；记录老化后自愈</td>
+      </tr>
     </tbody>
   </table>
 </section>
