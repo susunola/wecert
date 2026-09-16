@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
@@ -24,6 +25,71 @@ type TencentCLB struct {
 	types      []string
 	log        *slog.Logger
 	now        func() time.Time
+}
+
+// LazyTencentCLB creates the Tencent Cloud deployer only when an operation
+// actually needs it. Desired-state documents can enable deployment after the
+// process has started, while a document that keeps every certificate local
+// should not require otherwise-unused static credentials at startup.
+type LazyTencentCLB struct {
+	cfg config.Tencent
+	log *slog.Logger
+
+	mu    sync.Mutex
+	inner *TencentCLB
+}
+
+// NewLazyTencentCLB returns a deployer that defers credential validation and
+// client construction until Deploy, Delete, or Bindings is first needed.
+func NewLazyTencentCLB(cfg config.Tencent, log *slog.Logger) *LazyTencentCLB {
+	return &LazyTencentCLB{cfg: cfg, log: log}
+}
+
+func (d *LazyTencentCLB) client() (*TencentCLB, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.inner != nil {
+		return d.inner, nil
+	}
+	inner, err := NewTencentCLB(d.cfg, d.log)
+	if err != nil {
+		return nil, err
+	}
+	d.inner = inner
+	return inner, nil
+}
+
+// Deploy implements Deployer.
+func (d *LazyTencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM, keyPEM []byte) (string, error) {
+	inner, err := d.client()
+	if err != nil {
+		return "", err
+	}
+	return inner.Deploy(ctx, certName, oldID, certPEM, keyPEM)
+}
+
+// Delete implements Deployer.
+func (d *LazyTencentCLB) Delete(ctx context.Context, certID string) error {
+	if certID == "" {
+		return nil
+	}
+	inner, err := d.client()
+	if err != nil {
+		return err
+	}
+	return inner.Delete(ctx, certID)
+}
+
+// Bindings implements Deployer.
+func (d *LazyTencentCLB) Bindings(ctx context.Context, certID string) (int, error) {
+	if certID == "" {
+		return 0, nil
+	}
+	inner, err := d.client()
+	if err != nil {
+		return 0, err
+	}
+	return inner.Bindings(ctx, certID)
 }
 
 // NewTencentCLB constructs the deployer.

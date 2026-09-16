@@ -77,7 +77,8 @@ func TestProbeRecordsSingle(t *testing.T) {
 	}
 }
 
-// probeReady's rule: no reachable NS denies the value, and at least 2 confirm it.
+// probeReady's rule: no reachable NS denies the value, and at least one confirms it --
+// two when the zone has several authorities.
 // This exercises the rule itself, with no real DNS involved.
 func TestProbeReadyJudgement(t *testing.T) {
 	// No reachable NS: neither confirmed nor allowed through.
