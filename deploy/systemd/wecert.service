@@ -26,5 +26,48 @@ PrivateTmp=true
 NoNewPrivileges=true
 ReadOnlyPaths=/etc/wecert
 
+# ── Hardening beyond the baseline ────────────────────────────────────────────
+#
+# The daemon needs nothing but outbound TCP/DNS and write access to its own
+# StateDirectory. Everything below closes post-exploitation reach that the
+# baseline above leaves open; none of it changes what the process can do when it
+# behaves.
+#
+# `systemd-analyze security wecert.service` is the way to check the effect.
+
+# No capabilities at all: wecert binds no privileged port, does no raw I/O, and
+# never changes uid. An empty bounding set cannot be re-acquired.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Only the address families it actually uses.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# The standard service sandbox: no new namespaces, no setuid/setgid transitions, no
+# personality changes, and no /proc visibility into other processes.
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectProc=invisible
+ProcSubset=pid
+
+# Kernel surfaces a certificate renewer has no business touching.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+
+# Go never needs writable+executable memory, and wecert never forks a child.
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RemoveIPC=true
+SystemCallArchitectures=native
+
+# Umask for anything the process creates itself; StateDirectoryMode covers the
+# directory, this covers files the database driver makes inside it.
+UMask=0077
+
 [Install]
 WantedBy=multi-user.target

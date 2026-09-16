@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
@@ -32,9 +33,9 @@ import (
 // refuse outright.
 var errBothForms = errors.New("cert and certs are mutually exclusive")
 
-// errEmptyCerts rejects an explicit "certs": []. It asks for nothing, and
-// treating it like an absent body would silently widen it into a full
-// convergence the caller never asked for.
+// errEmptyCerts rejects an explicit "certs": [] or "certs": null. Both ask for
+// nothing, and treating either like an absent body would silently widen it into
+// a full convergence the caller never asked for.
 var errEmptyCerts = errors.New("certs must not be empty; omit the body to process everything")
 
 // errEmptyCert rejects an explicit "cert": "". As a plain string it would be
@@ -187,10 +188,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // body means "process everything".
 //
 // Both fields are pointers so "field absent" (full trigger) is distinguishable
-// from an explicit empty value, which asks for nothing and is rejected.
+// from an explicit empty value, which asks for nothing and is rejected. For
+// Certs, presence is additionally tracked separately because a pointer alone
+// cannot make that distinction for a JSON null: encoding/json leaves both
+// "certs" absent and "certs": null as a nil pointer, and null is what a Go
+// caller marshalling a nil []string sends.
 type reconcileRequest struct {
 	Cert  *string   `json:"cert"`
 	Certs *[]string `json:"certs"`
+
+	// certsPresent reports that the body carried a "certs" key at all.
+	certsPresent bool
 }
 
 type reconcileResponse struct {
@@ -281,17 +289,30 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return req, nil
 	}
+	// Decode the keys first: whether "certs" appeared at all decides what the
+	// request means, and the struct decode alone would report "absent" for a
+	// "certs": null body. Treating that as "absent" escalates a caller that named
+	// no certificates into a full-fleet convergence, burning issuance quota it
+	// never asked for.
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(body, &keys); err != nil {
+		return req, err
+	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return req, err
 	}
-	if req.Cert != nil && *req.Cert != "" && req.Certs != nil && len(*req.Certs) > 0 {
-		return req, errBothForms
-	}
+	_, req.certsPresent = keys["certs"]
+
 	if req.Cert != nil && *req.Cert == "" {
 		return req, errEmptyCert
 	}
-	if req.Certs != nil && len(*req.Certs) == 0 {
-		return req, errEmptyCerts
+	if req.certsPresent {
+		if req.Certs == nil || len(*req.Certs) == 0 {
+			return req, errEmptyCerts
+		}
+		if req.Cert != nil {
+			return req, errBothForms
+		}
 	}
 	return req, nil
 }
@@ -333,7 +354,7 @@ type certStatus struct {
 	Name                string `json:"name"`
 	NotAfter            string `json:"notAfter,omitempty"`
 	DaysLeft            *int   `json:"daysLeft,omitempty"`
-	Deployed            bool   `json:"deployed"`
+	Uploaded            bool   `json:"uploaded"`
 	DeployConfirmed     bool   `json:"deployConfirmed"`
 	ConsecutiveFailures int    `json:"consecutiveFailures"`
 	NextAttemptAt       string `json:"nextAttemptAt,omitempty"`
@@ -375,10 +396,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		if rec != nil {
 			if !rec.NotAfter.IsZero() {
 				st.NotAfter = rec.NotAfter.UTC().Format(time.RFC3339)
-				days := int(rec.NotAfter.Sub(now).Hours() / 24)
+				// config.DaysUntil rounds up, matching wecert-probe: truncation makes
+				// "23 hours left" read as 0 days, and a caller that treats 0 as expired
+				// reads a healthy certificate as down.
+				days := config.DaysUntil(rec.NotAfter, now)
 				st.DaysLeft = &days
 			}
-			st.Deployed = rec.DeployedCertID != ""
+			// `uploaded` is "we hold a CertId", `deployConfirmed` is "it is bound".
+			// They used to share the name `deployed` with the metric
+			// wecert_certificate_deployed, which means the *confirmed* thing -- the exact
+			// confusion that metric's help text was written to prevent.
+			st.Uploaded = rec.DeployedCertID != ""
 			st.DeployConfirmed = rec.DeployConfirmed
 			st.ConsecutiveFailures = rec.ConsecutiveFailures
 			st.LastError = rec.LastError
@@ -479,7 +507,7 @@ func (s *Server) handleDesired(dr DesiredReader) http.HandlerFunc {
 			} else if st != nil && !st.NotAfter.IsZero() {
 				dc.Issued = true
 				dc.NotAfter = st.NotAfter.UTC().Format(time.RFC3339)
-				days := int(st.NotAfter.Sub(now).Hours() / 24)
+				days := config.DaysUntil(st.NotAfter, now)
 				dc.DaysLeft = &days
 			}
 			out.Certificates = append(out.Certificates, dc)

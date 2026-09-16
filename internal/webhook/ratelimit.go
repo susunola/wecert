@@ -14,6 +14,14 @@ const (
 	// authSuccessForgiveFloor is the failure count below which a success clears
 	// the address state entirely. See recordSuccess for the tradeoff.
 	authSuccessForgiveFloor = 2
+
+	// authLimiterGCInterval amortizes the sweep once the map is large.
+	//
+	// Sweeping on every failure is itself a lever: an attacker sending one failed request
+	// from each of many source addresses makes every failure cost a full-map scan, so the
+	// total work grows with the square of the request count exactly when the endpoint is
+	// under load. One sweep per interval keeps it linear and still reclaims promptly.
+	authLimiterGCInterval = time.Minute
 )
 
 type authLimiterState struct {
@@ -26,6 +34,8 @@ type authLimiterState struct {
 type authLimiter struct {
 	mu     sync.Mutex
 	byAddr map[string]*authLimiterState
+	// lastGC is when the map was last swept; it bounds how often gc may scan.
+	lastGC time.Time
 }
 
 func newAuthLimiter() *authLimiter {
@@ -98,6 +108,10 @@ func (l *authLimiter) gc(now time.Time) {
 	if len(l.byAddr) < authLimiterGCThreshold {
 		return
 	}
+	if now.Sub(l.lastGC) < authLimiterGCInterval {
+		return
+	}
+	l.lastGC = now
 	for addr, st := range l.byAddr {
 		if now.After(st.blockedUntil) && now.Sub(st.windowStart) > authWindow {
 			delete(l.byAddr, addr)
