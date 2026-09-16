@@ -601,8 +601,20 @@ PROSE: dict[str, str] = {
         'ⓐ Deployment',
     '图 ⓪部署形态：免费证书在 CLB 上自动轮转':
         '<span class="num">diagram ⓐ</span>Deployment shape: a free certificate rotating itself on the CLB',
-    '最上面那条带子是这套系统要解决的场景：免费证书只有 90 天，必须自动轮转。 下面两条是它落到腾讯云上的形态——上面是请求路径，下面是这张证书是怎么来的。 关键的一层关系在中间： SNI 决定 CLB 用哪张证书，证书的 SAN 决定它能对哪些域名完成握手 —— 所以多个域名共用一张证书时，它们是生死与共的。':
-        'The band on top is the scenario this system exists for: <b>a free certificate is valid for 90 days, so it has to rotate automatically</b>. The two bands below are what that scenario looks like on Tencent Cloud — the request path on top, and where the certificate comes from underneath. The relationship in the middle is the one that matters: <b>SNI decides which certificate the CLB uses, and that certificate’s SAN decides which domains it can complete a handshake for</b> — so domains sharing one certificate share its fate.',
+    '最上面那条带子是这套系统要解决的场景：免费证书只有 90 天，必须自动轮转； 以及为什么选 Let\'s Encrypt 而不是腾讯云自带的免费 DV —— 后者是单域名证书，既不支持 SAN 也不支持通配符， 域名一多就得为每个域名单独维护一条轮转，而 Let\'s Encrypt 一张证书能装 100 个名字、 还支持通配符，多个域名可以合成一张、只轮转一条。 下面两条是它落到腾讯云上的形态——上面是请求路径，下面是这张证书是怎么来的。 关键的一层关系在中间： SNI 决定 CLB 用哪张证书，证书的 SAN 决定它能对哪些域名完成握手 —— 所以多个域名共用一张证书时，它们是生死与共的。':
+        'The band on top is the scenario this system exists for: <b>a free certificate is valid for 90 days, so it has to rotate automatically</b> — and why the choice falls on Let’s Encrypt rather than Tencent Cloud’s own free DV: <b>those are single-domain certificates, supporting neither SAN nor wildcard</b>, so every extra domain means another rotation to maintain. One Let’s Encrypt certificate holds up to 100 names and does support wildcards, so several domains combine into one certificate and rotate as one. The two bands below are what that scenario looks like on Tencent Cloud — the request path on top, and where the certificate comes from underneath. The relationship in the middle is the one that matters: <b>SNI decides which certificate the CLB uses, and that certificate’s SAN decides which domains it can complete a handshake for</b> — so domains sharing one certificate share its fate.',
+    '为什么用 Let\'s Encrypt，而不是腾讯云自带的免费 DV':
+        'Why Let’s Encrypt rather than Tencent Cloud’s own free DV',
+    '腾讯云免费 DV':
+        'Tencent Cloud free DV',
+    '单域名 · 不支持 SAN · 不支持通配符':
+        'one domain only · no SAN · no wildcard',
+    '3 个域名 = 3 张证书 = 3 条轮转要维护':
+        '3 domains = 3 certificates = 3 rotations to look after',
+    '一张证书最多 100 个 SAN · 支持通配符':
+        'up to 100 SANs in one certificate · wildcards supported',
+    '3 个域名（含 *.example.com）= 1 张证书 = 1 条轮转':
+        '3 domains (incl. *.example.com) = 1 certificate = 1 rotation',
     '场景 · 免费证书（Let\'s Encrypt）+ 自动轮转':
         'The scenario · a free certificate (Let’s Encrypt), rotating automatically',
     'Let\'s Encrypt 不收费，代价是有效期只有 90 天 —— 一年至少要轮 4 次，靠人记着做迟早会漏。':
@@ -697,6 +709,6 @@ PROSE: dict[str, str] = {
         'DNS-01 sequence: a wildcard and its apex sharing one TXT',
     '证书生命周期时间线':
         'certificate lifetime timeline',
-    "wecert 的部署形态：免费证书由 Let's Encrypt 自动轮转（免费签发 → 自动换绑 → 服务 90 天 → 到期前自动再签），客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池":
-        "wecert's deployment shape: a free certificate rotated automatically by Let's Encrypt (issued for free → rebound automatically → serving for 90 days → reissued before expiry), with clients reaching the CLB over SNI and one multi-SAN certificate routing to a backend RS pool",
+    "wecert 的部署形态：免费证书由 Let's Encrypt 自动轮转（免费签发 → 自动换绑 → 服务 90 天 → 到期前自动再签）；选它而不是腾讯云自带的免费 DV，是因为后者单域名、不支持 SAN 也不支持通配符。客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池":
+        "wecert's deployment shape: a free certificate rotated automatically by Let's Encrypt (issued for free → rebound automatically → serving for 90 days → reissued before expiry); Let's Encrypt is chosen over Tencent Cloud's own free DV because the latter is single-domain and supports neither SAN nor wildcard. Clients reach the CLB over SNI and one multi-SAN certificate routes to a backend RS pool",
 }
