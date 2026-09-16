@@ -1689,3 +1689,39 @@ func TestAbsenceMarkersAreReclaimedAfterRemoval(t *testing.T) {
 		t.Error("a name that just stopped being declared must still get a grace clock")
 	}
 }
+
+// The quota ledger must be pruned on every round, not only on rounds that consult it.
+//
+// ChangesWithin both counts and prunes, and it used to be reached only from the path that
+// records a change -- so the -force path (records without counting) and the unchanged path
+// (neither) never pruned. The ledger then grew without bound on a deployment whose name set
+// never changed, which is the common steady state.
+func TestQuotaLedgerIsPrunedOnEveryRound(t *testing.T) {
+	h := newHarness(t, Options{})
+
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	h.run(t)
+
+	// Backdate the ledger far beyond the budget window, directly in the persisted state: the
+	// next round finds the declarations unchanged, so it records nothing and never reaches the
+	// budget check -- which was the only pruner before this fix.
+	state, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	state.Changes = []time.Time{h.clock.now().Add(-30 * 24 * time.Hour)}
+	if err := state.Save(h.opts.StatePath); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	h.run(t)
+
+	after, err := LoadState(h.opts.StatePath)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if n := len(after.Changes); n != 0 {
+		t.Errorf("a change older than the budget window must be pruned even on a round that does "+
+			"not consult the budget, got %d entries", n)
+	}
+}
