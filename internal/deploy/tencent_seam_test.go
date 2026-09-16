@@ -105,32 +105,50 @@ func newTestDeployer(now func() time.Time) *TencentCLB {
 	}
 }
 
-// updateResp builds an UpdateCertificateInstance response. bound == 0 leaves the
-// progress list empty, which is how the server reports "nothing was bound".
+// updateResp builds an UpdateCertificateInstance response whose progress list *is*
+// populated -- with a total of `bound`, which may be 0. That is the server answering
+// "this many resources", so 0 really does mean "none bound".
 func updateResp(recordID uint64, bound int64) *ssl.UpdateCertificateInstanceResponse {
 	resp := &ssl.UpdateCertificateInstanceResponse{
 		Response: &ssl.UpdateCertificateInstanceResponseParams{
 			DeployRecordId: common.Uint64Ptr(recordID),
-		},
-	}
-	if bound > 0 {
-		resp.Response.UpdateSyncProgress = []*ssl.UpdateSyncProgress{{
-			ResourceType: common.StringPtr("clb"),
-			UpdateSyncProgressRegions: []*ssl.UpdateSyncProgressRegion{{
-				Region:     common.StringPtr("ap-guangzhou"),
-				TotalCount: common.Int64Ptr(bound),
+			UpdateSyncProgress: []*ssl.UpdateSyncProgress{{
+				ResourceType: common.StringPtr("clb"),
+				UpdateSyncProgressRegions: []*ssl.UpdateSyncProgressRegion{{
+					Region:     common.StringPtr("ap-guangzhou"),
+					TotalCount: common.Int64Ptr(bound),
+				}},
 			}},
-		}}
+		},
 	}
 	return resp
 }
 
+// updateRespNoProgress builds the response that caused a production incident: the task
+// was created (a real DeployRecordId) but the per-region progress was still absent.
+//
+// An empty progress list is a **missing** answer, not the answer "zero" -- the API
+// populates it separately from creating the task. It must not be read as "nothing is
+// bound", because the rebind it just started may well be switching the listener.
+func updateRespNoProgress(recordID uint64) *ssl.UpdateCertificateInstanceResponse {
+	return &ssl.UpdateCertificateInstanceResponse{
+		Response: &ssl.UpdateCertificateInstanceResponseParams{
+			DeployRecordId: common.Uint64Ptr(recordID),
+		},
+	}
+}
+
 func detailResp(success, failed, running int64) *ssl.DescribeHostUpdateRecordDetailResponse {
+	return detailRespPending(success, failed, running, 0)
+}
+
+func detailRespPending(success, failed, running, pending int64) *ssl.DescribeHostUpdateRecordDetailResponse {
 	return &ssl.DescribeHostUpdateRecordDetailResponse{
 		Response: &ssl.DescribeHostUpdateRecordDetailResponseParams{
 			SuccessTotalCount: common.Int64Ptr(success),
 			FailedTotalCount:  common.Int64Ptr(failed),
 			RunningTotalCount: common.Int64Ptr(running),
+			PendingTotalCount: common.Int64Ptr(pending),
 		},
 	}
 }
@@ -260,7 +278,7 @@ func TestWaitDeployRecordFailedCountsAsFailure(t *testing.T) {
 		},
 	}
 
-	err := d.waitDeployRecord(context.Background(), fake, 7)
+	err := d.waitDeployRecord(context.Background(), fake, 7, "old-id")
 	if err == nil {
 		t.Fatal("failed=2 must not be treated as success")
 	}
@@ -283,7 +301,7 @@ func TestWaitDeployRecordSuccess(t *testing.T) {
 		},
 	}
 
-	if err := d.waitDeployRecord(context.Background(), fake, 7); err != nil {
+	if err := d.waitDeployRecord(context.Background(), fake, 7, "old-id"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if calls != 1 {
@@ -309,7 +327,7 @@ func TestWaitDeployRecordRetriesQueryErrors(t *testing.T) {
 		},
 	}
 
-	if err := d.waitDeployRecord(context.Background(), fake, 7); err != nil {
+	if err := d.waitDeployRecord(context.Background(), fake, 7, "old-id"); err != nil {
 		t.Fatalf("a single query error must be retried, got: %v", err)
 	}
 	if calls != 2 {
@@ -332,7 +350,7 @@ func TestWaitDeployRecordTimeout(t *testing.T) {
 		},
 	}
 
-	err := d.waitDeployRecord(context.Background(), fake, 7)
+	err := d.waitDeployRecord(context.Background(), fake, 7, "old-id")
 	if err == nil || !strings.Contains(err.Error(), "did not finish within 3m") {
 		t.Fatalf("err = %v, want the 3-minute wait timeout", err)
 	}
@@ -367,6 +385,12 @@ func TestDeployReturnsNewIDWhenUpdateFails(t *testing.T) {
 		},
 		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
 			return nil, sentinel
+		},
+		// Deploy now asks whether the new certificate is already bound before believing
+		// the failure. Nothing is, so the error must propagate unchanged.
+		createTaskFn: stubCreateTask("new-id", "task-1"),
+		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			return bindingsResp("task-1", 0), nil
 		},
 	}
 
@@ -414,5 +438,208 @@ func TestDeployFirstIssuanceSkipsUpdate(t *testing.T) {
 	}
 	if newID != "new-id" {
 		t.Errorf("newID = %q, want new-id", newID)
+	}
+}
+
+// ── the production incident: absent progress detail is not "nothing bound" ──
+
+// updateInstance used to fail whenever UpdateSyncProgress was absent, reading "the
+// server has not answered yet" as "nothing is bound". Observed live: the rebind task
+// was created (recordId=14822), the creation response carried no per-region progress,
+// wecert recorded a failure -- and Tencent Cloud finished switching the listener 47
+// seconds later.
+//
+// The damage is not self-correcting. wecert keeps the old certificate as its anchor,
+// that certificate has no bindings left because the switch *did* happen, so every later
+// round uploads another certificate, fails identically and records another orphan --
+// while the certificate actually serving traffic sits in retired_certificates, held back
+// only by the cloud-side resource check.
+func TestUpdateInstanceWithNoProgressDetailWaitsForTheTask(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var detailCalls int
+	fake := &fakeSSLAPI{
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			return updateRespNoProgress(14822), nil
+		},
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			detailCalls++
+			// Nothing is reported for the first couple of polls, then the switch lands:
+			// exactly how the real task behaved.
+			if detailCalls < 3 {
+				return detailRespPending(0, 0, 0, 0), nil
+			}
+			return detailResp(1, 0, 0), nil
+		},
+	}
+
+	if err := d.updateInstance(context.Background(), fake, "old-id", "new-id"); err != nil {
+		t.Fatalf("a rebind whose task succeeds must not be reported as failed: %v", err)
+	}
+	if detailCalls < 3 {
+		t.Errorf("the wait should have polled until the record settled, got %d calls", detailCalls)
+	}
+}
+
+// Queued-but-not-started resources count as unfinished. Resources are dispatched in
+// batches, so "nothing is running" can be true while most of the task has not begun --
+// and declaring success there retires the old certificate while listeners still serve it.
+func TestWaitDeployRecordWaitsForPendingResources(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var calls int
+	fake := &fakeSSLAPI{
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			calls++
+			if calls == 1 {
+				// One resource done, three still queued, none running.
+				return detailRespPending(1, 0, 0, 3), nil
+			}
+			return detailResp(4, 0, 0), nil
+		},
+	}
+
+	if err := d.waitDeployRecord(context.Background(), fake, 7, "old-id"); err != nil {
+		t.Fatalf("waitDeployRecord: %v", err)
+	}
+	if calls < 2 {
+		t.Errorf("pending resources must keep the wait going, got %d poll(s)", calls)
+	}
+}
+
+// A task that reports nothing at all for the whole budget is the genuine "no resource
+// was bound to the old certificate" case. It is diagnosed at the deadline rather than
+// from the creation-time response, because an all-zero record is also what a task looks
+// like before the server has populated it -- and failing on that is what broke a rebind
+// that was in fact succeeding.
+func TestWaitDeployRecordDiagnosesAnEmptyTaskAtTheDeadline(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	fake := &fakeSSLAPI{
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			return detailRespPending(0, 0, 0, 0), nil
+		},
+	}
+
+	err := d.waitDeployRecord(context.Background(), fake, 7, "old-id")
+	if err == nil {
+		t.Fatal("a task that never reports anything must not be treated as success")
+	}
+	if !strings.Contains(err.Error(), "no resource appears to be bound") {
+		t.Errorf("err = %v, want the no-binding diagnosis", err)
+	}
+}
+
+// ── recovery: a switch that happened but was not recorded ───────────────────
+
+func stubCreateTask(certID, taskID string) func(context.Context, *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error) {
+	return func(context.Context, *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error) {
+		return &ssl.CreateCertificateBindResourceSyncTaskResponse{
+			Response: &ssl.CreateCertificateBindResourceSyncTaskResponseParams{
+				CertTaskIds: []*ssl.CertTaskId{{
+					CertId: common.StringPtr(certID),
+					TaskId: common.StringPtr(taskID),
+				}},
+			},
+		}, nil
+	}
+}
+
+// bindingsResp reports a finished enumeration totaling `total` resources. The result list
+// must be non-empty even for zero: countBindings keeps waiting on an empty one.
+func bindingsResp(taskID string, total uint64) *ssl.DescribeCertificateBindResourceTaskResultResponse {
+	return &ssl.DescribeCertificateBindResourceTaskResultResponse{
+		Response: &ssl.DescribeCertificateBindResourceTaskResultResponseParams{
+			SyncTaskBindResourceResult: []*ssl.SyncTaskBindResourceResult{{
+				TaskId: common.StringPtr(taskID),
+				Status: common.Uint64Ptr(1),
+				BindResourceResult: []*ssl.BindResourceResult{{
+					ResourceType: common.StringPtr("clb"),
+					BindResourceRegionResult: []*ssl.BindResourceRegionResult{{
+						Region:     common.StringPtr("ap-guangzhou"),
+						TotalCount: common.Uint64Ptr(total),
+						Error:      common.StringPtr(""),
+					}},
+				}},
+			}},
+		},
+	}
+}
+
+// A rebind that succeeded without being recorded leaves a wedge that no fix to the
+// "nothing to switch" check can clear on its own: the old certificate has no bindings
+// left, so every later round fails that check no matter how many certificates are
+// uploaded, and the certificate actually serving traffic sits in the reclamation list.
+//
+// Asking about the *new* certificate settles it: if anything is bound to it, the switch
+// is done.
+func TestDeployTreatsAnAlreadyBoundNewCertificateAsSuccess(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	fake := &fakeSSLAPI{
+		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
+			return &ssl.UploadCertificateResponse{
+				Response: &ssl.UploadCertificateResponseParams{CertificateId: common.StringPtr("new-id")},
+			}, nil
+		},
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			// The old certificate has no bindings left, which is the wedge.
+			return updateResp(42, 0), nil
+		},
+		createTaskFn: stubCreateTask("new-id", "task-1"),
+		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			return bindingsResp("task-1", 3), nil
+		},
+	}
+
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	id, err := d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if err != nil {
+		t.Fatalf("a new certificate that is already bound means the switch happened; got %v", err)
+	}
+	if id != "new-id" {
+		t.Errorf("Deploy returned %q, want new-id", id)
+	}
+}
+
+// The check must not turn a genuine failure into success: when nothing is bound to the
+// new certificate either, the error stands.
+func TestDeployKeepsTheErrorWhenNothingIsBoundToEitherCertificate(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	fake := &fakeSSLAPI{
+		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
+			return &ssl.UploadCertificateResponse{
+				Response: &ssl.UploadCertificateResponseParams{CertificateId: common.StringPtr("new-id")},
+			}, nil
+		},
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			return updateResp(42, 0), nil
+		},
+		createTaskFn: stubCreateTask("new-id", "task-1"),
+		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			return bindingsResp("task-1", 0), nil
+		},
+	}
+
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	id, err := d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if err == nil {
+		t.Fatal("nothing is bound to either certificate; the failure must stand")
+	}
+	if id != "new-id" {
+		t.Errorf("the uploaded id must still be returned for reclamation, got %q", id)
 	}
 }
