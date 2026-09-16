@@ -100,17 +100,55 @@ Full rationale in [Domains that change often](README.reference.md#domains-that-c
 
 The one rule everything else follows: **wecert never infers.** Something else works out what should exist and writes it down; wecert only reads that document and converges. Judgement is inferred once and reviewed as a diff, while the certificate lifecycle stays stable.
 
+### 1. System map — who owns what, who only reads
+
 ![wecert system map: the declaration layer, the inference layer, the contract, the execution layer, and external services](docs/diagrams/en/01-system-map.png)
 
 Left to right is the transfer of authority: **intent** (written by a human, as `_wecert` TXT records) → **inference** (`wecert-onboard`, disposable) → **contract** (a machine-written desired-state document) → **execution** (`wecert`, must be stable) → **external services**.
 
 Splitting it that way is about failure modes. If wecert enumerated DNS and CLB itself, a single API hiccup returning empty could be read as "these names are gone", and it would reissue a certificate without them — the site fails to handshake. With a document in between, a source failure means *the desired state stops updating*, which is safe.
 
+### 2. Intent → contract — the inference pipeline
+
+![the wecert-onboard pipeline: enumerate declarations, parse and filter, group and cover, the safety gates, assemble, atomic write](docs/diagrams/en/02-intent-to-contract.png)
+
+Red is only attached where a freeze actually happens. A malformed declaration excludes just that one; a group over the SAN limit keeps only its previous revision. **Neither freezes the whole run** — one typo must not stop every certificate from being updated.
+
+**Wildcard-first is where the quota is saved.** With `*.example.com` declared, adding `foo.example.com` costs **zero** issuances because the SAN set does not change at all; importing 50 subdomains costs zero too, where a certificate without a wildcard would spend the entire weekly allowance. A wildcard is never invented, though — declaring `*.example.com` means the certificate can handshake for *any* subdomain, and that has to be an explicit decision rather than something the grouping logic makes for you.
+
+### 3. Reconcile decisions
+
+![the five ordered checks wecert runs for each certificate](docs/diagrams/en/03-reconcile-decisions.png)
+
+The checks are **ordered**. The first branch that matches decides what this pass does, and if none match the answer is "do nothing" — which is what happens on the overwhelming majority of passes.
+
+Three invariants decide that order: at most one in-flight order per certificate with its URL on disk before anything else; renewals are ARI-first and carry `replaces`; and a wildcard and its apex are written, verified and cleaned up together. Breaking any of them runs straight into *5 certificates per exact set of identifiers / 7 days* — and that limit has no override.
+
+### 4. Order state machine
+
+![the ACME order state machine and where each state is persisted](docs/diagrams/en/04-order-state-machine.png)
+
+The entire point of this state machine is that **the process can be killed at any moment**. Every state has a column in `state.db`, and those columns decide, after a restart, whether to carry on or to place a new order.
+
+The order URL must be on disk immediately after `newOrder` returns, before anything else — that is the whole of the crash-safety story. Without it, a process killed during the few minutes of DNS propagation would place a second order whose identifier set is identical to the first, straight into the exact-set limit.
+
+### 5. DNS-01 — a wildcard and its apex share one TXT name
+
+![DNS-01 sequence showing the write-all, verify-all, clean-up-all shape](docs/diagrams/en/05-dns01-sequence.png)
+
+`example.com` and `*.example.com` both put their challenge at `_acme-challenge.example.com` — one name, two values. Handling identifiers one at a time would remove or overwrite one before the other is reached, which is why it is *write all → verify all → clean up together*.
+
+Propagation checking uses a quorum rather than "every authoritative nameserver reachable": in practice one of nine is routinely unreachable, and demanding all of them would never pass.
+
+### 6. The life of one certificate
+
 ![certificate lifetime timeline: issuance, deploy, the ARI window, the renewBefore fallback, expiry](docs/diagrams/en/06-certificate-lifetime.png)
 
-Every pass asks the same five ordered questions, and "do nothing" is the answer on the overwhelming majority of them. Renewal is ARI-first and carries `replaces`, because ARI-coordinated renewals are **exempt from every Let's Encrypt rate limit** — while a change to the name set makes the issuance a brand-new certificate, which forfeits that exemption. That is what makes wildcard-first more than an optimisation: with `*.example.com` declared, adding `foo.example.com` costs **zero** issuances.
+The axis is drawn for a `classic` 90-day certificate. What actually decides when renewal happens is ARI's `suggestedWindow`; `renewBefore` is only the fallback for when ARI is unavailable.
 
-The full story — all six diagrams, plus data ownership, failure semantics and the rate-limit arithmetic — is in [The certificate lifecycle](README.reference.md#the-certificate-lifecycle). There is also a single interactive page at [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html), with links between the figures and a print/PDF button.
+ARI-coordinated renewals are **exempt from every Let's Encrypt rate limit** — but only if the identifier set is unchanged. That is what makes wildcard-first more than an optimisation, and why adding a domain has to be driven to nearly zero cost.
+
+The tables behind these diagrams — data ownership, failure semantics and the rate-limit arithmetic — are in [The certificate lifecycle](README.reference.md#the-certificate-lifecycle), alongside the same six figures. There is also a single interactive page at [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html), with links between the figures and a print/PDF button.
 
 ## Event-driven
 
