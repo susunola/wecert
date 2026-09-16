@@ -100,6 +100,14 @@ Full rationale in [Domains that change often](README.reference.md#domains-that-c
 
 The one rule everything else follows: **wecert never infers.** Something else works out what should exist and writes it down; wecert only reads that document and converges. Judgement is inferred once and reviewed as a diff, while the certificate lifecycle stays stable.
 
+### 0. The problem this solves
+
+![wecert's problem scenario: TLS terminates at the CLB and the business machines hold no certificate](docs/diagrams/en/00-the-problem.png)
+
+TLS terminates at the CLB and the business machines hold no certificate file at all, so the premise every conventional approach rests on does not hold here: certbot on each CVM has nowhere to put a certificate, cert-manager assumes Kubernetes and produces a Secret rather than a listener binding, and copying the file to each node only makes more copies of a private key that nothing reads.
+
+What makes it hard rather than merely awkward is the last row. ARI exempts renewals from every rate limit — but **only for a same-name renewal**, so changing the name set once burns one issuance. "Domains change all the time" is this project's premise, so every other design decision follows from making "add a domain" avoid producing a new issuance.
+
 ### 1. System map — who owns what, who only reads
 
 ![wecert system map: the declaration layer, the inference layer, the contract, the execution layer, and external services](docs/diagrams/en/01-system-map.png)
@@ -195,7 +203,7 @@ Deletion is deliberately an order of magnitude more conservative than addition, 
 - [Configuration reference](README.reference.md#configuration-reference) · [Operations](README.reference.md#operations) · [Metrics and alerting](README.reference.md#metrics-and-alerting).
 - [Field notes and pitfalls](README.reference.md#field-notes-and-pitfalls) — the CLB SNI trap, `DescribeListeners` not reading bindings back, the DNSPod TTL floor, the lego API traps.
 - [Desired state](docs/desired-state.md) — declaring domains as `_wecert` DNS records, generating the desired-state document, and switching wecert over to it. Design rationale: [desired-state-providers.md](docs/desired-state-providers.md).
-- [The certificate lifecycle](README.reference.md#the-certificate-lifecycle) — six diagrams from a DNS declaration to retiring the old certificate, plus data ownership, failure semantics and the rate-limit arithmetic. Interactive version: [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html).
+- [The certificate lifecycle](README.reference.md#the-certificate-lifecycle) — seven diagrams, from the problem this exists to solve through to retiring the old certificate, plus data ownership, failure semantics and the rate-limit arithmetic. Interactive version: [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html).
 - [Roadmap](README.reference.md#roadmap) · [Development](README.reference.md#development).
 
 <details>

@@ -37,6 +37,7 @@ LANGS = [
 # 每张图的文件名与所对应的 SVG 序号（1 起）。名字是给 readme 里的引用用的，
 # 所以取得能自解释，而不是 diagram-1/2/3。
 NAMES = [
+    "00-the-problem",
     "01-system-map",
     "02-intent-to-contract",
     "03-reconcile-decisions",
