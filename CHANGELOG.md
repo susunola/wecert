@@ -105,6 +105,12 @@
   so a file that is only meant to be sourced interactively is no longer
   reported as "not set".
 
+- Deployment retries persist an uploaded Tencent Cloud certificate ID before starting
+  its asynchronous rebind. A restart or timeout now resumes that same certificate
+  instead of repeatedly uploading new copies; partial rebind failures remain failures.
+- Failure fallback remains reported while a full-name restoration attempt is pending or
+  fails; it clears only after a verified full certificate is promoted.
+
 ## 0.4.2 - 2026-09-16
 
 ### Security

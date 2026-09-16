@@ -52,6 +52,20 @@ type Deployer interface {
 	Bindings(ctx context.Context, certID string) (int, error)
 }
 
+// RetryableDeployer can resume a deployment after an earlier call uploaded the
+// certificate but did not observe its asynchronous rebind complete.
+type RetryableDeployer interface {
+	ResumeDeploy(ctx context.Context, certName, oldID, uploadedID string) (string, error)
+}
+
+// StagedDeployer exposes the durable boundary in a deployment. Callers must persist
+// the returned upload ID before calling DeployUploaded, so a crash cannot lose the
+// identity of a certificate that Tencent Cloud already accepted.
+type StagedDeployer interface {
+	Upload(ctx context.Context, certName string, certPEM, keyPEM []byte) (string, error)
+	DeployUploaded(ctx context.Context, certName, oldID, uploadedID string) (string, error)
+}
+
 // Noop is used when deploy.enabled=false: certificates stay only in the local state db.
 type Noop struct{}
 
