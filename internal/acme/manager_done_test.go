@@ -3,6 +3,7 @@ package acme
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	legoacme "github.com/go-acme/lego/v4/acme"
+	_ "modernc.org/sqlite"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
@@ -426,5 +428,156 @@ func TestOrderFailureWithoutReplacesIsNotRetried(t *testing.T) {
 	if len(fake.newOrderReplaces) != 1 {
 		t.Errorf("an error with no replaces to drop must not be retried, got %d attempts",
 			len(fake.newOrderReplaces))
+	}
+}
+
+// A failure to RECORD a created order must still schedule a backoff.
+//
+// This was a bare `return err`, the worst of both worlds: the order exists at the CA but not
+// in the state store, so the next pass has no order URL to resume and creates ANOTHER one --
+// and because recordFailure never ran, no backoff was scheduled either. The order rate then
+// follows the pass rate instead of the backoff: at a 1-minute interval that is 1440 orders a
+// day against "300 new orders per account per 3 hours", and hitting that ceiling blocks every
+// certificate on the account, not just this one.
+func TestFailedOrderPersistSchedulesABackoff(t *testing.T) {
+	// Opened here rather than through newAPITestHarness so the path is known: the test needs a
+	// second connection to install the trigger.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("open state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	certs := []config.Certificate{{
+		Name: "example-com", Domains: []string{"example.com"},
+		Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+		Deploy: config.Deploy{Enabled: false},
+	}}
+	if err := config.NormalizeCertificates(certs); err != nil {
+		t.Fatalf("normalize certificate: %v", err)
+	}
+	cert := &certs[0]
+
+	fake := &fakeAPI{}
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	now := fixed
+	m.now = func() time.Time { return now }
+
+	// Block only order INSERTs, so the certificate row (where the backoff lives) still writes.
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open second connection: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER block_order_insert BEFORE INSERT ON orders
+		BEGIN SELECT RAISE(FAIL, 'order insert blocked by test'); END;`); err != nil {
+		t.Fatalf("block order inserts: %v", err)
+	}
+
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+
+	// First issuance, so the pass goes straight to issue().
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("failing to record the order must be reported")
+	}
+	if len(fake.newOrderReplaces) != 1 {
+		t.Fatalf("expected one order attempt, got %d", len(fake.newOrderReplaces))
+	}
+
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st == nil || st.NextAttemptAt.IsZero() {
+		t.Fatal("a failed order-record must schedule a retry; without one the next pass runs " +
+			"immediately and creates another order, so the rate follows the pass rate")
+	}
+	if st.ConsecutiveFailures == 0 {
+		t.Error("the failure must be counted")
+	}
+
+	// And the scheduled window must actually hold the next pass off.
+	if err := m.Reconcile(context.Background(), cert); !errors.Is(err, state.ErrBackoff) {
+		t.Errorf("the next pass must wait for the backoff, got %v", err)
+	}
+	if len(fake.newOrderReplaces) != 1 {
+		t.Errorf("the backoff window must prevent a second order, got %d attempts",
+			len(fake.newOrderReplaces))
+	}
+}
+
+// An order URL that can never be fetched again must not block renewal until it expires.
+//
+// The order branch keeps advancing a persisted order instead of creating a new one, and
+// renewal is only decided AFTER that branch -- so an order whose URL is permanently gone
+// stalls every later renewal for the order's whole TTL (7 days by default). Reachable without
+// anything exotic: accounts are keyed by ACME directory while orders are not, so pointing
+// wecert at staging and back leaves orders naming a directory that no longer serves them.
+// Observed before the fix: a certificate 5 days from expiry sat through 24 passes and 24
+// GetOrder failures, fell to 21 hours left, and issued only once the order expired.
+func TestDeadOrderURLIsDiscardedInsteadOfBlockingRenewal(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	now := fixed
+	m.now = func() time.Time { return now }
+
+	// A live certificate well inside its renewal window, with a persisted order whose URL
+	// the CA will never serve again.
+	notAfter := fixed.Add(5 * 24 * time.Hour)
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: notAfter,
+		CertPEM: selfSignedCertPEM(t, notAfter, "example.com"),
+		KeyPEM:  []byte("live-key"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutOrder(&state.Order{
+		CertName: cert.Name, OrderURL: "https://ca.test/order/gone",
+		FinalizeURL: "https://ca.test/finalize/gone", Status: "pending",
+		Identifiers: cert.DomainKey(),
+		ExpiresAt:   fixed.Add(7 * 24 * time.Hour), // a week away
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every GetOrder fails; the fake is only consulted once the order row is gone.
+	fake.orderErr = nil
+	fake.getOrderErr = errors.New("acme: error: 404 :: urn:ietf:params:acme:error:malformed :: no order found")
+
+	var discarded bool
+	for i := 0; i < maxOrderFetchFailures+2; i++ {
+		_ = m.Reconcile(context.Background(), cert)
+		o, err := store.GetOrder(cert.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o == nil {
+			discarded = true
+			t.Logf("order discarded after %d attempt(s)", i+1)
+			break
+		}
+		// Clear the backoff so the next attempt is not simply skipped.
+		st, err := store.GetCert(cert.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st != nil {
+			st.NextAttemptAt = time.Time{}
+			if err := store.PutCert(st); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if !discarded {
+		t.Fatalf("an order that cannot be fetched must be discarded after %d consecutive failures, "+
+			"otherwise renewal waits for the order to expire (%s away)",
+			maxOrderFetchFailures, time.Until(fixed.Add(7*24*time.Hour)).Round(time.Hour))
 	}
 }

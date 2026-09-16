@@ -91,6 +91,45 @@ type Manager struct {
 	authzWait    time.Duration
 	pollInterval time.Duration
 
+	// transientBackoff holds a backoff deadline that could NOT be persisted, keyed by
+	// certificate name.
+	//
+	// Why it is needed: the documented disaster for this system is spending rate-limit
+	// quota, and the mechanism that prevents it is NextAttemptAt. That lives in CertState,
+	// so when the state store itself is failing -- a full disk is the obvious case, and it
+	// is exactly the situation where PutOrder just failed -- the deadline cannot be written
+	// and the next pass runs immediately. The order rate then follows the pass rate: at a
+	// 1-minute interval, 1440 orders a day against "300 new orders per account per 3 hours".
+	//
+	// Keeping the deadline in memory as well means a failure still costs one backoff window
+	// even when it cannot be recorded. It is deliberately not a substitute for persisting:
+	// it is lost on restart, which is acceptable because a restart is not a fast loop.
+	//
+	// Guarded because different certificates converge concurrently, and the map is keyed by
+	// name so one certificate's backoff cannot delay another's.
+	transientMu      sync.Mutex
+	transientBackoff map[string]time.Time
+
+	// orderFetchFails counts consecutive GetOrder failures per order URL.
+	//
+	// Why it exists: an order URL that is permanently gone (the CA purged it, or wecert was
+	// pointed at a different ACME directory -- accounts are keyed by directory while orders
+	// are not) fails GetOrder the same way every pass. That failure was classified as
+	// transient, and the only exits from the order branch are `expires_at` and an identifier
+	// set change, so RENEWAL -- which is decided after the order branch -- was blocked for the
+	// order's whole TTL. Observed: a certificate 5 days from expiry sat through 24 passes and
+	// 24 GetOrder failures, fell to 21 hours left, and only issued once the order expired.
+	//
+	// lego does not expose the HTTP status, so "permanently gone" cannot be distinguished from
+	// "the network hiccuped" by the error itself. Counting consecutive failures on the same
+	// URL can: a transient failure does not survive several rounds, and the cost of being
+	// wrong is one extra order, while the cost of not acting is an expiring certificate.
+	//
+	// Keyed by order URL rather than certificate name so a replaced order starts at zero, and
+	// cleared on any success.
+	orderFetchMu    sync.Mutex
+	orderFetchFails map[string]int
+
 	// bindingCheckEvery throttles the "is this certificate bound yet?" lookup, and
 	// bindingChecked remembers when each certificate was last asked.
 	//
@@ -111,6 +150,60 @@ type Manager struct {
 	// fallback is the "split off a subset and issue it before expiry" policy. nil means
 	// off, which is the default. See SetFallbackPolicy and applyFallback.
 	fallback *config.FailureFallback
+}
+
+// transientBackoffFor reports an unpersisted backoff deadline for this certificate, if any.
+//
+// Expired entries are dropped on read so the map cannot grow with every certificate that ever
+// failed once.
+func (m *Manager) transientBackoffFor(certName string) (time.Time, bool) {
+	m.transientMu.Lock()
+	defer m.transientMu.Unlock()
+	until, ok := m.transientBackoff[certName]
+	if !ok {
+		return time.Time{}, false
+	}
+	if !m.now().Before(until) {
+		delete(m.transientBackoff, certName)
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// setTransientBackoff remembers a deadline that could not be written to the state store.
+func (m *Manager) setTransientBackoff(certName string, until time.Time) {
+	m.transientMu.Lock()
+	defer m.transientMu.Unlock()
+	m.transientBackoff[certName] = until
+}
+
+// maxOrderFetchFailures is how many consecutive GetOrder failures discard an order.
+//
+// Four is chosen against the failure it prevents: the order branch blocks renewal while an
+// order exists, so the stake is "how long is renewal delayed". Four rounds is minutes at the
+// daemon's interval, while a genuinely transient failure (a CA blip, a brief network outage)
+// resolves well inside that. The cost of discarding wrongly is one order against the 300-per-
+// 3-hours account limit; the cost of not discarding is an expired certificate.
+const maxOrderFetchFailures = 4
+
+// noteOrderFetchFailure records a GetOrder failure and reports whether the order should now be
+// treated as dead.
+func (m *Manager) noteOrderFetchFailure(orderURL string) (dead bool) {
+	m.orderFetchMu.Lock()
+	defer m.orderFetchMu.Unlock()
+	m.orderFetchFails[orderURL]++
+	if m.orderFetchFails[orderURL] >= maxOrderFetchFailures {
+		delete(m.orderFetchFails, orderURL)
+		return true
+	}
+	return false
+}
+
+// clearOrderFetchFailures forgets the failures for an order that answered again.
+func (m *Manager) clearOrderFetchFailures(orderURL string) {
+	m.orderFetchMu.Lock()
+	defer m.orderFetchMu.Unlock()
+	delete(m.orderFetchFails, orderURL)
 }
 
 // round is the per-pass intent of ONE certificate: which domain set this pass decided to
@@ -185,6 +278,8 @@ func newManager(
 		pollInterval:      pollInterval,
 		bindingCheckEvery: bindingCheckInterval,
 		bindingChecked:    make(map[string]time.Time),
+		transientBackoff:  make(map[string]time.Time),
+		orderFetchFails:   make(map[string]int),
 		now:               time.Now,
 	}
 }
@@ -214,6 +309,13 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	}
 	// Skip straight through the backoff window. Once a retry is scheduled, stop knocking
 	// on the CA's door.
+	if until, ok := m.transientBackoffFor(c.Name); ok && m.now().Before(until) {
+		// A backoff that could not be persisted (see transientBackoff). Checking it first
+		// means a failing state store still costs one window instead of one order per pass.
+		m.log.Warn("inside a backoff window that could not be recorded (the state store was failing); skipping",
+			"cert", c.Name, "nextAttemptAt", until)
+		return state.ErrBackoff
+	}
 	if !st.NextAttemptAt.IsZero() && m.now().Before(st.NextAttemptAt) {
 		m.log.Debug("inside the backoff window; skipping", "cert", c.Name, "nextAttemptAt", st.NextAttemptAt)
 		return state.ErrBackoff
@@ -323,7 +425,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	if leaf, lerr := ParseLeaf(st.CertPEM); lerr != nil {
 		m.log.Warn("could not parse the live certificate; skipping the SAN comparison", "cert", c.Name, "err", lerr)
 	} else if drifted, detail := CoverageDrift(leaf, c.Domains); drifted {
-		if rd.fallbackActive {
+		if rd.fallbackActive && driftIsTheDegradation(leaf, c, m.store, c.Name, m.log) {
 			// A degradation is in force, so the live certificate is *supposed* to be
 			// missing names: this drift is the fallback working, not a config change that
 			// needs converging on.
