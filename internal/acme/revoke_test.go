@@ -50,8 +50,8 @@ func TestFailedRevocationIsRecordedAndRetried(t *testing.T) {
 	if req.Attempts == 0 {
 		t.Error("the failed attempt must be counted, so 'has this been failing for a week' is answerable")
 	}
-	if !m.HasPendingRevocations() {
-		t.Error("the pass gate must see the outstanding request")
+	if n, err := m.PendingRevocations(); err != nil || n != 1 {
+		t.Errorf("the pass gate must see the outstanding request, got (%d, %v)", n, err)
 	}
 
 	// The CA comes back, and the next pass finishes it.
@@ -71,8 +71,8 @@ func TestFailedRevocationIsRecordedAndRetried(t *testing.T) {
 	if req != nil {
 		t.Errorf("an accepted revocation must clear the request, still have %+v", req)
 	}
-	if m.HasPendingRevocations() {
-		t.Error("nothing should be pending after the CA accepted")
+	if n, err := m.PendingRevocations(); err != nil || n != 0 {
+		t.Errorf("nothing should be pending after the CA accepted, got (%d, %v)", n, err)
 	}
 }
 
@@ -160,17 +160,30 @@ func TestRevocationRejectsAnUnknownReason(t *testing.T) {
 	}
 }
 
-// The pass gate must not query when nothing is outstanding: this runs on every pass.
-func TestPendingRevocationsGate(t *testing.T) {
+// PendingRevocations is both the retry gate and the source of wecert_revocation_pending, so it has
+// to count exactly -- and it has to refuse to answer at all when the store cannot be read.
+func TestPendingRevocationsCountsAndRefusesToGuess(t *testing.T) {
 	store, m, _, cert := newAPITestHarness(t, []string{"example.com"})
-	if m.HasPendingRevocations() {
-		t.Fatal("a fresh store has nothing pending")
+	if n, err := m.PendingRevocations(); err != nil || n != 0 {
+		t.Fatalf("a fresh store has nothing pending, got (%d, %v)", n, err)
 	}
 	if err := store.AddRevokeRequest(cert.Name, 1, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if !m.HasPendingRevocations() {
-		t.Error("a recorded request must be visible to the pass gate")
+	if n, err := m.PendingRevocations(); err != nil || n != 1 {
+		t.Errorf("a recorded request must be visible to the pass gate, got (%d, %v)", n, err)
+	}
+
+	// Zero is a meaningful answer here, so an unreadable store must not be able to produce it.
+	// The reconciler publishes this count as wecert_revocation_pending, where 0 is the all-clear
+	// that says no certificate is waiting to stop being trusted.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	n, err := m.PendingRevocations()
+	if err == nil {
+		t.Errorf("an unreadable store must report an error rather than a count; got %d with no "+
+			"error, which the reconciler would publish as an all-clear", n)
 	}
 }
 

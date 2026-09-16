@@ -160,6 +160,21 @@ Static release binaries for three platforms:
 make release        # → dist/wecert_{linux_amd64,linux_arm64,darwin_arm64} + SHA256SUMS
 ```
 
+Two things you can check about a release rather than take on trust:
+
+```bash
+make repro-check    # rebuilds each platform twice and compares the bytes
+make sbom           # → dist/wecert-sbom.cdx.json (CycloneDX, needs cyclonedx-gomod)
+```
+
+`repro-check` is what makes "this binary was built from that commit" checkable: with `-trimpath`
+already in the build, the same source and toolchain produce identical bytes on all three platforms,
+so anyone can reproduce a release and compare. `sbom` answers "what is actually in the binary" —
+this program holds private keys and links two cloud SDKs plus a TLS stack, and the transitive tree is
+not something a reviewer should have to resolve by hand. It deliberately does **not** claim licence
+completeness: that needs every module in the local cache, and the tool responds to a missing one by
+omitting the field with only a warning.
+
 ### 2. Run the preflight checks
 
 Before touching any cloud resource, verify credentials, DNS ownership and NS delegation. All checks are read-only.
@@ -884,6 +899,9 @@ row per bucket in `rate_buckets`: the bucket model is its own memory, so no even
 | `wecert_certificate_consecutive_failures` | Persistently > 0 means manual intervention |
 | `wecert_certificate_ari_window_start_timestamp_seconds` | Start of the ARI window |
 | `wecert_reconcile_total{cert,result}` | Reconcile pass counter. `result` is `ok`, `error`, or `skipped` — the last means the pass deliberately did not run because the certificate is inside its retry backoff window |
+| `wecert_last_reconcile_timestamp_seconds` | When the last **full pass finished**. Stamped on completion, never on start, so a hung pass goes stale exactly like a dead process; `0` means none has finished since startup. This is how "the daemon is up and converging nothing" becomes visible — the counter above stops moving both when nothing is due and when the loop is wedged |
+| `wecert_revocation_pending` | Revocation requests recorded but not yet accepted by the CA. **Non-zero is an outstanding security action**, not a background task: the row exists because someone decided a certificate must stop being trusted |
+| `wecert_revocation_query_errors_total` | Passes that could not read the outstanding revocation requests. `wecert_revocation_pending` holds its last value when that read fails rather than reporting a false `0`, so this counter is what distinguishes "the queue is empty" from "we have been unable to look" |
 | `wecert_certificate_probe_match{host}` | 1 when the certificate served is the one deployed; 0 when a rebind did not take effect or another certificate is winning SNI |
 | `wecert_certificate_probe_not_after_timestamp_seconds{host}` | `notAfter` read back over the network — compare against the state-store value |
 | `wecert_certificate_probe_errors_total{host}` | The probe could not run at all. An environment problem, not a certificate problem |
@@ -903,6 +921,8 @@ Alert on `not_after`, **not** on "did the renewal job error" — the latter stay
 # tlsserver (45 days) — alert 10 days ahead
 (wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 10
 ```
+
+**The rest of the rules ship with the repository.** `deploy/prometheus/wecert-alerts.yml` is a ready-to-load Prometheus rule file — 17 rules in three groups (`wecert.expiry`, `wecert.convergence`, `wecert.integrity`) — with a comment above each threshold saying where the number came from. Point `rule_files:` at it and adjust the expiry windows to taste: the two expressions above are the ones whose window is a business decision, while what ships is the set that is wrong at any window — a revocation the CA has not accepted, a pass that has not finished in two hours, a certificate serving that is not the one deployed.
 
 **The black-box probe is built in.** Every pass, wecert dials 443 for each deployed certificate's first few names and reads back the certificate that is actually served — that is the `probe` section above. It catches "the program thinks it succeeded but nothing took effect", which is the most insidious failure, and trusting only your own state database cannot see it. If wecert runs somewhere that cannot reach the VIP, either disable `probe.enabled` or run `wecert-probe` on a schedule from a machine that can; leaving it on from a machine that cannot is harmless but useless, and shows up as `probe_errors` climbing while `probe_match` stays put.
 
@@ -1092,28 +1112,36 @@ The file holds the ACME account key and every certificate's private key. The sys
 ## Development
 
 ```bash
-make check      # the full gate: fmt-check + vet + test -race
+make check      # the full gate: gofmt + vet + English + test -race + e2e self-test + alert rules
 make test       # unit tests
 make test-race  # with the race detector (DNS probing and authz polling are concurrent)
-make fmt-check  # check only, no writes — this is what CI runs
+make fmt-check  # check only, no writes
 make vet        # static analysis
 make build      # → bin/wecert
 make release    # cross-compile linux/amd64, linux/arm64, darwin/arm64
+make fuzz       # property/fuzz targets, FUZZTIME per target (from PR #55)
+make test-pebble  # a real ACME lifecycle against a local CA (needs the pebble binary)
 make cover      # coverage
 ```
 
-CI (`.github/workflows/ci.yml`) runs `gofmt` + `vet` + `test -race` + cross-compile. Gating `gofmt` separately is necessary because `go vet` does not check formatting. The more concrete reason: a single type error can fail 4 of 9 packages — including the main binary — and `go vet` and `go test` fail along with it. Without CI, nobody finds out.
+CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI does **not** run `check-scripts`, `check-alerts`, `make fuzz` or `make test-pebble` yet — those are on whoever pushes.
 
 ### Test layout
 
-69 test cases across 13 files.
+633 test functions across 60 files in 18 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
 
-| Area | Files |
-|---|---|
-| ACME state machine | `ari_test.go`, `manager_test.go`, `reconcile_test.go`, `cleanup_test.go`, `dns_test.go` |
-| Config / domains | `config_test.go`, `domains_test.go` |
-| State | `state_test.go`, `migrate_test.go`, `deploy_confirmed_test.go`, `umask_*_test.go` |
-| Deploy | `tencent_test.go` |
+| Package | Files | What it covers |
+|---|---|---|
+| `internal/acme` | 20 | The issuance state machine |
+| `internal/config` | 5 | Validation, domain normalisation, profiles |
+| `internal/deploy` | 6 | Upload, bind confirmation, replacement |
+| `internal/state` | 7 | Schema, permissions, backups |
+| `internal/onboarding` | 4 | Document generation and the CLB guard |
+| `internal/reconcile` | 2 | Whether to order at all, and metric publication |
+| `internal/webhook` | 2 | Trigger parsing, token enforcement |
+| `internal/ratelimit` | 4 | Token arithmetic, including the fuzz targets |
+| `internal/spec`, `internal/probe`, `internal/group`, `internal/metrics` | 1 each | Source selection, the black-box probe, grouping, the registry |
+| `cmd/*` | 6 | Per-tool argument handling and exit codes |
 
 ### What the tests pin down
 
@@ -1131,7 +1159,7 @@ Not line coverage — the properties most easily broken by a later change:
 
 The `Manager`'s full issuance flow is still not covered end to end — that needs a real ACME server. `Reconcile`'s **decision path** is driven by a fake TLS ACME directory asserting *whether an order was attempted*. For full coverage, run [pebble](https://github.com/letsencrypt/pebble) (Let's Encrypt's official test ACME server, consuming no real quota) in CI.
 
-> Every new regression test was **mutation-verified**: revert the fix, confirm the test goes red, then restore from a checksum-verified backup. A test that has never been red does not count — an inverted assertion, a `t.Skip`, or a loop that never runs will happily stay green.
+> New regression tests are **mutation-verified**: revert the fix, confirm the test goes red, then restore. A test that has never been red does not count — an inverted assertion, a `t.Skip`, or a loop that never runs will happily stay green. This is a requirement in `CONTRIBUTING.md`, not a habit: the repository has shipped tests that passed both before and after the change they were supposed to pin.
 
 ### End-to-end harness
 
