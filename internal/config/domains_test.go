@@ -5,11 +5,12 @@ import (
 	"testing"
 )
 
-// SAN 多的证书上，domains 往往是从别处整段复制粘贴来的。
-// 去重必须发生在判上限**之前**，否则 100 个域名 + 1 个手误重复
-// 会被判成 101 超限而拒掉一个本来合法的配置。
+// On certificates with many SANs the domains list is usually pasted in
+// wholesale from elsewhere. Deduplication must happen **before** the cap check,
+// or 100 domains plus 1 accidental duplicate is counted as 101 and a legal
+// config is rejected.
 func TestDuplicateDomainsDedupedBeforeMaxNames(t *testing.T) {
-	// 100 个唯一域名，外加 5 个重复项 —— classic 上限正好是 100。
+	// 100 unique domains plus 5 duplicates — classic's cap is exactly 100.
 	domains := make([]string, 0, 105)
 	for i := 0; i < 100; i++ {
 		domains = append(domains, "d"+itoa(i)+".example.com")
@@ -26,14 +27,14 @@ certificates:
 `
 	cfg, err := Load(writeConfig(t, body))
 	if err != nil {
-		t.Fatalf("100 个唯一域名 + 5 个重复应当通过（去重后正好 100）: %v", err)
+		t.Fatalf("100 unique domains + 5 duplicates should pass (exactly 100 after dedup): %v", err)
 	}
 	if got := len(cfg.Certificates[0].Domains); got != 100 {
-		t.Errorf("去重后应有 100 个域名，得到 %d", got)
+		t.Errorf("expected 100 domains after dedup, got %d", got)
 	}
 }
 
-// 真正的超限仍然要拦住。
+// A genuine overflow must still be blocked.
 func TestRealOverflowStillRejected(t *testing.T) {
 	domains := make([]string, 0, 101)
 	for i := 0; i < 101; i++ {
@@ -46,11 +47,11 @@ certificates:
     domains: [` + strings.Join(quoteAll(domains), ", ") + `]
 `
 	if _, err := Load(writeConfig(t, body)); err == nil {
-		t.Fatal("101 个唯一域名应当被拒绝")
+		t.Fatal("101 unique domains should be rejected")
 	}
 }
 
-// 大小写不应当产生两个不同的 identifier。
+// Casing must not produce two different identifiers.
 func TestDomainsLowercased(t *testing.T) {
 	body := minimalPrefix + `
 certificates:
@@ -59,22 +60,22 @@ certificates:
 `
 	cfg, err := Load(writeConfig(t, body))
 	if err != nil {
-		t.Fatalf("Load 失败: %v", err)
+		t.Fatalf("Load failed: %v", err)
 	}
 
 	got := cfg.Certificates[0].Domains
 	want := []string{"example.com", "api.example.com"}
 	if len(got) != len(want) {
-		t.Fatalf("domains = %v，期望 %v", got, want)
+		t.Fatalf("domains = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("domains[%d] = %q，期望 %q", i, got[i], want[i])
+			t.Errorf("domains[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
 }
 
-// 顺序必须保持：classic profile 会把第一个 dNSName 提升为 CN。
+// Order must be preserved: the classic profile promotes the first dNSName to CN.
 func TestDomainOrderPreserved(t *testing.T) {
 	body := minimalPrefix + `
 certificates:
@@ -83,44 +84,45 @@ certificates:
 `
 	cfg, err := Load(writeConfig(t, body))
 	if err != nil {
-		t.Fatalf("Load 失败: %v", err)
+		t.Fatalf("Load failed: %v", err)
 	}
 	got := cfg.Certificates[0].Domains
 	if got[0] != "z.example.com" || got[1] != "a.example.com" || got[2] != "m.example.com" {
-		t.Errorf("顺序被改动了: %v（第一个域名会成为 CN）", got)
+		t.Errorf("order was changed: %v (the first domain becomes the CN)", got)
 	}
 }
 
-// DomainKey 必须与顺序、大小写、重复无关 —— 它是拿
-// "配置里期望的集合"和"证书实际 SAN"做等价比较的基础。
+// DomainKey must be independent of order, case and duplicates — it is the basis
+// for comparing "the set the config wants" with "the actual certificate SANs".
 func TestDomainKeyIsSetSemantics(t *testing.T) {
 	base := DomainKey([]string{"a.example.com", "b.example.com"})
 
 	same := [][]string{
-		{"b.example.com", "a.example.com"},                  // 顺序不同
-		{"A.Example.COM", "B.example.com"},                  // 大小写不同
-		{"a.example.com", "b.example.com", "a.example.com"}, // 有重复
-		{"a.example.com", " b.example.com "},                // 有空白
+		{"b.example.com", "a.example.com"},                  // different order
+		{"A.Example.COM", "B.example.com"},                  // different case
+		{"a.example.com", "b.example.com", "a.example.com"}, // duplicate present
+		{"a.example.com", " b.example.com "},                // whitespace present
 	}
 	for _, candidate := range same {
 		if got := DomainKey(candidate); got != base {
-			t.Errorf("DomainKey(%v) = %q，应与 %q 等价", candidate, got, base)
+			t.Errorf("DomainKey(%v) = %q, should equal %q", candidate, got, base)
 		}
 	}
 
 	different := [][]string{
-		{"a.example.com"}, // 少一个
-		{"a.example.com", "b.example.com", "c.example.com"}, // 多一个
-		{"a.example.com", "c.example.com"},                  // 换一个
+		{"a.example.com"}, // one fewer
+		{"a.example.com", "b.example.com", "c.example.com"}, // one more
+		{"a.example.com", "c.example.com"},                  // one swapped
 	}
 	for _, candidate := range different {
 		if got := DomainKey(candidate); got == base {
-			t.Errorf("DomainKey(%v) 不应等于 %q", candidate, base)
+			t.Errorf("DomainKey(%v) should not equal %q", candidate, base)
 		}
 	}
 }
 
-// DiffDomains 两个方向都要报：只报 missing 会漏掉"配置里删了域名"。
+// DiffDomains must report both directions: reporting only missing would miss "a
+// domain was deleted from the config".
 func TestDiffDomainsBothDirections(t *testing.T) {
 	missing, extra := DiffDomains(
 		[]string{"keep.example.com", "added.example.com"},
@@ -128,66 +130,68 @@ func TestDiffDomainsBothDirections(t *testing.T) {
 	)
 
 	if len(missing) != 1 || missing[0] != "added.example.com" {
-		t.Errorf("missing = %v，期望 [added.example.com]", missing)
+		t.Errorf("missing = %v, want [added.example.com]", missing)
 	}
 	if len(extra) != 1 || extra[0] != "removed.example.com" {
-		t.Errorf("extra = %v，期望 [removed.example.com]", extra)
+		t.Errorf("extra = %v, want [removed.example.com]", extra)
 	}
 
-	// 完全一致时两个都应为空。
+	// When the sets match exactly, both should be empty.
 	missing, extra = DiffDomains([]string{"a.com", "b.com"}, []string{"b.com", "a.com"})
 	if len(missing) != 0 || len(extra) != 0 {
-		t.Errorf("集合相同时不应有差异，得到 missing=%v extra=%v", missing, extra)
+		t.Errorf("identical sets should show no diff, got missing=%v extra=%v", missing, extra)
 	}
 }
 
-// 坏域名必须在本地被拦下 —— 每打出去一个必然被 CA 拒绝的订单，
-// 消耗的都是订单配额，而 SAN 多的证书重来一遍代价很大。
+// Bad domains must be blocked locally — every order sent out that the CA will
+// certainly reject burns order quota, and re-issuing a many-SAN certificate is
+// expensive.
 func TestDomainValidation(t *testing.T) {
 	cases := []struct {
 		domain  string
 		wantErr bool
 		why     string
 	}{
-		{"example.com", false, "普通域名"},
-		{"a.b.c.example.com", false, "多层子域"},
+		{"example.com", false, "ordinary domain"},
+		{"a.b.c.example.com", false, "multi-level subdomain"},
 		{"xn--fiqs8s.example.com", false, "punycode"},
-		{"my-host.example.com", false, "连字符"},
-		{"*.example.com", false, "合法通配符"},
-		{"*.*.example.com", true, "LE 不允许 *.*"},
-		{"a.*.example.com", true, "通配符必须在最左侧"},
-		{"example.com.", true, "尾点"},
-		{"", true, "空域名"},
-		{"a..example.com", true, "空标签"},
-		{".example.com", true, "以点开头"},
-		{"example..com", true, "中间空标签"},
-		{"exa mple.com", true, "含空格"},
-		{"example.com/path", true, "含斜杠"},
-		{"under_score.example.com", true, "下划线不是合法主机名字符"},
-		{"-lead.example.com", true, "标签以连字符开头"},
-		{"trail-.example.com", true, "标签以连字符结尾"},
-		{strings.Repeat("a", 64) + ".example.com", true, "标签超过 63 字符"},
-		{strings.Repeat("a", 63) + ".example.com", false, "标签正好 63 字符"},
+		{"my-host.example.com", false, "hyphen"},
+		{"*.example.com", false, "valid wildcard"},
+		{"*.*.example.com", true, "LE does not allow *.*"},
+		{"a.*.example.com", true, "wildcard must be leftmost"},
+		{"example.com.", true, "trailing dot"},
+		{"", true, "empty domain"},
+		{"a..example.com", true, "empty label"},
+		{".example.com", true, "leading dot"},
+		{"example..com", true, "empty label in the middle"},
+		{"exa mple.com", true, "contains a space"},
+		{"example.com/path", true, "contains a slash"},
+		{"under_score.example.com", true, "underscore is not a legal hostname character"},
+		{"-lead.example.com", true, "label starts with a hyphen"},
+		{"trail-.example.com", true, "label ends with a hyphen"},
+		{strings.Repeat("a", 64) + ".example.com", true, "label longer than 63 characters"},
+		{strings.Repeat("a", 63) + ".example.com", false, "label exactly 63 characters"},
 	}
 
 	for _, tc := range cases {
 		err := validateDomain(tc.domain)
 		if tc.wantErr && err == nil {
-			t.Errorf("%q (%s): 期望报错但没有", tc.domain, tc.why)
+			t.Errorf("%q (%s): expected an error but got none", tc.domain, tc.why)
 		}
 		if !tc.wantErr && err != nil {
-			t.Errorf("%q (%s): 期望通过但报错: %v", tc.domain, tc.why, err)
+			t.Errorf("%q (%s): expected success but got error: %v", tc.domain, tc.why, err)
 		}
 	}
 }
 
-// 通配符域名带非法字符时报错信息应当指向真正的问题。
+// For a wildcard with illegal characters the error should point at the real
+// problem.
 func TestWildcardPositionErrorIsClear(t *testing.T) {
 	err := validateDomain("a.*.example.com")
 	if err == nil {
-		t.Fatal("期望报错")
+		t.Fatal("expected an error")
 	}
 	if !strings.Contains(err.Error(), "wildcard") {
-		t.Errorf("报错应点明通配符位置问题，得到: %v", err)
+		t.Errorf("the error should point at the wildcard position, got: %v", err)
 	}
 }

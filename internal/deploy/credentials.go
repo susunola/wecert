@@ -14,22 +14,28 @@ import (
 	"github.com/susunola/wecert/internal/config"
 )
 
-// cvmMetadataURL 是 CVM 实例元数据服务里读取 CAM 角色临时凭证的地址。
-// 用角色而不是把 SecretId/SecretKey 写进配置文件，是为了让密钥不落盘。
+// cvmMetadataURL is the address for reading CAM role temporary credentials from the CVM
+// instance metadata service.
+// Using a role instead of writing SecretId/SecretKey into the config file keeps the
+// secrets off disk.
 const cvmMetadataURL = "http://metadata.tencentyun.com/latest/meta-data/cam/security-credentials/"
 
-// CredentialFunc 每次都重新获取一份凭证。
-// 不缓存是有意的：临时凭证会过期，而部署动作几十天才发生一次。
+// CredentialFunc fetches a fresh credential every time.
+// The lack of caching is deliberate: temporary credentials expire, and deployment only
+// happens once every few dozen days.
 type CredentialFunc func(ctx context.Context) (common.CredentialIface, error)
 
-// NewCredentialSource 按配置返回一个凭证来源。
-// 证书部署和 dns.provider=tencentcloud 的 DNS-01 共用同一套凭证。
+// NewCredentialSource returns a credential source according to config.
+// Certificate deployment and DNS-01 with dns.provider=tencentcloud share the same
+// credentials.
 func NewCredentialSource(cfg config.Tencent) (CredentialFunc, error) {
 	switch cfg.CredentialMode {
 	case config.CredentialStatic:
-		// 优先用配置里的值，其次回退到腾讯云官方约定的环境变量。
-		// 走环境变量的意义在于：凭证不必落进配置文件，
-		// 配置文件和 systemd unit 就可以放心提交、放心备份。
+		// Prefer values from the config, then fall back to Tencent Cloud's official
+		// environment variables.
+		// The point of going through the environment is that credentials need not land in
+		// the config file, so both the config file and the systemd unit can be committed
+		// and backed up without worry.
 		id, key := cfg.SecretID, cfg.SecretKey
 		if id == "" {
 			id = os.Getenv(EnvSecretID)
@@ -55,7 +61,7 @@ func NewCredentialSource(cfg config.Tencent) (CredentialFunc, error) {
 	}
 }
 
-// 腾讯云 SDK 约定的环境变量名。
+// Environment variable names as agreed by the Tencent Cloud SDK.
 const (
 	EnvSecretID  = "TENCENTCLOUD_SECRET_ID"
 	EnvSecretKey = "TENCENTCLOUD_SECRET_KEY"
@@ -69,10 +75,12 @@ type cvmRoleCredential struct {
 	Code         string `json:"Code"`
 }
 
-// fetchCVMRoleCredential 每次部署都重新取一次临时凭证。
+// fetchCVMRoleCredential fetches a fresh temporary credential on every deploy.
 //
-// 不做缓存是有意的：临时凭证通常 2 小时过期，而部署动作 45~90 天才发生一次，
-// 缓存它只会换来"等真要用的时候才发现已经过期"这种最难排查的故障。
+// The lack of caching is deliberate: temporary credentials usually expire in 2 hours
+// while a deploy happens only once every 45-90 days, so caching one buys nothing but the
+// hardest kind of failure to diagnose -- "it turned out to be expired right when we
+// finally needed it".
 func fetchCVMRoleCredential(ctx context.Context, roleName string) (common.CredentialIface, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cvmMetadataURL+roleName, nil)
 	if err != nil {

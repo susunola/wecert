@@ -16,29 +16,38 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # gofmt 必须单独设门禁：go vet 不检查格式，
-      # 所以未格式化的文件可以一路通过本地检查。
+      # gofmt needs its own gate: go vet does not check formatting, so an
+      # unformatted file sails through every other local check.
       - name: gofmt
         run: |
           out="$(gofmt -l .)"
           if [ -n "$out" ]; then
-            echo "以下文件未格式化："
+            echo "these files are not gofmt-clean:"
             echo "$out"
             exit 1
           fi
 
+      # wecert is an international project: every comment and every user-facing
+      # message in the source is English. Without a gate, Chinese comments creep
+      # back in one file at a time and nobody notices until a contributor asks
+      # why half the reasoning is unreadable to them.
+      - name: English source
+        run: python3 scripts/check-english.py
+
       - name: go vet
         run: go vet ./...
 
-      # -race 对这个项目尤其重要：SAN 多的证书上 DNS 探测与授权轮询都是并发的，
-      # 数据竞争的表现是"某个域名的验证偶尔莫名失败"，人工 review 看不出来。
+      # -race matters more than usual here: on a certificate with many SANs the
+      # DNS probing and the authorization polling are both concurrent, and a data
+      # race shows up as "one domain's validation failed for no reason" — the
+      # kind of thing a human review will never catch.
       - name: test
         run: go test -race ./...
 
       - name: build
         run: make build
 
-      # 交叉编译校验：release 产物是要直接扔到 CVM 上的，
-      # 别等到发版那天才发现编译不过。
+      # Cross-compilation check: the release artifacts get dropped straight onto
+      # a CVM, so do not wait until release day to find out they do not build.
       - name: cross build
         run: make release

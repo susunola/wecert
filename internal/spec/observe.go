@@ -9,15 +9,16 @@ import (
 	"github.com/susunola/wecert/internal/config"
 )
 
-// ShadowReport 是"如果按影子来源来会怎样"的对比结果。
+// ShadowReport is the comparison of "what would happen if the shadow source won".
 //
-// 它是 observe 模式的全部产出：不签发、不删除，只回答
-// "会加什么、会删什么、会改什么"。
+// It is the entire output of observe mode: it issues nothing and deletes
+// nothing, and only answers "what would be added, removed or changed".
 type ShadowReport struct {
 	Revision    string    `json:"revision,omitempty"`
 	GeneratedAt time.Time `json:"generatedAt,omitempty"`
 
-	// Error 非空表示影子来源这一轮读不到，因此没有对比结果。
+	// A non-empty Error means the shadow source was unreadable this round, so
+	// there is no comparison to report.
 	Error string `json:"error,omitempty"`
 
 	AddCertificates    []string            `json:"addCertificates,omitempty"`
@@ -28,7 +29,7 @@ type ShadowReport struct {
 	RemovedDomains int `json:"removedDomains"`
 }
 
-// CertificateChange 描述同一张证书的域名集合变化。
+// CertificateChange describes a change to one certificate's domain set.
 type CertificateChange struct {
 	Name    string   `json:"name"`
 	Added   []string `json:"addedDomains,omitempty"`
@@ -36,30 +37,31 @@ type CertificateChange struct {
 	Changed []string `json:"changedFields,omitempty"`
 }
 
-// Empty 报告影子来源与正在执行的状态是否一致。
+// Empty reports whether the shadow source agrees with what is being enforced.
 func (s *ShadowReport) Empty() bool {
 	if s == nil {
-		return false // 没有对比结果，不能声称"一致"。
+		return false // No comparison was produced, so do not claim agreement.
 	}
 	return s.Error == "" &&
 		len(s.AddCertificates) == 0 && len(s.RemoveCertificates) == 0 && len(s.ChangeCertificates) == 0
 }
 
-// Observer 包装一个主来源，同时读一份影子来源并报告差异。
+// Observer wraps a primary source, also reads a shadow source and reports the diff.
 //
-// 这是从 static 迁到 enforce 之间的必经阶段，而且它**不改变任何行为**：
-// 收敛照旧走 primary，影子只用来产生报告。
+// This is the mandatory stage between static and enforce, and it **changes no
+// behaviour**: convergence still follows primary, the shadow only reports.
 //
-// 文档 §8 把这一步单独拎出来，是因为直接上自动签发会在完全不了解
-// 真实漂移形态的情况下把配额赌进去：去抖窗口该多大、有没有批量导入、
-// 有没有奇怪的记录，这些只能从几周的真实数据里来。
+// It is singled out because jumping straight to automatic issuance gambles quota
+// blind to the real shape of drift: how wide the debounce window must be,
+// whether bulk imports or odd records exist -- questions only weeks of real data
+// can answer.
 type Observer struct {
 	primary Provider
 	shadow  Provider
 	log     *slog.Logger
 }
 
-// NewObserver 构造观察器。
+// NewObserver constructs an observer.
 func NewObserver(primary, shadow Provider, log *slog.Logger) *Observer {
 	if log == nil {
 		log = slog.Default()
@@ -67,18 +69,19 @@ func NewObserver(primary, shadow Provider, log *slog.Logger) *Observer {
 	return &Observer{primary: primary, shadow: shadow, log: log}
 }
 
-// Kind 实现 Named。
+// Kind implements Named.
 func (o *Observer) Kind() string { return "observe(" + KindOf(o.primary) + ")" }
 
-// Desired 实现 Provider，永远走主来源。
+// Desired implements Provider and always goes through the primary source.
 func (o *Observer) Desired(ctx context.Context) ([]config.Certificate, error) {
 	return o.primary.Desired(ctx)
 }
 
-// DesiredWithReasons 在主来源的结果上挂一份影子对比。
+// DesiredWithReasons attaches a shadow comparison to the primary result.
 //
-// 影子来源出错**不会**让整个求值失败：观察阶段读不到文档是很正常的事
-// （还没开始生成），此时正确的行为是照旧收敛，并把这个事实记下来。
+// A shadow source error does **not** fail the whole evaluation: during
+// observation an unreadable document is normal (generation has not started yet),
+// and the correct behaviour is to converge as usual and record the fact.
 func (o *Observer) DesiredWithReasons(ctx context.Context) (*Result, error) {
 	res, err := Desired(ctx, o.primary)
 	if err != nil {
@@ -105,7 +108,7 @@ func (o *Observer) DesiredWithReasons(ctx context.Context) (*Result, error) {
 	return res, nil
 }
 
-// Diff 比较"正在执行的"和"影子来源的"期望状态。
+// Diff compares the enforced desired state with the shadow one.
 func Diff(enforced, shadow *Result) *ShadowReport {
 	rep := &ShadowReport{Revision: shadow.Revision, GeneratedAt: shadow.GeneratedAt}
 
@@ -169,7 +172,7 @@ func diffCert(cur, want *config.Certificate) *CertificateChange {
 	return ch
 }
 
-// onlyIn 返回在 a 里、不在 b 里的名字。
+// onlyIn returns the names in a that are not in b.
 func onlyIn(a, b []string) []string {
 	if len(a) == 0 {
 		return nil

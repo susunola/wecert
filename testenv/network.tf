@@ -1,7 +1,8 @@
 ###############################################################################
-# 网络：VPC + 子网
+# Network: VPC + subnet
 #
-# 只在需要 CLB 或 CVM 时才创建。纯 wildcard 测试（阶段 A）用不到这个文件。
+# Created only when a CLB or CVM is needed. The pure wildcard test (stage A) never
+# touches this file.
 ###############################################################################
 
 resource "tencentcloud_vpc" "test" {

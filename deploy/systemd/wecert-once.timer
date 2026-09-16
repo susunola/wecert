@@ -1,20 +1,22 @@
 [Unit]
-Description=定时触发 wecert 单轮收敛
+Description=Triggers one wecert convergence pass on a schedule
 
 [Timer]
-# 显式指向 once 服务。
+# Point explicitly at the once service.
 #
-# 不写这一行时，systemd 会把 wecert-once.timer 解析成同名的
-# wecert-once.service —— 这正是我们要的，但依赖"文件名恰好等于
-# 目标服务名"这种隐式约定太脆：一旦有人把 timer 改成 wecert.timer，
-# 它就会静默指向常驻的 wecert.service，定时模式从此再也不生效。
+# Without this line systemd resolves wecert-once.timer to a same-named
+# wecert-once.service — which is what we want, but relying on "the filename
+# happens to equal the target service name" is too fragile: rename the timer
+# to wecert.timer and it silently points at the long-running wecert.service,
+# after which scheduled mode never runs again.
 Unit=wecert-once.service
 
-# 每小时跑一次。续期是否真的发生由 ARI 窗口决定，
-# 跑得勤只是让"窗口一到就动"，不会因此多下单。
+# Once an hour. Whether a renewal actually happens is decided by the ARI
+# window, so running often only means "act as soon as the window opens" —
+# it does not place extra orders.
 OnBootSec=2min
 OnUnitActiveSec=1h
-# 加抖动，避免多实例同时敲 CA 的门。
+# Jitter, so several instances do not knock on the CA's door at the same moment.
 RandomizedDelaySec=10min
 Persistent=true
 

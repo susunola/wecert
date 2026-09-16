@@ -1,12 +1,15 @@
-# 端到端测试配置 —— 阶段 A：wildcard
+# End-to-end test config — stage A: wildcard
 #
-# 这个阶段不需要任何云资源：通配符只能走 DNS-01，全程只有 DNS API 调用；
-# 证书签出来上传到腾讯云 SSL 证书服务也只是 API 调用，不需要绑定到 CLB。
+# This stage needs no cloud resources at all: a wildcard can only use DNS-01, so
+# the whole run is DNS API calls, and issuing the certificate and uploading it to
+# Tencent Cloud SSL Certificate Service is also just API calls — no CLB binding
+# needed.
 #
-# 验证的核心是 wildcard + apex 的交互：
-#   example.com 和 *.example.com 的 challenge 值
-#   都写在 _acme-challenge.example.com 上，必须同时存在。
-#   "写一条→验一条→删一条"的实现会在这里必败。
+# The core thing under test is the wildcard + apex interaction:
+#   the challenge values for example.com and *.example.com both go on
+#   _acme-challenge.example.com and must exist at the same time.
+#   An implementation that does "write one, validate one, delete one" is
+#   guaranteed to fail here.
 
 statePath: /tmp/wecert-e2e/state.db
 
@@ -28,16 +31,17 @@ tencent:
 
 certificates:
   - name: wildcard-test
-    # classic：90 天、Max Names 100。
-    # 跑通后可以改成 tlsserver（45 天、Max Names 25）再验一遍 profile 选择。
+    # classic: 90 days, Max Names 100.
+    # Once it works, switch to tlsserver (45 days, Max Names 25) to verify profile
+    # selection again.
     profile: classic
     keyType: ecdsa-p256
     domains:
-      # 关键：apex 和通配符一起申请。
-      # 只有这两个同时存在，才会触发"两条 authorization 写同一个 TXT 名字"。
+      # The key point: request the apex and the wildcard together. Only when both
+      # are present does it trigger "two authorizations writing the same TXT name".
       - REPLACE_ME
       - "*.REPLACE_ME"
     deploy:
-      # 开着才会上传到腾讯云 SSL 证书服务。
-      # 首次签发时 OldCertificateId 为空，不会更新任何已有资源。
+      # Only when enabled does it upload to Tencent Cloud SSL Certificate Service.
+      # On first issuance OldCertificateId is empty, so no existing resource is updated.
       enabled: true
