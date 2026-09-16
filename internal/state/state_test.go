@@ -227,6 +227,56 @@ func TestAuthorizationRoundTrip(t *testing.T) {
 	}
 }
 
+// The lease recovery path re-registers every presented row across all certificates, so the
+// listing has to be exhaustive and has to scan the columns in the right order -- it is a
+// hand-written SELECT with an explicit column list, which is exactly where a silent
+// mis-scan hides.
+func TestListPresentedAuthorizationsIsExhaustiveAndReadsEveryColumn(t *testing.T) {
+	s := openTestStore(t)
+
+	rows := []*Authorization{
+		{CertName: "a", AuthzURL: "authz-1", Identifier: "one.example.com", Status: "pending",
+			ChallengeURL: "https://ca.test/chall/1", ChallengeToken: "tok-1",
+			TxtName: "_acme-challenge.one.example.com.", TxtValue: "value-1",
+			Presented: true, ChallengeSent: true},
+		{CertName: "b", AuthzURL: "authz-2", Identifier: "two.example.com", Status: "pending",
+			ChallengeURL: "https://ca.test/chall/2", ChallengeToken: "tok-2",
+			TxtName: "_acme-challenge.two.example.com.", TxtValue: "value-2",
+			Presented: true},
+		// Not presented: it is not in DNS, so it must not be re-registered as a lease.
+		{CertName: "c", AuthzURL: "authz-3", Identifier: "three.example.com",
+			TxtName: "_acme-challenge.three.example.com.", TxtValue: "value-3"},
+	}
+	for _, a := range rows {
+		if err := s.PutAuthorization(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.ListPresentedAuthorizations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want the 2 presented rows, got %d: %+v", len(got), got)
+	}
+
+	byValue := map[string]*Authorization{}
+	for _, a := range got {
+		byValue[a.TxtValue] = a
+	}
+	first := byValue["value-1"]
+	if first == nil {
+		t.Fatalf("every presented row must be listed, got %+v", byValue)
+	}
+	if first.CertName != "a" || first.AuthzURL != "authz-1" || first.Identifier != "one.example.com" ||
+		first.Status != "pending" || first.ChallengeURL != "https://ca.test/chall/1" ||
+		first.ChallengeToken != "tok-1" || first.TxtName != "_acme-challenge.one.example.com." ||
+		!first.Presented || !first.ChallengeSent {
+		t.Errorf("columns are mis-scanned or missing: %+v", first)
+	}
+}
+
 func TestRetiredCerts(t *testing.T) {
 	s := openTestStore(t)
 

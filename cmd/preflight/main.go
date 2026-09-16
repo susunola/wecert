@@ -341,6 +341,53 @@ func derefU64(v *uint64) uint64 {
 	return *v
 }
 
+// Page size and page cap for the certificate listing.
+const (
+	prunePageSize = 100
+	pruneMaxPages = 1000 // 100k certificates: a bound on a server that ignores Offset
+)
+
+// certPage is one page of an SSL certificate listing.
+type certPage struct {
+	certs []*ssl.Certificates
+	// total is what the server reported, or nil when it reported nothing.
+	total *uint64
+}
+
+// listAllPages walks every page of a certificate listing.
+//
+// Termination must not hinge on TotalCount. The API leaves it null in some responses --
+// the same shape that caused the CLB rebind false failure -- and a nil total read as 0
+// would stop the walk after the first page. That is silent truncation, and here the walk
+// is exactly what decides which certificates get deleted, so the command would report a
+// complete cleanup while leaving the rest of the account behind. A short page is the
+// reliable end-of-list signal; TotalCount is only used to stop earlier when it is present.
+func listAllPages(pageSize, maxPages int, fetch func(offset, limit uint64) (certPage, error)) ([]*ssl.Certificates, error) {
+	var all []*ssl.Certificates
+	var offset uint64
+
+	for page := 0; ; page++ {
+		if page >= maxPages {
+			return nil, fmt.Errorf("the certificate listing did not advance after %d pages (%d certificates): "+
+				"refusing to loop, and refusing to report a cleanup that saw only part of the account", page, offset)
+		}
+
+		p, err := fetch(offset, uint64(pageSize))
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, p.certs...)
+
+		if len(p.certs) < pageSize {
+			return all, nil
+		}
+		offset += uint64(len(p.certs))
+		if p.total != nil && offset >= *p.total {
+			return all, nil
+		}
+	}
+}
+
 // pruneCertificates deletes the certificates wecert uploaded.
 //
 // Why it is needed: accounts have a quota on uploaded certificates, and long-running testing
@@ -372,30 +419,26 @@ func pruneCertificates(assumeYes bool) error {
 	// Page through the whole list: this listing drives deletion, so silently seeing
 	// only the first 100 certificates would leave the rest in place while looking like
 	// a complete cleanup.
-	var offset uint64
-	for {
+	certs, err := listAllPages(prunePageSize, pruneMaxPages, func(offset, limit uint64) (certPage, error) {
 		listReq := ssl.NewDescribeCertificatesRequest()
-		listReq.Limit = common.Uint64Ptr(100)
+		listReq.Limit = common.Uint64Ptr(limit)
 		listReq.Offset = common.Uint64Ptr(offset)
 		listResp, err := client.DescribeCertificatesWithContext(ctx, listReq)
 		if err != nil {
-			return err
+			return certPage{}, err
 		}
 		if listResp.Response == nil {
-			return fmt.Errorf("DescribeCertificates returned an empty response")
+			return certPage{}, fmt.Errorf("DescribeCertificates returned an empty response")
 		}
+		return certPage{certs: listResp.Response.Certificates, total: listResp.Response.TotalCount}, nil
+	})
+	if err != nil {
+		return err
+	}
 
-		for _, c := range listResp.Response.Certificates {
-			if strings.HasPrefix(deref(c.Alias), prefix) {
-				doomed = append(doomed, c)
-			}
-		}
-
-		offset += uint64(len(listResp.Response.Certificates))
-		// An empty page without reaching TotalCount means the list shifted under us;
-		// stopping there beats looping on a moving target.
-		if len(listResp.Response.Certificates) == 0 || offset >= derefU64(listResp.Response.TotalCount) {
-			break
+	for _, c := range certs {
+		if strings.HasPrefix(deref(c.Alias), prefix) {
+			doomed = append(doomed, c)
 		}
 	}
 

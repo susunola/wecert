@@ -530,12 +530,23 @@ type Webhook struct {
 	// event to it, to wire "certificate renewed" into downstream flows (triggering
 	// a config reload, for example).
 	NotifyURL string `yaml:"notifyURL"`
+
+	// NotifySecret is optional and only meaningful with NotifyURL. When set, each
+	// notification carries X-Wecert-Signature: sha256=<hex HMAC-SHA256 of the raw
+	// body>, which lets the receiver distinguish a genuine event from anything else
+	// that can reach its URL.
+	NotifySecret string `yaml:"notifySecret"`
 }
 
 // WebhookTokenMinLen is the minimum token length.
 // A short token is no authentication at all on this endpoint — an attacker who
 // triggers issuance can burn the rate-limit quota.
 const WebhookTokenMinLen = 16
+
+// WebhookNotifySecretMinLen is the minimum HMAC secret length.
+// An HMAC key shorter than its hash's output can be recovered by brute force from
+// a single signed event, so a short secret gives a false sense of authenticity.
+const WebhookNotifySecretMinLen = 32
 
 // Certificate is the desired state of one certificate.
 type Certificate struct {
@@ -696,6 +707,21 @@ func (c *Config) normalize() error {
 }
 
 func (w *Webhook) normalize() error {
+	// Checked before the listen-address branch below: NotifySecret is about the
+	// outbound event target, which is independent of the trigger endpoint.
+	if w.NotifySecret != "" {
+		if w.NotifyURL == "" {
+			return fmt.Errorf("webhook.notifySecret is set but webhook.notifyURL is empty: " +
+				"there is no outgoing event for the signature to cover")
+		}
+		if len(w.NotifySecret) < WebhookNotifySecretMinLen {
+			return fmt.Errorf("webhook.notifySecret is too short (%d characters, minimum %d): "+
+				"a key this short can be recovered from a single signed event, so it would not "+
+				"prove the notification came from wecert",
+				len(w.NotifySecret), WebhookNotifySecretMinLen)
+		}
+	}
+
 	// An empty Listen means disabled, in which case Token is not needed either.
 	if w.Listen == "" {
 		if w.Token != "" {

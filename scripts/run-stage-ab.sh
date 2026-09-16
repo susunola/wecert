@@ -74,8 +74,15 @@ fi
 # eval executes any command substitution a value happens to contain, and a credentials
 # file is data, not code. Extract the values with sed instead and strip one layer of
 # surrounding quotes.
+#
+# Both forms are accepted, with or without "export": a credentials file that is only
+# sourced by an interactive shell often omits it, and requiring the keyword here would
+# silently report "not set" for a file that does define the variable.
 cred_value() {
-	sed -n "s/^[[:space:]]*export[[:space:]][[:space:]]*$1=\(.*\)/\1/p" "${CREDS}" |
+	sed -n \
+		-e "s/^[[:space:]]*export[[:space:]][[:space:]]*$1=\(.*\)/\1/p" \
+		-e "s/^[[:space:]]*$1=\(.*\)/\1/p" \
+		"${CREDS}" |
 		head -n 1 |
 		sed -e 's/^["'"'"']//' -e 's/["'"'"']$//'
 }

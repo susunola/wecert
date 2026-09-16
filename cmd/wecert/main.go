@@ -163,9 +163,10 @@ func run() error {
 	// Note the shape: a nil interface and an interface holding a nil pointer differ, and
 	// stuffing (*webhook.Notifier)(nil) into one defeats the != nil check below.
 	var notifier reconcile.Notifier
-	if n := webhook.NewNotifier(cfg.Webhook.NotifyURL, log); n != nil {
+	if n := webhook.NewNotifier(cfg.Webhook.NotifyURL, cfg.Webhook.NotifySecret, log); n != nil {
 		notifier = n
-		log.Info("renewal results will be pushed out", "url", cfg.Webhook.NotifyURL)
+		log.Info("renewal results will be pushed out", "url", cfg.Webhook.NotifyURL,
+			"signed", cfg.Webhook.NotifySecret != "")
 	}
 
 	manager := acme.NewManager(store, acme.NewAPI(core), solver, deployer, log)
