@@ -62,6 +62,15 @@ type Reconciler struct {
 	mu      sync.Mutex
 	running map[string]struct{}
 
+	// startSlots bounds how many certificates a full trigger converges at once.
+	//
+	// Without it, POST /hook/reconcile started one goroutine per certificate, so a
+	// 100-certificate state fired 100 concurrent ACME orders, DNSPod writes and
+	// Tencent Cloud calls from a single HTTP request -- while the timer path walks the
+	// same certificates strictly one at a time. The bound matches the fan-out caps the
+	// acme and probe packages already use.
+	startSlots chan struct{}
+
 	// prober is the optional network-side prober. Nil means no probing.
 	//
 	// It is attached with SetProber instead of being a New parameter: it is purely
@@ -88,15 +97,20 @@ func (r *Reconciler) SetProber(p *probe.Runner) { r.prober = p }
 // that is exactly why switching sources requires no changes here.
 func New(cfg *config.Config, provider spec.Provider, store *state.Store, manager CertManager, notifier Notifier, log *slog.Logger) *Reconciler {
 	return &Reconciler{
-		cfg:      cfg,
-		provider: provider,
-		store:    store,
-		manager:  manager,
-		notifier: notifier,
-		log:      log,
-		running:  make(map[string]struct{}),
+		cfg:        cfg,
+		provider:   provider,
+		store:      store,
+		manager:    manager,
+		notifier:   notifier,
+		log:        log,
+		running:    make(map[string]struct{}),
+		startSlots: make(chan struct{}, maxConcurrentStarts),
 	}
 }
+
+// maxConcurrentStarts bounds the fan-out of a full webhook trigger. See
+// Reconciler.startSlots.
+const maxConcurrentStarts = 8
 
 // acquire tries to claim a certificate. False means someone is already running it.
 func (r *Reconciler) acquire(name string) bool {
@@ -222,6 +236,12 @@ func (r *Reconciler) publishOrphans(res *spec.Result) {
 		}
 		orphans++
 
+		// Reclaim the per-certificate series. Nothing else ever revisits a name that
+		// has left the desired state, so its gauges would sit at their last value
+		// forever -- and a not_after frozen at its last value trips the documented
+		// expiry rule permanently, for a certificate that no longer exists.
+		metrics.DeleteCertSeries(name)
+
 		attrs := []any{"cert", name}
 		if st, err := r.store.GetCert(name); err == nil && st != nil && !st.NotAfter.IsZero() {
 			attrs = append(attrs, "notAfter", st.NotAfter,
@@ -314,6 +334,38 @@ func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 //
 // ctx must be a **process-level** context, never a request context: it is
 // cancelled the moment the response returns, killing the background pass.
+// startCert launches one certificate's pass against an already-resolved desired
+// state.
+//
+// The resolved result is a parameter rather than something the callee fetches,
+// because resolve() costs a file read, a YAML decode, a full validation and a
+// sha256 of the document -- and a full trigger would otherwise pay that once per
+// certificate.
+func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.Certificate) error {
+	if !r.acquire(c.Name) {
+		return ErrAlreadyRunning
+	}
+
+	// res is heap-allocated and not reused during this pass, so referring to its
+	// elements is safe.
+	go func() {
+		defer r.release(c.Name)
+
+		// Queue for a start slot instead of running immediately. Nothing is dropped:
+		// the caller has already been told "accepted", and the pass starts as soon as
+		// a slot frees up.
+		select {
+		case r.startSlots <- struct{}{}:
+			defer func() { <-r.startSlots }()
+		case <-ctx.Done():
+			return
+		}
+
+		r.reconcileOne(ctx, c)
+	}()
+	return nil
+}
+
 func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 	res := r.resolve(ctx)
 	if res == nil {
@@ -323,18 +375,7 @@ func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 	if found == nil {
 		return fmt.Errorf("no certificate named %q in the desired state", name)
 	}
-
-	if !r.acquire(name) {
-		return ErrAlreadyRunning
-	}
-
-	// res is heap-allocated and not reused during this pass, so referring to its
-	// elements is safe.
-	go func() {
-		defer r.release(name)
-		r.reconcileOne(ctx, found)
-	}()
-	return nil
+	return r.startCert(ctx, res, found)
 }
 
 // StartAll processes every certificate asynchronously and synchronously returns
@@ -346,9 +387,11 @@ func (r *Reconciler) StartAll(ctx context.Context) []string {
 	}
 
 	var skipped []string
-	for _, name := range res.CertNames() {
-		if err := r.StartCert(ctx, name); err != nil {
-			skipped = append(skipped, name)
+	// Walk the resolved slice directly: looking each name up with Find over the same
+	// slice would make this O(n^2).
+	for i := range res.Certificates {
+		if err := r.startCert(ctx, res, &res.Certificates[i]); err != nil {
+			skipped = append(skipped, res.Certificates[i].Name)
 		}
 	}
 	return skipped

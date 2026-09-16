@@ -34,10 +34,50 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Checking binary architecture"
-file "${BINARY}"
-if ! file "${BINARY}" | grep -q 'ELF 64-bit'; then
+file -- "${BINARY}"
+if ! file -- "${BINARY}" | grep -q 'ELF 64-bit'; then
 	echo "Error: this is not a Linux ELF binary. The CVM needs a linux/amd64 or linux/arm64 build." >&2
 	exit 1
+fi
+
+# Verify the artifact before installing it as root.
+#
+# `make release` writes dist/SHA256SUMS next to the binaries, and nothing ever read
+# it: whatever file was passed in became a root-owned binary that systemd then runs
+# with the CAM credentials and the private-key database. That is a lot of trust to
+# place in a file that may have crossed a build host, a shared directory or a
+# download.
+#
+# Absent sums file: warn rather than refuse, because copying the single binary to a
+# CVM is a legitimate workflow. Present but mismatched: refuse, because that is the
+# case this check exists for.
+BINARY_DIR="$(cd "$(dirname "${BINARY}")" && pwd)"
+BINARY_NAME="$(basename "${BINARY}")"
+SUMS="${BINARY_DIR}/SHA256SUMS"
+
+if [[ -f "${SUMS}" ]]; then
+	echo "==> Verifying ${BINARY_NAME} against ${SUMS}"
+	expected="$(awk -v f="${BINARY_NAME}" '$2 == f { print $1 }' "${SUMS}")"
+	if [[ -z "${expected}" ]]; then
+		echo "Error: ${BINARY_NAME} is not listed in ${SUMS}. Refusing to install an unlisted artifact." >&2
+		exit 1
+	fi
+	if command -v sha256sum >/dev/null 2>&1; then
+		actual="$(sha256sum -- "${BINARY}" | awk '{ print $1 }')"
+	else
+		actual="$(shasum -a 256 -- "${BINARY}" | awk '{ print $1 }')"
+	fi
+	if [[ "${actual}" != "${expected}" ]]; then
+		echo "Error: checksum mismatch for ${BINARY_NAME}." >&2
+		echo "  expected ${expected}" >&2
+		echo "  actual   ${actual}" >&2
+		exit 1
+	fi
+	echo "    ok"
+else
+	echo "Warning: no SHA256SUMS beside ${BINARY_NAME}, so the artifact cannot be verified." >&2
+	echo "         It will be installed as root and run with the CAM credentials and the" >&2
+	echo "         private-key database. Prefer installing from a 'make release' output." >&2
 fi
 
 echo "==> Creating system user wecert"
@@ -49,7 +89,7 @@ else
 fi
 
 echo "==> Installing binary to ${INSTALL_PATH}"
-install -m 0755 -o root -g root "${BINARY}" "${INSTALL_PATH}"
+install -m 0755 -o root -g root -- "${BINARY}" "${INSTALL_PATH}"
 
 echo "==> Preparing config directory ${CONFIG_DIR}"
 mkdir -p "${CONFIG_DIR}"
