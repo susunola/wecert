@@ -76,6 +76,14 @@ type fakeAPI struct {
 	// one for the CSR the flow actually finalized, the way a real CA does -- which also
 	// means every flow test exercises "does the leaf belong to the order's key" instead of
 	// only the one test dedicated to it.
+	// newOrderReplaces records the ReplacesCertID of every NewOrder attempt, so a test can
+	// assert not only what was sent but that it was retried without it.
+	newOrderReplaces []string
+
+	// newOrderErr, when set, is returned by the next NewOrder call and then cleared. It
+	// scripts "the CA refused this order" without making the fake stateful.
+	newOrderErr error
+
 	certPEM []byte
 	certErr error
 
@@ -130,6 +138,16 @@ func (f *fakeAPI) NewOrder(domains []string, opts *api.OrderOptions) (legoacme.E
 	defer f.mu.Unlock()
 	f.newOrderDomains = append([]string(nil), domains...)
 	f.newOrderOpts = opts
+	replaces := ""
+	if opts != nil {
+		replaces = opts.ReplacesCertID
+	}
+	f.newOrderReplaces = append(f.newOrderReplaces, replaces)
+	if f.newOrderErr != nil {
+		err := f.newOrderErr
+		f.newOrderErr = nil
+		return legoacme.ExtendedOrder{}, err
+	}
 	if len(f.orders) == 0 {
 		return legoacme.ExtendedOrder{}, errors.New("fakeAPI: NewOrder has no scripted orders")
 	}
