@@ -22,6 +22,13 @@ const (
 	// total work grows with the square of the request count exactly when the endpoint is
 	// under load. One sweep per interval keeps it linear and still reclaims promptly.
 	authLimiterGCInterval = time.Minute
+
+	// authLimiterMaxEntries is the hard ceiling on tracked source addresses.
+	//
+	// The time-based sweep cannot bound the map while a flood is in progress, because
+	// entries younger than the window are deliberately kept. Without a ceiling, a client
+	// with an IPv6 /64 (or any distributed source) grows this map without limit.
+	authLimiterMaxEntries = 65536
 )
 
 type authLimiterState struct {
@@ -61,6 +68,13 @@ func (l *authLimiter) recordFailure(addr string, now time.Time) {
 	// would also drop blockedUntil, shrinking the 15-minute lockout to the
 	// 5-minute window under a sustained attack.
 	if st == nil || (now.Sub(st.windowStart) > authWindow && !now.Before(st.blockedUntil)) {
+		// Past the ceiling, refuse to track a new address rather than grow without
+		// limit. Existing entries keep their state -- including active blocks -- so a
+		// flood cannot evict the protections it is trying to escape; an untracked
+		// address simply starts counting if it ever gets a slot back.
+		if st == nil && len(l.byAddr) >= authLimiterMaxEntries {
+			return
+		}
 		st = &authLimiterState{windowStart: now}
 		l.byAddr[addr] = st
 	}
@@ -89,9 +103,22 @@ func (l *authLimiter) recordFailure(addr string, now time.Time) {
 // precedes the token check, so a fully locked-out caller (legit or not) waits
 // out the block. That ordering is deliberate -- the block is on the address,
 // not on the credentials presented.
-func (l *authLimiter) recordSuccess(addr string) {
+//
+// now is taken so the sweep below can run here as well as on failure.
+func (l *authLimiter) recordSuccess(addr string, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// Sweep here too, not only on failure.
+	//
+	// The map used to be collected only from recordFailure, so a burst of failed
+	// authentications left its entries behind forever once the failures stopped: no
+	// later success reached gc, and there is no background ticker. On a listener
+	// reachable over IPv6 a single client with a /64 can produce unbounded distinct
+	// source addresses, so "the map is bounded by the number of attackers" is not a
+	// bound at all. gc is amortised (at most once per interval), so calling it on the
+	// success path costs nothing measurable.
+	l.gc(now)
+
 	st := l.byAddr[addr]
 	if st == nil {
 		return
@@ -116,5 +143,27 @@ func (l *authLimiter) gc(now time.Time) {
 		if now.After(st.blockedUntil) && now.Sub(st.windowStart) > authWindow {
 			delete(l.byAddr, addr)
 		}
+	}
+
+	// Hard cap as a last resort. The sweep above only removes entries that are neither
+	// blocked nor inside the current window, so a flood keeps the map at roughly
+	// (rate x window) entries; past the cap, evict the oldest windows until it fits.
+	// Evicting limiter state can only make an attacker's next attempt count from zero,
+	// which is strictly less bad than unbounded memory growth.
+	for len(l.byAddr) > authLimiterMaxEntries {
+		var (
+			oldestAddr string
+			oldest     time.Time
+			found      bool
+		)
+		for addr, st := range l.byAddr {
+			if !found || st.windowStart.Before(oldest) {
+				oldestAddr, oldest, found = addr, st.windowStart, true
+			}
+		}
+		if !found {
+			break
+		}
+		delete(l.byAddr, oldestAddr)
 	}
 }

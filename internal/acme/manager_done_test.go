@@ -13,6 +13,7 @@ import (
 
 	legoacme "github.com/go-acme/lego/v4/acme"
 
+	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/state"
 )
@@ -116,7 +117,7 @@ func TestReapRetiredKeepsQueueWhenCloudDeploymentIsDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if err := store.AddRetiredCert("cloud-old", "example-com"); err != nil {
+	if err := store.AddRetiredCert("cloud-old", "example-com", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	m := newManager(store, nil, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -130,6 +131,121 @@ func TestReapRetiredKeepsQueueWhenCloudDeploymentIsDisabled(t *testing.T) {
 		t.Fatalf("Noop must not erase an undeleted cloud certificate from the queue: %+v", retired)
 	}
 }
+
+// A renewal must archive the OUTGOING certificate's material, so the rollback the retired
+// row promises is actually possible.
+//
+// The row used to keep only a CertId. The private key was overwritten in the certificates
+// row at the moment of renewal, so once the retention period expired and the reaper deleted
+// the cloud copy, there was nothing left to re-upload: the rollback window was really "how
+// long Tencent Cloud still has it", and the comment claiming otherwise was aspirational.
+func TestRenewalArchivesTheOutgoingCertificateMaterial(t *testing.T) {
+	t.Setenv("LEGO_DISABLE_CNAME_SUPPORT", "true")
+	saved := challengeLeases
+	challengeLeases = newTXTLeases()
+	t.Cleanup(func() { challengeLeases = saved })
+
+	// Built inline rather than through newAPITestHarness: that harness hardcodes
+	// deploy.Noop, and this test is specifically about what a real rebind records.
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{}
+	certs := []config.Certificate{{
+		Name:    "site-example-com",
+		Domains: []string{"a.example.com"},
+		Profile: config.ProfileClassic,
+		KeyType: config.KeyTypeECDSAP256,
+		Deploy:  config.Deploy{Enabled: true},
+	}}
+	if err := config.NormalizeCertificates(certs); err != nil {
+		t.Fatal(err)
+	}
+	cert := &certs[0]
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, &recordingDeployer{id: "cloud-new"}, log)
+
+	fake.orderDomains = func() []string { return cert.Domains }
+	fake.orderKeyPEM = func() []byte {
+		o, err := store.GetOrder(cert.Name)
+		if err != nil || o == nil {
+			return nil
+		}
+		return o.KeyPEM
+	}
+
+	// A live, deployed certificate whose material must survive the renewal. The fake issues
+	// against the key this order generated, so the key-match gate is satisfied.
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return fixed }
+
+	oldCertPEM := []byte("-----BEGIN CERTIFICATE-----\nOUTGOING\n-----END CERTIFICATE-----\n")
+	oldKeyPEM := []byte("-----BEGIN PRIVATE KEY-----\nOUTGOING-KEY\n-----END PRIVATE KEY-----\n")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(48 * time.Hour),
+		CertURL: "https://acme.test/cert/old", CertPEM: oldCertPEM, KeyPEM: oldKeyPEM,
+		DeployedCertID: "cloud-old", DeployConfirmed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDNS01Order(fake, cert.Domains)
+	fake.certNotAfter = fixed.Add(90 * 24 * time.Hour)
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	retired, err := store.ListRetiredCertsBefore(fixed.Add(24 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retired) != 1 {
+		t.Fatalf("expected the outgoing certificate on the reclaim list, got %+v", retired)
+	}
+	if retired[0].CertID != "cloud-old" {
+		t.Errorf("reclaim list holds %q, want cloud-old", retired[0].CertID)
+	}
+	if string(retired[0].CertPEM) != string(oldCertPEM) {
+		t.Errorf("the outgoing certificate's PEM was not archived:\n got %q\nwant %q",
+			retired[0].CertPEM, oldCertPEM)
+	}
+	if string(retired[0].KeyPEM) != string(oldKeyPEM) {
+		t.Errorf("the outgoing certificate's private key was not archived, so it can never be "+
+			"re-uploaded after the cloud copy is reclaimed:\n got %q\nwant %q",
+			retired[0].KeyPEM, oldKeyPEM)
+	}
+
+	// And the live row must hold the NEW material, not the archived one.
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(st.KeyPEM) == string(oldKeyPEM) {
+		t.Error("the archive overwrote the live certificate's key instead of recording the outgoing one")
+	}
+	if st.DeployedCertID != "cloud-new" {
+		t.Errorf("live DeployedCertID = %q, want cloud-new", st.DeployedCertID)
+	}
+}
+
+// recordingDeployer reports a configurable new CertId and records what it was asked to do.
+type recordingDeployer struct {
+	id string
+}
+
+func (d *recordingDeployer) Deploy(_ context.Context, _ string, oldID string, _, _ []byte) (string, error) {
+	if d.id == "" {
+		return oldID, nil
+	}
+	return d.id, nil
+}
+func (d *recordingDeployer) Delete(context.Context, string) error          { return nil }
+func (d *recordingDeployer) Bindings(context.Context, string) (int, error) { return 0, nil }
 
 // A domain-set change must not carry ARI's `replaces`.
 //

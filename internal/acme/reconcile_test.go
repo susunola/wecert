@@ -36,6 +36,10 @@ import (
 type fakeACME struct {
 	srv       *httptest.Server
 	newOrders atomic.Int64
+
+	// omitAccountLocation makes /new-account answer without a Location header, which is how a
+	// registration response that carries no kid looks. Only the account tests set it.
+	omitAccountLocation atomic.Bool
 }
 
 func newFakeACME(t *testing.T) *fakeACME {
@@ -71,7 +75,9 @@ func newFakeACME(t *testing.T) *fakeACME {
 		})
 	})
 	mux.HandleFunc("/new-account", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Location", "https://"+r.Host+"/acct/1")
+		if !f.omitAccountLocation.Load() {
+			w.Header().Set("Location", "https://"+r.Host+"/acct/1")
+		}
 		w.WriteHeader(http.StatusCreated)
 		writeJSON(w, map[string]any{"status": "valid"})
 	})

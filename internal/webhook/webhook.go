@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/susunola/wecert/internal/config"
-	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
@@ -38,9 +37,14 @@ var errBothForms = errors.New("cert and certs are mutually exclusive")
 // a full convergence the caller never asked for.
 var errEmptyCerts = errors.New("certs must not be empty; omit the body to process everything")
 
-// errEmptyCert rejects an explicit "cert": "". As a plain string it would be
-// indistinguishable from an absent field and widen into a full trigger -- the
-// same silent-widening problem as "certs": [].
+// errEmptyCert rejects an explicit "cert": "" or "cert": null, for the same
+// reason as errEmptyCerts.
+//
+// This is the more likely of the two to arrive by accident: the documented call
+// is {"cert":"<name>"} (README.md), so a CI job templating an unset $CERT sends
+// {"cert":""} -- and widening that into "every certificate" burns issuance quota
+// the caller never asked for. As a plain string it would additionally be
+// indistinguishable from an absent field, which is why the field is a pointer.
 var errEmptyCert = errors.New("cert must not be empty; omit the body to process everything")
 
 // Reconciler is the convergence capability the webhook needs. Defined at the
@@ -48,6 +52,17 @@ var errEmptyCert = errors.New("cert must not be empty; omit the body to process 
 type Reconciler interface {
 	CertNames() []string
 	StartCert(ctx context.Context, name string) error
+	// StartNamed starts a list of named certificates, resolving the desired state
+	// once (rather than once per name: resolve() re-reads and validates the
+	// document, and the whole loop runs synchronously inside one request).
+	//
+	// The buckets are the caller's answer body. A non-nil error means the
+	// desired state could not be read, so *nothing* was started and every name
+	// is unanswerable -- reporting the bucket as "unknown" would tell the caller
+	// to give up on a certificate that may well exist and simply could not be
+	// resolved this time.
+	StartNamed(ctx context.Context, names []string) (started, alreadyRunning, unknown []string, err error)
+
 	// StartAll reports the accepted names from the same resolution the starts
 	// were made from; a non-nil error means nothing started at all (the desired
 	// state is unreadable) and must not be reported as "accepted everything".
@@ -146,7 +161,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		// caller, so the accumulated failures are decayed -- not wiped, or one
 		// interleaved success would forgive a shared-IP attacker indefinitely
 		// (see recordSuccess).
-		s.limiter.recordSuccess(addr)
+		s.limiter.recordSuccess(addr, s.now())
 		next(w, r)
 	}
 }
@@ -188,17 +203,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // body means "process everything".
 //
 // Both fields are pointers so "field absent" (full trigger) is distinguishable
-// from an explicit empty value, which asks for nothing and is rejected. For
-// Certs, presence is additionally tracked separately because a pointer alone
-// cannot make that distinction for a JSON null: encoding/json leaves both
-// "certs" absent and "certs": null as a nil pointer, and null is what a Go
-// caller marshalling a nil []string sends.
+// from an explicit empty value, which asks for nothing and is rejected. Presence
+// is additionally tracked separately because a pointer alone cannot make that
+// distinction for a JSON null: encoding/json leaves both "certs" absent and
+// "certs": null as a nil pointer, and null is what a Go caller marshalling a nil
+// []string sends.
+//
+// Cert needs the same presence flag for the same reason, and the empty string
+// makes it the more dangerous of the two: "cert" absent and "cert": "" are both
+// the zero value there.
 type reconcileRequest struct {
 	Cert  *string   `json:"cert"`
 	Certs *[]string `json:"certs"`
 
 	// certsPresent reports that the body carried a "certs" key at all.
 	certsPresent bool
+	// certPresent reports that the body carried a "cert" key at all.
+	certPresent bool
 }
 
 type reconcileResponse struct {
@@ -242,25 +263,24 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		s.log.Info("webhook triggered a full convergence",
 			"accepted", len(resp.Accepted), "skipped", len(resp.Skipped), "remote", r.RemoteAddr)
 	} else {
-		for _, name := range targets {
-			switch err := s.rec.StartCert(s.baseCtx, name); {
-			case err == nil:
-				resp.Accepted = append(resp.Accepted, name)
-			case errors.Is(err, reconcile.ErrAlreadyRunning):
-				resp.Skipped = append(resp.Skipped, name)
-			case errors.Is(err, reconcile.ErrUnknownCert):
-				resp.Unknown = append(resp.Unknown, name)
-			default:
-				// Anything else -- above all an unreadable desired state -- is a
-				// transient internal failure, not "not managed". Reporting it in
-				// unknown would tell the caller to give up on a certificate that
-				// may well exist and simply could not be resolved this time.
-				s.log.Warn("trigger failed: cannot resolve the desired state",
-					"cert", name, "err", err, "remote", r.RemoteAddr)
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-				return
-			}
+		// Resolve the desired state once for the whole list rather than once per name.
+		// StartCert resolves internally, and resolve() is a file read plus a YAML decode,
+		// a full validation and a document hash -- all synchronously inside this request,
+		// which has a 15s write timeout.
+		started, running, notFound, err := s.rec.StartNamed(s.baseCtx, targets)
+		if err != nil {
+			// Anything else -- above all an unreadable desired state -- is a
+			// transient internal failure, not "not managed". Reporting it in
+			// unknown would tell the caller to give up on a certificate that
+			// may well exist and simply could not be resolved this time.
+			s.log.Warn("trigger failed: cannot resolve the desired state",
+				"certs", targets, "err", err, "remote", r.RemoteAddr)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
 		}
+		resp.Accepted = append(resp.Accepted, started...)
+		resp.Skipped = append(resp.Skipped, running...)
+		resp.Unknown = append(resp.Unknown, notFound...)
 		s.log.Info("webhook triggered convergence",
 			"accepted", resp.Accepted, "skipped", resp.Skipped, "unknown", resp.Unknown,
 			"remote", r.RemoteAddr)
@@ -302,8 +322,13 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 		return req, err
 	}
 	_, req.certsPresent = keys["certs"]
+	_, req.certPresent = keys["cert"]
 
-	if req.Cert != nil && *req.Cert == "" {
+	if req.certPresent && (req.Cert == nil || *req.Cert == "") {
+		// "cert": "" and "cert": null both ask for nothing; the presence key is what
+		// tells a null apart from an absent field (both leave the pointer nil).
+		// Treating either as absent is what made an unset $CERT in a CI template
+		// trigger the whole fleet.
 		return req, errEmptyCert
 	}
 	if req.certsPresent {

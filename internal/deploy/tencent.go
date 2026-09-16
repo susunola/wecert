@@ -123,6 +123,7 @@ type sslAPI interface {
 	UpdateCertificateInstanceWithContext(ctx context.Context, req *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error)
 	DescribeHostUpdateRecordDetailWithContext(ctx context.Context, req *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error)
 	DeleteCertificateWithContext(ctx context.Context, req *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error)
+	DescribeDeleteCertificatesTaskResultWithContext(ctx context.Context, req *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error)
 	CreateCertificateBindResourceSyncTaskWithContext(ctx context.Context, req *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error)
 	DescribeCertificateBindResourceTaskResultWithContext(ctx context.Context, req *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error)
 }
@@ -206,8 +207,20 @@ func (d *TencentCLB) deployUploaded(ctx context.Context, client sslAPI, certName
 		// Repair the historical wedge only when the old anchor is entirely gone. A
 		// non-zero new binding alone is not completion: a partially failed task has
 		// exactly that shape and must remain an error.
+		//
+		// Why the old anchor has to be checked: this path exists for a switch that happened
+		// but was not recorded. The shape is that the rebind went through (or an earlier
+		// attempt's did), so the OLD certificate has no bindings left and every later round
+		// fails the "nothing to switch" check no matter how many certificates we upload.
+		// Asking only about the new certificate would also accept a partial failure -- some
+		// listeners switched, so n > 0 -- and then the state anchors on the new ID while the
+		// rest stay on the old certificate, never to be revisited. Requiring oldBindings == 0
+		// distinguishes the two structurally, without having to classify the error.
 		if n, nerr := d.bindingsWith(ctx, client, newID); nerr == nil && n > 0 {
 			if oldBindings, oerr := d.bindingsWith(ctx, client, oldID); oerr == nil && oldBindings == 0 {
+				d.log.Warn("the one-click update reported nothing to switch, but the new certificate is bound "+
+					"and the old one is not; treating the switch as done (the rebind succeeded without being recorded)",
+					"oldCertId", oldID, "newCertId", newID, "boundResources", n)
 				return newID, nil
 			}
 		}
@@ -261,10 +274,26 @@ func (d *TencentCLB) upload(ctx context.Context, client sslAPI, certName string,
 	if err != nil {
 		return "", fmt.Errorf("UploadCertificate: %w", err)
 	}
-	if resp.Response == nil || resp.Response.CertificateId == nil || *resp.Response.CertificateId == "" {
-		return "", errors.New("UploadCertificate returned no CertificateId")
+	if resp.Response == nil {
+		return "", errors.New("UploadCertificate returned an empty response")
 	}
-	return *resp.Response.CertificateId, nil
+
+	// RepeatCertId is the ID of an existing copy. The SDK documents that when the same
+	// certificate has been uploaded more than 5000 times the API ignores Repeatable=true and
+	// returns the duplicate's ID here instead of creating another copy.
+	//
+	// That copy is the same certificate, so its ID is a usable answer -- and ignoring the
+	// field turned the case into "UploadCertificate returned no CertificateId", which names
+	// neither the cause nor the fix. Only reached when CertificateId is absent, so the
+	// normal path is untouched.
+	if id := derefStr(resp.Response.CertificateId); id != "" {
+		return id, nil
+	}
+	if dup := derefStr(resp.Response.RepeatCertId); dup != "" {
+		return dup, nil
+	}
+	return "", errors.New("UploadCertificate returned neither a CertificateId nor a " +
+		"RepeatCertId; the certificate was not stored")
 }
 
 // updateInstance calls UpdateCertificateInstance to do the one-click update.
@@ -296,6 +325,45 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 			recordID = *resp.Response.DeployRecordId
 			progress := resp.Response.UpdateSyncProgress
 			bound, progressReady := progressBoundCount(progress)
+
+			// DeployStatus distinguishes "this request created the task" from "a task is
+			// already running and this is its ID": the SDK documents 1 as created, 0 as
+			// "there is already an update in progress, no new task was created, and the
+			// returned DeployRecordId is that in-progress task's".
+			//
+			// Adopting a pre-existing task blindly is dangerous because it may belong to a
+			// different switch (for example the previous round's oldID -> X task, which this
+			// code abandoned after its own 3-minute wait). When it later succeeds,
+			// waitDeployRecord returns nil and Deploy reports newID as deployed while the
+			// cloud is serving X. The 1-minute manager backoff against the 3-minute wait
+			// makes that overlap reachable.
+			//
+			// Only an explicit 0 counts as "adopted": a nil DeployStatus is a missing answer
+			// from an older API version, not the answer "an existing task", and treating it
+			// as adopted would add a verification round trip for everyone.
+			//
+			// So an adopted task is waited on and then verified the only way that answers
+			// the question that matters: is THIS certificate bound anywhere?
+			if resp.Response.DeployStatus != nil && *resp.Response.DeployStatus == 0 {
+				d.log.Warn("another update task is already in progress; waiting for it and then "+
+					"verifying that this certificate is the one that got bound",
+					"oldCertId", oldID, "newCertId", newID, "deployRecordId", recordID)
+				if werr := d.waitDeployRecord(ctx, client, recordID, oldID); werr != nil {
+					return werr
+				}
+				n, berr := d.bindingsWith(ctx, client, newID)
+				if berr != nil {
+					return fmt.Errorf("the in-progress update task finished, but verifying whether %s is "+
+						"bound failed: %w (refusing to report success on an unverified switch)", newID, berr)
+				}
+				if n == 0 {
+					return fmt.Errorf("an update task was already in progress, and this certificate (%s) is "+
+						"not bound to any resource afterwards; the task belonged to a different switch, so "+
+						"this deploy did not happen", newID)
+				}
+				return nil
+			}
+
 			d.log.Info("one-click update task created",
 				"oldCertId", oldID, "newCertId", newID,
 				"deployRecordId", recordID,
@@ -476,10 +544,112 @@ func (d *TencentCLB) Delete(ctx context.Context, certID string) error {
 	// When the delete fails, ReapRetired logs a warning and retries next round.
 	req.IsCheckResource = common.BoolPtr(true)
 
-	if _, err := client.DeleteCertificateWithContext(ctx, req); err != nil {
+	resp, err := client.DeleteCertificateWithContext(ctx, req)
+	if err != nil {
 		return fmt.Errorf("DeleteCertificate(%s): %w", certID, err)
 	}
-	return nil
+	if resp.Response == nil {
+		return fmt.Errorf("DeleteCertificate(%s): the API returned an empty response", certID)
+	}
+
+	// IsCheckResource=true makes the delete ASYNCHRONOUS: the SDK documents that
+	// choosing the check makes the deletion asynchronous, that the call returns an
+	// async task ID, and that DescribeDeleteCertificatesTaskResult is the interface
+	// that says whether the deletion succeeded. Returning nil here for a call that was
+	// merely *accepted* would make ReapRetired drop its reclaim record, so the
+	// certificate would leak in the cloud account forever -- and the exact case the
+	// resource check exists for (a live certificate still bound to a listener) is
+	// reported asynchronously as status 4, which would never be seen.
+	if resp.Response.DeleteResult != nil && !*resp.Response.DeleteResult {
+		return fmt.Errorf("DeleteCertificate(%s): the API refused the delete", certID)
+	}
+	if resp.Response.TaskId == nil || *resp.Response.TaskId == "" {
+		// Synchronous answer: DeleteResult (nil means "no objection") is the whole result.
+		return nil
+	}
+	return d.waitDeleteTask(ctx, client, *resp.Response.TaskId, certID)
+}
+
+// How long to wait for an asynchronous delete task, and how often to ask.
+const (
+	deleteTaskTimeout = 2 * time.Minute
+	deleteTaskPoll    = 3 * time.Second
+)
+
+// delete task status values, from the SDK's DeleteTaskResult.Status:
+//
+//	0 in progress, 1 succeeded, 2 failed, 3 failed for lack of the service role,
+//	4 failed because an un-released cloud resource still references the certificate,
+//	5 failed because the binding query timed out.
+const (
+	deleteTaskRunning = 0
+	deleteTaskSuccess = 1
+)
+
+// waitDeleteTask polls until the delete really happened, and reports a failure otherwise.
+//
+// Status 4 is the one that matters most: it is the server saying "a resource still
+// references this certificate", which must keep the reclaim record so the next round
+// tries again once the reference is gone.
+func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, certID string) error {
+	deadline := d.now().Add(deleteTaskTimeout)
+
+	for {
+		req := ssl.NewDescribeDeleteCertificatesTaskResultRequest()
+		req.TaskIds = []*string{common.StringPtr(taskID)}
+		resp, err := client.DescribeDeleteCertificatesTaskResultWithContext(ctx, req)
+		if err != nil {
+			return fmt.Errorf("DescribeDeleteCertificatesTaskResult(%s): %w", taskID, err)
+		}
+
+		status, detail, found, err := deleteTaskStatus(resp, taskID)
+		if err != nil {
+			return err
+		}
+		if found && status != deleteTaskRunning {
+			if status == deleteTaskSuccess {
+				return nil
+			}
+			return fmt.Errorf("DeleteCertificate(%s) failed: task %s reported status %d%s",
+				certID, taskID, status, detail)
+		}
+
+		if d.now().After(deadline) {
+			return fmt.Errorf(
+				"the delete task for %s did not finish within %s (taskId=%s); keeping it on the reclaim list to retry",
+				certID, deleteTaskTimeout, taskID)
+		}
+		if err := waitBetweenPolls(ctx, deleteTaskPoll); err != nil {
+			return err
+		}
+	}
+}
+
+// deleteTaskStatus extracts one task's status out of a query response.
+//
+// found=false means the response carried no entry for this task yet, which is "still
+// working on it" rather than a failure.
+func deleteTaskStatus(
+	resp *ssl.DescribeDeleteCertificatesTaskResultResponse, taskID string,
+) (status uint64, detail string, found bool, err error) {
+	if resp == nil || resp.Response == nil {
+		return 0, "", false, nil
+	}
+
+	for _, r := range resp.Response.DeleteTaskResult {
+		if r == nil || r.TaskId == nil || *r.TaskId != taskID {
+			continue
+		}
+		if r.Status == nil {
+			return 0, "", false, nil
+		}
+		d := ""
+		if r.Error != nil && *r.Error != "" {
+			d = ": " + *r.Error
+		}
+		return *r.Status, d, true, nil
+	}
+	return 0, "", false, nil
 }
 
 func toPtrSlice(in []string) []*string {
@@ -525,6 +695,10 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready 
 // noResourceBoundError is the diagnosis shared by the two places that can conclude the
 // old certificate was bound to nothing: a populated sync response reporting zero, and an
 // async task that settles having updated nothing.
+//
+// Deploy's recovery path does not key on this error. It keys on the shape instead -- the new
+// certificate bound and the old one not -- which distinguishes "the switch happened and was
+// not recorded" from "the task partly failed" without having to classify the failure.
 func noResourceBoundError(oldID string, regions []string) error {
 	return fmt.Errorf("UpdateCertificateInstance found no resource bound to the old certificate %s (regions=%v); refusing to mark the new certificate as deployed. Check that the CLB listener has it bound (an SNI listener must use multi_cert_info; the primary certificate_id is silently ignored)",
 		oldID, regions)
