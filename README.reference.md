@@ -693,7 +693,7 @@ Policy for the `wecert-onboard` binary. These numbers decide how fast quota is s
 | `deploy` | `true` | Default deploy flag for generated certificates |
 | `gracePeriod` | `24h` | How long a name must be **confirmed** absent before it may be removed |
 | `budget` / `budgetWindow` | `25` / `168h` | Name-set changes allowed per window. Let's Encrypt allows 50 per registered domain per 7 days, shared across accounts; half of that is the budget |
-| `dropThreshold` | `0.30` | Freeze when the declared name set shrinks by more than this fraction |
+| `dropThreshold` | `0.30` | Freeze when the declared name set shrinks by more than this fraction. Must be **in `[0,1)`** — `0.3` means 30%, and `0` uses the default. The loss ratio can never exceed 1, so a percentage written as `30`, or any value `>= 1`, would leave the fuse unable to fire; `config.Load` rejects those rather than let the guard disappear silently |
 | `statePath` | `<out>.state.json` | Grace-period and budget bookkeeping. Must be persistent: an in-memory grace period never elapses across runs |
 | `reportPath` | `<out>.report.json` | Per-hostname decision report |
 

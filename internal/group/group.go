@@ -72,13 +72,30 @@ func RegisteredDomain(host string) string {
 //
 // This is where Name stability lands: the input can only be the registered
 // domain, never the domain set.
+//
+// The mapping also has to be **injective**. Two registered domains that collapse
+// to the same certificate name make the whole document invalid ("certificate
+// name %q is duplicated"), so WriteDocument fails on every round and no
+// certificate is ever updated again. A naive `.` -> `-` mapping collides:
+//
+//	a.co.uk  vs a-co.uk
+//	a.com    vs a-com
+//
+// So a literal `-` is doubled before dots become dashes:
+//
+//	a.co.uk  -> a-co-uk
+//	a-co.uk  -> a--co-uk
+//
+// Decoding is unambiguous -- scan for `--` first (a literal dash); a lone `-`
+// was a dot -- which is what makes the map injective. Registered domains
+// without a hyphen are named exactly as before.
 func CertName(registered string) string {
-	s := strings.NewReplacer(".", "-", ":", "-").Replace(strings.ToLower(registered))
-	s = strings.Trim(s, "-")
-	for strings.Contains(s, "--") {
-		s = strings.ReplaceAll(s, "--", "-")
-	}
-	return s
+	s := strings.ReplaceAll(strings.ToLower(registered), "-", "--")
+	s = strings.NewReplacer(".", "-", ":", "-").Replace(s)
+	// Only ever strips a leading/trailing dash from a malformed hostname: the
+	// inputs are registered domains, which by RFC 1123 cannot start or end with
+	// one. Kept because RegisteredDomain falls back to the raw hostname.
+	return strings.Trim(s, "-")
 }
 
 // Group is the set of declarations under one registered domain.

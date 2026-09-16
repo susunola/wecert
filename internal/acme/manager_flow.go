@@ -8,6 +8,7 @@ import (
 	"time"
 
 	legoacme "github.com/go-acme/lego/v4/acme"
+	"github.com/go-acme/lego/v4/challenge"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/state"
@@ -152,6 +153,16 @@ func (m *Manager) solveChallenges(
 		a.Status = cur.Status
 		a.Identifier = cur.Identifier.Value
 
+		// The ledger is keyed by the name as the operator wrote it, which for a
+		// wildcard means "*." + value: RFC 8555 §7.1.3 forbids the "*." prefix in
+		// the authorization's own identifier, so `cur.Identifier.Value` alone is the
+		// bare apex. Keying on the bare name would book a `*.example.com` failure
+		// against `example.com`, and the fallback would then drop the healthy apex
+		// while keeping the wildcard that is actually failing -- the exact opposite
+		// of its job. `a.Identifier` must stay unprefixed for DNS-01, because the
+		// apex and its wildcard deliberately share one TXT name.
+		targeted := challenge.GetTargetedDomain(cur)
+
 		switch cur.Status {
 		case "valid":
 			if err := m.store.PutAuthorization(a); err != nil {
@@ -165,7 +176,7 @@ func (m *Manager) solveChallenges(
 			// robs later debugging of its clues.
 			if perr := m.store.PutAuthorization(a); perr != nil {
 				m.log.Warn("failed to record the invalidated authorization",
-					"cert", c.Name, "identifier", a.Identifier, "err", perr)
+					"cert", c.Name, "identifier", targeted, "err", perr)
 			}
 
 			// Keep the books per identifier. The certificate-level consecutive_failures only
@@ -173,13 +184,13 @@ func (m *Manager) solveChallenges(
 			// answer "which name will not issue" -- without that we could only drop names at
 			// random, and that sacrifices the good names too.
 			if rerr := m.store.RecordIdentifierFailure(
-				c.Name, a.Identifier, authzError(cur), m.now()); rerr != nil {
+				c.Name, targeted, authzError(cur), m.now()); rerr != nil {
 				m.log.Warn("failed to record the identifier failure",
-					"cert", c.Name, "identifier", a.Identifier, "err", rerr)
+					"cert", c.Name, "identifier", targeted, "err", rerr)
 			}
 
 			return false, m.recordFailure(st, fmt.Errorf(
-				"the authorization for identifier %s is invalid: %s", a.Identifier, authzError(cur)))
+				"the authorization for identifier %s is invalid: %s", targeted, authzError(cur)))
 		}
 
 		if !a.Presented {

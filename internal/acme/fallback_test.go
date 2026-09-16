@@ -1,8 +1,11 @@
 package acme
 
 import (
+	"context"
 	"testing"
 	"time"
+
+	legoacme "github.com/go-acme/lego/v4/acme"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/state"
@@ -277,5 +280,79 @@ func TestFallbackClearsItselfOnceTheNamesAreHealthy(t *testing.T) {
 	}
 	if fb != nil {
 		t.Errorf("the fallback record should be cleared after returning to the full set, got %+v", fb)
+	}
+}
+
+// The failure ledger has to be keyed by the name the operator wrote, which for a
+// wildcard includes the "*.".
+//
+// RFC 8555 §7.1.3 forbids the "*." prefix in the authorization's own identifier:
+// a `*.example.com` authorization carries `example.com` plus `wildcard: true`, which
+// is why lego reconstructs the name with challenge.GetTargetedDomain. Keying the
+// ledger on the raw identifier therefore books a wildcard failure against the apex.
+//
+// The fallback drops the domains whose literal string matches the ledger, so it
+// would then shed the healthy apex and keep the wildcard that is actually failing.
+// That is exactly backwards from its purpose -- it gives up coverage that works and
+// still cannot issue -- and the certificate runs to expiry with neither name.
+func TestWildcardFailureIsBookedAgainstTheWildcardNotTheApex(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com", "*.example.com"})
+
+	const (
+		apexAuthz     = "https://ca.test/authz/apex"
+		wildcardAuthz = "https://ca.test/authz/wildcard"
+	)
+	fake.orders = []legoacme.ExtendedOrder{{
+		Order: legoacme.Order{
+			Status:         "pending",
+			Finalize:       "https://ca.test/finalize/1",
+			Authorizations: []string{apexAuthz, wildcardAuthz},
+		},
+		Location: "https://ca.test/order/1",
+	}}
+	fake.authzByURL = map[string]legoacme.Authorization{
+		apexAuthz: {Status: "valid", Identifier: legoacme.Identifier{Value: "example.com"}},
+		// The wildcard's own identifier is the bare apex; Wildcard carries the "*.".
+		wildcardAuthz: {
+			Status:     "invalid",
+			Wildcard:   true,
+			Identifier: legoacme.Identifier{Value: "example.com"},
+		},
+	}
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("an invalid authorization must fail the pass")
+	}
+
+	failures, err := store.ListIdentifierFailures(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failures) != 1 {
+		t.Fatalf("want exactly one recorded failure, got %d: %+v", len(failures), failures)
+	}
+	if got := failures[0].Identifier; got != "*.example.com" {
+		t.Errorf("the wildcard failure was booked against %q, want %q: the fallback would "+
+			"drop the healthy apex and keep the broken wildcard", got, "*.example.com")
+	}
+
+	// And the consequence, through the real chain: the name the fallback sheds has to
+	// be the wildcard. Dropping the apex instead would give up the name that still
+	// works and still fail to issue.
+	policy := fallbackPolicy()
+	policy.MinIdentifierFailures = 1 // this test records a single failure
+	m.SetFallbackPolicy(policy)
+
+	st := &state.CertState{
+		Name:                cert.Name,
+		NotAfter:            m.now().Add(3 * 24 * time.Hour), // inside the 7-day expiry window
+		ConsecutiveFailures: 4,                               // above policy.AfterFailures
+		ARICertID:           "YWJj.ZGVm",
+	}
+	got := m.applyFallback(cert, st)
+
+	if len(got.Domains) != 1 || got.Domains[0] != "example.com" {
+		t.Fatalf("after falling back the certificate should cover [example.com], got %v: "+
+			"the failing wildcard is the name to drop, not the apex", got.Domains)
 	}
 }
