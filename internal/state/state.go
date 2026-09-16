@@ -340,6 +340,28 @@ func (s *Store) PutAccount(a *Account) error {
 
 // ---------- CertState ----------
 
+// ListCertNames 返回状态库里所有证书名，已排序。
+//
+// 用途是"孤儿检查"：状态库里有、但期望状态里已经没有的证书不会再被续期，
+// 最终会安静地过期。让这个集合能被看见，是那条失败路径唯一的兜底。
+func (s *Store) ListCertNames() ([]string, error) {
+	rows, err := s.db.Query(`SELECT name FROM certificates ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("list certificate names: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan certificate name: %w", err)
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
 // GetCert 读取证书状态；不存在时返回 (nil, nil)。
 func (s *Store) GetCert(name string) (*CertState, error) {
 	row := s.db.QueryRow(`
