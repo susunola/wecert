@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TC-LIFECYCLE-01 验收实跑报告 · wecert</title>
+<style>
+  :root {
+    --paper: #fbfaf7; --paper-2: #f4f2ec;
+    --ink: #14161a; --ink-2: #43474e; --ink-3: #6b7079;
+    --rule: #e0ddd3; --rule-2: #cec9bc;
+    --accent: #0d5f5c;
+    --pass: #14683f; --pass-soft: #e2f0e8;
+    --fail: #a3231c; --fail-soft: #fbe6e4;
+    --fixed: #8a5a00; --fixed-soft: #fbf0d8;
+    --skip: #5f6570; --skip-soft: #eceae4;
+    --code-bg: #f2f0e9;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", "Helvetica Neue", sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Charter, Georgia, serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--serif); font-size: 17px; line-height: 1.62; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px 96px; }
+  header.masthead { border-bottom: 3px solid var(--ink); padding: 44px 0 20px; margin-bottom: 28px; }
+  .kicker { font-family: var(--sans); font-size: 12px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin: 0 0 10px; }
+  h1 { font-family: var(--sans); font-size: clamp(28px, 4.4vw, 42px); line-height: 1.14; letter-spacing: -0.015em; margin: 0 0 12px; }
+  .framing { font-size: 19px; color: var(--ink-2); max-width: 74ch; margin: 0 0 20px; }
+  .metabar { display: flex; flex-wrap: wrap; gap: 6px 22px; font-family: var(--sans); font-size: 13px; color: var(--ink-3); border-top: 1px solid var(--rule); padding-top: 14px; }
+  .metabar b { color: var(--ink); font-weight: 600; }
+  .strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 10px; margin: 0 0 34px; }
+  .stat { background: #fff; border: 1px solid var(--rule); border-left: 4px solid var(--rule-2); border-radius: 3px; padding: 12px 14px 13px; }
+  .stat .n { display: block; font-family: var(--sans); font-size: 30px; font-weight: 700; line-height: 1.1; letter-spacing: -0.02em; }
+  .stat .l { display: block; font-family: var(--sans); font-size: 12.5px; color: var(--ink-3); margin-top: 3px; }
+  .stat.ok { border-left-color: var(--pass); } .stat.ok .n { color: var(--pass); }
+  .stat.bad { border-left-color: var(--fail); } .stat.bad .n { color: var(--fail); }
+  .stat.warn { border-left-color: var(--fixed); } .stat.warn .n { color: var(--fixed); }
+  .stat.mute { border-left-color: var(--skip); } .stat.mute .n { color: var(--skip); }
+  nav.toc { background: var(--paper-2); border: 1px solid var(--rule); border-radius: 3px; padding: 16px 20px; margin: 0 0 40px; }
+  nav.toc h2 { font-family: var(--sans); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); margin: 0 0 10px; }
+  nav.toc ol { margin: 0; padding-left: 22px; font-family: var(--sans); font-size: 14.5px; columns: 2; column-gap: 36px; }
+  nav.toc li { margin: 2px 0; break-inside: avoid; }
+  nav.toc a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--rule-2); }
+  nav.toc a:hover, nav.toc a:focus { color: var(--accent); border-bottom-color: var(--accent); }
+  section { margin: 0 0 52px; scroll-margin-top: 18px; }
+  h2 { font-family: var(--sans); font-size: 13px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin: 0 0 6px; padding-bottom: 8px; border-bottom: 2px solid var(--ink); }
+  h2 .zh { display: block; font-size: 24px; letter-spacing: -0.01em; text-transform: none; color: var(--ink); margin-top: 4px; }
+  h3 { font-family: var(--sans); font-size: 18px; letter-spacing: -0.005em; margin: 30px 0 10px; }
+  p { margin: 0 0 14px; }
+  ul, ol { margin: 0 0 14px; padding-left: 24px; }
+  li { margin: 5px 0; }
+  code { font-family: var(--mono); font-size: .875em; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 2px; padding: .1em .34em; word-break: break-word; }
+  pre { font-family: var(--mono); font-size: 13px; line-height: 1.55; background: var(--code-bg); border: 1px solid var(--rule); border-left: 3px solid var(--rule-2); border-radius: 3px; padding: 13px 16px; overflow-x: auto; margin: 0 0 16px; }
+  pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+  pre.bad { border-left-color: var(--fail); background: #fdf3f2; }
+  pre.good { border-left-color: var(--pass); background: #f1f8f4; }
+  .lede { font-size: 18.5px; }
+  .muted { color: var(--ink-3); }
+  .tablebox { overflow-x: auto; margin: 0 0 12px; }
+  table { border-collapse: collapse; width: 100%; font-family: var(--sans); font-size: 14px; }
+  caption { text-align: left; font-family: var(--sans); font-size: 12.5px; color: var(--ink-3); padding: 0 0 8px; }
+  th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--rule); }
+  thead th { border-bottom: 2px solid var(--ink); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); white-space: nowrap; }
+  tbody tr:nth-child(even) { background: #fff; }
+  td.phase { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
+  td.ev { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); }
+  .badge { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .05em; padding: 2px 7px; border-radius: 2px; border: 1px solid transparent; white-space: nowrap; }
+  .badge.pass { color: var(--pass); background: var(--pass-soft); border-color: #bfdcc9; }
+  .badge.fail { color: var(--fail); background: var(--fail-soft); border-color: #eec4c0; }
+  .badge.fixed { color: var(--fixed); background: var(--fixed-soft); border-color: #e8d5a6; }
+  .badge.skip { color: var(--skip); background: var(--skip-soft); border-color: var(--rule-2); }
+  .filter { display: inline-flex; align-items: center; gap: 8px; font-family: var(--sans); font-size: 13.5px; color: var(--ink-2); background: var(--paper-2); border: 1px solid var(--rule); border-radius: 3px; padding: 7px 12px; margin: 0 0 12px; cursor: pointer; }
+  .filter input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+  .filter input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #phases.only-anomalies tr[data-status="pass"] { display: none; }
+  .card { background: #fff; border: 1px solid var(--rule); border-top: 3px solid var(--rule-2); border-radius: 3px; padding: 18px 20px 6px; margin: 0 0 18px; }
+  .card.bad { border-top-color: var(--fail); }
+  .card.warn { border-top-color: var(--fixed); }
+  .card h3 { margin-top: 0; }
+  .card .tag { font-family: var(--mono); font-size: 12px; color: var(--ink-3); display: block; margin-bottom: 4px; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-family: var(--sans); font-size: 14px; margin: 0 0 14px; }
+  .kv dt { color: var(--ink-3); }
+  .kv dd { margin: 0; }
+  .tl { font-family: var(--sans); font-size: 13.5px; margin: 0 0 14px; }
+  .tl-row { display: grid; grid-template-columns: 138px 84px 56px 1fr; align-items: center; gap: 10px; padding: 2px 0; border-bottom: 1px solid #f0eee7; }
+  .tl-row .p { font-weight: 600; color: var(--ink); }
+  .tl-row .t { color: var(--ink-3); font-family: var(--mono); font-size: 12px; }
+  .tl-row .d { color: var(--ink-2); text-align: right; font-family: var(--mono); font-size: 12px; }
+  .tl-row .bar { height: 11px; background: var(--accent); border-radius: 1px; min-width: 2px; }
+  .tl-row.fail .bar { background: var(--fail); }
+  .tl-row.fixed .bar { background: var(--fixed); }
+  .tl-key { color: var(--ink-3); font-size: 12.5px; margin: 10px 0 0; }
+  figure { margin: 0 0 22px; }
+  figure svg { display: block; width: 100%; height: auto; background: #fff; border: 1px solid var(--rule); border-radius: 3px; }
+  figcaption { font-family: var(--sans); font-size: 13px; color: var(--ink-3); margin-top: 8px; }
+  .fo { font-family: var(--sans); font-size: 13px; line-height: 1.4; color: var(--ink); }
+  .fo code { font-size: 12px; }
+  .sbar { display: flex; height: 26px; border: 1px solid var(--rule-2); border-radius: 2px; overflow: hidden; font-family: var(--sans); font-size: 12px; font-weight: 600; }
+  .sbar div { display: flex; align-items: center; justify-content: center; color: #fff; }
+  .sbar .yes { background: var(--pass); }
+  .sbar .no { background: var(--skip); }
+  footer { border-top: 3px solid var(--ink); padding-top: 16px; font-family: var(--sans); font-size: 13px; color: var(--ink-3); }
+  footer p { margin: 0 0 8px; }
+  @media (max-width: 700px) {
+    body { font-size: 16px; }
+    .wrap { padding: 0 16px 72px; }
+    nav.toc ol { columns: 1; }
+    .tl-row { grid-template-columns: 1fr 52px 44px; gap: 8px; }
+    .tl-row .t { display: none; }
+    .kv { grid-template-columns: 1fr; gap: 0 0; }
+    .kv dt { margin-top: 6px; }
+    thead th:nth-child(2), tbody td:nth-child(2) { display: none; }
+  }
+  @media print {
+    :root { --paper: #fff; --paper-2: #fff; }
+    body { font-size: 11.5pt; }
+    .wrap { max-width: none; padding: 0; }
+    nav.toc, .filter { display: none; }
+    .card, figure, table, pre { break-inside: avoid; }
+    h2 { break-after: avoid; }
+    a { color: var(--ink); text-decoration: none; }
+    pre { white-space: pre-wrap; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <p class="kicker">验收实跑报告 · wecert · Let's Encrypt staging + 真实 DNSPod</p>
+  <h1>TC-LIFECYCLE-01：证书全生命周期验收</h1>
+  <p class="framing">
+    在一台普通工作站上，对真实 DNSPod 区域与 Let's Encrypt <b>staging</b> 完整跑了一遍
+    <code>docs/lifecycle-acceptance.md</code> 的全部阶段。结论不是"能签发"，而是
+    <b>跑出了一个会让证书永久无法更换域名的缺陷</b>，另外发现用例本身有 6 处会误导下一个人的地方。
+  </p>
+  <div class="metabar">
+    <span>执行时间 <b>2026-09-16 17:15 – 17:35 CST</b></span>
+    <span>被测版本 <b>17bd915 → 4ba3b0f</b>（修复后复跑）</span>
+    <span>区域 <b>atomwangnus.com</b>（DNSPod）</span>
+    <span>ACME <b>acme-staging-v02</b></span>
+    <span>部署 <b>deploy.enabled: false</b>（不消耗云证书配额）</span>
+  </div>
+</header>
+
+<div class="strip">
+  <div class="stat ok"><span class="n">17</span><span class="l">执行阶段（另 1 个跳过）</span></div>
+  <div class="stat ok"><span class="n">16</span><span class="l">通过</span></div>
+  <div class="stat bad"><span class="n">1</span><span class="l">真缺陷（已修 · PR #45）</span></div>
+  <div class="stat warn"><span class="n">6</span><span class="l">用例自身错误（已修 · PR #46）</span></div>
+  <div class="stat warn"><span class="n">3</span><span class="l">失败轮次（1 自伤 + 2 竞态）</span></div>
+  <div class="stat mute"><span class="n">0</span><span class="l">DNS 残留 / 云证书</span></div>
+</div>
+
+<nav class="toc" aria-label="目录">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#tldr">TL;DR</a></li>
+    <li><a href="#how">怎么测的</a></li>
+    <li><a href="#phases">阶段结果</a></li>
+    <li><a href="#timeline">整轮时间线</a></li>
+    <li><a href="#window">A4 中断窗口实测</a></li>
+    <li><a href="#defect">发现① 代码缺陷</a></li>
+    <li><a href="#docbugs">发现② 用例的 6 处错误</a></li>
+    <li><a href="#env">环境观察</a></li>
+    <li><a href="#cleanup">收尾核查</a></li>
+    <li><a href="#gaps">未覆盖</a></li>
+    <li><a href="#sources">来源</a></li>
+  </ol>
+</nav>
+
+<section id="tldr">
+  <h2>TL;DR<span class="zh">三句话结论</span></h2>
+  <ul class="lede">
+    <li><b>系统整体行为正确</b>：首签、幂等、SAN 增删、wildcard 与 apex 共享一个 TXT 名、
+      并发双证书、ARI 与时间两条续期路径、中断续跑、孤儿行回收、声明层 observe→enforce→下线→冻结，
+      共 16 个阶段通过，且每个阶段的状态断言（订单数、授权行、DNS 残留、指标）都成立。</li>
+    <li><b>但换域名这条路是死的</b>：漂移分支无条件把旧证书的 ARI certID 当 <code>replaces</code> 发出去，
+      零重叠时 Let's Encrypt 直接 400 拒绝 <code>newOrder</code>；而 <code>ari_cert_id</code> 只在签发成功后重算，
+      于是每一轮都失败——证书永久无法更换域名，且 <code>-once</code> 仍返回 0。已修并合并（PR #45）。</li>
+    <li><b>用例本身也要修</b>：6 处错误，其中 3 处是"当初设计的测试手法根本无效"——最典型的是
+      "让递归解析器指向黑洞地址来制造中断"，实测会让 provider 连 TXT 都写不下去。已修（PR #46）。</li>
+  </ul>
+</section>
+
+<section id="how">
+  <h2>Method<span class="zh">怎么测的</span></h2>
+  <p>
+    用例的全部阶段都在 <b>Let's Encrypt staging</b> 上跑（先用锚定 <code>directory:</code> 的正则过闸），
+    挑战记录写进真实 DNSPod 区域，全程 <code>deploy.enabled: false</code>，因此不上传任何云证书、
+    不消耗生产配额。被删改的只有三样东西：配置里的域名列表、DNSPod 上本用例自己建的 TXT 记录、
+    以及测试状态库（<code>/tmp</code> 下的一次性 SQLite）。没有动测试环境里的 CLB 与 CVM。
+  </p>
+
+  <h3>安全闸</h3>
+  <pre><code>grep -qE '^[[:space:]]*directory:.*acme-staging' "$A_CFG" || { echo "拒绝运行"; exit 1; }</code></pre>
+  <p class="muted">
+    与 <code>scripts/e2e-test.sh</code> 同一条规则：锚定键而不是全文，注释里出现 "acme-staging" 不算数。
+    启动日志再确认一次 <code>production=false</code>。
+  </p>
+
+  <h3>怎么"制造一次崩溃"</h3>
+  <p>
+    崩溃恢复是这次的重点，而"掐时间 kill"听起来不可靠，所以第一版设计了一个看似更干净的手法：
+    把 <code>dns.recursiveNameservers</code> 指向 <code>192.0.2.1</code>（TEST-NET-1，永远不可达），
+    指望进程"写完 TXT、落完库，卡在传播确认"。
+  </p>
+  <p><b>实测证明这个手法是错的</b>：</p>
+  <pre class="bad"><code>present TXT (wild.atomwangnus.com): present TXT: tencentcloud:
+  failed to get hosted zone: could not find zone</code></pre>
+  <p>
+    原因在 <code>internal/acme/dns.go</code>：那个解析器列表会被灌进 <b>lego 的全局解析器</b>
+    （<code>dns01.AddRecursiveNameservers</code>），而 lego 的 provider 在写记录<b>之前</b>
+    要用它查一次 zone。黑洞地址把 provider 一起打断了，TXT 根本没写下去——想要的中间态永远不存在。
+  </p>
+  <p>
+    最终改用 <code>kill -9</code>，并在动手前量了窗口：从 <code>TXT presented</code> 到这一轮结束有
+    <b>23.5 秒</b>，完全够一个 <code>grep</code> 循环看到日志再发信号。杀完还强制校验前置态
+    （授权行 <code>presented=1</code> 且 TXT 真在 DNS 里），不成立就重来。
+  </p>
+</section>
+
+<section id="phases">
+  <h2>Phase results<span class="zh">阶段结果</span></h2>
+  <label class="filter" for="onlyAnomalies">
+    <input type="checkbox" id="onlyAnomalies">
+    <span>只看非"通过"项</span>
+  </label>
+  <div class="tablebox">
+    <table id="phases">
+      <caption>证据口径：状态库行数（orders / authorizations）、叶证书 SAN、DNSPod 权威 NS 上的 TXT 记录、进程日志原文。</caption>
+      <thead>
+        <tr><th>阶段</th><th>目的</th><th>结果</th><th>关键证据</th></tr>
+      </thead>
+      <tbody>
+        <tr data-status="pass">
+          <td class="phase">A0</td>
+          <td>冷启动首签</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">30.3s</span></td>
+          <td class="ev">ari_cert_id=3tpCJfI0…LPnGfvjq…（非空）; orders=0; authorizations=0; not_after=+90d; 无 TXT 残留</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">A1</td>
+          <td>窗口外不开单</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">0.9s</span></td>
+          <td class="ev">ACME order created ×0; not_after 未变; renewAt=2026-11-16T04:24:35Z（= notAfter−30d+抖动）</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">A2</td>
+          <td>SAN 扩张立刻重签</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">26.2s</span></td>
+          <td class="ev">detail="required by the config but missing: sub.atomwangnus.com"; SAN 变 2 个; replaces=true</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">A3</td>
+          <td>SAN 收缩</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">5.1s</span></td>
+          <td class="ev">detail="certificate present but removed from the config: sub…"; SAN 恰好=配置; status=ready（授权被复用）</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">A4</td>
+          <td>wildcard + apex 共享一个 TXT 名</td>
+          <td><span class="badge pass">PASS</span></td>
+          <td class="ev">中断态：2 行授权同 txt_name（_acme-challenge.wild…）不同 txt_value，均 presented=1; dig 权威 NS 返回 2 条 TXT</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">A5</td>
+          <td>中断后续跑同一订单</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">8.4s + 7.3s</span></td>
+          <td class="ev">resuming the existing order（order_url 与中断态完全一致）; 新建订单 ×0; 重写 TXT ×0。恢复轮撞上 LE NXDOMAIN 竞态（见下）</td>
+        </tr>
+        <tr data-status="fixed">
+          <td class="phase">A4b</td>
+          <td>换到零重叠的域名集合</td>
+          <td><span class="badge fail">FAIL</span> → <span class="badge fixed">PASS</span></td>
+          <td class="ev">修复前：400 malformed "Could not validate ARI 'replaces' field"; 修复后：replaces=false 且签发成功</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">A6</td>
+          <td>并发双证书同名不互删</td>
+          <td><span class="badge pass">PASS</span></td>
+          <td class="ev">accepted=[lifecycle, lifecycle-b]; 同一个 TXT 名写入 2 条; 日志 "another challenge is still live at the TXT name"; 两张都签发</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">A7</td>
+          <td>续期走 ARI（带 replaces）</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">5.3s</span></td>
+          <td class="ev">starting renewal ariReplaces=true; ACME order created replaces=true; ari_window 归零; ari_cert_id 变化</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">A8</td>
+          <td>ARI 不可用时的回退续期</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">5.1s</span></td>
+          <td class="ev">ariReplaces=false; replaces=false; 无 "ARI lookup failed"; not_after 回到 +90d</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">A9</td>
+          <td>回收未持久化的授权行</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">39.9s</span></td>
+          <td class="ev">"found the TXT of an interrupted pass; reclaiming it before deleting the row"; authz 行=0; TXT 空</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">B0</td>
+          <td>声明 → 期望状态文档</td>
+          <td><span class="badge pass">PASS</span></td>
+          <td class="ev">证书名 atomwangnus-com（注册域派生）; SAN 恰好 = 声明集合 {alpha, beta}; dry-run 不落盘; revision=sha256:a27ad03f…</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">B1</td>
+          <td>observe 影子对比不改变行为</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">40.3s</span></td>
+          <td class="ev">shadow_diff=0; frozen=0; desired_state_certificates=1; 仍按配置收敛</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">B2</td>
+          <td>切到 enforce</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">0.9s</span></td>
+          <td class="ev">"enforce mode: the desired-state document is the single source of truth"; certificates:[] 被接受; 无重签（not_after 不变）</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">B3</td>
+          <td>新增一条声明</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">44.1s</span></td>
+          <td class="ev">SAN 变 3 个（+gamma）; 证书名仍是 atomwangnus-com; replaces=false</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">B4</td>
+          <td>域名下线：宽限期 → 引用检查</td>
+          <td><span class="badge pass">PASS</span> <span class="muted">需放宽阈值</span></td>
+          <td class="ev">第一次 33%&gt;30% 被熔断（按设计）; 放宽后 included 3→2, carriedForward=1 后 removed; wecert 收缩 SAN</td>
+        </tr>
+        <tr data-status="pass">
+          <td class="phase">B5a</td>
+          <td>声明全删光：必须冻结</td>
+          <td><span class="badge pass">PASS</span></td>
+          <td class="ev">退出码 2; "FROZEN: the previous desired state is untouched"; 文档 revision 未变; 证书仍在续期</td>
+        </tr>
+        <tr data-status="skip">
+          <td class="phase">B5b</td>
+          <td>证书级孤儿</td>
+          <td><span class="badge skip">SKIPPED</span></td>
+          <td class="ev">需要第二个自有注册域；本环境只有一个（atomwangnus.com），未构造</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="timeline">
+  <h2>Run timeline<span class="zh">整轮时间线</span></h2>
+  <p>
+    全部阶段在同一状态库上顺序执行，共 <b>20 分钟</b>、284 行 debug 日志、14 次下单、11 次签发成功、3 次失败轮次。
+    条形长度按实际耗时（最长 62.3s）。
+  </p>
+  <div class="tl">
+    <div class="tl-row fail"><span class="p">a4 黑洞变体</span><span class="t">17:21</span><span class="d">62.3s</span><span class="bar" style="width:100%"></span></div>
+    <div class="tl-row"><span class="p">b3 新增声明</span><span class="t">17:30</span><span class="d">44.1s</span><span class="bar" style="width:70.8%"></span></div>
+    <div class="tl-row"><span class="p">b1 observe</span><span class="t">17:29</span><span class="d">40.3s</span><span class="bar" style="width:64.7%"></span></div>
+    <div class="tl-row"><span class="p">a9 回收</span><span class="t">17:28</span><span class="d">39.9s</span><span class="bar" style="width:64.0%"></span></div>
+    <div class="tl-row"><span class="p">a0 首签</span><span class="t">17:15</span><span class="d">30.3s</span><span class="bar" style="width:48.6%"></span></div>
+    <div class="tl-row fixed"><span class="p">a4b 换域名</span><span class="t">17:25</span><span class="d">30.1s</span><span class="bar" style="width:48.3%"></span></div>
+    <div class="tl-row"><span class="p">a6 并发</span><span class="t">17:26</span><span class="d">28.4s</span><span class="bar" style="width:45.6%"></span></div>
+    <div class="tl-row"><span class="p">a2 SAN 扩张</span><span class="t">17:16</span><span class="d">26.2s</span><span class="bar" style="width:42.1%"></span></div>
+    <div class="tl-row"><span class="p">a9 中断</span><span class="t">17:27</span><span class="d">13.1s</span><span class="bar" style="width:21.0%"></span></div>
+    <div class="tl-row"><span class="p">a6 补完</span><span class="t">17:27</span><span class="d">11.3s</span><span class="bar" style="width:18.1%"></span></div>
+    <div class="tl-row"><span class="p">a4 kill 中断</span><span class="t">17:23</span><span class="d">10.9s</span><span class="bar" style="width:17.5%"></span></div>
+    <div class="tl-row"><span class="p">a5 续跑</span><span class="t">17:23</span><span class="d">8.4s</span><span class="bar" style="width:13.5%"></span></div>
+    <div class="tl-row fail"><span class="p">a5 重试</span><span class="t">17:24</span><span class="d">7.3s</span><span class="bar" style="width:11.7%"></span></div>
+    <div class="tl-row"><span class="p">a3 / a7 / a8 / b4b</span><span class="t">17:16–32</span><span class="d">≈5s</span><span class="bar" style="width:8.2%"></span></div>
+    <div class="tl-row"><span class="p">其余 6 轮</span><span class="t">—</span><span class="d">≤2s</span><span class="bar" style="width:3%"></span></div>
+    <p class="tl-key">
+      红条 = 失败轮次，黄条 = 先失败后修复的阶段。最长的一条是<b>被否决的测试手法</b>本身
+      （a4 黑洞变体：provider 查不到 zone，白等 62 秒）；真正用得上的是紧邻的 kill 中断轮，只花 10.9 秒。
+      完整的逐轮明细在 <code>/tmp/wecert-lifecycle/logs/</code>。
+    </p>
+  </div>
+</section>
+
+<section id="window">
+  <h2>Interrupt window<span class="zh">A4 中断窗口实测</span></h2>
+  <p>
+    用例要的是"TXT 已经在 DNS 里、进程还没走完"这个中间态。它有多宽，决定了这个测试是否可靠——
+    所以先从实测日志逐行取时间戳，而不是估算。
+  </p>
+
+  <figure>
+    <svg viewBox="0 0 860 210" role="img" aria-label="一次签发的三段耗时：TXT presented 到 propagated 11.2 秒，propagated 到证书落地 12.2 秒，总计 23.5 秒">
+      <rect x="0" y="0" width="860" height="210" fill="#fff"/>
+      <rect x="120" y="86" width="314" height="28" fill="#fbf0d8" stroke="#e8d5a6"/>
+      <rect x="434" y="86" width="346" height="28" fill="#e3efee" stroke="#bcd9d7"/>
+      <line x1="90" y1="100" x2="810" y2="100" stroke="#14161a" stroke-width="2"/>
+      <g stroke="#14161a" stroke-width="2">
+        <line x1="120" y1="86" x2="120" y2="114"/>
+        <line x1="434" y1="86" x2="434" y2="114"/>
+        <line x1="780" y1="86" x2="780" y2="114"/>
+      </g>
+      <circle cx="120" cy="100" r="5" fill="#0d5f5c"/>
+      <circle cx="434" cy="100" r="5" fill="#0d5f5c"/>
+      <circle cx="780" cy="100" r="5" fill="#0d5f5c"/>
+      <g font-family="system-ui, sans-serif" font-size="13" fill="#14161a" font-weight="600">
+        <text x="120" y="70" text-anchor="middle">TXT presented</text>
+        <text x="434" y="70" text-anchor="middle">TXT propagated</text>
+        <text x="780" y="70" text-anchor="middle">证书落地</text>
+      </g>
+      <g font-family="ui-monospace, monospace" font-size="12" fill="#6b7079">
+        <text x="120" y="56" text-anchor="middle">t+0.0s</text>
+        <text x="434" y="56" text-anchor="middle">t+11.2s</text>
+        <text x="780" y="56" text-anchor="middle">t+23.5s</text>
+      </g>
+      <g font-family="system-ui, sans-serif" font-size="12.5">
+        <text x="277" y="136" text-anchor="middle" fill="#8a5a00" font-weight="600">kill 窗口：11.2s</text>
+        <text x="277" y="153" text-anchor="middle" fill="#6b7079">就绪检查在跑，TXT 已可读</text>
+        <text x="607" y="136" text-anchor="middle" fill="#0d5f5c" font-weight="600">LE 验证：12.2s</text>
+        <text x="607" y="153" text-anchor="middle" fill="#6b7079">此时杀也一样有效</text>
+      </g>
+      <line x1="120" y1="176" x2="780" y2="176" stroke="#cec9bc" stroke-width="1"/>
+      <g stroke="#cec9bc" stroke-width="1">
+        <line x1="120" y1="171" x2="120" y2="181"/>
+        <line x1="780" y1="171" x2="780" y2="181"/>
+      </g>
+      <text x="450" y="196" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12.5" fill="#43474e">
+        从第一条 TXT 写入到这一轮结束：23.5 秒（不依赖任何时钟调整）
+      </text>
+    </svg>
+    <figcaption>
+      数据来源：<code>/tmp/wecert-lifecycle/logs/a0.log</code> 的逐行时间戳（A0 首签那一轮）。
+      用例的脚本在 <code>TXT presented</code> 出现后以 0.1s 粒度轮询日志并立即 <code>kill -9</code>，
+      随后校验 <code>presented=1</code> 与 DNS 中确有记录，两步都成立才算测到。
+    </figcaption>
+  </figure>
+</section>
+
+<section id="defect">
+  <h2>Finding 1 · Code defect<span class="zh">发现① 证书永久无法更换域名</span></h2>
+
+  <p class="lede">
+    A4b 把一个已经签发的证书换到一组<b>完全不相交</b>的域名上，订单创建被 Let's Encrypt 直接拒绝。
+    这不是一次失败，而是一个<b>不会自愈的循环</b>。
+  </p>
+
+  <figure>
+    <svg viewBox="0 0 880 330" role="img" aria-label="缺陷机制循环图：检测到 SAN 漂移后发送 replaces，CA 返回 400，订单未创建，ari_cert_id 不变，于是下一轮继续发送同样的 replaces">
+      <rect width="880" height="330" fill="#fff"/>
+      <defs>
+        <marker id="ar" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#43474e"/>
+        </marker>
+        <marker id="arRed" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#a3231c"/>
+        </marker>
+      </defs>
+
+      <rect x="40" y="26" width="300" height="84" rx="4" fill="#fff" stroke="#cec9bc" stroke-width="1.5"/>
+      <foreignObject x="52" y="34" width="276" height="70">
+        <div class="fo"><b>① 检测到 SAN 漂移</b><br>
+        配置里的域名集合与叶证书不一致 → 立刻重签（这条设计本身是对的）</div>
+      </foreignObject>
+
+      <rect x="540" y="26" width="300" height="84" rx="4" fill="#fff" stroke="#cec9bc" stroke-width="1.5"/>
+      <foreignObject x="552" y="34" width="276" height="70">
+        <div class="fo"><b>② 下单时带上 <code>replaces</code></b><br>
+        值为旧证书的 <code>st.ARICertID</code>（漂移分支无条件发送）</div>
+      </foreignObject>
+
+      <rect x="540" y="220" width="300" height="84" rx="4" fill="#fbe6e4" stroke="#a3231c" stroke-width="1.5"/>
+      <foreignObject x="552" y="228" width="276" height="70">
+        <div class="fo"><b>③ CA 返回 400 malformed</b><br>
+        <code>identifiers in this order do not match any identifiers in the certificate being replaced</code></div>
+      </foreignObject>
+
+      <rect x="40" y="220" width="300" height="84" rx="4" fill="#fbe6e4" stroke="#a3231c" stroke-width="1.5"/>
+      <foreignObject x="52" y="228" width="276" height="70">
+        <div class="fo"><b>④ 订单没建起来</b><br>
+        <code>ari_cert_id</code> 只在签发成功后重算 → 它永远不会变</div>
+      </foreignObject>
+
+      <line x1="340" y1="68" x2="532" y2="68" stroke="#43474e" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="690" y1="110" x2="690" y2="212" stroke="#43474e" stroke-width="1.6" marker-end="url(#ar)"/>
+      <line x1="540" y1="262" x2="348" y2="262" stroke="#43474e" stroke-width="1.6" marker-end="url(#ar)"/>
+
+      <path d="M190 220 L190 118" fill="none" stroke="#a3231c" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arRed)"/>
+      <foreignObject x="196" y="146" width="160" height="46">
+        <div class="fo" style="color:#a3231c;font-weight:600">下一轮发同样的值<br>→ 永久循环</div>
+      </foreignObject>
+
+      <rect x="380" y="150" width="184" height="54" rx="4" fill="#e2f0e8" stroke="#14683f" stroke-width="1.5"/>
+      <foreignObject x="390" y="158" width="164" height="44">
+        <div class="fo" style="color:#14683f;font-weight:600">修复（PR #45）<br>漂移分支不发 replaces</div>
+      </foreignObject>
+    </svg>
+    <figcaption>
+      红色虚线是自愈缺失的那一环：失败没有改变任何输入，所以下一轮会原样重演。
+      顺带说明：Let's Encrypt 的 ARI 豁免只针对"同一 identifier 集合的续期"，
+      所以漂移分支本来也拿不到豁免——发送 <code>replaces</code> 只有风险，没有收益。
+    </figcaption>
+  </figure>
+
+  <h3>现场证据（修复前）</h3>
+  <pre class="bad"><code>level=ERROR msg="pass failed; a retry has been scheduled" cert=lifecycle
+  err="create order: acme: error: 400 :: POST :: https://acme-staging-v02.api.letsencrypt.org/acme/new-order
+    :: urn:ietf:params:acme:error:malformed
+    :: Could not validate ARI 'replaces' field
+    :: identifiers in this order do not match any identifiers in the certificate being replaced"
+  consecutiveFailures=1 nextAttemptAt=2026-09-16T17:18:04+08:00
+
+$ sqlite3 a.db "SELECT name, consecutive_failures, ari_cert_id FROM certificates; SELECT count(*) FROM orders;"
+lifecycle|1|3tpCJfI0wCebZhbPZWqQrCHVMIc.LCmKUKocV8oEVhEAaYwRfYIL
+0</code></pre>
+  <p>
+    <code>orders=0</code> 是这条缺陷的关键指纹：订单<b>根本没被创建</b>，
+    所以 <code>ari_cert_id</code> 没有任何机会被刷新，<code>consecutive_failures</code> 只会一路累加。
+    另外注意 <code>-once</code> 此时仍返回 <b>0</b>——单张证书的失败被刻意丢弃，
+    所以任何靠退出码判断健康度的巡检都看不见这件事。
+  </p>
+
+  <h3>修复</h3>
+  <p>两处，改在 <code>internal/acme/manager.go</code> 与 <code>manager_renew.go</code>：</p>
+  <pre class="good"><code>// manager.go —— 漂移分支不再发送 replaces
+} else if drifted, detail := CoverageDrift(leaf, c.Domains); drifted {
+    m.log.Warn("the live certificate's SANs no longer match the config; reissuing now", …)
+-   return m.issue(ctx, c, st, st.ARICertID)
++   return m.issue(ctx, c, st, "")</code></pre>
+  <pre class="good"><code>// manager_renew.go —— 兜底：被拒就丢掉 replaces 重试一次（覆盖续期路径）
+order, err := m.core.NewOrder(c.Domains, &amp;api.OrderOptions{Profile: c.Profile, ReplacesCertID: replaces})
++ if err != nil &amp;&amp; replaces != "" &amp;&amp; mentionsReplaces(err) {
++     m.log.Warn("the CA refused the ARI replaces field; retrying the order without it …")
++     order, err = m.core.NewOrder(c.Domains, &amp;api.OrderOptions{Profile: c.Profile})
++ }</code></pre>
+  <p>
+    兜底是刻意的：丢一次豁免只花一个配额，续不上是另一回事。
+    判断用 <code>strings.Contains(err, "replaces")</code>——误判的代价是"多一次 newOrder"，漏判则退回今天的行为，
+    两种都不会写坏状态，所以不值得为它引入一个 lego 类型化错误。
+  </p>
+
+  <h3>回归与复跑验证</h3>
+  <div class="tablebox">
+    <table>
+      <thead><tr><th>测试</th><th>断言</th><th>修复回退后</th></tr></thead>
+      <tbody>
+        <tr>
+          <td class="phase">TestDriftReissueSendsNoReplaces</td>
+          <td>叶证书 SAN 与配置零重叠时，<code>newOrderReplaces == [""]</code></td>
+          <td class="ev">FAIL — a changed identifier set must not send replaces (got "oldAki.oldSerial")</td>
+        </tr>
+        <tr>
+          <td class="phase">TestRefusedReplacesIsRetriedWithoutIt</td>
+          <td>假 CA 用真实错误串拒绝首次下单，断言尝试序列 <code>["oldAki.oldSerial", ""]</code> 且本轮恢复</td>
+          <td class="ev">FAIL — the pass must recover by dropping replaces, got: create order: acme: error: 400 …</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    修复后 A4b 复跑：<code>ACME order created … names=2 profile=classic replaces=false</code>，
+    签发成功，SAN = <code>{wild, *.wild}</code>，<code>consecutive_failures</code> 回到 0。
+    后续所有阶段（A6/A8/A9/B1/B3/B4）在集合变化时也都稳定出现 <code>replaces=false</code>。
+  </p>
+</section>
+
+<section id="docbugs">
+  <h2>Finding 2 · Document bugs<span class="zh">发现② 用例自身的 6 处错误</span></h2>
+  <p>
+    这些都是"纸上看不出、跑一次就露"的问题。留在这里是因为它们比缺陷本身更容易被下一个人踩到。
+    已全部修正（PR #46）。
+  </p>
+
+  <div class="card bad">
+    <span class="tag">③ 测试手法无效 · A4 / A9</span>
+    <h3>黑洞递归解析器做不出想要的中断</h3>
+    <dl class="kv">
+      <dt>症状</dt><dd><code>failed to get hosted zone: could not find zone</code>，TXT 从未写入</dd>
+      <dt>原因</dt><dd><code>dns.recursiveNameservers</code> 被灌进 lego 全局解析器（<code>dns01.AddRecursiveNameservers</code>），provider 写记录前要用它查 zone</dd>
+      <dt>修正</dt><dd>改用 <code>kill -9</code>，并给出实测窗口 11.2s / 23.5s 与前置态校验</dd>
+    </dl>
+  </div>
+
+  <div class="card bad">
+    <span class="tag">④ 前提假设错 · A4</span>
+    <h3>"apex + 通配"不一定产生两个挑战</h3>
+    <dl class="kv">
+      <dt>症状</dt><dd>预期 2 条 TXT，实际只有 1 条（<code>TXT propagated records=1</code>）</dd>
+      <dt>原因</dt><dd>Let's Encrypt 复用仍然有效的授权（同账号 + 同 identifier，约 30 天）；apex 在 A0 已验证过</dd>
+      <dt>修正</dt><dd>改用一对从未验证过的标识（<code>wild.$APEX</code> 与 <code>*.wild.$APEX</code>），并写明 <code>records=N</code> 是挑战数不是 SAN 数</dd>
+    </dl>
+  </div>
+
+  <div class="card warn">
+    <span class="tag">⑤ 未说明的竞态 · A5</span>
+    <h3>LE 报 NXDOMAIN，而权威探测明明看到记录</h3>
+    <dl class="kv">
+      <dt>症状</dt><dd><code>DNS problem: NXDOMAIN looking up TXT for _acme-challenge.wild…</code>，同一时刻权威 NS 返回 2 条 TXT</dd>
+      <dt>原因</dt><dd>DNSPod 的 NS 最终一致；就绪检查按设计容忍<b>从本机不可达</b>的 NS（实测 10 个地址有 4 个不可达），而 LE 能到达它们</dd>
+      <dt>修正</dt><dd>用例写明"这是重试场景，不是缺陷"：该轮记一次失败 → 重试时订单已被判 invalid 并丢弃 → 新订单成功</dd>
+    </dl>
+  </div>
+
+  <div class="card warn">
+    <span class="tag">⑥ 脚本写法错 · A6</span>
+    <h3>等待条件把第二张证书打断了</h3>
+    <dl class="kv">
+      <dt>症状</dt><dd>第一张签发成功后脚本立即跳出等待，杀进程时第二张还在验证中</dd>
+      <dt>原因</dt><dd>把两张证书的 <code>not_after</code> 拼成一个字符串再比 <code>!=</code>，任一张变化就成立</dd>
+      <dt>修正</dt><dd>改为逐张计数（<code>not_after &gt; 上一轮最大值</code> 的行数必须等于 2）</dd>
+    </dl>
+  </div>
+
+  <div class="card warn">
+    <span class="tag">⑦ 忽略了熔断 · B4</span>
+    <h3>3 条声明删 1 条 = 33%，直接被冻结</h3>
+    <dl class="kv">
+      <dt>症状</dt><dd><code>mode=frozen</code>: the declared name set dropped from 3 to 2 (33%, threshold 30%)，文档不动</dd>
+      <dt>原因</dt><dd>熔断阈值是"单轮跌幅 &gt; 30%"，声明条数少时一次正常下线就会触发</dd>
+      <dt>修正</dt><dd>用例写明：声明 4 条以上（25%，最忠实），或显式传 <code>-drop-threshold</code>；并单独把这次 33% 冻结记录为"熔断按设计工作"</dd>
+    </dl>
+  </div>
+
+  <div class="card bad">
+    <span class="tag">⑧ 观测信号错 · B5a</span>
+    <h3><code>wecert_desired_state_frozen</code> 永远是 0</h3>
+    <dl class="kv">
+      <dt>症状</dt><dd>onboard 已冻结（退出码 2、文档未更新），但 wecert 侧该项指标仍是 0</dd>
+      <dt>原因</dt><dd>wecert 只看到"文档仍然有效"，它<b>无从知道</b>写入方那一轮冻结了</dd>
+      <dt>修正</dt><dd>真正的运维信号是 <code>wecert_desired_state_age_seconds</code> 持续增长；用例判据已改，并删掉了失效的日志 grep</dd>
+    </dl>
+  </div>
+</section>
+
+<section id="env">
+  <h2>Environment<span class="zh">环境观察</span></h2>
+
+  <h3>权威 NS 可达性：10 个地址里 4 个不可达</h3>
+  <div class="sbar" role="img" aria-label="10 个权威 NS 地址中 6 个可达、4 个从本机超时">
+    <div class="yes" style="width:60%">6 可达</div>
+    <div class="no" style="width:40%">4 超时</div>
+  </div>
+  <p class="muted" style="margin-top:8px">
+    这是就绪检查"容忍不可达 NS"的直接后果，也是 A5 那次竞态的根因：我们看不见的 NS 可能还没同步，
+    而 LE 看得见。用例因此不能把"权威探测通过"当成"LE 一定能验证通过"。
+  </p>
+
+  <h3>另外两点</h3>
+  <ul>
+    <li><b>负缓存 180 秒</b>：DNSPod 的 SOA minimum 是 180s，递归解析器会据此缓存 NXDOMAIN。
+      记录删除后一段时间内，递归侧仍会返回否定答案——判断"记录在不在"必须问权威 NS。</li>
+    <li><b>LE 复用授权</b>：同一账号 + 同一 identifier 的有效授权在约 30 天内被复用，
+      所以"域名数量"与"写了几条 TXT"没有对应关系（A2 里 2 个 SAN 只写了 1 条，
+      A7 的续期甚至是 <code>status=ready</code> 直接下发、零挑战）。</li>
+  </ul>
+</section>
+
+<section id="cleanup">
+  <h2>Cleanup check<span class="zh">收尾核查</span></h2>
+  <div class="tablebox">
+    <table>
+      <thead><tr><th>检查项</th><th>方法</th><th>结果</th></tr></thead>
+      <tbody>
+        <tr><td>挑战记录残留</td><td class="ev">dig TXT @a.dnspod.com × 9 个名字</td><td><span class="badge pass">0 条</span></td></tr>
+        <tr><td>声明记录残留</td><td class="ev">dig TXT _wecert.* × 3 个名字</td><td><span class="badge pass">0 条</span></td></tr>
+        <tr><td>DNSPod 侧计数</td><td class="ev">tccli dnspod DescribeRecordList（_acme-challenge / _wecert）</td><td><span class="badge pass">残留 0</span></td></tr>
+        <tr><td>残留进程</td><td class="ev">pgrep -fl bin/wecert</td><td><span class="badge pass">none</span></td></tr>
+        <tr><td>云证书</td><td class="ev">全程 deploy.enabled=false</td><td><span class="badge pass">未上传</span></td></tr>
+        <tr><td>测试环境</td><td class="ev">CLB lb-hwjdqjk4 / CVM ins-nlqekrba</td><td><span class="badge skip">按要求未动</span></td></tr>
+        <tr><td>证据留存</td><td class="ev">/tmp/wecert-lifecycle/logs（284 行 debug 日志，444K）</td><td><span class="badge pass">保留</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="gaps">
+  <h2>Not covered<span class="zh">未覆盖 / 未做</span></h2>
+  <ul>
+    <li><b>B5b 证书级孤儿</b>：需要第二个自有注册域，本环境只有一个，跳过。名字级下线（B4）已覆盖。</li>
+    <li><b>Cloud deploy 路径</b>：CLB 绑定 / 重绑 / SNI 切换 / 真实 TLS——属于 <code>testenv/</code> 的 Stage B/B2/B3，
+      本报告全程 <code>deploy.enabled: false</code>，不能替代它。</li>
+    <li><b>生产 Let's Encrypt</b>：只在 staging 上跑；生产与 staging 的 ARI 行为可能不同
+      （A2/A3 在 staging 上带 <code>replaces</code> 的"部分重叠"订单被接受了，生产是否同样宽松未验证）。</li>
+    <li><b>failureFallback（故障降级）</b>：需要"某些 identifier 持续失败 + 临近过期"才触发，本用例不构造。</li>
+    <li><b>发现①的现场日志已被覆盖</b>：那次 400 的原始日志在后一阶段复用了同一个文件名。
+      错误原文可在 PR #45 描述与修复提交信息中找到（逐字引用）。</li>
+  </ul>
+</section>
+
+<section id="sources">
+  <h2>Sources<span class="zh">来源</span></h2>
+  <ul>
+    <li>用例：<code>docs/lifecycle-acceptance.md</code>（TC-LIFECYCLE-01，PR #44 引入，PR #46 修正）</li>
+    <li>缺陷修复：PR #45 / 提交 <code>4ba3b0f</code>（含真实错误串与两个回归测试）</li>
+    <li>用例修正：PR #46 / 提交 <code>fb3814c</code></li>
+    <li>被测代码：<code>internal/acme/manager.go</code>（漂移分支）、<code>manager_renew.go</code>（下单与 replaces）、
+        <code>internal/acme/dns.go</code>（<code>dns01.AddRecursiveNameservers</code>、就绪规则）、
+        <code>internal/onboarding/onboard.go</code>（熔断、宽限期、空期望状态）</li>
+    <li>运行日志与状态：<code>/tmp/wecert-lifecycle/logs/*.log</code>（21 个文件，284 行）、
+        <code>a.db</code> / <code>b.db</code>、<code>desired-state.yaml</code> 及其 <code>.report.json</code></li>
+    <li>环境事实：<code>dig</code> 对 <code>a/b/c.dnspod.com</code> 的逐 IP 查询、
+        <code>tccli dnspod DescribeRecordList</code>、<code>tccli clb DescribeListeners/Rules</code></li>
+    <li>外部参考：Let's Encrypt 社区关于同一错误串的讨论
+        <code>community.letsencrypt.org/t/…/238565</code>（同类客户端陷阱）</li>
+  </ul>
+</section>
+
+<footer>
+  <p><b>TC-LIFECYCLE-01 实跑报告</b> · wecert · 生成时间 <time datetime="2026-09-16T17:40:00+08:00">2026-09-16 17:40 CST</time></p>
+  <p>
+    staging + 真实 DNSPod；不代表生产 Let's Encrypt 行为。
+    证据全文在 <code>/tmp/wecert-lifecycle/logs/</code>，随机器重启会消失——需要长期留档请另行复制。
+  </p>
+</footer>
+
+</div>
+<script>
+  (function () {
+    var box = document.getElementById('onlyAnomalies');
+    var table = document.getElementById('phases');
+    if (!box || !table) return;
+    box.addEventListener('change', function () {
+      table.classList.toggle('only-anomalies', box.checked);
+    });
+  })();
+</script>
+</body>
+</html>
