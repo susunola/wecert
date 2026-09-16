@@ -858,6 +858,15 @@ Alert on `not_after`, **not** on "did the renewal job error" — the latter stay
 
 **The metrics listener fails fast.** If the port cannot be bound, wecert exits rather than logging and continuing — `/metrics` is the only expiry alerting path, and a silently dead endpoint means certificates expire unnoticed. The operational consequence, by design: two instances on one host is a startup failure.
 
+### What needs a human
+
+The automated layers are `make check` (unit and contract), `make test-pebble` (a real ACME
+lifecycle) and `scripts/e2e-wildcard.sh` (the wildcard challenge against real DNS). Three things
+need a real cloud account, a real CLB or a real CA, and **docs/staging-checklist.md** is the
+script for them: the manual-bind → automatic-rebind flow, the asynchronous delete and its
+resource-still-bound refusal, running against a CAM role built from `cam-policy-runtime.json`, and
+watching quota behaviour under a deliberately broken name.
+
 ### Tencent Cloud permissions
 
 With a **CVM role** (the default), credentials come from instance metadata and never touch disk:
