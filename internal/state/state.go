@@ -674,6 +674,37 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 	return out, rows.Err()
 }
 
+// ListPresentedAuthorizations lists every authorization this state store still believes
+// has a TXT record in DNS, across all certificates.
+//
+// It exists for the challenge-lease registry in internal/acme: that registry only knows
+// what the current *process* wrote, and lego's cleanup deletes every TXT at the challenge
+// name. A row recovered from a previous process is therefore a live value the registry
+// cannot see, and a cleanup for a different certificate sharing the name would delete it.
+// Re-registering from here before any cleanup closes that window.
+func (s *Store) ListPresentedAuthorizations() ([]*Authorization, error) {
+	rows, err := s.db.Query(`
+		SELECT cert_name, authz_url, identifier, status, challenge_url, challenge_token,
+		       txt_name, txt_value, presented, challenge_sent
+		FROM authorizations WHERE presented = 1 ORDER BY txt_name, cert_name`)
+	if err != nil {
+		return nil, fmt.Errorf("list presented authorizations: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Authorization
+	for rows.Next() {
+		a := &Authorization{}
+		if err := rows.Scan(&a.CertName, &a.AuthzURL, &a.Identifier, &a.Status,
+			&a.ChallengeURL, &a.ChallengeToken, &a.TxtName, &a.TxtValue,
+			&a.Presented, &a.ChallengeSent); err != nil {
+			return nil, fmt.Errorf("scan presented authorization: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // PutAuthorization writes a single authorization.
 func (s *Store) PutAuthorization(a *Authorization) error {
 	_, err := s.db.Exec(`

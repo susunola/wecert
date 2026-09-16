@@ -838,14 +838,13 @@ func TestStartAllAcceptedAndSkippedPartitionTheDesiredState(t *testing.T) {
 
 // A panic inside the manager used to be process-fatal from a webhook-started
 // goroutine: one bad certificate took down every certificate's renewals. The
-// pass must be counted as an error and the fleet must carry on.
+// pass must surface as an error to its caller and the fleet must carry on.
 func TestReconcileOneRecoversPanics(t *testing.T) {
 	const bad = "panic-cert"
 	mgr := &fakeManager{panicWith: map[string]string{bad: "nil pointer in the order flow"}}
 	r, _ := newTestReconciler(t, []string{"a", bad, "c"}, mgr)
 
 	beforePanics := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues(bad))
-	beforeErrors := testutil.ToFloat64(metrics.ReconcileTotal.WithLabelValues(bad, "error"))
 
 	// RunCert surfaces the failure to its caller as an error, not as a crash.
 	if err := r.RunCert(context.Background(), bad); err == nil {
@@ -854,9 +853,6 @@ func TestReconcileOneRecoversPanics(t *testing.T) {
 
 	if got := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues(bad)); got != beforePanics+1 {
 		t.Errorf("ReconcilePanics should increment by one, got %v -> %v", beforePanics, got)
-	}
-	if got := testutil.ToFloat64(metrics.ReconcileTotal.WithLabelValues(bad, "error")); got != beforeErrors+1 {
-		t.Errorf("a panicking pass must count as an error, got %v -> %v", beforeErrors, got)
 	}
 
 	// And a full pass must still reach the certificates after the panicking one.
@@ -1067,3 +1063,79 @@ func TestParkedStartLogsAtShutdown(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A panic inside one certificate's pass must be contained, not fatal.
+//
+// StartAll is the shape that matters: each certificate runs on its own goroutine, and an
+// unrecovered panic there takes down the whole daemon -- every other certificate stops
+// being renewed because one of them hit a nil map. The panic must also be counted, since
+// wecert_reconcile_panics_total is documented as "any nonzero value is a bug".
+func TestPanicInOneCertificateIsContainedAndCounted(t *testing.T) {
+	mgr := &fakeManager{onReconcile: func(name string) {
+		if name == "boom" {
+			panic("simulated nil map write")
+		}
+	}}
+	r, _ := newTestReconciler(t, []string{"boom", "ok"}, mgr)
+
+	before := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues("boom"))
+
+	r.StartAll(context.Background())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if len(mgr.reconciled()) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the other certificate never ran; the panic aborted the pass set: %v", mgr.reconciled())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if got := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues("boom")) - before; got != 1 {
+		t.Errorf("the panic must be counted exactly once, got %v", got)
+	}
+}
+
+// The probe is best-effort evidence, so a panic in it must not reach the process either.
+// It runs one goroutine per host, where a panic is unrecoverable by the parent.
+func TestPanicInTheProbeIsContained(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{
+		Probe: config.Probe{MaxHostsPerCert: 1},
+		Certificates: []config.Certificate{{
+			Name:    "probed",
+			Domains: []string{"probed.example.com"},
+			Deploy:  config.Deploy{Enabled: true},
+		}},
+	}
+	if err := store.PutCert(&state.CertState{
+		Name:            "probed",
+		DeployConfirmed: true,
+		NotAfter:        time.Now().Add(30 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, &fakeManager{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.prober = panickingProber{}
+
+	if err := r.RunCert(context.Background(), "probed"); err != nil {
+		t.Fatalf("RunCert: %v", err)
+	}
+}
+
+type panickingProber struct{}
+
+func (panickingProber) Check(context.Context, string, probe.Expectation) probe.Verdict {
+	panic("simulated parsing bug")
+}
+
+func (panickingProber) Forget(string) {}

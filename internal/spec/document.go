@@ -85,6 +85,30 @@ func Revision(certs []config.Certificate) string {
 // is machine-written: if a machine-written file is malformed, the upstream logic
 // has a bug, and **rejecting** is far safer than "best effort".
 func LoadDocument(path string) (*Document, error) {
+	// The document *is* the desired state: whoever can rewrite it decides which
+	// domains get served and which quietly stop being renewed. Two things follow.
+	//
+	// A symlink is refused rather than followed, so the configured path cannot be
+	// redirected at whatever the writer chooses. And a group- or world-writable file
+	// is refused, because on the default layout the document lives in a 0700 state
+	// directory and nothing but the daemon's own account has any business writing it.
+	//
+	// Readability is deliberately not checked: the file is 0644 so an operator can
+	// inspect it, and only the *write* bits can change what it says.
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat desired-state document: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("the desired-state document %s is a symlink; refusing to follow it -- point the config at the real file", path)
+	}
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		return nil, fmt.Errorf("the desired-state document %s is group- or world-writable (%04o); anyone who can write it can change which domains are served", path, perm)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("the desired-state document %s is not a regular file", path)
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read desired-state document: %w", err)
@@ -214,9 +238,13 @@ func WriteDocument(path string, doc *Document) error {
 
 // WriteDocumentUnchecked is WriteDocument without validation.
 //
-// Only for the onboarding component where validation would fail and evidence
-// must still be left behind (for example reporting a state that "should have been
-// generated but was not"). Do not use it to bypass validation.
+// It has exactly one caller: WriteDocument, which validates first and then delegates
+// the write. Nothing writes a document unchecked today -- the onboarding component
+// deliberately goes through spec.WriteDocument even when it freezes, so that a frozen
+// round leaves a *valid* document on disk and the previous revision in place.
+//
+// Kept as a separate function so the write path (atomic temp file, fsync, rename) has
+// a single implementation. Do not use it to bypass validation.
 func WriteDocumentUnchecked(path string, doc *Document) error {
 	body, err := yaml.Marshal(doc)
 	if err != nil {
