@@ -165,6 +165,16 @@ func run() error {
 	}
 
 	manager := acme.NewManager(store, acme.NewAPI(core), solver, deployer, log)
+
+	// 到期前降级：一张证书里有几个名字一直签不出来、而它又快到期时，
+	// 摘掉那几个名字先签一张，保住其余部分。默认关闭 —— 它会改变证书
+	// 覆盖什么，那是安全决策，不该由程序替人做。
+	if cfg.Fallback.EnabledOr(false) {
+		manager.SetFallbackPolicy(cfg.Fallback)
+		log.Warn("the failure fallback is ON: if issuance keeps failing near expiry, wecert will drop " +
+			"the names whose authorizations keep failing so the rest stay available; " +
+			"the dropped names lose coverage, which is the whole tradeoff, and it is logged at ERROR when it happens")
+	}
 	reconciler := reconcile.New(cfg, provider, store, manager, notifier, log)
 
 	// 网络侧探测：拨一个真实的 TLS 连接，确认线上服务的确实是部署的那张证书。

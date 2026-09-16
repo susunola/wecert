@@ -130,4 +130,21 @@ var (
 		Name: "wecert_certificate_probe_errors_total",
 		Help: "Probes that could not be completed at all (resolve, dial or handshake failed). Distinct from probe_match=0, which means the probe succeeded and found the wrong certificate.",
 	}, []string{"host"})
+
+	// ── 到期前降级 ──────────────────────────────────────────────────────────
+
+	// CertificateFallbackActive 表示这张证书正服务着一张缺了几个名字的证书。
+	//
+	// 持续为 1 说明有名字一直签不出来。它是有意的取舍（部分可用好过全挂），
+	// 但绝不是可以放着不管的状态 —— 那几个名字仍然在往外报错。
+	CertificateFallbackActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_certificate_fallback_active",
+		Help: "1 when this certificate is being served by a partial certificate with some names dropped (failure fallback). Partial availability beats total failure, but this is not a state to leave unattended.",
+	}, []string{"cert"})
+
+	// CertificateFallbackDropped 是被摘掉的名字数量。
+	CertificateFallbackDropped = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_certificate_fallback_dropped_names",
+		Help: "How many names were dropped from the certificate currently served by the failure fallback. The names themselves are in the state store and in the logs.",
+	}, []string{"cert"})
 )

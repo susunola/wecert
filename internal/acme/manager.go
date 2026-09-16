@@ -59,6 +59,10 @@ type Manager struct {
 	ariInterval time.Duration
 	retention   time.Duration
 	now         func() time.Time
+
+	// fallback 是"到期前拆分子集先签"的策略。nil 表示关闭 —— 那是默认值。
+	// 见 SetFallbackPolicy 与 applyFallback。
+	fallback *config.FailureFallback
 }
 
 // NewManager 构造收敛器。
@@ -110,6 +114,14 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		m.log.Debug("inside the backoff window; skipping", "cert", c.Name, "nextAttemptAt", st.NextAttemptAt)
 		return nil
 	}
+
+	// 到期前降级：这一轮到底该为什么样的域名集合下单。
+	//
+	// 放在这里而不是塞进 issue()，是因为下面每一个用到 c.Domains 的地方
+	// 都必须是同一个集合 —— 订单匹配、SAN 漂移比对、CSR、identifier 指纹。
+	// 只要有一处用的是配置里的全集，降级期间就会和"订单的 identifier
+	// 集合与配置不符 → 丢弃重建"打架，变成每轮一次的无谓下单。
+	c = m.applyFallback(c, st)
 
 	// 不变量 1：有未过期的进行中订单就继续推进，绝不新建。
 	if o, err := m.store.GetOrder(c.Name); err != nil {
