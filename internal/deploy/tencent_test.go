@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
@@ -8,8 +9,8 @@ import (
 )
 
 func TestProgressBoundCount(t *testing.T) {
-	if n := progressBoundCount(nil); n != 0 {
-		t.Errorf("nil progress = %d, want 0", n)
+	if n, ready := progressBoundCount(nil); n != 0 || ready {
+		t.Errorf("nil progress = (%d, %v), want (0, false)", n, ready)
 	}
 
 	zero := []*ssl.UpdateSyncProgress{{
@@ -19,8 +20,8 @@ func TestProgressBoundCount(t *testing.T) {
 			TotalCount: common.Int64Ptr(0),
 		}},
 	}}
-	if n := progressBoundCount(zero); n != 0 {
-		t.Errorf("zero total = %d, want 0", n)
+	if n, ready := progressBoundCount(zero); n != 0 || !ready {
+		t.Errorf("zero total = (%d, %v), want (0, true): an explicitly populated zero must be reported as ready", n, ready)
 	}
 
 	bound := []*ssl.UpdateSyncProgress{{
@@ -33,8 +34,63 @@ func TestProgressBoundCount(t *testing.T) {
 			TotalCount: common.Int64Ptr(1),
 		}},
 	}}
-	if n := progressBoundCount(bound); n != 3 {
-		t.Errorf("bound = %d, want 3", n)
+	if n, ready := progressBoundCount(bound); n != 3 || !ready {
+		t.Errorf("bound = (%d, %v), want (3, true)", n, ready)
+	}
+}
+
+// 钉住换绑误判的坑：UpdateCertificateInstance 任务创建成功、后台实际也会
+// 正常完成，但同步响应里 UpdateSyncProgressRegions[].TotalCount 全为 null
+// （服务端异步填充）。null 必须被视为"进度未就绪"，而不是"没有绑定资源"——
+// 否则一次成功的换绑会被误报成失败，随后以旧证书为锚重试又会陷入
+// bound=0 的死循环，每一轮还多漏一张孤儿证书。
+func TestProgressBoundCountNullTotalCountIsNotReady(t *testing.T) {
+	progress := []*ssl.UpdateSyncProgress{{
+		ResourceType: common.StringPtr("clb"),
+		UpdateSyncProgressRegions: []*ssl.UpdateSyncProgressRegion{{
+			Region:     common.StringPtr("ap-singapore"),
+			TotalCount: nil,
+		}, {
+			Region:     common.StringPtr("ap-tokyo"),
+			TotalCount: nil,
+		}},
+	}}
+	n, ready := progressBoundCount(progress)
+	if n != 0 {
+		t.Fatalf("count = %d, want 0", n)
+	}
+	if ready {
+		t.Fatal("ready = true, want false: a null TotalCount means the progress has not been populated yet, not that no resource is bound")
+	}
+}
+
+// 混合情形：任一 region 的 TotalCount 非 nil 即视为进度已填充。
+func TestProgressBoundCountMixedNullAndValue(t *testing.T) {
+	progress := []*ssl.UpdateSyncProgress{{
+		ResourceType: common.StringPtr("clb"),
+		UpdateSyncProgressRegions: []*ssl.UpdateSyncProgressRegion{{
+			Region:     common.StringPtr("ap-singapore"),
+			TotalCount: nil,
+		}, {
+			Region:     common.StringPtr("ap-tokyo"),
+			TotalCount: common.Int64Ptr(1),
+		}},
+	}}
+	if n, ready := progressBoundCount(progress); n != 1 || !ready {
+		t.Fatalf("count = %d, ready = %v; want 1, true", n, ready)
+	}
+}
+
+func TestNoResourceBoundErrorMentionsCertAndSNIHint(t *testing.T) {
+	err := noResourceBoundError("aqOld", []string{"ap-singapore"})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"aqOld", "ap-singapore", "multi_cert_info"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error message %q does not mention %q", msg, want)
+		}
 	}
 }
 
