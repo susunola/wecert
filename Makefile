@@ -132,6 +132,14 @@ fmt-check:
 check-scripts:
 	@bash scripts/test-e2e-wildcard.sh
 
+# A real ACME lifecycle against pebble (plus a real account, real order, real CSR finalize and
+# real chain download). Behind a build tag because it needs a pebble binary, and it skips with
+# instructions when the binary is absent rather than failing the build.
+#
+#	go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+test-pebble:
+	$(GO) test -tags pebble -count=1 -timeout 5m ./internal/acme/ -run TestPebble -v
+
 check: check-english fmt-check vet test-race check-scripts
 
 clean:
