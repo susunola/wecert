@@ -867,6 +867,37 @@ func TestStagedDecommissionDoesNotWedgeTheFuse(t *testing.T) {
 	}
 }
 
+// A drop under the freeze threshold passes, but it must be **reported**: a run of
+// them erodes the declaration set without ever tripping the fuse, and an operator
+// cannot alert on a number nobody publishes.
+func TestSubThresholdDropIsReportedNotJustAccepted(t *testing.T) {
+	h := newHarness(t, Options{}) // default threshold 0.30
+
+	names := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	set := func(prefixes []string) {
+		h.decls.raw = nil
+		h.rules.domains = nil
+		for _, n := range prefixes {
+			h.decls.raw = append(h.decls.raw, decl(n+".example.com"))
+			h.rules.domains = append(h.rules.domains, n+".example.com")
+		}
+	}
+
+	set(names)
+	if rep := h.run(t); rep.DeclarationDrop != 0 {
+		t.Fatalf("the first round has no baseline, so it must report no drop, got %d", rep.DeclarationDrop)
+	}
+
+	set(names[:8])
+	rep := h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("a 20%% drop is under the 30%% threshold: %v", rep.FreezeReasons)
+	}
+	if rep.DeclarationDrop != 2 {
+		t.Errorf("a passing drop of 2 must still be reported, got %d", rep.DeclarationDrop)
+	}
+}
+
 // State files written before LastDeclared existed have only the covered set.
 // That set must serve as the fuse's baseline for exactly one round -- a big
 // drop must still freeze -- rather than the fuse going quiet until the next
