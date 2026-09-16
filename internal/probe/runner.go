@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -152,6 +153,24 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		"notAfter", first.NotAfter, "daysLeft", first.DaysLeft(e.Now), "issuer", first.Issuer,
 		"trusted", first.Trusted, "handshakeMs", first.HandshakeMS)
 	return Verdict{OK: true}
+}
+
+// ProbedHosts returns every host this runner has recorded a state for.
+//
+// The reconciler uses it to reclaim per-host metric series: the probe vectors are
+// labelled by host, so a certificate leaving the desired state strands its hosts' series
+// at their last values forever, and the documented alert on
+// wecert_certificate_probe_match == 0 then fires permanently for a host that is no longer
+// part of the desired state at all.
+func (r *Runner) ProbedHosts() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.last))
+	for h := range r.last {
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // LastState returns the previous state for a name, mainly for diagnostics.

@@ -72,6 +72,12 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState) *con
 	cp := *c
 	cp.Domains = kept
 
+	// Tell the rest of the round that this certificate is being issued short of names.
+	// download uses it to keep the failure evidence that justifies the reduction, and
+	// the SAN-drift branch uses it to stop re-ordering the full set on every pass.
+	m.degradedRound = true
+	m.fallbackActive = true
+
 	// ERROR, not WARN: this is the decision "we deliberately removed names from the
 	// certificate", and it has to be loud enough that nobody can miss it.
 	m.log.Error("FALLING BACK to a subset of names so the rest stay available",
@@ -186,20 +192,36 @@ func entriesOfNotIn(want, have []string) []string {
 
 // fallbackDomains decides whether to degrade, and which names to drop.
 //
-// A non-empty dropped is the only thing that means "degrade". Every condition has to
-// hold at the same time:
+// A non-empty dropped is the only thing that means "degrade". The evidence conditions all
+// have to hold at the same time:
 //
 //   - the policy is explicitly enabled
 //   - a certificate is already in effect (without one there is no "keep what we have"
 //     to argue for)
 //   - this certificate has failed enough times in a row
-//   - we are already inside the danger window before expiry
 //   - **one specific** identifier keeps failing
 //   - the names left after dropping are no fewer than the floor
 //
 // The last two are the crux. When we do not know which name is broken we must never
 // drop anything -- dropping at random also sacrifices names that were fine, and that is
 // worse than not degrading at all.
+//
+// The pre-expiry window is special, and getting it wrong is what made the fallback
+// oscillate. It gates *entering* a fallback, not *staying* in one:
+//
+//   - to enter, the certificate must be close enough to expiry that losing it is the
+//     imminent risk the trade-off is for;
+//   - to stay, it must not -- because issuing the reduced set replaces the nearly-expired
+//     certificate with a fresh one, which pushes notAfter months out and would otherwise
+//     read as "the danger is over". That reading cleared the fallback one pass after it
+//     was established, and the next pass immediately ordered the full set -- the one
+//     containing the identifier that cannot issue. Once per backoff window, forever.
+//
+// So while a degradation record exists and the failing evidence is still fresh, the
+// reduced set stands. The full set gets its next attempt when the failure evidence ages
+// out (an operator fixed the name, or the ledger expired) -- that is the documented
+// self-healing entry point, and it now costs one attempt per failure window instead of
+// one per reconcile pass.
 func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState) (kept, dropped []string, reason string) {
 	p := m.fallback
 	if p == nil || !p.EnabledOr(false) {
@@ -222,9 +244,6 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState) (k
 		beforeExpiry = defaultFallbackBeforeExpiry
 	}
 	left := st.NotAfter.Sub(m.now())
-	if left > beforeExpiry {
-		return c.Domains, nil, ""
-	}
 
 	failures, err := m.store.ListIdentifierFailures(c.Name)
 	if err != nil {
@@ -233,9 +252,9 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState) (k
 		return c.Domains, nil, ""
 	}
 
-	// Only drop names that are still failing recently. Stale entries do not count --
-	// that is exactly the self-healing entry point: once the problem is fixed the
-	// entries age out and the next round naturally tries the full set again.
+	// Only names that are still failing recently count. Stale entries do not -- that is
+	// exactly the self-healing entry point: once the problem is fixed the entries age out
+	// and the next round naturally tries the full set again.
 	minFailures := p.MinIdentifierFailuresOr(defaultFallbackMinIdentFail)
 	cutoff := m.now().Add(-m.fallbackWindow())
 
@@ -246,6 +265,15 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState) (k
 		}
 	}
 	if len(bad) == 0 {
+		return c.Domains, nil, ""
+	}
+
+	// Decide what this round is: entering a fallback, or continuing one that already
+	// exists. Continuing does not re-check the expiry window, for the reason above.
+	held := m.fallbackActive
+	if !held && left > beforeExpiry {
+		// Not entering: the certificate is not close enough to expiry for the
+		// "keep most names alive" trade-off to be the right one yet.
 		return c.Domains, nil, ""
 	}
 

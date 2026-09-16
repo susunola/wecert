@@ -126,7 +126,13 @@ fmt-check:
 	fi
 
 # The full pre-commit gate.
-check: check-english fmt-check vet test-race
+# The shell scripts are part of the delivery surface (install.sh, the systemd units, the
+# e2e runners) and nothing else tests them. e2e-wildcard.sh in particular cannot be
+# exercised without real DNS, so its assertions are driven by a canned resolver here.
+check-scripts:
+	@bash scripts/test-e2e-wildcard.sh
+
+check: check-english fmt-check vet test-race check-scripts
 
 clean:
 	rm -rf bin dist coverage.out

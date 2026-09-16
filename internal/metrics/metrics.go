@@ -64,7 +64,26 @@ var (
 
 	DesiredStateShadowDiff = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "wecert_desired_state_shadow_diff",
-		Help: "In observe mode, the number of certificate-level differences between what is enforced and what the shadow source asks for. Should stay at 0 before switching to enforce.",
+		Help: "In observe mode, the number of certificate-level differences between what is enforced and what the shadow source asks for. Should stay at 0 before switching to enforce. Only meaningful while wecert_desired_state_shadow_errors_total is not increasing and _last_read is recent.",
+	})
+
+	// DesiredStateShadowErrors counts passes where the shadow source could not be read at
+	// all, so no comparison happened.
+	//
+	// Without it the diff gauge simply kept its previous value -- including 0 -- while
+	// nothing was being compared, and its own help text tells operators to gate the switch
+	// to enforce on that 0. An observe-mode document that was readable at startup and then
+	// disappeared produced exactly that false confidence.
+	DesiredStateShadowErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "wecert_desired_state_shadow_errors_total",
+		Help: "Passes in which the shadow desired-state source could not be read, so no comparison was produced. Non-zero means wecert_desired_state_shadow_diff is stale.",
+	})
+
+	// DesiredStateShadowLastRead is the unix time of the last successful shadow
+	// comparison (0 = never), so "is the diff gauge fresh?" is answerable.
+	DesiredStateShadowLastRead = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_desired_state_shadow_last_read_timestamp_seconds",
+		Help: "Unix time of the last successful shadow comparison in observe mode. If this stops advancing, the diff gauge is stale regardless of its value.",
 	})
 
 	OrphanedCertificates = promauto.NewGauge(prometheus.GaugeOpts{

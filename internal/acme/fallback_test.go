@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -280,6 +281,206 @@ func TestFallbackClearsItselfOnceTheNamesAreHealthy(t *testing.T) {
 	}
 	if fb == nil {
 		t.Error("trying the full set must not clear fallback before a full certificate is issued")
+	}
+}
+
+// A degraded certificate must not shake its own fallback loose.
+//
+// The regression this pins: a successful issuance for the reduced subset used to reset
+// consecutive_failures and clear the identifier ledger, exactly like any other success.
+// That erased the only evidence that an identifier was broken, so the very next pass
+// saw "failures = 0" plus a live certificate and ordered the full set again -- once per
+// backoff window, forever, spending a real order on an identifier set already known to
+// be broken. Let's Encrypt allows 5 certificates per exact set of identifiers per 7 days,
+// so a daily retry exhausts the account's quota within the week.
+func TestFallbackStaysStickyAfterIssuingTheDegradedSubset(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t,
+		[]string{"a.example.com", "b.example.com", "c.example.com"})
+
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	now := fixed
+	m.now = func() time.Time { return now }
+	m.SetFallbackPolicy(fallbackPolicy())
+
+	// A live certificate for the full set, inside the pre-expiry window.
+	liveNotAfter := fixed.Add(48 * time.Hour)
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: liveNotAfter, CertURL: "https://ca.test/cert/live",
+		ConsecutiveFailures: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// b.example.com is the identifier that keeps failing.
+	for i := 0; i < 5; i++ {
+		if err := store.RecordIdentifierFailure(cert.Name, "b.example.com", "dns says no", fixed); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+	// A real CA issues a certificate that is fresh from *its* now, so the renewal pass must
+	// get one whose notAfter really is later than the live certificate's -- download refuses
+	// to deploy one that is not, which is correct and would otherwise mask the recovery path
+	// being tested. The clock below moves three times, and this tracks it.
+	fake.certNotAfterFn = func() time.Time { return now.Add(90 * 24 * time.Hour) }
+
+	// The broken identifier is broken at the DNS level, so an order that includes it can
+	// never be finalized. Modelling the CA as always succeeding would test a world where
+	// the fallback has nothing to protect against.
+	//
+	// This hook also records every identifier set, and it can record them reliably because
+	// NewOrder now fills newOrderDomains before calling enter.
+	const broken = "b.example.com"
+	var ordered [][]string
+	// Set once the operator has done the expected thing (repaired the DNS) so phase 3 can
+	// reach the "successful full-set issuance" that is the only thing allowed to clear the
+	// fallback record. The retry has to be a *different* certificate URL: if the fake
+	// handed back the one already live, download's idempotent backstop would short-circuit
+	// before the new certificate was ever considered.
+	fixedByName := false
+	appendedFreshCert := false
+	fake.beforeCall = func(call string) {
+		if call != "NewOrder" {
+			return
+		}
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		ordered = append(ordered, append([]string(nil), fake.newOrderDomains...))
+		if fixedByName {
+			fake.orderErr = nil
+			if !appendedFreshCert {
+				appendedFreshCert = true
+				fake.orders = append(fake.orders, terminalOrder(
+					"https://ca.test/order/2", "https://ca.test/finalize/2", "https://ca.test/cert/2"))
+				// The polling pointer is exhausted and would otherwise keep handing back the
+				// already-live order/1, which download's idempotent backstop reads as "this
+				// certificate is already deployed" and short-circuits on.
+				fake.orderIdx = len(fake.orders) - 1
+			}
+			return
+		}
+		for _, d := range fake.newOrderDomains {
+			if d == broken {
+				fake.orderErr = errors.New("CA: the authorization for " + broken + " is invalid")
+				return
+			}
+		}
+	}
+
+	// Phase 1: while the failure evidence is fresh, the reduced set holds.
+	//
+	// The certificate the degraded issuance deploys is valid for 90 days, which puts it
+	// months outside the pre-expiry window. The fallback must survive that: it is the
+	// window that gates *entering* a degradation, not staying in one. Reading it the
+	// other way cleared the fallback one pass after it was established and re-ordered the
+	// broken full set on every pass.
+	const passes = 5
+	for pass := 0; pass < passes; pass++ {
+		if err := m.Reconcile(context.Background(), cert); err != nil {
+			t.Logf("pass %d failed as expected: %v", pass, err)
+		}
+		// No backoff skip: this asserts the decision, not the timer.
+	}
+
+	countFull := func() int {
+		n := 0
+		for _, set := range ordered {
+			if len(set) == 3 {
+				n++
+			}
+		}
+		return n
+	}
+	if got := countFull(); got != 0 {
+		t.Errorf("the full identifier set was ordered %d time(s) across %d passes while b.example.com is "+
+			"permanently broken; the fallback must hold until the failure evidence ages out "+
+			"(Let's Encrypt allows 5 per exact set per 7 days). Orders: %v", got, passes, ordered)
+	}
+
+	// The evidence that justifies the reduction must still be on disk.
+	failures, err := store.ListIdentifierFailures(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failures) == 0 {
+		t.Error("the identifier failure ledger was cleared by a degraded issuance, so the next pass " +
+			"cannot tell that b.example.com is still broken")
+	}
+
+	// And the certificate that is live is the reduced one, so consecutive_failures must
+	// not have been zeroed either.
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ConsecutiveFailures == 0 {
+		t.Error("consecutive_failures was reset by a degraded issuance, which re-arms the fallback trigger " +
+			"and lets the next pass re-order the full set")
+	}
+	fb, err := store.GetFallback(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fb == nil {
+		t.Fatal("the fallback record must survive while the degraded certificate is serving")
+	}
+	// The record keeps when the degradation started rather than being refreshed by every
+	// pass, so "degraded for three days" stays answerable.
+	if !fb.Since.Equal(fixed) {
+		t.Errorf("fallback since = %s, want the original %s: a refreshed timestamp makes the "+
+			"duration of the degradation unreadable", fb.Since, fixed)
+	}
+
+	// Phase 2: once the failure evidence ages past the window, the degradation is over in
+	// the sense that matters for *planning* -- the reduced set stops being forced -- but
+	// nothing is ordered yet: this certificate is 90 days old-in-hand and its renewal time
+	// is notAfter - renewBefore, 60 days out. The retry is bounded by evidence AND by the
+	// renewal window, so an aged-out ledger does not become an hourly full-set order.
+	now = fixed.Add(48 * time.Hour) // past fallbackPolicy's 24h FailureWindowDur
+	before := countFull()
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Logf("recovery pass returned: %v", err)
+	}
+	if got := countFull() - before; got != 0 {
+		t.Errorf("the aged-out evidence produced %d full-set order(s) while the replacement certificate is "+
+			"nowhere near renewal; the renewal window, not the ledger, decides when to try again "+
+			"(orders: %v)", got, ordered)
+	}
+	fb2, err := store.GetFallback(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fb2 == nil {
+		t.Fatal("the fallback record must survive while the degraded certificate is still the one serving: " +
+			"it is the only record that names are missing")
+	}
+
+	// Phase 3: at the renewal time the full set is attempted again -- that is the
+	// self-healing entry point -- and only a successful full-set issuance clears the
+	// record. Trying is not recovery: clearing it on the attempt would make the next pass
+	// order the full set again, once per backoff window, for a name that is still broken.
+	now = fixed.Add(65 * 24 * time.Hour) // past notAfter - renewBefore (60 days)
+	fixedByName = true                   // the fault the fallback was protecting against is gone
+	before = countFull()
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Logf("renewal pass returned: %v", err)
+	}
+	if got := countFull() - before; got != 1 {
+		t.Fatalf("the renewal pass must order the full set exactly once, got %d (orders: %v)", got, ordered)
+	}
+	last := ordered[len(ordered)-1]
+	if len(last) != 3 {
+		t.Fatalf("the final order must carry the full identifier set, got %v", last)
+	}
+	fb3, err := store.GetFallback(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fb3 != nil {
+		t.Errorf("a successful full-set issuance is the recovery signal, so the fallback record must be "+
+			"cleared, got %+v", fb3)
 	}
 }
 

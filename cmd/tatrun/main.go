@@ -52,7 +52,7 @@ func run() error {
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "tat.tencentcloudapi.com"
 
-	client, err := tat.NewClient(common.NewCredential(secretID, secretKey), *region, cpf)
+	client, err := newTATClient(common.NewCredential(secretID, secretKey), *region, cpf)
 	if err != nil {
 		return fmt.Errorf("build TAT client: %w", err)
 	}
@@ -60,17 +60,7 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	runReq := tat.NewRunCommandRequest()
-	// TAT requires Content to be base64 encoded. Passing plaintext reports
-	// InvalidParameterValue ... parameter `Content` is not valid.
-	runReq.Content = common.StringPtr(base64.StdEncoding.EncodeToString([]byte(*command)))
-	runReq.InstanceIds = []*string{common.StringPtr(*instance)}
-	runReq.CommandName = common.StringPtr("wecert-e2e")
-	runReq.Timeout = common.Uint64Ptr(uint64(timeout.Seconds()))
-	// No reason to keep a test command on record in TAT.
-	runReq.SaveCommand = common.BoolPtr(false)
-
-	runResp, err := client.RunCommandWithContext(ctx, runReq)
+	runResp, err := client.RunCommandWithContext(ctx, buildRunCommand(*command, *instance, *timeout))
 	if err != nil {
 		return fmt.Errorf("RunCommand (check the tat:RunCommand permission, and whether the CVM has the TAT agent installed): %w", err)
 	}
@@ -89,7 +79,28 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "TAT command submitted (invocation=%s), waiting for it to run...\n", invocationID)
 	}
 
-	deadline := time.Now().Add(*timeout)
+	return waitForTask(ctx, client, invocationID, *timeout, *interval, *quiet)
+}
+
+// tatAPI is the slice of the TAT client this command uses, so the poll loop below can be
+// driven without a live Tencent Cloud account.
+type tatAPI interface {
+	RunCommandWithContext(ctx context.Context, req *tat.RunCommandRequest) (*tat.RunCommandResponse, error)
+	DescribeInvocationTasksWithContext(ctx context.Context, req *tat.DescribeInvocationTasksRequest) (*tat.DescribeInvocationTasksResponse, error)
+}
+
+// newTATClient builds the TAT client. A package variable so tests can substitute a fake;
+// production code never reassigns it.
+var newTATClient = func(cred common.CredentialIface, region string, cpf *profile.ClientProfile) (tatAPI, error) {
+	return tat.NewClient(cred, region, cpf)
+}
+
+// waitForTask polls until the invocation reaches a terminal status.
+//
+// Split out of run() so the status table -- which is the whole point of this command, and where
+// an omission once turned "the CVM has no TAT agent" into "timed out" -- is testable.
+func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeout, interval time.Duration, quiet bool) error {
+	deadline := time.Now().Add(timeout)
 	for {
 		task, err := fetchTask(ctx, client, invocationID)
 		if err != nil {
@@ -105,7 +116,7 @@ func run() error {
 					out = deref(task.TaskResult.Output)
 					exitCode = derefI64(task.TaskResult.ExitCode)
 				}
-				if !*quiet {
+				if !quiet {
 					fmt.Fprintf(os.Stderr, "--- command output (exit=%d) ---\n", exitCode)
 				}
 				fmt.Print(out)
@@ -114,7 +125,13 @@ func run() error {
 				}
 				return nil
 
-			case "FAILED", "TIMEOUT":
+			case "FAILED", "TIMEOUT", "TASK_TIMEOUT", "START_FAILED", "DELIVER_FAILED", "CANCELLED", "TERMINATED":
+				// Every terminal-but-not-successful status the API defines, not just the
+				// two obvious ones. Anything omitted here keeps the poll loop running
+				// until the deadline and then reports "timed out waiting for the TAT
+				// result" -- which for START_FAILED/DELIVER_FAILED (a CVM with no TAT
+				// agent installed) sends the operator looking for a timeout that never
+				// happened, when the server already said exactly what was wrong.
 				if task.TaskResult != nil {
 					fmt.Print(deref(task.TaskResult.Output))
 				}
@@ -128,13 +145,29 @@ func run() error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(*interval):
+		case <-time.After(interval):
 		}
 	}
 }
 
+// buildRunCommand assembles the RunCommand request.
+//
+// Split out because TAT has one non-obvious requirement: Content must be base64 encoded, and
+// passing plaintext is rejected with InvalidParameterValue ... parameter `Content` is not valid,
+// which reads like a permission problem.
+func buildRunCommand(command, instance string, timeout time.Duration) *tat.RunCommandRequest {
+	req := tat.NewRunCommandRequest()
+	req.Content = common.StringPtr(base64.StdEncoding.EncodeToString([]byte(command)))
+	req.InstanceIds = []*string{common.StringPtr(instance)}
+	req.CommandName = common.StringPtr("wecert-e2e")
+	req.Timeout = common.Uint64Ptr(uint64(timeout.Seconds()))
+	// No reason to keep a test command on record in TAT.
+	req.SaveCommand = common.BoolPtr(false)
+	return req
+}
+
 // fetchTask looks up the execution result by invocation-id; (nil, nil) means no task record yet.
-func fetchTask(ctx context.Context, client *tat.Client, invocationID string) (*tat.InvocationTask, error) {
+func fetchTask(ctx context.Context, client tatAPI, invocationID string) (*tat.InvocationTask, error) {
 	req := tat.NewDescribeInvocationTasksRequest()
 	req.Filters = []*tat.Filter{{
 		Name:   common.StringPtr("invocation-id"),

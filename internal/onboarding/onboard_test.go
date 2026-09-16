@@ -775,6 +775,108 @@ func TestGuardOneAcceptsANameServedByAWildcardRule(t *testing.T) {
 	}
 }
 
+// Guard 1 must accept a wildcard declaration when a wildcard rule serves it.
+//
+// The check used to test only d.Hostname, so `_wecert.example.com wildcard=1` was
+// rejected unless something served the bare apex -- even though *.example.com (the rule
+// and the wildcard being declared) was served the whole time. When that was the only
+// declaration the round then froze on "the desired state came out empty".
+func TestGuardOneAcceptsAWildcardServedByAWildcardRule(t *testing.T) {
+	h := newHarness(t, Options{RequireRule: true})
+
+	h.decls.raw = []RawDeclaration{
+		{Zone: "example.com", Record: DeclarationPrefix + "example.com", Values: []string{"wildcard=1"}},
+	}
+	h.rules.domains = []string{"*.example.com"}
+
+	rep := h.run(t)
+
+	if rep.Frozen() {
+		t.Fatalf("a wildcard declaration served by a wildcard rule must not freeze the round: %v", rep.FreezeReasons)
+	}
+	got := h.domains(t)
+	if len(got) != 2 || got[0] != "example.com" || got[1] != "*.example.com" {
+		t.Fatalf("domain set = %v, want [example.com *.example.com]", got)
+	}
+}
+
+// A declaration that guard 1 excludes must not dictate the group's settings.
+//
+// It was excluded precisely because nothing serves it, so its profile/keyType/deploy
+// describe a certificate that is not being built. Letting it win silently moved a served
+// certificate onto a different profile -- with a different SAN cap and renewal window --
+// while the report said the declaration had been left out.
+func TestExcludedDeclarationDoesNotSetTheGroupProfile(t *testing.T) {
+	h := newHarness(t, Options{Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256, RequireRule: true})
+
+	// www is served; staging is declared with a different profile but has no rule.
+	h.decls.raw = []RawDeclaration{
+		decl("www.example.com"),
+		decl("staging.example.com", "profile=tlsserver"),
+	}
+	h.rules.domains = []string{"www.example.com"}
+
+	rep := h.run(t)
+
+	if d, ok := decisionFor(rep, "staging.example.com"); !ok || d.Included {
+		t.Fatalf("staging.example.com should have been excluded by guard 1, got %+v", d)
+	}
+	c := h.document(t).Certificates[0]
+	if c.Profile != config.ProfileClassic {
+		t.Errorf("profile = %q, want %q: the excluded declaration's profile must not be applied",
+			c.Profile, config.ProfileClassic)
+	}
+	if len(c.Domains) != 1 || c.Domains[0] != "www.example.com" {
+		t.Errorf("domains = %v, want [www.example.com]", c.Domains)
+	}
+}
+
+// Two excluded declarations that disagree must not freeze the round.
+//
+// groupSettings reports a conflict when declarations for one registered domain disagree
+// on profile/keyType/deploy. Excluded declarations used to be aggregated anyway, so two
+// unserved names with different profiles made every served name in that group ineligible
+// and the round froze on "the desired state came out empty" -- an outage caused entirely
+// by declarations that were supposed to have no effect.
+func TestExcludedDeclarationsDoNotFreezeTheRound(t *testing.T) {
+	h := newHarness(t, Options{Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256, RequireRule: true})
+
+	h.decls.raw = []RawDeclaration{
+		decl("www.example.com"),
+		decl("a.example.com", "profile=tlsserver"),
+		decl("b.example.com", "profile=classic"),
+	}
+	h.rules.domains = []string{"www.example.com"}
+
+	rep := h.run(t)
+
+	if rep.Frozen() {
+		t.Fatalf("conflicting *excluded* declarations must not freeze the round: %v", rep.FreezeReasons)
+	}
+	if got := h.domains(t); len(got) != 1 || got[0] != "www.example.com" {
+		t.Fatalf("domain set = %v, want [www.example.com]", got)
+	}
+}
+
+// An accepted declaration must still win, so the fix above cannot have disabled the
+// feature: settings from a declaration that really is part of the certificate still apply.
+func TestAcceptedDeclarationStillSetsTheGroupProfile(t *testing.T) {
+	h := newHarness(t, Options{Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256, RequireRule: true})
+
+	h.decls.raw = []RawDeclaration{
+		decl("www.example.com", "profile=tlsserver"),
+		decl("staging.example.com", "profile=classic"), // excluded: no rule
+	}
+	h.rules.domains = []string{"www.example.com"}
+
+	h.run(t)
+
+	c := h.document(t).Certificates[0]
+	if c.Profile != config.ProfileTLSServer {
+		t.Errorf("profile = %q, want %q from the accepted declaration", c.Profile, config.ProfileTLSServer)
+	}
+}
+
 func TestGroupSettingsConflictKeepsPreviousCertificate(t *testing.T) {
 	h := newHarness(t, Options{Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256})
 	h.rules.domains = []string{"api.example.com", "www.example.com"}

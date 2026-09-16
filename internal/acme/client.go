@@ -16,8 +16,23 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
+// userAgentVersion is the version reported to the CA. main sets it from the same -ldflags
+// value as `wecert -version`, so an ACME-side log lines up with the binary that sent the
+// request instead of naming a release that has been superseded for months.
+var userAgentVersion = "dev"
+
+// SetUserAgentVersion records the running version for the ACME User-Agent.
+// Call once at startup, before any request.
+func SetUserAgentVersion(v string) {
+	if v != "" {
+		userAgentVersion = v
+	}
+}
+
 // userAgent shows up in ACME requests, so it lines up with the logs when troubleshooting.
-const userAgent = "wecert/0.1 (+https://github.com/susunola/wecert)"
+func userAgent() string {
+	return "wecert/" + userAgentVersion + " (+https://github.com/susunola/wecert)"
+}
 
 // NewHTTPClient builds the HTTP client used for ACME.
 func NewHTTPClient(timeout time.Duration) *http.Client {
@@ -48,7 +63,7 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 		if err != nil {
 			return nil, fmt.Errorf("parse the stored account key: %w", err)
 		}
-		core, err := api.New(httpClient, userAgent, directory, acc.KID, key)
+		core, err := api.New(httpClient, userAgent(), directory, acc.KID, key)
 		if err != nil {
 			return nil, fmt.Errorf("initialise the ACME client: %w", err)
 		}
@@ -61,7 +76,7 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 		return nil, fmt.Errorf("generate the account key: %w", err)
 	}
 
-	core, err := api.New(httpClient, userAgent, directory, "", key)
+	core, err := api.New(httpClient, userAgent(), directory, "", key)
 	if err != nil {
 		return nil, fmt.Errorf("initialise the ACME client: %w", err)
 	}
