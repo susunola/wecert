@@ -26,10 +26,25 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # yet; keep this list in sync when it lands.
 CMDS := wecert wecert-onboard
 
-.PHONY: build tools release test test-race vet cover clean fmt validate-cloudinit check-english fmt-check check diagrams diagrams-check
+.PHONY: build build-lego-dns tools release test test-race vet cover clean fmt validate-cloudinit check-english fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
+
+# The same binary with lego's full DNS provider registry (~198 providers).
+#
+# Opt-in because the registry imports hundreds of third-party SDKs (Azure, AWS, Huawei, Yandex,
+# Oracle, Akamai, ...), which is a large amount of code to add to the supply chain of a program
+# that holds private keys -- and it would multiply the size of the default binary. The first
+# build with this tag therefore has to fetch all of them:
+#
+#	go mod tidy   # once, with the tag in effect, to populate go.sum
+#
+# Without that the build fails with "missing go.sum entry" for whichever provider module is
+# reached first, which is the honest outcome: a dependency cannot enter the binary without
+# being recorded.
+build-lego-dns:
+	$(GO) build -tags lego_dns -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
 
 # Six PNGs per language, embedded in the readme.
 #

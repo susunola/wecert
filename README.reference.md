@@ -552,6 +552,36 @@ Deletion is deliberately an order of magnitude more conservative than addition: 
 | `probe` | no | enabled | Network-side verification that the deployed certificate is the one actually being served |
 | `certificates` | static/observe only | — | At least one. Must be **empty** when `desiredState.mode` is `enforce` |
 
+### DNS providers
+
+Two providers are built in, and they cover the deployment this program exists for:
+
+| `dns.provider` | Credentials | Notes |
+|---|---|---|
+| `dnspod` | `dns.loginToken` (a DNSPod API token, not a CAM key) | The original path; the token never expires |
+| `tencentcloud` | Tencent Cloud CAM (`tencent.*`), including a CVM role | Rebuilds the client per call, so it never uses expired credentials |
+
+**Any of lego's ~198 DNS providers is available behind a build tag.** Set `dns.provider: lego`
+and `dns.legoProvider: <name>` (e.g. `cloudflare`, `route53`, `alidns`); the provider then reads
+its own credentials from the environment using lego's documented variable names, which is why no
+per-provider configuration exists here — a generic credential map would have to mirror 198
+different schemas that lego already defines.
+
+```bash
+make build-lego-dns        # or: go build -tags lego_dns ./cmd/wecert
+```
+
+The tag is opt-in rather than the default, and the reason is dependency surface rather than
+effort: lego's registry imports all 198 provider packages, and between them they pull in hundreds
+of third-party modules (the Azure and AWS SDKs, Huawei, Yandex, Oracle, Akamai, …). Compiling
+them in multiplies the size of the default binary and adds all of that code to the supply chain
+of a program whose job is holding private keys. The first tagged build therefore needs
+`go mod tidy` to record the new dependencies in `go.sum` — if a module is missing, the build says
+so rather than silently omitting the provider.
+
+A default binary asked for `dns.provider: lego` fails at config load with the rebuild
+instruction, not later when the solver is constructed.
+
 ### `acme`
 
 | Field | Required | Description |

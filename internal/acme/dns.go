@@ -99,6 +99,12 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 			})
 		}
 
+	case config.DNSProviderLego:
+		// Any provider from lego's registry, by name, with its credentials taken from the
+		// environment in lego's own variable names. See the build-tag files for why this is
+		// opt-in rather than always compiled in.
+		newProvider = newLegoProvider(dnsCfg.LegoProvider)
+
 	default:
 		return nil, fmt.Errorf("unknown dns.provider %q", dnsCfg.Provider)
 	}
