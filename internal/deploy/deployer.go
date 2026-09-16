@@ -49,7 +49,13 @@ type Deployer interface {
 	//
 	// Finding no binding does not mean failure -- returning 0 is fine. Callers use that to
 	// tell "not bound yet" apart from "cannot query".
-	Bindings(ctx context.Context, certID string) (int, error)
+	//
+	// complete says whether the count is the whole answer. It is false when at least one
+	// region's enumeration failed, or when the API returned no task to read, and then count is a
+	// LOWER BOUND: non-zero still proves something is bound, while zero proves nothing. The deploy
+	// recovery path treats "the old certificate has 0 bindings" as "the switch happened but was
+	// not recorded" and reports success on it, so an incomplete zero must never reach it.
+	Bindings(ctx context.Context, certID string) (count int, complete bool, err error)
 }
 
 // RetryableDeployer can resume a deployment after an earlier call uploaded the
@@ -85,4 +91,4 @@ func (Noop) Delete(_ context.Context, certID string) error {
 }
 
 // Bindings is always 0: Noop deploys nowhere, so there is nothing to bind.
-func (Noop) Bindings(_ context.Context, _ string) (int, error) { return 0, nil }
+func (Noop) Bindings(_ context.Context, _ string) (int, bool, error) { return 0, true, nil }

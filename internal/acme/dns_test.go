@@ -56,7 +56,7 @@ func TestConfiguredDiscoveryUsesOneResolverViewAndAuthoritativeTXT(t *testing.T)
 		t.Fatalf("findZone = %q, %v", zone, err)
 	}
 	servers, err := solver.authoritativeNS(context.Background(), zone)
-	if err != nil || len(servers) != 1 || servers[0] != authority {
+	if err != nil || len(servers) != 1 || servers[0].addr != authority {
 		t.Fatalf("authoritativeNS = %v, %v", servers, err)
 	}
 	results := solver.probeRecords(servers, []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}})
@@ -71,7 +71,7 @@ func TestConfiguredDiscoveryUsesOneResolverViewAndAuthoritativeTXT(t *testing.T)
 }
 
 func TestNonAuthoritativeTXTResponseDoesNotPassPropagation(t *testing.T) {
-	ready, summary := probeReadyWithExchange([]string{"192.0.2.53:53"}, "_acme-challenge.example.com.", "wanted", func(msg *dns.Msg, _ string) (*dns.Msg, error) {
+	ready, summary := probeReadyWithExchange(oneAuthority("192.0.2.53:53"), "_acme-challenge.example.com.", "wanted", func(msg *dns.Msg, _ string) (*dns.Msg, error) {
 		return dnsReply(msg, &dns.TXT{Hdr: dns.RR_Header{Name: "_acme-challenge.example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{"wanted"}}), nil
 	})
 	if ready {
@@ -568,4 +568,17 @@ func TestLeaseRegistrationHoldsTheNameLock(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("addUnderLock never completed after the mutex was released")
 	}
+}
+
+// oneAuthority builds a single NS name whose addresses are the given ones.
+//
+// The confirmation rule counts NS names, so a test that wants "two independent servers" has to say
+// whether its addresses belong to one name or two -- which is exactly the distinction the rule is
+// about.
+func oneAuthority(addrs ...string) []nsServer {
+	out := make([]nsServer, 0, len(addrs))
+	for _, a := range addrs {
+		out = append(out, nsServer{ns: "ns1.example.net.", addr: a})
+	}
+	return out
 }

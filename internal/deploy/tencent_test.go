@@ -151,8 +151,12 @@ func TestCountBindingsDone(t *testing.T) {
 	if !done {
 		t.Fatal("Status=1 with results populated should be judged done")
 	}
-	if n != 3 {
-		t.Errorf("count = %d, want 3", n)
+	if n.count != 3 {
+		t.Errorf("count = %d, want 3", n.count)
+	}
+	if !n.complete {
+		t.Error("every region answered, so the count is the whole answer -- complete must be true, " +
+			"otherwise the callers that refuse to act on a partial count become useless")
 	}
 }
 
@@ -174,8 +178,8 @@ func TestCountBindingsEmptyResultIsNotDone(t *testing.T) {
 	if done {
 		t.Error("an empty result list must keep waiting, otherwise a bound certificate is judged unbound")
 	}
-	if n != 0 {
-		t.Errorf("count should be 0 when not done, got %d", n)
+	if n.count != 0 {
+		t.Errorf("count should be 0 when not done, got %d", n.count)
 	}
 }
 
@@ -207,7 +211,13 @@ func TestCountBindingsSurfacesTaskError(t *testing.T) {
 
 // When a region's query fails, that region's number cannot be trusted and must not be
 // added in.
-func TestCountBindingsSkipsErroredRegion(t *testing.T) {
+// An errored region must not be counted -- and must not be silently forgotten either.
+//
+// This test used to assert only "total == 2, done == true", which is exactly the shape that made
+// DeployUploaded's repair path treat a half-enumerated answer as "the old certificate is bound
+// nowhere" and report a half-finished switch as done. The count is still 2; what is new is that the
+// answer says it is incomplete, so the callers that must not act on a partial zero can tell.
+func TestCountBindingsMarksAnErroredRegionAsIncomplete(t *testing.T) {
 	resp := &ssl.DescribeCertificateBindResourceTaskResultResponse{
 		Response: &ssl.DescribeCertificateBindResourceTaskResultResponseParams{
 			SyncTaskBindResourceResult: []*ssl.SyncTaskBindResourceResult{{
@@ -228,8 +238,12 @@ func TestCountBindingsSkipsErroredRegion(t *testing.T) {
 	if err != nil || !done {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
-	if n != 2 {
-		t.Errorf("an errored region should not be counted, count = %d, want 2", n)
+	if n.count != 2 {
+		t.Errorf("an errored region should not be counted, count = %d, want 2", n.count)
+	}
+	if n.complete {
+		t.Error("a region whose query failed was not counted, so this is a LOWER BOUND; reporting it " +
+			"as complete is what lets a partial answer be read as the number zero")
 	}
 }
 

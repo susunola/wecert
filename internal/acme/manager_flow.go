@@ -224,7 +224,7 @@ func (m *Manager) solveChallenges(
 		switch cur.Status {
 		case "valid":
 			if err := m.store.PutAuthorization(a); err != nil {
-				return false, err
+				return false, m.recordFailure(st, fmt.Errorf("persist a validated authorization (%s): %w", a.Identifier, err))
 			}
 			continue
 		case "invalid":
@@ -278,6 +278,15 @@ func (m *Manager) solveChallenges(
 			// Refreshing it loses the older token, not the older record: the provider's
 			// cleanup deletes every TXT at the name in one call.
 			firstVisit := a.ChallengeToken == ""
+			// A different challenge has never been POSTed, whatever the old row said. ChallengeSent
+			// belongs to the challenge it was set for, and this row has just been pointed at
+			// another one: keeping the flag true makes phase 3 skip it (`if a.ChallengeSent {
+			// continue }`), so the new challenge is written to DNS, never accepted, and the order
+			// sits pending until it expires -- up to the 7-day order TTL -- with no counter saying
+			// so. markResumedUnpresented clears Presented for the same reason and forgot this one.
+			if a.ChallengeToken != chlg.Token {
+				a.ChallengeSent = false
+			}
 			a.ChallengeURL = chlg.URL
 			a.ChallengeToken = chlg.Token
 
@@ -289,7 +298,7 @@ func (m *Manager) solveChallenges(
 				// way to locate that record again (the probe right below relies on it,
 				// and so does cleanupOrphanTXT).
 				if err := m.store.PutAuthorization(a); err != nil {
-					return false, err
+					return false, m.recordFailure(st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
 				}
 			} else {
 				// Been here before: an earlier pass was interrupted between the DNS write
@@ -337,7 +346,7 @@ func (m *Manager) solveChallenges(
 		}
 
 		if err := m.store.PutAuthorization(a); err != nil {
-			return false, err
+			return false, m.recordFailure(st, fmt.Errorf("persist a presented challenge (%s): %w", a.Identifier, err))
 		}
 		records = append(records, DNSRecord{FQDN: a.TxtName, Value: a.TxtValue})
 		pending = append(pending, a)
@@ -376,7 +385,10 @@ func (m *Manager) solveChallenges(
 		}
 		a.ChallengeSent = true
 		if err := m.store.PutAuthorization(a); err != nil {
-			return false, err
+			// The challenge WAS accepted; only the record of it failed. Counting the pass as a
+			// failure is still right: without the row, the next pass cannot tell that this
+			// challenge is already in flight, and the pass has not finished its job.
+			return false, m.recordFailure(st, fmt.Errorf("persist that a challenge was accepted (%s): %w", a.Identifier, err))
 		}
 	}
 
@@ -397,6 +409,9 @@ func (m *Manager) solveChallenges(
 func (m *Manager) markResumedUnpresented(certName string, resumed []*state.Authorization) {
 	for _, a := range resumed {
 		a.Presented = false
+		// ChallengeSent is deliberately NOT cleared here: this pass re-presents the SAME challenge,
+		// so if it was already accepted that is still true. It is cleared where the row is pointed
+		// at a different challenge, which is the only event that invalidates it.
 		if err := m.store.PutAuthorization(a); err != nil {
 			m.log.Warn("failed to mark a resumed authorization unpresented",
 				"cert", certName, "identifier", a.Identifier, "err", err)
@@ -753,7 +768,10 @@ func (m *Manager) awaitOrderStatus(
 		}
 
 		if m.now().After(deadline) {
-			return last, fmt.Errorf("the order did not reach %q within %s (currently %q)", timeout, want, o.Status)
+			// The argument order matters and nothing checks it: %q accepts a time.Duration (it is
+			// a string verb, and Duration has a String method), so swapping the first two produced
+			// `did not reach "3m0s" within ready` with go vet still clean.
+			return last, fmt.Errorf("the order did not reach %q within %s (currently %q)", want, timeout, o.Status)
 		}
 		select {
 		case <-ctx.Done():

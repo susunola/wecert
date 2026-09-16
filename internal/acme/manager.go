@@ -628,9 +628,20 @@ func (m *Manager) bindingCheckDue(certName string) bool {
 // "waiting for a human to bind it once in the CLB console", it is not an error, so it
 // records no failure and enters no backoff.
 func (m *Manager) confirmBinding(ctx context.Context, c *config.Certificate, st *state.CertState) error {
-	n, err := m.deployer.Bindings(ctx, st.DeployedCertID)
+	n, complete, err := m.deployer.Bindings(ctx, st.DeployedCertID)
 	if err != nil {
 		return err
+	}
+
+	if n == 0 && !complete {
+		// Not the same answer as "not bound": at least one region's enumeration failed, so a
+		// human may well have bound it. Saying "bind it once in the CLB console" here would send
+		// the operator to do something they have already done, so the two cases are kept apart
+		// and this one is only logged.
+		m.log.Warn("could not enumerate every region this certificate could be bound in; "+
+			"leaving the binding unconfirmed and re-checking later",
+			"cert", c.Name, "certId", st.DeployedCertID)
+		return nil
 	}
 
 	if n == 0 {

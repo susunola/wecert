@@ -213,10 +213,22 @@ func Open(path string) (*Store, error) { return open(path, true) }
 
 // OpenUnlocked opens the state database but does **not** take the exclusive lock.
 //
-// Only for the one-shot validation path (-dry-run): it almost always runs while the
-// daemon is up, and "you cannot even validate the config because the daemon is
-// running" pushes people into editing the config blindly. This path only reads the
-// existing ACME account and initiates no issuance, so skipping the lock is safe.
+// For the tools that have to work while the daemon holds it -- `-dry-run`, `-revoke`,
+// wecert-preflight, wecert-clbverify. "You cannot even validate the config because the daemon is
+// running" pushes people into editing it blindly, and a revocation that has to wait for a restart
+// is worse than one that lands now.
+//
+// These callers are NOT read-only, and the earlier claim here that they were was simply wrong:
+// `-revoke` records a revocation request (cmd/wecert/revoke.go) and `-dry-run` registers the ACME
+// account on a first run (acme.EnsureAccount). What makes the unlocked path safe is not the absence
+// of writes -- it is that none of them need serialising against a pass.
+//
+// What it must not do is migrate. `migrate` is a CREATE TABLE batch plus a check-then-act
+// `ALTER TABLE ... ADD COLUMN`, so without the lock two processes can pass the "does this column
+// exist?" check together and the loser aborts the entire open with `duplicate column name` -- the
+// "two processes initialising at once, hardest to diagnose" case the locking comment below is
+// about. An unlocked open therefore VERIFIES the schema and refuses with an instruction, rather
+// than changing it.
 func OpenUnlocked(path string) (*Store, error) { return open(path, false) }
 
 // LockFile takes the cross-process exclusive lock described in Store.lock on an
@@ -273,7 +285,7 @@ func open(path string, exclusive bool) (*Store, error) {
 		}
 	}
 
-	s, err := openFiles(path, lock, existedBefore, lockExisted)
+	s, err := openFiles(path, lock, existedBefore, lockExisted, exclusive)
 	if err != nil {
 		_ = lock.release()
 		return nil, err
@@ -291,7 +303,7 @@ func open(path string, exclusive bool) (*Store, error) {
 //
 // existedBefore/lockExisted are the two facts open() has to sample before the
 // pre-create below makes them unanswerable; see missingDatabaseWarning.
-func openFiles(path string, lock *fileLock, existedBefore, lockExisted bool) (*Store, error) {
+func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigrate bool) (*Store, error) {
 	restore := restrictiveUmask()
 	defer restore()
 
@@ -363,9 +375,27 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted bool) (*S
 		return nil, err
 	}
 
-	if err := s.migrate(); err != nil {
+	if mayMigrate {
+		if err := s.migrate(); err != nil {
+			db.Close()
+			return nil, err
+		}
+	} else if pending, err := s.pendingMigrations(); err != nil {
 		db.Close()
 		return nil, err
+	} else if len(pending) > 0 {
+		db.Close()
+		//lint:ignore ST1005 the second paragraph of a multi-line operator instruction is a
+		// sentence; capitalising it is the point, and the first paragraph still starts lowercase.
+		return nil, fmt.Errorf(
+			"the state database %s needs a schema update (%s), and this command opens it without "+
+				"the cross-process lock:\n"+
+				"       migrating from here could race the daemon's own migration -- two processes "+
+				"passing the same 'does this column exist?' check is how a database ends up with an "+
+				"opaque 'duplicate column name' error and a half-applied schema.\n"+
+				"       Run the daemon once (it migrates on startup), or stop it and re-run this "+
+				"command. See docs/recovery.md.",
+			path, strings.Join(pending, ", "))
 	}
 
 	// -wal / -shm only really appear after migrate, so tighten all permissions once.
@@ -729,21 +759,48 @@ CREATE TABLE IF NOT EXISTS rate_buckets (
 	// patch old databases separately. The package-level warning -- "losing it means
 	// hitting the rate limit" -- applies here too: on upgrade, one extra migration
 	// step is always better than demanding that users delete and rebuild the database.
-	for _, m := range []struct{ table, column, decl string }{
-		{"certificates", "deploy_confirmed", "INTEGER NOT NULL DEFAULT 0"},
-		{"orders", "identifiers", "TEXT NOT NULL DEFAULT ''"},
-		{"orders", "deployment_cert_id", "TEXT NOT NULL DEFAULT ''"},
-		// Rollback material. Legacy rows keep NULL: there is nothing to recover for a
-		// certificate retired before wecert started archiving, and inventing an empty
-		// value would look like a usable (empty) certificate.
-		{"retired_certificates", "cert_pem", "BLOB"},
-		{"retired_certificates", "key_pem", "BLOB"},
-	} {
+	for _, m := range schemaColumns {
 		if err := s.ensureColumn(m.table, m.column, m.decl); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// schemaColumns are the columns added to tables that predate them.
+//
+// Declared as data, and read by both migrate (which adds them) and pendingMigrations (which only
+// reports them), so the unlocked open cannot drift into believing a database is current when it is
+// not. A missing column here is a missing migration on both paths at once, which the daemon's own
+// migrate call still applies -- the unlocked path simply keeps refusing.
+var schemaColumns = []struct{ table, column, decl string }{
+	{"certificates", "deploy_confirmed", "INTEGER NOT NULL DEFAULT 0"},
+	{"orders", "identifiers", "TEXT NOT NULL DEFAULT ''"},
+	{"orders", "deployment_cert_id", "TEXT NOT NULL DEFAULT ''"},
+	// Rollback material. Legacy rows keep NULL: there is nothing to recover for a
+	// certificate retired before wecert started archiving, and inventing an empty
+	// value would look like a usable (empty) certificate.
+	{"retired_certificates", "cert_pem", "BLOB"},
+	{"retired_certificates", "key_pem", "BLOB"},
+}
+
+// pendingMigrations reports schema changes this binary would apply, without applying them.
+//
+// It is what an unlocked open uses instead of migrating. Check-then-act ALTER TABLE is not safe
+// between processes, and the loser of that race aborts the whole open with `duplicate column name`,
+// which names neither the cause nor the fix.
+func (s *Store) pendingMigrations() ([]string, error) {
+	var out []string
+	for _, m := range schemaColumns {
+		exists, err := s.columnExists(m.table, m.column)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			out = append(out, m.table+"."+m.column)
+		}
+	}
+	return out, nil
 }
 
 // ensureColumn adds a column to a table (when it does not already exist).
@@ -1218,7 +1275,16 @@ func (s *Store) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) 
 	_, err := s.db.Exec(`
 		INSERT INTO retired_certificates (cert_id, cert_name, retired_at, cert_pem, key_pem)
 		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(cert_id) DO NOTHING`,
+		ON CONFLICT(cert_id) DO UPDATE SET
+		    -- The first writer may have had nothing to archive. The orphan path records a
+		    -- certificate it merely uploaded, with NULL material; the retirement path records the
+		    -- one that was actually serving, with the fullchain and key. DO NOTHING let whichever
+		    -- arrived first win, so a row could keep two NULLs and the documented manual rollback
+		    -- (docs/recovery.md) had nothing to restore. COALESCE keeps real material from being
+		    -- overwritten by a later empty write, and lets it be filled in when the empty write
+		    -- came first.
+		    cert_pem = COALESCE(EXCLUDED.cert_pem, retired_certificates.cert_pem),
+		    key_pem  = COALESCE(EXCLUDED.key_pem,  retired_certificates.key_pem)`,
 		certID, certName, time.Now().Unix(), certPEM, keyPEM)
 	if err != nil {
 		return fmt.Errorf("add retired cert %s: %w", certID, err)

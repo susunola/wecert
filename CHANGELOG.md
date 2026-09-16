@@ -2,6 +2,89 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A deployment could be recorded as complete from an answer it never got.** The bind-resource
+  enumeration reported "0 bound resources, finished" when a region's query had failed inside the
+  task, and the deploy recovery path reads exactly that zero as "the old certificate is bound
+  nowhere, so the switch must have happened" — so a half-finished switch could be recorded as done,
+  with some listeners still on the old certificate and nothing left to revisit them. The same
+  silence produced the opposite error in the other verification call ("this deploy did not happen"
+  for one that did). The count now carries whether it is the whole answer; zero from an incomplete
+  answer is refused rather than believed, and a non-zero lower bound still proves a binding (which is
+  what the periodic confirmation poll needs).
+- **Two deployment verification calls were reading the server-side cache.** The SDK documents
+  `IsCache=1` as: if a completed task exists for this certificate within the last half hour, return
+  that task's result. That is fine for the periodic "has a human bound it yet" poll and wrong for the
+  two calls that decide whether a switch took effect. They now ask for a fresh answer; the periodic
+  poll keeps the cache.
+- **Propagation checks counted IP addresses where they meant nameservers.** DNSPod's own pools
+  publish three A records per NS name and a dual-stack name publishes two, so one multi-homed
+  authority satisfied "at least two independent confirmations" — the guard the comment promised was
+  not there. The mirror image was worse: a single-authority zone with an unreachable second address
+  could never confirm, because the "one authority is exempt" branch was keyed on the address count.
+  Confirmations are now counted per NS name.
+- **A SERVFAIL was read as "the record is not there".** Rcode was never inspected: SERVFAIL or
+  REFUSED landed in a bucket that only fed the summary line, unless the server set the authoritative
+  bit, in which case a transient failure was recorded as a denial — and a denial is what licenses
+  deleting the authorization row for a name that is still being validated. NXDOMAIN stays a denial
+  (it is a definitive answer); any other error code is now inconclusive.
+- **`exchangeDNS` threw away a usable UDP answer when the TCP retry failed.** Both attempts share the
+  caller's three-second context, so on a server that is slow on TCP — the case the retry exists for —
+  the truncated UDP answer was replaced by nil and the server counted as unreachable, discarding an
+  answer whose answer section may already have carried the record. A truncated answer is now returned
+  marked as truncated, and the probe treats it as inconclusive rather than as a denial.
+- **A late zone in the propagation wait could not succeed and was blamed for it.** Zones are processed
+  serially against one shared deadline, so a zone reached after the budget was gone got a single
+  doomed round and then an error reporting the *global* elapsed time as if it were that zone's own
+  wait — and because the zones come from a map, which one was starved changed from pass to pass. The
+  deadline is now checked before a zone is entered, and the message separates "this zone waited" from
+  "the pass had already spent".
+- **A store failure while solving a challenge skipped the failure accounting.** Four
+  `PutAuthorization` calls in `solveChallenges` (and one `PutCert` after a successful deploy) returned
+  the raw error, bypassing `recordFailure`: `ConsecutiveFailures` stayed 0, no backoff was scheduled
+  and no counter moved, so a persistent write failure — a full disk, or `SQLITE_BUSY` while another
+  process holds the write lock — was retried on every pass forever while the certificate's own
+  metrics reported a healthy zero failures.
+- **`ChallengeSent` was never cleared when the challenge changed.** The flag belongs to the challenge
+  it was set for, and phase 3 skips any row that has it, so after the CA handed back a different
+  challenge for the same authorization the new TXT was written, never announced, and the order sat
+  pending until it expired — up to the 7-day order TTL — with nothing counting it. The stale-token
+  refresh now clears it.
+- **`OpenUnlocked` migrated the schema without holding the lock.** `migrate` is a CREATE TABLE batch
+  plus a check-then-act `ALTER TABLE ... ADD COLUMN`, so two unlocked opens — `wecert -dry-run` and
+  `wecert -revoke` both use this path, and both write — could pass the same "does this column exist?"
+  check, and the loser aborted with `duplicate column name: ...`, an error that names neither the
+  cause nor the fix. The unlocked path now verifies the schema and refuses with an instruction; the
+  daemon owns migrations. Its doc comment also claimed the unlocked callers "only read", which was
+  untrue for both of them.
+- **Archived rollback material could be silently discarded.** `AddRetiredCert` used
+  `ON CONFLICT(cert_id) DO NOTHING`, so when the orphan path recorded a certificate with no material
+  before the retirement path recorded the same id with the fullchain and key, the real pair was
+  dropped and the documented manual rollback in `docs/recovery.md` had nothing to restore. It now
+  `COALESCE`s, so neither write order can lose material.
+- **`dns.pollingInterval` and `dns.propagationTimeout` had no floor.** Only "positive" was checked,
+  so `1ms` turned the propagation wait into a burst of UDP queries at the operator's own
+  authoritative nameservers, and `1s` made every fresh record fail its round and enter backoff. There
+  are now a 1s and a 30s floor plus the `polling < propagation` invariant, which the much less
+  dangerous `stateBackup.interval` has had all along.
+- **`stateBackup.enabled` did not do what its comment promised.** The comment says it defaults to true
+  where the directory is writable and false where it cannot be; `normalize` never probed anything and
+  the only caller passed a literal `true`, so a deployment with an unwritable snapshot directory
+  stayed enabled and logged an ERROR every interval forever. The decision is now made where the
+  directory is known.
+- **The order-timeout message had its two arguments swapped** — `did not reach "3m0s" within ready`.
+  Nothing catches this: `%q` is a string verb and `time.Duration` has a `String` method, so it
+  compiles and passes `go vet`.
+- `tencent.regions` and `tencent.resourceTypes` are trimmed, lowercased, deduplicated and checked for
+  empty entries, as every other list in the config already was. They are multiplied into the deploy
+  request (`types x regions`), so a duplicate was a bigger request and a typo was only found by the
+  cloud API at deploy time.
+- `deploy/systemd/wecert-once.service` claimed that being killed on timeout bumps
+  `consecutive_failures` and "manufactures a pointless alarm". It does not: `recordFailure` returns
+  early for `context.Canceled` and `context.DeadlineExceeded`. The comment was the stale artefact, not
+  the code.
+
 ### Added
 
 - **`make test-repeat`** (`-race -shuffle=on -count=3`), and the two defects it found. Two tests in
