@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- **`wecert_revocation_pending` can no longer report a false all-clear.** `PendingRevocations` used
+  to swallow a store error and return `0`, which is a meaningful answer ("nothing outstanding") — so
+  a database that could not be read looked exactly like a deployment with no outstanding revocation.
+  It now returns the error, and the reconciler leaves the gauge at its last value and counts the pass
+  in the new `wecert_revocation_query_errors_total` instead. A pending revocation is an outstanding
+  security action: the row exists because someone decided a certificate must stop being trusted.
+- **`WecertHasNotReconciledRecently` could never fire.** The rule was written against
+  `wecert_reconcile_total_created_timestamp`, which is not a series: the exposition is the classic
+  text format, which carries no `_created` timestamps at all. The expression parsed perfectly, so
+  nothing complained, and "the daemon is up and converging nothing" had no alert. It now uses the new
+  `wecert_last_reconcile_timestamp_seconds` gauge.
 - `UploadCertificate` now reads `RepeatCertId`. The SDK documents that once the same
   certificate has been uploaded more than 5000 times the API ignores `Repeatable=true` and
   returns the existing copy's ID there instead of creating another one; reading only
@@ -13,6 +24,30 @@
 
 ### Added
 
+- **`deploy/prometheus/wecert-alerts.yml`**: 17 ready-to-load alert rules in three groups
+  (`wecert.expiry`, `wecert.convergence`, `wecert.integrity`), each threshold with a comment saying
+  where the number came from. Several of the failures they watch for are silent by construction — a
+  revocation the CA never accepted, a pass that has not finished in two hours, a certificate serving
+  that is not the one deployed — so the alert is the only thing that notices.
+- **`wecert_last_reconcile_timestamp_seconds`**, stamped when a full pass finishes and never when one
+  starts, so a hung pass goes stale exactly like a dead process. `wecert_reconcile_total` could not
+  answer this: it stops moving both when nothing is due and when the loop is wedged.
+- **`wecert_revocation_query_errors_total`**, so a frozen `wecert_revocation_pending` is
+  distinguishable from a genuinely empty queue.
+- **`make sbom`** (CycloneDX, from the module graph) and **`make repro-check`** (rebuilds each
+  platform twice and compares the bytes). The first answers "what is in the binary" without resolving
+  the transitive tree by hand; the second makes "this artifact was built from that commit" checkable
+  rather than asserted.
+- **`make check-alerts`**, which fails if a rule refers to a `wecert_*` series this program does not
+  export, if two rules share a name, or if a rule has no expression. It exists because of the dead
+  alert above: a rule against a series that does not exist is syntactically perfect and can never
+  fire.
+- **`SECURITY.md`**, **`CONTRIBUTING.md`**, **`.github/CODEOWNERS`**,
+  **`.github/PULL_REQUEST_TEMPLATE.md`** and **`.github/dependabot.yml`**. The security policy states
+  its reporting channel honestly (GitHub private reporting is currently **off** in this repository, so
+  the fallback is written down instead of assumed), the contribution guide requires a test that fails
+  without the change and forbids comments the code does not back, and Dependabot is weekly with one
+  dependency per PR because a certificate renewer runs on a host nobody wants to babysit.
 - **Periodic, consistent snapshots of `state.db`** (`stateBackup`, on by default: 24h
   interval, 7 kept, beside the database). They use `VACUUM INTO`, not a file copy — the
   database runs in WAL mode, so a copy of `state.db` alone can miss the order URL committed

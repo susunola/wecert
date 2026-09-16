@@ -49,10 +49,12 @@ type fakeManager struct {
 	// quotaScopes records every PublishQuota call.
 	quotaScopes []map[string]string
 
-	// pendingRevocations drives HasPendingRevocations, and revocationRetries counts the
-	// retry calls, so a test can assert the gate is honoured.
-	pendingRevocations int
-	revocationRetries  int
+	// pendingRevocations drives PendingRevocations, and revocationRetries counts the
+	// retry calls, so a test can assert the gate is honoured. pendingRevocationsErr makes the
+	// read fail, to prove a failed read is not published as "nothing outstanding".
+	pendingRevocations    int
+	pendingRevocationsErr error
+	revocationRetries     int
 
 	// onReconcile fires on every Reconcile, so tests can cancel and so on.
 	onReconcile func(name string)
@@ -89,12 +91,19 @@ func (f *fakeManager) orphanCleaned() []string {
 	return append([]string(nil), f.cleaned...)
 }
 
-// PublishQuota records the scopes it was asked about, so a test can assert the loop reports
-// quota at all without depending on the metric registry.
-func (f *fakeManager) HasPendingRevocations() bool {
+// PendingRevocations reports the scripted outstanding count, so a test can assert the gate is
+// honoured and that the published gauge follows it.
+//
+// With pendingRevocationsErr set it returns a zero count and the error, which is what
+// acme.Manager does. That pairing is the trap the caller has to survive: the count is unusable, and
+// publishing it would read as "nothing outstanding".
+func (f *fakeManager) PendingRevocations() (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.pendingRevocations > 0
+	if f.pendingRevocationsErr != nil {
+		return 0, f.pendingRevocationsErr
+	}
+	return f.pendingRevocations, nil
 }
 
 func (f *fakeManager) RetryPendingRevocations(context.Context) {
@@ -1368,11 +1377,15 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 	mgr := &fakeManager{}
 	r := New(cfg, prov, store, mgr, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	// Nothing outstanding: the pass must not even ask the manager to retry.
+	// Nothing outstanding: the pass must not even ask the manager to retry, and the gauge must say
+	// so -- an operator reading wecert_revocation_pending at rest has to see 0, not nothing at all.
 	r.RunAll(context.Background())
 	if mgr.revocationRetries != 0 {
 		t.Errorf("with nothing outstanding the pass must skip the retry entirely, got %d calls",
 			mgr.revocationRetries)
+	}
+	if got := testutil.ToFloat64(metrics.RevocationPending); got != 0 {
+		t.Errorf("with nothing outstanding wecert_revocation_pending must read 0, got %v", got)
 	}
 
 	// Something outstanding: every pass retries it, so a CA that was briefly unavailable does
@@ -1386,10 +1399,93 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 		t.Errorf("an outstanding revocation must be retried on the pass, got %d calls",
 			mgr.revocationRetries)
 	}
+	if got := testutil.ToFloat64(metrics.RevocationPending); got != 1 {
+		t.Errorf("an outstanding revocation must be visible as wecert_revocation_pending=1, got %v",
+			got)
+	}
 
 	r.RunAll(context.Background())
 	if mgr.revocationRetries != 2 {
 		t.Errorf("it must be retried on every pass until it succeeds, got %d calls",
 			mgr.revocationRetries)
+	}
+
+	// The CA accepts it, so the next pass reports 0 -- and the retry stops being called.
+	mgr.mu.Lock()
+	mgr.pendingRevocations = 0
+	mgr.mu.Unlock()
+
+	r.RunAll(context.Background())
+	if mgr.revocationRetries != 2 {
+		t.Errorf("an accepted revocation must not be retried again, got %d calls",
+			mgr.revocationRetries)
+	}
+	if got := testutil.ToFloat64(metrics.RevocationPending); got != 0 {
+		t.Errorf("an accepted revocation must clear the gauge, got %v", got)
+	}
+
+	// A store that cannot be read must leave the last known value alone and be counted. Folding
+	// this error into a 0 would publish a confident all-clear on the one metric that says a
+	// certificate which should no longer be trusted still is.
+	mgr.mu.Lock()
+	mgr.pendingRevocations = 2
+	mgr.mu.Unlock()
+	r.RunAll(context.Background())
+	if got := testutil.ToFloat64(metrics.RevocationPending); got != 2 {
+		t.Fatalf("setup: the gauge must track the count before the failure, got %v", got)
+	}
+
+	beforeErrCount := testutil.ToFloat64(metrics.RevocationQueryErrors)
+	beforeRetries := mgr.revocationRetries
+	mgr.mu.Lock()
+	mgr.pendingRevocationsErr = errors.New("state.db is unreadable")
+	mgr.mu.Unlock()
+
+	r.RunAll(context.Background())
+	if got := testutil.ToFloat64(metrics.RevocationPending); got != 2 {
+		t.Errorf("a failed read must leave wecert_revocation_pending stale, not rewrite it to %v",
+			got)
+	}
+	if got := testutil.ToFloat64(metrics.RevocationQueryErrors); got != beforeErrCount+1 {
+		t.Errorf("a failed read must be counted, want %v errors, got %v", beforeErrCount+1, got)
+	}
+	if mgr.revocationRetries != beforeRetries {
+		t.Errorf("a failed read must not start a retry against a store that just failed, "+
+			"want %d calls, got %d", beforeRetries, mgr.revocationRetries)
+	}
+}
+
+// "Is this daemon converging at all?" has to be answerable from outside the process, and it has to
+// be answerable in a way that a wedged pass cannot fake.
+func TestOnlyAFullPassStampsLastReconcile(t *testing.T) {
+	mgr := &fakeManager{}
+	r, _ := newTestReconciler(t, []string{"one"}, mgr)
+
+	// 0 before any pass. The alert reads that as "nothing has finished since startup" -- which is
+	// true, and is the right answer for a daemon that has been up for a week without completing one.
+	metrics.LastReconcile.Set(0)
+
+	started := time.Now().Add(-time.Second).Unix()
+	r.RunAll(context.Background())
+	if got := testutil.ToFloat64(metrics.LastReconcile); got < float64(started) {
+		t.Errorf("a completed pass must stamp wecert_last_reconcile_timestamp_seconds with the time "+
+			"it finished; got %v, which is not after the pass started", got)
+	}
+
+	// The webhook path reconciles named certificates without running a pass. If it stamped this
+	// gauge, an API caller could keep a dead timer loop looking alive.
+	metrics.LastReconcile.Set(0)
+	if err := r.StartCert(context.Background(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(metrics.LastReconcile); got != 0 {
+		t.Errorf("StartCert must not stamp the pass timestamp, got %v", got)
+	}
+
+	if _, _, err := r.StartAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(metrics.LastReconcile); got != 0 {
+		t.Errorf("StartAll must not stamp the pass timestamp, got %v", got)
 	}
 }
