@@ -34,7 +34,7 @@ var (
 
 	ReconcileTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "wecert_reconcile_total",
-		Help: "Reconcile passes, with result being ok or error.",
+		Help: "Reconcile passes. result=ok when a pass ran and succeeded, error when it ran and failed, skipped when it deliberately did not run because the certificate is inside its retry backoff window.",
 	}, []string{"cert", "result"})
 
 	ReconcilePanics = promauto.NewCounterVec(prometheus.CounterOpts{

@@ -829,11 +829,11 @@ The timer's `Unit=` is not decorative: without it, systemd resolves the service 
 
 | Metric | Use |
 |---|---|
-| `wecert_certificate_not_after_timestamp_seconds` | **Primary expiry signal** |
+| `wecert_certificate_not_after_timestamp_seconds` | **Primary expiry signal.** The series is **absent** until a certificate has actually been issued — a never-issued certificate has no expiry to compare, and exporting `0` made the rule below fire at roughly -20,700 days |
 | `wecert_certificate_deployed` | `1` only when the certificate is confirmed live on a cloud resource; `0` while merely uploaded and awaiting the manual bind |
 | `wecert_certificate_consecutive_failures` | Persistently > 0 means manual intervention |
 | `wecert_certificate_ari_window_start_timestamp_seconds` | Start of the ARI window |
-| `wecert_reconcile_total{cert,result}` | Reconcile pass counter |
+| `wecert_reconcile_total{cert,result}` | Reconcile pass counter. `result` is `ok`, `error`, or `skipped` — the last means the pass deliberately did not run because the certificate is inside its retry backoff window |
 | `wecert_certificate_probe_match{host}` | 1 when the certificate served is the one deployed; 0 when a rebind did not take effect or another certificate is winning SNI |
 | `wecert_certificate_probe_not_after_timestamp_seconds{host}` | `notAfter` read back over the network — compare against the state-store value |
 | `wecert_certificate_probe_errors_total{host}` | The probe could not run at all. An environment problem, not a certificate problem |

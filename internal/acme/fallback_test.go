@@ -691,3 +691,111 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// ── a replacement may legitimately live LESS long than the certificate it replaces ──
+
+// Switching a certificate to a shorter-lived profile must take effect at the next renewal.
+//
+// The gate used to be "the new notAfter must be strictly later than the live one". When ARI
+// asks for renewal the live classic certificate (90d) still has weeks left, so a switch to
+// shortlived (160h) produced a certificate with an EARLIER notAfter and every attempt was
+// refused -- for as long as the live certificate outlived the new one, which is most of its
+// remaining life. The profile change silently failed, consecutive_failures sat at the cap,
+// and the renewal collapsed into the last few days of validity instead of happening 30 days
+// early.
+//
+// The same shape breaks the whole fleet whenever the CA shortens lifetimes (Let's Encrypt
+// has announced 90 -> 45 -> 6 days). The property to test is "issued after the live one",
+// not "expires later".
+func TestRenewalIsAcceptedWhenTheNewCertificateLivesLessLong(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com", "b.example.com"})
+
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	now := fixed
+	m.now = func() time.Time { return now }
+
+	// A healthy classic certificate with plenty of life left, issued a month ago.
+	liveNotBefore := fixed.Add(-70 * 24 * time.Hour) // issued ~70 days ago
+	// 20 days left. The classic renewal window opens at notAfter - renewBefore (30d), i.e.
+	// 10 days ago -- and DeterministicTime adds up to renewBefore/8 (3.75d) of deterministic
+	// jitter on top, so the window has to be open by more than the jitter for the renewal to
+	// actually be due here.
+	liveNotAfter := fixed.Add(20 * 24 * time.Hour)
+	if err := store.PutCert(&state.CertState{
+		Name:     cert.Name,
+		NotAfter: liveNotAfter,
+		CertURL:  "https://ca.test/cert/live",
+		CertPEM:  selfSignedCertAt(t, liveNotBefore, liveNotAfter, cert.Domains...),
+		IssuedAt: liveNotBefore,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The replacement is SHORTER lived (160h) but issued now -- a shortlived profile switch.
+	shortNotAfter := fixed.Add(160 * time.Hour)
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/2"),
+	}
+	fake.certNotAfter = shortNotAfter
+	fake.certNotBefore = fixed
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("a genuinely newer certificate must be deployed even though it expires sooner, got %v", err)
+	}
+
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.NotAfter.Equal(shortNotAfter) {
+		t.Errorf("the shorter-lived replacement must have been deployed: notAfter = %s, want %s",
+			st.NotAfter, shortNotAfter)
+	}
+	if st.ConsecutiveFailures != 0 {
+		t.Errorf("a successful renewal must clear the failure counter, got %d", st.ConsecutiveFailures)
+	}
+}
+
+// The control: a stale certificate that is neither later-expiring nor issued after the live
+// one must still be refused, so the fix cannot be satisfied by accepting everything.
+func TestStaleCertificateIsStillRefused(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
+
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return fixed }
+
+	// Live certificate has MORE life than the one the CA is about to hand back.
+	liveNotBefore := fixed.Add(-70 * 24 * time.Hour)
+	liveNotAfter := fixed.Add(20 * 24 * time.Hour)
+	if err := store.PutCert(&state.CertState{
+		Name:     cert.Name,
+		NotAfter: liveNotAfter,
+		CertURL:  "https://ca.test/cert/live",
+		CertPEM:  selfSignedCertAt(t, liveNotBefore, liveNotAfter, cert.Domains...),
+		IssuedAt: liveNotBefore,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The "replacement" expires sooner AND was issued BEFORE the live one: a stale artifact,
+	// not a renewal.
+	staleNotBefore := fixed.Add(-90 * 24 * time.Hour)
+	staleNotAfter := fixed.Add(10 * 24 * time.Hour)
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/2"),
+	}
+	fake.certNotAfter = staleNotAfter
+	fake.certNotBefore = staleNotBefore
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("a certificate that expires sooner and was issued earlier must be refused as stale")
+	}
+
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.NotAfter.Equal(liveNotAfter) {
+		t.Errorf("the live certificate must be left in place, notAfter = %s, want %s", st.NotAfter, liveNotAfter)
+	}
+}

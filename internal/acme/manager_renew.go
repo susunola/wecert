@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v4/acme/api"
@@ -109,18 +108,35 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		Profile:        c.Profile,
 		ReplacesCertID: replaces,
 	})
-	if err != nil && replaces != "" && mentionsReplaces(err) {
-		// A rejected `replaces` must never be a dead end.
+	if err != nil && replaces != "" {
+		// A `replaces` that the CA will not honour must never be a dead end, so retry once
+		// without it. Losing the rate-limit exemption is a far smaller cost than not renewing
+		// at all -- and a renewal that never happens is the worst failure this system has.
 		//
-		// The CA validates the field against the certificate it names, and a refusal
-		// comes back from newOrder -- so no order exists, and every later round sends
-		// the same value and is refused identically. The certificate would then never
-		// renew again, silently, until someone noticed it had expired. Losing the
-		// rate-limit exemption is a far smaller cost than that, so retry once without
-		// it. Covered here rather than only at the call site because the value flows in
-		// from the ARI state, which any future change could get wrong.
-		m.log.Warn("the CA refused the ARI replaces field; retrying the order without it "+
-			"(this renewal loses the rate-limit exemption, which beats not renewing at all)",
+		// WHY THIS RETRIES ON ANY ERROR rather than only on a recognised refusal. This used to
+		// gate on an error mentioning the literal word "replaces". The refusals that actually
+		// occur do not contain it:
+		//
+		//	Boulder: "parsing ARI CertID failed"
+		//	Boulder: "requester account did not request the certificate being replaced by
+		//	          this order"          <- "replaced", not "replaces"
+		//	Pebble:  "could not find an order for the given certificate"
+		//
+		// With the word-matching gate, all three fell through to `recordFailure`, the same
+		// `replaces` was sent again next round, and the certificate never renewed again --
+		// silently, until it expired. That is not a hypothetical: it is reachable whenever the
+		// stored ari_cert_id cannot be honoured by the current CA, and accounts are keyed by
+		// ACME directory while orders are not, so pointing wecert at staging and back is
+		// enough. Matching on a message string also cannot be made correct in principle: the
+		// wording is the CA's to choose.
+		//
+		// The asymmetry settles it. Retrying on a non-replaces error costs one extra newOrder
+		// call, and the order is created either way. NOT retrying on an unrecognised refusal
+		// costs the renewal. lego already handles the one status that must not be retried (409
+		// on a duplicate order), so this cannot mask a real conflict.
+		m.log.Warn("creating the order failed while an ARI replaces field was set; retrying without it "+
+			"(a CA that will not honour replaces must not stop the renewal; this attempt loses the "+
+			"rate-limit exemption)",
 			"cert", c.Name, "replaces", replaces, "err", err)
 		order, err = m.core.NewOrder(c.Domains, &api.OrderOptions{Profile: c.Profile})
 	}
@@ -157,16 +173,4 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		"cert", c.Name, "status", order.Status, "expiresAt", expiresAt,
 		"names", len(c.Domains), "profile", order.Profile, "replaces", replaces != "")
 	return m.advance(ctx, c, st, o, rd)
-}
-
-// mentionsReplaces reports whether an order-creation error is the CA refusing the ARI
-// `replaces` field.
-//
-// Matching on the message is a best-effort signal, and deliberately so: it only decides
-// whether to retry once without `replaces`, so a false negative leaves the caller where it
-// already was (the order fails, the pass is retried on the usual backoff), while a false
-// positive costs one extra newOrder call and still creates the order. Neither outcome can
-// damage state, which is why this does not need a typed error out of lego.
-func mentionsReplaces(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "replaces")
 }
