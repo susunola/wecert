@@ -845,6 +845,7 @@ func TestReconcileOneRecoversPanics(t *testing.T) {
 	r, _ := newTestReconciler(t, []string{"a", bad, "c"}, mgr)
 
 	beforePanics := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues(bad))
+	beforeErrors := testutil.ToFloat64(metrics.ReconcileTotal.WithLabelValues(bad, "error"))
 
 	// RunCert surfaces the failure to its caller as an error, not as a crash.
 	if err := r.RunCert(context.Background(), bad); err == nil {
@@ -853,6 +854,11 @@ func TestReconcileOneRecoversPanics(t *testing.T) {
 
 	if got := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues(bad)); got != beforePanics+1 {
 		t.Errorf("ReconcilePanics should increment by one, got %v -> %v", beforePanics, got)
+	}
+	// The panic skipped the normal accounting, so the recover path must record the
+	// failed pass itself -- reconcile_total must not under-report the worst passes.
+	if got := testutil.ToFloat64(metrics.ReconcileTotal.WithLabelValues(bad, "error")); got != beforeErrors+1 {
+		t.Errorf("ReconcileTotal{error} should increment by one on a panic, got %v -> %v", beforeErrors, got)
 	}
 
 	// And a full pass must still reach the certificates after the panicking one.
