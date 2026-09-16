@@ -104,13 +104,13 @@ lego 高层的 `certificate.Obtain` 是刻意不用的：它在内部自己 `new
 
 所有设计都从一条纪律出发：**wecert 永远不推断。** 由另一个东西负责算出应该有什么、并把它写下来，wecert 只读那份文档做收敛。判断只推断一次、以 diff 的形式被 review，而证书生命周期保持稳定。
 
-![wecert 系统全景：声明层、推断层、契约、执行层与外部服务](docs/diagrams/01-system-map.png)
+![wecert 系统全景：声明层、推断层、契约、执行层与外部服务](docs/diagrams/zh/01-system-map.png)
 
 从左到右是权限的传递：**意图**（人写，就是 `_wecert` TXT 记录）→ **推断**（`wecert-onboard`，可丢弃）→ **契约**（机器写的期望状态文档）→ **执行**（`wecert`，必须稳）→ **外部服务**。
 
 这么切分是关于失败模式的。如果让 wecert 自己去枚举 DNS 和 CLB，一次接口抖动返回空就可能被读成"这些域名都没了"，于是重签一张不含它们的证书 —— 线上立刻握手失败。中间插一份文档之后，来源故障的后果变成*期望状态不更新*，那是安全的。
 
-![证书生命周期时间轴：首次签发、部署、ARI 窗口、renewBefore 兜底、到期](docs/diagrams/06-certificate-lifetime.png)
+![证书生命周期时间轴：首次签发、部署、ARI 窗口、renewBefore 兜底、到期](docs/diagrams/zh/06-certificate-lifetime.png)
 
 每一轮问的都是同样五个有序的问题，而绝大多数轮次的答案是"什么都不做"。续期一律 ARI 优先并带 `replaces`，因为 ARI 协调的续期**豁免 Let's Encrypt 的全部限速** —— 而域名集合一变，这次签发就是一张全新证书，豁免随之失效。这正是通配符优先不只是优化的原因：声明了 `*.example.com` 之后，加 `foo.example.com` 的成本是 **0 次签发**。
 

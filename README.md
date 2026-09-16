@@ -100,17 +100,17 @@ Full rationale in [Domains that change often](README.reference.md#domains-that-c
 
 The one rule everything else follows: **wecert never infers.** Something else works out what should exist and writes it down; wecert only reads that document and converges. Judgement is inferred once and reviewed as a diff, while the certificate lifecycle stays stable.
 
-![wecert system map: the declaration layer, the inference layer, the contract, the execution layer, and external services](docs/diagrams/01-system-map.png)
+![wecert system map: the declaration layer, the inference layer, the contract, the execution layer, and external services](docs/diagrams/en/01-system-map.png)
 
 Left to right is the transfer of authority: **intent** (written by a human, as `_wecert` TXT records) → **inference** (`wecert-onboard`, disposable) → **contract** (a machine-written desired-state document) → **execution** (`wecert`, must be stable) → **external services**.
 
 Splitting it that way is about failure modes. If wecert enumerated DNS and CLB itself, a single API hiccup returning empty could be read as "these names are gone", and it would reissue a certificate without them — the site fails to handshake. With a document in between, a source failure means *the desired state stops updating*, which is safe.
 
-![certificate lifetime timeline: issuance, deploy, the ARI window, the renewBefore fallback, expiry](docs/diagrams/06-certificate-lifetime.png)
+![certificate lifetime timeline: issuance, deploy, the ARI window, the renewBefore fallback, expiry](docs/diagrams/en/06-certificate-lifetime.png)
 
 Every pass asks the same five ordered questions, and "do nothing" is the answer on the overwhelming majority of them. Renewal is ARI-first and carries `replaces`, because ARI-coordinated renewals are **exempt from every Let's Encrypt rate limit** — while a change to the name set makes the issuance a brand-new certificate, which forfeits that exemption. That is what makes wildcard-first more than an optimisation: with `*.example.com` declared, adding `foo.example.com` costs **zero** issuances.
 
-The full story — all six diagrams, plus data ownership, failure semantics and the rate-limit arithmetic — is in [The certificate lifecycle](README.reference.md#the-certificate-lifecycle). There is also a single interactive page at [docs/certificate-lifecycle.html](docs/certificate-lifecycle.html), with links between the figures and a print/PDF button.
+The full story — all six diagrams, plus data ownership, failure semantics and the rate-limit arithmetic — is in [The certificate lifecycle](README.reference.md#the-certificate-lifecycle). There is also a single interactive page at [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html), with links between the figures and a print/PDF button.
 
 ## Event-driven
 
@@ -157,7 +157,7 @@ Deletion is deliberately an order of magnitude more conservative than addition, 
 - [Configuration reference](README.reference.md#configuration-reference) · [Operations](README.reference.md#operations) · [Metrics and alerting](README.reference.md#metrics-and-alerting).
 - [Field notes and pitfalls](README.reference.md#field-notes-and-pitfalls) — the CLB SNI trap, `DescribeListeners` not reading bindings back, the DNSPod TTL floor, the lego API traps.
 - [Desired state](docs/desired-state.md) — declaring domains as `_wecert` DNS records, generating the desired-state document, and switching wecert over to it. Design rationale: [desired-state-providers.md](docs/desired-state-providers.md).
-- [The certificate lifecycle](README.reference.md#the-certificate-lifecycle) — six diagrams from a DNS declaration to retiring the old certificate, plus data ownership, failure semantics and the rate-limit arithmetic. Interactive version: [docs/certificate-lifecycle.html](docs/certificate-lifecycle.html).
+- [The certificate lifecycle](README.reference.md#the-certificate-lifecycle) — six diagrams from a DNS declaration to retiring the old certificate, plus data ownership, failure semantics and the rate-limit arithmetic. Interactive version: [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html).
 - [Roadmap](README.reference.md#roadmap) · [Development](README.reference.md#development).
 
 <details>

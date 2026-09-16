@@ -14,3 +14,7 @@ terraform.tfvars
 
 # 本机沙箱的 Go 缓存重定向（含绝对路径，不该进仓库）
 .goenv
+
+# Python 字节码
+__pycache__/
+*.pyc
