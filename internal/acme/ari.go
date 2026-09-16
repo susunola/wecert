@@ -42,8 +42,8 @@ func CertID(leaf *x509.Certificate) (string, error) {
 // ARI 是这套系统最重要的一环：走 ARI 并带上 replaces 的续期
 // 豁免 Let's Encrypt 的全部速率限制。不走 ARI 就只能吃
 // "5 certificates per exact set of identifiers / 7 days"。
-func FetchRenewalInfo(core *api.Core, certID string) (*RenewalInfo, time.Duration, error) {
-	resp, err := core.Certificates.GetRenewalInfo(certID)
+func FetchRenewalInfo(core API, certID string) (*RenewalInfo, time.Duration, error) {
+	resp, err := core.GetRenewalInfo(certID)
 	if err != nil {
 		return nil, 0, err
 	}
