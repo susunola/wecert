@@ -1056,8 +1056,6 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
 - [ ] 用 `multi_cert_info` 测 SNI 多证书场景（"换一张不误伤另一张"）
 - [ ] 阶段 C：CVM + systemd + CVM 角色凭证路径（`testenv/` 里已备好，`create_cvm=true`）
 - [ ] 签发失败降级策略：到期前 N 天仍未成功时，自动拆成更小子集先签（部分可用好过全挂）
-- [ ] 把 `Manager` 对 `*api.Core` 的依赖也抽成窄接口，或引入 pebble，
-      让完整签发流程进入单测（目前只抽了清理路径需要的窄接口）
 - [ ] `state.Store` 缺少事务能力，`download()` 收尾的
       "提升新证书 → 记录退役证书 → 丢弃订单" 三步是各自独立提交的；
       中间失败会留下孤儿云证书或一次假故障告警
@@ -1077,6 +1075,12 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
       换绑是异步的，SNI 上也可能有另一张证书在赢，这两件事控制面都看不出来。
       见 `probe` 配置节。
 - [x] **给 `state.db` 加跨进程排他锁（`flock`）。** 在 `state.Open` 里对
+- [x] **把 `Manager` 对 `*api.Core` 的依赖抽成窄接口。** `internal/acme/api.go`
+      定义了 Manager 真正需要的七个操作，`NewAPI(core)` 是 lego 的适配器。
+      收益不在于多一层间接，而在于订单状态机终于可以按**调用顺序和参数**断言，
+      不必起 HTTP 服务器。三条以前很难验的不变量现在有了测试：
+      order URL 在联系 CA 之前落盘、续期订单带 `replaces`、
+      CSR 是 DER 且提交到 finalize URL。
       `<statePath>.lock` 取排他锁，第二个进程启动即失败，而不是并发下单。
       内核管理，崩溃自动释放，不存在陈旧 PID 文件。见上面的 systemd 部署一节。
 

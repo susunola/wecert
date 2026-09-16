@@ -42,7 +42,7 @@ func (m *Manager) download(
 	}
 
 	// bundle=true → 返回的是 fullchain（叶子 + 中间证书），正是 CLB 需要的格式。
-	fullchain, _, err := m.core.Certificates.Get(order.Certificate, true)
+	fullchain, _, err := m.core.GetCertificate(order.Certificate, true)
 	if err != nil {
 		return m.recordFailure(st, fmt.Errorf("download certificate: %w", err))
 	}

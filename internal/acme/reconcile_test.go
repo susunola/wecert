@@ -133,7 +133,7 @@ func newReconcileHarness(t *testing.T, domains []string, certSANs []string) (*Ma
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	solver := &fakeSolver{}
-	m := newManager(store, core, solver, fakeKeyAuth{}, deploy.Noop{}, log)
+	m := newManager(store, NewAPI(core), solver, fakeKeyAuth{}, deploy.Noop{}, log)
 
 	// 90 天有效期、刚签不久：距离 classic 的 30 天续期窗口还很远。
 	notAfter := time.Now().Add(90 * 24 * time.Hour).Truncate(time.Second)
