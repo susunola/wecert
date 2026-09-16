@@ -581,3 +581,74 @@ func TestDeadOrderURLIsDiscardedInsteadOfBlockingRenewal(t *testing.T) {
 			maxOrderFetchFailures, time.Until(fixed.Add(7*24*time.Hour)).Round(time.Hour))
 	}
 }
+
+// A name whose authorization just failed must not be ordered again inside the failure window.
+//
+// The certificate backoff starts at a minute and doubles, so the first hour of a persistently
+// failing name costs six attempts (1+2+4+8+16+32 minutes) against "5 authorization failures
+// per identifier per hour". That budget belongs to the IDENTIFIER, not the certificate, so N
+// certificates sharing the name attack the same five -- at ten certificates, sixty failures in
+// the first hour, of which at most five could have produced a different answer. Past the limit
+// every further order for that name is rejected outright, so the extra attempts bought nothing
+// while the consecutive-failure counter (which feeds an account pause requiring manual portal
+// action) kept climbing.
+func TestIdentifierCooldownSuppressesFurtherOrders(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"broken.example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	now := fixed
+	m.now = func() time.Time { return now }
+
+	fake.orders = []legoacme.ExtendedOrder{
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+
+	// Everything except the identifier cooldown must be permissive, or this test would pass
+	// for the wrong reason. Two things have to be re-armed before each pass: the certificate
+	// backoff (cleared) and the renewal window. A successful issuance replaces the live
+	// certificate with a fresh 90-day one, which is NOT due for renewal -- so the expiry is
+	// reset too, leaving the cooldown as the only thing that can stop an order.
+	dueForRenewal := func(t *testing.T) {
+		t.Helper()
+		if err := store.PutCert(&state.CertState{
+			Name: cert.Name, NotAfter: fixed.Add(20 * 24 * time.Hour),
+			CertPEM: selfSignedCertAt(t, fixed.Add(-70*24*time.Hour),
+				fixed.Add(20*24*time.Hour), "broken.example.com"),
+			KeyPEM: []byte("live-key"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DeleteOrder(cert.Name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Pass 1: due for renewal, no cooldown, so an order is placed.
+	dueForRenewal(t)
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(fake.newOrderReplaces) != 1 {
+		t.Fatalf("expected one order, got %d", len(fake.newOrderReplaces))
+	}
+
+	// The CA reports the name's authorization as failed, starting its cooldown.
+	m.noteIdentifierFailure("broken.example.com")
+
+	// Pass 2: renewal is due and the backoff is clear, so only the cooldown can stop it.
+	dueForRenewal(t)
+	_ = m.Reconcile(context.Background(), cert)
+	if n := len(fake.newOrderReplaces); n != 1 {
+		t.Errorf("an identifier inside its failure cooldown must not be ordered again, got %d orders "+
+			"in total; retrying inside the window cannot succeed and spends the budget every other "+
+			"certificate for this name depends on", n)
+	}
+
+	// Pass 3, past the window: a cooldown is a delay, not a blacklist. A permanent one would
+	// turn a transient DNS problem into an outage.
+	now = fixed.Add(identifierCooldownFor + time.Minute)
+	dueForRenewal(t)
+	_ = m.Reconcile(context.Background(), cert)
+	if n := len(fake.newOrderReplaces); n != 2 {
+		t.Errorf("after the cooldown expires the name must be retried, got %d orders in total", n)
+	}
+}
