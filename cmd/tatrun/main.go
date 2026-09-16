@@ -1,9 +1,11 @@
-// Command tatrun 通过 TAT（自动化助手）在 CVM 上执行 shell 命令并打印输出。
+// Command tatrun runs a shell command on a CVM through TAT (TencentCloud Automation Tools) and
+// prints the output.
 //
-// 为什么需要它：不需要 SSH 密钥、不需要给 CVM 开公网入站端口，就能在测试机上
-// 执行验证命令。最有价值的用法是从 VPC 内部 curl CLB 的 VIP，
-// 读回实际正在服务的证书 —— 这是唯一能证明"证书真的在对外服务"的方式，
-// 比读 wecert 自己的状态库可信得多（后者正是"程序以为成功但没生效"的盲区）。
+// Why it exists: it runs verification commands on a test machine with no SSH key and no public
+// inbound port on the CVM. Its most valuable use is curling a CLB VIP from inside the VPC and
+// reading back the certificate actually being served -- the only way to prove a certificate is
+// truly in service, and far more trustworthy than wecert's own state store (the blind spot of
+// "the program believed it succeeded but nothing took effect").
 package main
 
 import (
@@ -59,13 +61,13 @@ func run() error {
 	defer cancel()
 
 	runReq := tat.NewRunCommandRequest()
-	// TAT 的 Content 要求 base64 编码。直接传明文会报
-	// InvalidParameterValue ... parameter `Content` is not valid。
+	// TAT requires Content to be base64 encoded. Passing plaintext reports
+	// InvalidParameterValue ... parameter `Content` is not valid.
 	runReq.Content = common.StringPtr(base64.StdEncoding.EncodeToString([]byte(*command)))
 	runReq.InstanceIds = []*string{common.StringPtr(*instance)}
 	runReq.CommandName = common.StringPtr("wecert-e2e")
 	runReq.Timeout = common.Uint64Ptr(uint64(timeout.Seconds()))
-	// 测试命令没必要在 TAT 里留档。
+	// No reason to keep a test command on record in TAT.
 	runReq.SaveCommand = common.BoolPtr(false)
 
 	runResp, err := client.RunCommandWithContext(ctx, runReq)
@@ -125,7 +127,7 @@ func run() error {
 	}
 }
 
-// fetchTask 按 invocation-id 查执行结果。返回 (nil, nil) 表示还没生成任务记录。
+// fetchTask looks up the execution result by invocation-id; (nil, nil) means no task record yet.
 func fetchTask(ctx context.Context, client *tat.Client, invocationID string) (*tat.InvocationTask, error) {
 	req := tat.NewDescribeInvocationTasksRequest()
 	req.Filters = []*tat.Filter{{

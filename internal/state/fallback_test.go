@@ -10,7 +10,7 @@ func newStore(t *testing.T) *Store {
 	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatalf("打开状态库失败: %v", err)
+		t.Fatalf("opening state db: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
@@ -34,21 +34,22 @@ func TestIdentifierFailureLedgerCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 2 {
-		t.Fatalf("应当有两条记录，实际 %d", len(got))
+		t.Fatalf("want two records, got %d", len(got))
 	}
-	// 按 identifier 排序，保证同样的输入给出同样的输出。
+	// Sorted by identifier, so identical input yields identical output.
 	if got[0].Identifier != "bad.example.com" || got[0].Failures != 3 {
-		t.Errorf("第一条 = %+v，期望 bad.example.com 计 3 次", got[0])
+		t.Errorf("first row = %+v, want bad.example.com with 3 failures", got[0])
 	}
 	if got[1].Identifier != "good.example.com" || got[1].Failures != 1 {
-		t.Errorf("第二条 = %+v", got[1])
+		t.Errorf("second row = %+v", got[1])
 	}
 	if !got[0].LastFailedAt.Equal(now) {
-		t.Errorf("LastFailedAt = %v，期望 %v", got[0].LastFailedAt, now)
+		t.Errorf("LastFailedAt = %v, want %v", got[0].LastFailedAt, now)
 	}
 }
 
-// 账本是按证书隔离的：一张证书的坏名字不该影响另一张。
+// The ledger is isolated per certificate: one certificate's bad name must not affect
+// another.
 func TestIdentifierFailureLedgerIsPerCertificate(t *testing.T) {
 	s := newStore(t)
 	now := time.Now()
@@ -61,7 +62,7 @@ func TestIdentifierFailureLedgerIsPerCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 0 {
-		t.Fatalf("另一张证书不该看到这条记录，实际 %v", got)
+		t.Fatalf("another certificate should not see this record, got %v", got)
 	}
 }
 
@@ -81,12 +82,12 @@ func TestClearIdentifierFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 0 {
-		t.Fatalf("清理之后应当为空，实际 %v", got)
+		t.Fatalf("want empty after clearing, got %v", got)
 	}
 }
 
-// 老记录必须能被丢掉：被摘掉的名字永远不会再被尝试，
-// 所以它等不到一次成功来洗白自己，唯一的出路就是过期。
+// Old records must be droppable: a name that was dropped will never be attempted again,
+// so it can never wait for a success to clear it -- expiring is its only way out.
 func TestPruneIdentifierFailuresDropsOnlyStaleRows(t *testing.T) {
 	s := newStore(t)
 	now := time.Now().Truncate(time.Second)
@@ -107,7 +108,7 @@ func TestPruneIdentifierFailuresDropsOnlyStaleRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || got[0].Identifier != "fresh.example.com" {
-		t.Fatalf("只该留下新鲜的记录，实际 %v", got)
+		t.Fatalf("only the fresh record should remain, got %v", got)
 	}
 }
 
@@ -120,12 +121,12 @@ func TestFallbackRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if fb != nil {
-		t.Fatalf("没有记录时应当返回 nil，实际 %+v", fb)
+		t.Fatalf("want nil when there is no record, got %+v", fb)
 	}
 
 	if err := s.PutFallback(&Fallback{
 		CertName: "c1",
-		// 故意乱序：落盘时应当排序，读回来才稳定。
+		// Deliberately out of order: it should be sorted on write so reads are stable.
 		Dropped: []string{"z.example.com", "a.example.com"},
 		Since:   now,
 		Reason:  "keeps failing",
@@ -138,13 +139,13 @@ func TestFallbackRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got == nil {
-		t.Fatal("应当读回降级记录")
+		t.Fatal("the fallback record should be read back")
 	}
 	if len(got.Dropped) != 2 || got.Dropped[0] != "a.example.com" || got.Dropped[1] != "z.example.com" {
-		t.Errorf("被摘名字应当排序后读出，实际 %v", got.Dropped)
+		t.Errorf("dropped names should be read back sorted, got %v", got.Dropped)
 	}
 	if !got.Since.Equal(now) {
-		t.Errorf("Since = %v，期望 %v", got.Since, now)
+		t.Errorf("Since = %v, want %v", got.Since, now)
 	}
 	if got.Reason != "keeps failing" {
 		t.Errorf("Reason = %q", got.Reason)
@@ -154,6 +155,6 @@ func TestFallbackRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if again, err := s.GetFallback("c1"); err != nil || again != nil {
-		t.Fatalf("清理之后应当为空，实际 %+v, %v", again, err)
+		t.Fatalf("want empty after clearing, got %+v, %v", again, err)
 	}
 }

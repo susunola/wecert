@@ -1,14 +1,16 @@
-// Command wecert-probe 拨一个真实的 TLS 连接，读回对端**实际出示**的证书。
+// Command wecert-probe dials a real TLS connection and reads back the certificate the
+// far end **actually serves**.
 //
-// 它是排障时的第一件工具，因为"云 API 说绑定成功"和"浏览器真的能拿到
-// 这张证书"是两件事：换绑是异步的（实测约 15 秒），SNI 上也可能有
-// 另一张证书在赢 —— 而这两件事控制面都看不出来。
+// It is the first tool to reach for when troubleshooting: "the cloud API says the bind
+// succeeded" and "a browser really gets this certificate" are two different things -- a rebind
+// is asynchronous (~15s measured) and another certificate can win SNI, neither visible on the
+// control plane.
 //
-// 用法：
+// Usage:
 //
 //	wecert-probe -host www.example.com
 //	wecert-probe -host www.example.com -min-valid 168h
-//	wecert-probe -host www.example.com -wait 90s     # 刚换完绑，等它生效
+//	wecert-probe -host www.example.com -wait 90s     # just rebound, wait for it to take effect
 //	wecert-probe -host a.example.com,b.example.com -json
 package main
 
@@ -27,11 +29,11 @@ import (
 	"github.com/susunola/wecert/internal/probe"
 )
 
-// version 可通过 -ldflags "-X main.version=..." 注入。
+// version can be injected through -ldflags "-X main.version=...".
 var version = "dev"
 
-// 退出码。分开是有用的：脚本里"拨不到"和"服务的是错的证书"
-// 需要走完全不同的处理路径。
+// Exit codes. Keeping them apart is useful: in a script, "cannot dial" and "serving the
+// wrong certificate" need completely different handling paths.
 const (
 	exitOK          = 0
 	exitUnreachable = 1
@@ -109,8 +111,8 @@ Flags:
 
 	opts := probe.Options{Port: *port, Timeout: *timeout}
 
-	// 汇总用的最坏结果：mismatch 比 unreachable 更值得让脚本停下来，
-	// 所以它优先。
+	// Worst result for the summary: a mismatch deserves to stop a script more than an
+	// unreachable host does, so it wins.
 	worst := exitOK
 	for _, host := range hosts {
 		code := checkOne(ctx, host, opts, e, *wait, *asJSON)
@@ -123,7 +125,7 @@ Flags:
 	return worst
 }
 
-// checkOne 探测一个名字，必要时轮询等待，返回它的退出码。
+// checkOne probes one name, polling while there is time, and returns its exit code.
 func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expectation, wait time.Duration, asJSON bool) int {
 	deadline := time.Time{}
 	if wait > 0 {
@@ -135,7 +137,7 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 		attempt++
 		code, retry := attemptOnce(ctx, host, opts, e, asJSON, attempt)
 
-		// 只有"还没生效"才值得等：拨不到和证书不对都不是等一等就会好的。
+		// Only "not in effect yet" is worth waiting for: unreachable and wrong-cert won't fix themselves.
 		if !retry || deadline.IsZero() || time.Now().After(deadline) {
 			return code
 		}
@@ -154,7 +156,7 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 	}
 }
 
-// attemptOnce 探测一次。retry 为真表示"再等一会儿可能会好"。
+// attemptOnce probes once. A true retry means "waiting a little longer might help".
 func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.Expectation, asJSON bool, attempt int) (code int, retry bool) {
 	res, err := probe.Probe(ctx, host, opts)
 	if err != nil {
@@ -163,7 +165,7 @@ func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.E
 		} else {
 			fmt.Printf("%s\n  unreachable: %v\n\n", host, err)
 		}
-		// 网络抖动、VIP 还没起、DNS 还没生效 —— 这些都值得再试。
+		// Network blips, a VIP not up yet, DNS not propagated -- all worth retrying.
 		return exitUnreachable, true
 	}
 
@@ -181,7 +183,7 @@ func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.E
 	if v.OK {
 		return exitOK, false
 	}
-	// 状态不对时也重试：刚换完绑的那十几秒里，看到旧证书是正常的。
+	// Retry on a bad verdict too: seeing the old certificate in the ~15s after a rebind is normal.
 	return exitMismatch, true
 }
 
@@ -194,7 +196,7 @@ func printHuman(res *probe.Result, v probe.Verdict, now time.Time) {
 	if res.Trusted {
 		fmt.Printf("  trusted     yes\n")
 	} else {
-		// 不可信不等于坏：内网 CA 是合法的，但浏览器里会红。
+		// Untrusted is not the same as bad: an internal CA is legitimate but turns browsers red.
 		fmt.Printf("  trusted     no (%s)\n", firstLine(res.ChainError))
 	}
 	fmt.Printf("  validity    %s -> %s  (%d days left)\n",

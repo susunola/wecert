@@ -1,40 +1,41 @@
-# 端到端测试专用配置（L1）
+# Config for the end-to-end test only (L1)
 #
-# 只做两件事：
-#   1. 用 Let's Encrypt staging 真实签一张证书（不占生产配额）
-#   2. 把证书上传到腾讯云 SSL 证书服务
+# It does two things:
+#   1. really issue a certificate with Let's Encrypt staging (no production quota used)
+#   2. upload the certificate to Tencent Cloud SSL Certificate Service
 #
-# 刻意不绑定任何 CLB —— 首次签发时 OldCertificateId 为空，
-# 所以 UpdateCertificateInstance 根本不会被调用，不会动到线上流量。
+# It deliberately binds no CLB: OldCertificateId is empty on first issuance, so
+# UpdateCertificateInstance is never called and live traffic is never touched.
 #
-# 凭证不写在这个文件里，走环境变量：
+# Credentials are not written in this file; they come from the environment:
 #   source /Users/atom/Documents/dsh/.secrets/tencent.env
 #   export TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY
 
 statePath: /tmp/wecert-e2e/state.db
 
 acme:
-  # 端到端测试必须用 staging。e2e-test.sh 会强制检查这一行。
+  # The end-to-end test must use staging. e2e-test.sh enforces this line.
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  # 填一个你真实能收信的邮箱；LE 不接受 example.com 这类保留域。
+  # Put in a mailbox you can actually receive mail at; LE rejects reserved domains like example.com.
   email: REPLACE_ME
 
 dns:
-  # 用腾讯云 CAM 凭证做 DNS-01，和证书部署共用同一套凭证。
+  # Use Tencent Cloud CAM credentials for DNS-01, sharing one set of credentials
+  # with certificate deployment.
   provider: tencentcloud
 
 tencent:
-  # static：从环境变量读 AK/SK，不落进这个文件。
+  # static: read AK/SK from the environment, never written into this file.
   credentialMode: static
-  # cvm-role（生产推荐）：
+  # cvm-role (recommended in production):
   # credentialMode: cvm-role
   # roleName: wecert-role
 
   resourceTypes:
     - clb
 
-  # 你的测试域名所在的地域。L1 阶段其实不会用到，
-  # 但要通过配置校验（CLB 是分地域资源）。
+  # The region your test domain lives in. L1 does not actually use it, but it is
+  # needed to pass config validation (CLB is a regional resource).
   regions:
     - ap-guangzhou
 
@@ -43,15 +44,16 @@ metrics:
 
 certificates:
   - name: e2e-test
-    # classic：90 天、Max Names 100，先确认基础流程。
-    # 跑通之后可以改成 tlsserver（45 天、Max Names 25）再验一遍。
+    # classic: 90 days, Max Names 100 — confirm the basic flow first.
+    # Once it works, switch to tlsserver (45 days, Max Names 25) and verify again.
     profile: classic
     keyType: ecdsa-p256
     domains:
-      # 换成你的测试域名。建议就用单域名先跑通，
-      # 再加通配符验证 wildcard + apex 共用同一个 TXT 名字的路径。
+      # Replace with your test domain. It is best to get a single name working
+      # first, then add the wildcard to exercise the path where wildcard + apex
+      # share one TXT name.
       - REPLACE_ME
     deploy:
-      # L1 要验证"上传到腾讯云"这一步，所以开着。
-      # 首次签发只会 UploadCertificate，不会更新任何已有资源。
+      # L1 needs to verify the "upload to Tencent Cloud" step, so this is on.
+      # First issuance only calls UploadCertificate and updates no existing resource.
       enabled: true

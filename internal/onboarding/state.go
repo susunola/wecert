@@ -10,33 +10,38 @@ import (
 	"time"
 )
 
-// State 是 onboarding 组件自己的持久化状态。
+// State is the onboarding component's own persistent state.
 //
-// 必须落盘，不能靠内存：onboarding 多半是定时任务，跑完就退出，
-// 而"重启之后忘了这个名字已经缺席三天"会让删除宽限期永远走不完 ——
-// 宽限期失效就等于删除变激进，那正是 §5.3 要防的事。
+// It must live on disk, never in memory: onboarding is usually a scheduled job
+// that exits when done, and "after a restart it forgot the name had been absent
+// for three days" would make the deletion grace period never elapse -- a broken
+// grace period means deletion turns aggressive, exactly what §5.3 guards against.
 //
-// 所有名字集合都用**展开后**的形式：通配符写成 "*.example.com" 单独占一项。
-// 这样"通配符声明被删掉"和"具体名字声明被删掉"是两条独立的记录，
-// 各自的宽限期互不干扰。
+// Every name set uses the **expanded** form: a wildcard is listed separately as
+// "*.example.com". That way "the wildcard declaration was removed" and "the
+// concrete name declaration was removed" are two independent records whose grace
+// periods never interfere.
 type State struct {
-	// AbsentSince 记录每个"上轮在、这轮不见了"的名字第一次被观察到缺席的时刻。
+	// AbsentSince records when each name that was present last round and missing
+	// this round was first observed absent.
 	AbsentSince map[string]time.Time `json:"absentSince,omitempty"`
 
-	// LastRevision 是上一版写出去的文档指纹。
+	// LastRevision is the fingerprint of the previously written document.
 	LastRevision string `json:"lastRevision,omitempty"`
 
-	// LastNames 是上一版期望状态覆盖的展开名字集合，供骤变熔断比较。
+	// LastNames is the expanded name set the previous desired state covered, used
+	// by the abrupt-change fuse.
 	LastNames []string `json:"lastNames,omitempty"`
 
-	// Changes 是最近若干次"名字集合真的变了"的时刻，用于配额预算。
+	// Changes holds the times of recent real name-set changes, used for the quota
+	// budget.
 	Changes []time.Time `json:"changes,omitempty"`
 
-	// UpdatedAt 是最后一次成功写入时刻。
+	// UpdatedAt is the time of the last successful write.
 	UpdatedAt time.Time `json:"updatedAt,omitempty"`
 }
 
-// LoadState 读取状态文件。文件不存在视为空状态（第一次跑）。
+// LoadState reads the state file. A missing file counts as empty state (first run).
 func LoadState(path string) (*State, error) {
 	st := &State{AbsentSince: map[string]time.Time{}}
 
@@ -51,8 +56,8 @@ func LoadState(path string) (*State, error) {
 		return st, nil
 	}
 
-	// 状态文件坏掉时**不能**当空状态用：那会让所有宽限期归零，
-	// 也就是把删除从保守路径变成激进路径。宁可拒绝跑这一轮。
+	// A corrupt state file must **not** count as empty: that zeroes every grace
+	// period, turning deletion from conservative into aggressive. Better to refuse.
 	if err := json.Unmarshal(data, st); err != nil {
 		return nil, fmt.Errorf("parse onboarding state %s: %w", path, err)
 	}
@@ -62,7 +67,7 @@ func LoadState(path string) (*State, error) {
 	return st, nil
 }
 
-// Save 原子地写回状态文件。
+// Save writes the state file back atomically.
 func (s *State) Save(path string) error {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
@@ -103,16 +108,17 @@ func (s *State) Save(path string) error {
 	return nil
 }
 
-// MarkPresent 清掉某个名字的缺席标记。名字回来了，宽限期就该重置。
+// MarkPresent clears a name's absence marker. The name is back, so the grace
+// period must reset.
 func (s *State) MarkPresent(name string) {
 	delete(s.AbsentSince, name)
 }
 
-// MarkAbsent 记录某个名字缺席，返回它最**早**一次被观察到缺席的时刻，
-// 以及这次是不是新记录下来的。
+// MarkAbsent records a name as absent and returns the **earliest** time it was
+// observed absent, plus whether this call created the record.
 //
-// 保留最早的时刻而不是不断刷新，是因为宽限期问的是"它已经缺席多久了"，
-// 不是"上次看到它缺席是什么时候"。
+// The earliest time is kept rather than refreshed because the grace period asks
+// "how long has it been absent", not "when did we last see it absent".
 func (s *State) MarkAbsent(name string, now time.Time) (since time.Time, isNew bool) {
 	if prev, ok := s.AbsentSince[name]; ok {
 		return prev, false
@@ -121,12 +127,13 @@ func (s *State) MarkAbsent(name string, now time.Time) (since time.Time, isNew b
 	return now, true
 }
 
-// RecordChange 记下一次真实发生过的名字集合变更。
+// RecordChange records one name-set change that really happened.
 func (s *State) RecordChange(now time.Time) {
 	s.Changes = append(s.Changes, now)
 }
 
-// ChangesWithin 返回 window 内发生过的集合变更次数，并顺手丢掉过期的记录。
+// ChangesWithin returns how many set changes happened within window, dropping
+// expired entries on the way.
 func (s *State) ChangesWithin(window time.Duration, now time.Time) int {
 	cutoff := now.Add(-window)
 	kept := s.Changes[:0]
@@ -142,7 +149,7 @@ func (s *State) ChangesWithin(window time.Duration, now time.Time) int {
 	return n
 }
 
-// LastNameSet 返回上一版名字集合，方便比较。
+// LastNameSet returns the previous name set as a lookup map, for easy comparison.
 func (s *State) LastNameSet() map[string]bool {
 	out := make(map[string]bool, len(s.LastNames))
 	for _, n := range s.LastNames {
@@ -151,7 +158,8 @@ func (s *State) LastNameSet() map[string]bool {
 	return out
 }
 
-// SetLastNames 记录这一版的名字集合，顺序稳定以便 diff 可读。
+// SetLastNames stores this round's name set, in stable order so diffs stay
+// readable.
 func (s *State) SetLastNames(names []string) {
 	cp := append([]string(nil), names...)
 	sort.Strings(cp)

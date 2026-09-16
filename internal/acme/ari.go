@@ -14,7 +14,7 @@ import (
 	"github.com/go-acme/lego/v4/acme/api"
 )
 
-// RenewalInfo 是 RFC 9773 的 renewalInfo 响应。
+// RenewalInfo is the RFC 9773 renewalInfo response.
 type RenewalInfo struct {
 	SuggestedWindow struct {
 		Start time.Time `json:"start"`
@@ -23,11 +23,12 @@ type RenewalInfo struct {
 	ExplanationURL string `json:"explanationURL"`
 }
 
-// CertID 按 RFC 9773 构造 ARI 的 certID：
+// CertID builds the ARI certID per RFC 9773:
 //
-//	base64url(AKI keyIdentifier) + "." + base64url(DER 序列号)
+//	base64url(AKI keyIdentifier) + "." + base64url(DER serial number)
 //
-// 注意 AKI 用的是扩展里的 keyIdentifier 原始字节，不是整个扩展。
+// Note the AKI is the keyIdentifier's raw bytes from the extension, not the whole
+// extension.
 func CertID(leaf *x509.Certificate) (string, error) {
 	if len(leaf.AuthorityKeyId) == 0 {
 		return "", fmt.Errorf("certificate has no Authority Key Identifier; cannot build an ARI certID")
@@ -37,11 +38,12 @@ func CertID(leaf *x509.Certificate) (string, error) {
 	return aki + "." + serial, nil
 }
 
-// FetchRenewalInfo 查询 ARI，同时返回服务器要求的 Retry-After。
+// FetchRenewalInfo queries ARI and also returns the Retry-After the server asked for.
 //
-// ARI 是这套系统最重要的一环：走 ARI 并带上 replaces 的续期
-// 豁免 Let's Encrypt 的全部速率限制。不走 ARI 就只能吃
-// "5 certificates per exact set of identifiers / 7 days"。
+// ARI is the single most important piece of this system: a renewal that goes through
+// ARI and carries replaces is exempt from every Let's Encrypt rate limit. Skip ARI and
+// all you are left with is the "5 certificates per exact set of identifiers / 7 days"
+// limit.
 func FetchRenewalInfo(core API, certID string) (*RenewalInfo, time.Duration, error) {
 	resp, err := core.GetRenewalInfo(certID)
 	if err != nil {
@@ -49,7 +51,7 @@ func FetchRenewalInfo(core API, certID string) (*RenewalInfo, time.Duration, err
 	}
 	defer resp.Body.Close()
 
-	// Retry-After 两种格式（秒数或 HTTP-date）lego 都帮我们处理了。
+	// lego already handles both Retry-After formats (seconds and HTTP-date) for us.
 	var retryAfter time.Duration
 	if v := resp.Header.Get("Retry-After"); v != "" {
 		if d, err := api.ParseRetryAfter(v); err == nil {
@@ -72,11 +74,12 @@ func FetchRenewalInfo(core API, certID string) (*RenewalInfo, time.Duration, err
 	return &info, retryAfter, nil
 }
 
-// RenewalTime 在 ARI 建议窗口内确定性地挑一个续期时刻。
+// RenewalTime picks a renewal instant deterministically inside the ARI suggested window.
 //
-// 为什么必须确定性：如果每次 reconcile 都重新随机，进程重启就会把续期时间
-// 不停往后推，最终推过有效期。用证书名 + 窗口起点做种子，
-// 同一个窗口内永远算出同一个时刻。
+// Why it has to be deterministic: if every reconcile re-rolled the dice, each process
+// restart would push the renewal further out until it slid past the expiry. Seeding with
+// the certificate name + the window start means the same window always yields the same
+// instant.
 func RenewalTime(name string, start, end time.Time) time.Time {
 	if !end.After(start) {
 		return start
@@ -87,13 +90,14 @@ func RenewalTime(name string, start, end time.Time) time.Time {
 
 	at := start.Add(time.Duration(binary.BigEndian.Uint64(h[:8]) % uint64(span)))
 
-	// 再叠一个确定性的 ±10% 抖动，避免多张证书挤在同一秒醒来。
+	// Layer on a deterministic +/-10% jitter so many certificates do not wake up in
+	// the same second.
 	if jitterSpan := span / 10; jitterSpan > 0 {
 		j := time.Duration(binary.BigEndian.Uint64(h[8:16]) % uint64(jitterSpan*2))
 		at = at.Add(j - jitterSpan)
 	}
 
-	// 抖动可能把它推出窗口，夹回来。
+	// Jitter can push it outside the window; clamp it back.
 	if at.Before(start) {
 		return start
 	}
@@ -103,10 +107,11 @@ func RenewalTime(name string, start, end time.Time) time.Time {
 	return at
 }
 
-// DeterministicTime 在 ARI 不可用时使用的兜底续期时刻。
+// DeterministicTime is the fallback renewal instant used when ARI is unavailable.
 //
-// 语义是"从 base 开始，在 spread 范围内按证书名确定性地散开"，
-// 这样几百张证书不会在同一分钟一起去敲 CA 的门。
+// The semantics are "start at base and spread deterministically by certificate name
+// across the spread range", so a few hundred certificates do not all knock on the CA's
+// door in the same minute.
 func DeterministicTime(name string, base time.Time, spread time.Duration) time.Time {
 	if spread <= 0 {
 		return base

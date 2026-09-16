@@ -4,8 +4,10 @@ package state
 
 import "syscall"
 
-// setUmask 临时设置进程 umask，并返回原值以便还原。
+// setUmask sets the process umask temporarily and returns the previous value so it can
+// be restored.
 //
-// 只用于测试：想证明文件权限是代码显式设置的，就必须在一个"什么都不挡"的
-// umask 下验证 —— 用 umask 077 跑出来的 0600 是 umask 的功劳，不是代码的。
+// Test-only: proving that file permissions are set explicitly by the code requires
+// verifying under a umask that masks nothing -- a 0600 produced by running under
+// umask 077 is the umask's doing, not the code's.
 func setUmask(mask int) int { return syscall.Umask(mask) }

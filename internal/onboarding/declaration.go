@@ -7,42 +7,47 @@ import (
 	"github.com/susunola/wecert/internal/group"
 )
 
-// DeclarationPrefix 是声明的记录名前缀。
+// DeclarationPrefix is the record-name prefix for a declaration.
 //
-// 为什么把声明做成 DNS 记录而不是让 wecert 去枚举 DNS 记录推断意图：
-// DNS zone 本来就是这个系统的信任根 —— 谁能写这个 zone，谁本来就能为
-// 其中任何名字做 DNS-01 验证、从任何 CA 拿到证书。把声明也放在这里，
-// 没有引入新的信任边界，只是把已经存在的能力显式化。
+// Why make declarations DNS records instead of letting wecert enumerate DNS
+// records and infer intent: the DNS zone is already this system's root of trust
+// -- whoever can write the zone can already do DNS-01 validation for any name in
+// it and obtain a certificate from any CA. Keeping declarations here introduces
+// no new trust boundary; it only makes an existing capability explicit.
 //
-// 反过来，"DNS 里有记录就签"是明确不做的：zone 里 MX/TXT/SPF/各种验证
-// 记录全在里面，DNS 记录 ≠ 想要证书。授权必须是一个明确的动作。
+// Conversely, "any DNS record means issue" is explicitly not done: the zone holds
+// MX/TXT/SPF and all kinds of verification records, and a DNS record is not a
+// request for a certificate. Authorization must be an explicit act.
 const DeclarationPrefix = "_wecert."
 
-// DeclarationVersion 是声明格式的版本号，写成 v=wecert1。
+// DeclarationVersion is the declaration format version, written as v=wecert1.
 const DeclarationVersion = "wecert1"
 
-// Declaration 是一条 _wecert TXT 声明解析后的结果。
+// Declaration is the parsed result of one _wecert TXT declaration.
 type Declaration struct {
-	// Hostname 是声明要证书的名字：记录名剥掉 _wecert. 前缀之后的部分。
+	// Hostname is the name declared to need a certificate: the record name with
+	// the _wecert. prefix stripped off.
 	Hostname string
 
-	// Wildcard 表示同时声明 *.<Hostname>。
+	// Wildcard means *.<Hostname> is declared as well.
 	//
-	// 通配符必须是显式声明的：加一张 *.example.com 意味着证书能对
-	// 任意子域完成握手，那是权限扩张，不该由分组逻辑替人决定。
+	// A wildcard must be declared explicitly: adding *.example.com means the
+	// certificate can handshake for any subdomain, which is privilege expansion
+	// and must not be decided on a human's behalf by grouping logic.
 	Wildcard bool
 
-	// 以下三项是可选的覆盖，留空表示沿用 onboarding 的默认值。
+	// The next three are optional overrides; empty means the onboarding default.
 	Profile string
 	KeyType string
 	Deploy  *bool
 
-	// Zone 与 Record 只用于报告和排障。
+	// Zone and Record are for reporting and troubleshooting only.
 	Zone   string
 	Record string
 }
 
-// Names 返回这条声明贡献的所有名字，含通配符展开。
+// Names returns every name this declaration contributes, including wildcard
+// expansion.
 func (d *Declaration) Names() []string {
 	out := make([]string, 0, 2)
 	out = append(out, d.Hostname)
@@ -52,11 +57,12 @@ func (d *Declaration) Names() []string {
 	return out
 }
 
-// ParseDeclaration 把一条 _wecert.* TXT 记录解析成声明。
+// ParseDeclaration parses one _wecert.* TXT record into a declaration.
 //
-// 未知的键一律报错而不是忽略。理由很直接：`wildard=1` 这种拼写错误
-// 如果被静默忽略，结果是"声明了通配符但没生效"，而人会以为它生效了 ——
-// 这类沉默的偏差比一条清晰的报错昂贵得多。
+// Unknown keys are always an error rather than ignored. The reason is plain: if a
+// typo like `wildard=1` were silently ignored, the result would be "declared a
+// wildcard but it never took effect" while the human believes it did -- a silent
+// divergence like that costs far more than a clear error.
 func ParseDeclaration(zone, record string, values []string) (*Declaration, error) {
 	full := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(record)), ".")
 	if !strings.HasPrefix(full, DeclarationPrefix) {
@@ -85,7 +91,8 @@ func ParseDeclaration(zone, record string, values []string) (*Declaration, error
 				continue
 			}
 			if !hasValue {
-				// 裸 `v=wecert1` 之外的裸字段没有意义，只有版本号自己允许省略。
+				// A bare field other than `v=wecert1` is meaningless; only the
+				// version marker itself may omit its value.
 				if key != DeclarationVersion {
 					return nil, fmt.Errorf("record %q: field %q is neither key=value nor the bare version marker %q",
 						record, field, DeclarationVersion)
@@ -130,10 +137,11 @@ func ParseDeclaration(zone, record string, values []string) (*Declaration, error
 	return d, nil
 }
 
-// splitFields 把 TXT 内容切成一个个字段。
+// splitFields cuts the TXT content into individual fields.
 //
-// 同时接受空格、逗号和分号分隔：DNS 控制台里手敲 TXT 的人不会记得
-// 该用哪个，多一种分隔符的成本远低于"声明没生效"的排障成本。
+// It accepts space, comma and semicolon separators alike: someone typing TXT by
+// hand in a DNS console will not remember which one to use, and supporting an
+// extra separator is far cheaper than debugging "the declaration did not apply".
 func splitFields(v string) []string {
 	v = strings.TrimSpace(v)
 	v = strings.Trim(v, `"`)

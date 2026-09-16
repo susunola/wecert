@@ -1,53 +1,63 @@
 GO ?= go
 BIN := bin/wecert
-# onboarding 组件。它和 wecert 一样是产品的一部分（跑在定时任务里），
-# 但刻意做成独立二进制：推断逻辑要能整个丢掉重写而不碰签发。
+# The onboarding component. Like wecert it is part of the product (it runs in the
+# scheduled job), but it is deliberately a separate binary: the inference logic
+# must be replaceable wholesale without touching issuance.
 ONBOARD := bin/wecert-onboard
-# 辅助工具：只用于测试与排障，不随产品部署。
-# 加 wecert- 前缀是为了安装到 /usr/local/bin 后不会和其它工具撞名。
+# Auxiliary tools: used only for testing and troubleshooting, never shipped with
+# the product. The wecert- prefix keeps them from colliding with other tools once
+# installed into /usr/local/bin.
 PREFLIGHT := bin/wecert-preflight
 CLBVERIFY := bin/wecert-clbverify
 TATRUN := bin/wecert-tatrun
 PROBE := bin/wecert-probe
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1.0)
 
-# 图：中文版是手写源，英文版是构建产物。
+# Diagrams: the Chinese version is the hand-written source, the English version is
+# a build artifact.
 SRCHTML := docs/certificate-lifecycle.html
 ENHTML  := docs/certificate-lifecycle.en.html
 
-# 交叉编译目标。腾讯云 CVM 绝大多数是 linux/amd64；
-# ARM 实例用 linux/arm64；darwin/arm64 供本机调试。
+# Cross-compilation targets. The vast majority of Tencent Cloud CVMs are
+# linux/amd64; ARM instances use linux/arm64; darwin/arm64 is for local debugging.
 PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 
-# 随产品发布的命令。webhook 触发的那一半不在这里时，这里也要同步补上。
+# Commands shipped with the product. The webhook-triggered half is not in here
+# yet; keep this list in sync when it lands.
 CMDS := wecert wecert-onboard
 
-.PHONY: build tools release test vet cover clean fmt validate-cloudinit fmt-check check diagrams diagrams-check
+.PHONY: build tools release test vet cover clean fmt validate-cloudinit check-english fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
 
-# readme 里嵌的两种语言各六张 PNG。
+# Six PNGs per language, embedded in the readme.
 #
-# 中文版是手写的事实来源，英文版由翻译表生成 —— 所以英文页面是构建产物，
-# 依赖中文源和翻译表，改了哪个都会自动重生成。
+# The Chinese version is the hand-written source of truth and the English version
+# is generated from the translation table — so the English page is a build
+# artifact that depends on the Chinese source and the translation table, and
+# changing either of them regenerates it.
 #
-# 之所以要有这条命令而不是手工导一次：PNG 是二进制，代码改了它不会自己跟。
-# 有一条可重跑的路径，「图过期了」才只是一次 `make diagrams` 的事。
+# Why there is a command for this instead of a one-off manual export: PNGs are
+# binary, so they do not follow along when the code changes. Having a re-runnable
+# path is what reduces "the diagram is stale" to a single `make diagrams`.
 diagrams: diagrams-check
 	python3 scripts/render-diagrams.py
 
-# 在真实浏览器里量每个 foreignObject 的标签有没有溢出盒子，两种语言都量。
+# Measure in a real browser whether every foreignObject label overflows its box,
+# in both languages.
 #
-# 英文比中文长，所以同一句话在两种语言下可能是"中文放得下、英文溢出" ——
-# 这正是英文版必须单独量一遍的原因（第一次跑就抓到图 6 差 1px）。
+# English is longer than Chinese, so the same sentence can fit in one language and
+# overflow in the other — which is exactly why the English version has to be
+# measured separately (the first run caught diagram 6 overflowing by 1px).
 diagrams-check: $(ENHTML)
 	python3 scripts/check-diagram-fit.py
 
 $(ENHTML): $(SRCHTML) scripts/diagram_i18n.py scripts/build-diagram-langs.py
 	python3 scripts/build-diagram-langs.py
 
-# 构建辅助工具（preflight 前置检查、clbverify 监听器绑定取证、probe 网络侧取证）。
+# Build the auxiliary tools (preflight pre-flight checks, clbverify
+# listener-binding evidence, probe network-side evidence).
 tools:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(ONBOARD) ./cmd/wecert-onboard
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(PROBE) ./cmd/wecert-probe
@@ -55,9 +65,10 @@ tools:
 	$(GO) build -trimpath -ldflags "-s -w" -o $(CLBVERIFY) ./cmd/clbverify
 	$(GO) build -trimpath -ldflags "-s -w" -o $(TATRUN) ./cmd/tatrun
 
-# 产出可直接扔到 CVM 上的静态二进制。
-# CGO_ENABLED=0 是必须的：一是交叉编译，二是让产物不依赖 glibc，
-# 这样 Alpine/musl 上也能直接跑。SQLite 用的是纯 Go 实现，所以可行。
+# Produce static binaries that can be dropped straight onto a CVM.
+# CGO_ENABLED=0 is required: first for cross-compilation, and second so the
+# artifacts do not depend on glibc and therefore also run on Alpine/musl. This is
+# feasible because SQLite is used through a pure-Go implementation.
 release:
 	@rm -rf dist && mkdir -p dist
 	@for cmd in $(CMDS); do \
@@ -71,19 +82,29 @@ release:
 		done; \
 	done
 	@cd dist && (command -v sha256sum >/dev/null 2>&1 && sha256sum wecert* || shasum -a 256 wecert*) > SHA256SUMS
-	@echo && echo "=== 产物 ===" && ls -lh dist/ && echo && cat dist/SHA256SUMS
+	@echo && echo "=== artifacts ===" && ls -lh dist/ && echo && cat dist/SHA256SUMS
 
-# apply 之前查 cloud-init user_data 里的脚本语法。
-# 这类错误只有机器启动后才暴露，现象是 CLB 502，很容易误判成网络问题。
+# Check the syntax of the scripts inside the cloud-init user_data before apply.
+# This class of error only shows up after the machine boots, and what you see is a
+# CLB 502, which is easily misdiagnosed as a network problem.
 validate-cloudinit:
 	python3 scripts/validate-cloudinit.py
+
+# Fail if any comment or message is still in Chinese. Two files are deliberately
+# excluded because their Chinese is data, not prose: docs/certificate-lifecycle.html
+# (the hand-written source for the Chinese diagram set) and scripts/diagram_i18n.py
+# (the zh->en translation table, whose Chinese keys are the lookup keys). Markdown
+# is skipped too: the repository ships paired English/Chinese documents on purpose.
+check-english:
+	python3 scripts/check-english.py
 
 test:
 	$(GO) test ./...
 
-# -race 是必要的：SAN 多的证书上，DNS 探测与授权轮询都是并发的，
-# 数据竞争会表现成"偶尔某个域名的验证莫名其妙失败"，
-# 那种 bug 靠人工 review 看不出来。
+# -race is necessary: on certificates with many SANs, DNS probing and
+# authorization polling run concurrently, and a data race shows up as "some
+# domain's validation fails intermittently for no apparent reason" — the kind of
+# bug that human review does not catch.
 test-race:
 	$(GO) test -race ./...
 
@@ -97,15 +118,15 @@ cover:
 fmt:
 	$(GO) fmt ./...
 
-# 只检查不修改，用于 CI 门禁。
+# Check only, never modify; used as a CI gate.
 fmt-check:
 	@out="$$(gofmt -l .)"; \
 	if [ -n "$$out" ]; then \
-		echo "以下文件未格式化，请运行 make fmt:"; echo "$$out"; exit 1; \
+		echo "The following files are not formatted; run make fmt:"; echo "$$out"; exit 1; \
 	fi
 
-# 提交前的完整门禁。
-check: fmt-check vet test-race
+# The full pre-commit gate.
+check: check-english fmt-check vet test-race
 
 clean:
 	rm -rf bin dist coverage.out

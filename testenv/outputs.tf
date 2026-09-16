@@ -1,37 +1,37 @@
 ###############################################################################
-# 输出：验证和后续步骤需要的东西
+# Outputs: what verification and the follow-up steps need
 ###############################################################################
 
 output "region" {
-  description = "资源所在地域。"
+  description = "Region the resources live in."
   value       = var.region
 }
 
-# ── 阶段 B：CLB ─────────────────────────────────────────────────────────────
+# ── stage B: CLB ────────────────────────────────────────────────────────────
 
 output "clb_id" {
-  description = "CLB 实例 ID。"
+  description = "CLB instance ID."
   value       = var.create_clb ? tencentcloud_clb_instance.test[0].id : null
 }
 
 output "listener_id" {
-  description = "HTTPS 监听器 ID。验证重绑定时要看它的 certificate_id。"
+  description = "HTTPS listener ID. Verifying the rebind means looking at its certificate_id."
   value       = var.create_clb ? tencentcloud_clb_listener.https[0].listener_id : null
 }
 
-# 这个值要预置进 wecert 状态库的 deployed_cert_id，
-# 用来模拟"wecert 管理的证书当前已经绑在监听器上"。
+# This value is seeded into the wecert state store's deployed_cert_id to simulate
+# "the certificate wecert manages is currently bound to the listener".
 output "placeholder_cert_id" {
-  description = "占位证书的 CertId。预置到 wecert 的 deployed_cert_id 后，续期就会触发 UpdateCertificateInstance。"
+  description = "CertId of the placeholder cert. Once seeded into wecert's deployed_cert_id, renewal triggers UpdateCertificateInstance."
   value       = var.create_clb ? tencentcloud_ssl_certificate.placeholder[0].id : null
 }
 
 output "placeholder_domain" {
-  description = "占位证书的域名。"
+  description = "Domain of the placeholder certificate."
   value       = var.clb_sni_domain
 }
 
-# ── 网络 ────────────────────────────────────────────────────────────────────
+# ── network ─────────────────────────────────────────────────────────────────
 
 output "vpc_id" {
   value = (var.create_clb || var.create_cvm) ? tencentcloud_vpc.test[0].id : null
@@ -41,67 +41,67 @@ output "subnet_id" {
   value = (var.create_clb || var.create_cvm) ? tencentcloud_subnet.test[0].id : null
 }
 
-# ── 阶段 C：CVM ─────────────────────────────────────────────────────────────
+# ── stage C: CVM ────────────────────────────────────────────────────────────
 
 output "cvm_instance_id" {
-  description = "CVM 实例 ID。用 TAT 在上面跑命令，不需要 SSH。"
+  description = "CVM instance ID. Use TAT to run commands on it; SSH is not needed."
   value       = var.create_cvm ? tencentcloud_instance.test[0].id : null
 }
 
 output "cvm_public_ip" {
-  description = "CVM 公网 IP。"
+  description = "CVM public IP."
   value       = var.create_cvm ? tencentcloud_instance.test[0].public_ip : null
 }
 
 output "cvm_cam_role" {
-  description = "CVM 关联的 CAM 角色。为空说明走的是静态凭证路径。"
+  description = "CAM role attached to the CVM. Empty means the static credential path is used."
   value       = var.create_cvm ? var.enable_cvm_role ? var.cam_role_name : "" : null
 }
 
 output "cvm_private_ip" {
-  description = "CVM 内网 IP。目标组就是按它注册后端的。"
+  description = "CVM private IP. This is what the target group registers the backend by."
   value       = var.create_cvm ? tencentcloud_instance.test[0].private_ip : null
 }
 
-# ── 端到端 TLS 验证所需 ─────────────────────────────────────────────────────
+# ── needed for end-to-end TLS verification ──────────────────────────────────
 
 output "clb_vip" {
-  description = "CLB 的 VIP。从 CVM 内部 curl 这个地址就能读到实际服务的证书。"
+  description = "The CLB's VIP. Curling this address from inside the CVM reads the certificate actually being served."
   value       = var.create_clb ? tencentcloud_clb_instance.test[0].vip : null
 }
 
 output "verify_command" {
-  description = "从 CVM 内部做端到端 TLS 验证的命令模板（把 <域名> 换成实际域名）。"
+  description = "Command template for end-to-end TLS verification from inside the CVM (replace <domain> with the real domain)."
   value = var.create_clb && var.create_cvm ? join(" ", [
     "./bin/wecert-tatrun",
     "-region", var.region,
     "-instance", tencentcloud_instance.test[0].id,
-    "-cmd", "'echo | openssl s_client -connect <域名>:443 -servername <域名> -showcerts 2>/dev/null | openssl x509 -noout -subject -dates'",
+    "-cmd", "'echo | openssl s_client -connect <domain>:443 -servername <domain> -showcerts 2>/dev/null | openssl x509 -noout -subject -dates'",
   ]) : null
 }
 
-# ── 你本机直接访问的 URL ────────────────────────────────────────────────────
+# ── URLs to open directly from your machine ─────────────────────────────────
 
 output "test_urls" {
-  description = "浏览器直接打开就能看到对应测试页（前提是 DNS 记录已建、且你的出口 IP 在 clb_allowed_cidrs 里）。"
+  description = "Open these in a browser to see the matching test page (provided the DNS records exist and your egress IP is in clb_allowed_cidrs)."
   value = var.create_clb && var.create_cvm ? {
     for d in var.clb_rule_domains : d => "https://${d}/  ->  ${lookup(var.backend_pages, d, "UNKNOWN")}"
   } : null
 }
 
 output "dns_records_created" {
-  description = "为测试建的 A 记录（测试完随 destroy 一起清掉）。"
+  description = "A records created for the test (cleaned up along with destroy when testing is done)."
   value       = var.create_dns && var.create_clb ? [for r in tencentcloud_dnspod_record.test : "${r.sub_domain}.${var.dns_zone} -> ${r.value}"] : []
 }
 
 output "clb_access_from" {
-  description = "允许访问 CLB:443 的来源网段。为空表示没挂安全组（对全网开放）。"
+  description = "Source CIDRs allowed to reach CLB:443. Empty means no security group is attached (open to the whole internet)."
   value       = var.clb_allowed_cidrs
 }
 
-# ── 清理提醒 ────────────────────────────────────────────────────────────────
+# ── teardown reminder ───────────────────────────────────────────────────────
 
 output "teardown_command" {
-  description = "销毁全部测试资源。"
+  description = "Destroy all test resources."
   value       = "cd ${abspath(path.module)} && terraform destroy -auto-approve"
 }

@@ -12,10 +12,11 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
-// download 下载证书、校验，然后部署并推进状态。
+// download downloads and verifies the certificate, then deploys it and advances the state.
 //
-// 这里的顺序是刻意的：在部署成功之前，绝不覆盖 CertState 里当前生效的
-// 证书与私钥。否则部署失败就会连回滚的资本都没有。
+// The ordering here is deliberate: until the deploy succeeds, never overwrite the
+// certificate and private key currently in effect in CertState. Otherwise a failed deploy
+// leaves nothing to roll back to.
 func (m *Manager) download(
 	ctx context.Context, c *config.Certificate, st *state.CertState,
 	o *state.Order, order legoacme.ExtendedOrder,
@@ -24,13 +25,15 @@ func (m *Manager) download(
 		return m.recordFailure(st, errors.New("the order is valid but has no certificate URL"))
 	}
 
-	// 幂等兜底：订单对应的证书已经是当前生效的那一张，说明上一轮
-	// "下载 + 部署"其实成功了，只是收尾（丢弃订单）没做完。
+	// Idempotent backstop: the order's certificate is already the live one, which means the
+	// previous round's "download + deploy" actually succeeded and only the finishing move
+	// (discarding the order) never completed.
 	//
-	// 这种情况下如果继续往下走，会被下面那道 notAfter 闸门挡下来 ——
-	// 新证书不可能比它自己更新 —— 于是每轮都报一次错、退避到 6 小时，
-	// 把一次成功的续期报成持续故障，consecutive_failures 一路涨到需要人工介入。
-	// 既然结果是已达成状态，直接收尾即可。
+	// Going any further would trip the notAfter gate below -- a new certificate cannot be
+	// newer than itself -- so every round would log an error and back off to 6 hours,
+	// reporting one successful renewal as a persistent fault with consecutive_failures
+	// climbing until a human has to intervene. The outcome is already the desired state, so
+	// just finish up.
 	if st.CertURL != "" && st.CertURL == order.Certificate && !st.NotAfter.IsZero() {
 		m.log.Info("the order's certificate is already the live one; skipping the duplicate deploy",
 			"cert", c.Name, "certUrl", order.Certificate)
@@ -41,7 +44,8 @@ func (m *Manager) download(
 		return m.discardOrder(ctx, c.Name)
 	}
 
-	// bundle=true → 返回的是 fullchain（叶子 + 中间证书），正是 CLB 需要的格式。
+	// bundle=true returns the fullchain (leaf + intermediate certificates), which is exactly
+	// the format CLB needs.
 	fullchain, _, err := m.core.GetCertificate(order.Certificate, true)
 	if err != nil {
 		return m.recordFailure(st, fmt.Errorf("download certificate: %w", err))
@@ -63,19 +67,22 @@ func (m *Manager) download(
 		return m.recordFailure(st, errors.New("the order has no private key; cannot deploy"))
 	}
 
-	// 部署。首次签发时 DeployedCertID 为空，此时只上传，等人工在 CLB 绑一次。
-	// 上传成功不等于已经绑到监听器：DeployConfirmed 要等一键更新真正换完才置位。
+	// Deploy. On a first issuance DeployedCertID is empty, so this only uploads and waits
+	// for a human to bind it once in the CLB console. A successful upload does not mean the
+	// listener is bound: DeployConfirmed is only set once the one-click update has really
+	// finished switching over.
 	oldDeployedID := st.DeployedCertID
 	deployedID := oldDeployedID
 	rebound := false
 	if c.Deploy.Enabled {
 		id, derr := m.deployer.Deploy(ctx, c.Name, oldDeployedID, fullchain, o.KeyPEM)
 		if derr != nil {
-			// Deployer 的约定是：出错时仍然把已经上传成功的证书 ID 返回来
-			// （见 internal/deploy/tencent.go 的 Deploy）。那个 ID 必须记进
-			// 待回收列表 —— 否则它既不在 certificates 表、也不在 retired 表里，
-			// ReapRetired 永远看不到它，一次失败就在腾讯云上漏下一张证书，
-			// 最后撞上账号配额，而回收机制的存在意义正是防这个。
+			// The Deployer contract is: on error it still returns the ID of the certificate
+			// that was uploaded successfully (see Deploy in internal/deploy/tencent.go). That
+			// ID must be recorded in the reclaim list -- otherwise it is in neither the
+			// certificates table nor the retired table, ReapRetired never sees it, and one
+			// failure leaks one certificate in Tencent Cloud until the account quota is hit.
+			// The reclaim machinery exists precisely to prevent that.
 			m.recordOrphanCert(id, oldDeployedID, c.Name)
 			return m.recordFailure(st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
 		}
@@ -85,11 +92,12 @@ func (m *Manager) download(
 
 	ariCertID, err := CertID(leaf)
 	if err != nil {
-		// ARI 不可用不该阻断签发，只是失去了速率豁免。
+		// ARI being unavailable must not block issuance; it only costs us the rate-limit
+		// exemption.
 		m.log.Warn("could not build the ARI certID; this renewal will go out without replaces", "cert", c.Name, "err", err)
 	}
 
-	// 部署成功，此时才把新证书提升为生效版本。
+	// The deploy succeeded; only now is the new certificate promoted to the live version.
 	st.NotAfter = leaf.NotAfter
 	st.CertURL = order.Certificate
 	st.CertPEM = fullchain
@@ -99,7 +107,8 @@ func (m *Manager) download(
 	if rebound {
 		st.DeployConfirmed = true
 	} else if oldDeployedID == "" {
-		// 首次上传：CertId 要记下来给人手绑定，但指标仍应显示未部署。
+		// First upload: record the CertId so a human can bind it, but the metric should still
+		// read "not deployed".
 		st.DeployConfirmed = false
 	}
 	st.ARICertID = ariCertID
@@ -115,8 +124,9 @@ func (m *Manager) download(
 		return err
 	}
 
-	// 只有确认已经从旧证换到新证之后，才把旧证挂到待回收列表。
-	// 首次上传还没绑监听器时绝不能退休，否则 7 天后会把人手刚绑上的证删掉。
+	// Only once the switch from the old certificate to the new one is confirmed does the old
+	// one go on the reclaim list. On a first upload nothing is bound to a listener yet, and
+	// retiring it would delete, 7 days later, the very certificate a human just bound.
 	if rebound && oldDeployedID != "" && oldDeployedID != deployedID {
 		if err := m.store.AddRetiredCert(oldDeployedID, c.Name); err != nil {
 			m.log.Warn("failed to record the certificate for reclaim", "cert", c.Name, "certId", oldDeployedID, "err", err)
@@ -127,12 +137,13 @@ func (m *Manager) download(
 		return err
 	}
 
-	// 一次成功的签发之后，如果此刻并没有处于降级，就把逐个 identifier 的
-	// 失败账本清掉。
+	// After a successful issuance, and only if we are not degraded right now, clear the
+	// per-identifier failure ledger.
 	//
-	// 账本的意义是"最近谁在坏"，不是"历史上谁坏过"。留着它会让一次早已
-	// 修好的故障把那个名字一直摘在证书外面 —— 而且因为被摘掉的名字永远
-	// 不会再被尝试，它也就永远等不到一次成功来给自己洗白。
+	// The ledger means "who has been broken lately", not "who has ever been broken". Keeping
+	// it would let a long-since-fixed fault keep that name out of the certificate forever --
+	// and because a dropped name is never tried again, it can never earn the one success that
+	// would clear its name.
 	if fb, err := m.store.GetFallback(c.Name); err == nil && fb == nil {
 		if cerr := m.store.ClearIdentifierFailures(c.Name); cerr != nil {
 			m.log.Warn("cannot clear the identifier failure ledger", "cert", c.Name, "err", cerr)
@@ -157,7 +168,7 @@ func (m *Manager) download(
 	return nil
 }
 
-// ReapRetired 回收超过保留期的退役证书。
+// ReapRetired reclaims retired certificates that are past the retention period.
 func (m *Manager) ReapRetired(ctx context.Context) {
 	retired, err := m.store.ListRetiredCertsBefore(m.now().Add(-m.retention))
 	if err != nil {
@@ -177,15 +188,16 @@ func (m *Manager) ReapRetired(ctx context.Context) {
 	}
 }
 
-// recordFailure 记录失败并安排指数退避。
-// recordFailure 记录失败并安排指数退避。
+// recordFailure records a failure and schedules exponential backoff.
 //
-// 上限 6 小时不是随手定的：撞上 "5 authorization failures per identifier per hour"
-// 之后继续猛重试只会让情况更糟，退到 6 小时意味着每天最多 4 次，
-// 远低于限速阈值，同时保证问题修好后能自愈。
+// The 6-hour cap is not arbitrary: once we have hit "5 authorization failures per
+// identifier per hour", hammering retries only makes things worse. Backing off to 6 hours
+// means at most 4 attempts a day, far below the rate-limit threshold, while still
+// guaranteeing that a fixed problem heals itself.
 func (m *Manager) recordFailure(st *state.CertState, err error) error {
-	// 停进程 / 父 context 取消不是业务失败。记进去会拉长退避，
-	// 重启后本该立刻续推同一张订单，结果被挡在窗口外。
+	// A stopped process / cancelled parent context is not a business failure. Recording it
+	// would lengthen the backoff, so after a restart the same order should have been pushed
+	// on immediately but is instead locked out of the window.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		m.log.Warn("pass cancelled; not counted as a failure and no backoff applied", "cert", st.Name, "err", err)
 		return err
@@ -214,29 +226,32 @@ func (m *Manager) recordFailure(st *state.CertState, err error) error {
 	return err
 }
 
-// discardOrder 丢弃当前订单，并**在删掉授权行之前先把 TXT 收掉**。
+// discardOrder discards the current order and **reclaims the TXT records before deleting the
+// authorization rows**.
 //
-// 顺序不能反。授权行（TxtName / ChallengeToken / TxtValue）是清理 DNS 的
-// 唯一线索，行一旦删掉，那些 _acme-challenge 记录就永远回收不了了。
+// The order cannot be reversed. The authorization row (TxtName / ChallengeToken / TxtValue)
+// is the only clue for cleaning up DNS; once the row is deleted those _acme-challenge
+// records can never be reclaimed.
 //
-// 这里以前只删行、不清 DNS，于是每走一次"订单已 ready、直接 finalize"
-// 的路径（也就是 solveChallenges 被整个跳过的那条常见路径），
-// DNSPod 上就攒下一条僵尸 TXT —— 而"授权验证跨轮次"在免费套餐
-// 2 分钟以上的传播时间里恰恰是常态。
+// This used to delete the rows without touching DNS, so every trip down the "the order is
+// already ready, finalize directly" path (the common path where solveChallenges is skipped
+// entirely) piled up one zombie TXT on DNSPod -- and cross-round authorization validation is
+// the norm when propagation takes over 2 minutes on the free tier.
 //
-// 清理交给 cleanupOrphanTXT：它自己负责删掉已经处理完的行，
-// 并保留那些定位不到 token 的行留给下一轮重试。
+// Cleanup is handed to cleanupOrphanTXT: it deletes the rows it has finished with, and keeps
+// the rows whose token cannot be located around for the next round to retry.
 func (m *Manager) discardOrder(ctx context.Context, certName string) error {
 	if err := m.cleanupOrphanTXT(ctx, certName); err != nil {
-		// 清理失败不能阻止丢弃订单 —— 否则会卡在一张签不出结果的订单上，
-		// 那比多留一条 TXT 严重得多。
+		// A cleanup failure must not stop us discarding the order -- that would leave us stuck
+		// on an order that can never produce a result, which is far worse than one extra TXT
+		// record.
 		m.log.Warn("failed to clean up TXT before discarding the order", "cert", certName, "err", err)
 	}
 	return m.store.DeleteOrder(certName)
 }
 
-// parseOrderExpires 解析 ACME 订单的 expires。空值或无法解析时退回 now+defaultOrderTTL，
-// 保证落盘的 ExpiresAt 永远不是零值。
+// parseOrderExpires parses an ACME order's expires. On an empty or unparsable value it
+// falls back to now+defaultOrderTTL, so the persisted ExpiresAt is never the zero value.
 func parseOrderExpires(raw string, now time.Time) (time.Time, error) {
 	fallback := now.Add(defaultOrderTTL)
 	if raw == "" {
@@ -253,7 +268,8 @@ func parseOrderExpires(raw string, now time.Time) (time.Time, error) {
 
 func (m *Manager) persistOrder(o *state.Order, order legoacme.ExtendedOrder) {
 	o.Status = order.Status
-	// 不要用空值覆盖已持久化的 finalize URL —— 丢掉它会让后续无法提交 CSR。
+	// Never overwrite a persisted finalize URL with an empty value -- losing it makes
+	// submitting the CSR impossible later.
 	if order.Finalize != "" {
 		o.FinalizeURL = order.Finalize
 	}
@@ -284,11 +300,13 @@ func authzError(authz legoacme.Authorization) string {
 	return "the CA gave no specific reason"
 }
 
-// recordOrphanCert 把一个"云上已经存在、但本地没有归属"的证书记进待回收列表。
+// recordOrphanCert records a certificate that "already exists in the cloud but has no local
+// owner" in the reclaim list.
 //
-// 场景是 Deploy 上传成功、重绑定失败。不记下来的话，这张证书既不在
-// certificates 表也不在 retired 表里，回收器永远看不到 ——
-// 而腾讯云账号下上传证书是有配额的，漏几张之后就无法续期了。
+// The scenario is a Deploy whose upload succeeded but whose rebind failed. Without recording
+// it, the certificate is in neither the certificates table nor the retired table and the
+// reaper never sees it -- and uploaded certificates count against a quota in the Tencent
+// Cloud account, so after a few leaks renewal becomes impossible.
 func (m *Manager) recordOrphanCert(newID, liveID, certName string) {
 	if newID == "" || newID == liveID {
 		return

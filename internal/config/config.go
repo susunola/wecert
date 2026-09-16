@@ -1,8 +1,9 @@
-// Package config 定义 wecert 的声明式期望状态（spec）。
+// Package config defines wecert's declarative desired state (the spec).
 //
-// 设计原则：YAML 里写的只是"我要什么"，不含任何运行时状态。
-// 运行时状态（order URL、ARI 窗口、腾讯云 CertId 等）一律进 SQLite，
-// 因为丢失它们会直接导致重复下单并撞上 Let's Encrypt 的速率限制。
+// Design principle: the YAML says only "what I want" and carries no runtime
+// state at all. Runtime state (order URL, ARI window, Tencent Cloud CertId and
+// so on) always goes into SQLite, because losing it directly causes duplicate
+// orders and runs into Let's Encrypt rate limits.
 package config
 
 import (
@@ -16,14 +17,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ACME profile 名。Max Names 上限随 profile 变化。
+// ACME profile names. The Max Names cap varies by profile.
 const (
 	ProfileClassic    = "classic"
 	ProfileTLSServer  = "tlsserver"
 	ProfileShortLived = "shortlived"
 )
 
-// Let's Encrypt 目录 URL。
+// Let's Encrypt directory URLs.
 const (
 	DirectoryStaging    = "https://acme-staging-v02.api.letsencrypt.org/directory"
 	DirectoryProduction = "https://acme-v02.api.letsencrypt.org/directory"
@@ -41,37 +42,38 @@ const (
 	CredentialCVMRole = "cvm-role"
 )
 
-// DNS-01 solver 的实现。两者的凭证体系完全不同，别搞混：
+// DNS-01 solver implementations. Their credential systems are completely
+// different, so do not mix them up:
 //
-// dnspod 用 DNSPod 自有的 API Token（dnspod.cn 控制台 → 密钥管理），调
-// dnsapi.cn。它和腾讯云 CAM 的 SecretId/SecretKey 是两套东西。
+// dnspod uses DNSPod's own API Token (dnspod.cn console -> key management) and
+// calls dnsapi.cn. That is not Tencent Cloud CAM's SecretId/SecretKey.
 //
-// tencentcloud 用腾讯云 CAM 凭证（AK/SK 或 CVM 角色临时凭证），调
-// dnspod.tencentcloudapi.com。好处是能和证书部署共用同一套凭证，而且支持
-// SessionToken，可以走 role。
+// tencentcloud uses Tencent Cloud CAM credentials (AK/SK or CVM role temporary
+// credentials) and calls dnspod.tencentcloudapi.com. The upside is one shared
+// credential set with certificate deployment, plus SessionToken and roles.
 const (
 	DNSProviderDNSPod       = "dnspod"
 	DNSProviderTencentCloud = "tencentcloud"
 )
 
-// profileMaxNames 是各 profile 允许的最大 identifier 数量。
-// classic 允许 100，但新的 tlsserver / shortlived 只有 25 —— 本地先拦，
-// 免得把一个必然被 CA 拒绝的订单打出去（那会消耗 order 配额）。
+// profileMaxNames is the maximum identifier count each profile allows.
+// classic allows 100, but the newer tlsserver / shortlived only 25 — reject
+// locally rather than send an order the CA will refuse and burn quota on.
 var profileMaxNames = map[string]int{
 	ProfileClassic:    100,
 	ProfileTLSServer:  25,
 	ProfileShortLived: 25,
 }
 
-// profileRenewBefore 是各 profile 的默认提前续期时长。
-// 这只在 ARI 不可用时作为兜底；ARI 可用时以 suggestedWindow 为准。
+// profileRenewBefore is each profile's default renew-ahead duration.
+// A fallback only when ARI is unavailable; otherwise suggestedWindow wins.
 var profileRenewBefore = map[string]time.Duration{
 	ProfileClassic:    30 * 24 * time.Hour,
 	ProfileTLSServer:  15 * 24 * time.Hour,
 	ProfileShortLived: 48 * time.Hour,
 }
 
-// Config 是整份配置。
+// Config is the whole configuration.
 type Config struct {
 	StatePath    string          `yaml:"statePath"`
 	ACME         ACME            `yaml:"acme"`
@@ -86,49 +88,52 @@ type Config struct {
 	Certificates []Certificate   `yaml:"certificates"`
 }
 
-// FailureFallback 配置"到期前拆分子集先签"的降级策略。
+// FailureFallback configures the "issue a subset before expiry" degradation.
 //
-// 它解决的是一个很具体的场景：一张 25 个名字的证书里有 1 个名字的 DNS
-// 配错了，于是整张证书签不出来 —— 而那 24 个本来好的名字会跟着一起过期。
-// 部分可用好过全挂。
+// It solves one very specific scenario: one name in a 25-name certificate has
+// the wrong DNS record, so the whole certificate cannot be issued — and the
+// other 24, which were fine, expire along with it. Partial availability beats
+// total failure.
 //
-// **默认关闭。** 它会改变证书覆盖什么，那是安全决策，不该由程序替人做。
+// **Off by default.** It changes what a certificate covers; that call is the
+// operator's to make, not the program's.
 type FailureFallback struct {
-	// Enabled 默认 false。
+	// Enabled defaults to false.
 	Enabled *bool `yaml:"enabled"`
 
-	// AfterFailures 是这张证书连续失败多少次之后才考虑降级。默认 5。
+	// AfterFailures is how many consecutive failures this certificate needs before
+	// degradation is considered. Default 5.
 	AfterFailures int `yaml:"afterFailures"`
 
-	// BeforeExpiry 是"距离到期多久之内"才考虑降级，默认 168h（7 天）。
+	// BeforeExpiry is how close to expiry degradation is considered. Default 168h.
 	//
-	// 不能设得太大：太早降级等于用一张缺名字的证书换掉一张还完全有效的
-	// 证书，那是净损失。
+	// Do not set it too large: degrading early swaps a fully valid certificate for
+	// one missing names, a net loss.
 	BeforeExpiry string `yaml:"beforeExpiry"`
 
-	// MinIdentifierFailures 是某个 identifier 至少失败多少次才允许把它摘掉。
-	// 默认 3。设成 1 会让一次网络抖动就摘掉一个名字。
+	// MinIdentifierFailures is how many times an identifier must fail before it
+	// may be dropped. Default 3. Setting it to 1 lets one network blip drop a name.
 	MinIdentifierFailures int `yaml:"minIdentifierFailures"`
 
-	// FailureWindow 是失败记录多久算过期，默认 24h。
+	// FailureWindow is how long a failure record counts, default 24h.
 	//
-	// 它同时是自愈机制：记录老化之后那个 identifier 不再被摘掉，
-	// 下一轮自然就去重试全集。问题修好之后最多等这么久就自动恢复，
-	// 不需要任何额外的重试状态。
+	// It doubles as the self-healing mechanism: once records age out, that
+	// identifier is no longer dropped and the next pass retries the full set.
+	// Recovery after a fix takes at most this long, with no extra retry state.
 	FailureWindow string `yaml:"failureWindow"`
 
-	// MinNames 是降级之后至少保留几个名字。默认 1。
+	// MinNames is how many names must remain after degradation. Default 1.
 	//
-	// 剩下的名字少于这个数就拒绝降级：那是"全挂"换了个样子，
-	// 却让人以为还有部分可用。
+	// Refuse to degrade if fewer names would remain: that is total failure wearing
+	// a disguise, while making people believe part of it still works.
 	MinNames int `yaml:"minNames"`
 
-	// 解析后的时长，由 normalize 填充。
+	// Parsed durations, filled in by normalize.
 	BeforeExpiryDur  time.Duration `yaml:"-"`
 	FailureWindowDur time.Duration `yaml:"-"`
 }
 
-// EnabledOr 返回降级开关，未设置时用 def。
+// EnabledOr returns the degradation switch, or def when it is unset.
 func (f *FailureFallback) EnabledOr(def bool) bool {
 	if f.Enabled == nil {
 		return def
@@ -136,8 +141,8 @@ func (f *FailureFallback) EnabledOr(def bool) bool {
 	return *f.Enabled
 }
 
-// 下面几个 Or 方法在字段未设置（<= 0）时给出默认值。
-// 用 0 表示"没写"在这里是安全的：这几个字段没有哪个合法取值是 0。
+// The Or methods below supply a default when the field is unset (<= 0).
+// Treating 0 as "not written" is safe here: no legal value of these fields is 0.
 func (f *FailureFallback) AfterFailuresOr(def int) int {
 	if f.AfterFailures <= 0 {
 		return def
@@ -170,44 +175,48 @@ func (f *FailureFallback) normalize() error {
 	return nil
 }
 
-// Probe 配置网络侧的证书探测。
+// Probe configures network-side certificate probing.
 //
-// 云 API 说"绑定成功"，和浏览器真的能拿到这张证书，是两件事：
-// 前者走控制面，后者要拨一个真实的 TLS 连接。这个开关决定要不要后者。
+// The cloud API saying "bound successfully" and a browser actually getting this
+// certificate are two things: the former goes through the control plane, the
+// latter dials a real TLS connection. This switch decides whether to dial.
 //
-// 默认开着，因为它能挡住一整类控制面看不出来的故障（换绑没生效、
-// CLB 上另一张证书在赢 SNI），而且"探测没跑成"和"证书不对"是分开报的 ——
-// 从这台机器拨不出去只会让 probe_errors 涨，不会让证书看起来是坏的。
+// On by default: it catches failures the control plane cannot see (a rebind
+// that did not take effect, another certificate winning SNI on the CLB), and
+// "the probe did not run" is reported separately from "the certificate is
+// wrong" — being unable to dial out only raises probe_errors, it never makes
+// certificates look broken.
 type Probe struct {
-	// Enabled 默认 true。
+	// Enabled defaults to true.
 	Enabled *bool `yaml:"enabled"`
 
-	// Port 默认 443。
+	// Port defaults to 443.
 	Port int `yaml:"port"`
 
-	// Timeout 默认 10s。跨可用区握手慢到 3~5 秒是常态，
-	// 设小了会频繁误报，而误报会训练人忽略告警。
+	// Timeout defaults to 10s. Cross-AZ handshakes routinely take 3-5 seconds;
+	// set it too low and false alarms become frequent, and false alarms train
+	// people to ignore alerts.
 	Timeout string `yaml:"timeout"`
 
-	// MaxHostsPerCert 是每张证书最多探测几个名字。默认 3。
+	// MaxHostsPerCert is how many names per certificate to probe. Default 3.
 	//
-	// 不做全量：一张 25 个名字的证书每轮拨 25 次握手，
-	// 收益递减而成本线性增长。
+	// Not exhaustive: a 25-name certificate would mean 25 handshakes every pass,
+	// with diminishing returns and linear cost.
 	MaxHostsPerCert int `yaml:"maxHostsPerCert"`
 
-	// MinValidFor 是"至少还要剩多久有效期"。留空表示不检查。
+	// MinValidFor is "at least this much validity must remain". Empty means skip.
 	//
-	// 这个检查是冗余的 —— 到期告警本来就该基于 notAfter。
-	// 但它的失败模式不同：它验的是"线上真的在服务一张没过期的证书"，
-	// 而不是"我以为部署了一张没过期的证书"。
+	// The check is redundant — expiry alerts should be based on notAfter anyway.
+	// But it fails differently: it verifies "the live endpoint really is serving a
+	// non-expired certificate", not "I believe one is deployed".
 	MinValidFor string `yaml:"minValidFor"`
 
-	// 解析后的时长，由 normalize 填充。
+	// Parsed durations, filled in by normalize.
 	TimeoutDur  time.Duration `yaml:"-"`
 	MinValidDur time.Duration `yaml:"-"`
 }
 
-// ProbeEnabledOr 返回探测开关，未设置时用 def。
+// EnabledOr returns the probe switch, or def when it is unset.
 func (p *Probe) EnabledOr(def bool) bool {
 	if p.Enabled == nil {
 		return def
@@ -221,8 +230,9 @@ func (p *Probe) normalize() error {
 		return err
 	}
 
-	// minValidFor 不能走 parseDuration：它把"默认值为 0"理解成"必填"，
-	// 而这里留空恰恰是合法且有意义的 —— 表示不检查剩余有效期。
+	// minValidFor cannot go through parseDuration: that helper reads "default 0"
+	// as "required", whereas leaving this empty is legal and meaningful here —
+	// it means "do not check remaining validity".
 	if p.MinValidFor != "" {
 		d, err := time.ParseDuration(p.MinValidFor)
 		if err != nil {
@@ -248,50 +258,56 @@ func (p *Probe) normalize() error {
 	return nil
 }
 
-// Onboarding 配置期望状态的生成策略，供 wecert-onboard 使用。
+// Onboarding configures how the desired state is generated; wecert-onboard
+// reads it.
 //
-// wecert 自己不读这一节 —— 这是刻意的：生成策略会反复调，而收敛必须稳。
-// 放在配置里而不是写成常量，是因为这些数字只能从真实漂移数据里来：
-// 先跑 observe 攒数据，再回来调它们。
+// wecert itself does not read this section — deliberately: generation policy
+// gets tuned repeatedly, while convergence must stay stable. It lives in the
+// config rather than in constants because these numbers can only come from
+// real drift data: run observe to collect some, then come back and tune them.
 type Onboarding struct {
-	// Zones 限定枚举哪些 DNS zone。留空表示账号下所有 zone。
+	// Zones limits which DNS zones are enumerated. Empty means every zone in the
+	// account.
 	Zones []string `yaml:"zones"`
 
-	// RequireCLBRule 表示声明必须同时有 CLB 规则才生效（守卫 1）。默认 true。
+	// RequireCLBRule means a declaration only takes effect if a CLB rule also
+	// exists (guard 1). Default true.
 	//
-	// 用指针是因为 false 是有意义的值，而 Go 的零值分不出"没写"和"写了 false"。
+	// It is a pointer because false is meaningful, and Go's zero value cannot
+	// distinguish "not written" from "written false".
 	RequireCLBRule *bool `yaml:"requireCLBRule"`
 
-	// Allowlist 限定允许签发证书的注册域。留空表示不限制。
+	// Allowlist limits the registered domains certificates may be issued for.
+	// Empty means no limit.
 	Allowlist []string `yaml:"allowlist"`
 
-	// MaxNames 是单证书 SAN 上限，默认 25（与 tlsserver 对齐，
-	// 将来切 profile 不用改架构）。
+	// MaxNames is the per-certificate SAN cap, default 25 (aligned with tlsserver
+	// so a future profile switch needs no structural change).
 	MaxNames int `yaml:"maxNames"`
 
 	Profile string `yaml:"profile"`
 	KeyType string `yaml:"keyType"`
 	Deploy  *bool  `yaml:"deploy"`
 
-	// GracePeriod 是删除宽限期，默认 24h。
+	// GracePeriod is the deletion grace period, default 24h.
 	GracePeriod string `yaml:"gracePeriod"`
 
-	// Budget / BudgetWindow 是配额预算，默认 25 次 / 7 天。
+	// Budget / BudgetWindow are the quota budget, default 25 operations / 7 days.
 	Budget       int    `yaml:"budget"`
 	BudgetWindow string `yaml:"budgetWindow"`
 
-	// DropThreshold 是骤变熔断阈值，默认 0.30。
+	// DropThreshold is the sudden-drop circuit-breaker threshold, default 0.30.
 	DropThreshold float64 `yaml:"dropThreshold"`
 
 	StatePath  string `yaml:"statePath"`
 	ReportPath string `yaml:"reportPath"`
 
-	// 解析后的时长，由 normalize 填充。
+	// Parsed durations, filled in by normalize.
 	GraceDur  time.Duration `yaml:"-"`
 	BudgetDur time.Duration `yaml:"-"`
 }
 
-// RequireCLBRuleOr 返回守卫开关，未设置时用 def。
+// RequireCLBRuleOr returns the guard switch, or def when it is unset.
 func (o *Onboarding) RequireCLBRuleOr(def bool) bool {
 	if o.RequireCLBRule == nil {
 		return def
@@ -299,7 +315,7 @@ func (o *Onboarding) RequireCLBRuleOr(def bool) bool {
 	return *o.RequireCLBRule
 }
 
-// DeployOr 返回部署默认值，未设置时用 def。
+// DeployOr returns the deploy default, or def when it is unset.
 func (o *Onboarding) DeployOr(def bool) bool {
 	if o.Deploy == nil {
 		return def
@@ -318,44 +334,50 @@ func (o *Onboarding) normalize() error {
 	return nil
 }
 
-// DesiredState 的三种模式。
+// The three DesiredState modes.
 //
-// 区别是**谁有最终解释权**，不是"读几个文件"。
+// The difference is **who gets the final say**, not "how many files are read".
 const (
-	// ModeStatic：配置里的 certificates 就是期望状态。历史行为，零风险。
+	// ModeStatic: the certificates block in the config is the desired state.
+	// Historical behaviour, zero risk.
 	ModeStatic = "static"
 
-	// ModeObserve：仍然按 certificates 收敛，但同时读文档并报告差异。
+	// ModeObserve: still converges on certificates, but also reads the document
+	// and reports the differences.
 	//
-	// 这是从 static 迁到 enforce 之间的必经阶段：它不签发任何东西，
-	// 只回答"如果真的按文档来，会加什么、会删什么"。
+	// This is the required stage between static and enforce: it issues nothing and
+	// only answers "if the document really won, what would be added and removed".
 	ModeObserve = "observe"
 
-	// ModeEnforce：文档就是期望状态。
+	// ModeEnforce: the document is the desired state.
 	ModeEnforce = "enforce"
 )
 
-// DesiredState 配置期望状态的来源。
+// DesiredState configures the source of the desired state.
 //
-// 为什么不把推断放进 wecert 自己：这个系统所有已知的坑（限速、误删、
-// 状态漂移）都出在"判断"上，而判断逻辑必然会反复改；证书生命周期必须稳。
-// 拆开之后，来源故障的失败模式是"期望状态不更新"（安全），
-// 而不是"域名看起来消失了"（灾难）。
+// Why the inference does not live inside wecert itself: every known pitfall in
+// this system (rate limits, accidental deletion, state drift) comes from
+// "judgement", which inevitably keeps changing, while the certificate
+// lifecycle must stay stable. Split apart, a source failure degrades into "the
+// desired state stops updating" (safe), not "domains look like they vanished"
+// (disastrous).
 type DesiredState struct {
-	// Mode 是 static / observe / enforce。
+	// Mode is static / observe / enforce.
 	Mode string `yaml:"mode"`
 
-	// Path 是期望状态文档的路径。observe 与 enforce 必填。
+	// Path is the desired-state document path. Required for observe and enforce.
 	Path string `yaml:"path"`
 
-	// MaxStaleness 是文档多久没被刷新就告警，默认 48h。
+	// MaxStaleness is how long the document may go unrefreshed before alerting,
+	// default 48h.
 	//
-	// 这是这套架构新引入的失败模式：onboarding 组件挂掉之后，wecert 会一直
-	// 按旧文档正常续期，一切看起来都正常，但新域名再也不会进来。
-	// 没有这个告警，那种状态能一直持续到有人想起来加域名为止。
+	// This is the failure mode this architecture newly introduces: after the
+	// onboarding component dies, wecert keeps renewing from the old document
+	// perfectly normally, everything looks fine, but no new domain ever enters.
+	// Without this alert, that state persists until someone remembers to add one.
 	MaxStaleness string `yaml:"maxStaleness"`
 
-	// 解析后的时长，由 normalize 填充。
+	// Parsed durations, filled in by normalize.
 	MaxStalenessDur time.Duration `yaml:"-"`
 }
 
@@ -393,35 +415,35 @@ func (d *DesiredState) normalize(hasCertificates bool) error {
 	return nil
 }
 
-// ACME 是 ACME 账号与目录配置。
+// ACME is the ACME account and directory configuration.
 type ACME struct {
 	Directory string `yaml:"directory"`
 	Email     string `yaml:"email"`
 }
 
-// DNS 是 DNS-01 solver 配置。
+// DNS is the DNS-01 solver configuration.
 type DNS struct {
 	Provider string `yaml:"provider"`
 
-	// provider=dnspod 时必填。
-	// 这是 DNSPod 自有的 API Token（形如 "12345,abcdef0123456789..."），
-	// 不是腾讯云 CAM 的 SecretId/SecretKey。
+	// Required when provider=dnspod.
+	// This is DNSPod's own API Token (of the form "12345,abcdef0123456789..."),
+	// not a Tencent Cloud CAM SecretId/SecretKey.
 	LoginToken string `yaml:"loginToken"`
 
-	// TTL 是写入 _acme-challenge TXT 记录时用的值。
+	// TTL is the value used when writing the _acme-challenge TXT record.
 	//
-	// 默认 600 而不是 60：DNSPod 免费套餐的 TTL 下限就是 600，
-	// 写 60 会被 API 以 LimitExceeded.RecordTtlLimit 拒绝。
-	// 付费套餐可以调低以加快传播和清理。
+	// The default is 600, not 60: on DNSPod's free tier the TTL floor is 600, and
+	// 60 is rejected by the API with LimitExceeded.RecordTtlLimit. Paid tiers may
+	// go lower to speed up propagation and cleanup.
 	TTL                int    `yaml:"ttl"`
 	PropagationTimeout string `yaml:"propagationTimeout"`
 	PollingInterval    string `yaml:"pollingInterval"`
-	// 解析后的时长，由 normalize 填充。
+	// Parsed durations, filled in by normalize.
 	Propagation time.Duration `yaml:"-"`
 	Polling     time.Duration `yaml:"-"`
 }
 
-// Tencent 是腾讯云凭证与部署目标配置。
+// Tencent is the Tencent Cloud credential and deployment target configuration.
 type Tencent struct {
 	CredentialMode string   `yaml:"credentialMode"`
 	SecretID       string   `yaml:"secretId"`
@@ -431,36 +453,40 @@ type Tencent struct {
 	Regions        []string `yaml:"regions"`
 }
 
-// Metrics 是 Prometheus 暴露配置。
+// Metrics is the Prometheus exposition configuration.
 type Metrics struct {
 	Listen string `yaml:"listen"`
 }
 
-// Webhook 让 wecert 可以被外部事件触发，而不是只靠定时轮询。
+// Webhook lets wecert be triggered by external events, not only by polling.
 //
-// 典型用法：域名新增后由 CI/事件总线调一次，不用等下一个整点。
+// Typical use: call it once from CI or an event bus after a domain is added,
+// rather than waiting for the next top of the hour.
 type Webhook struct {
-	// Listen 是触发端点的监听地址。留空表示不启用 webhook。
+	// Listen is the listen address of the trigger endpoint. Empty disables the
+	// webhook.
 	Listen string `yaml:"listen"`
 
-	// Token 是共享密钥，必填。
+	// Token is the shared secret and is required.
 	//
-	// 这个端点会触发真实签发、消耗 Let's Encrypt 的速率限制配额，
-	// 所以绝不能裸奔。支持两种带法：
+	// This endpoint triggers real issuance and consumes Let's Encrypt rate-limit
+	// quota, so it must never be left unauthenticated. Two forms are accepted:
 	//   Authorization: Bearer <token>
 	//   X-Wecert-Token: <token>
 	Token string `yaml:"token"`
 
-	// NotifyURL 可选。设置后，每次续期尝试结束都会向它 POST 一条 JSON 事件。
-	// 用来把"证书已续期"接进下游流程（比如触发一次配置重载）。
+	// NotifyURL is optional. When set, every finished renewal attempt POSTs a JSON
+	// event to it, to wire "certificate renewed" into downstream flows (triggering
+	// a config reload, for example).
 	NotifyURL string `yaml:"notifyURL"`
 }
 
-// WebhookTokenMinLen 是 token 的最小长度。
-// 太短的 token 在这个端点上等于没有鉴权 —— 攻击者触发签发就能烧掉速率配额。
+// WebhookTokenMinLen is the minimum token length.
+// A short token is no authentication at all on this endpoint — an attacker who
+// triggers issuance can burn the rate-limit quota.
 const WebhookTokenMinLen = 16
 
-// Certificate 是一张证书的期望状态。
+// Certificate is the desired state of one certificate.
 type Certificate struct {
 	Name        string   `yaml:"name" json:"name"`
 	Domains     []string `yaml:"domains" json:"domains"`
@@ -469,18 +495,20 @@ type Certificate struct {
 	RenewBefore string   `yaml:"renewBefore,omitempty" json:"renewBefore,omitempty"`
 	Deploy      Deploy   `yaml:"deploy" json:"deploy"`
 
-	// 解析后的时长，由 normalize 填充。
+	// Parsed durations, filled in by normalize.
 	RenewBeforeDur time.Duration `yaml:"-" json:"-"`
 }
 
-// Deploy 描述签出来的证书要部署到哪里。
-// 首次签发时腾讯云侧还没有绑定关系，需要人工绑一次；
-// 之后每 90/45 天续期都由 UpdateCertificateInstance 自动换。
+// Deploy describes where the issued certificate should be deployed.
+// On first issuance there is no binding on the Tencent Cloud side yet, so a
+// manual bind is needed once; after that every 90/45-day renewal is swapped in
+// automatically by UpdateCertificateInstance.
 type Deploy struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
-// MaxNames 返回该证书 profile 允许的最大域名数。
+// MaxNames returns the maximum domain count allowed by this certificate's
+// profile.
 func (c *Certificate) MaxNames() int {
 	if n, ok := profileMaxNames[c.Profile]; ok {
 		return n
@@ -488,7 +516,7 @@ func (c *Certificate) MaxNames() int {
 	return 0
 }
 
-// Load 读取并校验配置文件。
+// Load reads and validates the configuration file.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -497,7 +525,8 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
-	// 未知字段直接报错，避免配置写错了却静默生效。
+	// Unknown fields are a hard error, so a misspelled config never takes effect
+	// silently.
 	dec.KnownFields(true)
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
@@ -520,8 +549,9 @@ func (c *Config) normalize() error {
 		return fmt.Errorf("acme.email is required")
 	}
 
-	// DNS provider 必须显式选一个。默认 dnspod 会让人误以为
-	// 腾讯云 AK/SK 就够了，然后在 DNS-01 阶段一头雾水地失败。
+	// The DNS provider must be chosen explicitly. Defaulting to dnspod suggests
+	// Tencent Cloud AK/SK would be enough, then fails confusingly at the DNS-01
+	// step.
 	switch c.DNS.Provider {
 	case "":
 		c.DNS.Provider = DNSProviderDNSPod
@@ -544,9 +574,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 	if c.DNS.TTL <= 0 {
-		// 默认 600 而不是 60：DNSPod 免费套餐的 TTL 下限就是 600，
-		// 写 60 会被 API 以 LimitExceeded.RecordTtlLimit 拒绝。
-		// 付费套餐可以调低，但默认值必须对所有套餐都成立。
+		// The default is 600, not 60: on DNSPod's free tier the TTL floor is 600, and
+		// 60 is rejected by the API with LimitExceeded.RecordTtlLimit. Paid tiers may
+		// go lower, but the default must hold on every tier.
 		c.DNS.TTL = 600
 	}
 
@@ -567,9 +597,10 @@ func (c *Config) normalize() error {
 			CredentialStatic, CredentialCVMRole, c.Tencent.CredentialMode)
 	}
 
-	// credentialMode=static 时不再强制要求 secretId/secretKey 写在配置里：
-	// 也允许走 TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY 环境变量，
-	// 这样配置文件里就不必出现长期密钥。真正的校验在 deploy.NewCredentialSource。
+	// With credentialMode=static, secretId/secretKey need not live in the config:
+	// the TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY env vars are accepted
+	// too, so no long-lived secret has to appear in the file. The real validation
+	// happens in deploy.NewCredentialSource.
 	if c.Tencent.CredentialMode == CredentialCVMRole && c.Tencent.RoleName == "" {
 		return fmt.Errorf("tencent.credentialMode=cvm-role requires roleName")
 	}
@@ -593,8 +624,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 
-	// static 和 observe 都要用 certificates 收敛，所以非空是硬要求。
-	// enforce 模式下 certificates 必须为空（上面已经拦过），文档才是唯一来源。
+	// Both static and observe converge on certificates, so a non-empty list is a
+	// hard requirement. In enforce mode certificates must be empty (rejected
+	// above); the document is the only source.
 	if c.DesiredState.Mode != ModeEnforce && len(c.Certificates) == 0 {
 		return fmt.Errorf("at least one certificate is required "+
 			"(desiredState.mode=%q still converges on this list; "+
@@ -606,14 +638,14 @@ func (c *Config) normalize() error {
 }
 
 func (w *Webhook) normalize() error {
-	// 留空 Listen 表示不启用，此时 Token 也不必设置。
+	// An empty Listen means disabled, in which case Token is not needed either.
 	if w.Listen == "" {
 		if w.Token != "" {
 			return fmt.Errorf("webhook.token is set but webhook.listen is empty: " +
 				"with no listen address there is no endpoint for the token to guard")
 		}
 		if w.NotifyURL != "" {
-			// NotifyURL 独立于监听端点，允许单独使用。
+			// NotifyURL is independent of the listen endpoint and may be used alone.
 			return nil
 		}
 		return nil
@@ -662,11 +694,12 @@ func (c *Certificate) normalize(seen map[string]bool) error {
 		return fmt.Errorf("certificate %q: domains is empty", c.Name)
 	}
 
-	// 先把域名规范化（小写、去重、校验），再判上限。
+	// Normalize the domains first (lowercase, dedupe, validate), then check the cap.
 	//
-	// 顺序很重要：SAN 多的证书，domains 列表往往是从别处整段复制粘贴来的，
-	// 重复和小写混用是常态。如果先判上限，一个 100 个域名 + 1 个手误重复的
-	// 配置会被判成 101 超限而拒掉 —— 但它本该是合法的。
+	// The order matters: on certificates with many SANs the domains list is usually
+	// pasted in wholesale from elsewhere, so duplicates and mixed case are the
+	// norm. Checking the cap first would count a 100-domain config with 1
+	// accidental duplicate as 101 and reject it, even though it is legal.
 	normalized, err := normalizeDomains(c.Domains)
 	if err != nil {
 		return fmt.Errorf("certificate %q: %w", c.Name, err)
@@ -688,10 +721,12 @@ func (c *Certificate) normalize(seen map[string]bool) error {
 	return nil
 }
 
-// normalizeDomains 去空白、转小写、按集合去重，并逐个校验。
+// normalizeDomains trims whitespace, lowercases, dedupes as a set, and
+// validates each entry.
 //
-// 保留配置里的原始顺序是有意的：classic profile 会把第一个 dNSName 提升为 CN，
-// 顺序一变证书的 Subject CN 就跟着变。
+// Keeping the original config order is deliberate: the classic profile promotes
+// the first dNSName to CN, so changing the order changes the certificate's
+// Subject CN with it.
 func normalizeDomains(in []string) ([]string, error) {
 	out := make([]string, 0, len(in))
 	seen := make(map[string]bool, len(in))
@@ -710,13 +745,15 @@ func normalizeDomains(in []string) ([]string, error) {
 	return out, nil
 }
 
-// DomainKey 返回这张证书期望的域名集合指纹。
+// DomainKey returns the fingerprint of the domain set this certificate wants.
 func (c *Certificate) DomainKey() string { return DomainKey(c.Domains) }
 
-// DomainKey 把一组域名压成与顺序、大小写、重复无关的字符串。
+// DomainKey compresses a set of domains into a string independent of order,
+// case and duplicates.
 //
-// 用途是拿"配置里期望的集合"和"证书里实际的 SAN"做相等比较：
-// 直接比 []string 会被顺序和大小写干扰，而这两者对证书语义毫无影响。
+// It exists to compare "the set the config wants" against "the SANs actually in
+// the certificate": comparing []string directly is disturbed by order and case,
+// neither of which has any semantic effect on a certificate.
 func DomainKey(domains []string) string {
 	seen := make(map[string]bool, len(domains))
 	cp := make([]string, 0, len(domains))
@@ -732,10 +769,12 @@ func DomainKey(domains []string) string {
 	return strings.Join(cp, ",")
 }
 
-// DiffDomains 返回 want 有而 have 没有的（missing），以及 have 有而 want 没有的（extra）。
+// DiffDomains returns what want has and have lacks (missing), and what have has
+// and want lacks (extra).
 //
-// 两个方向都要看：只查 missing 会漏掉"配置里删了域名"这种情况，
-// 而那种情况下证书里多出来的 SAN 同样是需要收敛的偏差。
+// Both directions matter: checking only missing would overlook "a domain was
+// deleted from the config", where the extra SAN in the certificate is just as
+// much a deviation that needs converging.
 func DiffDomains(want, have []string) (missing, extra []string) {
 	inWant := make(map[string]bool, len(want))
 	inHave := make(map[string]bool, len(have))
@@ -760,20 +799,26 @@ func DiffDomains(want, have []string) (missing, extra []string) {
 	return missing, extra
 }
 
-// validateDomain 挡住几种明知会被 CA 拒绝、或者覆盖范围容易被误解的写法。
+// validateDomain blocks several forms that are known to be rejected by the CA,
+// or whose coverage is easily misunderstood.
 //
-// 为什么不交给 CA 报错：每个被拒的订单都要消耗一次订单配额，
-// 而 SAN 多的证书一旦有个手误，代价是整张证书重来一遍。本地拦下更便宜。
-// ValidateDomain 校验一个域名，允许最左侧一个通配符标签。
+// Why not let the CA report the error: every rejected order consumes order
+// quota, and on a certificate with many SANs one typo costs a full re-issue.
+// Blocking locally is cheaper.
+// ValidateDomain validates one domain, allowing a single wildcard label on the
+// far left.
 //
-// 导出是为了让期望状态来源复用同一套规则：如果来源接受了 wecert 会拒掉的名字，
-// 收敛就会卡在一个永远修不好的错误上，而报错点离真正的原因很远。
+// It is exported so desired-state sources reuse the same rules: if a source
+// accepted a name wecert rejects, convergence would get stuck on an error that
+// can never be fixed, with the reported failure far from the real cause.
 func ValidateDomain(d string) error { return validateDomain(d) }
 
-// NormalizeCertificates 校验并规范化一组证书：补默认值、去重名字、校验域名与数量上限。
+// NormalizeCertificates validates and normalizes a set of certificates: fills
+// in defaults, dedupes names, validates domains and count caps.
 //
-// 静态配置和期望状态文档都走这一个入口，避免两条路径的宽松程度不一致
-// —— 那是"文档里能过、配置里过不了"这类诡异差异的来源。
+// Both the static config and the desired-state document come through this one
+// entry point, so the two paths cannot differ in strictness — that is where
+// bizarre "passes in the document, fails in the config" gaps come from.
 func NormalizeCertificates(certs []Certificate) error {
 	seen := make(map[string]bool, len(certs))
 	for i := range certs {
@@ -798,10 +843,11 @@ func validateDomain(d string) error {
 		return fmt.Errorf("domain %q contains whitespace or a slash", d)
 	}
 
-	// 逐标签检查。空标签（a..example.com）、超长标签、非法字符都会被 CA 拒绝。
+	// Check label by label. Empty labels (a..example.com), over-long labels and
+	// illegal characters are all rejected by the CA.
 	for _, label := range strings.Split(d, ".") {
 		if label == "*" {
-			// 通配符标签本身合法，位置由下面单独校验。
+			// The wildcard label itself is legal; its position is checked separately below.
 			continue
 		}
 		if label == "" {
@@ -823,7 +869,7 @@ func validateDomain(d string) error {
 	}
 
 	if strings.Contains(d, "*") {
-		// LE 只允许最左侧一个通配符标签。
+		// LE allows only a single wildcard label, at the far left.
 		if !strings.HasPrefix(d, "*.") {
 			return fmt.Errorf("domain %q: wildcard must be the leftmost label (e.g. *.example.com)", d)
 		}

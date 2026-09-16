@@ -1,12 +1,14 @@
 ###############################################################################
-# CVM（阶段 C）—— 真实后端 + systemd/CVM 角色验证
+# CVM (stage C) — real backend + systemd/CVM role verification
 #
-# 后端按 Host 头返回不同测试页，用来验证 CLB 的域名路由是否真的生效：
-# test.alpha.<域> 显示 ALPHA，test.beta.<域> 显示 BETA。
-# 两个域名返回同一个页面 = 路由没生效，一眼就能看出来。
+# The backend returns a different test page per Host header, to verify that the
+# CLB's domain routing really works: test.alpha.<domain> shows ALPHA and
+# test.beta.<domain> shows BETA. Both domains returning the same page means
+# routing is not working, and it is obvious at a glance.
 #
-# 刻意不装任何软件包：python3 是 Ubuntu 默认自带的，写一个极简 HTTP 服务
-# 就够了，省掉 apt 网络依赖的不确定性。TLS 在 CLB 终结，CVM 只说 HTTP。
+# It deliberately installs no packages at all: python3 ships with Ubuntu, and a
+# minimal HTTP server is enough, which removes the uncertainty of depending on apt
+# over the network. TLS terminates at the CLB; the CVM speaks plain HTTP.
 ###############################################################################
 
 resource "tencentcloud_security_group" "test" {
@@ -17,14 +19,16 @@ resource "tencentcloud_security_group" "test" {
   tags        = local.tags
 }
 
-# 只放通到后端的 80 端口。
+# Only port 80 toward the backend is allowed.
 #
-# ⚠️ 0.0.0.0/0 是实测出来的，不是偷懒：
-# 公网型 CLB 的健康检查源既不在 VPC 网段，也不在 100.64.0.0/10。
-# 只放通那两段时健康检查一直失败，CLB 对所有请求返回 504 ——
-# 而 TLS 握手完全正常，所以极易误判成"后端挂了"（实际直连 CVM 返回 200）。
+# ⚠️ The 0.0.0.0/0 is empirical, not laziness: a public CLB's health check source
+# is neither in the VPC CIDR nor in 100.64.0.0/10. When only those two ranges were
+# allowed, health checks kept failing and the CLB returned 504 for every request —
+# while the TLS handshake was perfectly fine, so this is very easily misdiagnosed
+# as "the backend is down" (direct connections to the CVM actually returned 200).
 #
-# 生产上应该收窄到实际健康检查源，或者干脆别让后端有公网入口。
+# In production this should be narrowed to the real health check source, or the
+# backend should have no public ingress at all.
 resource "tencentcloud_security_group_rule_set" "test" {
   count = var.create_cvm ? 1 : 0
 
@@ -38,7 +42,7 @@ resource "tencentcloud_security_group_rule_set" "test" {
     description = "CLB health check + forwarding (test only; narrow in production)"
   }
 
-  # 出网全放通：TAT agent 要连服务端。
+  # Egress is fully open: the TAT agent needs to reach its server.
   egress {
     action      = "ACCEPT"
     cidr_block  = "0.0.0.0/0"
@@ -60,19 +64,22 @@ resource "tencentcloud_instance" "test" {
   subnet_id                  = tencentcloud_subnet.test[0].id
   security_groups            = [tencentcloud_security_group.test[0].id]
   internet_charge_type       = "TRAFFIC_POSTPAID_BY_HOUR"
-  internet_max_bandwidth_out = 1 # 够 TAT agent 出网即可
+  internet_max_bandwidth_out = 1 # just enough for the TAT agent's egress
   allocate_public_ip         = true
 
-  # 关联 CAM 角色 —— wecert 生产环境推荐的凭证方式：
-  # 密钥不落盘，从实例元数据服务现取现用。
+  # Attach the CAM role — the credential method wecert recommends in production:
+  # no key ever touches disk; credentials are fetched on demand from the instance
+  # metadata service.
   cam_role_name = var.enable_cvm_role ? var.cam_role_name : null
 
-  # 改 user_data 必须重建实例，否则新脚本只在**下次开机**才生效 ——
-  # 而 terraform plan 只会显示 "updated in-place"，看起来像已经生效了。
+  # Changing user_data must rebuild the instance; otherwise the new script only
+  # takes effect on the **next boot** — while terraform plan merely shows
+  # "updated in-place", which looks like it already took effect.
   user_data_replace_on_change = true
 
-  # 用 user_data_raw 而不是 user_data：后者要求调用方自己 base64 编码，
-  # 直接塞明文会报 InvalidParameterValue.InvalidUserDataFormat。
+  # Use user_data_raw rather than user_data: the latter requires the caller to
+  # base64-encode it, and passing plaintext fails with
+  # InvalidParameterValue.InvalidUserDataFormat.
   user_data_raw = <<-EOF
     #cloud-config
     write_files:
@@ -85,10 +92,11 @@ resource "tencentcloud_instance" "test" {
         permissions: '0755'
         content: |
           #!/usr/bin/env python3
-          """按 Host 头返回不同测试页的极简后端。
+          """Minimal backend returning a different test page per Host header.
 
-          只用 python3 自带库，不装任何包 —— 测试环境里少一个失败点。
-          TLS 在 CLB 终结，这里只说 HTTP。
+          It uses only the python3 standard library and installs no packages —
+          one fewer failure point in a test environment. TLS terminates at the
+          CLB; this speaks plain HTTP.
           """
           import http.server
           import json
@@ -97,7 +105,7 @@ resource "tencentcloud_instance" "test" {
           PAGES_FILE = "/srv/www/pages.json"
 
           PAGE_TEMPLATE = """<!DOCTYPE html>
-          <html lang="zh"><head><meta charset="utf-8"><title>{label}</title></head>
+          <html lang="en"><head><meta charset="utf-8"><title>{label}</title></head>
           <body style="font-family:system-ui,sans-serif;text-align:center;padding:4rem">
           <h1 style="font-size:6rem;margin:0;color:{colour}">{label}</h1>
           <p style="font-size:1.2rem">{note}</p>
@@ -124,10 +132,10 @@ resource "tencentcloud_instance" "test" {
                   label = load_pages().get(host)
                   if label is None:
                       label = "UNKNOWN"
-                      note = "没有为 " + host + " 配置测试页"
+                      note = "No test page configured for " + host
                       colour = "#c92a2a"
                   else:
-                      note = "这是 " + host + " 的测试页"
+                      note = "Test page for " + host
                       colour = "#0b7285"
 
                   payload = PAGE_TEMPLATE.format(
@@ -138,8 +146,9 @@ resource "tencentcloud_instance" "test" {
                       backend=os.uname().nodename,
                   ).encode("utf-8")
 
-                  # 一律返回 200：CLB 的健康检查也打这个端点。
-                  # 未知 Host 返回 404 会让健康检查失败，CLB 随即对真实请求回 504。
+                  # Always return 200: the CLB health check hits this endpoint too.
+                  # Returning 404 for an unknown Host would fail the health check,
+                  # and the CLB would then answer real requests with 504.
                   self.send_response(200)
                   self.send_header("Content-Type", "text/html; charset=utf-8")
                   self.send_header("Content-Length", str(len(payload)))
