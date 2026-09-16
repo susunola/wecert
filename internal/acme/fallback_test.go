@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,8 +62,7 @@ func TestFallbackIsOffByDefault(t *testing.T) {
 	}
 
 	st := &state.CertState{Name: cert.Name, NotAfter: now.Add(time.Hour), ConsecutiveFailures: 99}
-	got := m.applyFallback(cert, st)
-
+	got, _ := m.applyFallback(cert, st, round{})
 	if len(got.Domains) != 3 {
 		t.Fatalf("no name should be dropped when the policy is off, got %v", got.Domains)
 	}
@@ -84,7 +84,7 @@ func TestFallbackWaitsForEnoughConsecutiveFailures(t *testing.T) {
 		NotAfter:            now.Add(24 * time.Hour),
 		ConsecutiveFailures: 2, // threshold is 3
 	}
-	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
+	if got, _ := m.applyFallback(cert, st, round{}); len(got.Domains) != 3 {
 		t.Fatalf("should not fall back below the failure threshold, got %v", got.Domains)
 	}
 }
@@ -104,7 +104,7 @@ func TestFallbackWaitsForTheExpiryWindow(t *testing.T) {
 		NotAfter:            now.Add(30 * 24 * time.Hour), // still outside the 7-day window
 		ConsecutiveFailures: 9,
 	}
-	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
+	if got, _ := m.applyFallback(cert, st, round{}); len(got.Domains) != 3 {
 		t.Fatalf("should not fall back outside the expiry window, got %v", got.Domains)
 	}
 }
@@ -121,7 +121,7 @@ func TestFallbackRefusesWithoutALiveCertificate(t *testing.T) {
 	}
 
 	st := &state.CertState{Name: cert.Name, ConsecutiveFailures: 9} // NotAfter is the zero value
-	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
+	if got, _ := m.applyFallback(cert, st, round{}); len(got.Domains) != 3 {
 		t.Fatalf("should not fall back without a live certificate, got %v", got.Domains)
 	}
 }
@@ -136,7 +136,7 @@ func TestFallbackRefusesWithoutASpecificFailingIdentifier(t *testing.T) {
 		NotAfter:            now.Add(24 * time.Hour),
 		ConsecutiveFailures: 9,
 	}
-	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
+	if got, _ := m.applyFallback(cert, st, round{}); len(got.Domains) != 3 {
 		t.Fatalf("should not fall back without per-identifier failure records, got %v", got.Domains)
 	}
 }
@@ -162,8 +162,7 @@ func TestFallbackDropsOnlyTheFailingIdentifiers(t *testing.T) {
 		ARICertID:           "YWJj.ZGVm",
 	}
 
-	got := m.applyFallback(cert, st)
-
+	got, _ := m.applyFallback(cert, st, round{})
 	want := []string{"a.example.com", "c.example.com"}
 	if len(got.Domains) != len(want) {
 		t.Fatalf("domain set = %v, want %v", got.Domains, want)
@@ -220,7 +219,7 @@ func TestFallbackRefusesWhenItWouldDropTooMany(t *testing.T) {
 		ConsecutiveFailures: 9,
 	}
 
-	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
+	if got, _ := m.applyFallback(cert, st, round{}); len(got.Domains) != 3 {
 		t.Fatalf("must refuse to fall back when fewer names than the minimum remain, got %v", got.Domains)
 	}
 	if fb, _ := store.GetFallback(cert.Name); fb != nil {
@@ -247,7 +246,7 @@ func TestFallbackIgnoresStaleFailures(t *testing.T) {
 		NotAfter:            now.Add(24 * time.Hour),
 		ConsecutiveFailures: 9,
 	}
-	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
+	if got, _ := m.applyFallback(cert, st, round{}); len(got.Domains) != 3 {
 		t.Fatalf("records older than the failure window must not count towards fallback, got %v", got.Domains)
 	}
 }
@@ -271,7 +270,7 @@ func TestFallbackClearsItselfOnceTheNamesAreHealthy(t *testing.T) {
 		NotAfter:            now.Add(24 * time.Hour),
 		ConsecutiveFailures: 0,
 	}
-	if got := m.applyFallback(cert, st); len(got.Domains) != 3 {
+	if got, _ := m.applyFallback(cert, st, round{}); len(got.Domains) != 3 {
 		t.Fatalf("should return to the full set, got %v", got.Domains)
 	}
 
@@ -550,10 +549,145 @@ func TestWildcardFailureIsBookedAgainstTheWildcardNotTheApex(t *testing.T) {
 		ConsecutiveFailures: 4,                               // above policy.AfterFailures
 		ARICertID:           "YWJj.ZGVm",
 	}
-	got := m.applyFallback(cert, st)
-
+	got, _ := m.applyFallback(cert, st, round{})
 	if len(got.Domains) != 1 || got.Domains[0] != "example.com" {
 		t.Fatalf("after falling back the certificate should cover [example.com], got %v: "+
 			"the failing wildcard is the name to drop, not the apex", got.Domains)
 	}
+}
+
+// ── per-pass state must be local to the pass ────────────────────────────────────────
+
+// The round intent that decides "hold the degraded set" versus "order the full set" is a
+// value, not Manager state, and this pins the consequence: the SAME certificate and the
+// SAME store produce two different decisions depending only on the value handed in.
+//
+// This is the invariant two concurrent certificates used to violate. The reconciler is
+// serial per certificate NAME, not per process: startCert fans out one goroutine per
+// certificate (capped at maxConcurrentStarts), the timer's RunAll overlaps them, and every
+// one of them shares the single Manager built in main. While the flags lived on the
+// Manager, a neighbour's pass could flip fallbackActive between this certificate's write
+// and its read, and the degraded certificate would then re-order the very identifier set
+// whose one broken name caused the fallback -- an order per pass straight into
+// "5 certificates per exact set of identifiers / 7 days".
+func TestFallbackDecisionDependsOnlyOnTheValueHandedIn(t *testing.T) {
+	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
+
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: now.Add(90 * 24 * time.Hour),
+		CertURL: "https://ca.test/cert/live", ConsecutiveFailures: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := store.RecordIdentifierFailure(cert.Name, "b.example.com", "dns says no", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.PutFallback(&state.Fallback{
+		CertName: cert.Name, Dropped: []string{"b.example.com"},
+		Since: now, Reason: "one identifier keeps failing",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A degradation is in force: the reduced set must be held, NOT the broken full set.
+	held, heldRound := m.applyFallback(cert, st, round{fallbackActive: true})
+	if got, want := held.Domains, []string{"a.example.com", "c.example.com"}; !equalStrings(got, want) {
+		t.Errorf("with a degradation in force the pass must keep the reduced set %v, got %v", want, got)
+	}
+	if !heldRound.degraded || !heldRound.fallbackActive {
+		t.Errorf("the returned round must report the reduction, got %+v", heldRound)
+	}
+
+	// The same inputs, minus "a degradation is in force": now the full set is tried. The
+	// only difference is the value, which is the point -- nothing on the Manager can leak
+	// between the two calls.
+	tried, triedRound := m.applyFallback(cert, st, round{})
+	if got := len(tried.Domains); got != 3 {
+		t.Errorf("with no degradation in force the full set must be tried, got %d names: %v",
+			got, tried.Domains)
+	}
+	if triedRound.degraded {
+		t.Error("a round that ordered every name must not report itself degraded")
+	}
+}
+
+// Two different certificates reconciled at the same time must not interfere. Run under
+// -race this fails on the Manager-field version (manager.go's per-round writes), and the
+// assertion catches the outcome rather than only the memory access.
+func TestConcurrentReconcilesOfDifferentCertificatesDoNotInterfere(t *testing.T) {
+	store, m, _, cert := newAPITestHarness(t,
+		[]string{"a.example.com", "b.example.com", "c.example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return fixed }
+	m.SetFallbackPolicy(fallbackPolicy())
+
+	// The certificate that must HOLD: a degraded certificate is live and the evidence is
+	// still fresh, so no full-set order may be placed for it.
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(90 * 24 * time.Hour),
+		CertURL: "https://ca.test/cert/live", ConsecutiveFailures: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := store.RecordIdentifierFailure(cert.Name, "b.example.com", "dns says no", fixed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.PutFallback(&state.Fallback{
+		CertName: cert.Name, Dropped: []string{"b.example.com"},
+		Since: fixed, Reason: "one identifier keeps failing",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A neighbour with nothing wrong with it, whose pass touches the same code path.
+	neighbour := *cert
+	neighbour.Name = "neighbour-cert"
+	neighbour.Domains = []string{"a.example.com", "b.example.com", "c.example.com"}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() { defer wg.Done(); _ = m.Reconcile(context.Background(), cert) }()
+		go func() { defer wg.Done(); _ = m.Reconcile(context.Background(), &neighbour) }()
+	}
+	wg.Wait()
+
+	// The hold must have survived the neighbours: the degraded certificate still has its
+	// fallback record and, crucially, its failure evidence was not erased.
+	fb, err := store.GetFallback(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fb == nil {
+		t.Error("the fallback record was cleared while a degraded certificate is serving: " +
+			"the next pass will re-order the identifier set that is known to be broken")
+	}
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ConsecutiveFailures == 0 {
+		t.Error("consecutive_failures was cleared by a concurrent neighbour's pass, which re-arms " +
+			"the fallback trigger and lets the next pass re-order the broken full set")
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

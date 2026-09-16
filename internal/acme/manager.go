@@ -111,25 +111,38 @@ type Manager struct {
 	// fallback is the "split off a subset and issue it before expiry" policy. nil means
 	// off, which is the default. See SetFallbackPolicy and applyFallback.
 	fallback *config.FailureFallback
+}
 
-	// degradedRound / fullSetRound describe the domain set THIS round ordered for, and
-	// they are the difference between a fallback that holds and a fallback that
-	// oscillates.
-	//
-	// A successful issuance for the degraded subset used to reset consecutive_failures
-	// and clear the identifier ledger along with every other success. That erased the
-	// only evidence that anything was wrong, so the very next pass judged the
-	// certificate "recoverable", tried the full set again, and fell back once more --
-	// once per backoff window, forever, spending an order on an identifier set already
-	// known to be broken. See download for what each flag suppresses.
-	//
-	// Per-certificate and never read across goroutines: the reconciler runs one pass
-	// per certificate at a time (ErrAlreadyRunning).
-	degradedRound bool
-	fullSetRound  bool
+// round is the per-pass intent of ONE certificate: which domain set this pass decided to
+// order for, and whether a degradation was in force when it decided.
+//
+// These used to be Manager fields, and that was a bug. The reconciler is serial per
+// *certificate*, not per process: startCert fans out one goroutine per certificate (capped
+// at maxConcurrentStarts) and the timer's RunAll overlaps them, and all of them share the
+// one Manager built in main. Two different certificates' passes therefore wrote and read
+// the same three booleans, which showed up as genuine data races and as three wrong
+// outcomes -- a full-set issuance keeping its failure counter, a fallback re-ordering the
+// identifier set it exists to avoid, and a certificate with months of validity left having
+// names dropped because a neighbour's round looked like a fallback.
+//
+// It is a value threaded down the call chain now, so there is nothing to share and no lock
+// to take.
+//
+// Why the flags matter at all: a successful issuance for the degraded subset used to reset
+// consecutive_failures and clear the identifier ledger along with every other success. That
+// erased the only evidence that anything was wrong, so the very next pass judged the
+// certificate "recoverable", tried the full set again, and fell back once more -- once per
+// backoff window, forever, spending an order on an identifier set already known to be
+// broken. See download for what each flag suppresses.
+type round struct {
+	// degraded is set when this pass ordered a SUBSET of the configured names.
+	degraded bool
+
+	// fullSet is set when this pass ordered the FULL configured identifier set.
+	fullSet bool
 
 	// fallbackActive records that a degradation decision is in force for this certificate
-	// (a cert_fallback row exists), whether or not this round dropped anything.
+	// (a cert_fallback row exists), whether or not this pass dropped anything.
 	//
 	// The SAN-drift branch in Reconcile reads it: while a fallback is active the live
 	// certificate is *supposed* to be missing the dropped names, so "the SANs do not
@@ -188,15 +201,16 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		st = &state.CertState{Name: c.Name}
 	}
 
-	// Reset per-round intent: every early return below must leave it false, so a
-	// previous pass can never make this one look like it ordered something.
-	m.degradedRound = false
-	m.fullSetRound = false
-	// Whether a degradation record exists is a durable fact, not a per-round one, so it
-	// is re-read rather than reset. A read failure leaves it false, which is the
-	// pre-existing behaviour.
+	// Whether a degradation record exists is a durable fact about this certificate, not
+	// per-pass state, so it is read once here and carried in the round value. A read
+	// failure leaves it false, which is the pre-existing behaviour.
+	//
+	// Reading it once, up front, is also what makes the rest of the pass consistent: the
+	// drift branch, the fallback decision and download all see the same answer even though
+	// other certificates are converging at the same time.
+	rd := round{}
 	if fb, ferr := m.store.GetFallback(c.Name); ferr == nil {
-		m.fallbackActive = fb != nil
+		rd.fallbackActive = fb != nil
 	}
 	// Skip straight through the backoff window. Once a retry is scheduled, stop knocking
 	// on the CA's door.
@@ -219,14 +233,14 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	// with the config -> discard and rebuild", turning into a pointless order every round.
 	//
 	// Note what this does NOT mean: using the reduced set here is not a licence to forget
-	// that names were dropped. download keys off the flag below so that a successful
+	// that names were dropped. download keys off the round value below so that a successful
 	// issuance for the subset keeps the failure evidence intact; without it the next pass
 	// sees a "healthy" certificate and immediately re-orders the full set.
-	c = m.applyFallback(c, st)
+	c, rd = m.applyFallback(c, st, rd)
 	if len(c.Domains) == len(cfgDomains) {
 		// applyFallback only ever removes names, so the counts matching means the full
 		// configured set is what this round would order for.
-		m.fullSetRound = true
+		rd.fullSet = true
 	}
 
 	// Invariant 1: with an unexpired order in progress, keep advancing it, never create a
@@ -260,7 +274,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 
 		default:
 			m.log.Info("resuming the existing order", "cert", c.Name, "order", o.OrderURL, "status", o.Status)
-			return m.advance(ctx, c, st, o)
+			return m.advance(ctx, c, st, o, rd)
 		}
 	}
 
@@ -276,7 +290,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	if st.NotAfter.IsZero() {
 		m.log.Info("first issuance",
 			"cert", c.Name, "names", len(c.Domains), "profile", c.Profile)
-		return m.issue(ctx, c, st, "")
+		return m.issue(ctx, c, st, "", rd)
 	}
 
 	// Certificate exists, but the binding to a cloud resource is unconfirmed -> do one
@@ -309,7 +323,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	if leaf, lerr := ParseLeaf(st.CertPEM); lerr != nil {
 		m.log.Warn("could not parse the live certificate; skipping the SAN comparison", "cert", c.Name, "err", lerr)
 	} else if drifted, detail := CoverageDrift(leaf, c.Domains); drifted {
-		if m.fallbackActive {
+		if rd.fallbackActive {
 			// A degradation is in force, so the live certificate is *supposed* to be
 			// missing names: this drift is the fallback working, not a config change that
 			// needs converging on.
@@ -351,7 +365,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 			// The fallback case above reconciles the two concerns: it holds the degraded
 			// set rather than reissuing, so the "changed identifier set" this branch exists
 			// for is a genuine config change, and no replaces is the right call for it.
-			return m.issue(ctx, c, st, "")
+			return m.issue(ctx, c, st, "", rd)
 		}
 	}
 
@@ -376,7 +390,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 
 	m.log.Info("starting renewal",
 		"cert", c.Name, "notAfter", st.NotAfter, "renewAt", renewAt, "ariReplaces", replaces != "")
-	return m.issue(ctx, c, st, replaces)
+	return m.issue(ctx, c, st, replaces, rd)
 }
 
 // orderMatchesConfig reports whether the order's identifier set still matches the config.
