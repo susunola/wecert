@@ -110,9 +110,14 @@ type Options struct {
 
 	// StatePath is the path to onboarding's own state file.
 	//
-	// Empty means no persistence -- which downgrades the deletion grace period to
-	// "recompute from scratch every run", so it never elapses. Suitable only for
-	// one-off troubleshooting.
+	// Empty means no persistence, and the consequence is stronger than "the grace period
+	// recomputes every run": with nothing persisted, every removal takes effect on the
+	// round that observes it. There is no AbsentSince entry to age, so the grace period is
+	// bypassed rather than merely postponed, and the abrupt-change fuse has no baseline
+	// either. RecoverBaselineFromDocument narrows the damage when a previous document is on
+	// disk, but on a first run there is nothing to recover from.
+	//
+	// Suitable only for one-off troubleshooting, never for a system left running.
 	StatePath string
 
 	// ReportPath is where the decision report (JSON) is written. Empty means no report.
@@ -585,8 +590,14 @@ func (r *run) loadRules(ctx context.Context) {
 		//
 		// §9 explicitly refuses "degrade to a single source when one is unavailable":
 		// degradation makes safety vanish together with the source, exactly when it is
-		// needed most. So the judgement always freezes -- no name is removed this
-		// round, and the guard counts as satisfied (conservative direction: keep).
+		// needed most. So nothing is removed this round and the guard counts as satisfied
+		// (conservative direction: keep).
+		//
+		// Note the mechanism, because an earlier version of this comment said the judgement
+		// "always freezes": it does not call freeze(). Setting guardUnavailable suppresses
+		// deletions while leaving the rest of the round intact, so additions still converge.
+		// Freezing outright would stop every certificate from being updated because one API
+		// call failed — a worse trade than "no deletions today".
 		r.guardUnavailable = true
 		r.rep.GuardUnavailable = true
 		r.o.log.Warn("CLB rule guard is unavailable this round; no name will be removed and the guard is treated as satisfied",
@@ -899,6 +910,42 @@ func (r *run) applyGrace() {
 	}
 	sort.Strings(absent)
 
+	// A name covered last round but not eligible now is only "absent" in the sense that it
+	// left the certificate. It has NOT necessarily stopped being declared: guard 1 rejects a
+	// declaration whose name no CLB rule serves, and a declaration that failed the conflict
+	// check never reaches the eligible set either. Treating those as removed produced two
+	// lies at once:
+	//
+	//   - the report said "no longer declared, but only absent for 0s" about a name that is
+	//     declared right now, and
+	//   - because carry() puts the name back into eligible, the round then kept converging
+	//     on a name the guard had just rejected -- re-issuing a certificate for a name with
+	//     no rule, which is precisely what guard 1 exists to prevent.
+	//
+	// So the grace period applies only to names that genuinely stopped being declared. A
+	// still-declared name that a guard filtered out is reported once, by that guard, with the
+	// real reason.
+	declaredNow := r.declaredNameSet()
+	stillDeclared := make([]string, 0)
+	genuinelyAbsent := make([]string, 0, len(absent))
+	for _, n := range absent {
+		if declaredNow[n] {
+			stillDeclared = append(stillDeclared, n)
+			continue
+		}
+		genuinelyAbsent = append(genuinelyAbsent, n)
+	}
+	absent = genuinelyAbsent
+
+	for _, n := range stillDeclared {
+		// Deliberately not carried and deliberately not marked absent: the name is still
+		// here, it just did not pass a guard. MarkAbsent would start a grace clock for a
+		// name that never left.
+		r.st.MarkPresent(n)
+		r.o.log.Debug("a declared name did not reach the certificate this round; the guard that "+
+			"filtered it already reported the reason", "hostname", n)
+	}
+
 	for _, n := range absent {
 		since, _ := r.st.MarkAbsent(n, r.now)
 		age := r.now.Sub(since)
@@ -941,6 +988,33 @@ func (r *run) applyGrace() {
 	// is back, so the grace period resets.
 	for n := range present {
 		r.st.MarkPresent(n)
+	}
+
+	// Drop absence markers that no longer describe anything.
+	//
+	// MarkAbsent is reached only from the absent set, which is derived from the PREVIOUS
+	// round's covered names. Once a name has left the covered set and its grace period has
+	// run out, it never enters that set again -- so nothing clears its marker, and
+	// MarkPresent only runs for names that come back. The map therefore grew by one entry
+	// for every name ever removed from a certificate, for the life of the state file, on a
+	// system whose hostnames churn by design.
+	//
+	// After the loop above, the markers that SHOULD exist are exactly the names absent this
+	// round: every one of them got a MarkAbsent, and every name that came back got a
+	// MarkPresent. Anything else is a leftover from an earlier round, including names whose
+	// grace period expired and which were consequently removed from the document.
+	//
+	// Pruning to the absent set rather than to "previous or current names" is deliberate:
+	// this runs BEFORE LastNames is reassigned, so r.st.LastNames is still the previous
+	// revision and would keep every already-removed name alive for one more round.
+	keepMarkers := make(map[string]bool, len(absent))
+	for _, n := range absent {
+		keepMarkers[n] = true
+	}
+	for n := range r.st.AbsentSince {
+		if !keepMarkers[n] {
+			delete(r.st.AbsentSince, n)
+		}
 	}
 }
 
@@ -1217,6 +1291,22 @@ func (r *run) budget() {
 
 // declaredNames returns this round's expanded declaration set -- what DNS actually
 // asked for, before guards, grace carries and grouping.
+// declaredNameSet is every name the current round's declarations contribute, as a set.
+//
+// Distinct from the eligible set: a declared name may still have been filtered out by a
+// guard, so this answers "did DNS still ask for it", which is what the grace period needs
+// to know. Parse failures and conflict-rejected declarations are absent from
+// r.declarations, so they do correctly count as no-longer-declared.
+func (r *run) declaredNameSet() map[string]bool {
+	out := make(map[string]bool, len(r.declarations)*2)
+	for _, d := range r.declarations {
+		for _, n := range d.Names() {
+			out[n] = true
+		}
+	}
+	return out
+}
+
 func (r *run) declaredNames() []string {
 	declared := make([]string, 0, len(r.declarations)*2)
 	for _, d := range r.declarations {
@@ -1227,6 +1317,18 @@ func (r *run) declaredNames() []string {
 
 // assemble builds the document and state.
 func (r *run) assemble() {
+	// Age the change ledger on EVERY round that reaches here.
+	//
+	// ChangesWithin both counts and prunes, and it used to be reached only on the path that
+	// records a change -- so the -force path (which records without counting) and the
+	// unchanged path (which does neither) never pruned. The ledger then grew without bound on
+	// a deployment whose name set never changed, which is the common steady state: one entry
+	// per pass that took either of those two paths.
+	//
+	// Calling it here means pruning is unconditional. The count is discarded because this is
+	// not the decision point; the budget check below calls it again for the value.
+	_ = r.st.ChangesWithin(r.o.opts.BudgetWindow, r.now)
+
 	names := make([]string, 0, len(r.eligible))
 	for n := range r.eligible {
 		names = append(names, n)

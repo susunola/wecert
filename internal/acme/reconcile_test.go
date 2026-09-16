@@ -95,6 +95,14 @@ func writeJSON(w http.ResponseWriter, v any) {
 // selfSignedCertPEM builds a self-signed certificate with the given SANs, used to fill CertState.CertPEM.
 func selfSignedCertPEM(t *testing.T, notAfter time.Time, dnsNames ...string) []byte {
 	t.Helper()
+	return selfSignedCertAt(t, time.Now().Add(-time.Hour), notAfter, dnsNames...)
+}
+
+// selfSignedCertAt is selfSignedCertPEM with an explicit NotBefore, for tests that must
+// distinguish "issued after the live certificate" from "expires later than it" -- the two
+// are not the same thing once a profile can get shorter.
+func selfSignedCertAt(t *testing.T, notBefore, notAfter time.Time, dnsNames ...string) []byte {
+	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -104,7 +112,7 @@ func selfSignedCertPEM(t *testing.T, notAfter time.Time, dnsNames ...string) []b
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "test"},
 		DNSNames:              dnsNames,
-		NotBefore:             time.Now().Add(-time.Hour),
+		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		AuthorityKeyId:        []byte{0x01, 0x02, 0x03},
 		BasicConstraintsValid: true,
