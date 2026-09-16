@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,8 +76,9 @@ type Reconciler struct {
 	//
 	// It is attached with SetProber instead of being a New parameter: it is purely
 	// additional observation and should not force every test double to construct
-	// one.
-	prober *probe.Runner
+	// one. The field is an interface so the panic containment around a probe can be
+	// exercised without a live TLS endpoint.
+	prober prober
 
 	// last is the most recently resolved desired state, for read-only diagnostics.
 	// A pointer is required: the diagnostic endpoint reads it from another
@@ -84,10 +86,25 @@ type Reconciler struct {
 	last atomic.Pointer[spec.Result]
 }
 
+// prober is the network-side probe capability the reconciler needs.
+type prober interface {
+	Check(ctx context.Context, host string, e probe.Expectation) probe.Verdict
+}
+
 // SetProber attaches the network-side prober. Must be called before the first
 // convergence. Passing nil makes the whole probe path a no-op, so convergence
 // behaves exactly as if none were attached.
-func (r *Reconciler) SetProber(p *probe.Runner) { r.prober = p }
+//
+// The nil check is not redundant with the interface field: storing a nil
+// *probe.Runner in it would make r.prober != nil, and the probe path would then call
+// Check on a nil runner instead of being skipped.
+func (r *Reconciler) SetProber(p *probe.Runner) {
+	if p == nil {
+		r.prober = nil
+		return
+	}
+	r.prober = p
+}
 
 // New builds a reconciler.
 //
@@ -402,8 +419,26 @@ func (r *Reconciler) StartAll(ctx context.Context) []string {
 // and notifications. The pass's error is returned for callers that need it
 // (RunCert); RunAll and startCert deliberately discard it -- one failing
 // certificate must not stall the others.
-func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) error {
-	err := r.manager.Reconcile(ctx, c)
+func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (err error) {
+	// Contain a panic at the certificate boundary.
+	//
+	// Every caller of this function runs it for one certificate on behalf of all the
+	// others -- twice from a goroutine, where an unrecovered panic takes the whole
+	// process down. A single nil map write would then stop every other certificate
+	// from renewing, which is the same "one failure blocks everything" coupling this
+	// package exists to avoid. Recovering here turns it into an ordinary failed pass:
+	// counted, logged with a stack, and retried on the usual backoff.
+	defer func() {
+		if p := recover(); p != nil {
+			metrics.ReconcilePanics.WithLabelValues(c.Name).Inc()
+			r.log.Error("recovered from a panic: this certificate's pass was aborted, "+
+				"the other certificates are unaffected; this is a bug, please report it",
+				"cert", c.Name, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+			err = fmt.Errorf("panic while reconciling %s: %v", c.Name, p)
+		}
+	}()
+
+	err = r.manager.Reconcile(ctx, c)
 	if err != nil {
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
 		// manager already logged and scheduled backoff; this is just a summary.
@@ -470,6 +505,17 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 		wg.Add(1)
 		go func(h string) {
 			defer wg.Done()
+			// A panic on a background goroutine is not recoverable by its parent, so
+			// without this guard a parsing bug in one host's certificate takes the
+			// whole daemon down -- and the probe is best-effort evidence, the least
+			// important thing here to die for.
+			defer func() {
+				if p := recover(); p != nil {
+					metrics.CertificateProbeErrors.WithLabelValues(h).Inc()
+					r.log.Error("recovered from a panic while probing; the probe was abandoned",
+						"host", h, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+				}
+			}()
 			r.prober.Check(ctx, h, e)
 		}(host)
 	}

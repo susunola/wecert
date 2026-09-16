@@ -9,6 +9,7 @@ import (
 
 	legoacme "github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/challenge"
+	"github.com/go-acme/lego/v4/challenge/dns01"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/state"
@@ -227,15 +228,28 @@ func (m *Manager) solveChallenges(
 				return false, m.recordFailure(st, fmt.Errorf("compute the key authorization: %w", err))
 			}
 
+			// The row must describe the challenge this pass is actually solving. The token
+			// kept from an earlier visit can be a different challenge than the one `chlg`
+			// names now, and then the row's token no longer hashes to its own TxtValue.
+			// That breaks cleanup: removeAuthzTXT derives the key authorization from the
+			// token, so CleanUp would look for a value that was never registered, conclude
+			// "another challenge is still live at this name", and never fire the provider's
+			// delete-all again -- stranding every later TXT record at that name for the
+			// lifetime of the process.
+			//
+			// Refreshing it loses the older token, not the older record: the provider's
+			// cleanup deletes every TXT at the name in one call.
+			firstVisit := a.ChallengeToken == ""
+			a.ChallengeURL = chlg.URL
+			a.ChallengeToken = chlg.Token
+
 			adopted := false
-			if a.ChallengeToken == "" {
+			if firstVisit {
 				// First visit: persist the challenge **before** writing DNS. A pass that
 				// dies between the write and the persist below leaves the record up while
 				// the row still says Presented=false -- and the token is then the only
 				// way to locate that record again (the probe right below relies on it,
 				// and so does cleanupOrphanTXT).
-				a.ChallengeURL = chlg.URL
-				a.ChallengeToken = chlg.Token
 				if err := m.store.PutAuthorization(a); err != nil {
 					return false, err
 				}
@@ -410,8 +424,38 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 	}
 }
 
+// registerRecoveredLeases re-registers every TXT this state store still believes is in
+// DNS, before anything is cleaned up.
+//
+// The lease registry (see challengeLeases) only knows the values this *process* wrote.
+// lego's provider cleanup deletes **every** TXT at the challenge name, so a row recovered
+// from a previous process -- the pass that wrote it died before marking Presented -- is a
+// live value the registry cannot see. A cleanup for a different certificate sharing the
+// challenge name would then find "no other live values" and delete it, taking out a
+// challenge that is still pending and burning the per-identifier authorization-failure
+// quota.
+//
+// Re-reading the rows first makes the registry's view match what is actually in DNS, so
+// "no other live values" becomes true rather than merely believed.
+func (m *Manager) registerRecoveredLeases() {
+	rows, err := m.store.ListPresentedAuthorizations()
+	if err != nil {
+		// Not fatal: the worst case is the behaviour without this call, which is what
+		// every version before it did.
+		m.log.Warn("cannot list presented authorizations to re-register their TXT leases", "err", err)
+		return
+	}
+	for _, a := range rows {
+		if a.TxtName != "" && a.TxtValue != "" {
+			challengeLeases.add(a.TxtName, a.TxtValue)
+		}
+	}
+}
+
 // cleanup deletes every TXT this round wrote. It is only called once all authorizations pass.
 func (m *Manager) cleanup(ctx context.Context, certName string, authzs []*state.Authorization) {
+	m.registerRecoveredLeases()
+
 	for _, a := range authzs {
 		cleaned, err := m.removeAuthzTXT(ctx, a)
 		if err != nil {
@@ -451,6 +495,17 @@ func (m *Manager) removeAuthzTXT(ctx context.Context, a *state.Authorization) (c
 	if err != nil {
 		return false, fmt.Errorf("compute the key authorization: %w", err)
 	}
+	// Register exactly the value CleanUp is about to remove, so the registry stays
+	// symmetric: a lease that goes in must be the one that comes out, or the leftover
+	// entry makes "another challenge is still live here" true forever and the provider's
+	// delete-all never fires again for the name for the lifetime of this process.
+	//
+	// It cannot be a.TxtValue unconditionally. A row written before the challenge token
+	// was refreshed can carry a TxtValue that its token no longer hashes to, and
+	// registering that stale value would create precisely that phantom lease.
+	if a.TxtName != "" {
+		challengeLeases.add(a.TxtName, dns01.GetChallengeInfo(a.Identifier, keyAuth).Value)
+	}
 	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
 		return false, fmt.Errorf("clean up TXT %s: %w", a.TxtName, err)
 	}
@@ -468,6 +523,8 @@ func (m *Manager) removeAuthzTXT(ctx context.Context, a *state.Authorization) (c
 // The second source is exactly why this function exists: it is idempotent and self-healing,
 // and nobody has to go digging around in the DNSPod console.
 func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
+	m.registerRecoveredLeases()
+
 	authzs, err := m.store.ListAuthorizations(certName)
 	if err != nil {
 		return err
@@ -540,11 +597,19 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 		return false
 	}
 	if !found {
-		// Nothing in DNS under this value: the write genuinely never happened.
+		// Every reachable authoritative nameserver denied this value, which is the
+		// only answer that licenses deleting the row: the write genuinely never
+		// happened. Any other outcome -- including one that merely could not be
+		// confirmed -- reaches the caller as err, and the row is kept.
 		return true
 	}
 	m.log.Info("found the TXT of an interrupted pass; reclaiming it before deleting the row",
 		"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN)
+	// Register it before asking for cleanup. CleanUp removes one lease and only fires the
+	// provider's delete-all when no other value is live at the name; without registering,
+	// this value is invisible to the registry and the delete-all would go ahead -- taking
+	// out any other certificate's record at the same name.
+	challengeLeases.add(rec.FQDN, rec.Value)
 	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
 		m.log.Warn("failed to reclaim the TXT of an interrupted pass; keeping the row",
 			"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN, "err", err)
