@@ -770,7 +770,7 @@ func TestGuardOneAcceptsANameServedByAWildcardRule(t *testing.T) {
 	}
 	if got := h.domains(t); len(got) != 1 || got[0] != "www.example.com" {
 		t.Fatalf("domain set = %v, want [www.example.com]", got)
- 	}
+	}
 }
 
 func TestGroupSettingsConflictKeepsPreviousCertificate(t *testing.T) {
