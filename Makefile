@@ -1,5 +1,8 @@
 GO ?= go
 BIN := bin/wecert
+# onboarding 组件。它和 wecert 一样是产品的一部分（跑在定时任务里），
+# 但刻意做成独立二进制：推断逻辑要能整个丢掉重写而不碰签发。
+ONBOARD := bin/wecert-onboard
 # 辅助工具：只用于测试与排障，不随产品部署。
 # 加 wecert- 前缀是为了安装到 /usr/local/bin 后不会和其它工具撞名。
 PREFLIGHT := bin/wecert-preflight
@@ -11,6 +14,9 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1
 # ARM 实例用 linux/arm64；darwin/arm64 供本机调试。
 PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 
+# 随产品发布的命令。webhook 触发的那一半不在这里时，这里也要同步补上。
+CMDS := wecert wecert-onboard
+
 .PHONY: build tools release test vet cover clean fmt validate-cloudinit fmt-check check
 
 build:
@@ -18,6 +24,7 @@ build:
 
 # 构建辅助工具（preflight 前置检查、clbverify 监听器绑定取证）。
 tools:
+	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(ONBOARD) ./cmd/wecert-onboard
 	$(GO) build -trimpath -ldflags "-s -w" -o $(PREFLIGHT) ./cmd/preflight
 	$(GO) build -trimpath -ldflags "-s -w" -o $(CLBVERIFY) ./cmd/clbverify
 	$(GO) build -trimpath -ldflags "-s -w" -o $(TATRUN) ./cmd/tatrun
@@ -27,15 +34,17 @@ tools:
 # 这样 Alpine/musl 上也能直接跑。SQLite 用的是纯 Go 实现，所以可行。
 release:
 	@rm -rf dist && mkdir -p dist
-	@for p in $(PLATFORMS); do \
-		os=$${p%%/*}; arch=$${p##*/}; \
-		out=dist/wecert_$${os}_$${arch}; \
-		printf 'building %-24s' "$$out"; \
-		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath \
-			-ldflags "-s -w -X main.version=$(VERSION)" -o $$out ./cmd/wecert || exit 1; \
-		printf '%s\n' "ok"; \
+	@for cmd in $(CMDS); do \
+		for p in $(PLATFORMS); do \
+			os=$${p%%/*}; arch=$${p##*/}; \
+			out=dist/$${cmd}_$${os}_$${arch}; \
+			printf 'building %-34s' "$$out"; \
+			CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath \
+				-ldflags "-s -w -X main.version=$(VERSION)" -o $$out ./cmd/$$cmd || exit 1; \
+			printf '%s\n' "ok"; \
+		done; \
 	done
-	@cd dist && (command -v sha256sum >/dev/null 2>&1 && sha256sum wecert_* || shasum -a 256 wecert_*) > SHA256SUMS
+	@cd dist && (command -v sha256sum >/dev/null 2>&1 && sha256sum wecert* || shasum -a 256 wecert*) > SHA256SUMS
 	@echo && echo "=== 产物 ===" && ls -lh dist/ && echo && cat dist/SHA256SUMS
 
 # apply 之前查 cloud-init user_data 里的脚本语法。

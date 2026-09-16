@@ -13,6 +13,7 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/metrics"
+	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -59,7 +60,7 @@ func newTestReconciler(t *testing.T, names []string, mgr CertManager) (*Reconcil
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(cfg, store, mgr, nil, log), store
+	return New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, log), store
 }
 
 // fakeNotifier 记录收到的通知，用来验证"结果事件确实发出去了"。
@@ -96,7 +97,8 @@ func TestNotifierReceivesRenewalResult(t *testing.T) {
 	defer store.Close()
 
 	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
-	r := New(cfg, store, mgr, notifier, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.RunOnce(context.Background())
 
 	select {
@@ -121,7 +123,8 @@ func TestNotifierReceivesFailure(t *testing.T) {
 	defer store.Close()
 
 	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
-	r := New(cfg, store, mgr, notifier, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.RunOnce(context.Background())
 
 	select {
@@ -270,6 +273,12 @@ func TestCertNamesPreservesConfigOrder(t *testing.T) {
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"z", "a", "m"}, mgr)
 
+	// CertNames 读的是最近一次求值的缓存，所以先求值一次。
+	// 启动时 main 会调 Prime 做同一件事：只读端点在第一次收敛之前
+	// 就必须能回答"有哪些证书"，否则它会返回空列表 ——
+	// 而空列表会被读成"期望为空"。
+	r.Prime(context.Background())
+
 	got := r.CertNames()
 	want := []string{"z", "a", "m"}
 	if len(got) != len(want) {
@@ -405,5 +414,76 @@ func TestRunOnceCountsFailuresInMetrics(t *testing.T) {
 
 	if got := testutil.ToFloat64(metrics.CertConsecutiveFailures.WithLabelValues(name)); got != 3 {
 		t.Errorf("连续失败次数应透出为 3，实际 %v", got)
+	}
+}
+
+// ── 期望状态来源的失败语义 ──────────────────────────────────────────────────
+
+// failingProvider 模拟"来源读不到"。
+type failingProvider struct{ err error }
+
+func (f failingProvider) Desired(context.Context) ([]config.Certificate, error) {
+	return nil, f.err
+}
+
+// 来源读不到时**绝不能**被当成"期望为空"。
+//
+// 这是整套设计里唯一能造成灾难的地方：空结果一旦被当作期望状态，
+// wecert 就会把域名从每张证书里摘掉，线上立刻握手失败 ——
+// 这比"这轮没签发"严重得多。正确反应是整个跳过这一轮。
+//
+// 这条不变量既在 onboarding 侧（三态语义）守，也在这里守：
+// 契约边界不能假设上游一定做对了。
+func TestUnreadableSourceSkipsThePassEntirely(t *testing.T) {
+	mgr := &fakeManager{}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{}
+	r := New(cfg, failingProvider{err: errors.New("dns api is down")}, store, mgr, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	before := testutil.ToFloat64(metrics.DesiredStateErrors)
+	r.RunOnce(context.Background())
+
+	if len(mgr.calls) != 0 {
+		t.Errorf("来源读不到时不该处理任何证书，实际处理了 %v", mgr.calls)
+	}
+	if got := testutil.ToFloat64(metrics.DesiredStateErrors); got != before+1 {
+		t.Errorf("DesiredStateErrors 应当加一，实际 %v -> %v", before, got)
+	}
+	// CertNames 也不能因此变成空列表：空列表会被读成"期望为空"。
+	if got := r.CertNames(); got != nil {
+		t.Errorf("没有成功求值过时 CertNames 应为 nil，实际 %v", got)
+	}
+}
+
+// 状态库里有、但期望状态里已经没有的证书不会再被续期，最终会安静地过期。
+// 这条告警是那条失败路径唯一的兜底：删除路径本来就有宽限期和引用检查，
+// 万一还是漏出去了，至少要在到期之前看见它。
+func TestOrphanedCertificatesAreReported(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: "kept"}}}
+	if err := store.PutCert(&state.CertState{
+		Name: "forgotten", NotAfter: time.Now().Add(10 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, &fakeManager{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.RunOnce(context.Background())
+
+	if got := testutil.ToFloat64(metrics.OrphanedCertificates); got != 1 {
+		t.Errorf("应报告 1 张孤儿证书，实际 %v", got)
 	}
 }

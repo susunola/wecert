@@ -377,6 +377,32 @@ t3: DNS 恢复           → 又重签                 ✗ 再烧一次
 
 ---
 
+## 8.1 实现状态
+
+阶段 1~4 都已落地，来源采用"**取向 B 作为取向 C 里的来源**"：
+
+| 阶段 | 状态 | 落在哪里 |
+|---|---|---|
+| 0 GitOps + webhook | 已有 | 配置里的 `certificates` + `POST /hook/reconcile` |
+| 1 Provider 抽象 + 只读来源 + 只告警 | **已实现** | `internal/spec`（契约/文档/Provider/Observer）、`cmd/wecert-onboard`、`desiredState.mode: observe` |
+| 2 通配符优先分组 | **已实现** | `internal/group`（PSL 注册域 + 单层覆盖计算） |
+| 3 自动签发 + 去抖/排队/熔断 | **已实现，但默认关闭** | `internal/onboarding` 的骤变熔断与配额预算；`mode` 默认 `static`，要显式切 `enforce` |
+| 4 删除宽限期与引用检查 | **已实现** | `internal/onboarding`：确认缺失 + 宽限期 + CLB 引用检查，三者同时满足才移除 |
+
+五条安全不变量在代码里的落点写在 `internal/onboarding/onboard.go` 的包注释里。
+日常操作、切换步骤与排障见 [`desired-state.md`](desired-state.md)。
+
+**和设计的一处偏离：** 第 5.4 条提到的"去抖窗口"没有单独实现，
+而是由 onboarding 的**定时器周期**承担 —— 它是一个一次性进程，
+跑完就退出，两次运行之间的窗口天然就是去抖窗口。
+把它做进进程里只会引入一份额外的状态和一类新的时钟 bug。
+
+**仍然没做：** 外部黑盒探测（拨 443 读 `notAfter`）、
+`multi_cert_info` 的"一张证书不影响另一张"验证、
+DNSPod token 走 `LoadCredential`。
+
+---
+
 ## 9. 明确不做的
 
 - **不做"DNS 有记录就自动签"。** zone 里 MX/TXT/SPF/验证记录全在里面，

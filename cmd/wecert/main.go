@@ -26,6 +26,7 @@ import (
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/reconcile"
+	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 	"github.com/susunola/wecert/internal/webhook"
 )
@@ -81,6 +82,19 @@ func run() error {
 	}
 	logStartup(log, cfg, firstRun)
 
+	// 期望状态来源在碰网络之前就构造好。
+	//
+	// enforce 模式下文档读不到必须在**启动时**就炸，而不是等到第一次收敛 ——
+	// 允许"起得来但没有期望状态"意味着 wecert 会安静地什么都不续期，
+	// 直到所有证书过期才被发现。
+	//
+	// 放在这里而不是更后面，还让 -dry-run 能真正回答那个最关键的问题：
+	// "现在切过去，它起得来吗？" —— 而且不必先成功注册一次 ACME 账号。
+	provider, err := newProvider(cfg, log)
+	if err != nil {
+		return err
+	}
+
 	httpClient := acme.NewHTTPClient(60 * time.Second)
 	core, err := acme.EnsureAccount(cfg, store, httpClient)
 	if err != nil {
@@ -88,7 +102,10 @@ func run() error {
 	}
 
 	if *dryRun {
-		log.Info("dry run finished: the config and the ACME account are both fine", "certificates", len(cfg.Certificates))
+		log.Info("dry run finished: the config, the ACME account and the desired-state source are all fine",
+			"mode", cfg.DesiredState.Mode,
+			"provider", spec.KindOf(provider),
+			"certificates", len(cfg.Certificates))
 		return nil
 	}
 
@@ -117,7 +134,12 @@ func run() error {
 	}
 
 	manager := acme.NewManager(store, core, solver, deployer, log)
-	reconciler := reconcile.New(cfg, store, manager, notifier, log)
+	reconciler := reconcile.New(cfg, provider, store, manager, notifier, log)
+
+	// 先求值一次并缓存。这样只读端点（webhook 的名字解析、诊断端点）
+	// 在第一次收敛跑完之前就能给出正确答案，而不是先返回一个空列表 ——
+	// 空列表会被读成"期望为空"。
+	reconciler.Prime(ctx)
 
 	// 指标服务。先同步绑定端口，失败就直接退出 —— 见下面的注释。
 	if err := startMetricsServer(ctx, cfg.Metrics.Listen, log); err != nil {
@@ -137,6 +159,58 @@ func run() error {
 	log.Info("entering daemon mode", "interval", *interval)
 	runDaemon(ctx, reconciler, *interval, log)
 	return nil
+}
+
+// newProvider 按 desiredState.mode 装配期望状态来源。
+//
+// 三种模式的差别是**谁有最终解释权**，而不是"读几个文件"：
+//
+//	static   配置里的 certificates 说了算。历史行为，零风险。
+//	observe  仍然按 certificates 收敛，但同时读文档并报告差异。
+//	enforce  文档说了算，certificates 必须为空。
+//
+// 之所以把推断挡在 wecert 之外：这个系统所有已知的坑都在"判断"上，
+// 而判断逻辑必然会反复改，证书生命周期必须稳。
+func newProvider(cfg *config.Config, log *slog.Logger) (spec.Provider, error) {
+	static := spec.NewStatic(cfg.Certificates)
+
+	switch cfg.DesiredState.Mode {
+	case config.ModeStatic:
+		log.Info("desired state comes from the configuration file",
+			"mode", config.ModeStatic, "certificates", len(cfg.Certificates))
+		return static, nil
+
+	case config.ModeObserve:
+		// 影子来源构造失败**不**让进程起不来：观察阶段文档还没生成是很正常的事，
+		// 此时应当照旧按配置收敛，只是没有对比结果。
+		shadow, err := spec.NewFile(cfg.DesiredState.Path, log)
+		if err != nil {
+			log.Warn("observe mode: the desired-state document is not readable yet; "+
+				"convergence will run on the configuration file exactly as before",
+				"path", cfg.DesiredState.Path, "err", err)
+			return static, nil
+		}
+		log.Info("observe mode: converging on the configuration file while reporting the diff against the document",
+			"path", cfg.DesiredState.Path)
+		return spec.NewObserver(static, shadow, log), nil
+
+	case config.ModeEnforce:
+		// enforce 模式下文档读不到必须**硬失败**。
+		//
+		// 允许"起得来但没有期望状态"意味着 wecert 会安静地什么都不续期，
+		// 直到所有证书过期才被发现 —— 那是最糟的一种失败：无声，且后果全在线上。
+		// 起不来至少是吵闹的，systemd 会重启它，人也会注意到。
+		f, err := spec.NewFile(cfg.DesiredState.Path, log)
+		if err != nil {
+			return nil, fmt.Errorf("desiredState.mode=%q requires a readable document: %w",
+				config.ModeEnforce, err)
+		}
+		log.Info("enforce mode: the desired-state document is the single source of truth",
+			"path", cfg.DesiredState.Path)
+		return f, nil
+	}
+
+	return nil, fmt.Errorf("unknown desiredState.mode %q", cfg.DesiredState.Mode)
 }
 
 func runDaemon(ctx context.Context, r *reconcile.Reconciler, interval time.Duration, log *slog.Logger) {
