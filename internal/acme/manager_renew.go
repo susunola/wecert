@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v4/acme/api"
@@ -108,6 +109,21 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		Profile:        c.Profile,
 		ReplacesCertID: replaces,
 	})
+	if err != nil && replaces != "" && mentionsReplaces(err) {
+		// A rejected `replaces` must never be a dead end.
+		//
+		// The CA validates the field against the certificate it names, and a refusal
+		// comes back from newOrder -- so no order exists, and every later round sends
+		// the same value and is refused identically. The certificate would then never
+		// renew again, silently, until someone noticed it had expired. Losing the
+		// rate-limit exemption is a far smaller cost than that, so retry once without
+		// it. Covered here rather than only at the call site because the value flows in
+		// from the ARI state, which any future change could get wrong.
+		m.log.Warn("the CA refused the ARI replaces field; retrying the order without it "+
+			"(this renewal loses the rate-limit exemption, which beats not renewing at all)",
+			"cert", c.Name, "replaces", replaces, "err", err)
+		order, err = m.core.NewOrder(c.Domains, &api.OrderOptions{Profile: c.Profile})
+	}
 	if err != nil {
 		return m.recordFailure(st, fmt.Errorf("create order: %w", err))
 	}
@@ -141,4 +157,16 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		"cert", c.Name, "status", order.Status, "expiresAt", expiresAt,
 		"names", len(c.Domains), "profile", order.Profile, "replaces", replaces != "")
 	return m.advance(ctx, c, st, o)
+}
+
+// mentionsReplaces reports whether an order-creation error is the CA refusing the ARI
+// `replaces` field.
+//
+// Matching on the message is a best-effort signal, and deliberately so: it only decides
+// whether to retry once without `replaces`, so a false negative leaves the caller where it
+// already was (the order fails, the pass is retried on the usual backoff), while a false
+// positive costs one extra newOrder call and still creates the order. Neither outcome can
+// damage state, which is why this does not need a typed error out of lego.
+func mentionsReplaces(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "replaces")
 }
