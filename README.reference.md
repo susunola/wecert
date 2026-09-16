@@ -374,13 +374,18 @@ Regenerate them with `make diagrams`. The **Chinese page is the source of truth*
 
 The build also *measures* every label in a real browser, in **both** languages, and refuses to render if any of them overflows its box or if two `<text>` labels collide. English runs longer than Chinese, so "fits in Chinese, overflows in English" is a real failure mode — the first run caught exactly that.
 
-### 0. The problem this solves
+### 0. Deployment shape — SNI for several domains, one multi-SAN certificate, a backend RS pool
 
-![wecert's problem scenario: TLS terminates at the CLB and the business machines hold no certificate](docs/diagrams/en/00-the-problem.png)
+![wecert's deployment shape: clients reach the CLB over SNI, one multi-SAN certificate routes to a backend RS pool, and wecert obtains it from DNSPod and Let's Encrypt and rebinds it to the CLB](docs/diagrams/en/00-the-problem.png)
 
-TLS terminates at the CLB and the business machines hold no certificate file at all, so the premise every conventional approach rests on does not hold here: certbot on each CVM has nowhere to put a certificate, cert-manager assumes Kubernetes and produces a Secret rather than a listener binding, and copying the file to each node only makes more copies of a private key that nothing reads.
+Requests arrive at the CLB over SNI. The CLB picks the certificate out of `multi_cert_info` using the name the client sent, and the layer-7 rules route by domain to the backend RS pool. `wecert` runs on one of those CVMs; it reads the `_wecert.*` declarations from DNSPod, writes the `_acme-challenge` records, obtains the certificate from Let's Encrypt, uploads it to Tencent Cloud SSL and rebinds the listener.
 
-What makes it hard rather than merely awkward is the last row. ARI exempts renewals from every rate limit — but **only for a same-name renewal**, so changing the name set once burns one issuance. "Domains change all the time" is this project's premise, so every other design decision follows from making "add a domain" avoid producing a new issuance.
+Two consequences of this shape are easy to miss:
+
+- **The backend RSs take no part in TLS.** Decryption happens at the CLB, so the certificate is a *cloud resource*, not a few files. Putting certbot on every RS buys nothing, and tools that assume the certificate ends up in a Secret have nowhere to land here.
+- **Domains sharing one certificate share their fate.** SNI only decides *which* certificate is used; the certificate's SAN decides which domains it can actually serve. So once `a.example.com` and `b.example.com` are in the same certificate, a DNS problem on one drags the other down with it.
+
+The second point is the constraint everything else is built around — wildcard-first grouping, the desired state, and the failure fallback all exist because of it.
 
 ### 1. System map — who owns what, who only reads
 

@@ -175,8 +175,6 @@ LABELS = {
     "wecert-onboard 推断流水线": "the wecert-onboard inference pipeline",
     "wecert 每轮收敛的决策流程": "wecert's per-pass decision flow",
     "ACME 订单状态机": "the ACME order state machine",
-    "DNS-01 通配符与顶点共用 TXT 的时序图":
-        "DNS-01 sequence: a wildcard and its apex sharing one TXT",
     "证书生命周期时间线": "certificate lifetime timeline",
 }
 
@@ -535,8 +533,6 @@ PROSE: dict[str, str] = {
         'Thing',
     '情况':
         'Situation',
-    '声明集合骤降 30%':
-        'Declared set drops by &gt;30%',
     '限制':
         'Limit',
     '这一条推出来的直接结论：域名集合变一次就是一张全新证书，拿不到 ARI 豁免。 所以"加一个域名"的成本必须被压到接近零，而唯一能做到这件事的手段就是通配符。 这也是为什么期望状态生成器宁可把"加子域"解释成"已被通配符覆盖，0 次签发"， 也不肯为它动 SAN 集合。':
@@ -583,84 +579,96 @@ PROSE: dict[str, str] = {
         'last updated 2026-09-16 · for v0.5.0',
     'wecert · 证书生命周期架构图 源码 github.com/susunola/wecert':
         '<strong>wecert</strong> · certificate lifecycle<br/>\n      source <code>github.com/susunola/wecert</code>',
-    '⓪ 要解决的场景':
-        'ⓐ The problem',
-    '图 ⓪要解决的问题：证书不在业务机器上':
-        '<span class="num">diagram ⓐ</span>The problem: the certificate is not on the business machines',
     '图 ⓪':
         'diagram ⓐ',
-    '这不是"再写一个证书自动续期工具"的场景。TLS 在 CLB 上终结，业务机器上根本没有证书文件 —— 常规做法的前提在这里不成立。下面三块分别是部署形态、为什么现成办法都不行、以及钉死了一切设计的硬约束。':
-        'This is not “yet another certificate renewal tool”. TLS terminates at the CLB and the business machines hold no certificate file at all — so the premise every conventional approach rests on does not hold here. Below: the deployment shape, why the off-the-shelf tools do not fit, and the hard limits that shaped every other decision.',
-    '部署形态 · 证书不在业务机器上':
-        'Deployment shape · the certificate is not on the business machines',
     '浏览器 / 客户端':
         'Browser / client',
-    '只认证书，不关心它在哪':
-        'only checks the certificate, never where it lives',
-    '腾讯云 CLB':
-        'Tencent Cloud CLB',
-    'TLS 在这里终结 · SNI · multi_cert_info':
-        'TLS <b>terminates here</b> · SNI · multi_cert_info',
-    '证书挂在监听器上，是一份云端资源':
-        'the certificate is bound to a listener — a cloud resource',
-    'CVM 池':
-        'CVM pool',
     '只跑业务 · 明文 HTTP':
         'business only · plain HTTP',
-    'ACME · 90 天 · 速率限制':
-        'ACME · 90 days · rate limits',
-    '证书必须挂在这里 —— 业务机器上没有证书文件可分发':
-        'The certificate has to live here — there is no certificate file on the business machines to distribute',
-    '所以"把证书文件铺到节点上"这个前提，在这个形态下不成立':
-        'so “copy the certificate file onto every node” has no meaning in this shape',
     '明文 HTTP':
         'plain HTTP',
-    '所以现成的办法都不成立':
-        'So none of the off-the-shelf approaches fit',
-    'certbot 装在每台 CVM 上':
-        'certbot on every CVM',
-    'TLS 不在 CVM 终结，签出来也没地方用；而且每台机器各自签一次，配额按台数翻倍':
-        'TLS does not terminate on the CVMs, so a certificate there is useless — and each machine would issue its own, multiplying the quota',
-    '这里没有 K8s，只有 CLB 和几台 CVM；而证书最终要挂到 CLB 监听器上，不是一个 Secret':
-        'There is no Kubernetes here, just a CLB and a few CVMs — and the certificate ends up on a <b>CLB listener</b>, not in a Secret',
-    '把证书文件分发到各个节点':
-        'Distribute the certificate file to each node',
-    '节点根本不读证书 —— 解密发生在 LB，铺文件只是把密钥多复制了几份':
-        'The nodes never read a certificate — decryption happens at the LB, so this only makes more copies of the private key',
-    '手工申请 → 上传 → 绑定':
-        'Apply → upload → bind, by hand',
-    '每 90 天一次，全靠人记得；而忘了的表现是线上直接握手失败，不是一条告警':
-        'Once every 90 days, entirely on someone remembering — and forgetting shows up as <b>a broken handshake in production</b>, not as an alert',
-    '硬约束 · 这些数字决定了一切设计':
-        'Hard limits · these numbers shaped every design decision',
-    '90 天 → 47 天':
-        '90 days → 47 days',
-    '2029-03-15 起证书有效期上限':
-        'the validity ceiling from 2029-03-15',
-    '续期频率只会更高':
-        'renewal only gets more frequent',
     '50 / 7 天':
         '50 / 7 days',
-    '每注册域的新证书数':
-        'new certificates per registered domain',
-    '跨账号共享，留一半余量':
-        'shared across accounts — keep half in reserve',
     '5 / 7 天':
         '5 / 7 days',
     '精确 identifier 集合':
         'the exact identifier set',
-    '没有 override，撞了等满一周':
-        'no override; hit it and you wait a week',
-    'ARI 豁免全部限速':
-        'ARI exempts all of them',
     '前提是同名续期':
         'but only for a <b>same-name renewal</b>',
-    '域名集合一变，这次签发就重新计入配额':
-        'change the name set and this issuance counts again',
-    '这四张约束里最要命的是最后一张。它意味着改一次域名集合就等于烧掉一次配额， 而"域名随时会变"恰恰是这个项目的前提。所以整套设计绕着一个问题转： 怎么让"加一个域名"这件事尽量不产生新的签发 —— 答案就是通配符优先（见 图 ②）。':
-        'The last of those four is the one that bites: <strong>changing the name set once burns one issuance</strong>, and “domains change all the time” is this project’s premise. So the whole design turns on one question — how to make “add a domain” <strong>avoid producing a new issuance</strong> as often as possible. The answer is wildcard-first (see <a href="#intent">diagram ②</a>).',
     '图 ②':
         'diagram ②',
-    'wecert 要解决的场景：CLB 终结 TLS，业务机器上没有证书文件':
-        "wecert's problem scenario: TLS terminates at the CLB and the business machines hold no certificate",
+    '⓪ 部署形态':
+        'ⓐ Deployment',
+    '图 ⓪部署形态：SNI 多域名 → 一张多 SAN 证书 → 后端 RS 池':
+        '<span class="num">diagram ⓐ</span>Deployment shape: SNI for several domains → one multi-SAN certificate → a backend RS pool',
+    '上半是请求路径，下半是这张证书是怎么来的。关键的一层关系在中间： SNI 决定 CLB 用哪张证书，证书的 SAN 决定它能对哪些域名完成握手 —— 所以多个域名共用一张证书时，它们是生死与共的。':
+        'The top half is the request path; the bottom half is where that certificate comes from. The relationship in the middle is the one that matters: <b>SNI decides which certificate the CLB uses, and that certificate’s SAN decides which domains it can complete a handshake for</b> — so domains sharing one certificate share its fate.',
+    '请求路径 · SNI 选证书，证书的 SAN 决定它能服务哪些域名':
+        'Request path · SNI picks the certificate, the certificate’s SAN decides which domains it can serve',
+    'CLB · 监听器 443 · SNI 开启':
+        'CLB · listener 443 · <b>SNI on</b>',
+    '它按客户端给的 SNI 去 multi_cert_info 里挑证书':
+        'it picks the certificate out of multi_cert_info using the SNI the client sent',
+    '挂载的那一张证书':
+        'The one certificate that is bound',
+    '三个域名生死与共：一起成功、一起失败、一起过期':
+        'these domains share their fate: they succeed, fail and expire together',
+    '七层规则按域名分流到后端':
+        'Layer-7 rules route by domain to the backend',
+    'a.example.com → RS 组 A b.example.com → RS 组 B':
+        'a.example.com → RS group A\u3000\u3000b.example.com → RS group B',
+    '后端 RS 池':
+        'Backend RS pool',
+    '机器上没有证书文件，也不需要':
+        'no certificate file on these machines, and none is needed',
+    '控制面 · 这张证书是怎么来的（wecert 跑在其中一台 CVM 上）':
+        'Control plane · where this certificate comes from (wecert runs on one of the CVMs)',
+    '守护进程 · 一台 CVM':
+        'daemon · one CVM',
+    '1 · 读期望状态（只读） 2 · 决策：签发 / 重签 / 续期 3 · 写 _acme-challenge 4 · finalize 并下载证书 5 · 上传并换绑到 CLB':
+        '1 · read the desired state (read-only)<br/>2 · decide: issue / reissue / renew<br/>3 · write _acme-challenge<br/>4 · finalize and download<br/>5 · upload and rebind to the CLB',
+    '_wecert.* 声明 —— 意图来源':
+        '_wecert.* declarations — where the intent comes from',
+    '_acme-challenge —— DNS-01 挑战':
+        '_acme-challenge — the DNS-01 challenge',
+    'ACME · 下单 / finalize / 下载':
+        'ACME · order / finalize / download',
+    'ARI · 协调续期（豁免限速）':
+        'ARI · coordinated renewal (exempt from rate limits)',
+    '腾讯云 SSL 证书服务':
+        'Tencent Cloud SSL',
+    '上传证书（wecert/ 前缀）':
+        'upload the certificate (wecert/ prefix)',
+    'UpdateCertificateInstance 一键换绑':
+        'UpdateCertificateInstance rebinds it',
+    '换绑是异步的（实测约 15 秒）而且不是原子的':
+        'The rebind is asynchronous (measured ~15s) and not atomic',
+    '所以每一轮还要拨 443 读回对端实际出示的证书， 确认线上服务的确实是这一张 —— 控制面说成功不等于已经生效':
+        'so every pass also dials 443 and reads back the certificate <b>actually served</b>, confirming that what is live really is this one — the control plane saying “done” is not the same as it being in effect',
+    '上传证书':
+        'upload',
+    '换绑到监听器':
+        'rebind to the listener',
+    '这个形态里有一条容易忽略的因果：后端 RS 完全不参与 TLS —— 解密发生在 CLB，所以证书是一份云端资源，不是几个文件。 把 certbot 装在每台 RS 上拿不到任何好处，而 cert-manager 那类假设 "证书最终写进一个 Secret" 的工具，在这里也没有落点。':
+        'One easily missed consequence of this shape: <strong>the backend RSs take no part in TLS at all</strong> — decryption happens at the CLB, so the certificate is a <strong>cloud resource</strong>, not a few files. Putting certbot on every RS buys nothing, and tools that assume “the certificate ends up in a Secret” have nowhere to land here.',
+    '另一条是共用一张证书的域名生死与共。SNI 只决定"用哪一张"， 真正决定"能不能服务这个域名"的是那张证书的 SAN —— 所以 a 和 b 被放进同一张证书之后， a 的 DNS 出问题会拖着 b 一起签不出来。这就是为什么 分组策略、通配符优先、以及"到期前降级"都是围绕这个约束做的 （见 图 ② 和 表 B）。':
+        'The other is that <strong>domains sharing one certificate share its fate</strong>. SNI only decides <em>which</em> certificate is used; what decides whether a domain can actually be served is that certificate’s SAN. So once <code>a</code> and <code>b</code> are in the same certificate, a DNS problem on <code>a</code> drags <code>b</code> down with it. That is the constraint the grouping policy, wildcard-first and the failure fallback are all built around (see <a href="#intent">diagram ②</a> and <a href="#failure">table B</a>).',
+    '表 B':
+        'table B',
+
+    # 只出现在 aria-label 属性里的键（正文压平查不到它们，别被剪枝误删）
+    'wecert 系统全景架构图':
+        'wecert system map',
+    'wecert-onboard 推断流水线':
+        'the wecert-onboard inference pipeline',
+    'wecert 每轮收敛的决策流程':
+        "wecert's per-pass decision flow",
+    'ACME 订单状态机':
+        'the ACME order state machine',
+    'DNS-01 通配符与顶点共用 TXT 的时序图':
+        'DNS-01 sequence: a wildcard and its apex sharing one TXT',
+    '证书生命周期时间线':
+        'certificate lifetime timeline',
+    "wecert 的部署形态：客户端经 SNI 到 CLB，一张多 SAN 证书分流到后端 RS 池；wecert 从 DNSPod 与 Let's Encrypt 取得证书并换绑到 CLB":
+        "wecert's deployment shape: clients reach the CLB over SNI, one multi-SAN certificate routes to a backend RS pool, and wecert obtains it from DNSPod and Let's Encrypt and rebinds it to the CLB",
 }
