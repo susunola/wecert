@@ -2,6 +2,9 @@ package webhook
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -314,6 +317,22 @@ func TestTriggerRejectsEmptyCerts(t *testing.T) {
 	}
 }
 
+// "certs": null is what a Go caller marshalling a nil []string emits. It names no
+// certificates just like an empty list, so it must not be read as an absent body —
+// that reading turns a targeted trigger into a full-fleet convergence.
+func TestTriggerRejectsNullCerts(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"certs":null}`, bearer())
+	if w.Code != http.StatusBadRequest {
+		t.Errorf(`{"certs":null} should return 400, got %d`, w.Code)
+	}
+	if len(rec.started) != 0 {
+		t.Errorf("nothing should be triggered, got %v", rec.started)
+	}
+}
+
 func TestTriggerRejectsGET(t *testing.T) {
 	s, _ := newTestServer(t, &fakeReconciler{names: []string{"a"}})
 
@@ -391,7 +410,7 @@ func TestNotifierPostsEvent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := NewNotifier(srv.URL, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	n := NewNotifier(srv.URL, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	n.Renewal(context.Background(), "my-cert", nil)
 
 	select {
@@ -417,7 +436,7 @@ func TestNotifierReportsErrorResult(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := NewNotifier(srv.URL, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	n := NewNotifier(srv.URL, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	n.Renewal(context.Background(), "c", errors.New("boom"))
 
 	select {
@@ -433,7 +452,7 @@ func TestNotifierReportsErrorResult(t *testing.T) {
 // A dead notification target must not affect convergence: Renewal must return
 // immediately (it is asynchronous).
 func TestNotifierDoesNotBlockOnDeadEndpoint(t *testing.T) {
-	n := NewNotifier("http://127.0.0.1:1/nowhere", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	n := NewNotifier("http://127.0.0.1:1/nowhere", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	start := time.Now()
 	n.Renewal(context.Background(), "c", nil)
@@ -443,7 +462,62 @@ func TestNotifierDoesNotBlockOnDeadEndpoint(t *testing.T) {
 }
 
 func TestNewNotifierDisabledWhenURLEmpty(t *testing.T) {
-	if n := NewNotifier("", slog.New(slog.NewTextHandler(io.Discard, nil))); n != nil {
+	if n := NewNotifier("", "", slog.New(slog.NewTextHandler(io.Discard, nil))); n != nil {
 		t.Error("an empty url should return nil")
+	}
+}
+
+// The notify target is often a public endpoint, so the receiver needs a way to tell a
+// genuine renewal event from anything else that can reach its URL. The signature covers
+// the raw body, so it must be computed over the bytes actually sent.
+func TestNotifierSignsTheBodyWhenASecretIsSet(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+
+	body := make(chan []byte, 1)
+	sig := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body <- raw
+		sig <- r.Header.Get("X-Wecert-Signature")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	n := NewNotifier(srv.URL, secret, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	n.Renewal(context.Background(), "my-cert", nil)
+
+	select {
+	case raw := <-body:
+		mac := hmac.New(sha256.New, []byte(secret))
+		_, _ = mac.Write(raw)
+		want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		if got := <-sig; got != want {
+			t.Errorf("signature mismatch\n got %q\nwant %q", got, want)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no notification received")
+	}
+}
+
+// Without a secret the header must be absent, not an empty or truncated value: a receiver
+// that only checks "is the header present" would otherwise accept unsigned traffic.
+func TestNotifierOmitsSignatureWithoutASecret(t *testing.T) {
+	sig := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sig <- r.Header.Get("X-Wecert-Signature")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	n := NewNotifier(srv.URL, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	n.Renewal(context.Background(), "my-cert", nil)
+
+	select {
+	case got := <-sig:
+		if got != "" {
+			t.Errorf("no secret means no signature header, got %q", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no notification received")
 	}
 }
