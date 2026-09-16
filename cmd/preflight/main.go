@@ -134,8 +134,7 @@ func checkDelegation(ctx context.Context, domain string) error {
 	for _, ns := range names {
 		host := strings.TrimSuffix(ns.Host, ".")
 		hosts = append(hosts, host)
-		// DNSPod's authoritative nameserver hostnames look like xxx.dnspod.net / xxx.dnsv1.com.
-		if !strings.Contains(host, "dnspod") && !strings.Contains(host, "dnsv") {
+		if !isDNSPodNS(host) {
 			allOnDNSPod = false
 		}
 	}
@@ -153,6 +152,25 @@ func checkDelegation(ctx context.Context, domain string) error {
 
 	fmt.Printf("      OK - %d nameservers, all pointing at DNSPod (%s)\n", len(hosts), strings.Join(hosts, ", "))
 	return nil
+}
+
+// isDNSPodNS reports whether a nameserver hostname belongs to DNSPod.
+//
+// DNSPod's authoritative hostnames live under its own domains: the free tier's
+// dedicated addresses look like <account-specific>.dnspod.net / .dnspod.com (older
+// ones f1g1ns1.dnspod.net), and the paid tiers use ns?.dnsv1.com .. ns?.dnsv5.com
+// (see docs.dnspod.cn/dns/dns-plan-address). Matching is by *suffix* on the lowercased
+// host: a substring match would false-pass lookalikes such as ns1.dnsvault.example,
+// and a case-sensitive one would false-fail a mixed-case record, while DNS is
+// case-insensitive.
+func isDNSPodNS(host string) bool {
+	host = strings.ToLower(host)
+	for _, suffix := range []string{".dnspod.net", ".dnspod.com", ".dnsv1.com", ".dnsv2.com", ".dnsv3.com", ".dnsv4.com", ".dnsv5.com"} {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkSSL verifies read access to the SSL certificate service.
@@ -182,6 +200,56 @@ func checkSSL(ctx context.Context, cred common.CredentialIface) error {
 	return nil
 }
 
+// describeDomainList is the seam over the SDK call, so the paging logic in findDomain
+// can be tested without real credentials.
+var describeDomainList = func(ctx context.Context, client *dnspod.Client, req *dnspod.DescribeDomainListRequest) (*dnspod.DescribeDomainListResponse, error) {
+	return client.DescribeDomainListWithContext(ctx, req)
+}
+
+// findDomain looks the target domain up in this account's DNSPod domain list.
+//
+// Keyword is a substring filter capped by Limit, not an exact lookup: an account with
+// more than one page of matches (example.com, www.example.com, example.com.cn, ...)
+// can hide the exact hit behind unrelated domains, and trusting one page would
+// false-report "domain not under DNSPod" for a domain that really is. Page through
+// until the filtered total is covered before drawing that conclusion.
+//
+// A nil item (with nil error) means the account genuinely does not hold the domain.
+func findDomain(ctx context.Context, client *dnspod.Client, domain string) (*dnspod.DomainListItem, error) {
+	var offset int64
+	for {
+		req := dnspod.NewDescribeDomainListRequest()
+		req.Keyword = common.StringPtr(domain)
+		req.Limit = common.Int64Ptr(100)
+		req.Offset = common.Int64Ptr(offset)
+
+		resp, err := describeDomainList(ctx, client, req)
+		if err != nil {
+			return nil, fmt.Errorf("DescribeDomainList failed (check the dnspod:DescribeDomainList permission): %w", err)
+		}
+		if resp.Response == nil {
+			return nil, fmt.Errorf("DescribeDomainList returned an empty response")
+		}
+
+		for _, d := range resp.Response.DomainList {
+			if d.Name != nil && strings.EqualFold(*d.Name, domain) {
+				return d, nil
+			}
+		}
+
+		offset += int64(len(resp.Response.DomainList))
+		// An empty page before the filtered total is covered means the list shifted
+		// under us; stopping there beats looping on a moving target. A missing total
+		// likewise means "keep going until an empty page says stop".
+		if len(resp.Response.DomainList) == 0 {
+			return nil, nil
+		}
+		if info := resp.Response.DomainCountInfo; info != nil && info.DomainTotal != nil && offset >= int64(*info.DomainTotal) {
+			return nil, nil
+		}
+	}
+}
+
 // checkDNSPod verifies DNSPod read access and confirms the domain belongs to this account.
 func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string) error {
 	fmt.Println("[2/4] DNSPod domain ownership")
@@ -194,24 +262,9 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 		return fmt.Errorf("build DNSPod client: %w", err)
 	}
 
-	// Query the target domain directly: more precise than pulling the full list and matching.
-	req := dnspod.NewDescribeDomainListRequest()
-	req.Keyword = common.StringPtr(domain)
-	req.Limit = common.Int64Ptr(20)
-
-	resp, err := client.DescribeDomainListWithContext(ctx, req)
+	found, err := findDomain(ctx, client, domain)
 	if err != nil {
-		return fmt.Errorf("DescribeDomainList failed (check the dnspod:DescribeDomainList permission): %w", err)
-	}
-
-	var found *dnspod.DomainListItem
-	if resp.Response != nil {
-		for _, d := range resp.Response.DomainList {
-			if d.Name != nil && strings.EqualFold(*d.Name, domain) {
-				found = d
-				break
-			}
-		}
+		return err
 	}
 
 	if found == nil {
@@ -421,7 +474,11 @@ func pruneCertificates(assumeYes bool) error {
 	for _, c := range doomed {
 		req := ssl.NewDeleteCertificateRequest()
 		req.CertificateId = c.CertificateId
-		// We track bindings in our own state store, so the server need not check associated resources.
+		// IsCheckResource=false deliberately skips the server-side associated-resource
+		// check. This standalone tool never opens wecert's state store, so it cannot
+		// know what is bound; the WARNING printed above plus the interactive
+		// confirmation gate (skipped only by -yes) is the entire protection against
+		// deleting a certificate a CLB still references.
 		req.IsCheckResource = common.BoolPtr(false)
 		if _, err := client.DeleteCertificateWithContext(ctx, req); err != nil {
 			fmt.Printf("  failed to delete %s: %v\n", deref(c.CertificateId), err)

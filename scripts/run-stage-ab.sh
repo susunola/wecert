@@ -75,9 +75,31 @@ fi
 # file is data, not code. Extract the values with sed instead and strip one layer of
 # surrounding quotes.
 cred_value() {
-	sed -n "s/^[[:space:]]*export[[:space:]][[:space:]]*$1=\(.*\)/\1/p" "${CREDS}" |
-		head -n 1 |
-		sed -e 's/^["'"'"']//' -e 's/["'"'"']$//'
+	# Last definition wins, the way eval would see it. The export prefix is
+	# optional: a plain KEY=value line is just as valid in an env file.
+	local raw
+	raw="$(sed -n -e "s/^[[:space:]]*export[[:space:]][[:space:]]*/ /" \
+		-e "s/^[[:space:]]*$1=\(.*\)/\1/p" "${CREDS}" | tail -n 1)"
+	# Strip the value the way the shell would, not with a blanket
+	# "remove quotes and everything after #": a trailing comment only counts
+	# outside quotes ("KEY=abc # note" is abc, but KEY="abc # note" is not),
+	# and a quoted value ends at its closing quote even with text behind it.
+	raw="${raw#"${raw%%[![:space:]]*}"}"
+	raw="${raw%"${raw##*[![:space:]]}"}"
+	case "${raw}" in
+	\"*)
+		raw="${raw#\"}"
+		raw="${raw%%\"*}"
+		;;
+	\'*)
+		raw="${raw#\'}"
+		raw="${raw%%\'*}"
+		;;
+	*)
+		raw="$(printf '%s' "${raw}" | sed 's/[[:space:]][[:space:]]*#.*$//')"
+		;;
+	esac
+	printf '%s' "${raw}"
 }
 TENCENTCLOUD_SECRET_ID="$(cred_value TENCENTCLOUD_SECRET_ID)"
 TENCENTCLOUD_SECRET_KEY="$(cred_value TENCENTCLOUD_SECRET_KEY)"

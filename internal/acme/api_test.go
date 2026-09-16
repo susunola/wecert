@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"crypto/x509"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -782,5 +783,115 @@ func TestSolveChallengesPresentsWhenProbeMisses(t *testing.T) {
 	}
 	if len(records) != 1 || records[0].FQDN != "_acme-challenge.example.com." {
 		t.Errorf("the computed challenge name must be _acme-challenge.example.com., got %+v", records)
+	}
+}
+
+// ── an invalid order must back off even when discarding it fails ───────────
+
+// advance's invalid branch used to return the discard error early, before recordFailure.
+// A transient store error (exactly when discardOrder fails) then made the next round
+// place a fresh order immediately, bypassing the backoff -- burning exact-set quota,
+// which the backoff exists to prevent.
+func TestAdvanceInvalidOrderBacksOffEvenWhenDiscardFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("open state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{}
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cert := &config.Certificate{Name: "c", Domains: []string{"a.example.com"}}
+
+	// Make only DeleteOrder fail, through a second connection: a BEFORE DELETE trigger
+	// leaves every other write (persistOrder's upsert, recordFailure's PutCert) working,
+	// which is exactly the "transient store error mid-step" this test is about.
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open second connection: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER block_order_delete BEFORE DELETE ON orders
+		BEGIN SELECT RAISE(FAIL, 'order delete blocked by test'); END;`); err != nil {
+		t.Fatalf("block order deletes: %v", err)
+	}
+
+	fake.orders = []legoacme.ExtendedOrder{{
+		Order:    legoacme.Order{Status: "invalid"},
+		Location: "https://ca.test/order/1",
+	}}
+
+	o := &state.Order{CertName: cert.Name, OrderURL: "https://ca.test/order/1", Status: "pending"}
+	st := &state.CertState{Name: cert.Name}
+
+	err = m.advance(context.Background(), cert, st, o)
+	if err == nil {
+		t.Fatal("an invalid order must fail the pass")
+	}
+	if !strings.Contains(err.Error(), "order became invalid") {
+		t.Errorf("the order failure must survive into the returned error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "order delete blocked") {
+		t.Errorf("the discard failure must be joined into the returned error, got: %v", err)
+	}
+
+	// The whole point: the failure was recorded, so the next round backs off instead of
+	// immediately placing a fresh order.
+	if st.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1: a transient discard error must not skip the backoff",
+			st.ConsecutiveFailures)
+	}
+	if st.NextAttemptAt.IsZero() {
+		t.Error("NextAttemptAt is unset: the next round would place a fresh order immediately")
+	}
+}
+
+// ── a resumed TXT that never propagates is re-presented next round ─────────
+
+// A row resumed as Presented=true is never re-written by the pass -- but its record may
+// have been deleted out of band (DNS console, account cleanup). WaitAll is the only
+// remaining check, and when it fails the row must go back to Presented=false: otherwise
+// every round burns the whole propagation budget waiting for a record that will never
+// appear, until the order expires.
+func TestSolveChallengesMarksResumedTXTUnpresentedWhenPropagationFails(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	solver := &fakeSolver{waitErr: errors.New("TXT propagation not confirmed: waited 5m")}
+	m.dns = solver
+
+	const authzURL = "https://ca.test/authz/1"
+	seedInterruptedPass(t, store, cert, authzURL)
+	// Upgrade the row to "an earlier pass wrote the record and marked it" -- the resume
+	// shape this test is about.
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: cert.Name, AuthzURL: authzURL, Identifier: "example.com",
+		Status: "pending", ChallengeURL: "https://ca.test/chall/1", ChallengeToken: "tok-1",
+		TxtName: "_acme-challenge.example.com.", TxtValue: "txt-tok-1", Presented: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	scriptPendingThenValid(fake, authzURL)
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("a failed propagation wait must fail the round")
+	}
+
+	solver.mu.Lock()
+	presented := append([]string(nil), solver.presented...)
+	solver.mu.Unlock()
+	if len(presented) != 0 {
+		t.Errorf("a resumed row is not re-written in the same round, got presents %v", presented)
+	}
+
+	as, err := store.ListAuthorizations(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(as) != 1 {
+		t.Fatalf("want 1 authorization row, got %d", len(as))
+	}
+	if as[0].Presented {
+		t.Error("the resumed row must go back to Presented=false, so the next round probes and re-presents it")
 	}
 }

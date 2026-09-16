@@ -2,11 +2,18 @@ package reconcile
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +24,7 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/metrics"
+	"github.com/susunola/wecert/internal/probe"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
@@ -29,6 +37,13 @@ type fakeManager struct {
 	calls    []string
 	failWith map[string]error
 
+	// panicWith makes Reconcile panic for the named certificates, to prove a
+	// panic inside the manager is recovered rather than process-fatal.
+	panicWith map[string]string
+
+	// cleaned records every CleanupOrphan call, in call order.
+	cleaned []string
+
 	reaped int
 
 	// onReconcile fires on every Reconcile, so tests can cancel and so on.
@@ -40,8 +55,12 @@ type fakeManager struct {
 func (f *fakeManager) Reconcile(_ context.Context, c *config.Certificate) error {
 	f.mu.Lock()
 	f.calls = append(f.calls, c.Name)
+	panicMsg := f.panicWith[c.Name]
 	f.mu.Unlock()
 
+	if panicMsg != "" {
+		panic(panicMsg)
+	}
 	if f.onReconcile != nil {
 		f.onReconcile(c.Name)
 	}
@@ -53,6 +72,20 @@ func (f *fakeManager) reconciled() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.calls...)
+}
+
+// orphanCleaned returns the names CleanupOrphan was called with.
+func (f *fakeManager) orphanCleaned() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cleaned...)
+}
+
+func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cleaned = append(f.cleaned, certName)
+	return nil
 }
 
 func (f *fakeManager) ReapRetired(_ context.Context) {
@@ -253,7 +286,10 @@ func TestStartAllSkipsBusyCerts(t *testing.T) {
 	}
 	<-entered
 
-	skipped := r.StartAll(context.Background())
+	_, skipped, err := r.StartAll(context.Background())
+	if err != nil {
+		t.Fatalf("StartAll failed: %v", err)
+	}
 	found := false
 	for _, n := range skipped {
 		if n == busy {
@@ -553,7 +589,11 @@ func TestStartAllResolvesTheDesiredStateOnce(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	r := New(cfg, prov, store, mgr, nil, log)
 
-	if skipped := r.StartAll(context.Background()); len(skipped) != 0 {
+	_, skipped, err := r.StartAll(context.Background())
+	if err != nil {
+		t.Fatalf("StartAll failed: %v", err)
+	}
+	if len(skipped) != 0 {
 		t.Fatalf("nothing should be skipped, got %v", skipped)
 	}
 
@@ -604,7 +644,9 @@ func TestFullTriggerBoundsConcurrentReconciles(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, log)
 
-	r.StartAll(context.Background())
+	if _, _, err := r.StartAll(context.Background()); err != nil {
+		t.Fatalf("StartAll failed: %v", err)
+	}
 
 	// Long enough for every goroutine that can hold a slot to take one and block.
 	time.Sleep(200 * time.Millisecond)
@@ -723,5 +765,305 @@ func TestRunCertPropagatesTheReconcileError(t *testing.T) {
 	}
 	if err := r.RunCert(context.Background(), "a"); err != nil {
 		t.Errorf("a successful pass must return nil, got %v", err)
+	}
+}
+
+// StartAll used to report nothing when the desired state was unreadable: the
+// webhook then answered 202 with every certificate "accepted" (from the last
+// good cache) while not a single pass had started -- a convergence that will
+// never happen, reported as scheduled.
+func TestStartAllFailsWhenDesiredStateIsUnreadable(t *testing.T) {
+	mgr := &fakeManager{}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{}
+	r := New(cfg, failingProvider{err: errors.New("document service is down")}, store, mgr, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	accepted, skipped, err := r.StartAll(context.Background())
+	if !errors.Is(err, ErrDesiredStateUnavailable) {
+		t.Errorf("StartAll must report ErrDesiredStateUnavailable, got %v", err)
+	}
+	if len(accepted) != 0 || len(skipped) != 0 {
+		t.Errorf("nothing may be reported accepted or skipped, got accepted=%v skipped=%v", accepted, skipped)
+	}
+	if len(mgr.reconciled()) != 0 {
+		t.Errorf("an unreadable source should start nothing, started %v", mgr.reconciled())
+	}
+}
+
+// The accepted list must come from the same resolution the starts were made
+// from, and together with skipped it must partition the desired state -- a name
+// in both, or in neither, means the trigger report lies about what happened.
+func TestStartAllAcceptedAndSkippedPartitionTheDesiredState(t *testing.T) {
+	const busy = "busy-partition"
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+
+	mgr := &fakeManager{onReconcile: func(n string) {
+		if n == busy {
+			entered <- struct{}{}
+			<-release
+		}
+	}}
+	r, _ := newTestReconciler(t, []string{busy, "free-a", "free-b"}, mgr)
+
+	if err := r.StartCert(context.Background(), busy); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+
+	accepted, skipped, err := r.StartAll(context.Background())
+	if err != nil {
+		t.Fatalf("StartAll failed: %v", err)
+	}
+	if len(skipped) != 1 || skipped[0] != busy {
+		t.Errorf("skipped should be exactly [%q], got %v", busy, skipped)
+	}
+	if len(accepted) != 2 {
+		t.Fatalf("the two free certificates should be accepted, got %v", accepted)
+	}
+	for _, n := range accepted {
+		if n == busy {
+			t.Errorf("the busy certificate must not be both accepted and skipped: %v / %v", accepted, skipped)
+		}
+	}
+	close(release)
+}
+
+// A panic inside the manager used to be process-fatal from a webhook-started
+// goroutine: one bad certificate took down every certificate's renewals. The
+// pass must be counted as an error and the fleet must carry on.
+func TestReconcileOneRecoversPanics(t *testing.T) {
+	const bad = "panic-cert"
+	mgr := &fakeManager{panicWith: map[string]string{bad: "nil pointer in the order flow"}}
+	r, _ := newTestReconciler(t, []string{"a", bad, "c"}, mgr)
+
+	beforePanics := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues(bad))
+	beforeErrors := testutil.ToFloat64(metrics.ReconcileTotal.WithLabelValues(bad, "error"))
+
+	// RunCert surfaces the failure to its caller as an error, not as a crash.
+	if err := r.RunCert(context.Background(), bad); err == nil {
+		t.Fatal("a panicking pass must be reported as an error")
+	}
+
+	if got := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues(bad)); got != beforePanics+1 {
+		t.Errorf("ReconcilePanics should increment by one, got %v -> %v", beforePanics, got)
+	}
+	if got := testutil.ToFloat64(metrics.ReconcileTotal.WithLabelValues(bad, "error")); got != beforeErrors+1 {
+		t.Errorf("a panicking pass must count as an error, got %v -> %v", beforeErrors, got)
+	}
+
+	// And a full pass must still reach the certificates after the panicking one.
+	r.RunAll(context.Background())
+	calls := mgr.reconciled()
+	seen := map[string]bool{}
+	for _, n := range calls {
+		seen[n] = true
+	}
+	if !seen["a"] || !seen["c"] {
+		t.Errorf("the other certificates must still be processed after a panic, got %v", calls)
+	}
+}
+
+// selfSignedCertPEM issues a throwaway certificate so the orphan path can
+// recover probe hosts from its SANs -- the desired state no longer carries the
+// domains, the last issued certificate does.
+func selfSignedCertPEM(t *testing.T, dnsNames ...string) []byte {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		DNSNames:     dnsNames,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("issuing the test certificate: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// hasProbeSeries reports whether the probe_match gauge currently exports this host.
+func hasProbeSeries(t *testing.T, host string) bool {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != "wecert_certificate_probe_match" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "host" && l.GetValue() == host {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// A certificate removed from the desired state mid-order used to leak its
+// challenge leases and TXT rows forever (poisoning every other certificate
+// sharing the TXT name), and its probe series plus the prober's transition
+// memory stayed behind for good. The orphan path must tear all of it down.
+func TestOrphanCleanupIsWired(t *testing.T) {
+	const (
+		gone = "orphan-wired"
+		kept = "kept-wired"
+		host = "orphan.invalid"
+	)
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: kept})
+
+	cfg := &config.Config{}
+	cfg.Certificates = []config.Certificate{{Name: kept}}
+	cfg.Probe.MaxHostsPerCert = 3
+
+	mgr := &fakeManager{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, mgr, nil, log)
+	prober := probe.NewRunner(probe.Options{}, 0, log)
+	r.SetProber(prober)
+
+	// The dropped certificate: issued once (so it has SANs to reclaim probes for),
+	// with an in-flight order whose cleanup must be requested.
+	if err := store.PutCert(&state.CertState{
+		Name: gone, NotAfter: time.Now().Add(48 * time.Hour),
+		CertPEM: selfSignedCertPEM(t, host),
+	}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	if err := store.PutOrder(&state.Order{
+		CertName: gone, OrderURL: "https://acme.example/order/orphan", Status: "pending",
+	}); err != nil {
+		t.Fatalf("PutOrder: %v", err)
+	}
+
+	// Simulate that the host was probed while the certificate was still managed:
+	// an exported series and a remembered transition state.
+	metrics.CertificateProbeMatch.WithLabelValues(host).Set(1)
+	prober.Check(context.Background(), host, probe.Expectation{})
+	if prober.LastState(host) == "" {
+		t.Fatal("the prober should remember the host before the drop")
+	}
+
+	r.RunAll(context.Background())
+
+	if cleaned := mgr.orphanCleaned(); len(cleaned) != 1 || cleaned[0] != gone {
+		t.Errorf("CleanupOrphan should be called exactly once, for %q, got %v", gone, cleaned)
+	}
+	if hasProbeSeries(t, host) {
+		t.Error("the dropped host's probe series must be reclaimed")
+	}
+	if got := prober.LastState(host); got != "" {
+		t.Errorf("the prober must forget the dropped host, still remembers %q", got)
+	}
+}
+
+// recordLogHandler captures log messages so a test can assert a specific line
+// went out.
+type recordLogHandler struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *recordLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordLogHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, r.Message)
+	return nil
+}
+
+func (h *recordLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordLogHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *recordLogHandler) contains(sub string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, m := range h.msgs {
+		if strings.Contains(m, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// A pass parked on a start slot when shutdown arrives is dropped without
+// running, even though the caller was told "accepted". That must leave a trace
+// -- silently, the 202 is indistinguishable from a pass that started and failed.
+func TestParkedStartLogsAtShutdown(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, maxConcurrentStarts)
+	mgr := &fakeManager{onReconcile: func(string) {
+		entered <- struct{}{}
+		<-release
+	}}
+	defer close(release)
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{}
+	for i := 0; i < maxConcurrentStarts; i++ {
+		cfg.Certificates = append(cfg.Certificates, config.Certificate{Name: fmt.Sprintf("filler-%02d", i)})
+	}
+	cfg.Certificates = append(cfg.Certificates, config.Certificate{Name: "parked"})
+
+	handler := &recordLogHandler{}
+	log := slog.New(handler)
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, log)
+
+	// Occupy every start slot with a blocked pass, but leave "parked" out.
+	if err := r.StartCert(context.Background(), "filler-00"); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	for i := 1; i < maxConcurrentStarts; i++ {
+		if err := r.StartCert(context.Background(), fmt.Sprintf("filler-%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+		<-entered
+	}
+
+	// With all slots held, this pass can only park; cancelling the context is
+	// the shutdown signal.
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := r.StartCert(ctx, "parked"); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !handler.contains("shutdown while waiting for a start slot") {
+		if time.Now().After(deadline) {
+			t.Fatal("the parked pass must log that it will not run")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
