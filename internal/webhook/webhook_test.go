@@ -356,7 +356,7 @@ func TestStatusReportsCertificates(t *testing.T) {
 	}
 
 	a := out.Certificates[0]
-	if a.Name != "cert-a" || !a.Deployed || !a.DeployConfirmed {
+	if a.Name != "cert-a" || !a.Uploaded || !a.DeployConfirmed {
 		t.Errorf("cert-a state is wrong: %+v", a)
 	}
 	if a.DaysLeft == nil || *a.DaysLeft < 58 || *a.DaysLeft > 60 {

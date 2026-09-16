@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
@@ -295,7 +296,7 @@ type certStatus struct {
 	Name                string `json:"name"`
 	NotAfter            string `json:"notAfter,omitempty"`
 	DaysLeft            *int   `json:"daysLeft,omitempty"`
-	Deployed            bool   `json:"deployed"`
+	Uploaded            bool   `json:"uploaded"`
 	DeployConfirmed     bool   `json:"deployConfirmed"`
 	ConsecutiveFailures int    `json:"consecutiveFailures"`
 	NextAttemptAt       string `json:"nextAttemptAt,omitempty"`
@@ -332,10 +333,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		if rec != nil {
 			if !rec.NotAfter.IsZero() {
 				st.NotAfter = rec.NotAfter.UTC().Format(time.RFC3339)
-				days := int(rec.NotAfter.Sub(now).Hours() / 24)
+				// config.DaysUntil rounds up, matching wecert-probe: truncation makes
+				// "23 hours left" read as 0 days, and a caller that treats 0 as expired
+				// reads a healthy certificate as down.
+				days := config.DaysUntil(rec.NotAfter, now)
 				st.DaysLeft = &days
 			}
-			st.Deployed = rec.DeployedCertID != ""
+			// `uploaded` is "we hold a CertId", `deployConfirmed` is "it is bound".
+			// They used to share the name `deployed` with the metric
+			// wecert_certificate_deployed, which means the *confirmed* thing -- the exact
+			// confusion that metric's help text was written to prevent.
+			st.Uploaded = rec.DeployedCertID != ""
 			st.DeployConfirmed = rec.DeployConfirmed
 			st.ConsecutiveFailures = rec.ConsecutiveFailures
 			st.LastError = rec.LastError
@@ -436,7 +444,7 @@ func (s *Server) handleDesired(dr DesiredReader) http.HandlerFunc {
 			} else if st != nil && !st.NotAfter.IsZero() {
 				dc.Issued = true
 				dc.NotAfter = st.NotAfter.UTC().Format(time.RFC3339)
-				days := int(st.NotAfter.Sub(now).Hours() / 24)
+				days := config.DaysUntil(st.NotAfter, now)
 				dc.DaysLeft = &days
 			}
 			out.Certificates = append(out.Certificates, dc)

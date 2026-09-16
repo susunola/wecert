@@ -479,3 +479,56 @@ certificates:
 		}
 	}
 }
+
+// DaysUntil round **up**: truncation makes "23 hours left" read as 0 days, and 0 is a
+// meaningless answer for a certificate that is still valid -- a caller that treats 0 as
+// expired reads a healthy certificate as down. probe.DaysLeft uses the same rule.
+func TestDaysUntilRoundsUp(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		left time.Duration
+		want int
+	}{
+		{0, 0},
+		{-time.Hour, 0},     // already expired
+		{time.Minute, 1},    // a minute left is still "1 day", not 0
+		{23 * time.Hour, 1}, // the case truncation gets wrong
+		{24 * time.Hour, 1}, // exactly one day
+		{25 * time.Hour, 2}, // just over a day
+		{48 * time.Hour, 2}, //
+		{90 * 24 * time.Hour, 90},
+	}
+	for _, tc := range cases {
+		if got := DaysUntil(now.Add(tc.left), now); got != tc.want {
+			t.Errorf("DaysUntil(%v left) = %d, want %d", tc.left, got, tc.want)
+		}
+	}
+}
+
+// The expiry warning has to scale with the profile. A fixed 21-day window is most of a
+// shortlived certificate's 160-hour life, so that profile would warn from the moment it
+// was issued -- every pass, for its whole life -- which is the kind of alarm that trains
+// people to ignore logs.
+func TestExpiryWarningThresholdScalesWithTheProfile(t *testing.T) {
+	classic := ExpiryWarningThreshold(ProfileClassic)
+	short := ExpiryWarningThreshold(ProfileShortLived)
+
+	if short >= classic {
+		t.Errorf("shortlived threshold %v must be well below classic %v", short, classic)
+	}
+	if short >= 160*time.Hour {
+		t.Errorf("the shortlived threshold %v is not below that profile's whole validity", short)
+	}
+	// Every profile's threshold must leave room to act: it has to be a fraction of the
+	// validity, not all of it.
+	for _, p := range []string{ProfileClassic, ProfileTLSServer, ProfileShortLived} {
+		if th := ExpiryWarningThreshold(p); th <= 0 || th >= 90*24*time.Hour {
+			t.Errorf("threshold for %s = %v, outside a sane range", p, th)
+		}
+	}
+	// An unknown profile falls back to classic rather than warning at zero.
+	if got := ExpiryWarningThreshold("bogus"); got != classic {
+		t.Errorf("unknown profile = %v, want the classic threshold %v", got, classic)
+	}
+}
