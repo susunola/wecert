@@ -263,3 +263,48 @@ func TestRetiredCertificateMaterialSurvivesEitherWriteOrder(t *testing.T) {
 		})
 	}
 }
+
+// A one-shot tool must be able to run on a machine where the daemon has never started.
+//
+// This is the documented install flow: install, edit the config, `wecert -dry-run`. Opening the
+// store unlocked unconditionally -- which is what OpenUnlocked does -- made that fail on a fresh
+// state directory, because a brand-new database needs a schema and the unlocked path refuses to
+// create one. The dry run exists to check the config BEFORE the daemon is started, so it cannot
+// require the daemon to have run first.
+func TestOpenForToolMigratesWhenNobodyHoldsTheLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+
+	store, err := OpenForTool(path)
+	if err != nil {
+		t.Fatalf("a fresh state directory must be usable by a one-shot command: %v", err)
+	}
+	defer store.Close()
+
+	// The schema really is there, not just "open succeeded".
+	if err := store.PutCert(&CertState{Name: "c", CertPEM: []byte("x")}); err != nil {
+		t.Fatalf("the freshly created schema is not usable: %v", err)
+	}
+}
+
+// With the daemon running, the same call must fall back to reading without the lock instead of
+// failing: that is the whole reason the unlocked path exists.
+func TestOpenForToolFallsBackToTheUnlockedPath(t *testing.T) {
+	path := lockTestPath(t)
+
+	held, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	tool, err := OpenForTool(path)
+	if err != nil {
+		t.Fatalf("a running daemon must not stop a one-shot command: %v", err)
+	}
+	defer tool.Close()
+
+	// And it must not have taken over the lock: the daemon still holds it.
+	if _, err := Open(path); !errors.Is(err, ErrLocked) {
+		t.Fatalf("the tool released the daemon's lock, got: %v", err)
+	}
+}

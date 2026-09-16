@@ -591,6 +591,7 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 |---|---|---|---|
 | `provider` | 否 | `dnspod` | `dnspod` 用 DNSPod 自有 API Token（调 dnsapi.cn）。`tencentcloud` 用腾讯云 CAM 凭证（调 dnspod.tencentcloudapi.com）—— 推荐，因为能和证书部署共用一套凭证，且支持实例角色的 `SessionToken`。 |
 | `loginToken` | 当 `provider: dnspod` | — | DNSPod 自有 API Token，形如 `12345,abcdef…`。**不是**腾讯云 SecretId/SecretKey。 |
+| `loginTokenFile` | 替代 `loginToken` | — | 改成从文件读取 Token，于是它不会出现在 `config.yaml` 里 —— 也就不会出现在它的备份、diff 和任何人的终端回滚里。路径会做**环境变量展开**，这正是 systemd `LoadCredential` 能用的原因：`LoadCredential=dnspod-token:/etc/wecert/dnspod.token` 把文件放到 `$CREDENTIALS_DIRECTORY/dnspod-token`，配置里写 `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token` 即可。两者都没设时也接受环境变量 `DNSPOD_LOGIN_TOKEN`。同时设置 `loginToken` 与 `loginTokenFile` 会被拒绝，而不是替你猜一个。 |
 | `ttl` | 否 | `600` | `_acme-challenge` TXT 记录的 TTL。**600 是 DNSPod 免费套餐的下限** —— 配 60 会被 `LimitExceeded.RecordTtlLimit` 拒绝。付费套餐可以调低以加快传播与清理。 |
 | `propagationTimeout` | 否 | `5m` | 等待全部权威 NS 可见该记录的上限 |
 | `pollingInterval` | 否 | `5s` | 传播探测的间隔 |
@@ -612,6 +613,7 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 |---|---|---|---|
 | `credentialMode` | 否 | `cvm-role` | `cvm-role` 从实例元数据取临时凭证（密钥不落盘）。`static` 用下面的 `secretId`/`secretKey`，或环境变量 `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY`（仅建议本地调试）。 |
 | `secretId` / `secretKey` | 当 `static` | — | CAM 密钥对。优先用环境变量，这样配置文件可以放心提交、放心备份。 |
+| `secretIdFile` / `secretKeyFile` | 替代上面两个 | — | 文件形式，同样做环境变量展开，并与内联值互斥。用 `credentialMode: cvm-role` 时不需要它们：根本没有静态密钥。 |
 | `roleName` | 当 `cvm-role` | — | CVM 实例绑定的角色名 |
 | `resourceTypes` | 否 | `[clb]` | `UpdateCertificateInstance` 的资源类型。`clb` 最常用，`cdn`、`waf`、`tke`、`apigateway` 也支持。 |
 | `regions` | 是 | — | **CLB 是分地域资源，必须列出所有有 CLB 的地域。** 漏掉的地域会静默不更新，那边的证书会过期。 |

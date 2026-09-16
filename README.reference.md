@@ -612,6 +612,7 @@ The two providers use completely different credentials. Don't mix them up.
 |---|---|---|---|
 | `provider` | no | `dnspod` | `dnspod` uses DNSPod's own API token (dnsapi.cn). `tencentcloud` uses Tencent Cloud CAM credentials (dnspod.tencentcloudapi.com) — recommended, because it shares credentials with deployment and supports `SessionToken` for instance roles. |
 | `loginToken` | when `provider: dnspod` | — | DNSPod's own API token, shaped `12345,abcdef…`. **Not** a Tencent Cloud SecretId/SecretKey. |
+| `loginTokenFile` | alternative to `loginToken` | — | Reads the token from a file instead, so it never appears in `config.yaml` — and therefore not in its backups, its diffs, or anyone's scrollback. The path is **environment-expanded**, which is what makes systemd's `LoadCredential` work: `LoadCredential=dnspod-token:/etc/wecert/dnspod.token` exposes the file at `$CREDENTIALS_DIRECTORY/dnspod-token`, and the config says `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token`. `DNSPOD_LOGIN_TOKEN` in the environment is also accepted when neither is set. Setting both `loginToken` and `loginTokenFile` is refused rather than guessed at. |
 | `ttl` | no | `600` | TTL for the `_acme-challenge` TXT record. **600 is the floor on DNSPod's free tier** — configuring 60 is rejected with `LimitExceeded.RecordTtlLimit`. Paid tiers can go lower to speed up propagation and cleanup. |
 | `propagationTimeout` | no | `5m` | Upper bound on waiting for all authoritative nameservers to see the record |
 | `pollingInterval` | no | `5s` | Interval between propagation probes |
@@ -633,6 +634,7 @@ This is fully supported: `GetChallengeInfo` follows the CNAME and reports the re
 |---|---|---|---|
 | `credentialMode` | no | `cvm-role` | `cvm-role` takes temporary credentials from instance metadata (nothing on disk). `static` uses `secretId`/`secretKey` below, or the `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` environment variables (local debugging only). |
 | `secretId` / `secretKey` | when `static` | — | CAM key pair. Prefer the environment variables so the config file can be committed and backed up freely. |
+| `secretIdFile` / `secretKeyFile` | alternative to the pair above | — | File variants, environment-expanded and mutually exclusive with the inline values, exactly like `loginTokenFile`. Unnecessary with `credentialMode: cvm-role`, where no static key exists at all. |
 | `roleName` | when `cvm-role` | — | The role bound to the CVM instance |
 | `resourceTypes` | no | `[clb]` | Resource types for `UpdateCertificateInstance`. `clb` is the common one; `cdn`, `waf`, `tke` and `apigateway` are also supported. |
 | `regions` | yes | — | **CLB is a regional resource. List every region that has a CLB.** A missing region is silently not updated and the certificate there expires. |

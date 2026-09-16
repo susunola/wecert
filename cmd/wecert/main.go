@@ -93,7 +93,9 @@ func run() error {
 	// blindly editing the config. This path only reads the existing ACME account; no issuance.
 	openStore := state.Open
 	if *dryRun {
-		openStore = state.OpenUnlocked
+		// Prefers the lock and falls back when the daemon holds it: see state.OpenForTool. Opening
+		// unlocked unconditionally is what made `-dry-run` fail on a fresh installation.
+		openStore = state.OpenForTool
 	}
 	store, err := openStore(cfg.StatePath)
 	if err != nil {
