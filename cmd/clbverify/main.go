@@ -102,6 +102,13 @@ func run() error {
 
 	// SNI extension certificates: this is exactly where rotating one certificate can
 	// clobber another, so they are printed separately.
+	//
+	// They are also part of the ASSERTION, not just the output. The SDK documents
+	// ExtCertIds as "additional server certificate IDs for the multi-certificate case",
+	// and this project's own e2e uses an SNI listener, so a check that only compared the
+	// primary ID certified a rebind that had not happened -- and failed one that had,
+	// when the managed certificate is an extension cert.
+	bound := boundCertIDs(l.Certificate)
 	if n := len(l.Certificate.ExtCertIds); n > 0 {
 		fmt.Printf("  SNI certificates  : %d\n", n)
 		for _, e := range l.Certificate.ExtCertIds {
@@ -113,7 +120,7 @@ func run() error {
 
 	// UpdateCertificateInstance is asynchronous: a return means only that the task was
 	// created; the real rebind waits on the backend (~15s measured), so the assertion must wait.
-	if *expect != "" && *wait > 0 && certID != *expect {
+	if *expect != "" && *wait > 0 && !contains(bound, *expect) {
 		// The wait loop needs its own, long-enough ctx.
 		//
 		// Reusing the 30-second ctx above makes every request return deadline exceeded once
@@ -127,7 +134,7 @@ func run() error {
 		var lastErr error
 		for time.Now().Before(deadline) {
 			time.Sleep(5 * time.Second)
-			cur, err := fetchCertID(waitCtx, client, *lbID, *listenerID)
+			ids, err := fetchBoundCertIDs(waitCtx, client, *lbID, *listenerID)
 			if err != nil {
 				// No more silent continue: the query itself failing and "not switched over
 				// yet" are two completely different things, and both must be visible.
@@ -136,29 +143,60 @@ func run() error {
 				continue
 			}
 			lastErr = nil
-			fmt.Printf("  ...waiting; currently bound to %s\n", cur)
-			if cur == *expect {
-				certID = cur
+			bound = ids
+			fmt.Printf("  ...waiting; currently bound to %v\n", ids)
+			if contains(bound, *expect) {
 				break
 			}
-			certID = cur
 		}
-		if certID != *expect && lastErr != nil {
+		if !contains(bound, *expect) && lastErr != nil {
 			fmt.Printf("  ...note: the final query also failed, so the assertion above may not be trustworthy: %v\n", lastErr)
 		}
 		fmt.Println()
 	}
 
-	if *notExpect != "" && certID == *notExpect {
-		return fmt.Errorf("assertion failed: the listener is still bound to %s, which should be gone", *notExpect)
+	// The assertions look at every certificate the listener carries, primary and SNI
+	// alike. Reporting "-not-expect <old> passed" while the old certificate is still bound
+	// as an extension cert is the exact failure this tool exists to catch.
+	if *notExpect != "" && contains(bound, *notExpect) {
+		return fmt.Errorf("assertion failed: the listener is still bound to %s (bound: %v), which should be gone",
+			*notExpect, bound)
 	}
 	if *expect != "" {
-		if certID != *expect {
-			return fmt.Errorf("assertion failed: after waiting %s it is still not %s (actual: %s)", *wait, *expect, certID)
+		if !contains(bound, *expect) {
+			return fmt.Errorf("assertion failed: after waiting %s %s is still not bound (bound: %v)", *wait, *expect, bound)
 		}
-		fmt.Printf("\nOK: assertion passed - the listener is now bound to %s\n", *expect)
+		fmt.Printf("\nOK: assertion passed - the listener is bound to %s\n", *expect)
 	}
 	return nil
+}
+
+// boundCertIDs is every certificate the listener carries: the primary one plus the SNI
+// extension certificates, which are separate server certificates in the
+// multi-certificate case.
+func boundCertIDs(c *clb.CertificateOutput) []string {
+	if c == nil {
+		return nil
+	}
+	out := make([]string, 0, 1+len(c.ExtCertIds))
+	if c.CertId != nil && *c.CertId != "" {
+		out = append(out, *c.CertId)
+	}
+	for _, e := range c.ExtCertIds {
+		if e != nil && *e != "" {
+			out = append(out, *e)
+		}
+	}
+	return out
+}
+
+func contains(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }
 
 // noListenersError words the empty-listener failure to fit how the query was made:
@@ -179,6 +217,22 @@ func noListenersError(lbID, listenerID string) error {
 // -- passing an empty ListenerIds makes the API error out, which the wait loop would then
 // retry as though it were a network blip.
 func fetchCertID(ctx context.Context, client *clb.Client, lbID, listenerID string) (string, error) {
+	ids, err := fetchBoundCertIDs(ctx, client, lbID, listenerID)
+	if err != nil {
+		return "", err
+	}
+	if len(ids) == 0 {
+		return "", fmt.Errorf("no certificate bound")
+	}
+	return ids[0], nil
+}
+
+// fetchBoundCertIDs returns every certificate the listener carries, primary first.
+//
+// The assertions need the whole set, not just the primary: a listener may serve the
+// managed certificate as an SNI extension certificate, and comparing only the primary
+// both misses a stale binding and rejects a correct one.
+func fetchBoundCertIDs(ctx context.Context, client *clb.Client, lbID, listenerID string) ([]string, error) {
 	req := clb.NewDescribeListenersRequest()
 	req.LoadBalancerId = common.StringPtr(lbID)
 	if listenerID != "" {
@@ -187,16 +241,16 @@ func fetchCertID(ctx context.Context, client *clb.Client, lbID, listenerID strin
 
 	resp, err := client.DescribeListenersWithContext(ctx, req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if resp.Response == nil || len(resp.Response.Listeners) == 0 {
-		return "", fmt.Errorf("the listener does not exist")
+		return nil, fmt.Errorf("the listener does not exist")
 	}
-	l := resp.Response.Listeners[0]
-	if l.Certificate == nil || l.Certificate.CertId == nil {
-		return "", fmt.Errorf("no certificate bound")
+	ids := boundCertIDs(resp.Response.Listeners[0].Certificate)
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no certificate bound")
 	}
-	return *l.Certificate.CertId, nil
+	return ids, nil
 }
 
 func derefStr(s *string) string {

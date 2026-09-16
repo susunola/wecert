@@ -7,6 +7,27 @@
 
 statePath: /var/lib/wecert/state.db
 
+# Periodic consistent snapshots of state.db, written beside it.
+#
+# Why this is on by default: state.db holds the ACME account key and every in-flight order
+# URL. Losing it does not just cost an issuance -- accounts are limited to 10 per IP per 3
+# hours, and a re-placed order counts against "5 certificates per exact set of identifiers /
+# 7 days", a limit with no override. Until this existed the only guidance was a README line
+# saying it is the one thing to back up.
+#
+# Snapshots use SQLite's VACUUM INTO, not a file copy: the database runs in WAL mode, so a
+# copy of state.db alone can miss everything committed since the last checkpoint -- which is
+# exactly the order URL you would be trying to recover.
+stateBackup:
+  enabled: true
+  interval: 24h
+  # How many snapshots to keep, newest first. Each is a full copy of the database.
+  keep: 7
+  # Defaults to the directory holding state.db (already 0700). Point it elsewhere if you
+  # want the copies on separate storage, but note they must be renamed atomically, so a
+  # different filesystem means the rename is a copy.
+  # dir: /var/backups/wecert
+
 acme:
   # ⚠️ Defaults to staging. install.sh installs this very file as
   #    /etc/wecert/config.yaml, so the default has to be the safe one: if the
