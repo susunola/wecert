@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/probe"
 	"github.com/susunola/wecert/internal/spec"
@@ -72,6 +73,11 @@ type Drainer interface {
 type CertManager interface {
 	Reconcile(ctx context.Context, c *config.Certificate) error
 	ReapRetired(ctx context.Context)
+	// PublishQuota refreshes the rate-limit gauges. Optional in spirit -- a manager that has
+	// no quota accounting simply reports nothing -- but part of the interface because every
+	// production manager has one.
+	PublishQuota(scopes map[string]string)
+
 	// CleanupOrphan reclaims the in-flight order and the challenge TXT records
 	// of a certificate that has left the desired state. It must exist on this
 	// interface rather than being optional: skipping it leaks _acme-challenge
@@ -551,7 +557,36 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 
 	r.manager.ReapRetired(ctx)
 	r.reclaimStaleProbeSeries()
+	r.publishQuota(res)
 	return rep
+}
+
+// publishQuota refreshes the rate-limit gauges from the desired state this pass resolved.
+//
+// The scopes are derived here rather than asked of the manager: the manager does not know
+// which registered domains or identifier sets this deployment cares about, and inventing them
+// would mean a DNS lookup per certificate per pass. Using the resolved document keeps it free.
+func (r *Reconciler) publishQuota(res *spec.Result) {
+	if res == nil {
+		return
+	}
+	scopes := map[string]string{}
+	// One representative per family is enough for the account-wide limit, which is the one
+	// that gates everything; the per-domain families are reported for the first certificate
+	// because that is the bucket an operator is about to spend against when they add a name.
+	for i := range res.Certificates {
+		c := &res.Certificates[i]
+		if _, ok := scopes["registered-domain"]; !ok && len(c.Domains) > 0 {
+			scopes["registered-domain"] = group.RegisteredDomain(c.Domains[0])
+		}
+		if _, ok := scopes["exact-identifier-set"]; !ok {
+			scopes["exact-identifier-set"] = c.DomainKey()
+		}
+		if _, ok := scopes["identifier"]; !ok && len(c.Domains) > 0 {
+			scopes["identifier"] = strings.ToLower(c.Domains[0])
+		}
+	}
+	r.manager.PublishQuota(scopes)
 }
 
 // reclaimStaleProbeSeries drops the per-host probe metric series of hosts that are no

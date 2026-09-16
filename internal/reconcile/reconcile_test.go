@@ -46,6 +46,9 @@ type fakeManager struct {
 
 	reaped int
 
+	// quotaScopes records every PublishQuota call.
+	quotaScopes []map[string]string
+
 	// onReconcile fires on every Reconcile, so tests can cancel and so on.
 	onReconcile func(name string)
 
@@ -79,6 +82,14 @@ func (f *fakeManager) orphanCleaned() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.cleaned...)
+}
+
+// PublishQuota records the scopes it was asked about, so a test can assert the loop reports
+// quota at all without depending on the metric registry.
+func (f *fakeManager) PublishQuota(scopes map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.quotaScopes = append(f.quotaScopes, scopes)
 }
 
 func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {

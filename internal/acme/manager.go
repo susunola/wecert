@@ -8,6 +8,7 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -148,6 +149,13 @@ type Manager struct {
 	identifierMu       sync.Mutex
 	identifierCooldown map[string]time.Time
 
+	// quota answers "how much of each published rate limit is left".
+	//
+	// Let's Encrypt publishes its limits but has no endpoint to query the remainder, so the
+	// answer comes from accounting for what this program spent (see internal/ratelimit). nil
+	// disables the accounting entirely, which is what the focused unit tests want.
+	quota *ratelimit.Tracker
+
 	// bindingCheckEvery throttles the "is this certificate bound yet?" lookup, and
 	// bindingChecked remembers when each certificate was last asked.
 	//
@@ -272,6 +280,18 @@ func (m *Manager) clearIdentifierCooldown(identifier string) {
 	delete(m.identifierCooldown, identifier)
 }
 
+// quotaNow reports the clock the quota accounting uses.
+//
+// Tests replace m.now wholesale (m.now = func() time.Time { ... }), which cannot reach the
+// tracker's own clock, so the two would otherwise disagree and a test's simulated hours would
+// not advance the buckets. Callers that need consistency use SetNow instead.
+func (m *Manager) SetNow(now func() time.Time) {
+	m.now = now
+	if m.quota != nil {
+		m.quota.SetNow(now)
+	}
+}
+
 // round is the per-pass intent of ONE certificate: which domain set this pass decided to
 // order for, and whether a degradation was in force when it decided.
 //
@@ -347,7 +367,10 @@ func newManager(
 		transientBackoff:   make(map[string]time.Time),
 		orderFetchFails:    make(map[string]int),
 		identifierCooldown: make(map[string]time.Time),
-		now:                time.Now,
+		quota:              ratelimit.NewTracker(rateBucketAdapter{store: store}, log, nil),
+		// quotaNow is kept in step with m.now by SetNow, so a test that drives the clock
+		// does not leave the quota accounting reading the wall clock.
+		now: time.Now,
 	}
 }
 
