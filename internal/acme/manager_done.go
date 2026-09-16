@@ -120,6 +120,13 @@ func (m *Manager) download(
 		}
 		deployedID = id
 		o.DeploymentCertID = ""
+		// Persist the clear, not just the in-memory field. discardOrder below re-reads the
+		// order from the store, and a stale ID left there would be reclaimed as an orphan
+		// even though this certificate is the one now in service. Best-effort: a successful
+		// issuance must not fail because a bookkeeping write did.
+		if err := m.store.PutOrder(o); err != nil {
+			m.log.Warn("cannot persist the cleared deployment ID", "cert", c.Name, "err", err)
+		}
 		rebound = oldDeployedID != ""
 	} else {
 		// A local-only renewal must never claim the older cloud certificate is this
@@ -322,6 +329,30 @@ func (m *Manager) recordFailure(st *state.CertState, err error) error {
 // Cleanup is handed to cleanupOrphanTXT: it deletes the rows it has finished with, and keeps
 // the rows whose token cannot be located around for the next round to retry.
 func (m *Manager) discardOrder(ctx context.Context, certName string) error {
+	// An order can carry the ID of a certificate that was uploaded to Tencent Cloud but whose
+	// asynchronous rebind never completed. Deleting the row throws away the only local record
+	// of that certificate: it is then in neither the certificates table nor the retired table,
+	// ReapRetired never sees it, and it occupies the account's uploaded-certificate quota
+	// forever -- and quota exhaustion is what stops renewal.
+	//
+	// The order is going away, so the pending retry cannot happen. The reclaim list is the
+	// only thing left that can still delete it.
+	if o, err := m.store.GetOrder(certName); err != nil {
+		m.log.Warn("cannot read the order before discarding it; an uploaded certificate may be left unreclaimed",
+			"cert", certName, "err", err)
+	} else if o != nil && o.DeploymentCertID != "" {
+		liveID := ""
+		if st, cerr := m.store.GetCert(certName); cerr != nil {
+			m.log.Warn("cannot read the certificate before discarding its order", "cert", certName, "err", cerr)
+		} else if st != nil {
+			liveID = st.DeployedCertID
+		}
+		// liveID == "" errs toward reclaiming: recordOrphanCert only skips on an exact match,
+		// and a certificate still bound to a listener is protected by IsCheckResource refusing
+		// the delete.
+		m.recordOrphanCert(o.DeploymentCertID, liveID, certName)
+	}
+
 	if err := m.cleanupOrphanTXT(ctx, certName); err != nil {
 		// A cleanup failure must not stop us discarding the order -- that would leave us stuck
 		// on an order that can never produce a result, which is far worse than one extra TXT
