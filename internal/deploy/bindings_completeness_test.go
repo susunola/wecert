@@ -272,3 +272,31 @@ func TestAnUnpopulatedBindingEntryIsNotAnAuthoritativeZero(t *testing.T) {
 		}
 	})
 }
+
+// A half-populated sync progress must not read as a finished zero.
+//
+// Readiness was computed over the entries that were listed, so a response with one populated region
+// reporting zero and one entry carrying no regions at all scored (0, ready=true). The caller then
+// takes the hard "the old certificate was bound to nothing" branch instead of deferring to the
+// authoritative deploy record -- the same shape countBindings was fixed for.
+func TestAHalfPopulatedSyncProgressIsNotAFinishedZero(t *testing.T) {
+	populatedZero := &ssl.UpdateSyncProgress{
+		UpdateSyncProgressRegions: []*ssl.UpdateSyncProgressRegion{{
+			Region: common.StringPtr("ap-guangzhou"), TotalCount: common.Int64Ptr(0),
+		}},
+	}
+
+	// The genuine zero: one populated entry, every region answered.
+	if n, ready := progressBoundCount([]*ssl.UpdateSyncProgress{populatedZero}); n != 0 || !ready {
+		t.Errorf("a fully populated answer of zero IS the answer zero, got (%d, %v)", n, ready)
+	}
+
+	// The same entry next to one that says nothing: not an answer.
+	silent := &ssl.UpdateSyncProgress{}
+	if n, ready := progressBoundCount([]*ssl.UpdateSyncProgress{populatedZero, silent}); ready {
+		t.Errorf("an entry with no regions leaves the answer incomplete, got (%d, %v)", n, ready)
+	}
+	if n, ready := progressBoundCount([]*ssl.UpdateSyncProgress{populatedZero, nil}); ready {
+		t.Errorf("a nil entry leaves the answer incomplete, got (%d, %v)", n, ready)
+	}
+}
