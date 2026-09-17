@@ -25,6 +25,7 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -693,6 +694,17 @@ func TestAwaitAuthorizationInvalidRecordsIdentifierFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid authorization must fail")
 	}
+	// The CA's per-identifier failure budget is spent in the local estimate too. Without this the
+	// gauge published for that limit could only ever read "full" -- Remaining on a bucket nobody
+	// writes returns Capacity by design -- so the alert built on it was structurally unable to
+	// fire for the one limit that a DNS-01 misconfiguration burns.
+	if bucket, berr := store.GetRateBucket(ratelimit.AuthzFailuresPerIdentifier.Name, "bad.example.com"); berr != nil {
+		t.Fatal(berr)
+	} else if want := ratelimit.AuthzFailuresPerIdentifier.Capacity - 1; bucket.Tokens != want {
+		t.Errorf("the failed authorization was not counted against the identifier's budget: tokens=%v want %v",
+			bucket.Tokens, want)
+	}
+
 	got, err := store.ListIdentifierFailures(cert.Name)
 	if err != nil {
 		t.Fatal(err)

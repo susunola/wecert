@@ -34,6 +34,11 @@ type fakeReconciler struct {
 
 	// startAllErr simulates "the desired state is unreadable": nothing started.
 	startAllErr error
+
+	// fresh is what the reconciler's own resolve finds. When it is set it differs from names,
+	// which stands for the cache CertNames() reads -- the situation a named trigger meets when a
+	// certificate was onboarded after the last pass.
+	fresh []string
 }
 
 func (f *fakeReconciler) CertNames() []string { return f.names }
@@ -70,6 +75,14 @@ func (f *fakeReconciler) StartNamed(_ context.Context, names []string) (started,
 }
 
 func (f *fakeReconciler) known(name string) bool {
+	if f.fresh != nil {
+		for _, n := range f.fresh {
+			if n == name {
+				return true
+			}
+		}
+		return false
+	}
 	for _, n := range f.names {
 		if n == name {
 			return true
@@ -1040,5 +1053,32 @@ func TestDrainRefusesNewNotifications(t *testing.T) {
 
 	if atomic.LoadInt32(&got) != 0 {
 		t.Error("a notification accepted after Drain can never be waited for; it must be refused")
+	}
+}
+
+// A certificate onboarded after the last pass must be STARTED by a named trigger, not reported as
+// unknown.
+//
+// The classification used to run against CertNames(), the cache a pass refreshes, while StartNamed
+// resolves the document itself -- so the flow this endpoint exists for (README: CI triggers
+// convergence right after a domain is added) put the new name in "unknown" and, because the
+// pre-filter had already emptied the target list, handed StartNamed nothing to resolve. The caller
+// was told the certificate is not in the configuration, and issuance waited for the next pass.
+func TestTriggerStartsACertificateTheCacheHasNotSeen(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}, fresh: []string{"a", "new-one"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"new-one"}`, bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("accepted convergence should answer 202, got %d", w.Code)
+	}
+
+	var resp reconcileResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Accepted) != 1 || resp.Accepted[0] != "new-one" {
+		t.Errorf("the fresh desired state has this certificate, so it must be started, got %+v", resp)
+	}
+	if len(resp.Unknown) != 0 {
+		t.Errorf("reporting it unknown tells the caller to give up on a certificate that exists: %+v", resp)
 	}
 }
