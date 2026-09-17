@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	clb "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317"
@@ -32,7 +33,8 @@ func run() error {
 		region     = flag.String("region", "", "region, e.g. ap-guangzhou")
 		lbID       = flag.String("clb", "", "CLB instance ID")
 		listenerID = flag.String("listener", "", "listener ID; when omitted, the first listener on that CLB is used")
-		expect     = flag.String("expect", "", "expected primary certificate ID; when set the assertion must hold")
+		expect     = flag.String("expect", "", "certificate ID that must be in the asserted set; when set the assertion must hold")
+		domain     = flag.String("domain", "", "assert on the certificate the forwarding rule for this domain serves (SNI); when omitted every certificate on the listener and its rules is asserted")
 		notExpect  = flag.String("not-expect", "", "certificate ID that must NOT be present")
 		raw        = flag.Bool("raw", false, "dump the raw DescribeListeners JSON response for troubleshooting")
 		wait       = flag.Duration("wait", 0, "how long to poll for the expected certificate (UpdateCertificateInstance is asynchronous)")
@@ -93,30 +95,39 @@ func run() error {
 	l := resp.Response.Listeners[0]
 	fmt.Printf("listener %s  (%s:%d)\n", derefStr(l.ListenerId), derefStr(l.Protocol), derefI64(l.Port))
 
-	if l.Certificate == nil || l.Certificate.CertId == nil {
-		return fmt.Errorf("the listener has no certificate bound")
-	}
-
-	certID := *l.Certificate.CertId
-	fmt.Printf("  primary certificate: %s\n", certID)
-
-	// SNI extension certificates: this is exactly where rotating one certificate can
-	// clobber another, so they are printed separately.
-	//
-	// They are also part of the ASSERTION, not just the output. The SDK documents
-	// ExtCertIds as "additional server certificate IDs for the multi-certificate case",
-	// and this project's own e2e uses an SNI listener, so a check that only compared the
-	// primary ID certified a rebind that had not happened -- and failed one that had,
-	// when the managed certificate is an extension cert.
-	bound := boundCertIDs(l.Certificate)
-	if n := len(l.Certificate.ExtCertIds); n > 0 {
-		fmt.Printf("  SNI certificates  : %d\n", n)
-		for _, e := range l.Certificate.ExtCertIds {
-			fmt.Printf("      %s\n", derefStr(e))
-		}
+	// What the listener itself carries. In CLB's SNI model this is often EMPTY and the
+	// certificates live on the forwarding rules instead: the API ignores listener-level
+	// certificate fields when SNI is on, and this project's own test account cannot turn SNI
+	// off. Failing here with "the listener has no certificate bound" -- which is what this
+	// tool used to do -- therefore reported a healthy, serving listener as broken.
+	listenerCerts := boundCertIDs(l.Certificate)
+	if len(listenerCerts) > 0 {
+		fmt.Printf("  listener certificates: %v\n", listenerCerts)
 	} else {
-		fmt.Printf("  SNI certificates  : none\n")
+		fmt.Printf("  listener certificates: none\n")
 	}
+
+	// Per-rule certificates: one per SNI name, and the set that actually decides which
+	// certificate a given hostname is served. Rotating one must not disturb another, which is
+	// why they are printed and asserted individually rather than summarised.
+	rules := ruleCertificates(l)
+	for _, r := range rules {
+		fmt.Printf("  rule %-28s %v\n", r.domain, r.certIDs)
+	}
+
+	asserted, scope, err := assertedCertificates(l, *domain)
+	if err != nil {
+		return err
+	}
+	if len(asserted) == 0 {
+		if *domain != "" {
+			return fmt.Errorf("no certificate is bound to the rule serving %q, so nothing can be asserted", *domain)
+		}
+		return fmt.Errorf("no certificate is bound to listener %s or to any of its %d rule(s)",
+			derefStr(l.ListenerId), len(rules))
+	}
+	fmt.Printf("  asserted set (%s): %v\n", scope, asserted)
+	bound := asserted
 
 	// UpdateCertificateInstance is asynchronous: a return means only that the task was
 	// created; the real rebind waits on the backend (~15s measured), so the assertion must wait.
@@ -134,7 +145,7 @@ func run() error {
 		var lastErr error
 		for time.Now().Before(deadline) {
 			time.Sleep(5 * time.Second)
-			ids, err := fetchBoundCertIDs(waitCtx, client, *lbID, *listenerID)
+			ids, err := fetchBoundCertIDs(waitCtx, client, *lbID, *listenerID, *domain)
 			if err != nil {
 				// No more silent continue: the query itself failing and "not switched over
 				// yet" are two completely different things, and both must be visible.
@@ -159,19 +170,110 @@ func run() error {
 	// alike. Reporting "-not-expect <old> passed" while the old certificate is still bound
 	// as an extension cert is the exact failure this tool exists to catch.
 	if *notExpect != "" && contains(bound, *notExpect) {
-		return fmt.Errorf("assertion failed: the listener is still bound to %s (bound: %v), which should be gone",
-			*notExpect, bound)
+		return fmt.Errorf("assertion failed: %s is still bound (%s: %v), which should be gone",
+			*notExpect, scope, bound)
 	}
 	if *expect != "" {
 		if !contains(bound, *expect) {
-			return fmt.Errorf("assertion failed: after waiting %s %s is still not bound (bound: %v)", *wait, *expect, bound)
+			return fmt.Errorf("assertion failed: after waiting %s %s is still not bound (%s: %v)",
+				*wait, *expect, scope, bound)
 		}
-		fmt.Printf("\nOK: assertion passed - the listener is bound to %s\n", *expect)
+		fmt.Printf("\nOK: assertion passed - %s is bound (%s)\n", *expect, scope)
 	}
 	return nil
 }
 
-// boundCertIDs is every certificate the listener carries: the primary one plus the SNI
+// ruleCert is one forwarding rule's SNI binding.
+type ruleCert struct {
+	domain     string
+	locationID string
+	certIDs    []string
+}
+
+// ruleCertificates returns the certificate each forwarding rule serves, in order.
+//
+// Rule-level bindings are not decoration: with SNI on, the rule is what decides the certificate
+// for its hostname (that is how CLB implements multiple certificates on one listener), so a tool
+// that only looks at Listener.Certificate is blind to the binding it is supposed to verify. This
+// repository hit exactly that: the e2e account cannot turn SNI off, so the listener carries no
+// certificate at all and every certificate lives on a rule.
+func ruleCertificates(l *clb.Listener) []ruleCert {
+	if l == nil {
+		return nil
+	}
+	out := make([]ruleCert, 0, len(l.Rules))
+	for _, r := range l.Rules {
+		if r == nil {
+			continue
+		}
+		out = append(out, ruleCert{
+			domain:     derefStr(r.Domain),
+			locationID: derefStr(r.LocationId),
+			certIDs:    boundCertIDs(r.Certificate),
+		})
+	}
+	return out
+}
+
+// assertedCertificates returns the set the flags are checked against, and a label saying what
+// that set is.
+//
+// Without -domain it is every certificate the listener can serve: the listener-level primary and
+// SNI extensions plus each rule's own certificate. Reporting "-not-expect <old> passed" while the
+// old certificate is still bound on the rule that serves the name is the exact false assurance
+// this tool exists to prevent.
+//
+// With -domain it is the certificate(s) of the rule(s) serving that name, because that is the
+// binding that decides what a client is handed. Naming a domain that no rule serves is an error
+// rather than an empty pass: a typo must not read as "nothing is bound to the old certificate".
+func assertedCertificates(l *clb.Listener, domain string) (ids []string, scope string, err error) {
+	seen := map[string]bool{}
+	add := func(list []string) {
+		for _, id := range list {
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+
+	if domain == "" {
+		add(boundCertIDs(l.Certificate))
+		for _, r := range ruleCertificates(l) {
+			add(r.certIDs)
+		}
+		return ids, "listener + rules", nil
+	}
+
+	matched := false
+	for _, r := range ruleCertificates(l) {
+		if strings.EqualFold(r.domain, domain) {
+			matched = true
+			add(r.certIDs)
+		}
+	}
+	if !matched {
+		return nil, "", fmt.Errorf("no forwarding rule on this listener serves %q, so there is nothing to assert "+
+			"(rules: %s)", domain, ruleDomains(l))
+	}
+	return ids, "rule for " + domain, nil
+}
+
+// ruleDomains renders the listener's rule domains for an error message.
+func ruleDomains(l *clb.Listener) string {
+	rules := ruleCertificates(l)
+	if len(rules) == 0 {
+		return "none"
+	}
+	out := make([]string, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, r.domain)
+	}
+	return strings.Join(out, ", ")
+}
+
+// boundCertIDs is every certificate one binding carries: the primary one plus the SNI
 // extension certificates, which are separate server certificates in the
 // multi-certificate case.
 func boundCertIDs(c *clb.CertificateOutput) []string {
@@ -216,7 +318,7 @@ func noListenersError(lbID, listenerID string) error {
 // The assertions need the whole set, not just the primary: a listener may serve the
 // managed certificate as an SNI extension certificate, and comparing only the primary
 // both misses a stale binding and rejects a correct one.
-func fetchBoundCertIDs(ctx context.Context, client *clb.Client, lbID, listenerID string) ([]string, error) {
+func fetchBoundCertIDs(ctx context.Context, client *clb.Client, lbID, listenerID, domain string) ([]string, error) {
 	req := clb.NewDescribeListenersRequest()
 	req.LoadBalancerId = common.StringPtr(lbID)
 	if listenerID != "" {
@@ -230,7 +332,13 @@ func fetchBoundCertIDs(ctx context.Context, client *clb.Client, lbID, listenerID
 	if resp.Response == nil || len(resp.Response.Listeners) == 0 {
 		return nil, fmt.Errorf("the listener does not exist")
 	}
-	ids := boundCertIDs(resp.Response.Listeners[0].Certificate)
+	// The same asserted set the first query uses, domain filter included: polling the
+	// listener-level field alone would spin until the deadline while the rule it is asked about
+	// already serves the new certificate.
+	ids, _, err := assertedCertificates(resp.Response.Listeners[0], domain)
+	if err != nil {
+		return nil, err
+	}
 	if len(ids) == 0 {
 		return nil, fmt.Errorf("no certificate bound")
 	}

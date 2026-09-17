@@ -11,7 +11,9 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/metrics"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -68,6 +70,19 @@ func (m *Manager) download(
 
 	if err := VerifyCoverage(leaf, c.Domains); err != nil {
 		return m.recordFailure(st, err)
+	}
+
+	// A certificate exists at the CA now, so the two certificate budgets are spent -- here, not
+	// after the deploy, because the CA counts the issuance and a later failure of ours (the
+	// deploy, or the epilogue transaction) does not give that budget back.
+	//
+	// ARI-exempt renewals are counted too, which makes this estimate a LOWER bound on what is
+	// left. That is the direction this package promises to be wrong in: the alerting rule for
+	// "certs per exact identifier set" -- the limit with no override path -- must not be the one
+	// number that is structurally always full.
+	m.quota.Spend(ratelimit.CertsPerExactIdentifierSet, c.DomainKey(), 1)
+	for _, domain := range uniqueRegisteredDomains(c.Domains) {
+		m.quota.Spend(ratelimit.CertsPerRegisteredDomain, domain, 1)
 	}
 	// Reject a certificate that is not actually a REPLACEMENT for the live one.
 	//
@@ -450,6 +465,23 @@ func (m *Manager) ReapRetired(ctx context.Context) {
 			m.log.Warn("failed to remove the reclaim record", "certId", r.CertID, "err", err)
 		}
 	}
+}
+
+// uniqueRegisteredDomains returns the registered domains a certificate's names belong to, once
+// each: "certs per registered domain" is counted per registered domain the certificate covers, and
+// a certificate spanning several of them spends that many slots.
+func uniqueRegisteredDomains(domains []string) []string {
+	seen := make(map[string]bool, len(domains))
+	out := make([]string, 0, len(domains))
+	for _, d := range domains {
+		rd := group.RegisteredDomain(d)
+		if rd == "" || seen[rd] {
+			continue
+		}
+		seen[rd] = true
+		out = append(out, rd)
+	}
+	return out
 }
 
 // recordFailure records a failure and schedules exponential backoff.

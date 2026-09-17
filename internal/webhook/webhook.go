@@ -242,12 +242,12 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targets, unknown := s.resolveTargets(req)
+	targets := requestedTargets(req)
 
-	resp := reconcileResponse{Unknown: unknown}
+	resp := reconcileResponse{}
 
 	// No cert/certs means a full trigger.
-	if len(targets) == 0 && len(unknown) == 0 {
+	if len(targets) == 0 {
 		accepted, skipped, err := s.rec.StartAll(s.baseCtx)
 		if err != nil {
 			// The desired state is unreadable, so nothing started. Answering 202
@@ -278,6 +278,13 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
+		// The buckets are StartNamed's answer, from the desired state it just resolved. They used
+		// to come from a pre-filter against CertNames(), the cache refreshed once per pass, and
+		// that inverted the answer for exactly the flow this endpoint exists for: a name added
+		// since the last pass was reported "not in the configuration" and -- because the pre-filter
+		// had already emptied the target list -- the fresh resolution inside StartNamed never ran,
+		// so the certificate was not started either. The caller was told the opposite of the truth
+		// and issuance waited up to a full interval.
 		resp.Accepted = append(resp.Accepted, started...)
 		resp.Skipped = append(resp.Skipped, running...)
 		resp.Unknown = append(resp.Unknown, notFound...)
@@ -343,12 +350,14 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 }
 
 // resolveTargets maps requested names onto certificates that actually exist.
-func (s *Server) resolveTargets(req reconcileRequest) (targets, unknown []string) {
-	known := make(map[string]struct{})
-	for _, n := range s.rec.CertNames() {
-		known[n] = struct{}{}
-	}
-
+// requestedTargets returns the names a trigger asked for, deduplicated and in order.
+//
+// It deliberately does NOT classify them. CertNames() reads the cache that a pass refreshes, while
+// StartNamed resolves the desired-state document itself, so classifying here answers an older
+// question than the one the caller asked -- and answering it here also decides whether StartNamed
+// gets to run at all. Whether a name exists, is already running, or was started is StartNamed's
+// answer to give.
+func requestedTargets(req reconcileRequest) (targets []string) {
 	var wanted []string
 	if req.Cert != nil {
 		wanted = []string{*req.Cert}
@@ -364,13 +373,9 @@ func (s *Server) resolveTargets(req reconcileRequest) (targets, unknown []string
 			continue
 		}
 		seen[n] = struct{}{}
-		if _, ok := known[n]; ok {
-			targets = append(targets, n)
-		} else {
-			unknown = append(unknown, n)
-		}
+		targets = append(targets, n)
 	}
-	return targets, unknown
+	return targets
 }
 
 // ── Status endpoint ────────────────────────────────────────────────────────────────
