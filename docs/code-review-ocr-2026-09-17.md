@@ -104,6 +104,8 @@ clear 先落盘，提升与删单在事务里。事务失败时（错误信息�
 
 同轮依据 `code-review-expert` 复审结果补的小改动：日志 URL 去签名（P2）、`UpdateRateBucket` 的回调不得重入 store 的契约写明（P2）、DNSPod 空结果判定收敛到新的 `internal/tcerr`（P2，原先 `cmd/preflight` 与 `internal/onboarding` 各一份）、`bucketStore` 拆成读/写两个接口并删掉已无人使用的 `PutRateBucket`（P2）、采纳任务校验成功后打印耗时与绑定数（P2）、`pollUntilBound` 的回调合二为一并把轮询间隔提成常量（P3）。
 
+**刻意留下的清理项**（`code-review-expert` 的 removal plan 里标为「defer with plan」）：`reconcile.RunOnce` 现在只有一个生产调用者（守护进程循环），`RunAll` 的返回值在那里被丢弃——把两者收敛成一个入口是安全的，但会动到守护进程路径，值得单独一个提交和一轮它自己的测试；本轮没有顺手做，以免把一次「关闭已知缺陷」的改动混进一次行为重构。
+
 ---
 
 ## 3. 精度说明（这份审查的可信度边界）
