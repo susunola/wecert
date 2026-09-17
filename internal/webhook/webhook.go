@@ -270,10 +270,13 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	if len(targets) == 0 {
 		accepted, skipped, err := s.rec.StartAll(s.baseCtx)
 		if err != nil {
-			// The desired state is unreadable, so nothing started. Answering 202
-			// with every certificate "accepted" (from the last good cache) would
-			// report a convergence that will never happen.
-			s.log.Warn("full trigger failed: the desired state is unreadable",
+			// Two causes, both "nothing started", and both an answer of 202
+			// with every certificate "accepted" would misreport as a
+			// convergence that is on its way: the desired state is unreadable,
+			// or the process is shutting down -- the HTTP server's shutdown is
+			// asynchronous, so a trigger can still arrive while the reconciler
+			// is draining and refuses new passes.
+			s.log.Warn("full trigger failed: the desired state is unreadable or the process is shutting down",
 				"err", err, "remote", r.RemoteAddr)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
@@ -293,11 +296,12 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		// which has a 15s write timeout.
 		started, running, notFound, err := s.rec.StartNamed(s.baseCtx, targets)
 		if err != nil {
-			// Anything else -- above all an unreadable desired state -- is a
-			// transient internal failure, not "not managed". Reporting it in
-			// unknown would tell the caller to give up on a certificate that
-			// may well exist and simply could not be resolved this time.
-			s.log.Warn("trigger failed: cannot resolve the desired state",
+			// Anything else -- an unreadable desired state, or a process that is
+			// already draining and refuses new passes -- is a transient internal
+			// failure, not "not managed". Reporting it in unknown would tell the
+			// caller to give up on a certificate that may well exist and simply
+			// could not be resolved this time.
+			s.log.Warn("trigger failed: cannot resolve the desired state, or the process is shutting down",
 				"certs", targets, "err", err, "remote", r.RemoteAddr)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return

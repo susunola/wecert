@@ -642,9 +642,11 @@ func (r *run) loadRules(ctx context.Context) {
 
 // parse turns raw TXT records into declarations.
 //
-// Unparseable records do not enter the desired state, but they do leave a decision
-// entry: silently dropping a declaration leaves a human doubting their sanity in
-// front of the DNS console.
+// Unparseable records do not enter the desired state, and the first one for a hostname leaves a
+// decision entry: silently dropping a declaration leaves a human doubting their sanity in front of
+// the DNS console. The exception is a record whose hostname already has a usable declaration --
+// the report carries one verdict per name, so that record is named in the journal instead (see the
+// guard in the loop below).
 func (r *run) parse(raw []RawDeclaration) {
 	r.reasons = map[string]string{}
 	byHost := map[string]*Declaration{}
@@ -661,18 +663,25 @@ func (r *run) parse(raw []RawDeclaration) {
 			// included must carry exactly one verdict, and which record the zone walk happened to
 			// return first is not something the report should depend on.
 			host := hostnameFromRecord(rec.Record)
-			if _, usable := byHost[host]; !usable {
-				r.reject(host, fmt.Sprintf("unparseable declaration: %v", err))
+			if _, usable := byHost[host]; usable {
+				// Not silent, though: the decision list is the artifact an operator reads, and it
+				// cannot carry this record without contradicting the declaration that won. The
+				// journal is where "one of your records is broken and was ignored" has to show up,
+				// or a typo'd wildcard=1 vanishes without a trace.
+				r.o.log.Warn("a declaration record could not be parsed and was ignored because the same "+
+					"name is declared by a record that does parse",
+					"record", rec.Record, "zone", rec.Zone, "hostname", host, "err", err)
+				continue
 			}
+			r.reject(host, fmt.Sprintf("unparseable declaration: %v", err))
 			continue
 		}
 		if rejected[d.Hostname] {
 			// Once two records for one hostname disagreed, the hostname is poisoned
 			// for the round: accepting a third record would let whoever writes last
-			// silently win the conflict.
-			r.reject(d.Hostname, fmt.Sprintf(
-				"conflicting declarations for the same name: %s repeats a hostname already rejected for conflicting declarations",
-				d.Record))
+			// silently win the conflict. The exclusion is already recorded (the conflict is the
+			// cause, and reject keeps a name's first reason), so there is nothing to add here --
+			// only this record to refuse.
 			continue
 		}
 		if prev, dup := byHost[d.Hostname]; dup {
@@ -681,9 +690,13 @@ func (r *run) parse(raw []RawDeclaration) {
 			// and guessing which one is right would be wrong either way.
 			if prev.Wildcard != d.Wildcard || prev.Profile != d.Profile ||
 				prev.KeyType != d.KeyType || !sameBoolPtr(prev.Deploy, d.Deploy) {
+				// Zones are in the message because the record name usually is not enough to tell
+				// the two apart: the same name declared in a parent zone and in a delegated
+				// subzone has the same record string, and the message used to print it twice.
 				r.reject(d.Hostname, fmt.Sprintf(
-					"conflicting declarations for the same name (%s and %s): they disagree on wildcard/profile/keytype/deploy",
-					byHostRecord[d.Hostname], d.Record))
+					"conflicting declarations for the same name (%s in zone %s and %s in zone %s): "+
+						"they disagree on wildcard/profile/keytype/deploy",
+					byHostRecord[d.Hostname], prev.Zone, d.Record, d.Zone))
 				rejected[d.Hostname] = true
 				delete(byHost, d.Hostname)
 				delete(byHostRecord, d.Hostname)
@@ -721,12 +734,35 @@ func (r *run) parse(raw []RawDeclaration) {
 }
 
 // reject records a "this name was excluded" decision.
+//
+// One verdict per hostname: a name that is already excluded keeps the reason it was excluded for
+// first, which is the cause. A third record for a name a conflict already poisoned, or a second
+// rejection from a later stage, used to append another exclusion -- the report then listed the same
+// hostname two or three times with different stories, in the artifact a human reads to find out
+// what happened. The opposite transition (a name that ends up included) is unreject's job, and
+// include calls it.
 func (r *run) reject(hostname, reason string) {
+	for _, d := range r.rep.Decisions {
+		if d.Hostname == hostname && !d.Included {
+			return
+		}
+	}
 	r.rep.Decisions = append(r.rep.Decisions, spec.Decision{
 		Hostname: hostname,
 		Included: false,
 		Reason:   reason,
 	})
+}
+
+// include records a "this name is covered" decision.
+//
+// It drops any exclusion recorded for the name first, so the report cannot carry two opposite
+// verdicts for one hostname whichever order the stages ran in. unreject is deliberately separate:
+// the carry path needs to drop the exclusion and *then* decide the reason, and calling include
+// there would add a second inclusion.
+func (r *run) include(d spec.Decision) {
+	r.unreject(d.Hostname)
+	r.rep.Decisions = append(r.rep.Decisions, d)
 }
 
 // hostnameFromRecord does its best to extract the recognizable name from a record.
@@ -738,9 +774,20 @@ func (r *run) reject(hostname, reason string) {
 func hostnameFromRecord(record string) string {
 	full := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(record)), ".")
 	if !strings.HasPrefix(full, DeclarationPrefix) {
-		return record
+		return full
 	}
-	return strings.TrimPrefix(full, DeclarationPrefix)
+	// Normalise the way ParseDeclaration does, so that the name this reports is the same string
+	// the declaration carries. Trimming one trailing dot and skipping group.Normalize meant a
+	// record written "_wecert.api.example.com.." (or with stray whitespace) produced an exclusion
+	// for "api.example.com." beside an inclusion for "api.example.com" -- one DNS name, two
+	// verdicts, two spellings.
+	host, err := group.Normalize(strings.TrimPrefix(full, DeclarationPrefix))
+	if err != nil {
+		// Not a name anything could be declared under, so there is nothing to match; the label
+		// only has to be recognisable.
+		return strings.TrimPrefix(full, DeclarationPrefix)
+	}
+	return host
 }
 
 // fuse is §5.2: the abrupt desired-state change fuse.
@@ -1226,7 +1273,7 @@ func (r *run) build() {
 					reason += " and served by a CLB rule"
 				}
 			}
-			r.rep.Decisions = append(r.rep.Decisions, spec.Decision{
+			r.include(spec.Decision{
 				Hostname:    n,
 				Included:    true,
 				Reason:      reason,
@@ -1248,7 +1295,7 @@ func (r *run) overLimit(g group.Group, cause error) {
 	if prev := r.previousCert(g.Name); prev != nil {
 		r.certs = append(r.certs, *prev)
 		for _, n := range all {
-			r.rep.Decisions = append(r.rep.Decisions, spec.Decision{
+			r.include(spec.Decision{
 				Hostname:    n,
 				Included:    true,
 				Reason:      fmt.Sprintf("kept at the previous revision: %v", cause),
@@ -1350,7 +1397,7 @@ func (r *run) overSettingsConflict(g group.Group, cause error) {
 	if prev := r.previousCert(g.Name); prev != nil {
 		r.certs = append(r.certs, *prev)
 		for _, n := range append(append([]string(nil), g.Names...), g.Wildcards...) {
-			r.rep.Decisions = append(r.rep.Decisions, spec.Decision{Hostname: n, Included: true, Certificate: g.Name, Reason: fmt.Sprintf("kept at the previous revision: %v", cause)})
+			r.include(spec.Decision{Hostname: n, Included: true, Certificate: g.Name, Reason: fmt.Sprintf("kept at the previous revision: %v", cause)})
 		}
 		r.rep.CarriedForward += len(g.Names) + len(g.Wildcards)
 		return

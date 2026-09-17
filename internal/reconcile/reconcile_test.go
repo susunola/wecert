@@ -1740,3 +1740,93 @@ func TestDrainIsBounded(t *testing.T) {
 			"about to be closed under it")
 	}
 }
+
+// A pass may not be admitted once Drain has been called.
+//
+// Drain's contract is that the state store is safe to close when it returns, and a pass admitted
+// afterwards breaks it in two ways: it writes its promotion, resume anchor and failure counter into
+// a database that is already closed, and registering it is a sync.WaitGroup misuse (an Add that
+// starts from a zero counter concurrent with Wait), which Go answers with the process-fatal
+// "sync: WaitGroup is reused before previous Wait has returned". The webhook's HTTP shutdown is
+// asynchronous, so a trigger arriving during shutdown reaches exactly this path.
+func TestAPassStartedAfterDrainIsRefused(t *testing.T) {
+	mgr := &fakeManager{}
+	r, _ := newTestReconciler(t, []string{"a", "b"}, mgr)
+
+	if err := r.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain with no pass in flight: %v", err)
+	}
+
+	if err := r.StartCert(context.Background(), "a"); !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("StartCert after Drain must be refused with ErrShuttingDown, got %v", err)
+	}
+	if _, _, err := r.StartAll(context.Background()); !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("StartAll after Drain must be refused with ErrShuttingDown, got %v", err)
+	}
+	if _, _, _, err := r.StartNamed(context.Background(), []string{"a", "b"}); !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("StartNamed after Drain must be refused with ErrShuttingDown, got %v", err)
+	}
+
+	// A refusal, not a pass that runs anyway. (No goroutine was started, so reading the record
+	// without the mutex is safe.)
+	if len(mgr.calls) != 0 {
+		t.Errorf("no pass may run after Drain returned, these did: %v", mgr.calls)
+	}
+}
+
+// A refused trigger must not be reported as "already running".
+//
+// The webhook maps a start error to the "skipped" bucket, which means "already running" -- so
+// answering ErrAlreadyRunning for a shutdown would tell the caller to poll for a pass that will
+// never happen.
+func TestAShutdownRefusalIsNotReportedAsAlreadyRunning(t *testing.T) {
+	mgr := &fakeManager{}
+	r, _ := newTestReconciler(t, []string{"a"}, mgr)
+	if err := r.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	started, running, unknown, err := r.StartNamed(context.Background(), []string{"a"})
+	if !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("want ErrShuttingDown, got %v", err)
+	}
+	if len(started) != 0 || len(running) != 0 || len(unknown) != 0 {
+		t.Errorf("a refused trigger must report nothing but the error, got started=%v running=%v unknown=%v",
+			started, running, unknown)
+	}
+}
+
+// Registering a pass and entering Drain must not race.
+//
+// This is the window bgMu exists for: startCert's registration (bg.Add) running concurrently with
+// Drain's bg.Wait. Without the lock this test fails with the process-fatal "sync: WaitGroup is
+// reused before previous Wait has returned" panic, and -race reports the Add/Wait pair as a data
+// race. Each iteration builds its own reconciler because draining is terminal by design.
+func TestStartingAPassDoesNotRaceWithDrain(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		mgr := &fakeManager{}
+		r, _ := newTestReconciler(t, []string{"a", "b", "c", "d"}, mgr)
+
+		begin := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-begin
+			_, _, _ = r.StartAll(context.Background())
+		}()
+		go func() {
+			defer wg.Done()
+			<-begin
+			_ = r.Drain(context.Background())
+		}()
+		close(begin)
+		wg.Wait()
+
+		// Whatever the interleaving, nothing may be left running once Drain returns: a pass
+		// admitted before the transition is waited for, and one attempted after it is refused.
+		if err := r.Drain(context.Background()); err != nil {
+			t.Fatalf("iteration %d: Drain after the race reported %v", i, err)
+		}
+	}
+}
