@@ -231,7 +231,7 @@ func TestProbeExpectationFollowsTheDeployedSubsetNotTheConfig(t *testing.T) {
 // A host's probe series must survive a round that could not probe it because its
 // certificate's pass was already in flight.
 //
-// RunAll skips a certificate whose claim is held, so that certificate never reaches
+// A pass skips a certificate whose claim is held, so that certificate never reaches
 // probeCert and never lands in this round's probed set. Reclaiming on "absent from this
 // round" alone then deletes the series of a host that is being probed right now -- the
 // flicker reclaimStaleProbeSeries exists to avoid, and a false alert for anything paging on

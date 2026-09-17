@@ -186,7 +186,7 @@ func TestNotifierReceivesRenewalResult(t *testing.T) {
 	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
 	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	select {
 	case ev := <-notifier.events:
@@ -212,7 +212,7 @@ func TestNotifierReceivesFailure(t *testing.T) {
 	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
 	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	select {
 	case ev := <-notifier.events:
@@ -339,7 +339,7 @@ func TestStartAllSkipsBusyCerts(t *testing.T) {
 	close(release)
 }
 
-func TestRunAllSkipsBusyCerts(t *testing.T) {
+func TestAPassSkipsBusyCerts(t *testing.T) {
 	const busy = "busy-runall"
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -355,9 +355,9 @@ func TestRunAllSkipsBusyCerts(t *testing.T) {
 	go func() { _ = r.RunCert(context.Background(), busy) }()
 	<-entered
 
-	skipped := r.RunAll(context.Background())
+	skipped := r.RunDetailed(context.Background()).Skipped
 	if len(skipped) != 1 || skipped[0] != busy {
-		t.Errorf("RunAll should skip %q, got %v", busy, skipped)
+		t.Errorf("a pass should skip %q, got %v", busy, skipped)
 	}
 	close(release)
 }
@@ -385,16 +385,16 @@ func TestCertNamesPreservesConfigOrder(t *testing.T) {
 	}
 }
 
-// This is the entire reason RunOnce exists: one exploding certificate must not
+// This is the entire reason a pass does not abort: one exploding certificate must not
 // stall the others' renewals. The most dangerous thing in automation is that
 // coupling — one mistyped domain and no certificate on the site renews.
-func TestRunOnceContinuesAfterOneCertFails(t *testing.T) {
+func TestAPassContinuesAfterOneCertFails(t *testing.T) {
 	mgr := &fakeManager{failWith: map[string]error{
 		"b": errors.New("boom"),
 	}}
 	r, _ := newTestReconciler(t, []string{"a", "b", "c"}, mgr)
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if len(mgr.calls) != 3 {
 		t.Fatalf("all three certificates should be processed, only got %v", mgr.calls)
@@ -408,11 +408,11 @@ func TestRunOnceContinuesAfterOneCertFails(t *testing.T) {
 	}
 }
 
-func TestRunOnceReapsRetiredCerts(t *testing.T) {
+func TestAPassReapsRetiredCerts(t *testing.T) {
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"only"}, mgr)
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if mgr.reaped != 1 {
 		t.Errorf("every pass should reap retired certificates once, got %d", mgr.reaped)
@@ -420,14 +420,14 @@ func TestRunOnceReapsRetiredCerts(t *testing.T) {
 }
 
 // After a stop signal, no further certificates should be processed.
-func TestRunOnceStopsOnContextCancel(t *testing.T) {
+func TestAPassStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	mgr := &fakeManager{onReconcile: func(string) { cancel() }}
 	r, _ := newTestReconciler(t, []string{"a", "b", "c"}, mgr)
 
-	r.RunOnce(ctx)
+	r.RunDetailed(ctx)
 
 	if len(mgr.calls) != 1 {
 		t.Errorf("after cancellation it should stop at the first, processed %v", mgr.calls)
@@ -443,7 +443,7 @@ func TestPublishExportsNotAfter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	got := testutil.ToFloat64(metrics.CertNotAfter.WithLabelValues("pub-notafter"))
 	if int64(got) != notAfter.Unix() {
@@ -464,7 +464,7 @@ func TestPublishDeployedRequiresConfirmation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.CertDeployed.WithLabelValues(name)); got != 0 {
 		t.Errorf("CertDeployed should be 0 when the binding is unconfirmed, got %v", got)
 	}
@@ -476,7 +476,7 @@ func TestPublishDeployedRequiresConfirmation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.CertDeployed.WithLabelValues(name)); got != 1 {
 		t.Errorf("CertDeployed should be 1 after confirmation, got %v", got)
 	}
@@ -489,7 +489,7 @@ func TestPublishMissingCertIsNoop(t *testing.T) {
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{name}, mgr)
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	// The point is no panic. The metric should be at its default 0 here.
 	if got := testutil.ToFloat64(metrics.CertConsecutiveFailures.WithLabelValues(name)); got != 0 {
@@ -497,7 +497,7 @@ func TestPublishMissingCertIsNoop(t *testing.T) {
 	}
 }
 
-func TestRunOnceCountsFailuresInMetrics(t *testing.T) {
+func TestAPassCountsFailuresInMetrics(t *testing.T) {
 	const name = "pub-failcount"
 	mgr := &fakeManager{failWith: map[string]error{name: errors.New("boom")}}
 	r, store := newTestReconciler(t, []string{name}, mgr)
@@ -506,7 +506,7 @@ func TestRunOnceCountsFailuresInMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if got := testutil.ToFloat64(metrics.CertConsecutiveFailures.WithLabelValues(name)); got != 3 {
 		t.Errorf("the consecutive failure count should surface as 3, got %v", got)
@@ -547,7 +547,7 @@ func TestUnreadableSourceSkipsThePassEntirely(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	before := testutil.ToFloat64(metrics.DesiredStateErrors)
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if len(mgr.calls) != 0 {
 		t.Errorf("an unreadable source should process no certificates, processed %v", mgr.calls)
@@ -583,7 +583,7 @@ func TestOrphanedCertificatesAreReported(t *testing.T) {
 
 	r := New(cfg, spec.NewStatic(cfg.Certificates), store, &fakeManager{}, nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if got := testutil.ToFloat64(metrics.OrphanedCertificates); got != 1 {
 		t.Errorf("should report 1 orphaned certificate, got %v", got)
@@ -769,7 +769,7 @@ func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
 		}
 	}
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if !hasCertSeries(t, "gone") || !hasCertSeries(t, "kept") {
 		t.Fatal("both certificates should be exported after the first pass")
 	}
@@ -777,7 +777,7 @@ func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
 	// The declaration disappears.
 	prov.set(config.Certificate{Name: "kept"})
 	cfg.Certificates = []config.Certificate{{Name: "kept"}}
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	if hasCertSeries(t, "gone") {
 		t.Error("the removed certificate's series must be reclaimed, or its frozen " +
@@ -790,7 +790,7 @@ func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
 
 // RunCert asks for one specific certificate, so its caller must hear the pass's
 // own failure -- reporting success while the pass errored makes a targeted
-// trigger look healthy when it was not. RunAll deliberately stays
+// trigger look healthy when it was not. A pass deliberately stays
 // fire-and-forget: one failing certificate must not stall the others.
 func TestRunCertPropagatesTheReconcileError(t *testing.T) {
 	boom := errors.New("boom")
@@ -899,7 +899,7 @@ func TestReconcileOneRecoversPanics(t *testing.T) {
 	}
 
 	// And a full pass must still reach the certificates after the panicking one.
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	calls := mgr.reconciled()
 	seen := map[string]bool{}
 	for _, n := range calls {
@@ -1007,7 +1007,7 @@ func TestOrphanCleanupIsWired(t *testing.T) {
 		t.Fatal("the prober should remember the host before the drop")
 	}
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	if cleaned := mgr.orphanCleaned(); len(cleaned) != 1 || cleaned[0] != gone {
 		t.Errorf("CleanupOrphan should be called exactly once, for %q, got %v", gone, cleaned)
@@ -1195,7 +1195,7 @@ func (panickingProber) Forget(string) {}
 // re-orders into the "5 certificates per exact set of identifiers / 7 days" limit.
 //
 // The claim is held here directly rather than by racing a real pass, so the assertion is
-// deterministic: publishOrphans runs at the top of RunAll, before the loop that claims.
+// deterministic: publishOrphans runs at the top of a pass, before the loop that claims.
 func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 	const (
 		gone = "in-flight-cert"
@@ -1233,7 +1233,7 @@ func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 		t.Fatal("acquiring the claim should succeed on a fresh reconciler")
 	}
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	if cleaned := mgr.orphanCleaned(); len(cleaned) != 0 {
 		t.Errorf("the orphan teardown ran for a certificate with a pass in flight (%v); "+
@@ -1242,7 +1242,7 @@ func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 
 	// Once the pass releases, the next round must reap it -- skipping must not mean losing.
 	r.release(gone)
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	if cleaned := mgr.orphanCleaned(); len(cleaned) != 1 || cleaned[0] != gone {
 		t.Errorf("after the claim is released the orphan must be reaped exactly once, got %v", cleaned)
@@ -1280,7 +1280,7 @@ func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
 	// earlier run already counted it".
 	before := reconcileCounts(t, name)
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	// No notification: nothing was attempted.
 	select {
@@ -1336,7 +1336,7 @@ func TestGenuineFailureStillCountsAndNotifies(t *testing.T) {
 
 	before := reconcileCounts(t, name)
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	select {
 	case ev := <-notifier.events:
@@ -1404,7 +1404,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 
 	// Nothing outstanding: the pass must not even ask the manager to retry, and the gauge must say
 	// so -- an operator reading wecert_revocation_pending at rest has to see 0, not nothing at all.
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if mgr.revocationRetries != 0 {
 		t.Errorf("with nothing outstanding the pass must skip the retry entirely, got %d calls",
 			mgr.revocationRetries)
@@ -1419,7 +1419,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 	mgr.pendingRevocations = 1
 	mgr.mu.Unlock()
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if mgr.revocationRetries != 1 {
 		t.Errorf("an outstanding revocation must be retried on the pass, got %d calls",
 			mgr.revocationRetries)
@@ -1429,7 +1429,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 			got)
 	}
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if mgr.revocationRetries != 2 {
 		t.Errorf("it must be retried on every pass until it succeeds, got %d calls",
 			mgr.revocationRetries)
@@ -1440,7 +1440,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 	mgr.pendingRevocations = 0
 	mgr.mu.Unlock()
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if mgr.revocationRetries != 2 {
 		t.Errorf("an accepted revocation must not be retried again, got %d calls",
 			mgr.revocationRetries)
@@ -1455,7 +1455,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 	mgr.mu.Lock()
 	mgr.pendingRevocations = 2
 	mgr.mu.Unlock()
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.RevocationPending); got != 2 {
 		t.Fatalf("setup: the gauge must track the count before the failure, got %v", got)
 	}
@@ -1466,7 +1466,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 	mgr.pendingRevocationsErr = errors.New("state.db is unreadable")
 	mgr.mu.Unlock()
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.RevocationPending); got != 2 {
 		t.Errorf("a failed read must leave wecert_revocation_pending stale, not rewrite it to %v",
 			got)
@@ -1491,7 +1491,7 @@ func TestOnlyAFullPassStampsLastReconcile(t *testing.T) {
 	metrics.LastReconcile.Set(0)
 
 	started := time.Now().Add(-time.Second).Unix()
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.LastReconcile); got < float64(started) {
 		t.Errorf("a completed pass must stamp wecert_last_reconcile_timestamp_seconds with the time "+
 			"it finished; got %v, which is not after the pass started", got)
