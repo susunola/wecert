@@ -163,7 +163,14 @@ sudo systemctl enable --now wecert                      # daemon, reconciles hou
 
 Run **one** of the two per machine. They share one state database, and the second process is
 **refused at startup** by the lock on it (exit non-zero: `the state database is already held by
-another wecert process`) rather than queued. Two processes placing orders for the same certificate
+another wecert process`) rather than queued.
+
+The two modes differ in how they report a bad pass. The daemon logs per-certificate failures and
+keeps running; the timer's unit is **oneshot**, so `-once` exits non-zero when the pass did not
+converge (a certificate failed, the desired state was unreadable, or nothing was attempted while
+everything was skipped -- the state a certificate stuck in a long backoff sits in). `systemctl
+status wecert-once` and `journalctl -u wecert-once` then show a failed unit instead of a green
+timer over a fleet that went unmanaged. Two processes placing orders for the same certificate
 would race the same rate limits, and "at most one in-flight order per certificate" only holds
 inside a single process.
 

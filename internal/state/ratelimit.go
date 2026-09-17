@@ -61,6 +61,11 @@ func (s *Store) GetRateBucket(limitName, scopeID string) (*RateBucket, error) {
 // UpdateRateBucket reads one bucket, applies fn, and writes the result back as a single
 // operation under the store's mutex.
 //
+// fn runs while the store's mutex is held, so it must not call back into the Store: s.mu is a
+// plain sync.Mutex, not a reentrant one, and a callback that reads or writes through the same Store
+// would deadlock rather than make progress. Every current caller is pure arithmetic on the record
+// it is handed; that is the contract, not an accident.
+//
 // The read and the write have to be one operation, for the same reason UpdateCert exists: the
 // mutex covers one statement, not a Get...Put pair, so two concurrent callers both read the same
 // token count and the second write silently discards the first caller's spend. That is not a

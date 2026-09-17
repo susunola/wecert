@@ -16,7 +16,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -26,10 +25,11 @@ import (
 	"time"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
-	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	dnspod "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
+
+	"github.com/susunola/wecert/internal/tcerr"
 )
 
 func main() {
@@ -297,7 +297,7 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 	if err != nil {
 		// When there are no records at all DNSPod returns an error code rather than an
 		// empty list -- which is exactly the state we want, so it must not count as failure.
-		if isNoRecord(err) {
+		if tcerr.IsNoDataOfRecord(err) {
 			fmt.Println()
 			fmt.Println("[3/4] _acme-challenge leftover check")
 			fmt.Println("      OK - no leftover TXT records")
@@ -330,22 +330,6 @@ func deref(s *string) string {
 		return "<nil>"
 	}
 	return *s
-}
-
-// isNoRecord reports whether the error means "the record list is empty".
-// DNSPod expresses that with ResourceNotFound.NoDataOfRecord.
-func isNoRecord(err error) bool {
-	if err == nil {
-		// A nil error is not "no record": it means the call succeeded, and reporting that as an
-		// absent record would silently pass the delegation check. Guarding also keeps the
-		// substring fallback below from dereferencing nil, which panicked before.
-		return false
-	}
-	var sdkErr *tcerrors.TencentCloudSDKError
-	if errors.As(err, &sdkErr) {
-		return sdkErr.Code == "ResourceNotFound.NoDataOfRecord"
-	}
-	return strings.Contains(err.Error(), "NoDataOfRecord")
 }
 
 // listCertificates lists the SSL certificates in the account.

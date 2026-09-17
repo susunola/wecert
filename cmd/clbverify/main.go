@@ -143,10 +143,14 @@ func run() error {
 
 		bound, lastErr := pollUntilBound(waitCtx, *wait, func() ([]string, error) {
 			return fetchBoundCertIDs(waitCtx, client, *lbID, *listenerID, *domain)
-		}, *expect, func(ids []string) {
+		}, *expect, func(ids []string, err error) {
+			if err != nil {
+				// The query failing and "not switched over yet" are two different things, and
+				// both have to be visible.
+				fmt.Printf("  ...query failed, retrying shortly: %v\n", err)
+				return
+			}
 			fmt.Printf("  ...waiting; currently bound to %v\n", ids)
-		}, func(err error) {
-			fmt.Printf("  ...query failed, retrying shortly: %v\n", err)
 		})
 		if !contains(bound, *expect) && lastErr != nil {
 			fmt.Printf("  ...note: the final query also failed, so the assertion above may not be trustworthy: %v\n", lastErr)
@@ -171,6 +175,12 @@ func run() error {
 	return nil
 }
 
+// bindingsPollInterval is how long to wait between queries while -wait allows it.
+//
+// The sleep is capped to whatever remains of the budget, so this is a ceiling rather than a
+// fixed delay.
+const bindingsPollInterval = 5 * time.Second
+
 // pollUntilBound polls fetch until the expected certificate appears or the budget runs out, and
 // returns the last set it saw plus the last query error.
 //
@@ -184,10 +194,8 @@ func pollUntilBound(
 	budget time.Duration,
 	fetch func() ([]string, error),
 	expect string,
-	onPoll func([]string),
-	onError func(error),
+	onAttempt func(ids []string, err error),
 ) (ids []string, lastErr error) {
-	const interval = 5 * time.Second
 	deadline := time.Now().Add(budget)
 
 	for {
@@ -199,26 +207,26 @@ func pollUntilBound(
 			// No more silent continue: the query itself failing and "not switched over yet" are
 			// two completely different things, and both must be visible.
 			lastErr = err
-			if onError != nil {
-				onError(err)
-			}
 		} else {
 			lastErr = nil
 			ids = got
-			if onPoll != nil {
-				onPoll(got)
-			}
 			if contains(ids, expect) {
+				if onAttempt != nil {
+					onAttempt(got, nil)
+				}
 				return ids, nil
 			}
+		}
+		if onAttempt != nil {
+			onAttempt(ids, lastErr)
 		}
 
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return ids, lastErr
 		}
-		if remaining > interval {
-			remaining = interval
+		if remaining > bindingsPollInterval {
+			remaining = bindingsPollInterval
 		}
 		select {
 		case <-ctx.Done():
@@ -403,7 +411,3 @@ func derefI64(v *int64) int64 {
 	}
 	return *v
 }
-
-// retryIntervalForTest exposes the poll interval so a test can assert it exceeds the budget it
-// uses -- the assertion only means something while the production interval is the larger of the two.
-func retryIntervalForTest() time.Duration { return 5 * time.Second }

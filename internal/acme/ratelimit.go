@@ -30,17 +30,6 @@ func (a rateBucketAdapter) GetRateBucket(limitName, scopeID string) (*ratelimit.
 	}, nil
 }
 
-func (a rateBucketAdapter) PutRateBucket(rec *ratelimit.BucketRecord) error {
-	return a.store.PutRateBucket(&state.RateBucket{
-		LimitName:   rec.LimitName,
-		ScopeID:     rec.ScopeID,
-		Tokens:      rec.Tokens,
-		ObservedAt:  rec.ObservedAt,
-		ResetAt:     rec.ResetAt,
-		ResetReason: rec.ResetReason,
-	})
-}
-
 // UpdateRateBucket translates the boundary type and applies fn inside the store's own lock, so a
 // spend cannot be lost to a concurrent pass spending on the same account-scoped bucket.
 func (a rateBucketAdapter) UpdateRateBucket(limitName, scopeID string, fn func(*ratelimit.BucketRecord) error) error {

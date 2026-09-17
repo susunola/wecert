@@ -91,6 +91,21 @@ clear 先落盘，提升与删单在事务里。事务失败时（错误信息�
 | m3 | `cmd/tatrun/main.go:112-126` | `SUCCESS` 但 `TaskResult == nil` 时报成功、退出 0、无输出 | **核实**。这是"取证工具在拿不到证据时不该判成功"的典型（仓库自己的 docs/test-plan.md 也这么写）。**已修**：SUCCESS 但 `TaskResult == nil` 直接返回错误（并说明「没有可报告的证据」）。用例 `TestWaitForTaskRefusesSucceededWithoutEvidence`；恢复旧分支后变红。 |
 | m4 | `internal/deploy/tencent.go:969-991` | `countBindings` 对"一个 region 都没数到"的响应给出 `complete:true, count:0` | **代码层核实，可达性未证实**：`res == nil`／空 `BindResourceRegionResult` 不会把 `complete` 置假（而同函数里 `region == nil` 会）。子代理查了本会话落盘的原始响应，真实服务端总是把条目填全，所以这更像**防御性缺口**而非已观测故障；但一旦出现，"旧证书 0 绑定"会被当成"切换已发生"的证据。**已修**：`res == nil` 或该条目一个 region 都没数到时 `complete = false`。用例 `TestAnUnpopulatedBindingEntryIsNotAnAuthoritativeZero`（nil 条目与无 region 两种形状）。 |
 
+### 2.4 后续补修的 6 条（原先「未核实」，现已核实并修复）
+
+| # | 位置 | 问题 | 状态 |
+|---|---|---|---|
+| N1 | `cmd/wecert/main.go`（`-once` 路径） | `RunOnce` 丢弃 `RunReport`，于是 `wecert-once.service` 在**每条证书都失败**时仍退出 0；`Trouble()` 没有任何生产调用者 | 已修：改用 `RunDetailed`，`Trouble()` 为真即返回错误；`onceExit` 的三种 trouble 形态与两种健康形态各有断言 |
+| N2 | `internal/spec/observe.go` | 文件源首次读取成功后再也**不返回错误**，而是返回 frozen + nil error；于是 observe 模式对着读不出来的文档算出一份「安静」的差异，`ShadowReport.Error` 为空，切 enforce 的判据（`shadow_errors_total` / `shadow_last_read`）看起来一切正常 | 已修：frozen 的 shadow 报成「没有比较」；用例 `TestObserverReportsAFrozenShadowAsNoComparison`（去掉即变红） |
+| N3 | `internal/ratelimit/ratelimit.go` | `Spend` 把快照锚点写成 `now`，即使时钟回拨；`Tokens` 已经计息到旧锚点，于是 `[now, s.At]` 会被**重复计息**，凭空多出配额 | 已修：锚点只向前走；用例 `TestASpendOnABackwardClockDoesNotReAnchorTheSnapshot` |
+| N4 | `cmd/tatrun/main.go` | 截断的远端输出被当成完整结果打印，`Dropped` / `OutputUrl` 完全没用 | 已修：给出截断警告，且**不打印签名部分**（见下一条 P2）；用例断言警告包含丢弃字节数、不含 `q-signature` 等凭据 |
+| N5 | `cmd/wecert/main.go` | 「快照已启用但目录不可写」分支**不可达**（`EnabledOr` 把显式设置直接返回，第一个分支已经吃掉），循环照常启动、每轮失败并打 ERROR | 已修：`planStateBackups` 把「开关」与「目录」分开判定；用例枚举五种组合 |
+| N6 | `cmd/clbverify/main.go` | `-wait` 只限定尝试次数不限定耗时：先睡满一个间隔才看截止时间，`-wait 1s` 会阻塞 5s | 已修：先查一次、sleep 上限取剩余预算；用例断言 80ms 预算的耗时上限，并在把 sleep 改回固定间隔后变红 |
+
+同轮依据 `code-review-expert` 复审结果补的小改动：日志 URL 去签名（P2）、`UpdateRateBucket` 的回调不得重入 store 的契约写明（P2）、DNSPod 空结果判定收敛到新的 `internal/tcerr`（P2，原先 `cmd/preflight` 与 `internal/onboarding` 各一份）、`bucketStore` 拆成读/写两个接口并删掉已无人使用的 `PutRateBucket`（P2）、采纳任务校验成功后打印耗时与绑定数（P2）、`pollUntilBound` 的回调合二为一并把轮询间隔提成常量（P3）。
+
+---
+
 ## 3. 精度说明（这份审查的可信度边界）
 
 - 工作流原始输出 36 条，落盘时被截断，**完整回收 21 条**；下面这些是我**逐条回代码核对**的：B1、B2、M1–M7、m1–m4，共 **15 条**。其余 6 条（`reconcile.go` 的 `RunOnce` 丢弃 `RunReport`、`internal/spec/observe.go` 的 frozen shadow 被报成新鲜对比、`rate-limit` 的时钟回拨重复计息、`ratelimit` 的 `Spendable` 之外几条 minor）**未逐条核实**，按"工具报告、待确认"看待。
