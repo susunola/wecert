@@ -146,7 +146,11 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 				// agent installed) sends the operator looking for a timeout that never
 				// happened, when the server already said exactly what was wrong.
 				if task.TaskResult != nil {
-					fmt.Print(deref(task.TaskResult.Output))
+					// Decoded like the success path. The API returns Base64, so printing it raw
+					// handed the operator a blob exactly when the command had failed -- the
+					// moment the output is the whole point. Found by using the tool: a command
+					// whose last statement exited non-zero printed its own error as Base64.
+					fmt.Print(decodeRemoteOutput(deref(task.TaskResult.Output)))
 				}
 				return fmt.Errorf("TAT task %s: %s", deref(task.TaskStatus), deref(task.ErrorInfo))
 			}
