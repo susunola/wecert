@@ -373,22 +373,17 @@ func (o *Onboarder) Run(ctx context.Context) (*Report, error) {
 	return r.rep, nil
 }
 
-// Commit persists: the desired-state document, the decision report, the onboarding
-// state.
+// Commit persists: the desired-state document, the onboarding state, the decision
+// report.
 //
 // When frozen it writes only the report -- the report is exactly what tells a human
 // why nothing moved this round.
 func (o *Onboarder) Commit(rep *Report) error {
-	if o.opts.ReportPath != "" {
-		if err := writeJSONAtomic(o.opts.ReportPath, rep); err != nil {
-			return err
-		}
-	}
 	if rep.Frozen() {
 		// When frozen no state is touched: AbsentSince would advance, but this round
 		// we do not know whether the names still exist; advancing it shortens the
 		// grace period on noise.
-		return nil
+		return o.writeReport(rep)
 	}
 
 	// The document goes first, the state second. A failure between the two leaves
@@ -406,7 +401,21 @@ func (o *Onboarder) Commit(rep *Report) error {
 			return err
 		}
 	}
-	return nil
+
+	// The report is written LAST, and the order is the contract: it is the human-readable
+	// claim about what this round did ("mode": "written", with a revision), so writing it
+	// before the files it describes leaves a report announcing a revision that was never
+	// written whenever a write fails in between -- and the operator reading the report has no
+	// way to see that. Written last, the report exists exactly when the round completed.
+	return o.writeReport(rep)
+}
+
+// writeReport persists the decision report, when a path is configured.
+func (o *Onboarder) writeReport(rep *Report) error {
+	if o.opts.ReportPath == "" {
+		return nil
+	}
+	return writeJSONAtomic(o.opts.ReportPath, rep)
 }
 
 // run carries the intermediate state of one evaluation round.

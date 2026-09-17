@@ -118,6 +118,13 @@ func (f *fakeManager) PublishQuota(scopes map[string]string) {
 	f.quotaScopes = append(f.quotaScopes, scopes)
 }
 
+// publishedQuota returns the scopes of every PublishQuota call so far.
+func (f *fakeManager) publishedQuota() []map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]string(nil), f.quotaScopes...)
+}
+
 func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1512,5 +1519,45 @@ func TestOnlyAFullPassStampsLastReconcile(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.LastReconcile); got != 0 {
 		t.Errorf("StartAll must not stamp the pass timestamp, got %v", got)
+	}
+}
+
+// A webhook-triggered pass must publish the rate-limit gauges when it finishes.
+//
+// Publishing lived only at the end of RunDetailed, so the webhook path -- which spends quota and
+// records the CA's Retry-After exactly like a scheduled pass -- never refreshed either gauge. A
+// deadline shorter than the polling interval (an hour by default) was then never visible as
+// blocked, which is the whole window it describes: WecertRateLimitBlocked could not fire for it.
+// The publish also has to come *after* the pass, or the spend it just made is not in the number.
+func TestAWebhookTriggeredPassPublishesQuotaWhenItFinishes(t *testing.T) {
+	started := make(chan struct{}, 4)
+	hold := make(chan struct{})
+	mgr := &fakeManager{onReconcile: func(string) {
+		started <- struct{}{}
+		<-hold
+	}}
+	r, _ := newTestReconciler(t, []string{"webhook-a"}, mgr)
+
+	if _, _, err := r.StartAll(context.Background()); err != nil {
+		t.Fatalf("StartAll failed: %v", err)
+	}
+	<-started
+
+	// The pass is in flight (blocked inside Reconcile), so nothing has been spent or decided yet.
+	if n := len(mgr.publishedQuota()); n != 0 {
+		t.Errorf("the gauges must be published when the pass finishes, not before it runs; got %d "+
+			"call(s) while the pass was still in flight", n)
+	}
+
+	close(hold)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(mgr.publishedQuota()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a webhook-triggered pass must publish the rate-limit gauges; otherwise a quota " +
+				"spend and the CA's deadline stay invisible until the next scheduled round, which " +
+				"an hour away is too late for a deadline that is shorter than that")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

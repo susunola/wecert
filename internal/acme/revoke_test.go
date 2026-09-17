@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 
 	legoacme "github.com/go-acme/lego/v4/acme"
@@ -594,5 +595,178 @@ func TestARequestIsHonouredFromTheArchiveWhenNothingIsStored(t *testing.T) {
 	}
 	if req, err := store.GetRevokeRequest(cert.Name); err != nil || req == nil {
 		t.Errorf("a request that could not be honoured must stay outstanding (req=%+v err=%v)", req, err)
+	}
+}
+
+// A failed ARI decision must schedule the retry, not just stop the round.
+//
+// The guard that refuses to renew when the decision itself failed was returning the bare error.
+// The write that failed is the one carrying ARICheckedAt, and that column is the ONLY thing
+// throttling the ARI call: with the store broken, every pass re-queried renewalInfo for every
+// certificate -- the exact loop renewalDecision's default branch exists to avoid. recordFailure
+// adds the backoff it could not persist, which is what a broken state store still costs.
+func TestAFailedARIDecisionSchedulesItsOwnBackoff(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(30 * 24 * time.Hour),
+		CertPEM: selfSignedCertPEM(t, fixed.Add(30*24*time.Hour), "example.com"),
+		// An ARI check is due, and the store dies while ARI is answering -- so the write that
+		// records ARICheckedAt is the one that fails.
+		ARICertID: "aki.serial",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake.beforeCall = func(call string) {
+		if call == "GetRenewalInfo" {
+			_ = store.Close()
+		}
+	}
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("the decision could not be made, so the pass must report a failure")
+	}
+	if _, ok := m.transientBackoffFor(cert.Name); !ok {
+		t.Error("a failed ARI decision must schedule a retry: without one, every pass re-queries the " +
+			"CA's renewalInfo for every certificate until the state store recovers")
+	}
+}
+
+// A cancelled pass is not a business failure, and must not cost a backoff window.
+//
+// This is the other half of the same guard: the ARI decision returns the context error when the
+// pass is shutting down, and recording that as a failure would lock the certificate out of the
+// next window for a stop signal. recordFailure filters it; a bare return trivially "passed" this,
+// which is why the fix has to keep it.
+func TestACancelledPassDoesNotSetABackoff(t *testing.T) {
+	store, m, _, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(30 * 24 * time.Hour),
+		CertPEM: selfSignedCertPEM(t, fixed.Add(30*24*time.Hour), "example.com"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := m.Reconcile(ctx, cert)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a stopped pass must report the cancellation, got %v", err)
+	}
+	if _, ok := m.transientBackoffFor(cert.Name); ok {
+		t.Error("a stop signal must not schedule a business backoff: after a restart the certificate " +
+			"would be locked out of the window it should have been renewed in")
+	}
+}
+
+// The new-order spend must follow the attempt that actually created the order.
+//
+// A renewal whose `replaces` the CA refuses is retried without it, and the retry is what creates
+// the order. Accounting ran on the first call alone, so that order was never counted: the
+// published lower bound (which gates the fleet against "300 new orders per account per 3 hours")
+// was optimistic by one, in the one flow that places orders in bursts -- every renewal that hits a
+// CA which will not honour the stored ARI certID.
+func TestTheNewOrderSpendFollowsTheAttemptThatCreatedTheOrder(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
+	now := m.now()
+
+	// The ARI window is in the past and was checked just now, so renewal is due and the order
+	// carries the stored certID as `replaces`.
+	if err := store.PutCert(&state.CertState{
+		Name:           cert.Name,
+		NotAfter:       now.Add(20 * 24 * time.Hour),
+		ARICertID:      "YWJj.ZGVm",
+		ARIWindowStart: now.Add(-2 * time.Hour),
+		ARIWindowEnd:   now.Add(-time.Hour),
+		ARICheckedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first attempt is refused and the retry succeeds. The order sequence converges, so the
+	// pass does not sit in the state machine's polling loop.
+	fake.newOrderErr = errors.New("ACME error: replaces is not honoured for this order")
+	fake.orders = []legoacme.ExtendedOrder{
+		{
+			Order:    legoacme.Order{Status: "pending", Finalize: "https://ca.test/finalize/1"},
+			Location: "https://ca.test/order/1",
+		},
+		terminalOrder("https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1"),
+	}
+
+	_ = m.Reconcile(context.Background(), cert)
+
+	if got := len(fake.newOrderReplaces); got != 2 {
+		t.Fatalf("expected the refused replaces attempt and the retry, got %d NewOrder call(s): %v",
+			got, fake.newOrderReplaces)
+	}
+	if fake.newOrderReplaces[1] != "" {
+		t.Fatalf("the retry must drop replaces, got %q", fake.newOrderReplaces[1])
+	}
+
+	bucket, err := store.GetRateBucket(ratelimit.NewOrdersPerAccount.Name, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := ratelimit.NewOrdersPerAccount.Capacity - 1; bucket.Tokens != want {
+		t.Errorf("the order the retry created must be counted: tokens=%v want %v. An order that is "+
+			"not counted makes the published lower bound -- the number an operator trusts against "+
+			"the account's 300-per-3-hours limit -- read higher than the real usage",
+			bucket.Tokens, want)
+	}
+}
+
+// A rate-limit refusal from the replaces retry must not be dropped.
+//
+// The first attempt is refused for a `replaces` reason, which carries no deadline; the retry is
+// then refused by the rate limiter, which does. Reading only the first error threw that deadline
+// away -- the one signal that says every certificate on the account has to wait, not just this one.
+func TestARateLimitRefusalFromTheRetryStillSetsTheDeadline(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	if err := store.PutCert(&state.CertState{
+		Name:           cert.Name,
+		NotAfter:       fixed.Add(20 * 24 * time.Hour),
+		ARICertID:      "YWJj.ZGVm",
+		ARIWindowStart: fixed.Add(-2 * time.Hour),
+		ARIWindowEnd:   fixed.Add(-time.Hour),
+		ARICheckedAt:   fixed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fake.newOrderErr = errors.New("ACME error: the requested replaces certificate was not issued by this account")
+	calls := 0
+	fake.beforeCall = func(call string) {
+		if call != "NewOrder" {
+			return
+		}
+		calls++
+		if calls == 2 {
+			// orderErr is sticky, so this refusal is what the retry sees.
+			fake.orderErr = errors.New("acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: " +
+				"too many new orders recently, retry after 2026-09-16 15:00:00 UTC")
+		}
+	}
+
+	_ = m.Reconcile(context.Background(), cert)
+
+	at, reason, blocked := m.quota.BlockedUntil(ratelimit.NewOrdersPerAccount, "")
+	if !blocked {
+		t.Fatal("the retry's rate-limit refusal names the instant the CA will listen again; dropping " +
+			"it leaves every certificate retrying into a closed door")
+	}
+	if want := time.Date(2026, 9, 16, 15, 0, 0, 0, time.UTC); !at.Equal(want) {
+		t.Errorf("deadline = %s, want %s", at, want)
+	}
+	if reason != ratelimit.NewOrdersPerAccount.Name {
+		t.Errorf("the deadline must name the limit, got %q", reason)
 	}
 }
