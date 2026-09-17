@@ -12,8 +12,8 @@
 |---|---|---|
 | 第 1 轮 | ACME 订单状态机；DNS 挑战层/ARI/吊销/配额记账；state + ratelimit；onboarding + spec + config；deploy + probe + reconcile + webhook + cmd | **已完成**（7 组复审返回，见 §2） |
 | 第 2 轮 | 第 1 轮剩下未修的项 + 并发/生命周期/资源泄漏视角 | **已完成**（见 §3） |
-| 第 3 轮 | 对本次会话全部改动的对抗性复审 + 不变量与属性/模糊测试 | 待做 |
-| 第 4 轮 | 跨面：文档 vs 行为、cmd/*、scripts、deploy、testenv，以及遗留项收口 | 待做 |
+| 第 3 轮 | 对本次会话全部改动的对抗性复审 + 不变量与属性/模糊测试 | **已完成**（见 §4） |
+| 第 4 轮 | 跨面：文档 vs 行为、cmd/*、scripts、deploy、testenv，以及遗留项收口 | **已完成**（见 §5） |
 
 ---
 
@@ -123,4 +123,37 @@
 
 ---
 
-## 3. 精度说明
+## 4. 第 3 轮：对抗性复审（攻击我自己刚做的修复）
+
+方法：`git diff b72d1e3..HEAD` 逐块读，对每处修复只问一句「它在什么情况下会把事情弄得更糟」；另有一个独立复审者拿到同样的任务（只审这一天的改动），结论写进 `/tmp/wecert-review-r4c/adversarial.json`。属性侧同时跑了 `make test-pebble`（2/2）、`make e2e`（3/3）、4 个 fuzz 目标（45s 各）、`go test -race -shuffle=on -count=2`（19/19）。
+
+**在自己刚做的修复里抓到两个缺陷**（都已修 + 变异校验）：
+
+| # | 是哪次修复引入的 | 缺陷 | 修法 |
+|---|---|---|---|
+| 1 | 4.1 的「仍在等第一次绑定」 | 提升新上传的同时，把**被替换的那张上传**从状态里抹掉了：它没有任何绑定（这正是判定成立的前提），承载它的行马上被覆盖，而回收记录没写 —— 于是这个 id 既不在 `certificates` 也不在 `retired_certificates`，**永远计费、永不回收** | 该情形下把旧 id 记入回收清单（安全性由两点保证：deployer 只在**两份枚举都完整且为 0** 时才报 `ErrNothingBoundYet`，且删除时云端仍会因资源引用而拒绝）。用例扩到断言回收清单里有 `cloud-old`，去掉修复即变红 |
+| 2 | 4.1b 的「fallback 读不到就保持」 | 我复用了「有降级在生效」那个标志，而 `applyFallback` 也读它 —— 那条路径**跳过到期窗口判断**（降级一旦生效就继续，不看剩余寿命）。于是一次状态库抖动就能让一张离到期还很远的证书**丢名字**，与「保持」的初衷正好相反 | 拆成独立标志 `fallbackUnknown`：只让 SAN drift 分支保持，不告诉 `applyFallback`「有降级在生效」。新用例先断言「若真的在降级，这份 fixture 确实会丢名字」（避免空测试），再断言读不到时不丢名字；把两个标志都置上即变红 |
+| 3 | 4.1b 的限流归类 | 我按「registered domain」这个词匹配，但 Boulder 对这条限额的真实文案**不含这三个词**：`too many certificates (%d) already issued for %q in the last %s, retry after %s`（从 Boulder 源码 `ratelimits/limiter.go` 取回逐条核对），于是它压根匹配不上、又退回 new-orders | 按真实形状匹配（`already issued for "…"`，且不是 exact set），并**从消息里取出 CA 点名的那个域名**作为 scope（证书跨多个注册域时，猜「第一个」会把告警指向没被限流的那个）。用例改成 Boulder 的真实串，且证书的两个注册域故意让被点名的排在第二；去掉提取、或退回旧词匹配，各自变红 |
+
+**这一轮也确认了没有问题的部分**：`Spend` 的容量钳制对欠债桶/零容量桶都给出保守读数（fuzz 目标覆盖）；`: see ` 截断不会吞掉合法消息（时间戳是前缀，且仍有 `trimTrailing`）；`Drain` 在 `-once` 与守护进程两条退出路径上都成立；`MaxBytesReader` 的 413 与 `errors.As` 匹配正确；`challenge_prepared_at` 的 `CASE WHEN excluded > 0` 在「不改年龄的写入」上保留原值（旧库迁移用例覆盖）。
+
+---
+
+## 5. 第 4 轮：跨面收口（文档 vs 行为、脚本、cmd、部署面）
+
+| 面 | 检查 | 结果 |
+|---|---|---|
+| 文档 vs 行为 | `docs/desired-state.md`（守卫/carry、闸门 3）、`docs/test-cases.md`（TC-PROBE-11/13/15 与新增 TC-PROBE-21b）、`README.md` + `README.zh-CN.md`（probe `-json` 是 NDJSON；`-prune-certs` 把云端拒绝报成失败） | 4 处更新，已提交；`docs/staging-checklist.md` 的 `clbverify -raw` 步骤因「-raw 现在同时断言」而更强，无需改 |
+| 脚本 | `scripts/e2e-wildcard.sh`（等待窗口）、自测 5/5、`shellcheck` 干净；`scripts/check-alerts.py` + 自测通过；`scripts/e2e.sh` 三个套件通过 | 无发现 |
+| 告警/指标 | `deploy/prometheus/wecert-alerts.yml`（fallback 注解不再插值错的数字）、`check-alerts` 17 条规则引用的序列都存在 | 无发现 |
+| `cmd/*` | 6 个二进制全部在本轮被改过（`wecert`：UA 位置、drain、事后撤销顺序；`wecert-onboard`：报错输出；`wecert-probe`：每次尝试都执行 + 每个地址都判定；`clbverify`：-raw 断言 + 双凭据；`preflight`：删除判定 + 证书数；`tatrun`：失败输出解码 + 超时消息）；每个新行为都有用例 | 无遗留 |
+| `testenv/` | 三个 `tfplan-*` 二进制已停止跟踪并加入 `.gitignore`；`terraform.tfvars`/README 未受影响 | 见 §3.4 |
+| 遗留项 | §2.7 的 12 条：11 条已修，1 条（LC-2 客户端复用）与 LC-4 明确记为「核实为真但故意不改」，理由见 §3.2 | 收口 |
+
+**四轮总计**：复审者返回 37（第 1 轮）+ 4（第 2 轮）+ 独立对抗复审（第 3 轮，与本轮自查并行）条；**已修 30 条**（第 1 轮 28、第 2 轮 2、第 3 轮又自查出 2 条并修），**驳回 3 条**，**核实为真但故意不改 2 条**，其余按「脚手架 / 需产品决策」分类记录。所有修复都带「去掉修复就变红」的用例（唯一的例外是报告 fsync，属持久性加固，已注明无行为用例）。
+
+---
+
+## 6. 精度说明（这份审查的可信度边界）
+
+---
