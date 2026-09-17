@@ -15,6 +15,24 @@ import (
 // returned: nothing has been deleted from Tencent Cloud.
 var ErrDeploymentDisabled = errors.New("cloud deployment is disabled")
 
+// ErrSwitchUnverified reports that the one-click switch is reported as done, but that
+// wecert could not independently confirm the new certificate is bound: the bind-resource
+// enumeration did not finish within its budget, or did not cover every region.
+//
+// It is deliberately NOT a failure. The deploy record -- the authoritative account of what
+// the switch did -- already reported it finished with no failed resources, and the
+// enumeration is an asynchronous server-side cache whose completion time is not ours to
+// bound. Failing the pass here is not self-correcting: by then the old certificate has no
+// bindings left, so the next round re-runs the same deploy, meets the same enumeration
+// delay, and the state never records the certificate that is actually serving traffic.
+// Observed for real on a shared account: three consecutive passes each reported
+// `success=1 failed=0`, and `deployed_cert_id` stayed on the old certificate while
+// `not_after` stayed at 0.
+//
+// Callers record the new certificate as deployed but unconfirmed, so the next pass's cheap
+// binding probe settles it, and the deployed metric stays honest in the meantime.
+var ErrSwitchUnverified = errors.New("the switch is reported as done but its binding could not be verified")
+
 // Deployer abstracts the deployment target.
 //
 // It is an interface because Tencent Cloud offers two routes and the controller should
