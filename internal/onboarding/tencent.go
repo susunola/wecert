@@ -2,7 +2,6 @@ package onboarding
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -10,12 +9,12 @@ import (
 
 	clbsdk "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
-	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	dnssdk "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/tcerr"
 )
 
 // Page sizes. DNSPod's DescribeRecordList caps a page at 3000; 100 is used here:
@@ -186,22 +185,6 @@ func (d *DNSPodDeclarations) listZones(ctx context.Context, client dnspodAPI) ([
 	return zones, nil
 }
 
-// isNoRecordsError reports whether the API answered "this query matched nothing".
-//
-// The error code is not a failure to read the zone: DNSPod has returned it both for a zone with
-// no records and for a filtered query with no match, which is why ErrorOnEmpty is set above and
-// this stays as the belt to that braces.
-func isNoRecordsError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var sdkErr *tcerrors.TencentCloudSDKError
-	if errors.As(err, &sdkErr) {
-		return sdkErr.Code == "ResourceNotFound.NoDataOfRecord"
-	}
-	return strings.Contains(err.Error(), "NoDataOfRecord")
-}
-
 // listTXTRecords reads a zone's TXT records and picks out the _wecert.* ones.
 //
 // Deliberately no Keyword filter: whether the server-side fuzzy search covers
@@ -230,7 +213,7 @@ func (d *DNSPodDeclarations) listTXTRecords(ctx context.Context, client dnspodAP
 
 		resp, err := client.DescribeRecordListWithContext(ctx, req)
 		if err != nil {
-			if isNoRecordsError(err) {
+			if tcerr.IsNoDataOfRecord(err) {
 				break
 			}
 			return nil, fmt.Errorf("list TXT records: %w", err)

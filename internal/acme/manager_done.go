@@ -80,6 +80,11 @@ func (m *Manager) download(
 	// left. That is the direction this package promises to be wrong in: the alerting rule for
 	// "certs per exact identifier set" -- the limit with no override path -- must not be the one
 	// number that is structurally always full.
+	//
+	// A later failure of ours can double-count as well: the epilogue transaction may roll back
+	// after this point, and the next pass downloads the same certificate again (the CA issues it
+	// once, and the order is still valid) and spends a second slot. Also the conservative
+	// direction, and also bounded by one per retry.
 	m.quota.Spend(ratelimit.CertsPerExactIdentifierSet, c.DomainKey(), 1)
 	for _, domain := range uniqueRegisteredDomains(c.Domains) {
 		m.quota.Spend(ratelimit.CertsPerRegisteredDomain, domain, 1)

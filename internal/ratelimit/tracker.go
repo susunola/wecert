@@ -9,13 +9,27 @@ import (
 // bucketStore is the persistence the tracker needs. Defined here at the consumer so the
 // tracker can be tested without a real database, and so ratelimit does not depend on the
 // state package (which imports nothing of this one, keeping the layering one-way).
-type bucketStore interface {
+// bucketReader is what reading a limit needs.
+type bucketReader interface {
 	GetRateBucket(limitName, scopeID string) (*BucketRecord, error)
-	PutRateBucket(*BucketRecord) error
-	// UpdateRateBucket applies fn to the stored bucket as one operation. A read-modify-write
-	// through Get/Put loses concurrent updates: the manager runs one goroutine per certificate
-	// and they all spend on the same account-scoped bucket.
+}
+
+// bucketWriter is what changing a limit needs.
+//
+// UpdateRateBucket applies fn to the stored bucket as ONE operation. A read-modify-write through
+// Get then Put loses concurrent updates -- the manager runs one goroutine per certificate and they
+// all spend on the same account-scoped bucket -- which is why there is no Put here: a caller that
+// wants to change a bucket has no business writing a value it read earlier.
+//
+// fn runs under the store's lock and must not call back into the store.
+type bucketWriter interface {
 	UpdateRateBucket(limitName, scopeID string, fn func(*BucketRecord) error) error
+}
+
+// bucketStore is what the tracker needs: it both reads buckets and changes them.
+type bucketStore interface {
+	bucketReader
+	bucketWriter
 }
 
 // BucketRecord mirrors state.RateBucket.

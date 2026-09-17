@@ -287,3 +287,41 @@ func TestWaitForTaskWarnsWhenTheOutputIsTruncated(t *testing.T) {
 		t.Errorf("complete output must not warn, got %q", got)
 	}
 }
+
+// A presigned log URL must not be printed verbatim.
+//
+// TAT returns a link to the full output stored in COS, and a presigned link is the credential:
+// anyone holding it can fetch the object until it expires. This warning goes to stderr, which under
+// systemd is the journal -- often shipped somewhere with a wider audience than the command's owner.
+// The operator still has to learn that the output was partial and where the rest lives.
+func TestTruncationNoticeDoesNotPrintASignedURL(t *testing.T) {
+	signed := "https://bucket.cos.ap-guangzhou.myqcloud.com/log.txt" +
+		"?q-sign-algorithm=sha1&q-ak=AKIDEXAMPLE&q-signature=deadbeef"
+	notice := truncationNotice(&tat.TaskResult{
+		Output: common.StringPtr("partial"), Dropped: common.Uint64Ptr(4096),
+		OutputUrl: common.StringPtr(signed),
+	})
+	if notice == "" {
+		t.Fatal("truncated output must still warn")
+	}
+	for _, secret := range []string{"q-signature", "deadbeef", "AKIDEXAMPLE", "?"} {
+		if strings.Contains(notice, secret) {
+			t.Errorf("the warning leaks the signed part of the URL (%q present): %s", secret, notice)
+		}
+	}
+	if !strings.Contains(notice, "bucket.cos.ap-guangzhou.myqcloud.com") {
+		t.Errorf("the operator still needs to know where the log lives, got %q", notice)
+	}
+	if !strings.Contains(notice, "4096") {
+		t.Errorf("the warning must say how much was dropped, got %q", notice)
+	}
+
+	// An unparseable value is the one case where nothing may be echoed.
+	if got := truncationNotice(&tat.TaskResult{OutputUrl: common.StringPtr(":// not a url")}); strings.Contains(got, "://") {
+		t.Errorf("an unparseable URL must be withheld entirely, got %q", got)
+	}
+	// A plain URL without a signature is printed as-is.
+	if got := truncationNotice(&tat.TaskResult{OutputUrl: common.StringPtr("https://example.com/log")}); !strings.Contains(got, "https://example.com/log") {
+		t.Errorf("an unsigned URL is not a credential and is useful as-is, got %q", got)
+	}
+}

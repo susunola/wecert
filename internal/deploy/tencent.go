@@ -375,6 +375,7 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 			// So an adopted task is waited on and then verified the only way that answers
 			// the question that matters: is THIS certificate bound anywhere?
 			if resp.Response.DeployStatus != nil && *resp.Response.DeployStatus == 0 {
+				verifyStart := d.now()
 				d.log.Warn("another update task is already in progress; waiting for it and then "+
 					"verifying that this certificate is the one that got bound",
 					"oldCertId", oldID, "newCertId", newID, "deployRecordId", recordID)
@@ -405,6 +406,14 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 						"not bound to any resource afterwards; the task belonged to a different switch, so "+
 						"this deploy did not happen", newID)
 				}
+				// Say how long the verification took. It is bounded by the record wait (3m) plus the
+				// enumeration budget (3m), so a pass can legitimately spend minutes here, and without
+				// this line a slow verification is indistinguishable from a hung one in the journal.
+				// It is the same path that used to fail whenever the enumeration was slower than 30s,
+				// so the number is also the evidence that the budget is now adequate.
+				d.log.Info("verified the adopted update task",
+					"oldCertId", oldID, "newCertId", newID, "deployRecordId", recordID,
+					"boundResources", n.count, "took", d.now().Sub(verifyStart).Round(time.Second))
 				return nil
 			}
 
