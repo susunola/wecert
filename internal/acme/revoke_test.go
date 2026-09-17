@@ -1,8 +1,16 @@
 package acme
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"testing"
 	"time"
 
@@ -185,7 +193,7 @@ func TestPendingRevocationsCountsAndRefusesToGuess(t *testing.T) {
 	if n, err := m.PendingRevocations(); err != nil || n != 0 {
 		t.Fatalf("a fresh store has nothing pending, got (%d, %v)", n, err)
 	}
-	if err := store.AddRevokeRequest(cert.Name, 1, time.Now()); err != nil {
+	if err := store.AddRevokeRequest(cert.Name, 1, "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := m.PendingRevocations(); err != nil || n != 1 {
@@ -262,5 +270,329 @@ func TestAlreadyRevokedIsTerminalAndClearsTheRequest(t *testing.T) {
 	}
 	if again, err := store.GetRevokeRequest(cert.Name); err != nil || again == nil {
 		t.Errorf("a retryable failure must leave the request outstanding (req=%+v err=%v)", again, err)
+	}
+}
+
+// certPEMWithSerial issues a self-signed certificate with a chosen serial, so a test can hold two
+// certificates for one name that are tellable apart -- which is the whole question a revocation
+// request outliving a renewal turns on. The shared helper always uses serial 1.
+func certPEMWithSerial(t *testing.T, serial int64, dnsNames ...string) []byte {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: "test"},
+		DNSNames:              dnsNames,
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(30 * 24 * time.Hour),
+		AuthorityKeyId:        []byte{0x01, 0x02, 0x03},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("issue test certificate: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// leafIdentity is certIdentity of the stored PEM, for assertions.
+func leafIdentity(t *testing.T, certPEM []byte) string {
+	t.Helper()
+	leaf, err := leafCertificate(certPEM)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	return certIdentity(leaf)
+}
+
+// A revocation that outlives a renewal must revoke the certificate it was asked about.
+//
+// The request is durable, so its retry can land after a renewal has replaced the material stored
+// under the name -- and reconcile retries revocations AFTER the certificate loop, so the same pass
+// can install a new certificate and then revoke it. The retry used to read the current
+// certificates.cert_pem, which is now the new certificate: it revoked that, cleared the row as a
+// success, and left the compromised certificate valid -- the exact opposite of what the operator
+// asked for, on the one action where being wrong is unrecoverable.
+func TestARetryThatOutlivesARenewalRevokesTheArchivedCertificate(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	oldCert := certPEMWithSerial(t, 1001, "example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(30 * 24 * time.Hour), CertPEM: oldCert,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The operator asks while the compromised certificate is the one stored, and the CA is down,
+	// so the request stays outstanding.
+	fake.revokeErr = errors.New("acme: error: 503 :: service unavailable")
+	if err := m.RequestRevocation(context.Background(), cert.Name, RevocationReasons["keyCompromise"]); err == nil {
+		t.Fatal("the CA refused the revocation, so this must report a failure")
+	}
+	req, err := store.GetRevokeRequest(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req == nil {
+		t.Fatal("the request must be recorded")
+	}
+	if req.CertIdentity != leafIdentity(t, oldCert) {
+		t.Fatalf("the request must record which certificate it is about: got %q, want the stored "+
+			"leaf's identity %q", req.CertIdentity, leafIdentity(t, oldCert))
+	}
+
+	// A renewal happens: the new certificate is stored, and the old one is archived (this is what
+	// the deploy path does with the material it takes out of service).
+	newCert := certPEMWithSerial(t, 2002, "example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(90 * 24 * time.Hour), CertPEM: newCert,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddRetiredCert("cloud-cert-1", cert.Name, oldCert, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// The CA comes back. The retry belongs to the old certificate.
+	fake.revokeErr = nil
+	m.RetryPendingRevocations(context.Background())
+
+	if len(fake.revoked) != 2 {
+		t.Fatalf("expected the failed attempt and its retry, got %d calls", len(fake.revoked))
+	}
+	wantDER, err := leafDER(oldCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongDER, err := leafDER(newCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fake.revoked[1].DER, wantDER) {
+		t.Errorf("the retry revoked the wrong certificate: it sent %d bytes, and the certificate "+
+			"asked about is %d bytes (the newly issued one is %d). Revoking the live certificate "+
+			"leaves the compromised one valid and destroys coverage that was fine",
+			len(fake.revoked[1].DER), len(wantDER), len(wrongDER))
+	}
+	if again, err := store.GetRevokeRequest(cert.Name); err != nil || again != nil {
+		t.Errorf("the CA accepted the revocation of the certificate asked about, so the request is "+
+			"done (req=%+v err=%v)", again, err)
+	}
+	if n, err := m.PendingRevocations(); err != nil || n != 0 {
+		t.Errorf("nothing should be pending afterwards, got (%d, %v)", n, err)
+	}
+}
+
+// When the archived copy is gone the retry must not fall back to the live certificate.
+//
+// Retention reclaims retired material, so "the certificate asked about is not here any more" is a
+// real outcome. The one thing that must not happen then is revoking the replacement: it is valid,
+// it is serving traffic, and the compromised certificate would stay valid. The request stays
+// outstanding instead, which is what keeps wecert_revocation_pending and its alert up.
+func TestAReplacementIsNeverRevokedInPlaceOfTheRequestedCertificate(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	oldCert := certPEMWithSerial(t, 1001, "example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(30 * 24 * time.Hour), CertPEM: oldCert,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake.revokeErr = errors.New("acme: error: 503 :: service unavailable")
+	if err := m.RequestRevocation(context.Background(), cert.Name, RevocationReasons["keyCompromise"]); err == nil {
+		t.Fatal("the CA refused the revocation, so this must report a failure")
+	}
+
+	// A renewal, and the retired row holds no material (the orphan path records exactly this: a
+	// certificate wecert uploaded and never held a copy of).
+	newCert := certPEMWithSerial(t, 2002, "example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(90 * 24 * time.Hour), CertPEM: newCert,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddRetiredCert("cloud-cert-1", cert.Name, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	fake.revokeErr = nil
+	m.RetryPendingRevocations(context.Background())
+
+	if len(fake.revoked) != 1 {
+		t.Fatalf("only the first, failed attempt belongs here: the replacement certificate must "+
+			"never be sent in place of the one asked about, got %d calls", len(fake.revoked))
+	}
+	req, err := store.GetRevokeRequest(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req == nil {
+		t.Fatal("the request must stay outstanding: the certificate asked about has not been revoked")
+	}
+	if req.Attempts < 2 {
+		t.Errorf("the failed retry must be counted, got %d attempts", req.Attempts)
+	}
+	if !contains(req.LastError, "revoked at the CA") {
+		t.Errorf("the operator has to be told what is left to do, got last_error %q", req.LastError)
+	}
+}
+
+// A request recorded before identities were stored must still be honoured.
+//
+// Empty means "unknown", not "mismatch". Refusing on unknown would strand every request written by
+// an older build: the row could never be cleared, wecert_revocation_pending would stay up for a
+// certificate that may well have been revoked, and the operator's only way out would be editing
+// the database.
+func TestARequestWithoutAnIdentityRevokesTheStoredCertificate(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	stored := certPEMWithSerial(t, 1001, "example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(30 * 24 * time.Hour), CertPEM: stored,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// As an older build wrote it: no identity column at all.
+	if err := store.AddRevokeRequest(cert.Name, RevocationReasons["superseded"], "", fixed); err != nil {
+		t.Fatal(err)
+	}
+
+	m.RetryPendingRevocations(context.Background())
+
+	if len(fake.revoked) != 1 {
+		t.Fatalf("expected one revoke call, got %d", len(fake.revoked))
+	}
+	wantDER, err := leafDER(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fake.revoked[0].DER, wantDER) {
+		t.Error("a request with no recorded identity revokes the material stored under the name")
+	}
+	if req, err := store.GetRevokeRequest(cert.Name); err != nil || req != nil {
+		t.Errorf("the CA accepted it, so the request is done (req=%+v err=%v)", req, err)
+	}
+}
+
+// Asking again after a renewal is a decision about the certificate stored now.
+//
+// The identity has to travel with the reason on that refresh, otherwise the second request would
+// silently keep pointing at a certificate the operator is no longer asking about -- and a name
+// whose certificate is replaced twice would never get its current one revoked.
+func TestAskingAgainAfterARenewalTargetsTheCertificateStoredNow(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	oldCert := certPEMWithSerial(t, 1001, "example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(30 * 24 * time.Hour), CertPEM: oldCert,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake.revokeErr = errors.New("acme: error: 503 :: service unavailable")
+	if err := m.RequestRevocation(context.Background(), cert.Name, RevocationReasons["keyCompromise"]); err == nil {
+		t.Fatal("the CA refused the revocation, so this must report a failure")
+	}
+
+	newCert := certPEMWithSerial(t, 2002, "example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(90 * 24 * time.Hour), CertPEM: newCert,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The operator asks again, now about the certificate that is stored.
+	fake.revokeErr = nil
+	if err := m.RequestRevocation(context.Background(), cert.Name, RevocationReasons["superseded"]); err != nil {
+		t.Fatalf("RequestRevocation: %v", err)
+	}
+
+	if len(fake.revoked) != 2 {
+		t.Fatalf("expected the failed attempt and the new request, got %d calls", len(fake.revoked))
+	}
+	wantDER, err := leafDER(newCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fake.revoked[1].DER, wantDER) {
+		t.Error("the second request is about the certificate stored now, and that is the one it must revoke")
+	}
+	if req, err := store.GetRevokeRequest(cert.Name); err != nil || req != nil {
+		t.Errorf("the CA accepted it, so the request is done (req=%+v err=%v)", req, err)
+	}
+}
+
+// A request can also be honoured from the archive when no material is stored at all.
+//
+// The name does not always keep its certificate row: an onboarding or re-plan pass can rewrite it
+// with no material, and a request recorded while the certificate was stored must not become
+// unanswerable because of that. The archive still holds what the operator asked about, so that is
+// what is sent -- and with no identity recorded there is nothing to look for, which is the one case
+// that keeps the old refusal.
+func TestARequestIsHonouredFromTheArchiveWhenNothingIsStored(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	stored := certPEMWithSerial(t, 1001, "example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(30 * 24 * time.Hour), CertPEM: stored,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake.revokeErr = errors.New("acme: error: 503 :: service unavailable")
+	if err := m.RequestRevocation(context.Background(), cert.Name, RevocationReasons["keyCompromise"]); err == nil {
+		t.Fatal("the CA refused the revocation, so this must report a failure")
+	}
+
+	// The row loses its material, and the certificate moves to the archive.
+	if err := store.PutCert(&state.CertState{Name: cert.Name}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddRetiredCert("cloud-cert-1", cert.Name, stored, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	fake.revokeErr = nil
+	m.RetryPendingRevocations(context.Background())
+
+	if len(fake.revoked) != 2 {
+		t.Fatalf("the retry belongs here and must send the archived certificate, got %d calls",
+			len(fake.revoked))
+	}
+	wantDER, err := leafDER(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fake.revoked[1].DER, wantDER) {
+		t.Error("the archived copy of the certificate asked about is what must be revoked")
+	}
+	if req, err := store.GetRevokeRequest(cert.Name); err != nil || req != nil {
+		t.Errorf("the CA accepted it, so the request is done (req=%+v err=%v)", req, err)
+	}
+
+	// With no identity and nothing stored there is still nothing to send, and saying so is the
+	// only honest answer: the request stays outstanding rather than being cleared as a success.
+	if err := store.AddRevokeRequest(cert.Name, RevocationReasons["superseded"], "", fixed); err != nil {
+		t.Fatal(err)
+	}
+	m.RetryPendingRevocations(context.Background())
+	if len(fake.revoked) != 2 {
+		t.Error("there is no certificate to send, so no revoke call belongs here")
+	}
+	if req, err := store.GetRevokeRequest(cert.Name); err != nil || req == nil {
+		t.Errorf("a request that could not be honoured must stay outstanding (req=%+v err=%v)", req, err)
 	}
 }
