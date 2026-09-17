@@ -1333,7 +1333,15 @@ func addRetiredCertExec(e execer, certID, certName string, certPEM, keyPEM []byt
 		    -- overwritten by a later empty write, and lets it be filled in when the empty write
 		    -- came first.
 		    cert_pem = COALESCE(EXCLUDED.cert_pem, retired_certificates.cert_pem),
-		    key_pem  = COALESCE(EXCLUDED.key_pem,  retired_certificates.key_pem)`,
+		    key_pem  = COALESCE(EXCLUDED.key_pem,  retired_certificates.key_pem),
+		    -- The clock restarts on the write that actually retires the certificate. Without
+		    -- this a row first written by the orphan path (which records a certificate it merely
+		    -- uploaded, with no material) kept the ORPHAN's timestamp when the same cert_id was
+		    -- later retired with the fullchain and key: ReapRetired, which reaps on retired_at,
+		    -- would then delete the cloud copy and the freshly archived rollback material on the
+		    -- earlier clock -- and before the rebind it asks to delete a certificate that may
+		    -- still be serving, refused only by the cloud-side binding check.
+		    retired_at = EXCLUDED.retired_at`,
 		certID, certName, time.Now().Unix(), certPEM, keyPEM)
 	if err != nil {
 		return fmt.Errorf("add retired cert %s: %w", certID, err)
