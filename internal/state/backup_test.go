@@ -456,3 +456,39 @@ func TestSnapshotIsBornWithRestrictivePermissions(t *testing.T) {
 			"world-readable temp file nothing ever cleans up (want 0600 from the start)", modeAtCopy)
 	}
 }
+
+// A same-millisecond collision must sort AFTER the name it collides with.
+//
+// Retention prunes from the front of a lexicographic sort, so the collision suffix has to be
+// greater than '.': with "<stamp>-1.db" ('-' is 0x2D, '.' is 0x2E) the suffixed file sorted first
+// and keep=1 deleted the NEWER snapshot while keeping the older one -- the opposite of what the
+// code comment claimed, and the very failure the pid suffix had been blamed for.
+func TestACollisionSnapshotSortsLastAndStillCountsAsOurs(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+
+	first, err := s.Snapshot(backups, 3)
+	if err != nil {
+		t.Fatalf("first snapshot: %v", err)
+	}
+	stamp, ok := s.snapshotStampOf(filepath.Base(first))
+	if !ok {
+		t.Fatalf("%s is not recognised as a snapshot of this store", filepath.Base(first))
+	}
+
+	// The name a collision produces, and the ordering property retention depends on.
+	collision := s.snapshotName(stamp + "~1")
+	if !(collision > filepath.Base(first)) {
+		t.Errorf("the collision name %q must sort after %q, or pruning keeps the older snapshot",
+			collision, filepath.Base(first))
+	}
+	if _, ok := s.snapshotStampOf(collision); !ok {
+		t.Errorf("%q must still count as a snapshot of this store, or retention never prunes it",
+			collision)
+	}
+	// The separator this used before must keep being recognised, or snapshots written by an older
+	// build stay on disk forever.
+	if _, ok := s.snapshotStampOf(s.snapshotName(stamp + "-1")); !ok {
+		t.Error("the old '-' collision suffix must keep counting as a snapshot")
+	}
+}

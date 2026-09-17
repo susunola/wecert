@@ -86,14 +86,15 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 		}
 	}()
 
-	// Two snapshots can still collide at millisecond precision. The fallback keeps the sort order
-	// intact: a numeric suffix appended after the stamp sorts LATER, so the newer file stays
-	// "newest" for retention. (The pid-based version this replaces did the opposite.)
+	// Two snapshots can still collide at millisecond precision. The suffix has to sort AFTER the
+	// unsuffixed name or retention keeps the wrong one: pruning deletes from the front of a
+	// lexicographic sort, so "<stamp>-1.db" ('-' is 0x2D) sorted BEFORE "<stamp>.db" ('.' is 0x2E)
+	// and keep=1 deleted the newer snapshot while the comment claimed the opposite. "~" is 0x7E.
 	for n := 1; ; n++ {
 		if _, err := os.Stat(final); os.IsNotExist(err) {
 			break
 		}
-		final = filepath.Join(dir, s.snapshotName(fmt.Sprintf("%s-%d", stamp, n)))
+		final = filepath.Join(dir, s.snapshotName(fmt.Sprintf("%s~%d", stamp, n)))
 	}
 
 	// The copy is born under a restrictive umask, not tightened afterwards.
@@ -155,8 +156,12 @@ func (s *Store) snapshotStampOf(name string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	// A collision suffix ("<stamp>-2") is not part of the timestamp.
-	if i := strings.IndexByte(rest, '-'); i >= 0 {
+	// A collision suffix ("<stamp>~2") is not part of the timestamp. The '-' form is still
+	// accepted: snapshots written before the separator changed must keep counting as ours, or
+	// retention stops seeing them and they stay on disk forever.
+	if i := strings.IndexByte(rest, '~'); i >= 0 {
+		rest = rest[:i]
+	} else if i := strings.IndexByte(rest, '-'); i >= 0 {
 		rest = rest[:i]
 	}
 	if _, err := time.Parse(snapshotStamp, rest); err != nil {

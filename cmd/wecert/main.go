@@ -254,8 +254,9 @@ func run() error {
 
 	if *once {
 		// RunDetailed, not a wrapper that drops the report: the one-shot unit is what a systemd
-		// "exited 0 with every certificate failing" is the failure mode this report exists to
-		// prevent -- the timer would report success while the fleet went unmanaged. A pass that
+		// timer runs, and "exited 0 with every certificate failing" is the failure mode this
+		// report exists to prevent -- the timer would report success while the fleet went
+		// unmanaged. A pass that
 		// attempted nothing and skipped everything counts as trouble too, because that is a
 		// desired state that resolved to nothing.
 		rep := reconciler.RunDetailed(ctx)
@@ -464,6 +465,11 @@ func jitter(d time.Duration) time.Duration {
 // perfectly healthy while monitoring never hears another signal, and certificates slide
 // silently into expiry. That is precisely the failure this project exists to prevent,
 // and it should not manufacture one itself.
+//
+// The doc comment above belongs to startMetricsServer; the one below to startStateBackups. They
+// had run together when the pair was split out of run(), which left startStateBackups documented
+// by both and startMetricsServer by neither.
+//
 // startStateBackups snapshots the state database on an interval, in the background.
 //
 // It never fails the process: a snapshot that cannot be written is a degraded recovery

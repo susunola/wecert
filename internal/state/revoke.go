@@ -117,7 +117,10 @@ func (s *Store) RecordRevokeAttempt(certName string, attemptErr error, now time.
 
 	msg := ""
 	if attemptErr != nil {
-		msg = attemptErr.Error()
+		// Bounded like every other last_error writer in this package: lego hands back the CA's
+		// body verbatim, and one huge HTML error page in every attempt row is how a state file
+		// grows without bound.
+		msg = truncate(attemptErr.Error(), maxLastErrorBytes)
 	}
 	_, err := s.db.Exec(`
 		UPDATE revoke_requests
