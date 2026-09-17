@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wecert 真实 E2E 实跑报告</title>
+<style>
+  :root {
+    --paper: #fbfaf7; --paper-2: #f4f2ec;
+    --ink: #14161a; --ink-2: #43474e; --ink-3: #6b7079;
+    --rule: #e0ddd3; --rule-2: #cec9bc;
+    --accent: #0d5f5c;
+    --pass: #14683f; --pass-soft: #e2f0e8;
+    --fail: #a3231c; --fail-soft: #fbe6e4;
+    --warn: #8a5a00; --warn-soft: #fbf0d8;
+    --skip: #5f6570; --skip-soft: #eceae4;
+    --code-bg: #f2f0e9;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", "Helvetica Neue", sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Charter, Georgia, serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--serif); font-size: 17px; line-height: 1.62; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px 96px; }
+  header.masthead { border-bottom: 3px solid var(--ink); padding: 44px 0 20px; margin-bottom: 28px; }
+  .kicker { font-family: var(--sans); font-size: 12px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin: 0 0 10px; }
+  h1 { font-family: var(--sans); font-size: clamp(28px, 4.4vw, 42px); line-height: 1.14; letter-spacing: -0.015em; margin: 0 0 12px; }
+  .framing { font-size: 19px; color: var(--ink-2); max-width: 74ch; margin: 0 0 20px; }
+  .metabar { display: flex; flex-wrap: wrap; gap: 6px 22px; font-family: var(--sans); font-size: 13px; color: var(--ink-3); border-top: 1px solid var(--rule); padding-top: 14px; }
+  .metabar b { color: var(--ink); font-weight: 600; }
+  .strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 10px; margin: 0 0 34px; }
+  .stat { background: #fff; border: 1px solid var(--rule); border-left: 4px solid var(--rule-2); border-radius: 3px; padding: 12px 14px; }
+  .stat.ok { border-left-color: var(--pass); } .stat.bad { border-left-color: var(--fail); } .stat.mute { border-left-color: var(--skip); }
+  .stat .k { font-family: var(--sans); font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); }
+  .stat .v { font-family: var(--sans); font-size: 26px; font-weight: 650; letter-spacing: -0.02em; }
+  h2 { font-family: var(--sans); font-size: 22px; letter-spacing: -0.01em; margin: 44px 0 6px; padding-bottom: 8px; border-bottom: 2px solid var(--ink); }
+  h2 .zh { font-weight: 400; color: var(--ink-3); font-size: 15px; margin-left: 10px; }
+  p.lede { color: var(--ink-2); max-width: 80ch; }
+  .card { background: #fff; border: 1px solid var(--rule); border-radius: 3px; padding: 14px 16px; margin: 10px 0; }
+  .card.good { border-left: 4px solid var(--pass); } .card.bad { border-left: 4px solid var(--fail); } .card.warn { border-left: 4px solid var(--warn); }
+  .card .t { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .card .n { font-family: var(--mono); font-size: 14.5px; font-weight: 600; }
+  .card .d { margin-left: auto; font-family: var(--sans); font-size: 12.5px; color: var(--ink-3); }
+  .card .what { margin: 6px 0 0; color: var(--ink-2); font-size: 15.5px; }
+  ul.ev { margin: 8px 0 0; padding-left: 20px; font-family: var(--mono); font-size: 13px; color: var(--ink-2); }
+  ul.ev li { margin: 2px 0; }
+  .badge { font-family: var(--sans); font-size: 11.5px; font-weight: 700; letter-spacing: .04em; padding: 2px 8px; border-radius: 999px; }
+  .badge.pass { color: var(--pass); background: var(--pass-soft); }
+  .badge.fail { color: var(--fail); background: var(--fail-soft); }
+  .badge.skip { color: var(--skip); background: var(--skip-soft); }
+  .tablebox { overflow-x: auto; border: 1px solid var(--rule); border-radius: 3px; background: #fff; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-family: var(--sans); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); background: var(--paper-2); }
+  tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-family: var(--mono); }
+  .mono { font-family: var(--mono); font-size: 13.5px; }
+  .muted { color: var(--ink-3); font-size: 14px; }
+  .note { background: var(--warn-soft); border: 1px solid #e8d9ae; border-radius: 3px; padding: 12px 14px; margin: 14px 0; font-size: 15.5px; }
+  code { font-family: var(--mono); font-size: 13.5px; background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  footer { margin-top: 56px; border-top: 1px solid var(--rule); padding-top: 16px; font-family: var(--sans); font-size: 13px; color: var(--ink-3); }
+  @media print { body { background: #fff; } h2 { break-after: avoid; } .card { break-inside: avoid; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <p class="kicker">wecert · end-to-end run</p>
+    <h1>真实 E2E 实跑报告</h1>
+    <p class="framing">不是单元测试的汇总，而是一轮可复现的端到端实跑：真实的 ACME 服务端、真实的权威 DNS 服务（53 端口）、真实的 DNS-01 记录写入与回读、真实签发的证书；以及这套环境里<strong>跑不了</strong>的部分，和它们各自需要什么才能跑。</p>
+    <div class="metabar">
+      <span><b>开始</b> 2026-09-17 22:57 UTC</span>
+      <span><b>用例</b> 7 通过 / 0 失败</span>
+      <span><b>未跑</b> 4 项（附原因与命令）</span>
+      <span><b>宿主</b> macOS-26.6.2-arm64-arm-64bit-Mach-O</span>
+    </div>
+  </header>
+
+  <div class="strip">
+    <div class="stat ok"><div class="k">Cases</div><div class="v">7/7</div></div>
+    <div class="stat ok"><div class="k">Suites</div><div class="v">3/3</div></div>
+    <div class="stat mute"><div class="k">DNS queries served</div><div class="v">287</div></div>
+    <div class="stat mute"><div class="k">Not run</div><div class="v">4</div></div>
+  </div>
+
+  <h2>怎么测的<span class="zh">what is real, and what is not</span></h2>
+  <p class="lede">这一轮里每一个"真实"都写明了边界。评审时最该看的是下面这张表：哪些部件真的在跑，哪些是替身，以及替身各自对应到哪条验收路径。</p>
+  <div class="tablebox"><table>
+    <tr><th>部件</th><th>这一轮实际用的是什么</th></tr>
+      <tr><td class="mono">acme_server</td><td>pebble, validation DEGRADED (the CA did not read the record)</td></tr>      <tr><td class="mono">deploy</td><td>disabled (deploy.Noop): no Tencent Cloud credentials in a test environment</td></tr>      <tr><td class="mono">dns</td><td>authoritative test server on 127.0.0.1:53</td></tr>      <tr><td class="mono">dns_provider</td><td>lego httpreq -&gt; the test authority&#x27;s /present, /cleanup</td></tr>      <tr><td class="mono">transports</td><td>authority answered over udp; tcp: tcp: dial tcp 127.0.0.1:53: i/o timeout</td></tr>
+  </table></div>
+  <div class="note">
+    <b>关于 CA 校验（这一轮最需要看清的边界）。</b>pebble&#x27;s validator forces TCP whenever a custom resolver is configured (va.go: if customResolverAddr is non-empty, va.dnsClient.Net = &quot;tcp&quot;), and this host cannot carry TCP on port 53: the bind succeeds and the traffic never arrives (tcp: dial tcp 127.0.0.1:53: i/o timeout). So the CA accepted the challenges without reading them, and PEBBLE_VA_ALWAYS_VALID was set for this run. Everything on wecert&#x27;s side is still real -- the solver wrote the records through a real lego provider, and the production propagation check read them back over UDP, which the per-case evidence below shows -- but &quot;the CA validated the record&quot; is NOT one of the things this run proves. On a host where TCP/53 works (Linux with CAP_NET_BIND_SERVICE, for example docker run --cap-add=NET_BIND_SERVICE) the same suite runs with real validation and the report says so.
+  </div>
+
+  <h2>套件结果<span class="zh">suites</span></h2>
+  <div class="tablebox"><table>
+    <tr><th>套件</th><th>结论</th><th>耗时</th><th>覆盖什么</th></tr>
+      <tr><td class="mono">TestRealDNS01Lifecycle</td><td><span class="badge pass">通过</span></td><td class="num">10s</td><td class="muted">real ACME server + real authoritative DNS on :53 + real solver + real propagation check</td></tr>      <tr><td class="mono">TestPebble (order protocol)</td><td><span class="badge pass">通过</span></td><td class="num">5s</td><td class="muted">account/key binding, authorization polling, CSR finalize, chain download against the same real ACME server</td></tr>      <tr><td class="mono">test-e2e-wildcard.sh</td><td><span class="badge pass">通过</span></td><td class="num">22s</td><td class="muted">the shared apex/wildcard _acme-challenge name, against a canned resolver</td></tr>
+  </table></div>
+
+  <h2>用例结果<span class="zh">cases</span></h2>
+  <p class="lede">每条用例都是对一个可再生故障的断言，不是"跑通了"。失败会让整轮退出码非零，所以这份报告不可能在红的运行上显示成绿的。</p>
+      <div class="card good">
+        <div class="t"><span class="n">issue-over-real-validation</span><span class="badge pass">通过</span><span class="d">3.13s</span></div>
+        <p class="what">Place an order, write the challenge records through the real solver, wait for the real propagation check, and let a real ACME server validate them over DNS and sign the certificate.</p>
+        <ul class="ev"><li>propagation probe queried TXT _acme-challenge.a.e2e.example.com over UDP</li><li>propagation probe queried TXT _acme-challenge.b.e2e.example.com over UDP</li><li>issued 2026-09-17T14:57:23Z..2026-12-16T14:57:22Z, 2 SAN(s)</li><li>issuer &quot;Pebble Intermediate CA 0c7e98&quot;</li><li>challenge records cleaned up: none left in the zone</li></ul>
+      </div>      <div class="card good">
+        <div class="t"><span class="n">second-pass-places-no-order</span><span class="badge pass">通过</span><span class="d">0.00s</span></div>
+        <p class="what">Reconcile again immediately: a fresh certificate must not be reissued, and the ARI window must have been recorded so the next renewal is CA-coordinated.</p>
+        <ul class="ev"><li>notAfter unchanged: 2026-12-16T14:57:22Z</li><li>ARI window recorded at 2026-09-17T14:57:26Z</li></ul>
+      </div>      <div class="card good">
+        <div class="t"><span class="n">domain-drift-reissues</span><span class="badge pass">通过</span><span class="d">3.15s</span></div>
+        <p class="what">Add a name to the certificate and reconcile: the SAN set is the desired state, so it must reissue at once instead of waiting for the renewal window.</p>
+        <ul class="ev"><li>reissued for a.e2e.example.com, b.e2e.example.com, c.e2e.example.com</li></ul>
+      </div>      <div class="card good">
+        <div class="t"><span class="n">wildcard-and-apex-share-one-name</span><span class="badge pass">通过</span><span class="d">3.11s</span></div>
+        <p class="what">A wildcard and its apex hash to the same _acme-challenge name, so both values must be up at the same time: write all, verify all, and only then let the CA validate.</p>
+        <ul class="ev"><li>_acme-challenge.e2e.example.com. held 2 values simultaneously</li><li>issued for e2e.example.com, *.e2e.example.com</li></ul>
+      </div>      <div class="card good">
+        <div class="t"><span class="n">tlsserver-profile-issuance</span><span class="badge pass">通过</span><span class="d">3.10s</span></div>
+        <p class="what">Issue under the tlsserver profile: the new-order request must carry the profile name verbatim, and the certificate must come back with that profile&#x27;s 45-day validity instead of the 90-day classic default.</p>
+        <ul class="ev"><li>same CA, same run: the classic certificate e2e-basic lives 2159h59m59s against this one&#x27;s 1079h59m59s</li><li>the new-order request carried profile &quot;tlsserver&quot; verbatim</li><li>issued validity 1079h59m59s (2026-09-17T14:57:32Z..2026-11-01T14:57:31Z) against the configured validityPeriod of 3888000s</li><li>issuer &quot;Pebble Intermediate CA 0c7e98&quot;, 2 SAN(s), key matched to the stored private key</li><li>challenge records cleaned up: none left in the zone</li></ul>
+      </div>      <div class="card good">
+        <div class="t"><span class="n">automatic-renewal-of-a-tlsserver-certificate</span><span class="badge pass">通过</span><span class="d">6.30s</span></div>
+        <p class="what">Issue a tlsserver certificate, let one pass record the CA&#x27;s ARI window, then move the clock to the instant that window implies and reconcile ONCE: the pass alone must place the order, validate over the test authority, promote the replacement and clean up after itself.</p>
+        <ul class="ev"><li>issued serial 7162087380124337877, valid 2026-09-17T14:57:35Z..2026-11-01T14:57:34Z</li><li>the pass inside the validity period recorded the CA&#x27;s window 2026-10-16T14:57:34Z..2026-10-18T14:57:34Z and did not renew</li><li>clock moved to 2026-10-18T01:36:24Z, the deterministic instant inside that window (14.6 days before expiry), while the local fallback for renewBefore=24h0m0s was 2026-10-31T17:16:53Z</li><li>one Reconcile then renewed it: serial 7162087380124337877 -&gt; 5718345528530683664, notAfter 2026-11-01T14:57:34Z -&gt; 2026-11-01T14:57:38Z, still 2 names</li><li>that pass read renewalInfo once and placed exactly 1 order, profile &quot;tlsserver&quot; and replaces=IHpKtqIFKutgknW90OnKZkxsSqY.Y2TYhp6ehtU</li><li>the renewal solved 2 of 2 names over the test authority (2 record write(s), 2 delete(s)); the zone&#x27;s live record set is empty afterwards</li><li>the outgoing certificate was not queued for reclamation: deploy is disabled, so no cloud certificate ID exists for it (deployedCertId=&quot;&quot;) and the retire branch cannot run</li><li>the renewed certificate&#x27;s ARI certID IHpKtqIFKutgknW90OnKZkxsSqY.T1uk9gsDxxA is recorded for its own next renewal</li></ul>
+      </div>      <div class="card good">
+        <div class="t"><span class="n">revocation-and-its-durable-retry</span><span class="badge pass">通过</span><span class="d">0.00s</span></div>
+        <p class="what">Revoke a real certificate, then revoke it again: an accepted revocation clears the request, and a refused one must stay recorded so every later pass retries it.</p>
+        <ul class="ev"><li>first revocation: recorded in state.db, submitted, accepted, cleared</li><li>second revocation: the CA refused it and the request is still recorded for the next pass</li></ul>
+      </div>
+
+  <h2>DNS 证据<span class="zh">what the authority was actually asked</span></h2>
+  <p class="lede">这是权威 DNS 服务器收到的全部查询的汇总。UDP 列来自 wecert 自己的传播检查，TCP 列来自校验方（本机降级模式下为 0）。</p>
+  <div class="tablebox"><table>
+    <tr><th>名字</th><th>类型</th><th>UDP</th><th>TCP</th></tr>
+      <tr><td class="mono">e2e.example.com.</td><td class="mono">SOA</td><td class="num">40</td><td class="num">0</td></tr>      <tr><td class="mono">e2e.example.com.</td><td class="mono">NS</td><td class="num">19</td><td class="num">0</td></tr>      <tr><td class="mono">ns1.e2e.example.com.</td><td class="mono">A</td><td class="num">19</td><td class="num">0</td></tr>      <tr><td class="mono">ns1.e2e.example.com.</td><td class="mono">AAAA</td><td class="num">19</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.e2e.example.com.</td><td class="mono">CNAME</td><td class="num">13</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.a.e2e.example.com.</td><td class="mono">CNAME</td><td class="num">12</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.b.e2e.example.com.</td><td class="mono">CNAME</td><td class="num">12</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.r1.e2e.example.com.</td><td class="mono">CNAME</td><td class="num">12</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.r2.e2e.example.com.</td><td class="mono">CNAME</td><td class="num">12</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.a.e2e.example.com.</td><td class="mono">SOA</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.a.e2e.example.com.</td><td class="mono">TXT</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.b.e2e.example.com.</td><td class="mono">SOA</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.b.e2e.example.com.</td><td class="mono">TXT</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.c.e2e.example.com.</td><td class="mono">CNAME</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.e2e.example.com.</td><td class="mono">SOA</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.e2e.example.com.</td><td class="mono">TXT</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.p1.e2e.example.com.</td><td class="mono">CNAME</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.p2.e2e.example.com.</td><td class="mono">CNAME</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.r1.e2e.example.com.</td><td class="mono">SOA</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.r1.e2e.example.com.</td><td class="mono">TXT</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.r2.e2e.example.com.</td><td class="mono">SOA</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">_acme-challenge.r2.e2e.example.com.</td><td class="mono">TXT</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">a.e2e.example.com.</td><td class="mono">SOA</td><td class="num">6</td><td class="num">0</td></tr>      <tr><td class="mono">b.e2e.example.com.</td><td class="mono">SOA</td><td class="num">6</td><td class="num">0</td></tr>
+  </table></div>
+  <div class="note"><b>共享名证据：</b><ul><li><span class="mono">_acme-challenge.e2e.example.com.</span> 同时存在过 <b>2</b> 个值</li></ul>通配符与 apex 共用同一个 <code>_acme-challenge</code> 名，两个值必须同时在场。</div>
+
+  <h2>未跑的部分<span class="zh">not run, and why</span></h2>
+  <p class="lede">这几项属于"需要真实云凭证或真实域名"，本环境没有，所以它们<strong>没有</strong>被算进上面的通过数。每条都给出可直接执行的命令。</p>
+      <div class="card warn">
+        <div class="t"><span class="n">cloud-deploy-and-rebind</span><span class="badge skip">需要凭证</span></div>
+        <p class="what">Upload to Tencent Cloud SSL and rebind the CLB listener, then read the binding back from the API.</p>
+        <ul class="ev"><li>needs TENCENTCLOUD_SECRET_ID/KEY with the CAM policy in deploy/, plus a CLB and an HTTPS listener: scripts/run-stage-ab.sh</li></ul>
+      </div>      <div class="card warn">
+        <div class="t"><span class="n">lets-encrypt-staging-issuance</span><span class="badge skip">需要凭证</span></div>
+        <p class="what">The same lifecycle against Let&#x27;s Encrypt staging with a real DNSPod or Tencent Cloud DNS zone.</p>
+        <ul class="ev"><li>needs a real zone plus DNS API credentials and outbound DNS: cp e2e-config.example.yaml e2e-config.yaml &amp;&amp; ./scripts/e2e-test.sh &lt;domain&gt; ./e2e-config.yaml</li></ul>
+      </div>      <div class="card warn">
+        <div class="t"><span class="n">black-box-probe-of-the-live-endpoint</span><span class="badge skip">需要凭证</span></div>
+        <p class="what">Dial 443 and compare the certificate served with the one deployed.</p>
+        <ul class="ev"><li>needs a deployed certificate behind a CLB: ./bin/wecert-probe -host &lt;name&gt; -min-valid 168h</li></ul>
+      </div>      <div class="card warn">
+        <div class="t"><span class="n">binary-against-a-local-ca</span><span class="badge skip">本机无法运行</span></div>
+        <p class="what">Run the compiled wecert binary, rather than the Manager in-process, against pebble.</p>
+        <ul class="ev"><li>the binary builds its own ACME HTTP client with no CA override, and on macOS Go ignores SSL_CERT_FILE (verified: GODEBUG=x509usefallbackroots=1 has no effect without SetFallbackRoots, which this program does not call). On Linux, SSL_CERT_FILE is honoured, so the same run works in CI.</li></ul>
+      </div>
+
+  <footer>
+    生成方式：<code>make e2e</code>（<code>scripts/e2e.sh</code> → <code>scripts/e2e-report.py</code>）。
+    原始数据：<code>dist/e2e-go.json</code>（用例与 DNS 查询日志）、<code>dist/e2e-extras.json</code>（套件与宿主）。
+    报告只呈现这次运行真实产生的结论。
+  </footer>
+</div>
+</body>
+</html>
