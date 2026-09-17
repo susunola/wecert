@@ -1755,3 +1755,59 @@ func TestParseDeclarationRejectsUnknownProfileAndKeyType(t *testing.T) {
 		}
 	}
 }
+
+// The report is a claim about what the round did, so it must be written last.
+//
+// It carries "mode": "written" and the revision, and it is the artifact a human reads to find out
+// what onboarding decided. Writing it before the document and the state file meant a failure in
+// between left a report announcing a revision that was never written -- and nothing in the report
+// said so. Written last, the file exists exactly when the round finished, which is a property an
+// operator can rely on without cross-checking two other files.
+func TestAFailedCommitWritesNoReport(t *testing.T) {
+	reportDir := t.TempDir()
+	docDir := t.TempDir()
+	reportPath := filepath.Join(reportDir, "report.json")
+
+	h := newHarness(t, Options{
+		DocumentPath: filepath.Join(docDir, "desired-state.yaml"),
+		StatePath:    filepath.Join(docDir, "onboard-state.json"),
+		ReportPath:   reportPath,
+	})
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	h.rules.domains = []string{"a.example.com"}
+
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if rep.Frozen() {
+		t.Fatalf("this round must not freeze: %v", rep.FreezeReasons)
+	}
+
+	// The desired-state document cannot be written, and the report is somewhere writable: the
+	// only thing that can keep the report off disk is the order.
+	if err := os.Chmod(docDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(docDir, 0o700) })
+
+	if err := h.ob.Commit(rep); err == nil {
+		t.Fatal("the document write must fail in an unwritable directory")
+	}
+	if _, err := os.Stat(reportPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a round that could not write revision %s must not leave a report claiming it did "+
+			"(stat: %v)", rep.Revision, err)
+	}
+
+	// And the report is still written when the round does complete: "never write it" would
+	// satisfy the check above.
+	if err := os.Chmod(docDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ob.Commit(rep); err != nil {
+		t.Fatalf("Commit failed once the document was writable again: %v", err)
+	}
+	if _, err := os.Stat(reportPath); err != nil {
+		t.Errorf("a completed round must leave its report behind: %v", err)
+	}
+}
