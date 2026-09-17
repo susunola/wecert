@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/susunola/wecert/internal/group"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 // DeclarationPrefix is the record-name prefix for a declaration.
@@ -118,8 +120,22 @@ func ParseDeclaration(zone, record string, values []string) (*Declaration, error
 				}
 				d.Wildcard = b
 			case "profile":
+				// Validated here, not at document-write time. A bad value reaching
+				// config.NormalizeCertificates failed Commit for every certificate in every later
+				// round (the document and the state file were never written) until someone edited
+				// DNS -- while this package's contract is that one bad declaration is recorded as a
+				// rejection and skipped.
+				if !config.ValidProfile(val) {
+					return nil, fmt.Errorf("record %q: unknown profile %q (want %s/%s/%s)",
+						record, val, config.ProfileClassic, config.ProfileTLSServer, config.ProfileShortLived)
+				}
 				d.Profile = val
 			case "keytype":
+				if !config.ValidKeyType(val) {
+					return nil, fmt.Errorf("record %q: unknown keyType %q (want %s/%s/%s/%s)",
+						record, val, config.KeyTypeECDSAP256, config.KeyTypeECDSAP384,
+						config.KeyTypeRSA2048, config.KeyTypeRSA4096)
+				}
 				d.KeyType = val
 			case "deploy":
 				b, err := parseBool(val)
