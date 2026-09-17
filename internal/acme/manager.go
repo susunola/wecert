@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -447,7 +448,11 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 			m.log.Warn("order expired; discarding it and deciding again",
 				"cert", c.Name, "order", o.OrderURL, "expiredAt", o.ExpiresAt)
 			if err := m.discardOrder(ctx, c.Name); err != nil {
-				return err
+				// A store failure here has to schedule the retry, exactly as the sibling call site in
+				// manager_flow.go does: returning the bare error skips the backoff entirely, so the
+				// next pass retries at the pass rate (re-running cleanupOrphanTXT's authoritative DNS
+				// probes and provider deletes each time) and nothing escalates or records why.
+				return m.recordFailure(st, fmt.Errorf("discard the expired order: %w", err))
 			}
 
 		case !orderMatchesConfig(o, c):
@@ -461,7 +466,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 				"orderIdentifiers", o.Identifiers,
 				"configIdentifiers", c.DomainKey())
 			if err := m.discardOrder(ctx, c.Name); err != nil {
-				return err
+				return m.recordFailure(st, fmt.Errorf("discard the order for the changed domain set: %w", err))
 			}
 
 		default:
