@@ -684,6 +684,13 @@ func (r *run) parse(raw []RawDeclaration) {
 			}
 			continue
 		}
+		// This record parsed and survived the conflict checks, so the hostname has a usable
+		// declaration. Any exclusion recorded for it earlier in this loop is stale: the usual
+		// case is a typo'd record in one zone and a valid one for the same name in another
+		// (a parent zone and a delegated subzone), and leaving the exclusion in place showed the
+		// same hostname twice in the report -- once as excluded and once as included -- while
+		// stillDeclaredReason could quote the stale text for a name it carries.
+		r.unreject(d.Hostname)
 		byHost[d.Hostname] = d
 		byHostRecord[d.Hostname] = d.Record
 	}
@@ -1194,7 +1201,17 @@ func (r *run) build() {
 		for _, n := range append(append([]string(nil), g.Names...), g.Wildcards...) {
 			reason := r.reasons[n]
 			if coverer, ok := cov.Covered[n]; ok {
-				reason = fmt.Sprintf("covered by the declared wildcard %s, so it costs no extra issuance", coverer)
+				// The wildcard note is ADDED to whatever reason the name already carries, not
+				// written over it. Overwriting it hid the fact that a filter rejected this name
+				// (the carried-by-declaration case): the report then said only "covered by the
+				// wildcard", so the guard that is dropping it was invisible in the one artifact
+				// an operator reads.
+				note := fmt.Sprintf("covered by the declared wildcard %s, so it costs no extra issuance", coverer)
+				if reason == "" {
+					reason = note
+				} else {
+					reason += "; " + note
+				}
 				r.rep.CoveredByWildcard++
 			} else if reason == "" {
 				reason = "declared via a " + DeclarationPrefix + " TXT record"
@@ -1531,6 +1548,16 @@ func writeJSONAtomic(path string, v any) error {
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return fmt.Errorf("write %s: %w", path, err)
+	}
+	// fsync before the rename, like the document writer and the state writer.
+	//
+	// Both of them do this; the report did not, so a crash (or a full disk losing the tail of the
+	// page cache) could leave a renamed, truncated -- even zero-byte -- report behind after a round
+	// that otherwise completed. The report is the artifact a human reads to find out what the round
+	// decided, and "it exists exactly when the round completed" is the contract Commit documents.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync %s: %w", path, err)
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", path, err)

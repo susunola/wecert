@@ -770,3 +770,100 @@ func TestARateLimitRefusalFromTheRetryStillSetsTheDeadline(t *testing.T) {
 		t.Errorf("the deadline must name the limit, got %q", reason)
 	}
 }
+
+// A refusal must be booked against the limit the CA actually refused.
+//
+// Every newOrder refusal was recorded against new-orders, whatever the CA said. A refusal for
+// "this exact set of identifiers" then marked the wrong series blocked while the exact-set series
+// -- the limit with NO override path, and the one whose alert is `< 5` -- kept reading optimistic:
+// the estimate was wrong in the direction that leads to an order the CA will reject.
+func TestARefusalIsBookedAgainstTheLimitItNames(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+	cert.Domains = []string{"a.example.com"}
+
+	cases := []struct {
+		name     string
+		message  string
+		limit    ratelimit.Limit
+		scope    string
+		unmarked ratelimit.Limit
+	}{
+		{
+			name: "exact identifier set",
+			message: "acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: too many certificates " +
+				"already issued for this exact set of identifiers, retry after 2026-09-16 15:00:00 UTC: see " +
+				"https://letsencrypt.org/docs/rate-limits/#certificates-per-exact-set-of-identifiers",
+			limit: ratelimit.CertsPerExactIdentifierSet,
+			scope: cert.DomainKey(),
+			// The account-wide order budget is untouched by this refusal and must not be marked.
+			unmarked: ratelimit.NewOrdersPerAccount,
+		},
+		{
+			name: "registered domain",
+			message: "acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: too many certificates " +
+				"already issued for this registered domain, retry after 2026-09-16 15:00:00 UTC",
+			limit:    ratelimit.CertsPerRegisteredDomain,
+			scope:    "example.com",
+			unmarked: ratelimit.NewOrdersPerAccount,
+		},
+		{
+			name: "new orders",
+			message: "acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: too many new orders " +
+				"recently, retry after 2026-09-16 15:00:00 UTC",
+			limit:    ratelimit.NewOrdersPerAccount,
+			scope:    "",
+			unmarked: ratelimit.CertsPerExactIdentifierSet,
+		},
+	}
+
+	want := time.Date(2026, 9, 16, 15, 0, 0, 0, time.UTC)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Re-seed the row: the previous case left a retry deadline behind, and a pass inside a
+			// backoff window never reaches the order at all.
+			// NotAfter inside the renewal window (renewBefore is 30 days for classic) and no ARI,
+			// so the pass places an order; and a fresh row, so the previous case's retry deadline
+			// does not send this pass into its backoff window.
+			expiry := fixed.Add(10 * 24 * time.Hour)
+			if err := store.PutCert(&state.CertState{
+				Name:     cert.Name,
+				NotAfter: expiry,
+				CertPEM:  selfSignedCertPEM(t, expiry, "a.example.com"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			fake.orders = []legoacme.ExtendedOrder{terminalOrder(
+				"https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1")}
+			fake.newOrderErr = errors.New(tc.message)
+
+			if err := m.Reconcile(context.Background(), cert); err == nil {
+				t.Fatal("a rate-limited order must be reported as a failure")
+			}
+
+			at, reason, blocked := m.quota.BlockedUntil(tc.limit, tc.scope)
+			if !blocked {
+				t.Fatalf("the refusal names the %s limit; that deadline must gate it", tc.limit.Name)
+			}
+			if !at.Equal(want) {
+				t.Errorf("deadline = %s, want %s", at, want)
+			}
+			if reason != tc.limit.Name {
+				t.Errorf("the deadline must name the limit, got %q", reason)
+			}
+			if _, _, other := m.quota.BlockedUntil(tc.unmarked, ""); other {
+				t.Errorf("%s was marked blocked by a refusal that does not name it", tc.unmarked.Name)
+			}
+
+			// Clear the bucket so the next case starts clean.
+			if err := store.UpdateRateBucket(tc.limit.Name, tc.scope, func(rec *state.RateBucket) error {
+				rec.ResetAt = time.Time{}
+				rec.ResetReason = ""
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
