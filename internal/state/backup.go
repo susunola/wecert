@@ -58,7 +58,6 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 	// second meant keep=1 deleted the NEWER one and kept the older -- silently, and only under
 	// load, which is exactly when a fresh snapshot matters.
 	stamp := time.Now().UTC().Format(snapshotStamp)
-	final := filepath.Join(dir, s.snapshotName(stamp))
 
 	// VACUUM INTO refuses to overwrite, and creating the file itself would be the wrong
 	// way to get the 0600 mode: the driver creates it 0644 (the process umask), and this
@@ -86,15 +85,11 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 		}
 	}()
 
-	// Two snapshots can still collide at millisecond precision. The suffix has to sort AFTER the
-	// unsuffixed name or retention keeps the wrong one: pruning deletes from the front of a
-	// lexicographic sort, so "<stamp>-1.db" ('-' is 0x2D) sorted BEFORE "<stamp>.db" ('.' is 0x2E)
-	// and keep=1 deleted the newer snapshot while the comment claimed the opposite. "~" is 0x7E.
-	for n := 1; ; n++ {
-		if _, err := os.Stat(final); os.IsNotExist(err) {
-			break
-		}
-		final = filepath.Join(dir, s.snapshotName(fmt.Sprintf("%s~%d", stamp, n)))
+	// Two snapshots can still collide at millisecond precision; the collision name has to sort
+	// after the unsuffixed one, which freeSnapshotName explains.
+	final, err := s.freeSnapshotName(dir, stamp)
+	if err != nil {
+		return "", err
 	}
 
 	// The copy is born under a restrictive umask, not tightened afterwards.
@@ -131,6 +126,33 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 		return final, fmt.Errorf("snapshot written to %s, but pruning old snapshots failed: %w", final, err)
 	}
 	return final, nil
+}
+
+// freeSnapshotName returns the first snapshot name under dir that is free for this stamp.
+//
+// The suffix has to sort AFTER the unsuffixed name or retention keeps the wrong one: pruning
+// deletes from the front of a lexicographic sort, so "<stamp>-1.db" ('-' is 0x2D) sorted BEFORE
+// "<stamp>.db" ('.' is 0x2E) and keep=1 deleted the newer snapshot while the comment claimed the
+// opposite. "~" is 0x7E.
+func (s *Store) freeSnapshotName(dir, stamp string) (string, error) {
+	final := filepath.Join(dir, s.snapshotName(stamp))
+	for n := 1; ; n++ {
+		_, statErr := os.Stat(final)
+		if statErr == nil {
+			// Taken. Try the next suffix.
+			final = filepath.Join(dir, s.snapshotName(fmt.Sprintf("%s~%d", stamp, n)))
+			continue
+		}
+		// Any other failure leaves the name's state UNKNOWN, and "unknown" must not be read as
+		// "taken": every candidate suffix fails the same way, so the loop would spin here forever
+		// -- a directory that lost its search permission, an unreachable mount, a symlink loop --
+		// burning a core in the backup goroutine while no snapshot is ever written. Reporting it
+		// skips this round, which the caller logs, and the next round tries again.
+		if !os.IsNotExist(statErr) {
+			return "", fmt.Errorf("cannot tell whether snapshot %s already exists: %w", final, statErr)
+		}
+		return final, nil
+	}
 }
 
 // snapshotName builds the filename for one snapshot of this store.

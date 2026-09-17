@@ -539,3 +539,58 @@ func TestRetiringACertificateRestartsTheRetentionClock(t *testing.T) {
 		t.Errorf("the archived material must survive the upsert, got %q", retired[0].CertPEM)
 	}
 }
+
+// A collision probe that cannot answer must be reported, not treated as "taken".
+//
+// The suffix loop exists for the millisecond collision, and it used to treat ANY Stat failure as
+// "this name is taken". "Unknown" is not "taken": every candidate suffix fails the same way, so the
+// loop spins forever -- a directory that lost its search permission, an unreachable mount, a
+// symlink loop -- burning a core in the backup goroutine while no snapshot is ever written and
+// nothing is logged. This is the same failure mode, one layer down, as reading an unreadable quota
+// as zero: a failed read must not be turned into an answer.
+func TestAnUnanswerableCollisionProbeIsReported(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const stamp = "20260101T000000.000Z"
+
+	// A free name is used as-is.
+	name, err := s.freeSnapshotName(backups, stamp)
+	if err != nil {
+		t.Fatalf("a free directory must produce a name: %v", err)
+	}
+	if want := filepath.Join(backups, s.snapshotName(stamp)); name != want {
+		t.Errorf("name = %s, want the unsuffixed %s", name, want)
+	}
+
+	// A real collision advances to the next suffix, which still sorts after it.
+	if err := os.WriteFile(name, []byte("existing snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, err := s.freeSnapshotName(backups, stamp)
+	if err != nil {
+		t.Fatalf("a collision must produce the next free name: %v", err)
+	}
+	if next == name {
+		t.Fatalf("the occupied name %s must not be handed out again: the snapshot would overwrite "+
+			"an existing one", name)
+	}
+	if !(filepath.Base(next) > filepath.Base(name)) {
+		t.Errorf("the collision name %q must sort after %q, or retention keeps the older snapshot",
+			filepath.Base(next), filepath.Base(name))
+	}
+
+	// Now make the probe itself unanswerable: a symlink pointing at itself fails with ELOOP,
+	// which is neither "free" nor "taken".
+	loop := filepath.Join(backups, s.snapshotName("20260102T000000.000Z"))
+	if err := os.Symlink(filepath.Base(loop), loop); err != nil {
+		t.Skipf("this filesystem cannot create a symlink loop: %v", err)
+	}
+	if got, err := s.freeSnapshotName(backups, "20260102T000000.000Z"); err == nil {
+		t.Errorf("a probe that cannot answer must be reported, not silently worked around; got %q. "+
+			"Treating it as \"taken\" spins the suffix loop forever when every candidate fails the "+
+			"same way", got)
+	}
+}
