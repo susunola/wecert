@@ -1,4 +1,4 @@
-# 第四轮代码复审（2026-09-18，共 4 小轮）
+# 第四轮代码复审（2026-09-18，共 4 小轮 + 1 小轮补做）
 
 > 承接 [`docs/code-review-ocr-2026-09-17.md`](code-review-ocr-2026-09-17.md)（前两轮，已清空）。这一轮换了打法：**5 个独立复审者并行**，每人只负责一组文件，结论写进 `/tmp/wecert-review-r4/<组>.json`（不经过会被截断的返回值），再由我逐条回代码核实、修复、并做「去掉修复就变红」的变异校验。
 >
@@ -14,6 +14,7 @@
 | 第 2 轮 | 第 1 轮剩下未修的项 + 并发/生命周期/资源泄漏视角 | **已完成**（见 §3） |
 | 第 3 轮 | 对本次会话全部改动的对抗性复审 + 不变量与属性/模糊测试 | **已完成**（见 §4） |
 | 第 4 轮 | 跨面：文档 vs 行为、cmd/*、scripts、deploy、testenv，以及遗留项收口 | **已完成**（见 §5） |
+| 第 5 轮（补做） | 只审 4.2/4.3 与今天这批修复本身（两个独立复审者：一个只攻击 diff，一个只跑代码） | **已完成**（见 §6） |
 
 ---
 
@@ -83,7 +84,7 @@
 |---|---|---|
 | `internal/acme/manager_flow.go` + `internal/state`（新增 `authorizations.challenge_prepared_at`） | `reclaimUnpresentedTXT` 把「所有可达权威都否认」当成「这次写入从未发生」。但同一个行形状有两种来历：**死在 DNS 写入与状态落盘之间**，以及**死在持久化挑战与写 DNS 之间**——只看记录无法区分。DNSPod 的权威服务器滞后于 API 写入（本轮实测删除传播到所有权威最多 60s），于是刚写下的记录可能被每个权威否认，行与租约被删掉，而记录稍后出现：唯一的线索已经没了，那条 TXT 会留在 DNS 里占用额度、并可能污染同名（通配符 + apex 共用）的下一次挑战 | 授权行新增 `challenge_prepared_at`（`schemaColumns` 加列，老行为 0 = 年龄未知）；选择挑战时写入；否认只在「距选择挑战已超过传播窗口」时才被采信，窗口取 solver 自己的 `PropagationTimeout()`（新增到 `challengeSolver` 接口）。三个用例：刚准备（10s 前）→ 保留行；一小时前 → 删除行（否则老行永远留不完）；无时间戳的旧行 → 沿用旧行为。两处变异（去掉年龄判断、不写时间戳）各自变红 |
 
-第 1 轮至此**全部 28 条已核实发现都已处置**（28 修，0 遗留），其中「非交互 stdin」「`-json` NDJSON 形状」「tx.go 注释」三条经核实**驳回/不计**（见 §2.2）。
+第 1 轮至此**全部 26 条已核实发现都已处置**（26 修，0 遗留：§2.1 的 14 + §2.4 的 9 + §2.5 的 2 + §2.6 的 1），另有 4 条经核实**驳回/不计**（见 §2.2）。
 
 ### 2.7 第 1 轮之后仍待办（第 2–4 小轮）
 
@@ -150,10 +151,86 @@
 | `testenv/` | 三个 `tfplan-*` 二进制已停止跟踪并加入 `.gitignore`；`terraform.tfvars`/README 未受影响 | 见 §3.4 |
 | 遗留项 | §2.7 的 12 条：11 条已修，1 条（LC-2 客户端复用）与 LC-4 明确记为「核实为真但故意不改」，理由见 §3.2 | 收口 |
 
-**四轮总计**：复审者返回 37（第 1 轮）+ 4（第 2 轮）+ 独立对抗复审（第 3 轮，与本轮自查并行）条；**已修 30 条**（第 1 轮 28、第 2 轮 2、第 3 轮又自查出 2 条并修），**驳回 3 条**，**核实为真但故意不改 2 条**，其余按「脚手架 / 需产品决策」分类记录。所有修复都带「去掉修复就变红」的用例（唯一的例外是报告 fsync，属持久性加固，已注明无行为用例）。
+**五轮总计（按本文各表逐条计数）**：已修 **42 条** —— 第 1 轮 26 条（§2.1 的 14 + §2.4 的 9 + §2.5 的 2 + §2.6 的 1）、第 2 轮 2 条（§3.1）、第 3 轮 3 条（§4，其中 2 条是那批修复**自己引入**的）、第 5 轮 11 条（§6.1，其中 4 条是修复自己引入的：第 1、2 条属这一轮，第 5、6 条推翻了 4.2 与这一轮的修复）；**驳回/不计 4 条**（§2.2），外加第 5 轮复审者独立提出、核实后不成立的 8 项（§6.3 的表）；**核实为真但故意不改 3 条**（§3.2）。复审者返回的条数与「已修」条数**本来就不相等**：返回里混着同一缺陷的重复描述、追不到可达调用路径的猜测（不计），以及属于脚手架 `testenv/` 而不属于产品的观察。所有修复都带「去掉修复就变红」的用例（唯一的例外是报告 fsync 与第 4 条那处日志文案，已注明无行为用例）。
 
 ---
 
-## 6. 精度说明（这份审查的可信度边界）
+## 6. 第 5 小轮（补做）：两个独立复审者，一轮只攻击修复、一轮只跑代码
+
+第 3 轮的对抗复审只覆盖 `b72d1e3..HEAD` 那道 diff，而 4.2（`c49ff31`）、4.3（`ed88a4b`）两个提交是它之后才落的；今天这批修复（重写 `manager_test.go` 时带掉的用例、挑战行落盘次序、onboarding 记录次序、提示文案）也没有经过任何独立复审者。于是补一轮，方法与第 3 轮相同——**只问一句「这处修复在什么情况下会把事情弄得更糟」**——但这次派了两个人，并要求结论落到磁盘（`/tmp/wecert-r5/*.json`）而不是返回值：一个**只攻击修复**（读 diff 与代码），一个**只跑代码**（自己写用例观察行为，不看结论）。这一轮抓到 7 条新缺陷，其中 2 条推翻了**我自己前两轮的修复**。
+
+### 6.1 复核出的 11 条（其中 4 条是我自己引入的）
+
+第 1–4 条来自**第一批**（我自己的复查 + 一个对抗复审者）；第 5–11 条来自**两个独立复审者**：一个只攻击这批修复（结论写进 `/tmp/wecert-r5/adversarial.json`），一个只**跑代码**做行为验证（不读结论，写进 `/tmp/wecert-r5/behaviour.json`，17 项检查 / 5 项未验证）。第 5、6 条推翻的是**我自己这两轮的修复**。
+
+| # | 位置 | 缺陷 | 修法与用例 |
+|---|---|---|---|
+| 1 | `internal/acme/manager_test.go` | **我在 4.3（`ed88a4b`）重写这个文件时把 4.1b 刚加的用例删掉了**：`TestAFailedOrderReadSchedulesTheRetry` 守的是 4.1 的修复「状态库读订单行失败必须走 `recordFailure`」（否则该 pass 在 `wecert_certificate_consecutive_failures` 里不可见、且按 pass 频率立刻重试）。用例没了，修复就成了没人守的代码（`git log -S` 可查：`48e7490` 加入，`ed88a4b` 删除） | 用例按原样补回（`dropTable(orders)` 造出读失败，断言 `ConsecutiveFailures` 与 `NextAttemptAt` 都非零）。变异校验：把 `m.recordFailure(...)` 改回裸 `fmt.Errorf`，两条断言同时变红 |
+| 2 | `internal/acme/manager_flow.go` | 挑战行与**刷新后的 `challenge_prepared_at`** 只在「首次访问」那条路径上先落盘；**续做路径**（行里有旧 token、`Presented=false`）要等到循环末尾那次 `PutAuthorization` 才写盘。中间崩溃时，磁盘上留下的年龄**比写入还老**——而 4.1d 刚定的规则是「权威否认只有在写入经过传播窗口之后才算证据」，于是回收探针会去信一个针对**仍在传播**的记录的否认，删掉行却把 TXT 留在 DNS 里 | 年龄必须在 DNS 写入**之前**落盘，但**能落到盘上的只有年龄**（见第 5 条：这一版最初写成「无条件连新 token 一起写」，被对抗复审推翻，终版按访问类型分开——首次访问可以连新 token 一起写，续做路径只写年龄、token 等写入成功后的末尾那次落盘再改）。用例 `TestTheChallengeIsPersistedBeforeTheDNSWrite`（`onPresent` 钩子在 `Present` 被调用的一瞬间读库）与 `TestAFailedWriteOnTheRevisitPathKeepsTheTokenThatNamesTheRecord`（见第 5 条） |
+| 3 | `internal/onboarding/onboard.go` | 4.1 给「被包含的名字不能同时被报成排除」加的 `unreject` **依赖记录次序**：域名区遍历先返回哪条记录不由我们决定。坏记录在前、好记录在后时 `unreject` 生效；**好记录在前**时，后面那条无法解析的记录又无条件 `reject` 一次，报告对同一个名字给出两个相反结论（`included=true` 与 `included=false` 并存） | 无法解析的分支先看 `byHost`：该名字已经有可用声明时不再写排除结论（与 `unreject` 互为镜像）。用例改成**两个次序都跑**。变异校验：把守卫去掉，`order broken-first=true`（好记录在前）那轮变红，红出的正是两条矛盾结论 |
+| 4 | `internal/acme/manager_done.go` | 4.1 新写的提示文案说「bind **either** certificate once in the CLB console」，但在同一轮里「等第一次绑定」已被实现为「提升新证书 + 把被替换的那张放进回收清单」：照提示去绑旧的那张，程序跟踪的那行仍然是未绑定 → 下一轮再次判定「无人绑定」→ 再上传第三张、再烧一次签发额度 | 文案改为只指本次上传的那张（并点名 `certId` 字段），同时写清旧的那张会被回收、换绑之后自动进行。**这条是日志文案，没有行为用例**（没有任何用例断言提示字符串），如实说明。对抗复审者独立核了文案里的三处事实（旧证书确实进了回收清单、云端在仍有引用时确实拒绝删除、按提示绑定后确实会自动换绑），未推翻 |
+| 5 | `internal/acme/manager_flow.go` | **第 2 条的第一版把「年龄先落盘」做成了「无条件连新 token 一起先落盘」，这会在另一条路径上丢线索**：一行只存一个 token，而 `reclaimUnpresentedTXT` 正是靠它推导出要探测的 TXT 值。续做路径上若 CA 给出了不同的挑战（代码自己承认这个形状存在，`releaseStaleLease`/`releaseRowStaleLease` 就是为它写的），而这次写入**失败**（一次普通的 DNSPod 报错，不需要崩溃），盘上的 token 已经变成新的：恢复时按新值探测 → 被权威否认 → 删行，而 DNS 里那条旧记录从此没有任何东西指向它 | 终版：续做路径只把**年龄**落盘（token/URL 保持旧值），写入成功后的末尾那次落盘才换 token；首次访问没有旧记录可言，仍连新 token 一起先落盘。用例 `TestAFailedWriteOnTheRevisitPathKeepsTheTokenThatNamesTheRecord`（拒绝写入的 provider + 权威只提供旧值；断言盘上 token 仍是 `tok-1`、年龄已刷新、恢复时 delete-all 确实触发）。两处变异各自变红：改回「无条件写新 token」→ 行名变成 `tok-2`、`delete-all ran 0 times`；去掉续做路径的年龄落盘 → 年龄仍是 30 分钟前的旧值 |
+| 6 | `internal/reconcile/reconcile.go` | **4.2 的 `Drain` 有两个真缺陷（都是我自己引入的）**：(a) `startCert` 的 `bg.Add(1)` 与 `Drain` 的 `bg.Wait()` 并发——`sync.WaitGroup` 明确要求「从零开始的 Add 必须发生在 Wait 之前」，实测可复现进程级 panic `sync: WaitGroup is reused before previous Wait has returned`（`-race` 下每次都报 DATA RACE）；生产路径真实存在：HTTP server 的 `Shutdown` 是异步的，触发器可以在 `Drain` 期间到达。(b) 同一个竞态还让 `Drain` 返回**之后**才启动的 pass 照常运行（`select` 两个 case 同时就绪时随机选），其状态写入全部落在已关闭的库上（`sql: database is closed`）——正是 `Drain` 要防的那种丢失 | 新增 `bgMu` + `draining`：`beginPass()` 在同一把锁下判断并 `Add`，`Drain` 先在锁内把 `draining` 置位再 `Wait`；`StartAll`/`StartNamed`/`StartCert` 在 draining 后以新哨兵 `ErrShuttingDown` 拒绝（不能报成 `ErrAlreadyRunning`——那会让调用方以为「已经在跑、等着就行」），webhook 的两条错误日志也改成如实说明「状态读不到**或**进程正在退出」。用例 `TestAPassStartedAfterDrainIsRefused`、`TestAShutdownRefusalIsNotReportedAsAlreadyRunning`、`TestStartingAPassDoesNotRaceWithDrain`（40 轮 StartAll×Drain 对撞）。变异校验：把 `draining` 判断改成恒假，拒绝用例立刻报「no pass may run after Drain returned, these did: [a]」，对撞用例三次全部 `WARNING: DATA RACE` |
+| 7 | `internal/onboarding/onboard.go` | 两个复审者各自独立复现：**同一个 hostname 会出现 2–3 条排除结论**。冲突之后再写第三条记录 → 冲突那条 + 「repeats a hostname already rejected」那条；同一个名字在两个 zone 各写一条坏记录（都没有可用声明）→ 2–3 条一模一样的「unparseable declaration」 | `reject` 变成**每个 hostname 只记第一条**（第一条就是原因），冲突之后那条分支不再补记（只拒收），并新增 `include()` 统一处理「包含」结论（先 `unreject` 再追加）。用例 `TestOneVerdictPerHostname`（6 个子例：冲突+第三条、坏+好+坏、好/坏两种次序、只有坏记录 2 条、只有坏记录 3 条）；把 `reject` 改回「一律追加」→ 后两个子例分别报 2 条和 3 条 |
+| 8 | `internal/onboarding/onboard.go` | 同一个 DNS 名字、两种拼写、两个相反结论：`hostnameFromRecord` 只去掉**一个**尾点、也不做 `group.Normalize`，而 `ParseDeclaration` 是 `Normalize` 过的。于是 `_wecert.api.example.com..`（多一个点）或带多余空格的名字，会被报成 `api.example.com.` 排除 + `api.example.com` 包含 | `hostnameFromRecord` 按 `ParseDeclaration` 的方式规范化（`group.Normalize`，失败时退回去前缀的字符串）。用例 `TestOneVerdictPerHostname` 的两个「非规范拼写」子例；去掉规范化 → 两个子例都报出 `api.example.com.` 的排除条目 |
+| 9 | `internal/onboarding/onboard.go` | 第 3 条的守卫把「矛盾」换成了「静默丢弃」：一条无法解析的记录若同名已有可用声明，就**什么决定都不留**，而 `parse()` 的文档注释还写着「无法解析的记录会留下一条决定」——`Decisions` 是运维唯一会读的产物，于是一个写错的 `wildcard=maybe` 就这样消失了 | 决定列表仍然只留一条（不能自相矛盾），但**日志里点名**：记录名、zone、hostname 与解析错误。用例 `TestAnIgnoredBrokenRecordIsNamedInTheJournal`（harness 现在把日志收进 buffer 供断言），并同步改掉文档注释 |
+| 10 | `internal/onboarding/onboard_test.go` | 第 3 条那个「两个次序都跑」的用例，失败信息里的 `order[0].Record == broken.Record` **恒为真**（两条记录的 Record 字符串相同，区别在 Zone），所以明明是「好记录在前」那轮失败，却打印 `broken-first=true`——一个会把人带偏的诊断 | 改成比较 Zone。复审者验证：改回字符串比较后，失败轮被标成 `broken-first=true`，而实际是 good-first |
+| 11 | `internal/reconcile/reconcile.go` | `reconcileOne` 上方的文档注释被复制成两遍（`...into metrics// reconcileOne processes...`），是某次脚本编辑留下的残骸 | 去重（纯注释） |
+
+
+### 6.2 这一轮的机械核查
+
+- **用例清单不缩水**：`git show HEAD:<file> | grep -c '^func Test'` 与工作树逐文件对照，函数总数 765 → 773，**只有新增、无删除**（新增的正是第 1、2 条与第 5–9 条那几条）。这条核查是因为第 1 条缺陷（静默删用例）才加的，之后每轮都会跑。
+- **8 处变异校验亲自复跑**（在 `/tmp` 的副本里改，绝不动工作树）：每处都先确认变异**能编译**且确实把修复改回去了，再看失败输出，而不是只看 `grep`。8 处全部变红且失败信息指向缺陷本身（只有第 4 条是日志文案，无变异可做）。其中 2 处是**推翻我自己上一次修复**的（第 5、6 条）。
+- **顺手清掉机械恢复留下的垃圾**：上一轮用脚本补回被误删的 `solver.newProvider` 赋值时，在新用例里留下了**一处死赋值**和一处多余空行（gofmt 不会报）；`reconcileOne` 上方的注释还被复制成两遍（第 11 条）。都已清掉并按全量门禁重跑。
+- **没有「不断言」的用例**：脚本按大括号配对取出全部 `Test*` 的函数体，筛「体内既没有 `t.Error/Fatal/Fail/Skip` 也没有 `t.Run`」的，只有 1 个命中：`TestReclaimSkipsAProberWithoutHostEnumeration` —— 它的断言就是「不 panic」（类型断言若写成非 comma-ok 形式，这个用例会以 panic 失败），属误报。作为「测试不是在自我安慰」的证据记录。
+
+### 6.3 独立复审者的结论
+
+两个复审者用了**不同的方法**，这一点比他们的结论更重要：一个只读代码与 diff、假设每处修复都错（对抗型），一个只跑代码、自己写用例去观察真实行为（行为型，`17 项检查`）。两人的交集是第 7 条（重复结论），说明这类「报告产物的一致性」缺陷是读代码就能看见的；而第 5、6 条只有动手构造场景才会暴露——**只读结论的复审者两轮都没发现它们**。
+
+**他们独立提出的、我核实后不成立的（驳回项）**——这些同样是这一轮的产出，记下来是为了说明哪些面真的查过了：
+
+| 面 | 复审说法 | 为什么不是缺陷 |
+|---|---|---|
+| `ratelimit.Spend` 的容量钳制 | 超出容量的结余、`cost > capacity`、负 cost 三种输入下行为可疑 | 行为验证者自己写表驱动用例跑过：结余**丢弃**（不是结转）、`cost > capacity` 把欠债夹在 `-capacity`（保守方向）、欠债会继续背、负 cost 不会被当成 credit。最初两条「失败」是**复审者自己的算术错**，不是产品缺陷 |
+| `ParseRetryAfter` 的严格度 | 提示里的 `2026-09-18T05:00:00Z` 形状解析不出来 | Boulder 的 `Decision.Result` 用的是 `Format("2006-01-02 15:04:05 MST")`，那个形状**不是** CA 会发的；四种真实措辞（含/不含 `: see <url>`）都精确解析，空串、垃圾、零时刻都返回 `(zero,false)`，不 panic、不落零窗口。**[1m,24h] 的钳制不在这个解析结果上**（它按原样保存），而在 RFC 9773 §4.3.2 的 ARI 区间上，实现于 `manager_renew.go:224-229`，30s→1m、25h→24h、服务端给的 2h **不会**被我们 6h 的下限拉长——这一条我此前在文档里说得含糊，已按实测改正 |
+| 状态库迁移 | 旧库（缺列）打开后是否丢数据 | 行为验证者用 `6172439^` 的真实旧 schema 建库、每张表都放一行，`Open` 后两列补齐、数据无损、部分迁移可用、拿不到锁时拒绝并且**不碰文件** |
+| `CASE WHEN excluded > 0` 的 upsert | 不知道新列的写入者会不会把值抹掉 | 不会：挑战年龄与 CA 截止时间在「不写该列」的更新里保留，写入者知道时替换，只有显式清除才清空 |
+| `releaseRowStaleLease` / `releaseStaleLeaseExcept` | 会不会放掉还活着的租约 | 不会：排除自身那行的逻辑成立，别的证书在同一名字上的声明仍然保住租约，读库失败时**保留**租约（保守方向） |
+| 落盘次序（第 2、5 条的终版） | 是否真的做到「写 DNS 时盘上已有本次挑战」 | 用同一个 `onPresent` 钩子对两条路径、多标识符订单逐点验证：`Present` 被调用时盘上的行已经是本次挑战、`Presented=false`、年龄是新的；反向次序观察不到 |
+| `Drain` 的核心契约（修好第 6 条之后） | 是否真的等到 pass 及其状态写入结束 | 会：等在飞的 pass（含它那次 `PutCert`）、等等待期间启动的 pass、并发 `Drain` 都能返回且不会 double close |
+| 第 4 条那处提示文案的三条事实 | 旧证书是否真进回收清单、云端是否真会拒绝删除仍被引用的证书、按提示绑定后是否真会自动换绑 | 三条都成立（回收清单由同一事务写入；`Delete` 带 `IsCheckResource=true` 并等异步任务，任何非成功状态都保留回收记录；`Noop.Delete` 会拒绝而不是假装成功）。没有找到「照提示做反而被卡住」的序列 |
+| 第 3 条的守卫键 | `hostnameFromRecord` 与 `ParseDeclaration` 的 Hostname 会不会对不上 | 对 DNSPod lister 能产出的 11 种形状逐一比对，全部一致；只有「记录名不带 `_wecert.` 前缀」这种会被 lister 过滤掉的形状才可能不一致 |
+
+**他们明确无法验证的（与我自己的清单合并，见 §7）**：云端对 `IsCheckResource` 的真实执行与真实删除任务状态、CA 是否真的会在同一个授权 URL 上换挑战（第 5 条的前提）、DNSPod 是否会返回非规范记录名（第 8 条的前提）、在「落盘」与「写 DNS」之间注入真实崩溃、线上 LE 429 的真实文案、以及第 6 条那个窗口在生产里出现的频率（需要放大并发才复现）。
+
+### 6.4 本小轮的门禁
+
+两批改动（`6d2eb98` 与第 5–11 条那一批）各跑一遍完整门禁：`gofmt -l .` 干净；`go vet ./...` 与 `go vet -tags "pebble lego_dns" ./...` 干净；`staticcheck ./...` 干净；`python3 scripts/check-english.py` 182 个源文件通过；`go test -race -count=1 ./...` **19/19 包通过**；`make check`、`make test-pebble`（2/2）、`make e2e`（3/3）通过；`scripts/test-e2e-wildcard.sh` 5/5；抖动/次序门禁 `make test-repeat`（`-race -shuffle=on -count=3`）**19/19 包通过**；`6d2eb98` 已推送且 CI 在 `test/e2e-tlsserver-renewal`（PR #67）上 **success**，第二批同样推送后复核 CI。
+
+---
+
+## 7. 精度说明（这份审查的可信度边界）
+
+这份文档只声称它真的做到的事，下面把边界写清楚：
+
+- **缺陷的判定标准**：必须能追到一条可达调用路径，并给出具体场景；追不到的一律不计（§2.2 的第 4 条就是这种：注释与实现不符属实，但没有调用者）。gofmt / vet / staticcheck / `-race` 已经能判的东西不重复报。
+- **「每条修复都有会变红的用例」的含义与边界**：它证明这条用例对**这处**修复敏感（去掉修复就红，已逐条实测），**不证明**用例覆盖了该修复的所有回归路径，也不证明没有别的地方还在依赖旧行为。第 5 轮那 8 条变异是我在 `/tmp` 的副本里亲自复跑的（先确认变异能编译、确实改回了旧代码，再看失败输出），不是只看 `grep`。反过来说：**这一轮最值钱的两条缺陷（§6.1 第 5、6 条）恰恰是「用例全绿」时被复审者用新场景打出来的** —— 用例绿只说明它守的那条路径没坏。
+- **工具能证明什么**：`-race` 只覆盖测试里**实际发生**过的交错，不是「无竞态」的证明（§6.1 第 6 条的竞态就是靠一个 40 轮对撞的用例才每次都报出来的，单跑一次并不保证）；4 个 fuzz 目标各跑 45s，不是跑到饱和；`staticcheck`/`vet` 只能判它们看得见的模式。ACME 订单状态机没有做模型检查或形式化验证 —— 它的正确性来自用例、pebble 集成测试与真机 e2e 的观察。
+- **复审者的独立性有限，但方法差异有效**：第 1/2/3/5 轮的复审者是同一模型族的不同实例，共享同样的盲区（例如都可能在腾讯云 API 文档过时、DNSPod 免费额度行为这类**外部事实**上判断错）。这一轮把「读代码」和「跑代码」分成两个人之后，两个只读型的复审（第 3 轮与第 5 轮的对抗者）都没有发现 `Drain` 的 WaitGroup 误用，只有动手构造场景的那一个发现了 —— 说明**换方法比换复审者更值钱**。真机 e2e 是唯一能证伪外部事实盲区的手段，而它只覆盖了跑过的那些路径。
+- **本轮明确未跑 / 未验证**（不是「应该没问题」，是**没验证**；与 `docs/e2e-run-2026-09-18-credentialed.md` 第 6 节一致）：
+  1. 真实时间流逝下的自然续期（真机跑的是把续期窗口推到当下的等价做法）—— **未跑**；
+  2. 生产（非 staging）Let's Encrypt 的配额与签发行为、以及线上 429 的真实文案（全程 staging，另加本地 pebble；`ParseRetryAfter` 的四种措辞是照 Boulder 源码核对的，不是线上抓的）—— **未跑**；
+  3. 「归档副本也没了」的吊销报错分支 —— **真机未跑**，单元层面由 `TestAReplacementIsNeverRevokedInPlaceOfTheRequestedCertificate` 覆盖（`ListRetiredCertMaterial` 只返回 `cert_pem IS NOT NULL` 的行，所以「保留期已回收」与「行里没有材料」落到同一条错误分支：请求保持未决、`last_error` 写明只能在 CA 侧吊销）；
+  4. 「枚举超时 / 未覆盖全部 region」的部署哨兵分支 —— **真机未跑**，仅单元测试（本轮换绑走的是 adopted task + 恢复判定）；
+  5. Stage C「首绑 → 自动换绑」在 CVM/systemd 上的重跑（09-18 那轮只在 Stage B 用同一条 `UpdateCertificateInstance` 路径复核了换绑，CVM 侧只跑到「首签上传 + 提示手工绑定」）；
+  6. 监听器关闭 SNI 的路径（本账号无法关闭 SNI）；
+  7. 云端对 `IsCheckResource=true` 的真实执行与真实删除任务状态（单元与 seam 测试覆盖了状态 4 的处理，真机没构造过「证书仍被引用时删除」）；
+  8. CA 是否真的会在**同一个授权 URL** 上换挑战（§6.1 第 5 条的前提：代码自己承认这个形状存在，但真机上没观察到）、以及 DNSPod 是否会返回非规范记录名（第 8 条的前提）；
+  9. 在「落盘」与「写 DNS」之间注入**真实崩溃**（第 2、5 条的时间窗是用测试钩子观测的，不是真崩溃）；
+  10. §6.1 第 6 条那个 `Add`/`Wait` 窗口在生产里出现的频率（要靠放大并发才复现，真实触发概率未知——但代价是进程级 panic，所以按「会发生」处理）；
+  11. LC-2（SDK client 复用）与 LC-4（最后一个租约的 delete-all）—— 核实为真但**故意不改**，理由见 §3.2。
+- **本文与代码的对应**：每条「已修」都对应一次提交（`770d018`、`48e7490`、`41b55cf`、`0f61177`、`9d9b12e`、`c49ff31`、`ed88a4b`，以及第 5 轮的两批：`6d2eb98` 与 §6.1 第 5–11 条那一批）；改动只在 `internal/`、`cmd/`、`scripts/`、`deploy/` 与 `docs/` 内，`testenv/` 只被顺带清理（那是你的测试脚手架，不是产品）。
 
 ---
