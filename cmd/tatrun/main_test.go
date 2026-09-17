@@ -22,6 +22,10 @@ type fakeTAT struct {
 
 	// err makes the describe call fail, so the retry/abort behaviour is observable.
 	err error
+
+	// omitResult drops the TaskResult even on SUCCESS, which is how the API looks when the task
+	// record was never instrumented.
+	omitResult bool
 }
 
 func (f *fakeTAT) RunCommandWithContext(context.Context, *tat.RunCommandRequest) (*tat.RunCommandResponse, error) {
@@ -37,7 +41,7 @@ func (f *fakeTAT) DescribeInvocationTasksWithContext(context.Context, *tat.Descr
 		f.idx++
 	}
 	task := &tat.InvocationTask{TaskStatus: common.StringPtr(status)}
-	if status == "SUCCESS" || f.output != "" {
+	if !f.omitResult && (status == "SUCCESS" || f.output != "") {
 		task.TaskResult = &tat.TaskResult{
 			Output:   common.StringPtr(f.output),
 			ExitCode: common.Int64Ptr(f.exitCode),
@@ -221,5 +225,22 @@ func TestBuildRunCommandEncodesTheContent(t *testing.T) {
 	}
 	if len(req.InstanceIds) != 1 || req.InstanceIds[0] == nil || *req.InstanceIds[0] != "ins-1" {
 		t.Errorf("InstanceIds = %v, want [ins-1]", req.InstanceIds)
+	}
+}
+
+// SUCCESS without a result body is the absence of evidence, not a run that printed nothing.
+//
+// The tool's whole purpose is to be the evidence that does not trust the control plane, and the
+// project's own test plan lists this case (a remote command that produces no output but errors):
+// exit 0 with empty output is indistinguishable from a command that ran and produced nothing,
+// which is the false green light an operator would act on.
+func TestWaitForTaskRefusesSucceededWithoutEvidence(t *testing.T) {
+	f := &fakeTAT{statuses: []string{"SUCCESS"}, omitResult: true}
+	err := wait(t, f)
+	if err == nil {
+		t.Fatal("SUCCESS with no TaskResult must be reported as an error, not as an empty successful run")
+	}
+	if !strings.Contains(err.Error(), "no result") {
+		t.Errorf("the error must say the result was missing, got %q", err)
 	}
 }

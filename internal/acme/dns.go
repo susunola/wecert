@@ -973,6 +973,16 @@ func (s *DNSSolver) queryRecursive(ctx context.Context, msg *dns.Msg) (*dns.Msg,
 	var errs []error
 	for _, resolver := range s.recursiveNameservers {
 		resp, err := s.exchange(ctx, msg.Copy(), resolver)
+		if err == nil && resp != nil && resp.Truncated {
+			// exchangeDNS hands back the UDP answer when its TCP retry fails, with Truncated still
+			// set so the caller can decide -- the probe paths do decide. Callers of this one read
+			// the answer structurally (authoritativeNS builds the server list out of resp.Answer),
+			// so accepting it would silently shrink the authority set, and a reduced set is how the
+			// "two independent servers must agree" rule degrades into the single-authority
+			// exemption it exists to avoid. Ask the next resolver instead.
+			errs = append(errs, fmt.Errorf("%s: truncated answer (TCP retry failed)", resolver))
+			continue
+		}
 		if err == nil && resp != nil && (resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError) {
 			return resp, nil
 		}

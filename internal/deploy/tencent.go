@@ -968,7 +968,17 @@ func countBindings(
 		complete := true
 		for _, res := range r.BindResourceResult {
 			if res == nil {
+				// A resource-type entry with no body counted nothing. Treating that as an answered
+				// enumeration is how a total of zero becomes authoritative: the repair path reads
+				// "complete && count == 0" as "the old certificate is gone" and reports the switch
+				// as done. The empty outer list is refused above for the same reason, one level up.
+				complete = false
 				continue
+			}
+			if len(res.BindResourceRegionResult) == 0 {
+				// Same shape one level down: the entry exists but no region was counted, so the
+				// zero is a missing answer rather than the number zero.
+				complete = false
 			}
 			for _, region := range res.BindResourceRegionResult {
 				// A region that is absent from the answer, or that carries no TotalCount, is a

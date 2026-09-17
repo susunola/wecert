@@ -39,22 +39,29 @@ func ReasonName(code int) string {
 // to survive the process. If this only attempted the revoke and reported the error, a
 // transient failure would leave the operator believing the certificate was revoked when it was
 // not, which is the worst possible outcome for this particular action.
+// ErrRevocationNotRecorded marks the failures where NOTHING reached the state store: there is no
+// queued request, and no later pass will retry anything. Callers that tell an operator "it is
+// recorded and will be retried" must check for it -- on a key compromise, telling someone their
+// revocation is queued when it is not is wrong in the unsafe direction.
+var ErrRevocationNotRecorded = errors.New("the revocation request was not recorded")
+
 func (m *Manager) RequestRevocation(ctx context.Context, certName string, reason int) error {
 	st, err := m.store.GetCert(certName)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: reading the certificate: %w", ErrRevocationNotRecorded, err)
 	}
 	if st == nil || len(st.CertPEM) == 0 {
-		return fmt.Errorf("no certificate material stored for %q, so there is nothing to revoke; "+
-			"if the certificate was issued before wecert started archiving it, revoke it at the CA", certName)
+		return fmt.Errorf("%w: no certificate material stored for %q, so there is nothing to revoke; "+
+			"if the certificate was issued before wecert started archiving it, revoke it at the CA",
+			ErrRevocationNotRecorded, certName)
 	}
 
 	if _, err := m.RevocationReasonCode(reason); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrRevocationNotRecorded, err)
 	}
 
 	if err := m.store.AddRevokeRequest(certName, reason, m.now()); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrRevocationNotRecorded, err)
 	}
 	m.log.Error("revocation requested; the request is recorded and will be retried until the CA accepts it",
 		"cert", certName, "reason", ReasonName(reason))
