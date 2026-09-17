@@ -239,6 +239,13 @@ func TestCleanUpDefersDeleteAllWhileAnotherValueIsLive(t *testing.T) {
 	solver := &DNSSolver{
 		newProvider: func(context.Context) (challenge.Provider, error) { return p, nil },
 		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// Present resolves the zone before handing the write to the provider, so the fixture
+		// needs a resolver that answers. This test is about the lease registry, not discovery.
+		recursiveNameservers: []string{"192.0.2.53:53"},
+		exchange: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
+			return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{
+				Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}}), nil
+		},
 	}
 	ctx := context.Background()
 
@@ -730,4 +737,51 @@ func TestUnreachableRecursiveResolversDegradeToAWarning(t *testing.T) {
 	if !strings.Contains(logs.String(), "no recursive resolver could answer") {
 		t.Errorf("degrading must be visible in the log, got:\n%s", logs.String())
 	}
+}
+
+// The zone must be resolved by us, before the provider is asked to write.
+//
+// lego performs the same SOA walk internally and has no guard for it climbing to the public
+// suffix: when the resolver answers for `com.` but not for the domain, lego concludes the zone
+// is `com.` and the write fails with "zone com. not found in dnspod for domain ...", which
+// reads like a DNSPod account problem. Observed for real on a run whose configured resolvers
+// were the host's own ones. findZone already refuses to return a public suffix, so asking it
+// first turns the confusing failure into the actionable one.
+func TestPresentReportsTheZoneInsteadOfLettingLegoBlameTheAccount(t *testing.T) {
+	provider := &stubChallengeProvider{}
+	solver := &DNSSolver{
+		recursiveNameservers: []string{"192.0.2.53:53"},
+		log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		newProvider: func(context.Context) (challenge.Provider, error) {
+			return provider, nil
+		},
+		exchange: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
+			// Only the public suffix answers an SOA; the domain itself never does.
+			if msg.Question[0].Qtype == dns.TypeSOA && msg.Question[0].Name == "com." {
+				return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{
+					Name: "com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}}), nil
+			}
+			return dnsReply(msg), nil
+		},
+	}
+
+	_, err := solver.Present(context.Background(), "example.com", "token", "key-auth")
+	if err == nil {
+		t.Fatal("no SOA was ever returned for the domain, so the TXT write cannot work; it must fail here")
+	}
+	if !strings.Contains(err.Error(), "public suffix") {
+		t.Errorf("the error must name the real cause (the SOA walk stopped at the public suffix), got: %v", err)
+	}
+	if provider.presented != 0 {
+		t.Error("the provider must not be asked to write into a zone we could not resolve")
+	}
+}
+
+// stubChallengeProvider records whether it was asked to write anything.
+type stubChallengeProvider struct{ presented int }
+
+func (p *stubChallengeProvider) Present(string, string, string) error { p.presented++; return nil }
+func (p *stubChallengeProvider) CleanUp(string, string, string) error { return nil }
+func (p *stubChallengeProvider) Timeout() (time.Duration, time.Duration) {
+	return time.Second, time.Second
 }
