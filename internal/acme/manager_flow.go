@@ -1,6 +1,8 @@
 package acme
 
 import (
+	"strings"
+
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"github.com/go-acme/lego/v4/challenge/dns01"
 
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -246,6 +249,7 @@ func (m *Manager) solveChallenges(
 			// stops this process from spending the identifier's hourly failure budget on
 			// retries inside the same window (see identifierCooldown).
 			m.noteIdentifierFailure(targeted)
+			m.spendAuthzFailure(targeted)
 			if rerr := m.store.RecordIdentifierFailure(
 				c.Name, targeted, authzError(cur), m.now()); rerr != nil {
 				m.log.Warn("failed to record the identifier failure",
@@ -491,6 +495,10 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 				// ledger key wildcard-aware, just as solveChallenges does.
 				targeted := challenge.GetTargetedDomain(cur)
 				m.noteIdentifierFailure(targeted)
+				// The same budget as in solveChallenges: whichever poll observes the invalid
+				// authorization first is the one that spends the identifier's hourly failure slot,
+				// and both paths can be the first to see it.
+				m.spendAuthzFailure(targeted)
 				if rerr := m.store.RecordIdentifierFailure(a.CertName, targeted, authzError(cur), m.now()); rerr != nil {
 					m.log.Warn("failed to record the identifier failure", "cert", a.CertName, "identifier", targeted, "err", rerr)
 				}
@@ -779,4 +787,20 @@ func (m *Manager) awaitOrderStatus(
 		case <-time.After(m.pollInterval):
 		}
 	}
+}
+
+// spendAuthzFailure books one failed authorization against the identifier's hourly budget.
+//
+// This is one of the five failed authorizations per identifier per hour that Let's Encrypt allows.
+// Nobody spent it while a gauge for it was published anyway, and Remaining on a bucket nobody
+// writes returns Capacity by design -- so the number was structurally always full and the alert
+// built on it could never fire, on the limit a DNS-01 misconfiguration burns first.
+//
+// The scope matches the one publishQuota derives (the lowercased identifier), so the spend and the
+// gauge land on the same series.
+func (m *Manager) spendAuthzFailure(identifier string) {
+	if m.quota == nil {
+		return
+	}
+	m.quota.Spend(ratelimit.AuthzFailuresPerIdentifier, strings.ToLower(identifier), 1)
 }

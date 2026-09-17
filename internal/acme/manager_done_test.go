@@ -18,6 +18,7 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
@@ -1105,5 +1106,66 @@ func TestAFailedDiscardSchedulesARetry(t *testing.T) {
 		t.Errorf("a failed discard recorded no failure (failures=%d nextAttempt=%v): the next pass then "+
 			"retries at the pass rate instead of a backoff, re-running the TXT reclaim probes each time",
 			got.ConsecutiveFailures, got.NextAttemptAt)
+	}
+}
+
+// An issuance spends the two per-certificate budgets, so the gauges that publish them mean
+// something.
+//
+// Only the account-wide order limit was ever spent, while all four limits were published as
+// `wecert_ratelimit_remaining_tokens`. Remaining on a bucket nobody writes returns Capacity by
+// design, so three of those gauges were pinned at "full" forever and the alert on
+// certs-per-exact-identifier-set -- the limit Let's Encrypt offers no override for -- could never
+// fire. The spend happens where the certificate exists at the CA, not after the deploy: a deploy
+// failure of ours does not give that budget back.
+func TestAnIssuanceSpendsTheCertificateBudgets(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
+	cert.Deploy.Enabled = false
+
+	fixed := time.Now()
+	m.now = func() time.Time { return fixed }
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(24 * time.Hour),
+		CertURL: "https://ca.test/cert/old", CertPEM: selfSignedCertPEM(t, fixed.Add(24*time.Hour), "a.example.com"),
+		KeyPEM: []byte("old-key"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := GenerateKey(cert.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := MarshalPrivateKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutOrder(&state.Order{CertName: cert.Name, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	fake.certNotAfter = fixed.Add(90 * 24 * time.Hour)
+	fake.orders = []legoacme.ExtendedOrder{{
+		Order:    legoacme.Order{Status: "valid", Certificate: "https://ca.test/new"},
+		Location: "https://ca.test/order/new",
+	}}
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	for _, tc := range []struct {
+		limit ratelimit.Limit
+		scope string
+	}{
+		{ratelimit.CertsPerExactIdentifierSet, cert.DomainKey()},
+		{ratelimit.CertsPerRegisteredDomain, group.RegisteredDomain("a.example.com")},
+	} {
+		bucket, err := store.GetRateBucket(tc.limit.Name, tc.scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := tc.limit.Capacity - 1; bucket.Tokens != want {
+			t.Errorf("%s/%s was not spent: tokens=%v want %v (an unspent bucket reads as full, so the "+
+				"published gauge and its alert are meaningless)", tc.limit.Name, tc.scope, bucket.Tokens, want)
+		}
 	}
 }
