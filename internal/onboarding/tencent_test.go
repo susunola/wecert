@@ -3,11 +3,13 @@ package onboarding
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	clbsdk "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
+	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	dnssdk "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
 
@@ -35,6 +37,12 @@ type fakeDNSPod struct {
 	// error check only fires when Error.Code is set, and ErrorResponse.Response is an
 	// inline struct), so this is what a version mismatch or a proxy looks like.
 	nilResponse bool
+
+	// realEmptyError makes DescribeRecordListWithContext behave like the API: a query that
+	// matches no record is an ERROR (ResourceNotFound.NoDataOfRecord) unless the caller asked for
+	// an empty list with ErrorOnEmpty=no. Without this the fake is friendlier than production and
+	// the request field can be dropped without any test noticing.
+	realEmptyError bool
 }
 
 func (f *fakeDNSPod) DescribeDomainListWithContext(_ context.Context, req *dnssdk.DescribeDomainListRequest) (*dnssdk.DescribeDomainListResponse, error) {
@@ -83,6 +91,14 @@ func (f *fakeDNSPod) DescribeRecordListWithContext(_ context.Context, req *dnssd
 	}
 	if req.Limit != nil {
 		limit = *req.Limit
+	}
+	emptyMatch := len(all) == 0 || offset >= uint64(len(all))
+	wantsEmpty := req.ErrorOnEmpty != nil && *req.ErrorOnEmpty == "no"
+	if f.realEmptyError && emptyMatch && !wantsEmpty {
+		return nil, &tcerrors.TencentCloudSDKError{
+			Code:    "ResourceNotFound.NoDataOfRecord",
+			Message: "No records on the list.",
+		}
 	}
 	end := offset + limit
 	if end > uint64(len(all)) {
@@ -669,5 +685,41 @@ func TestLoadBalancerEnumerationDoesNotFilterByInstanceGeneration(t *testing.T) 
 		t.Errorf("DescribeLoadBalancers sent Forward=%d; that is the instance generation, not a "+
 			"layer-7 filter, so it hides classic load balancers and their rule domains with them",
 			*fake.forward)
+	}
+}
+
+// A zone with no TXT records -- or one page request past the end -- must not fail the whole
+// declaration read.
+//
+// The API's default is to report "nothing matched" as an ERROR, not as an empty list, and a
+// failed declaration source freezes the round: the desired-state document and the state file are
+// then not written for any certificate until a human edits DNS. Two ordinary situations reach it:
+// any enumerated zone without TXT records, and the page request this loop makes whenever a zone's
+// TXT count is an exact multiple of the page size.
+func TestAnEmptyZoneDoesNotFreezeTheDeclarationRead(t *testing.T) {
+	fake := &fakeDNSPod{
+		realEmptyError: true,
+		domains: []*dnssdk.DomainListItem{
+			{Name: common.StringPtr("empty.example.com")},
+			{Name: common.StringPtr("full.example.com")},
+		},
+		records: map[string][]*dnssdk.RecordListItem{},
+	}
+	// Exactly one full page, so the loop asks for the page after it.
+	for i := 0; i < int(dnsPageSize); i++ {
+		fake.records["full.example.com"] = append(fake.records["full.example.com"], &dnssdk.RecordListItem{
+			Name:  common.StringPtr(fmt.Sprintf("_wecert.api.n%03d", i)),
+			Type:  common.StringPtr("TXT"),
+			Value: common.StringPtr("domains=a.example.com"),
+		})
+	}
+	stubDNSPod(t, fake)
+
+	got, err := newDeclarations(t, nil).ListDeclarations(context.Background())
+	if err != nil {
+		t.Fatalf("a zone with no TXT records must read as \"no declarations\", not fail the round: %v", err)
+	}
+	if len(got) != int(dnsPageSize) {
+		t.Errorf("declarations = %d, want the %d from the full zone", len(got), dnsPageSize)
 	}
 }

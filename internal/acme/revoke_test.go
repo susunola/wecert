@@ -35,6 +35,12 @@ func TestFailedRevocationIsRecordedAndRetried(t *testing.T) {
 		t.Fatal("a failed revocation must be reported, not silently reported as done")
 	}
 
+	// This error is the "it is recorded, the CA has not accepted yet" kind, so a caller may tell
+	// the operator the request is queued and will be retried.
+	if errors.Is(err, ErrRevocationNotRecorded) {
+		t.Errorf("the request WAS recorded, so this must not be reported as \"nothing was recorded\": %v", err)
+	}
+
 	// The decision is recorded, so the daemon can finish the job.
 	req, err := store.GetRevokeRequest(cert.Name)
 	if err != nil {
@@ -136,6 +142,12 @@ func TestRevocationWithoutStoredMaterialIsRefused(t *testing.T) {
 	if got := err.Error(); !contains(got, "revoke it at the CA") {
 		t.Errorf("the error should say what to do instead, got %q", got)
 	}
+	// Nothing reached the store, so no later pass will retry this: the CLI has to be able to tell
+	// that apart from the recorded case, or it tells an operator acting on a key compromise that
+	// the revocation is queued.
+	if !errors.Is(err, ErrRevocationNotRecorded) {
+		t.Errorf("this failure recorded nothing, so it must match ErrRevocationNotRecorded: %v", err)
+	}
 }
 
 // An unknown certificate must not create a request that can never complete.
@@ -144,6 +156,8 @@ func TestRevocationOfAnUnknownCertificateIsRefused(t *testing.T) {
 
 	if err := m.RequestRevocation(context.Background(), "no-such-cert", 1); err == nil {
 		t.Fatal("revoking an unknown certificate must be refused")
+	} else if !errors.Is(err, ErrRevocationNotRecorded) {
+		t.Errorf("an unknown certificate records nothing, so it must match ErrRevocationNotRecorded: %v", err)
 	}
 	if len(fake.revoked) != 0 {
 		t.Error("no revoke call belongs here")
@@ -157,6 +171,8 @@ func TestRevocationRejectsAnUnknownReason(t *testing.T) {
 
 	if err := m.RequestRevocation(context.Background(), cert.Name, 99); err == nil {
 		t.Fatal("an unknown RFC 5280 reason code must be refused before contacting the CA")
+	} else if !errors.Is(err, ErrRevocationNotRecorded) {
+		t.Errorf("a rejected reason records nothing, so it must match ErrRevocationNotRecorded: %v", err)
 	}
 }
 

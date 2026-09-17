@@ -44,7 +44,14 @@ func (m *Manager) download(
 			m.log.Warn("but this certificate is not confirmed deployed to a cloud resource; check that the CLB listener has it bound",
 				"cert", c.Name, "deployedCertId", st.DeployedCertID)
 		}
-		return m.discardOrder(ctx, c.Name)
+		if err := m.discardOrder(ctx, c.Name); err != nil {
+			// The issuance is already the live one; what failed is the bookkeeping that finishes the
+			// order. That is still a failed pass -- and the one thing it must not do is come back
+			// immediately, because discardOrder is what reclaims TXT records through authoritative
+			// DNS probes.
+			return m.recordFailure(st, fmt.Errorf("discard the already-live order: %w", err))
+		}
+		return nil
 	}
 
 	// bundle=true returns the fullchain (leaf + intermediate certificates), which is exactly

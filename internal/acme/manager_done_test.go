@@ -1038,3 +1038,72 @@ func TestAFailedEpilogueKeepsTheOrdersResumeAnchor(t *testing.T) {
 		t.Errorf("a rolled-back epilogue left reclaim records: %+v", retired)
 	}
 }
+
+// A failed discardOrder must schedule a retry, not return the bare error.
+//
+// discardOrder is what reclaims TXT records through authoritative DNS probes, and its failures are
+// state-store failures. Returning the error without recordFailure skips the backoff entirely, so
+// the next pass re-runs those probes at the pass rate and nothing escalates or records why. The
+// sibling call site in manager_flow.go already says exactly this; the other three did not.
+func TestAFailedDiscardSchedulesARetry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{}
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	certs := []config.Certificate{{
+		Name: "site-example-com", Domains: []string{"a.example.com"},
+		Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+	}}
+	if err := config.NormalizeCertificates(certs); err != nil {
+		t.Fatal(err)
+	}
+	cert := &certs[0]
+
+	now := time.Now()
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: now.Add(24 * time.Hour),
+		CertURL: "https://acme.test/cert/old", CertPEM: selfSignedCertPEM(t, now.Add(24*time.Hour), "a.example.com"),
+		KeyPEM: []byte("old-key"), DeployedCertID: "cloud-old", DeployConfirmed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An order the CA has already expired: the pass discards it before doing anything else.
+	if err := store.PutOrder(&state.Order{
+		CertName: cert.Name, OrderURL: "https://acme.test/order/expired",
+		FinalizeURL: "https://acme.test/finalize/expired", Status: "pending",
+		KeyPEM: []byte("old-key"), Identifiers: cert.DomainKey(),
+		ExpiresAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER block_order_delete BEFORE DELETE ON orders
+		BEGIN SELECT RAISE(FAIL, 'orders blocked by test'); END;`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("the store refused the delete, so the pass must be reported as failed")
+	}
+
+	got, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConsecutiveFailures == 0 || got.NextAttemptAt.IsZero() {
+		t.Errorf("a failed discard recorded no failure (failures=%d nextAttempt=%v): the next pass then "+
+			"retries at the pass rate instead of a backoff, re-running the TXT reclaim probes each time",
+			got.ConsecutiveFailures, got.NextAttemptAt)
+	}
+}

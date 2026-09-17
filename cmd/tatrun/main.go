@@ -110,12 +110,16 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 		if task != nil {
 			switch deref(task.TaskStatus) {
 			case "SUCCESS":
-				out := ""
-				exitCode := int64(0)
-				if task.TaskResult != nil {
-					out = deref(task.TaskResult.Output)
-					exitCode = derefI64(task.TaskResult.ExitCode)
+				// A terminal SUCCESS with no result body is not "the command ran and printed
+				// nothing": it is the absence of the evidence this tool exists to fetch. Exiting 0
+				// with empty output makes the two indistinguishable, and the operator greps that
+				// empty output to decide what a listener is serving.
+				if task.TaskResult == nil {
+					return fmt.Errorf("the TAT task reported SUCCESS for invocation=%s but returned no "+
+						"result, so there is no evidence to report", invocationID)
 				}
+				out := deref(task.TaskResult.Output)
+				exitCode := derefI64(task.TaskResult.ExitCode)
 				if !quiet {
 					fmt.Fprintf(os.Stderr, "--- command output (exit=%d) ---\n", exitCode)
 				}

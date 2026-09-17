@@ -785,3 +785,74 @@ func (p *stubChallengeProvider) CleanUp(string, string, string) error { return n
 func (p *stubChallengeProvider) Timeout() (time.Duration, time.Duration) {
 	return time.Second, time.Second
 }
+
+// A truncated answer must not shrink the authority set.
+//
+// exchangeDNS retries over TCP and, when that fails, hands the UDP answer back with Truncated
+// still set -- the probe paths check it, queryRecursive did not. Its callers read the answer
+// structurally: authoritativeNS builds the server list out of resp.Answer. A truncated response
+// therefore removes servers silently, and a reduced list is how "two independent servers must
+// agree" degrades into the single-authority exemption that rule exists to prevent.
+func TestATruncatedAnswerDoesNotShrinkTheAuthoritySet(t *testing.T) {
+	const truncated = "192.0.2.53:53"
+	const full = "192.0.2.54:53"
+
+	nsNames := []string{"ns1.example.net.", "ns2.example.net.", "ns3.example.net."}
+	solver := &DNSSolver{
+		recursiveNameservers: []string{truncated, full},
+		log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		exchange: func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+			q := msg.Question[0]
+			if server == truncated {
+				// The TCP retry failed, so this is all the caller gets -- and it says so.
+				resp := dnsReply(msg, &dns.NS{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET},
+					Ns:  nsNames[0],
+				})
+				resp.Truncated = true
+				return resp, nil
+			}
+			switch q.Qtype {
+			case dns.TypeNS:
+				answers := make([]dns.RR, 0, len(nsNames))
+				for _, ns := range nsNames {
+					answers = append(answers, &dns.NS{
+						Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET},
+						Ns:  ns,
+					})
+				}
+				return dnsReply(msg, answers...), nil
+			case dns.TypeA:
+				// One distinct address per NS name: authoritativeNS deduplicates by address, so
+				// answering the same IP for every name would leave one server no matter what the
+				// truncation handling does.
+				last := byte(0)
+				for i, ns := range nsNames {
+					if ns == q.Name {
+						last = byte(10 + i)
+						break
+					}
+				}
+				if last == 0 {
+					return dnsReply(msg), nil
+				}
+				return dnsReply(msg, &dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET},
+					A:   []byte{198, 51, 100, last},
+				}), nil
+			default:
+				return dnsReply(msg), nil
+			}
+		},
+	}
+
+	servers, err := solver.authoritativeNS(context.Background(), "example.com.")
+	if err != nil {
+		t.Fatalf("the second resolver answers in full, so this must succeed: %v", err)
+	}
+	if len(servers) != len(nsNames) {
+		t.Errorf("authoritativeNS returned %d servers, want %d: a truncated answer from one resolver "+
+			"must not decide the authority set (that is what silently downgrades the multi-authority "+
+			"propagation rule to its single-authority exemption)", len(servers), len(nsNames))
+	}
+}
