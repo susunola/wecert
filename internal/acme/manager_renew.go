@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v4/acme/api"
@@ -83,18 +84,81 @@ func (m *Manager) spendNewOrder() {
 	m.quota.Spend(ratelimit.NewOrdersPerAccount, "", 1)
 }
 
-// noteNewOrderRefusal turns a new-order failure into the CA's deadline when it names one.
+// noteNewOrderRefusal turns a new-order failure into the CA's deadline when it names one, on the
+// limit the CA actually refused.
+//
+// A newOrder can be refused by any of the three certificate limits, and Boulder's message says
+// which. Booking every refusal against new-orders marked the wrong series blocked AND left the
+// refused limit reading optimistic -- and the exact-set limit is the one with no override path, so
+// it is precisely the number an operator cannot appeal. Which scopes the per-certificate limits
+// use is the same rule the spend path applies (see download): the exact identifier set, and each
+// registered domain the order covers.
 //
 // NoteRetryAfter only answers for errors that actually carry a Retry-After, so a refusal of any
 // other kind is left to the caller's own failure accounting.
-func (m *Manager) noteNewOrderRefusal(certName string, err error) {
-	at, ok := m.quota.NoteRetryAfter(ratelimit.NewOrdersPerAccount, "", err.Error())
-	if !ok {
+func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) {
+	named := refusedLimits(err.Error())
+	if len(named) == 0 {
+		// A rate-limited refusal that names no specific limit is most likely the account-wide
+		// order budget, which is what this used to assume for all of them.
+		named = []ratelimit.Limit{ratelimit.NewOrdersPerAccount}
+	}
+
+	blocked := false
+	for _, l := range named {
+		at, ok := m.quota.NoteRetryAfter(l, newOrderRefusalScope(l, c), err.Error())
+		if !ok {
+			continue
+		}
+		blocked = true
+		m.log.Error("the CA refused a new order against a documented rate limit; every request "+
+			"against that limit must wait for the reported instant",
+			"cert", c.Name, "limit", l.Name, "scope", newOrderRefusalScope(l, c), "until", at)
+	}
+	if !blocked {
 		return
 	}
-	m.log.Error("the account is out of new-order quota; every certificate must wait for the "+
-		"reported instant, not just this one",
-		"cert", certName, "until", at)
+}
+
+// newOrderRefusalScope is the bucket a refused limit is recorded against, matching the scope the
+// spend path uses for the same limit.
+func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate) string {
+	switch l.Name {
+	case ratelimit.CertsPerExactIdentifierSet.Name:
+		return c.DomainKey()
+	case ratelimit.CertsPerRegisteredDomain.Name:
+		if doms := uniqueRegisteredDomains(c.Domains); len(doms) > 0 {
+			return doms[0]
+		}
+	}
+	return ""
+}
+
+// refusedLimits maps the CA's own wording to the limits it refused.
+//
+// The phrases are the ones Boulder publishes (and the ones its own tests assert):
+//
+//	too many new orders recently ...
+//	too many certificates already issued for this exact set of identifiers ...
+//	too many certificates already issued for this registered domain ...
+//
+// Matching text is not ideal -- the wording is the CA's to choose -- but a rate-limit refusal is
+// exactly the case the protocol gives no machine-readable field for (the deadline itself is inside
+// free text too, see ParseRetryAfter). An unrecognised message falls back to new-orders, which is
+// where every refusal used to be booked.
+func refusedLimits(msg string) []ratelimit.Limit {
+	lower := strings.ToLower(msg)
+	var out []ratelimit.Limit
+	if strings.Contains(lower, "exact set of identifiers") || strings.Contains(lower, "exact-identifier-set") {
+		out = append(out, ratelimit.CertsPerExactIdentifierSet)
+	}
+	if strings.Contains(lower, "registered domain") || strings.Contains(lower, "registered-domain") {
+		out = append(out, ratelimit.CertsPerRegisteredDomain)
+	}
+	if strings.Contains(lower, "new orders") || strings.Contains(lower, "new-orders") {
+		out = append(out, ratelimit.NewOrdersPerAccount)
+	}
+	return out
 }
 
 func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
@@ -183,7 +247,7 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 	} else {
 		// Worth reading even though a retry follows: a rate-limited account is not a `replaces`
 		// problem, and the instant it names governs every certificate on this account.
-		m.noteNewOrderRefusal(c.Name, err)
+		m.noteNewOrderRefusal(c, err)
 	}
 	if err != nil && replaces != "" {
 		// A `replaces` that the CA will not honour must never be a dead end, so retry once
@@ -221,7 +285,7 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		} else {
 			// The retry is the attempt that decided the outcome, so its refusal is the one that
 			// must be read: this is where a rate-limit deadline was being lost.
-			m.noteNewOrderRefusal(c.Name, err)
+			m.noteNewOrderRefusal(c, err)
 		}
 	}
 	if err != nil {

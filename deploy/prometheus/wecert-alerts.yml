@@ -132,11 +132,15 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.cert }} is serving a certificate missing {{ $value }} name(s)"
+          # No {{ $value }} here: this expression is `== 1`, so the value is always 1 and the summary
+          # said "missing 1 name(s)" no matter how many were dropped. The count lives in
+          # wecert_certificate_fallback_dropped_names, which a template cannot join to.
+          summary: "{{ $labels.cert }} is in failure fallback: a partial certificate is planned or serving"
           description: >-
-            A partial certificate is in production: some names are covered and others are not. The
-            cause is a name whose authorizations keep failing. wecert_desired_state_* and the log
-            name the dropped identifiers.
+            A degradation decision is in force for this certificate: the names whose authorizations
+            keep failing have been dropped, so the certificate it serves (or is about to serve) is
+            partial. The dropped count is wecert_certificate_fallback_dropped_names; the identifiers
+            themselves are in the log and in wecert_desired_state_*.
 
       # "Nothing is happening" is its own failure mode, and no error counter sees it: the daemon can
       # be up, healthy-looking, and issuing nothing.

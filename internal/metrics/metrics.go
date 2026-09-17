@@ -169,7 +169,13 @@ var (
 
 	CertificateFallbackActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_fallback_active",
-		Help: "1 when this certificate is being served by a partial certificate with some names dropped (failure fallback). Partial availability beats total failure, but this is not a state to leave unattended.",
+		// "in force", not "serving": the gauge is set when the degradation DECISION is taken (and
+		// cleared only when a full certificate has been issued and deployed), so it covers the pass
+		// that is about to issue the reduced set. That is deliberate -- the decision is the event an
+		// operator can act on, and waiting for the deployment would hide a fallback whose own
+		// issuance is failing -- but the help text used to claim the certificate was already being
+		// served, which is not true for that first pass.
+		Help: "1 while a failure fallback is in force for this certificate: names whose authorizations keep failing have been dropped, so the certificate it serves (or is about to serve) is partial. Partial availability beats total failure, but this is not a state to leave unattended.",
 	}, []string{"cert"})
 
 	CertificateFallbackDropped = promauto.NewGaugeVec(prometheus.GaugeOpts{

@@ -56,19 +56,24 @@
 - `deploy`：Upload → UpdateCertificateInstance → 等待 → 验证绑定整条链及其每个错误分支（不泄漏已上传证书、不虚报 deployed、resume anchor 不丢）；凭据不落日志不落盘；CVM 角色路径。
 - 并发/关闭：每证书 claim 与 backoff、webhook HTTP 面、probe 判定与指标。
 
-### 2.4 本轮未修（留给后面 3 个小轮，逐条已核实）
+### 2.4 第 1 轮收尾：又修掉 9 条（同属第 1 轮复审的返回）
+
+| 位置 | 缺陷 | 修法与用例 |
+|---|---|---|
+| `internal/onboarding/onboard.go`（报告落盘） | 报告用 rename 落盘但**不 fsync**（文档与状态都 fsync），崩溃/丢页缓存后可能留下被截断甚至 0 字节的报告 | 落盘前 `tmp.Sync()`，与另外两个写入者一致。**这条是持久性加固，没有行为用例**（无法在测试里制造崩溃），如实说明 |
+| `internal/onboarding/onboard.go`（parse） | 一条无法解析的记录给出的排除决定，在**同名**记录解析成功并被 included 后没有撤销（父 zone 与委派子 zone 各写一条、其中一条有 typo 就会命中），报告里同一 hostname 同时 excluded 与 included | 记录被接受时 `unreject(d.Hostname)`；`TestAnIncludedHostnameIsNotAlsoReportedAsExcluded` |
+| `internal/onboarding/onboard.go`（build） | 「被声明的通配符覆盖」这句把 carry 原因**整个改写**掉，于是「某个筛选器正在拒它」在报告里消失 | 两句话拼接而不是替换；`TestAWildcardCoveredCarryKeepsItsFilterReason` |
+| `internal/webhook/webhook.go`（请求体上限） | 用 `io.LimitReader` 截断超长请求体后照常解析：正好切在 JSON 边界上就被**接受**，切在中间则报「invalid JSON」，把人引向错误的排查方向 | 改用 `http.MaxBytesReader` 并识别 `*http.MaxBytesError` → **413**；`TestAnOversizedTriggerBodyIsRefused` |
+| `internal/webhook/webhook.go`（`/hook/status`） | 读状态库失败时回的是零值 `certStatus`，与「这张证书还没有状态」无法区分 —— 而这个端点的全部意义就是回答「触发到底成没成」 | `certStatus` 增加 `error` 字段并在读失败时填上；`TestStatusReportsAnUnreadableCertificateState` |
+| `internal/acme/manager.go`（`GetFallback` 读失败） | 读失败被当成「没有 fallback」，于是 SAN drift 分支立刻去订**完整**（已知有问题）的标识集，而同包 `fallback.go` 在同样的失败下选择「保持」 | 读失败时按「有 fallback」保守处理并在日志说明；`TestAnUnreadableFallbackRecordHoldsInsteadOfReissuing`（测试用第二个连接 DROP 掉 `cert_fallback` 表，制造「库部分损坏」） |
+| `internal/acme/manager.go`（`GetOrder` 读失败） | 裸返回，绕过 `recordFailure`：没有失败计数、没有 backoff、没有内存里的临时 backoff，于是状态库恰好在这次读上失败是完全不可见的 | 走 `recordFailure`；`TestAFailedOrderReadSchedulesTheRetry`（同样用 DROP TABLE 制造失败，断言 `consecutive_failures` 与 `next_attempt_at` 都被写上） |
+| `internal/acme/manager_renew.go`（限流归类） | 任何 newOrder 拒绝都记到 `new-orders`：exact-set 的拒绝会点亮错误的序列，而「没有任何 override」的那条限额继续读得偏乐观 | `refusedLimits` 按 CA 的原话（Boulder 的三种措辞）归类到对应限额，scope 与记账路径一致；`TestARefusalIsBookedAgainstTheLimitItNames` 三个子例 |
+| `deploy/prometheus/wecert-alerts.yml` + `internal/metrics` | fallback 的 CRITICAL 告警 `{{ $value }}` 取的是 `== 1` 的 gauge，永远说「missing 1 name(s)」；而 gauge 的 Help 说「正在服务一张部分证书」，实际是在**决定**时就置位 | 注解不再插值错误的数字（真正的数量在 `wecert_certificate_fallback_dropped_names`，模板无法 join）；Help/描述改成「fallback 生效中（即将或正在服务部分证书）」，并把「为什么在决定时置位」写进注释（决定才是可行动事件；等部署会掩盖一个自身签发也在失败的 fallback） |
+
+### 2.5 仍未修（留给后面 3 个小轮，逐条已核实）
 
 | 位置 | 问题 | 计划 |
 |---|---|---|
-| `internal/onboarding/onboard.go` | 报告 JSON 落盘用 rename 但不 fsync（文档与状态都 fsync），崩溃后可能留下被截断的报告 | 落盘前 fsync |
-| `internal/onboarding/onboard.go` | 同名的「无法解析的声明」被拒绝后，另一条同名记录解析成功并 included，报告里同一 hostname 同时出现 excluded 与 included | 让 included 覆盖早期的排除决定 |
-| `internal/onboarding/onboard.go` | `build()` 用「被声明的通配符覆盖」改写 carry 原因，于是被 guard 拒掉这件事在报告里消失 | 保留 carry 原因并附上通配符说明 |
-| `internal/webhook/webhook.go` | 超长请求体用 `io.LimitReader` 截断后按正常解析，应回 413 而不是静默截断 | 判定溢出并回 413 |
-| `internal/webhook/webhook.go` | `/hook/status` 读状态库失败时按「没有这个证书」回答 | 区分「读不到」与「没有」 |
 | `internal/acme/manager_flow.go` | `reclaimUnpresentedTXT` 把「权威否认」当成「写入从未发生」，但 DNSPod 的写入传播可以滞后（本轮实测删除传播到所有权威最多 60s） | 给授权行加「挑战准备时间」列，滞后窗口内不采信否认 |
-| `internal/acme/manager_renew.go` | 任何 newOrder 限流拒绝都记到 `new-orders` 桶，exact-set 的拒绝会让那个「没有 override」的限额读数偏乐观 | 按 CA 消息分类到正确的限额 |
 | `internal/acme/manager.go` | 授权状态 `expired`/`deactivated`/`revoked` 没有分支，按 pending 处理（重新呈现 + 等满 3 分钟） | 视为订单不可用并丢弃订单 |
-| `internal/acme/manager.go` | `GetFallback` 读失败被当成「没有 fallback」，与同包 `fallback.go` 在同样失败下选择「保持」相反 | 读失败时保持上一版 |
-| `internal/acme/manager.go` | `GetOrder` 失败裸返回，绕过 `recordFailure`（没有失败计数、没有 backoff） | 走 `recordFailure` |
-| `deploy/prometheus/wecert-alerts.yml` | fallback 的 CRITICAL 告警 `{{ $value }}` 取的是 0/1 gauge，永远说「missing 1 name(s)」；且该 gauge 在**决定**时就被置位，而不是在降级证书真的上线后 | 注解取正确的序列；gauge 的置位时机另议 |
 | `cmd/wecert-probe/main.go` | CLI 用 `probe.Probe`（第一个成功的地址）判定，而守护进程用 `ProbeAll`（多地址时一个旧证书就能藏住） | 决定语义后统一 |

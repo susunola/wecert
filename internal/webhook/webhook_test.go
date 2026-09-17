@@ -1119,3 +1119,49 @@ func TestFullTriggerWithNothingAcceptedSerializesAsEmptyArray(t *testing.T) {
 		t.Errorf("the skipped certificate must be reported, got %s", body)
 	}
 }
+
+// An oversized trigger body must be refused, not truncated.
+//
+// The body was read through io.LimitReader, which reports a clean EOF at the cap: a body larger
+// than 64 KiB was silently cut and then parsed as if it were complete -- accepted outright when the
+// cut happened to land on a JSON boundary, and reported as "invalid JSON" otherwise, which sends
+// the caller to inspect their JSON rather than their payload size.
+func TestAnOversizedTriggerBodyIsRefused(t *testing.T) {
+	s, _ := newTestServer(t, &fakeReconciler{names: []string{"a"}})
+
+	// A valid JSON document with a long (ignored) field, so the truncation point cannot be reasoned
+	// about: the only correct answer is to refuse it.
+	big := `{"certs":["a"],"padding":"` + strings.Repeat("x", 70<<10) + `"}`
+	w := do(t, s, http.MethodPost, "/hook/reconcile", big, bearer())
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a %d-byte body must be refused with 413, got %d: %s", len(big), w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "exceeds") {
+		t.Errorf("the error must say the body is too large, got %s", w.Body.String())
+	}
+}
+
+// A certificate whose state cannot be read must say so, not answer with the zero value.
+//
+// /hook/status exists to answer "did the trigger work", and a read failure produced the same
+// certStatus a certificate with no recorded state produces: the caller could not tell an unreadable
+// store from "nothing has happened".
+func TestStatusReportsAnUnreadableCertificateState(t *testing.T) {
+	s, store := newTestServer(t, &fakeReconciler{names: []string{"a"}})
+	if err := store.PutCert(&state.CertState{Name: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	// Close the store so the read fails, the way a busy or broken database looks.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := do(t, s, http.MethodGet, "/hook/status", "", bearer())
+	if w.Code != http.StatusOK {
+		t.Fatalf("the endpoint itself worked, so it should answer 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"error"`) {
+		t.Errorf("an unreadable state must be reported as an error on the entry, got %s", w.Body.String())
+	}
+}
