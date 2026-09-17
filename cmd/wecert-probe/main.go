@@ -152,9 +152,29 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 	}
 
 	attempt := 0
+	var lastCode int
 	for {
 		attempt++
-		code, retry := attemptOnce(ctx, host, opts, e, asJSON, attempt, prober)
+		// Each attempt is bounded by what is left of the wait, not just by its own -timeout.
+		//
+		// The deadline used to be checked only between attempts, so an attempt already in flight ran
+		// to the full per-attempt timeout: with the default 10s timeout, `-wait 1s` took ten seconds
+		// and `-wait 1s -timeout 5s` took five -- the flag bounded the attempt count and the sleep,
+		// but not the command. The comment above the sleep already promises the caller that -wait is
+		// how long the command may take.
+		attemptOpts := opts
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				// Out of budget before this attempt started: report what the last one saw.
+				return lastCode
+			}
+			if attemptOpts.Timeout <= 0 || attemptOpts.Timeout > remaining {
+				attemptOpts.Timeout = remaining
+			}
+		}
+		code, retry := attemptOnce(ctx, host, attemptOpts, e, asJSON, attempt, prober)
+		lastCode = code
 
 		// Retry on both outcomes. An unreachable host may be a network blip, a VIP that is not
 		// up yet or DNS that has not propagated; a mismatch is the normal shape for roughly 15
