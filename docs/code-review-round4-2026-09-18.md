@@ -207,7 +207,7 @@
 
 ### 6.4 本小轮的门禁
 
-两批改动（`6d2eb98` 与第 5–11 条那一批）各跑一遍完整门禁：`gofmt -l .` 干净；`go vet ./...` 与 `go vet -tags "pebble lego_dns" ./...` 干净；`staticcheck ./...` 干净；`python3 scripts/check-english.py` 182 个源文件通过；`go test -race -count=1 ./...` **19/19 包通过**；`make check`、`make test-pebble`（2/2）、`make e2e`（3/3）通过；`scripts/test-e2e-wildcard.sh` 5/5；抖动/次序门禁 `make test-repeat`（`-race -shuffle=on -count=3`）**19/19 包通过**；`6d2eb98` 已推送且 CI 在 `test/e2e-tlsserver-renewal`（PR #67）上 **success**，第二批同样推送后复核 CI。
+两批改动（`6d2eb98` 与 `2399075`）各跑一遍完整门禁：`gofmt -l .` 干净；`go vet ./...` 与 `go vet -tags "pebble lego_dns" ./...` 干净；`staticcheck ./...` 干净；`python3 scripts/check-english.py` 182 个源文件通过；`go test -race -count=1 ./...` **19/19 包通过**；`make check`、`make test-pebble`（2/2）、`make e2e`（3/3）通过；`scripts/test-e2e-wildcard.sh` 5/5；抖动/次序门禁 `make test-repeat`（`-race -shuffle=on -count=3`）**19/19 包通过**；两批都已推送，CI 在 `test/e2e-tlsserver-renewal`（PR #67）上都是 **success**。
 
 ---
 
@@ -231,6 +231,6 @@
   9. 在「落盘」与「写 DNS」之间注入**真实崩溃**（第 2、5 条的时间窗是用测试钩子观测的，不是真崩溃）；
   10. §6.1 第 6 条那个 `Add`/`Wait` 窗口在生产里出现的频率（要靠放大并发才复现，真实触发概率未知——但代价是进程级 panic，所以按「会发生」处理）；
   11. LC-2（SDK client 复用）与 LC-4（最后一个租约的 delete-all）—— 核实为真但**故意不改**，理由见 §3.2。
-- **本文与代码的对应**：每条「已修」都对应一次提交（`770d018`、`48e7490`、`41b55cf`、`0f61177`、`9d9b12e`、`c49ff31`、`ed88a4b`，以及第 5 轮的两批：`6d2eb98` 与 §6.1 第 5–11 条那一批）；改动只在 `internal/`、`cmd/`、`scripts/`、`deploy/` 与 `docs/` 内，`testenv/` 只被顺带清理（那是你的测试脚手架，不是产品）。
+- **本文与代码的对应**：每条「已修」都对应一次提交（`770d018`、`48e7490`、`41b55cf`、`0f61177`、`9d9b12e`、`c49ff31`、`ed88a4b`，以及第 5 轮的两批：`6d2eb98`、`2399075`）；改动只在 `internal/`、`cmd/`、`scripts/`、`deploy/` 与 `docs/` 内，`testenv/` 只被顺带清理（那是你的测试脚手架，不是产品）。
 
 ---
