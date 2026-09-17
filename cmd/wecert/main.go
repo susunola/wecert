@@ -38,6 +38,13 @@ import (
 var version = "dev"
 
 func main() {
+	// The ACME User-Agent names the running build, so a CA-side log lines up with the binary that
+	// sent the request. It is set here, at process start, rather than inside run(): run() returns
+	// from the -revoke branch early, and having the call after that branch meant every revocation
+	// -- the request an operator makes about a compromised key -- identified itself as "wecert/dev".
+	// A global with no dependencies belongs at the top, where no branch can skip it.
+	acme.SetUserAgentVersion(version)
+
 	if err := run(); err != nil {
 		slog.Error("wecert exited with an error", "err", err)
 		os.Exit(1)
@@ -70,10 +77,6 @@ func run() error {
 	}
 
 	log := newLogger(*logLevel)
-
-	// Let the ACME User-Agent name the running build, so a CA-side log lines up with the
-	// binary that sent the request.
-	acme.SetUserAgentVersion(version)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {

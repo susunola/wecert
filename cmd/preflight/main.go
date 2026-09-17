@@ -196,12 +196,29 @@ func checkSSL(ctx context.Context, cred common.CredentialIface) error {
 		return fmt.Errorf("DescribeCertificates failed (check the ssl:DescribeCertificates permission): %w", err)
 	}
 
-	var total uint64
-	if resp.Response != nil && resp.Response.TotalCount != nil {
-		total = *resp.Response.TotalCount
+	total, err := certificateCount(resp)
+	if err != nil {
+		return err
 	}
 	fmt.Printf("      OK - the account already holds %d certificates\n", total)
 	return nil
+}
+
+// certificateCount reads the account's certificate total out of a DescribeCertificates answer.
+//
+// A missing result body is the SDK's shape for a well-formed HTTP 200 with no body, or for an
+// API-version mismatch -- and treating it as zero printed "OK - the account already holds 0
+// certificates" for an answer that was never read, which is the one thing a preflight check must
+// not do. Every other SDK call in this repository guards the same field.
+func certificateCount(resp *ssl.DescribeCertificatesResponse) (uint64, error) {
+	if resp == nil || resp.Response == nil {
+		return 0, fmt.Errorf("DescribeCertificates returned no result, so the account's certificate " +
+			"count cannot be read (an unreadable answer is not zero)")
+	}
+	if resp.Response.TotalCount == nil {
+		return 0, fmt.Errorf("DescribeCertificates returned no total count; that is unreadable, not zero")
+	}
+	return *resp.Response.TotalCount, nil
 }
 
 // describeDomainList is the seam over the SDK call, so the paging logic in findDomain
@@ -517,8 +534,18 @@ func pruneCertificates(assumeYes bool) error {
 		// confirmation gate (skipped only by -yes) is the entire protection against
 		// deleting a certificate a CLB still references.
 		req.IsCheckResource = common.BoolPtr(false)
-		if _, err := client.DeleteCertificateWithContext(ctx, req); err != nil {
+		resp, err := client.DeleteCertificateWithContext(ctx, req)
+		if err != nil {
 			fmt.Printf("  failed to delete %s: %v\n", deref(c.CertificateId), err)
+			failed++
+			continue
+		}
+		// The response decides, exactly as internal/deploy does for the same call. It was thrown
+		// away here, so a refusal (DeleteResult=false, no transport error) printed "deleted <id>"
+		// and the command exited 0: a destructive action reported as done that the API declined.
+		deleted, detail := deleteOutcome(resp)
+		if !deleted {
+			fmt.Printf("  failed to delete %s: %s\n", deref(c.CertificateId), detail)
 			failed++
 			continue
 		}
@@ -528,6 +555,26 @@ func pruneCertificates(assumeYes bool) error {
 		return fmt.Errorf("%d certificates could not be deleted (the rest were)", failed)
 	}
 	return nil
+}
+
+// deleteOutcome judges one DeleteCertificate answer.
+//
+// IsCheckResource=false makes the call synchronous, so DeleteResult IS the outcome: false means
+// the API refused (a nil field means "no objection", the same reading internal/deploy uses). An
+// empty response, or one that came back with a task id after all, is not a deletion this tool can
+// confirm -- and "deleted" is the one thing it must never print for those.
+func deleteOutcome(resp *ssl.DeleteCertificateResponse) (bool, string) {
+	if resp == nil || resp.Response == nil {
+		return false, "the API returned no result"
+	}
+	if resp.Response.DeleteResult != nil && !*resp.Response.DeleteResult {
+		return false, "the API refused the delete (DeleteResult=false)"
+	}
+	if resp.Response.TaskId != nil && *resp.Response.TaskId != "" {
+		return false, "the API answered with an asynchronous task (" + *resp.Response.TaskId +
+			"), so the deletion is not confirmed; check the SSL console"
+	}
+	return true, ""
 }
 
 // confirm reads one y/N from the terminal, and treats a non-interactive stdin (not a

@@ -1906,3 +1906,122 @@ func TestATruncatedGuardAnswerIsReportedAndRemovesNothing(t *testing.T) {
 		t.Errorf("b must be kept and reported as kept, got %+v", d)
 	}
 }
+
+// A carried declaration must keep its settings, not just its name.
+//
+// applyGrace keeps a still-declared name whose filter rejected it, but groupSettings skipped every
+// declaration the filters had not accepted -- so the certificate was rebuilt from the onboarding
+// defaults. A declaration saying `profile=tlsserver, deploy=0` came back as the default profile
+// with deployment ON: the revision changed, wecert reissued, and it began deploying a certificate
+// the declaration explicitly said not to deploy. That is the opposite of the promise the carry
+// makes ("the name keeps its coverage, nothing is reissued").
+func TestACarriedDeclarationKeepsItsSettings(t *testing.T) {
+	const name = "api.example.com"
+
+	h := newHarness(t, Options{RequireRule: true})
+	h.decls.raw = []RawDeclaration{decl(name, "profile=tlsserver", "deploy=0")}
+	h.rules.domains = []string{name}
+	first := h.run(t)
+
+	doc := h.document(t)
+	if len(doc.Certificates) != 1 {
+		t.Fatalf("expected one certificate, got %d", len(doc.Certificates))
+	}
+	c := doc.Certificates[0]
+	if c.Profile != config.ProfileTLSServer || c.Deploy.Enabled {
+		t.Fatalf("the declaration's own settings must reach the document first, got profile=%s deploy=%v",
+			c.Profile, c.Deploy.Enabled)
+	}
+
+	// The rule disappears; the declaration stays, so the name is carried.
+	h.rules.domains = nil
+	second := h.run(t)
+
+	doc = h.document(t)
+	if len(doc.Certificates) != 1 {
+		t.Fatalf("expected one certificate, got %d", len(doc.Certificates))
+	}
+	c = doc.Certificates[0]
+	if c.Profile != config.ProfileTLSServer {
+		t.Errorf("the carried certificate's profile flipped to %q: the declaration's settings were "+
+			"dropped, which changes the revision and reissues", c.Profile)
+	}
+	if c.Deploy.Enabled {
+		t.Errorf("deployment was turned ON for a declaration that says deploy=0: the filter changed " +
+			"what the declaration asked for")
+	}
+	if second.Revision != first.Revision {
+		t.Errorf("a guard wobble changed the revision (%s -> %s): the certificate is reissued even "+
+			"though nothing about the declaration changed", first.Revision, second.Revision)
+	}
+	if !containsAllDomains(h.domains(t), name) {
+		t.Errorf("the carried name must stay covered, got %v", h.domains(t))
+	}
+}
+
+// A group is capped by the profile it will actually be issued with.
+//
+// onboarding.maxNames is validated only as "not negative", and on its own it is legal for classic
+// (100). A declaration asking for tlsserver inside such a group produced a certificate with more
+// than 25 identifiers, which spec.WriteDocument then rejected -- on every round, for every
+// certificate, with no document, no state and no report, while Run still reported "written". The
+// cap has to come from the profile, and exceeding it has to be a reported decision (overLimit)
+// rather than an unwritable document.
+func TestAGroupIsCappedByTheProfileItWillUse(t *testing.T) {
+	h := newHarness(t, Options{RequireRule: true, MaxNames: 100, DropThreshold: 0.9})
+
+	names := make([]string, 0, 26)
+	h.decls.raw = append(h.decls.raw, decl("api.example.com", "profile=tlsserver"))
+	names = append(names, "api.example.com")
+	for i := range 25 {
+		host := "n" + itoa(i) + ".example.com"
+		h.decls.raw = append(h.decls.raw, decl(host))
+		names = append(names, host)
+	}
+	h.rules.domains = names
+
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	// The failure the fix removes: Commit rejecting a document Run called "written".
+	if err := h.ob.Commit(rep); err != nil {
+		t.Fatalf("Commit failed on a document the round reported as %s: %v. A cap that ignores the "+
+			"profile produces a document no writer accepts, so every round fails for every "+
+			"certificate", rep.Mode, err)
+	}
+
+	// And the reason is reported rather than silently dropped.
+	var explained bool
+	for _, d := range rep.Decisions {
+		if strings.Contains(d.Reason, "max is 25") || strings.Contains(d.Reason, "cannot be expressed") {
+			explained = true
+		}
+	}
+	for _, r := range rep.FreezeReasons {
+		if strings.Contains(r, "max is 25") {
+			explained = true
+		}
+	}
+	if !explained {
+		t.Errorf("the group exceeds the tlsserver cap, so the round must say so: decisions=%+v freeze=%v",
+			rep.Decisions, rep.FreezeReasons)
+	}
+}
+
+// containsAllDomains reports whether every wanted name is in got.
+func containsAllDomains(got []string, want ...string) bool {
+	for _, w := range want {
+		var found bool
+		for _, g := range got {
+			if g == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}

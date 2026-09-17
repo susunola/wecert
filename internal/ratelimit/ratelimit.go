@@ -190,6 +190,14 @@ func Remaining(s Snapshot, l Limit, now time.Time) float64 {
 // is full again before the withdrawal -- which is what makes "50 per 7 days, 1 back every 202
 // minutes" behave as the CA does rather than as a naive counter would.
 //
+// "Full" is the CAPACITY, not however much the idle interval would have produced. A bucket left
+// alone for two refill periods refills to twice its capacity if nothing caps it, and every token
+// above the capacity is invisible (Remaining clamps what it reports) while still being there to
+// spend: the stored count then reads "full" for many spends longer than the CA would allow, which
+// is exactly the direction this estimate must never be wrong in. TestSpendingAnIdleBucketStores-
+// NoMoreThanCapacity pins it; Remaining's clamp alone cannot, because the surplus lives in the
+// snapshot.
+//
 // A spend that exceeds what is available drives the bucket negative on purpose: the negative
 // value is what makes Remaining report 0 AND tells the next refill how much debt to work off,
 // so an over-spend is not silently forgiven. The CA would have rejected that request, so a
@@ -213,7 +221,7 @@ func Spend(s Snapshot, l Limit, cost float64, now time.Time) Snapshot {
 	if now.Before(s.At) {
 		now = s.At
 	}
-	tokens := level(s, l, now) - cost
+	tokens := math.Min(level(s, l, now), l.Capacity) - cost
 	// Clamp the debt. Without a floor, one catastrophic burst (or a clock jump) could leave a
 	// bucket so negative that it takes longer than the window to recover and the estimate
 	// stays pinned at zero long after the CA would have allowed the request again.
@@ -258,6 +266,21 @@ func ParseRetryAfter(msg string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	rest := msg[i+len(marker):]
+	// The instant is a PREFIX of what follows it, not the whole of it.
+	//
+	// Boulder formats "retry after 2006-01-02 15:04:05 MST" and then appends the documentation
+	// link: a real refusal reads
+	//
+	//	too many new orders recently, retry after 2026-09-18 12:34:56 UTC: see
+	//	https://letsencrypt.org/docs/rate-limits/#new-orders-per-account
+	//
+	// Requiring the message to end at the instant made every genuine refusal return false, so no
+	// deadline was ever recorded and the WecertRateLimitBlocked alert was unreachable -- the one
+	// signal that says the whole account has to wait. The test used a fabricated message with no
+	// suffix, which is why the suite stayed green.
+	if j := indexOf(rest, ": see "); j >= 0 {
+		rest = rest[:j]
+	}
 	// Trim the trailing sentence punctuation the message may carry.
 	rest = trimTrailing(rest)
 

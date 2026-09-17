@@ -262,8 +262,12 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
-		resp.Accepted = accepted
-		resp.Skipped = skipped
+		// append, not assign: StartAll hands back a nil slice when it accepted nothing, and
+		// assigning it would undo the initialisation above -- a full trigger that skipped every
+		// certificate answered `{"accepted": null}`, the exact shape the comment rules out. The
+		// named-trigger branch below already appends, which is why only this one regressed.
+		resp.Accepted = append(resp.Accepted, accepted...)
+		resp.Skipped = append(resp.Skipped, skipped...)
 		s.log.Info("webhook triggered a full convergence",
 			"accepted", len(resp.Accepted), "skipped", len(resp.Skipped), "remote", r.RemoteAddr)
 	} else {

@@ -227,6 +227,27 @@ func (d *TencentCLB) deployUploaded(ctx context.Context, client sslAPI, certName
 	// The caller must record it in the reclamation list, otherwise this certificate becomes a
 	// cloud orphan that occupies the account's uploaded-certificate quota forever.
 	if err := d.updateInstance(ctx, client, oldID, newID); err != nil {
+		// Nothing is bound to either certificate: this is not a failed switch, it is the
+		// documented first-issuance state, reached on a renewal because the first upload was never
+		// bound by hand.
+		//
+		// The distinction matters because the two look identical to the cloud
+		// (FailedOperation.CertificateDeployInstanceEmpty) and call for opposite answers. Before
+		// this, every renewal of a certificate nobody had bound yet failed the pass, so the
+		// promotion never ran and st.NotAfter/CertPEM stayed on the certificate that was expiring:
+		// the state kept naming a certificate whose only remaining future was to expire, and each
+		// failed cycle issued and uploaded another one.
+		//
+		// Both answers must be COMPLETE for this reading: a partial enumeration reports 0 for a
+		// certificate that is bound in a region the read could not reach, and treating that as
+		// "nothing is bound" is how a needed switch gets skipped and a listener keeps serving a
+		// certificate that is about to expire.
+		if d.nothingBoundYet(ctx, client, oldID, newID) {
+			d.log.Warn("neither the old nor the new certificate is bound to anything yet; "+
+				"recording the new one as uploaded and waiting for the one-time manual bind",
+				"oldCertId", oldID, "newCertId", newID)
+			return newID, ErrNothingBoundYet
+		}
 		// Repair the historical wedge only when the old anchor is entirely gone. A
 		// non-zero new binding alone is not completion: a partially failed task has
 		// exactly that shape and must remain an error.
@@ -857,6 +878,25 @@ func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, bool, er
 type bindingCount struct {
 	count    int
 	complete bool
+}
+
+// ErrNothingBoundYet means the certificate was uploaded, but neither it nor the certificate it
+// replaces is bound to any cloud resource.
+//
+// It is the documented first-issuance state ("upload once, bind it by hand once, renewals switch
+// automatically afterwards") met during a renewal, and it is deliberately not a failure: there was
+// no switch to perform. Callers must record the new certificate id and leave DeployConfirmed false,
+// so the deployed metric keeps saying "uploaded, not serving yet" until the enumeration finds it.
+var ErrNothingBoundYet = errors.New("the certificate is uploaded but nothing is bound to it yet")
+
+// nothingBoundYet reports whether BOTH certificates have zero bindings, from complete answers.
+func (d *TencentCLB) nothingBoundYet(ctx context.Context, client sslAPI, oldID, newID string) bool {
+	newBindings, nerr := d.bindingsWith(ctx, client, newID, false)
+	if nerr != nil || !newBindings.complete || newBindings.count > 0 {
+		return false
+	}
+	oldBindings, oerr := d.bindingsWith(ctx, client, oldID, false)
+	return oerr == nil && oldBindings.complete && oldBindings.count == 0
 }
 
 // bindingsWith enumerates a certificate's bindings against an existing client.

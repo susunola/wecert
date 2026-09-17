@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -262,5 +263,86 @@ func TestTheWaitResultReachesTheAssertions(t *testing.T) {
 	}
 	if err := assertBindings([]string{"new-cert", "old-cert"}, "", "old-cert", "listener", time.Second); err == nil {
 		t.Error("-not-expect must fail while the certificate is still bound")
+	}
+}
+
+// -raw must not turn the assertions off.
+//
+// The dump used to return before any assertion ran, so `clbverify -raw -expect <id>` printed the
+// server's answer and exited 0 whatever it said -- a script that added -raw while debugging kept
+// reporting success, and the one flag combination that exists for "show me the raw answer AND
+// tell me whether the switch landed" was the one that could not assert.
+func TestRawStillAsserts(t *testing.T) {
+	resp := &clb.DescribeListenersResponse{
+		Response: &clb.DescribeListenersResponseParams{
+			Listeners: []*clb.Listener{{
+				ListenerId: common.StringPtr("lbl-1"),
+				Protocol:   common.StringPtr("HTTPS"),
+				Port:       common.Int64Ptr(443),
+				Certificate: &clb.CertificateOutput{
+					CertId: common.StringPtr("cert-bound"),
+				},
+			}},
+		},
+	}
+
+	t.Run("expect that is not bound fails", func(t *testing.T) {
+		var out bytes.Buffer
+		err := evaluateListener(&out, resp, verifyOptions{
+			raw:    true,
+			expect: "cert-missing",
+		}, func(context.Context) ([]string, error) { return nil, nil })
+
+		if err == nil {
+			t.Fatal("-raw silently disabled the assertion: the expected certificate is not bound " +
+				"and the command reported success")
+		}
+		if !strings.Contains(out.String(), "cert-bound") {
+			t.Errorf("the raw dump must still be printed, got %q", out.String())
+		}
+	})
+
+	t.Run("matching expect passes and prints the raw answer", func(t *testing.T) {
+		var out bytes.Buffer
+		if err := evaluateListener(&out, resp, verifyOptions{
+			raw:    true,
+			expect: "cert-bound",
+		}, func(context.Context) ([]string, error) { return nil, nil }); err != nil {
+			t.Fatalf("the bound certificate matches -expect: %v", err)
+		}
+		if !strings.Contains(out.String(), "OK: assertion passed") {
+			t.Errorf("the verdict must be printed next to the dump, got %q", out.String())
+		}
+	})
+
+	t.Run("-not-expect is asserted too", func(t *testing.T) {
+		var out bytes.Buffer
+		err := evaluateListener(&out, resp, verifyOptions{
+			raw:       true,
+			notExpect: "cert-bound",
+		}, func(context.Context) ([]string, error) { return nil, nil })
+		if err == nil {
+			t.Fatal("-raw silently disabled -not-expect")
+		}
+	})
+}
+
+// Both credential halves are required.
+//
+// The guard read only the secret id, so an empty TENCENTCLOUD_SECRET_KEY passed it and the run
+// failed later inside the API client with an authentication error -- from a layer that cannot say
+// which variable is empty, under a message that names both.
+func TestCredentialGuardRequiresBothHalves(t *testing.T) {
+	for _, tc := range []struct{ id, key string }{
+		{"", "key"},
+		{"id", ""},
+		{"", ""},
+	} {
+		if missingCredential(tc.id, tc.key) == "" {
+			t.Errorf("id=%q key=%q must be rejected", tc.id, tc.key)
+		}
+	}
+	if got := missingCredential("id", "key"); got != "" {
+		t.Errorf("both halves present must pass, got %q", got)
 	}
 }

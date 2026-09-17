@@ -1196,3 +1196,76 @@ func TestAdoptedTaskWhoseEnumerationNeverAnswersIsUnverifiedNotFailed(t *testing
 		t.Errorf("id = %q, want new-id even on the unverified path", id)
 	}
 }
+
+// Nothing bound to either certificate is not a failed switch: it is a pending first bind.
+//
+// deploy.enabled starts with one upload plus a manual bind, and a renewal can arrive before a human
+// does that. The cloud then answers FailedOperation.CertificateDeployInstanceEmpty, which is also
+// what a genuinely broken switch looks like -- so the decision has to come from the bindings
+// enumeration, and both answers must be COMPLETE: a partial enumeration reports 0 for a certificate
+// that is bound in a region the read could not reach, and reading that as "nothing is bound" skips
+// a switch that was needed, leaving a listener on a certificate that is about to expire.
+func TestDeployReportsAPendingFirstBindInsteadOfAFailure(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	createTask, taskResult := bindingsFor(t, map[string]uint64{"new-id": 0, "old-id": 0})
+	fake := &fakeSSLAPI{
+		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
+			return &ssl.UploadCertificateResponse{
+				Response: &ssl.UploadCertificateResponseParams{CertificateId: common.StringPtr("new-id")},
+			}, nil
+		},
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			// What the real API answers when no resource holds the old certificate.
+			return nil, errors.New("UpdateCertificateInstance: [TencentCloudSDKError] " +
+				"Code=FailedOperation.CertificateDeployInstanceEmpty, Message=no usable instance was found")
+		},
+		createTaskFn: createTask,
+		taskResultFn: taskResult,
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	id, err := d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if !errors.Is(err, ErrNothingBoundYet) {
+		t.Fatalf("nothing is bound anywhere, so this is a pending first bind, not a failure: %v", err)
+	}
+	if id != "new-id" {
+		t.Errorf("the uploaded certificate's id must still be reported for the caller to record, got %q", id)
+	}
+
+	// A partial enumeration must not be read as "nothing is bound".
+	createTask, taskResult = bindingsFor(t, map[string]uint64{"new-id": 0, "old-id": 0})
+	// Make the old certificate's answer incomplete: one region's enumeration fails.
+	partialResultFn := func(ctx context.Context, req *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+		resp, err := taskResult(ctx, req)
+		if err != nil || resp == nil || resp.Response == nil {
+			return resp, err
+		}
+		// One region's enumeration failed, so the answer is a lower bound.
+		for _, task := range resp.Response.SyncTaskBindResourceResult {
+			if task == nil {
+				continue
+			}
+			for _, res := range task.BindResourceResult {
+				if res == nil {
+					continue
+				}
+				for _, region := range res.BindResourceRegionResult {
+					if region != nil {
+						region.Error = common.StringPtr("region ap-shanghai did not answer")
+					}
+				}
+			}
+		}
+		return resp, nil
+	}
+	fake.createTaskFn, fake.taskResultFn = createTask, partialResultFn
+
+	_, err = d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if errors.Is(err, ErrNothingBoundYet) {
+		t.Error("an incomplete enumeration reports zero for a certificate that may be bound where the " +
+			"read did not reach: that must not be read as \"nothing is bound\", or a needed switch is skipped")
+	}
+}

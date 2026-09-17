@@ -15,6 +15,8 @@ import (
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/miekg/dns"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 func dnsReply(question *dns.Msg, answers ...dns.RR) *dns.Msg {
@@ -854,5 +856,42 @@ func TestATruncatedAnswerDoesNotShrinkTheAuthoritySet(t *testing.T) {
 		t.Errorf("authoritativeNS returned %d servers, want %d: a truncated answer from one resolver "+
 			"must not decide the authority set (that is what silently downgrades the multi-authority "+
 			"propagation rule to its single-authority exemption)", len(servers), len(nsNames))
+	}
+}
+
+// A DNS provider built from a literal does not inherit lego's defaults, so the timeout must be set.
+//
+// lego's NewDefaultConfig gives the tencentcloud provider a 30s HTTPTimeout, but we build the
+// config ourselves -- and the zero value reaches the SDK as ReqTimeout=0, which the SDK turns into
+// an http.Client with NO timeout. Present and CleanUp hold the per-name TXT lease mutex across that
+// call, so a single stalled connection wedges every certificate that shares the challenge name, the
+// pass never finishes, and the TXT records stay in DNS. The DNSPod provider takes an HTTP client
+// instead; a nil one falls back to http.DefaultClient, which also has no timeout.
+func TestDNSProviderConfigsBoundTheirAPICalls(t *testing.T) {
+	dnsCfg := config.DNS{
+		LoginToken:  "token",
+		TTL:         600,
+		Propagation: 5 * time.Minute,
+		Polling:     5 * time.Second,
+	}
+
+	tc := tencentDNSConfig("id", "key", "session", dnsCfg)
+	if tc.HTTPTimeout <= 0 {
+		t.Errorf("the tencentcloud provider's HTTP timeout is %s: a zero value reaches the SDK as "+
+			"ReqTimeout=0 and produces a client with no timeout at all", tc.HTTPTimeout)
+	}
+	if tc.SessionToken != "session" || tc.TTL != 600 || tc.PropagationTimeout != dnsCfg.Propagation {
+		t.Errorf("the config must still carry what the caller passed, got %+v", tc)
+	}
+
+	dp := dnspodConfig(dnsCfg)
+	if dp.HTTPClient == nil {
+		t.Fatal("a nil HTTP client makes the DNSPod provider use http.DefaultClient, which has no timeout")
+	}
+	if dp.HTTPClient.Timeout <= 0 {
+		t.Errorf("the DNSPod client's timeout is %s", dp.HTTPClient.Timeout)
+	}
+	if dp.LoginToken != "token" || dp.TTL != 600 {
+		t.Errorf("the config must still carry what the caller passed, got %+v", dp)
 	}
 }

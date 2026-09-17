@@ -371,7 +371,7 @@ var newCLBClient = func(cred common.CredentialIface, region string, cpf *profile
 // generation.
 func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI, region string) ([]string, error) {
 	var out []string
-	var offset, read int64
+	var offset, read, reported int64
 	for {
 		req := clbsdk.NewDescribeLoadBalancersRequest()
 		// Forward is deliberately NOT set. Despite the name it is not "layer 7 only": the
@@ -400,6 +400,9 @@ func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI, region 
 		}
 		list := resp.Response.LoadBalancerSet
 		read += int64(len(list))
+		if resp.Response.TotalCount != nil {
+			reported = int64(*resp.Response.TotalCount)
+		}
 		for _, lb := range list {
 			if lb == nil || lb.LoadBalancerId == nil || *lb.LoadBalancerId == "" {
 				// One unusable entry is enough to make the whole guard answer incomplete: the
@@ -410,14 +413,6 @@ func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI, region 
 			}
 			out = append(out, *lb.LoadBalancerId)
 		}
-		if resp.Response.TotalCount != nil && int64(*resp.Response.TotalCount) > read {
-			// The API says there are more instances than it has handed over. Paging again would
-			// be the fix if the response were a page, but the loop below already treats a short
-			// page as the end -- so the honest answer is "I cannot enumerate them", and the round
-			// must not act on a list it knows is short.
-			return nil, fmt.Errorf("%w: region %s reported %d load balancers and returned %d",
-				errIncompleteRuleList, region, *resp.Response.TotalCount, read)
-		}
 		if len(list) < clbPageSize {
 			break
 		}
@@ -425,6 +420,20 @@ func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI, region 
 		if offset > maxLoadBalancers {
 			return nil, fmt.Errorf("more than %d load balancers; refusing to keep paging", offset)
 		}
+	}
+
+	// The count is compared AFTER the loop, against everything the pages returned.
+	//
+	// It used to be compared inside the loop, against the bytes read so far -- which is wrong by
+	// construction: TotalCount ("the total number of load balancers matching the filter; this
+	// value is independent of Limit") is larger than the first page for ANY region with more
+	// instances than one page, so paging was dead code and the guard reported itself incomplete
+	// for every account with more than clbPageSize load balancers in a region -- disabling guard
+	// 1 entirely (no rule check, no removals) and printing a false "the rule list is truncated"
+	// every round.
+	if reported > read {
+		return nil, fmt.Errorf("%w: region %s reported %d load balancers and the pages returned %d",
+			errIncompleteRuleList, region, reported, read)
 	}
 	sort.Strings(out)
 	return out, nil

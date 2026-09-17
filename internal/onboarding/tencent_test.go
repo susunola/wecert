@@ -381,6 +381,10 @@ type fakeCLB struct {
 	// TRUNCATED answer: the API says more objects exist than it returned.
 	lbTotal       *uint64
 	listenerTotal *uint64
+
+	// paging makes DescribeLoadBalancers answer one page at a time, as the API does. Without it
+	// the fake returns every load balancer at once and the page loop is never entered.
+	paging bool
 }
 
 func (f *fakeCLB) DescribeLoadBalancersWithContext(_ context.Context, req *clbsdk.DescribeLoadBalancersRequest) (*clbsdk.DescribeLoadBalancersResponse, error) {
@@ -391,13 +395,38 @@ func (f *fakeCLB) DescribeLoadBalancersWithContext(_ context.Context, req *clbsd
 	if f.nilResponse {
 		return &clbsdk.DescribeLoadBalancersResponse{}, nil
 	}
-	var out []*clbsdk.LoadBalancer
+	var all []*clbsdk.LoadBalancer
 	for _, v := range f.lbs {
-		out = append(out, v...)
+		all = append(all, v...)
 	}
-	total := uint64(len(out))
+	// TotalCount is the number of instances matching the filter -- documented as independent of
+	// Limit -- so it is computed BEFORE the page is cut. Computing it from the page made the fake
+	// report "one page is everything", which is exactly the shape that hides a paging bug.
+	total := uint64(len(all))
 	if f.lbTotal != nil {
 		total = *f.lbTotal
+	}
+	out := all
+	// Honour Offset/Limit the way the API does. Returning everything in one page (what this fake
+	// used to do) hides the paging bugs entirely: the completeness check and the page loop can
+	// only be exercised by an answer that really is a page.
+	if f.paging {
+		limit := int64(100)
+		if req.Limit != nil && *req.Limit > 0 {
+			limit = *req.Limit
+		}
+		offset := int64(0)
+		if req.Offset != nil && *req.Offset > 0 {
+			offset = *req.Offset
+		}
+		if offset > int64(len(all)) {
+			offset = int64(len(all))
+		}
+		end := offset + limit
+		if end > int64(len(all)) {
+			end = int64(len(all))
+		}
+		out = all[offset:end]
 	}
 	return &clbsdk.DescribeLoadBalancersResponse{
 		Response: &clbsdk.DescribeLoadBalancersResponseParams{
@@ -790,5 +819,44 @@ func TestAnEmptyZoneDoesNotFreezeTheDeclarationRead(t *testing.T) {
 	}
 	if len(got) != int(dnsPageSize) {
 		t.Errorf("declarations = %d, want the %d from the full zone", len(got), dnsPageSize)
+	}
+}
+
+// A region with more load balancers than one page must be paged, not called incomplete.
+//
+// The completeness check compared TotalCount against the bytes read SO FAR, inside the page loop.
+// TotalCount is the total matching the filter and is documented as independent of Limit, so for
+// any region with more instances than one page the first iteration saw "100 returned, 250
+// reported" and returned errIncompleteRuleList: paging was dead code, and guard 1 was reported
+// incomplete (and therefore disabled: no rule check, no removals) for the whole account. The
+// in-tree fake returned every instance in one page, which is why no test could see it.
+func TestListRuleDomainsPagesPastOnePage(t *testing.T) {
+	const count = 250
+	lbs := make([]*clbsdk.LoadBalancer, 0, count)
+	rules := map[string][]string{}
+	for i := range count {
+		id := "lb-" + itoa(i)
+		lbs = append(lbs, &clbsdk.LoadBalancer{LoadBalancerId: common.StringPtr(id)})
+		rules[id] = []string{"host-" + itoa(i) + ".example.com"}
+	}
+	fake := &fakeCLB{
+		paging: true,
+		lbs:    map[string][]*clbsdk.LoadBalancer{"ap-guangzhou": lbs},
+		rules:  rules,
+	}
+	stubCLB(t, fake)
+
+	got, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
+	if err != nil {
+		t.Fatalf("a region with %d load balancers must be paged, not reported incomplete: %v", count, err)
+	}
+	if len(got) != count {
+		t.Errorf("the guard saw %d rule domains, want %d: the pages after the first were skipped", len(got), count)
+	}
+
+	// And a genuinely short answer is still reported: the check moved, it did not disappear.
+	fake.lbTotal = common.Uint64Ptr(count + 50)
+	if _, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background()); !errors.Is(err, errIncompleteRuleList) {
+		t.Errorf("a response that reports more instances than its pages returned must stay an error, got %v", err)
 	}
 }

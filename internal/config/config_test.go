@@ -754,15 +754,14 @@ dns:
 	}
 }
 
-// Whether a *valid* lego config loads depends on the build tag, and this package cannot see the
-// tag: acme owns it and config must not import acme (that would be a cycle), so all this package
-// can observe is its own zero value for the flag. A test here therefore cannot tell "correctly
-// refused in a default build" from "wrongly refused in a -tags lego_dns build" -- an earlier
-// version of this test asserted only that the error mentioned lego_dns, which is true in both,
-// and so passed in a tagged binary that would have rejected a valid config.
-//
-// The contract is asserted in internal/acme/lego_build_config_test.go instead, where acme's init
-// has by construction run.
+// Whether a *valid* lego config loads depends on the build tag. This package used to be unable to
+// answer that -- the flag was set by internal/acme's init, and config must not import acme (that is
+// a cycle), so all config could observe was its own zero value. The flag now comes from this
+// package's own build-tagged file (lego_registry_tags.go), which is what makes a config-only binary
+// such as wecert-onboard agree with a full one: before that, a -tags lego_dns build of
+// wecert-onboard refused a valid config and told the operator to rebuild with the tag they had just
+// used. The contract is asserted in lego_registry_tags_test.go / lego_registry_notags_test.go here,
+// and end-to-end in internal/acme/lego_build_config_test.go.
 
 // A provider name that is not one of wecert's own must not fall through to a default: silently
 // issuing with dnspod credentials because someone wrote "cloudflare" is the kind of mistake that
