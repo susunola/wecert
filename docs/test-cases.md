@@ -110,6 +110,7 @@ return exitMismatch, true                        // 重绑定后 ~15s 内看到�
 | TC-PROBE-19 | `-version` | 退出码 **0**，stdout 一行版本号 |
 | TC-PROBE-20 | `-json`，桩匹配 | stdout 是**一个**合法 JSON 对象，含 `host` / `result` / `verdict` / `attempt`；`result` 含 `sans`、`notAfter`、`trusted`、`resolvedIPs` |
 | TC-PROBE-21 | `-json -wait 10s`，桩一直不匹配 | stdout 是 **NDJSON**：每个尝试一行一个 JSON 对象，不是末尾一个聚合对象 |
+| TC-PROBE-21b | `-json`，主机名解析到**多个地址** | 每个地址一行 JSON（含 `address` / `addressIndex`），并且**任一地址不匹配即退出码 2** —— CLI 与守护进程一致地检查每一个后端（曾用 `probe.Probe`，只看第一个应答的地址） |
 | TC-PROBE-22 | `-json`，桩不可达 | 输出对象含 `error` 字段且**不含** `result` |
 | TC-PROBE-23 | 非 `-json`，桩不匹配 | 人类可读输出到 **stdout**，重试提示到 **stderr**（保证 stdout 可进日志/管道） |
 
