@@ -1382,6 +1382,13 @@ func TestAFailedRenewalEpilogueLeavesNothingHalfRecorded(t *testing.T) {
 	if o, _ := store.GetOrder(cert.Name); o == nil {
 		t.Error("the order was discarded by a transaction that failed, so the next pass has nothing " +
 			"to finish and the uploaded certificate is only recoverable from the cloud")
+	} else if o.DeploymentCertID != "ap-orphan" {
+		// The clear used to happen before the transaction, as a best-effort write. A rollback then
+		// left the order without its resume anchor: the next pass would upload a SECOND copy of the
+		// certificate instead of resuming the one already in the cloud, and the first copy was
+		// recorded nowhere at all.
+		t.Errorf("the failed epilogue dropped the order's resume anchor (DeploymentCertID=%q, want "+
+			"ap-orphan): the next pass cannot resume the upload it already paid for", o.DeploymentCertID)
 	}
 	if after.ConsecutiveFailures == 0 || after.NextAttemptAt.IsZero() {
 		t.Error("a failed epilogue must be recorded as a failure with backoff, not silently retried " +
