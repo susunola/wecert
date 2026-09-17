@@ -141,7 +141,12 @@ func run() error {
 		waitCtx, cancelWait := context.WithTimeout(context.Background(), *wait+30*time.Second)
 		defer cancelWait()
 
-		bound, lastErr := pollUntilBound(waitCtx, *wait, func() ([]string, error) {
+		// `=` and a declared lastErr, not `:=`: an := here declares a NEW bound that shadows the
+		// one the assertions below read, so the wait would poll away and then assert against the
+		// stale pre-wait set -- failing exactly when the rebind did land, which is the case -wait
+		// exists for.
+		var lastErr error
+		bound, lastErr = pollUntilBound(waitCtx, *wait, func() ([]string, error) {
 			return fetchBoundCertIDs(waitCtx, client, *lbID, *listenerID, *domain)
 		}, *expect, func(ids []string, err error) {
 			if err != nil {
@@ -161,16 +166,28 @@ func run() error {
 	// The assertions look at every certificate the listener carries, primary and SNI
 	// alike. Reporting "-not-expect <old> passed" while the old certificate is still bound
 	// as an extension cert is the exact failure this tool exists to catch.
-	if *notExpect != "" && contains(bound, *notExpect) {
-		return fmt.Errorf("assertion failed: %s is still bound (%s: %v), which should be gone",
-			*notExpect, scope, bound)
+	if err := assertBindings(bound, *expect, *notExpect, scope, *wait); err != nil {
+		return err
 	}
 	if *expect != "" {
-		if !contains(bound, *expect) {
-			return fmt.Errorf("assertion failed: after waiting %s %s is still not bound (%s: %v)",
-				*wait, *expect, scope, bound)
-		}
 		fmt.Printf("\nOK: assertion passed - %s is bound (%s)\n", *expect, scope)
+	}
+	return nil
+}
+
+// assertBindings applies -expect and -not-expect to the set that was observed.
+//
+// Separated from the flags and the client so the assertion itself has a test: it is the whole point
+// of this tool, and the wait path around it is exactly where a stale set can hide (a shadowed
+// variable cost a false "still not bound" for every -wait run that succeeded).
+func assertBindings(bound []string, expect, notExpect, scope string, wait time.Duration) error {
+	if notExpect != "" && contains(bound, notExpect) {
+		return fmt.Errorf("assertion failed: %s is still bound (%s: %v), which should be gone",
+			notExpect, scope, bound)
+	}
+	if expect != "" && !contains(bound, expect) {
+		return fmt.Errorf("assertion failed: after waiting %s %s is still not bound (%s: %v)",
+			wait, expect, scope, bound)
 	}
 	return nil
 }

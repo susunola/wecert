@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"encoding/base64"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	tat "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/tat/v20201028"
 )
@@ -48,7 +49,9 @@ func (f *fakeTAT) DescribeInvocationTasksWithContext(context.Context, *tat.Descr
 	task := &tat.InvocationTask{TaskStatus: common.StringPtr(status)}
 	if !f.omitResult && (status == "SUCCESS" || f.output != "") {
 		task.TaskResult = &tat.TaskResult{
-			Output:   common.StringPtr(f.output),
+			// The real API returns Base64 ("Base64编码后的命令输出"); feeding plain text here is
+			// what let the tool print a blob for its whole life without a test noticing.
+			Output:   common.StringPtr(base64.StdEncoding.EncodeToString([]byte(f.output))),
 			ExitCode: common.Int64Ptr(f.exitCode),
 		}
 		if f.dropped > 0 {
@@ -323,5 +326,32 @@ func TestTruncationNoticeDoesNotPrintASignedURL(t *testing.T) {
 	// A plain URL without a signature is printed as-is.
 	if got := truncationNotice(&tat.TaskResult{OutputUrl: common.StringPtr("https://example.com/log")}); !strings.Contains(got, "https://example.com/log") {
 		t.Errorf("an unsigned URL is not a credential and is useful as-is, got %q", got)
+	}
+}
+
+// The remote output is Base64 on the wire and must reach the operator decoded.
+//
+// TaskResult.Output is documented as Base64-encoded, and this repository's own e2e captures decode
+// from Base64 to the openssl output they were checking. Printing the field verbatim made every run's
+// evidence a blob that `-quiet | grep` could not match.
+func TestWaitForTaskPrintsDecodedOutput(t *testing.T) {
+	f := &fakeTAT{statuses: []string{"SUCCESS"}, output: "root\n"}
+	if err := wait(t, f); err != nil {
+		t.Fatalf("a successful command must not be an error: %v", err)
+	}
+	if got := decodeRemoteOutput(base64.StdEncoding.EncodeToString([]byte("hello\n"))); got != "hello\n" {
+		t.Errorf("decodeRemoteOutput = %q, want the decoded text", got)
+	}
+	// Padding-less Base64 is accepted too.
+	if got := decodeRemoteOutput("aGVsbG8"); got != "hello" {
+		t.Errorf("unpadded Base64 must decode, got %q", got)
+	}
+	// Something that is not Base64 at all is passed through rather than dropped: it is still the
+	// only evidence there is.
+	if got := decodeRemoteOutput("not base64 !!"); got != "not base64 !!" {
+		t.Errorf("undecodable output must be passed through, got %q", got)
+	}
+	if got := decodeRemoteOutput(""); got != "" {
+		t.Errorf("empty output stays empty, got %q", got)
 	}
 }
