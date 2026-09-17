@@ -77,9 +77,18 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		if err != nil {
 			return nil, err
 		}
-		// Fetch and build on the spot every time. Constructing a provider only creates
-		// an SDK client, a negligible cost, and what we get for it is never calling the
-		// API with expired credentials.
+		// Fetch and build on the spot every time, so the API is never called with credentials
+		// that have expired since they were fetched -- the CVM instance role hands out temporary
+		// ones.
+		//
+		// The cost is not quite negligible, and it is worth writing down because it is invisible
+		// here: the SDK builds each client's HTTP client around a CLONE of http.DefaultTransport
+		// (common.Client.Init, unless common.DefaultHttpClient is set, which this program does not
+		// set), so every provider instance has its own connection pool. One Present or CleanUp is
+		// therefore one fresh TLS handshake, plus one connection left idle for the SDK's 30s
+		// IdleConnTimeout. That is the price of not reusing a client; sharing one is not free
+		// either, because the SDK applies ReqTimeout by mutating the client it was given, so a
+		// shared client would couple unrelated timeouts.
 		newProvider = func(ctx context.Context) (challenge.Provider, error) {
 			cred, err := creds(ctx)
 			if err != nil {
