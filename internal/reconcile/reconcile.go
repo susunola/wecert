@@ -890,6 +890,14 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 				"the other certificates are unaffected; this is a bug, please report it",
 				"cert", c.Name, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
 			err = fmt.Errorf("panic while reconciling %s: %v", c.Name, p)
+
+			// The notification is sent from here because the normal call below is unreachable
+			// while the stack unwinds -- and a panic is the failure an operator most needs to
+			// hear about, not the one that goes quiet. Same contract as any other failure: the
+			// pass attempted something and it did not succeed.
+			if r.notifier != nil {
+				r.notifier.Renewal(ctx, c.Name, err)
+			}
 		}
 	}()
 

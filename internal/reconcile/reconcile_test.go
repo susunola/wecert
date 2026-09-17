@@ -1627,3 +1627,44 @@ func TestTheOrphanTeardownHoldsTheClaimWhileItRuns(t *testing.T) {
 		r.release(orphan)
 	}
 }
+
+// A panicking pass must still notify.
+//
+// The panic recover sits in a defer, so the notifier call at the end of reconcileOne is
+// unreachable while the stack unwinds: the pass was counted as an error and logged, but the
+// operator's channel heard nothing -- and a panic is precisely the failure that must not go quiet.
+func TestAPanickingPassStillNotifies(t *testing.T) {
+	const name = "boom"
+	mgr := &fakeManager{onReconcile: func(n string) {
+		if n == name {
+			panic("simulated nil map write")
+		}
+	}}
+	notifier := newFakeNotifier()
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err := r.RunCert(context.Background(), name); err == nil {
+		t.Fatal("the pass must report the panic as a failure")
+	}
+
+	select {
+	case ev := <-notifier.events:
+		if ev.cert != name {
+			t.Errorf("notification was for %q, want %q", ev.cert, name)
+		}
+		if ev.err == nil {
+			t.Error("the notified result must be the failure, not a success")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a panicking pass emitted no notification: the recover unwinds past the notifier, " +
+			"so the one failure an operator must hear about is the one that goes quiet")
+	}
+}

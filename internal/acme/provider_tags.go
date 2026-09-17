@@ -7,15 +7,11 @@ import (
 
 	"github.com/go-acme/lego/v4/challenge"
 	legodns "github.com/go-acme/lego/v4/providers/dns"
-
-	"github.com/susunola/wecert/internal/config"
 )
-
-func init() { config.SetLegoProviderSupport(true) }
 
 // legoProviderAvailable tells the build-tag tests which half of the pair this is. It is not read
 // by the program: config validation is what accepts `dns.provider: lego` here, and it learns that
-// from the init above rather than from this constant.
+// from internal/config's own build-tagged file (not from this package's init -- see there for why).
 const legoProviderAvailable = true
 
 // newLegoProvider builds any of lego's ~198 DNS providers by name. Its counterpart under

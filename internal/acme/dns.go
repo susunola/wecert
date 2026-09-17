@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -64,12 +65,7 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		// zone in the account) into stdout, which under systemd means the journal.
 		//
 		// Keep it out of the unit and out of any drop-in; debug DNS locally instead.
-		p, err := dnspod.NewDNSProviderConfig(&dnspod.Config{
-			LoginToken:         dnsCfg.LoginToken,
-			TTL:                dnsCfg.TTL,
-			PropagationTimeout: dnsCfg.Propagation,
-			PollingInterval:    dnsCfg.Polling,
-		})
+		p, err := dnspod.NewDNSProviderConfig(dnspodConfig(dnsCfg))
 		if err != nil {
 			return nil, fmt.Errorf("initialise the dnspod provider: %w", err)
 		}
@@ -89,14 +85,8 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 			if err != nil {
 				return nil, err
 			}
-			return tencentcloud.NewDNSProviderConfig(&tencentcloud.Config{
-				SecretID:           cred.GetSecretId(),
-				SecretKey:          cred.GetSecretKey(),
-				SessionToken:       cred.GetToken(),
-				TTL:                dnsCfg.TTL,
-				PropagationTimeout: dnsCfg.Propagation,
-				PollingInterval:    dnsCfg.Polling,
-			})
+			return tencentcloud.NewDNSProviderConfig(tencentDNSConfig(
+				cred.GetSecretId(), cred.GetSecretKey(), cred.GetToken(), dnsCfg))
 		}
 
 	case config.DNSProviderLego:
@@ -117,6 +107,46 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		return nil, fmt.Errorf("configure lego recursive nameservers: %w", err)
 	}
 	return &DNSSolver{newProvider: newProvider, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS}, nil
+}
+
+// dnsAPITimeout bounds one call to the DNS provider's API.
+//
+// It has to be set explicitly, because a provider built from a struct literal does NOT get lego's
+// NewDefaultConfig defaults: the tencentcloud provider would leave the SDK's ReqTimeout at 0, and
+// the SDK then builds an http.Client with Timeout 0 -- no timeout at all. Present and CleanUp hold
+// the per-name TXT lease mutex across that call (see challengeLeases), so one stalled connection
+// would wedge every certificate sharing the challenge FQDN for as long as the TCP connection
+// lives, with the pass never finishing and the TXT records left in DNS. Sixty seconds matches the
+// other Tencent Cloud client in this program (internal/deploy).
+const dnsAPITimeout = 60 * time.Second
+
+// tencentDNSConfig builds the tencentcloud provider's config, timeout included.
+//
+// Split out so a test can assert the timeout is there: it cannot be read back from the constructed
+// provider (lego keeps its config unexported), and that is exactly the field whose absence is
+// invisible until a connection stalls.
+func tencentDNSConfig(secretID, secretKey, sessionToken string, dnsCfg config.DNS) *tencentcloud.Config {
+	return &tencentcloud.Config{
+		SecretID:           secretID,
+		SecretKey:          secretKey,
+		SessionToken:       sessionToken,
+		TTL:                dnsCfg.TTL,
+		PropagationTimeout: dnsCfg.Propagation,
+		PollingInterval:    dnsCfg.Polling,
+		HTTPTimeout:        dnsAPITimeout,
+	}
+}
+
+// dnspodConfig builds the DNSPod provider's config, with a bounded HTTP client for the same reason
+// as tencentDNSConfig: a nil client falls back to http.DefaultClient, which has no timeout either.
+func dnspodConfig(dnsCfg config.DNS) *dnspod.Config {
+	return &dnspod.Config{
+		LoginToken:         dnsCfg.LoginToken,
+		TTL:                dnsCfg.TTL,
+		PropagationTimeout: dnsCfg.Propagation,
+		PollingInterval:    dnsCfg.Polling,
+		HTTPClient:         &http.Client{Timeout: dnsAPITimeout},
+	}
 }
 
 // DNSRecord is one _acme-challenge TXT record that is to be written or verified.

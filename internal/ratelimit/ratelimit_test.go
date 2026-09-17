@@ -299,3 +299,70 @@ func TestSpendingWhileInDebtCarriesTheDebt(t *testing.T) {
 			"as several)", got)
 	}
 }
+
+// An idle bucket refills to its CAPACITY, not beyond it.
+//
+// level() keeps counting past the capacity, and Spend subtracted from that uncapped value: a
+// certificate limit of 5 refilling every 34h stored 45.35 tokens after two months of idleness, and
+// the stored count then read "full" for a hundred spends where the CA would have allowed none.
+// Remaining() clamps what it REPORTS, so the surplus was invisible in the metric and in the alert
+// that watches it -- the estimate was wrong in the optimistic direction, which is the one this
+// package promises never to be wrong in (see the package comment's "lower bound").
+func TestSpendingAnIdleBucketStoresNoMoreThanCapacity(t *testing.T) {
+	l := Limit{Name: "certs-per-exact-identifier-set", Capacity: 5, Refill: 34 * time.Hour}
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	full := Snapshot{Tokens: l.Capacity, At: start}
+
+	// Two months later the bucket is idle-and-full, not full a hundred times over.
+	idle := start.Add(60 * 24 * time.Hour)
+	after := Spend(full, l, 1, idle)
+	if after.Tokens > l.Capacity-1 {
+		t.Errorf("a spend from an idle bucket stored %v tokens (capacity %v): the surplus is "+
+			"spendable slack that makes the estimate read higher than reality",
+			after.Tokens, l.Capacity)
+	}
+
+	// And the burst proves it is gone: five spends from full leave nothing, and the sixth is
+	// debt rather than another "full" reading.
+	// All five at the same instant, so the assertion is exactly about the surplus rather than
+	// about the fraction of a token a minute of refill is worth.
+	snap := full
+	for i := 0; i < int(l.Capacity); i++ {
+		snap = Spend(snap, l, 1, idle)
+		if got := Remaining(snap, l, idle); got != l.Capacity-1-float64(i) {
+			t.Fatalf("spend %d: remaining = %v, want %v", i+1, got, l.Capacity-1-float64(i))
+		}
+	}
+	if got := Remaining(snap, l, idle); got != 0 {
+		t.Errorf("the bucket is spent, so remaining must read 0, got %v", got)
+	}
+}
+
+// The real refusal message carries a documentation link after the instant.
+//
+// Boulder formats the deadline and then appends ": see <url>", so the instant is a PREFIX of the
+// text (boulder/ratelimits/limiter.go + errors/errors.go). This function required the message to
+// END at the instant, so every genuine refusal was rejected: no deadline was stored, nothing was
+// ever marked blocked, and the CRITICAL WecertRateLimitBlocked alert could not fire. The existing
+// test passed because it used a fabricated message with no suffix.
+func TestParseRetryAfterAcceptsTheRealMessage(t *testing.T) {
+	const want = "2026-09-18 12:34:56 UTC"
+	cases := []string{
+		"acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: too many new orders recently, " +
+			"retry after 2026-09-18 12:34:56 UTC: see https://letsencrypt.org/docs/rate-limits/#new-orders-per-account",
+		"too many certificates already issued for this exact set of identifiers, retry after " +
+			"2026-09-18 12:34:56.123456789 UTC: see https://letsencrypt.org/docs/rate-limits/#certificates-per-exact-set-of-identifiers",
+		// The suffix-free form must keep working: it is what a CA that says nothing more sends.
+		"too many new orders recently, retry after 2026-09-18 12:34:56 UTC",
+	}
+	for _, msg := range cases {
+		got, ok := ParseRetryAfter(msg)
+		if !ok {
+			t.Errorf("the CA named an instant; a suffix after it must not hide the deadline:\n%s", msg)
+			continue
+		}
+		if got.Format("2006-01-02 15:04:05 MST") != want {
+			t.Errorf("deadline = %s, want %s", got, want)
+		}
+	}
+}

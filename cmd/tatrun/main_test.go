@@ -404,3 +404,30 @@ func captureStdout(t *testing.T) func() string {
 		return string(data)
 	}
 }
+
+// The diagnosable timeout must survive the context deadline.
+//
+// run() builds the context with the same duration as the loop's own deadline -- and builds it
+// first -- so the context always expired first and fetchTask handed back a raw "context deadline
+// exceeded" from the SDK. The message that names the invocation (and says what to do) was
+// unreachable in production; the existing tests could not see it because they pass a context
+// without a deadline.
+func TestTheTATTimeoutMessageSurvivesTheContextDeadline(t *testing.T) {
+	f := &fakeTAT{statuses: []string{"RUNNING"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+
+	// The loop's own deadline is deliberately much longer than the context's: in production run()
+	// creates the context first with the same duration, so the context ALWAYS expires first, and
+	// this reproduces that ordering without depending on which check happens to win a race.
+	err := waitForTask(ctx, f, "inv-42", 10*time.Second, 5*time.Millisecond, true)
+	if err == nil {
+		t.Fatal("a task that never reaches a terminal status must time out")
+	}
+	if !strings.Contains(err.Error(), "timed out waiting for the TAT result") {
+		t.Errorf("the operator needs the message that names the invocation, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "inv-42") {
+		t.Errorf("the message must carry the invocation id, got %v", err)
+	}
+}

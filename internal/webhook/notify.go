@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -53,9 +54,22 @@ func NewNotifier(url, secret string, log *slog.Logger) *Notifier {
 	return &Notifier{
 		url:    url,
 		secret: secret,
-		client: &http.Client{Timeout: 10 * time.Second},
-		log:    log,
-		sem:    make(chan struct{}, maxNotifyInFlight),
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			// Redirects are refused rather than followed.
+			//
+			// The Go default follows up to ten of them, and every hop is wrong for this request:
+			// a 301/302/303 turns the signed POST into a bodiless GET at the new location (the
+			// event is lost, and a receiver that answers the GET with 200 is reported as a
+			// delivery), and a 307/308 re-sends the body -- with the X-Wecert-Signature header --
+			// to whatever host the redirect names. Treating it as a failure tells the operator
+			// that the notify target moved, which is the actionable truth.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return errors.New("the notify target answered with a redirect; point webhook.notifyURL at its final location")
+			},
+		},
+		log: log,
+		sem: make(chan struct{}, maxNotifyInFlight),
 	}
 }
 

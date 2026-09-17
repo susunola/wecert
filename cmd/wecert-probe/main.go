@@ -133,6 +133,13 @@ func worseExitCode(current, next int) int {
 	return exitOK
 }
 
+// minAttemptBudget is the floor an attempt gets when -wait leaves no room.
+//
+// It exists so "the budget is spent" cannot become "no probe happened": the first attempt runs
+// whatever is left, with just enough time for a dial to fail. It is deliberately small -- a
+// caller who asked for a nanosecond of waiting asked for a verdict, not for a ten-second dial.
+const minAttemptBudget = 250 * time.Millisecond
+
 // retryInterval is how long to wait between attempts under -wait.
 //
 // The comment used to read "only 'not in effect yet' is worth waiting for", which contradicted
@@ -165,9 +172,18 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 		attemptOpts := opts
 		if !deadline.IsZero() {
 			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				// Out of budget before this attempt started: report what the last one saw.
-				return lastCode
+			if remaining < minAttemptBudget {
+				// The budget cannot cover another attempt. That is a reason to stop RETRYING, not
+				// a reason to report a verdict without looking: the first attempt always runs,
+				// with a floor that at least lets a socket fail. Returning before the first dial
+				// handed back lastCode's zero value -- which is exitOK -- so
+				// `wecert-probe -wait 1ns` reported "every host served the expected certificate"
+				// having opened nothing. The documented contract agrees: one attempt with -wait
+				// (TC-PROBE-11/15) and a total that stays close to the wait (TC-PROBE-13).
+				if attempt > 1 {
+					return lastCode
+				}
+				remaining = minAttemptBudget
 			}
 			if attemptOpts.Timeout <= 0 || attemptOpts.Timeout > remaining {
 				attemptOpts.Timeout = remaining

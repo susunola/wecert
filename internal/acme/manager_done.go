@@ -140,6 +140,9 @@ func (m *Manager) download(
 	// (deploy.ErrSwitchUnverified): the certificate is promoted, but not as a confirmed
 	// deployment.
 	unverified := false
+	// Set when nothing is bound to either certificate (deploy.ErrNothingBoundYet): the renewed
+	// certificate is promoted as uploaded-but-unbound, exactly like a first issuance.
+	waitingFirstBind := false
 	if c.Deploy.Enabled {
 		var id string
 		var derr error
@@ -189,6 +192,18 @@ func (m *Manager) download(
 					"recording the new certificate as deployed but unconfirmed",
 					"cert", c.Name, "certId", id, "err", derr)
 				unverified = true
+			} else if errors.Is(derr, deploy.ErrNothingBoundYet) && id != "" {
+				// The documented first-issuance state, met on a renewal because nobody bound the
+				// first upload. There was no switch to perform, so this is not a failed deploy:
+				// before this case existed the pass failed every time, the promotion below never
+				// ran, and the state kept pointing at the certificate that was expiring while
+				// each cycle issued and uploaded another one.
+				m.log.Warn("the renewed certificate is uploaded but neither it nor its predecessor is "+
+					"bound to any cloud resource; nothing was switched, and the one-time manual bind "+
+					"is still outstanding",
+					"cert", c.Name, "certId", id, "hint",
+					"bind either certificate once in the CLB console; later renewals switch it automatically")
+				waitingFirstBind = true
 			} else {
 				if id != "" {
 					o.DeploymentCertID = id
@@ -218,7 +233,10 @@ func (m *Manager) download(
 		// tx.DeleteOrder below removes the row (and with it the ID) inside the transaction, which
 		// is both atomic and sufficient: on success nothing stale survives, and on failure the
 		// anchor survives too, which is what lets the next pass resume instead of re-uploading.
-		rebound = oldDeployedID != ""
+		// A first bind that has not happened yet is not a rebind: claiming DeployConfirmed here
+		// would make the deployed metric green for a certificate that is serving nothing, and the
+		// next renewal would try to switch from it.
+		rebound = oldDeployedID != "" && !waitingFirstBind
 	} else {
 		// A local-only renewal must never claim the older cloud certificate is this
 		// newly issued one: keeping DeployConfirmed would make the deployed metric
@@ -293,6 +311,14 @@ func (m *Manager) download(
 		// confirmed, so "deployed" is not something this program can claim yet. The next
 		// pass's binding probe sets it once the enumeration answers (see confirmBinding),
 		// which is why this does not have to be settled here.
+		promoted.DeployConfirmed = false
+	}
+	if waitingFirstBind {
+		// Neither certificate is bound, so the flag must be cleared rather than inherited from the
+		// row being replaced: the seed value came from an earlier confirmed deployment, and this
+		// promotion replaces a certificate that nothing is serving with one that nothing is
+		// serving either. Leaving it true would make the deployed metric green and let the next
+		// renewal try to switch away from a certificate no listener has.
 		promoted.DeployConfirmed = false
 	}
 	promoted.ARICertID = ariCertID

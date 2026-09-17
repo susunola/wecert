@@ -1,0 +1,3 @@
+./client.go
+./errors.go
+./models.go

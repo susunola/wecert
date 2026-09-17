@@ -226,3 +226,29 @@ func TestWaitBoundsAnAttemptAlreadyInFlight(t *testing.T) {
 			"was left of the wait, so -wait does not bound the command", budget, elapsed)
 	}
 }
+
+// A spent -wait budget must not turn into a successful probe that never dialled.
+//
+// The deadline check came before the first attempt, and its early return handed back lastCode's
+// zero value -- which is exitOK. `wecert-probe -host H -wait 1ns` therefore exited 0, printing
+// nothing, having opened no socket: the answer a script trusts most ("the listener serves the
+// expected certificate") was produced without looking. -wait means "keep re-checking for this
+// long"; it cannot mean "do not check at all".
+func TestASpentWaitBudgetStillProbesOnce(t *testing.T) {
+	attempts := 0
+	prober := func(context.Context, string, probe.Options) (*probe.Result, error) {
+		attempts++
+		return nil, errors.New("dial tcp 10.0.0.1:443: connect: connection refused")
+	}
+
+	code := checkOne(context.Background(), "example.com", probe.Options{}, probe.Expectation{},
+		time.Nanosecond, false, prober)
+
+	if attempts == 0 {
+		t.Fatal("the probe never dialled: a budget too small to wait must still produce one attempt, " +
+			"not an answer")
+	}
+	if code == exitOK {
+		t.Errorf("exit code = %d (ok) although nothing was ever dialled", code)
+	}
+}
