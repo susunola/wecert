@@ -49,6 +49,11 @@ type challengeSolver interface {
 	// "cannot tell" -- which is the answer for an empty resolver cache too, because a
 	// cached negative must never be mistaken for proof that nothing was written.
 	LookupTXT(ctx context.Context, domain, keyAuth string) (DNSRecord, bool, error)
+
+	// PropagationTimeout is the budget the solver waits for a record to appear. Crash recovery uses
+	// it as the floor under "an authoritative denial means the write never happened": inside that
+	// window a denial proves nothing, because the write may still be propagating.
+	PropagationTimeout() time.Duration
 }
 
 // keyAuthProvider only needs "convert a challenge token into a key authorization".

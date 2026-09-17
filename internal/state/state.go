@@ -195,6 +195,11 @@ type Authorization struct {
 	Presented bool
 	// ChallengeSent means the CA has been POSTed to go and validate.
 	ChallengeSent bool
+
+	// ChallengePreparedAt is when the challenge currently in this row was chosen. Zero means the
+	// row predates the column (or was written by a path that does not pick a challenge), and the
+	// reader treats it as "age unknown" rather than as "just now".
+	ChallengePreparedAt time.Time
 }
 
 // Account is an ACME account.
@@ -691,6 +696,10 @@ CREATE TABLE IF NOT EXISTS authorizations (
     txt_value       TEXT NOT NULL DEFAULT '',
     presented       INTEGER NOT NULL DEFAULT 0,
     challenge_sent  INTEGER NOT NULL DEFAULT 0,
+    -- When the challenge currently in this row was chosen (see the acme package). Crash recovery
+    -- needs it: an authoritative "no such record" is only trustworthy once the write would have had
+    -- time to propagate, and DNSPod's authoritative servers lag the API write by up to a minute.
+    challenge_prepared_at INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (cert_name, authz_url)
 );
 
@@ -849,6 +858,9 @@ var schemaColumns = []struct{ table, column, decl string }{
 	// material stored now); inventing an identity would make the retry refuse to act on the
 	// operator's request for a reason that was not true when they made it.
 	{"revoke_requests", "cert_identity", "TEXT NOT NULL DEFAULT ''"},
+	// When the challenge in an authorization row was chosen. Legacy rows keep 0, which reads as
+	// "unknown age" and makes the reclaim probe fall back to its previous behaviour.
+	{"authorizations", "challenge_prepared_at", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // pendingMigrations reports schema changes this binary would apply, without applying them.
@@ -1240,7 +1252,7 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`
 		SELECT cert_name, authz_url, identifier, status, challenge_url, challenge_token,
-		       txt_name, txt_value, presented, challenge_sent
+		       txt_name, txt_value, presented, challenge_sent, challenge_prepared_at
 		FROM authorizations WHERE cert_name = ? ORDER BY authz_url`, certName)
 	if err != nil {
 		return nil, fmt.Errorf("list authorizations for %s: %w", certName, err)
@@ -1250,11 +1262,13 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 	var out []*Authorization
 	for rows.Next() {
 		a := &Authorization{}
+		var preparedAt int64
 		if err := rows.Scan(&a.CertName, &a.AuthzURL, &a.Identifier, &a.Status,
 			&a.ChallengeURL, &a.ChallengeToken, &a.TxtName, &a.TxtValue,
-			&a.Presented, &a.ChallengeSent); err != nil {
+			&a.Presented, &a.ChallengeSent, &preparedAt); err != nil {
 			return nil, fmt.Errorf("scan authorization: %w", err)
 		}
+		a.ChallengePreparedAt = fromUnix(preparedAt)
 		out = append(out, a)
 	}
 	return out, rows.Err()
@@ -1273,7 +1287,7 @@ func (s *Store) ListPresentedAuthorizations() ([]*Authorization, error) {
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`
 		SELECT cert_name, authz_url, identifier, status, challenge_url, challenge_token,
-		       txt_name, txt_value, presented, challenge_sent
+		       txt_name, txt_value, presented, challenge_sent, challenge_prepared_at
 		FROM authorizations WHERE presented = 1 ORDER BY txt_name, cert_name`)
 	if err != nil {
 		return nil, fmt.Errorf("list presented authorizations: %w", err)
@@ -1283,11 +1297,13 @@ func (s *Store) ListPresentedAuthorizations() ([]*Authorization, error) {
 	var out []*Authorization
 	for rows.Next() {
 		a := &Authorization{}
+		var preparedAt int64
 		if err := rows.Scan(&a.CertName, &a.AuthzURL, &a.Identifier, &a.Status,
 			&a.ChallengeURL, &a.ChallengeToken, &a.TxtName, &a.TxtValue,
-			&a.Presented, &a.ChallengeSent); err != nil {
+			&a.Presented, &a.ChallengeSent, &preparedAt); err != nil {
 			return nil, fmt.Errorf("scan presented authorization: %w", err)
 		}
+		a.ChallengePreparedAt = fromUnix(preparedAt)
 		out = append(out, a)
 	}
 	return out, rows.Err()
@@ -1300,8 +1316,8 @@ func (s *Store) PutAuthorization(a *Authorization) error {
 	_, err := s.db.Exec(`
 		INSERT INTO authorizations (
 			cert_name, authz_url, identifier, status, challenge_url, challenge_token,
-			txt_name, txt_value, presented, challenge_sent
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			txt_name, txt_value, presented, challenge_sent, challenge_prepared_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(cert_name, authz_url) DO UPDATE SET
 			identifier      = excluded.identifier,
 			status          = excluded.status,
@@ -1310,9 +1326,14 @@ func (s *Store) PutAuthorization(a *Authorization) error {
 			txt_name        = excluded.txt_name,
 			txt_value       = excluded.txt_value,
 			presented       = excluded.presented,
-			challenge_sent  = excluded.challenge_sent`,
+			challenge_sent  = excluded.challenge_sent,
+			-- Kept, not overwritten with 0, when the writer does not know: several paths persist a
+			-- row they did not pick a challenge for (a status update), and losing the age there
+			-- would silently switch the reclaim probe back to trusting a fresh denial.
+			challenge_prepared_at = CASE WHEN excluded.challenge_prepared_at > 0
+				THEN excluded.challenge_prepared_at ELSE authorizations.challenge_prepared_at END`,
 		a.CertName, a.AuthzURL, a.Identifier, a.Status, a.ChallengeURL, a.ChallengeToken,
-		a.TxtName, a.TxtValue, a.Presented, a.ChallengeSent)
+		a.TxtName, a.TxtValue, a.Presented, a.ChallengeSent, toUnix(a.ChallengePreparedAt))
 	if err != nil {
 		return fmt.Errorf("put authorization %s: %w", a.AuthzURL, err)
 	}
