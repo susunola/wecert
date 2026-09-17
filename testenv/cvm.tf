@@ -178,6 +178,15 @@ resource "tencentcloud_instance" "test" {
       - mkdir -p /srv/www
       - systemctl daemon-reload
       - systemctl enable --now wecert-backend
+      # The whole Stage C runbook drives this machine through TAT, so the agent is
+      # a hard dependency -- and it is not always present: the public Ubuntu image
+      # this module defaults to (img-487zeit5) booted without it, and every
+      # RunCommand then failed with ResourceUnavailable.AgentNotInstalled while
+      # DescribeAutomationAgentStatus returned an empty set. Tencent's own
+      # installer is idempotent and the instance already has egress, so installing
+      # it here makes the module self-sufficient instead of leaving the operator to
+      # discover the gap from an error message.
+      - wget -qO - https://mirrors.tencentyun.com/install/tat_agent/tat_agent_installer.sh | sh
   EOF
 
   tags = local.tags
