@@ -326,6 +326,13 @@ type round struct {
 	// fullSet is set when this pass ordered the FULL configured identifier set.
 	fullSet bool
 
+	// fallbackUnknown records that the degradation state could not be read this pass.
+	//
+	// It holds the SAN-drift branch (do not reissue the known-bad full set) WITHOUT telling
+	// applyFallback that a degradation is in force: that path skips the expiry gate and can drop
+	// names, which a state-store blip has no business doing.
+	fallbackUnknown bool
+
 	// fallbackActive records that a degradation decision is in force for this certificate
 	// (a cert_fallback row exists), whether or not this pass dropped anything.
 	//
@@ -411,7 +418,12 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		// sibling decision in fallback.go holds on the very same failure. Holding costs one pass;
 		// the other direction spends an order on the set whose broken identifier caused the
 		// degradation, which is the oscillation the fallback exists to stop.
-		rd.fallbackActive = true
+		//
+		// It is a SEPARATE flag, not fallbackActive: that one also means "a degradation is being
+		// continued" to applyFallback, which skips the expiry gate -- so setting it here would let a
+		// state-store blip drop names from a certificate that is nowhere near expiry, which is the
+		// opposite of holding.
+		rd.fallbackUnknown = true
 		m.log.Warn("cannot read whether a degradation is in force; holding the current certificate "+
 			"this pass rather than reissuing the full identifier set",
 			"cert", c.Name, "err", ferr)
@@ -542,7 +554,16 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	if leaf, lerr := ParseLeaf(st.CertPEM); lerr != nil {
 		m.log.Warn("could not parse the live certificate; skipping the SAN comparison", "cert", c.Name, "err", lerr)
 	} else if drifted, detail := CoverageDrift(leaf, c.Domains); drifted {
-		if rd.fallbackActive && driftIsTheDegradation(leaf, c, m.store, c.Name, m.log) {
+		if rd.fallbackUnknown {
+			// The degradation state could not be read, so this drift cannot be classified as either
+			// "the fallback working" or "the config changed". Holding is the conservative answer:
+			// reissuing now would order the full set -- the one whose broken identifier caused the
+			// degradation -- and that is the oscillation the fallback exists to stop. Nothing is
+			// dropped this pass either (see fallbackUnknown's field comment).
+			m.log.Warn("cannot read whether a degradation is in force, so this certificate's SAN drift "+
+				"cannot be classified; holding it this pass instead of re-ordering the full set",
+				"cert", c.Name, "detail", detail)
+		} else if rd.fallbackActive && driftIsTheDegradation(leaf, c, m.store, c.Name, m.log) {
 			// A degradation is in force, so the live certificate is *supposed* to be
 			// missing names: this drift is the fallback working, not a config change that
 			// needs converging on.

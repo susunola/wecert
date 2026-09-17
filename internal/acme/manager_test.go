@@ -1,11 +1,13 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,37 +83,83 @@ func TestAnUnreadableFallbackRecordHoldsInsteadOfReissuing(t *testing.T) {
 	}
 }
 
-// A failed order read must schedule the retry like every other failed decision.
+// Holding on an unreadable fallback must not turn into DROPPING names.
 //
-// Reconcile's own comment promises that a decision which failed schedules the retry, and this path
-// returned the bare store error: no ConsecutiveFailures, no NextAttemptAt, no in-memory transient
-// backoff. A state store failing exactly this read was then invisible in
-// wecert_certificate_consecutive_failures and retried at the pass rate.
-func TestAFailedOrderReadSchedulesTheRetry(t *testing.T) {
-	store, m, _, cert, dbPath := newDBFaultHarness(t)
+// The first version of the hold reused the "a degradation is in force" flag, which applyFallback
+// also reads -- and that path skips the expiry gate, because a degradation already in force is
+// continued whatever the remaining lifetime is. So a state-store blip could drop names from a
+// certificate that is nowhere near expiry: the opposite of the conservative direction the hold was
+// for. The two facts are now separate flags, and this test pins both halves: the fixture really
+// would drop if a fallback were in force, and an unreadable record does not.
+func TestAnUnreadableFallbackDoesNotDropNames(t *testing.T) {
+	var logs bytes.Buffer
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 
+	fake := &fakeAPI{}
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(&logs, nil)))
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return now })
+
+	yes := true
+	m.SetFallbackPolicy(config.FailureFallback{
+		Enabled:               &yes,
+		AfterFailures:         3,
+		MinIdentifierFailures: 2,
+		MinNames:              1,
+		BeforeExpiryDur:       168 * time.Hour,
+		FailureWindowDur:      72 * time.Hour,
+	})
+
+	cert := &config.Certificate{
+		Name: "site-example-com", Domains: []string{"example.com", "broken.example.com"},
+		Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+	}
+	// The live certificate covers only the healthy name: the degraded shape.
 	if err := store.PutCert(&state.CertState{
-		Name:     cert.Name,
-		NotAfter: time.Now().Add(60 * 24 * time.Hour),
-		CertPEM:  selfSignedCertPEM(t, time.Now().Add(60*24*time.Hour), "example.com"),
+		Name: cert.Name, NotAfter: now.Add(60 * 24 * time.Hour),
+		CertPEM:             selfSignedCertPEM(t, now.Add(60*24*time.Hour), "example.com"),
+		ConsecutiveFailures: 20,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	dropTable(t, dbPath, "orders")
-
-	if err := m.Reconcile(context.Background(), cert); err == nil {
-		t.Fatal("an unreadable order row must be reported as a failed pass")
+	for i := 0; i < 5; i++ {
+		if err := store.RecordIdentifierFailure(cert.Name, "broken.example.com", "NXDOMAIN", now); err != nil {
+			t.Fatal(err)
+		}
 	}
+
 	st, err := store.GetCert(cert.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.ConsecutiveFailures == 0 {
-		t.Error("the failure must be counted: without it the pass is invisible in " +
-			"wecert_certificate_consecutive_failures")
+
+	// The precondition, asserted rather than assumed: with a degradation in force this fixture
+	// WOULD drop the failing name. Without this the rest of the test could pass vacuously.
+	kept, dropped, _ := m.fallbackDomains(cert, st, true)
+	if len(dropped) != 1 || dropped[0] != "broken.example.com" || len(kept) != 1 {
+		t.Fatalf("the fixture must be a certificate that would drop its failing name "+
+			"(kept=%v dropped=%v)", kept, dropped)
 	}
-	if st.NextAttemptAt.IsZero() {
-		t.Error("the failure must schedule a retry, otherwise the next pass repeats it immediately")
+
+	// Now make the degradation state unreadable.
+	dropTable(t, dbPath, "cert_fallback")
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("a failed fallback read must hold the certificate, not fail the pass: %v", err)
+	}
+	if strings.Contains(logs.String(), "FALLING BACK") {
+		t.Errorf("an unreadable fallback record must not drop names from a certificate that is "+
+			"nowhere near expiry; log:\n%s", logs.String())
+	}
+	if fake.newOrderDomains != nil {
+		t.Errorf("nothing may be ordered on an unreadable fallback: %v", fake.newOrderDomains)
 	}
 }
 
