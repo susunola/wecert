@@ -96,6 +96,34 @@ func TestBackwardClockDoesNotCreateTokens(t *testing.T) {
 	}
 }
 
+// A spend taken while the clock is behind must not move the anchor back with it.
+//
+// Remaining refuses to credit an interval that has not passed, but Spend still stamped the
+// snapshot with `now`. s.Tokens had already been credited up to s.At, so anchoring at an earlier
+// instant made [now, s.At] creditable a second time: after the clock caught up, the same hour was
+// refilled twice and the estimate reported quota the CA would refuse. The anchor therefore only
+// moves forward, and an already-credited interval can never be credited again.
+func TestASpendOnABackwardClockDoesNotReAnchorTheSnapshot(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	l := NewOrdersPerAccount
+
+	// Spend 100, then spend again while the clock reads an hour earlier, then read at the
+	// original instant.
+	s := Spend(Snapshot{}, l, 100, now)
+	s = Spend(s, l, 1, now.Add(-time.Hour))
+
+	want := l.Capacity - 101
+	if got := Remaining(s, l, now); got != want {
+		t.Errorf("tokens after a spend taken on a backward clock = %v, want %v: the anchor moved back, "+
+			"so the interval between the two instants is credited twice and the estimate hands out "+
+			"quota the CA would refuse", got, want)
+	}
+	if s.At.Before(now) {
+		t.Errorf("the snapshot anchor moved backwards to %v (was %v): every later read re-credits the "+
+			"interval in between", s.At, now)
+	}
+}
+
 func TestParseRetryAfter(t *testing.T) {
 	cases := []struct {
 		name string

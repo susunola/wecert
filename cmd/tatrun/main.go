@@ -124,6 +124,13 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 					fmt.Fprintf(os.Stderr, "--- command output (exit=%d) ---\n", exitCode)
 				}
 				fmt.Print(out)
+				// The API caps Output (24KB) and reports what it dropped, plus a link to the full
+				// log. This tool exists to be the evidence an operator greps: partial output
+				// presented as the whole answer turns "the certificate is missing from the log" into
+				// "this listener is not serving it".
+				if notice := truncationNotice(task.TaskResult); notice != "" {
+					fmt.Fprintf(os.Stderr, "\n%s\n", notice)
+				}
 				if exitCode != 0 {
 					return fmt.Errorf("command exited with code %d", exitCode)
 				}
@@ -194,6 +201,33 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// truncationNotice words the warning for a truncated TaskResult, or returns "" when the output is
+// whole.
+//
+// The API caps Output (24KB) and reports both the dropped byte count and a link to the full log.
+// This tool is the evidence an operator greps -- "which certificate is this listener serving" -- so
+// partial output presented as the whole answer turns "the certificate is missing from the log" into
+// "this listener is not serving it".
+func truncationNotice(r *tat.TaskResult) string {
+	if r == nil {
+		return ""
+	}
+	dropped := derefU64(r.Dropped)
+	full := deref(r.OutputUrl)
+	if dropped == 0 && full == "" {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: the remote output is incomplete: dropped=%d bytes, full log: %s",
+		dropped, full)
+}
+
+func derefU64(v *uint64) uint64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func derefI64(v *int64) int64 {

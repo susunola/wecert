@@ -2,6 +2,7 @@ package spec
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"time"
@@ -93,6 +94,27 @@ func (o *Observer) DesiredWithReasons(ctx context.Context) (*Result, error) {
 		res.Shadow = &ShadowReport{Error: err.Error()}
 		o.log.Warn("cannot read the shadow desired state; there is nothing to compare against",
 			"shadow", KindOf(o.shadow), "err", err)
+		return res, nil
+	}
+
+	// A frozen shadow source is "no comparison", not "no differences".
+	//
+	// A file source never returns an error once it has read the document successfully: a later
+	// unreadable revision comes back as a FROZEN result with a nil error, carrying the last good
+	// revision. Comparing against that and reporting the result as a fresh diff is the false
+	// confidence this mode is supposed to be free of -- the diff would be computed against a
+	// document nobody can read, ShadowReport.Error would stay empty, and the gate that decides
+	// whether it is safe to switch to enforce (shadow_errors_total quiet, shadow_last_read recent)
+	// would report a quiet, up-to-date comparison.
+	if sh.Frozen {
+		res.Shadow = &ShadowReport{
+			Revision:    sh.Revision,
+			GeneratedAt: sh.GeneratedAt,
+			Error: fmt.Sprintf("the shadow source is frozen on revision %s: %s",
+				sh.Revision, sh.FreezeReason),
+		}
+		o.log.Warn("the shadow desired state is frozen, so there is nothing to compare against",
+			"shadow", KindOf(o.shadow), "revision", sh.Revision, "reason", sh.FreezeReason)
 		return res, nil
 	}
 
