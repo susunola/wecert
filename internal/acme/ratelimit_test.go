@@ -85,6 +85,52 @@ func TestQuotaSeriesFollowTheDesiredState(t *testing.T) {
 	}
 }
 
+// A quota that could not be read must not be published as zero.
+//
+// `Remaining` reports (0, false) when the stored bucket cannot be read, and the report used to
+// drop that `false` on the floor: the gauge was set to 0 -- the strongest claim the metric can
+// make, "no quota left" -- on the strength of a failed read. `WecertRateLimitNearlyExhausted`
+// fires below 5, so a single failed read blanked the estimate for every limit at once and raised
+// a page for a fleet that had spent nothing. The next successful pass cleared it, which is what
+// makes it hard to diagnose from the alert alone.
+func TestUnreadableQuotaIsNotPublishedAsZero(t *testing.T) {
+	metrics.RateLimitRemaining.Reset()
+
+	store, m, _, _ := newAPITestHarness(t, []string{"example.com"})
+	scopes := map[string]string{
+		"registered-domain":    "example.com",
+		"exact-identifier-set": "example.com",
+		"identifier":           "example.com",
+	}
+
+	m.PublishQuota(scopes)
+	if before := quotaSeries(t); len(before) == 0 {
+		t.Fatal("a readable bucket must be published, otherwise this test proves nothing")
+	}
+
+	// Now every read fails, as it does when the database is busy or gone.
+	if err := store.Close(); err != nil {
+		t.Fatalf("closing the state store: %v", err)
+	}
+
+	reports := m.QuotaStatus(scopes)
+	if len(reports) == 0 {
+		t.Fatal("the report must cover the spendable limits")
+	}
+	for _, rep := range reports {
+		if !rep.Unreadable {
+			t.Errorf("limit %s scope %q could not be read, yet the report offers %v remaining; "+
+				"a failed read must not produce a number", rep.Limit, rep.Scope, rep.Remaining)
+		}
+	}
+
+	m.PublishQuota(scopes)
+	for _, s := range quotaSeries(t) {
+		t.Errorf("series %q was published from a failed read; a scrape cannot tell that zero from "+
+			"a genuine exhaustion", s)
+	}
+}
+
 func hasScope(series []string, scope string) bool {
 	for _, s := range series {
 		if hasSuffixScope(s, scope) {

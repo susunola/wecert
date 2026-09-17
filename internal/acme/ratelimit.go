@@ -60,6 +60,15 @@ type QuotaReport struct {
 	Remaining    float64
 	Blocked      bool
 	BlockedUntil time.Time
+
+	// Unreadable means the stored bucket could not be read, so Remaining is NOT an answer.
+	//
+	// It used to be published as zero, which is the strongest possible claim ("no quota left") made
+	// on the strength of a failed read: one SQLITE_BUSY made wecert_ratelimit_remaining_tokens read
+	// 0 for every limit and fired the "nearly exhausted" alert until the next successful pass. The
+	// revocation gauge in this same package already declines to touch itself when its read fails;
+	// this is the same rule.
+	Unreadable bool
 }
 
 // QuotaStatus reports every spendable limit for the given per-scope buckets.
@@ -82,6 +91,8 @@ func (m *Manager) QuotaStatus(scopes map[string]string) []QuotaReport {
 			rep.BlockedUntil = at
 		} else if left, ok := m.quota.Remaining(l, scopeID); ok {
 			rep.Remaining = left
+		} else {
+			rep.Unreadable = true
 		}
 		out = append(out, rep)
 	}
@@ -108,6 +119,11 @@ func (m *Manager) PublishQuota(scopes map[string]string) {
 	metrics.RateLimitRemaining.Reset()
 	metrics.RateLimitBlocked.Reset()
 	for _, rep := range m.QuotaStatus(scopes) {
+		if rep.Unreadable {
+			// No series rather than a zero: absent reads as "not published", which is the honest
+			// answer for a bucket whose stored value could not be read.
+			continue
+		}
 		metrics.RateLimitRemaining.WithLabelValues(rep.Limit, rep.Scope).Set(rep.Remaining)
 		if rep.Blocked {
 			metrics.RateLimitBlocked.WithLabelValues(rep.Limit, rep.Scope).Set(1)
