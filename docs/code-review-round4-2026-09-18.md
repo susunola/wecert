@@ -77,8 +77,15 @@
 | `internal/acme/manager_flow.go` | RFC 8555 §7.1.6 的 `deactivated`/`expired`/`revoked` 三种「已关闭」授权状态没有分支，被当成 pending：每轮都重新呈现挑战（真写 DNS + 等传播）、对已关闭的授权 POST `AcceptChallenge`、再等满 `authzWait`，直到订单自己的 7 天 TTL 到期 | 新增分支：丢弃订单（下一轮下新单，新单的授权是新的），并且**不记 identifier 失败**（名字并没有验证失败，记账会让 fallback 误伤健康名字）。`TestAClosedAuthorizationDiscardsTheOrder`（三种状态各一例，断言订单被丢弃、账本为空、DNS 无写入） |
 | `cmd/wecert-probe/main.go` | CLI 用 `probe.Probe`（**第一个**应答的地址）判定，而守护进程用 `ProbeAll`（「更新过的节点不能藏住还在服务旧证书的节点」）：换绑是逐个后端生效的，于是这个工具最核心的用途（等换绑生效）由「碰巧先应答的那个地址」回答，旁边还打印着全部解析地址 | 改用 `ProbeAll`：每个解析地址都判定、都输出，任一地址不匹配即退出码 2（不匹配优先于不可达）。`TestEveryResolvedAddressDecidesTheVerdict` 用 stdout 捕获断言「第二个地址确实被检查过」（去掉遍历即变红） |
 
-### 2.6 仍未修（留给后面 3 个小轮，逐条已核实）
+### 2.6 最后一条（同样已修）：拒绝的「证据效力」有了时间下限
+
+| 位置 | 缺陷 | 修法 |
+|---|---|---|
+| `internal/acme/manager_flow.go` + `internal/state`（新增 `authorizations.challenge_prepared_at`） | `reclaimUnpresentedTXT` 把「所有可达权威都否认」当成「这次写入从未发生」。但同一个行形状有两种来历：**死在 DNS 写入与状态落盘之间**，以及**死在持久化挑战与写 DNS 之间**——只看记录无法区分。DNSPod 的权威服务器滞后于 API 写入（本轮实测删除传播到所有权威最多 60s），于是刚写下的记录可能被每个权威否认，行与租约被删掉，而记录稍后出现：唯一的线索已经没了，那条 TXT 会留在 DNS 里占用额度、并可能污染同名（通配符 + apex 共用）的下一次挑战 | 授权行新增 `challenge_prepared_at`（`schemaColumns` 加列，老行为 0 = 年龄未知）；选择挑战时写入；否认只在「距选择挑战已超过传播窗口」时才被采信，窗口取 solver 自己的 `PropagationTimeout()`（新增到 `challengeSolver` 接口）。三个用例：刚准备（10s 前）→ 保留行；一小时前 → 删除行（否则老行永远留不完）；无时间戳的旧行 → 沿用旧行为。两处变异（去掉年龄判断、不写时间戳）各自变红 |
+
+第 1 轮至此**全部 28 条已核实发现都已处置**（28 修，0 遗留），其中「非交互 stdin」「`-json` NDJSON 形状」「tx.go 注释」三条经核实**驳回/不计**（见 §2.2）。
+
+### 2.7 第 1 轮之后仍待办（第 2–4 小轮）
 
 | 位置 | 问题 | 计划 |
 |---|---|---|
-| `internal/acme/manager_flow.go` | `reclaimUnpresentedTXT` 把「权威否认」当成「写入从未发生」，但 DNSPod 的写入传播可以滞后（本轮实测删除传播到所有权威最多 60s） | 给授权行加「挑战准备时间」列，滞后窗口内不采信否认 |

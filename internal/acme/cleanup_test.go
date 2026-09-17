@@ -36,9 +36,12 @@ type fakeSolver struct {
 	lookupErr   error
 	// waitErr scripts a WaitAll failure ("the records never confirmed propagated"),
 	// which is what the resumed-row re-verification path in solveChallenges reacts to.
-	waitErr  error
-	cleaned  []string // "identifier|keyAuth"
-	cleanErr error
+	waitErr error
+	// propagationTimeout is what PropagationTimeout reports, for the tests that exercise the
+	// "was this write given time to appear" decision.
+	propagationTimeout time.Duration
+	cleaned            []string // "identifier|keyAuth"
+	cleanErr           error
 }
 
 func (f *fakeSolver) Present(_ context.Context, domain, token, keyAuth string) (DNSRecord, error) {
@@ -51,6 +54,15 @@ func (f *fakeSolver) Present(_ context.Context, domain, token, keyAuth string) (
 }
 
 func (f *fakeSolver) WaitAll(context.Context, []DNSRecord) error { return f.waitErr }
+
+// PropagationTimeout is the window the reclaim probe uses as its floor for trusting a denial; the
+// fake takes it from the test that built it (see fakeSolver.propagationTimeout).
+func (f *fakeSolver) PropagationTimeout() time.Duration {
+	if f.propagationTimeout > 0 {
+		return f.propagationTimeout
+	}
+	return 5 * time.Minute
+}
 
 func (f *fakeSolver) CleanUp(_ context.Context, domain, token, keyAuth string) error {
 	f.mu.Lock()
@@ -848,5 +860,158 @@ func TestAClosedAuthorizationDiscardsTheOrder(t *testing.T) {
 				t.Errorf("nothing may be written to DNS for a closed authorization, got %v", solver.presented)
 			}
 		})
+	}
+}
+
+// A denial inside the propagation window is not proof that nothing was written.
+//
+// reclaimUnpresentedTXT exists for the pass that died between the DNS write and the state persist --
+// but the same row shape appears for the pass that died between persisting the challenge and
+// writing DNS, and the record alone cannot tell them apart. Deleting the row on a denial drops the
+// only clue to a record that is about to appear, which then stays in DNS and can poison a later
+// challenge at the same name (a wildcard and its apex share one). DNSPod's authoritative servers
+// lag the API write -- measured at up to ~60s for a deletion this session -- so inside the
+// propagation window the denial proves nothing.
+func TestADenialInsideThePropagationWindowKeepsTheRow(t *testing.T) {
+	const fqdn = "_acme-challenge.example.com."
+
+	newHarnessFor := func(t *testing.T) (*Manager, *state.Store, *fakeSolver) {
+		t.Helper()
+		solver := &fakeSolver{lookupFound: false, propagationTimeout: 5 * time.Minute}
+		m, store := newTestManager(t, solver, fakeKeyAuth{})
+		m.SetNow(func() time.Time { return time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC) })
+		return m, store, solver
+	}
+
+	t.Run("challenge prepared moments ago", func(t *testing.T) {
+		m, store, _ := newHarnessFor(t)
+
+		now := m.now()
+		if err := store.PutAuthorization(&state.Authorization{
+			CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+			ChallengeToken: "tok-1", TxtName: fqdn, TxtValue: "txt-lookup", Presented: false,
+			ChallengePreparedAt: now.Add(-10 * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+			t.Fatalf("cleanupOrphanTXT: %v", err)
+		}
+		if as, _ := store.ListAuthorizations("c"); len(as) != 1 {
+			t.Errorf("the row must be kept: the write may still be propagating, and the row is the "+
+				"only record of the value (rows now: %d)", len(as))
+		}
+	})
+
+	t.Run("challenge prepared long ago", func(t *testing.T) {
+		m, store, _ := newHarnessFor(t)
+
+		now := m.now()
+		if err := store.PutAuthorization(&state.Authorization{
+			CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+			ChallengeToken: "tok-1", TxtName: fqdn, TxtValue: "txt-lookup", Presented: false,
+			ChallengePreparedAt: now.Add(-time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+			t.Fatalf("cleanupOrphanTXT: %v", err)
+		}
+		if as, _ := store.ListAuthorizations("c"); len(as) != 0 {
+			t.Errorf("past the propagation window a denial IS evidence the write never happened, so "+
+				"the row must be deleted rather than kept forever (rows now: %d)", len(as))
+		}
+	})
+
+	t.Run("row predates the column", func(t *testing.T) {
+		m, store, _ := newHarnessFor(t)
+
+		if err := store.PutAuthorization(&state.Authorization{
+			CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+			ChallengeToken: "tok-1", TxtName: fqdn, TxtValue: "txt-lookup", Presented: false,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+			t.Fatalf("cleanupOrphanTXT: %v", err)
+		}
+		if as, _ := store.ListAuthorizations("c"); len(as) != 0 {
+			t.Errorf("a row with no timestamp has an unknown age, so the previous behaviour must "+
+				"stand -- refusing to delete those would strand every legacy row (rows now: %d)", len(as))
+		}
+	})
+}
+
+// Choosing a challenge must record when it was chosen.
+//
+// reclaimUnpresentedTXT uses that age to decide whether an authoritative denial may be trusted: a
+// challenge picked moments ago may simply not have propagated yet, and deleting the row then drops
+// the only clue to a record that is about to appear. A row written without the timestamp would fall
+// back to trusting every denial, which is the behaviour the window exists to replace.
+func TestChoosingAChallengeRecordsWhenItWasChosen(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	solver, _, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			resp := dnsReply(msg)
+			resp.Rcode = dns.RcodeNameError
+			resp.Authoritative = true
+			return resp, nil
+		})
+	solver.newProvider = func(context.Context) (challenge.Provider, error) {
+		return &recordingProvider{}, nil
+	}
+	solver.timeout = time.Millisecond
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	m := newManager(store, &fakeAPI{}, solver, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return now })
+
+	fake := m.core.(*fakeAPI)
+	fake.authzByURL = map[string]legoacme.Authorization{
+		"https://ca.test/authz/1": {
+			Status:     "pending",
+			Identifier: legoacme.Identifier{Value: "example.com"},
+			Challenges: []legoacme.Challenge{{
+				Type: "dns-01", URL: "https://ca.test/chall/1", Token: "tok-1",
+			}},
+		},
+	}
+
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "https://ca.test/authz/1", Identifier: "example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cert := &config.Certificate{Name: "c", Domains: []string{"example.com"}}
+	order := legoacme.ExtendedOrder{
+		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
+		Location: "https://ca.test/order/1",
+	}
+	_, _ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
+
+	as, err := store.ListAuthorizations("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(as) != 1 {
+		t.Fatalf("expected one authorization row, got %d", len(as))
+	}
+	if as[0].ChallengeURL == "" {
+		t.Fatalf("the fixture must have picked a challenge: %+v", as[0])
+	}
+	if !as[0].ChallengePreparedAt.Equal(now) {
+		t.Errorf("the row must record when the challenge was chosen, got %s want %s",
+			as[0].ChallengePreparedAt, now)
 	}
 }

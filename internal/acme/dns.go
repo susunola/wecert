@@ -149,6 +149,9 @@ func dnspodConfig(dnsCfg config.DNS) *dnspod.Config {
 	}
 }
 
+// PropagationTimeout reports the budget WaitAll waits for a record to appear.
+func (s *DNSSolver) PropagationTimeout() time.Duration { return s.timeout }
+
 // DNSRecord is one _acme-challenge TXT record that is to be written or verified.
 type DNSRecord struct {
 	FQDN  string
