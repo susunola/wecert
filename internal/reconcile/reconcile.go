@@ -108,6 +108,18 @@ type Reconciler struct {
 	mu      sync.Mutex
 	running map[string]struct{}
 
+	// bg counts the passes started by the webhook surface, so shutdown can wait for them.
+	//
+	// A pass can take minutes (DNS propagation), and the store, the ACME account and the process
+	// are all shared with it. Nothing used to wait: on SIGTERM the daemon cancelled its context,
+	// returned, and the deferred store.Close() closed SQLite under any pass still running -- so its
+	// epilogue (promotion, resume-anchor PutOrder, authorization update, recordFailure) failed. The
+	// worst case is the one this code already names elsewhere: an exit between an upload returning
+	// an id and PutOrder recording it leaves a cloud certificate in neither certificates nor
+	// retired_certificates, so it is billed and never reclaimed. Add happens before the goroutine
+	// starts, so a pass still queued for a start slot is counted too.
+	bg sync.WaitGroup
+
 	// startSlots bounds how many certificates a full trigger converges at once.
 	//
 	// Without it, POST /hook/reconcile started one goroutine per certificate, so a
@@ -795,7 +807,9 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 
 	// res is heap-allocated and not reused during this pass, so referring to its
 	// elements is safe.
+	r.bg.Add(1)
 	go func() {
+		defer r.bg.Done()
 		defer r.release(c.Name)
 
 		// Queue for a start slot instead of running immediately. Nothing is dropped:
@@ -867,7 +881,31 @@ func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, 
 	return accepted, skipped, nil
 }
 
-// reconcileOne processes one certificate and mirrors the result into metrics
+// Drain waits for the passes this reconciler started in the background, up to ctx's deadline.
+//
+// The caller is the shutdown path, and what it protects is the state store: an accepted pass writes
+// promotions, resume anchors and failure counters, and closing SQLite underneath one loses whichever
+// of those was in flight (see the bg field). A pass still parked waiting for a start slot is counted
+// as well, and returns as soon as the cancelled context reaches it.
+//
+// A pass already inside a CA call cannot be interrupted (lego's low-level API is context-free), so
+// this is bounded rather than absolute: the caller decides how long a shutdown may take, and a
+// timeout is reported so the operator knows the store is about to be closed under a live pass.
+func (r *Reconciler) Drain(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		r.bg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("still waiting for background passes to finish: %w", ctx.Err())
+	}
+}
+
+// reconcileOne processes one certificate and mirrors the result into metrics// reconcileOne processes one certificate and mirrors the result into metrics
 // and notifications. The pass's error is returned for callers that need it
 // (RunCert); a whole pass and startCert deliberately discard it -- one failing
 // certificate must not stall the others.

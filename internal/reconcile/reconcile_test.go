@@ -1668,3 +1668,75 @@ func TestAPanickingPassStillNotifies(t *testing.T) {
 			"so the one failure an operator must hear about is the one that goes quiet")
 	}
 }
+
+// Shutdown must wait for a webhook-triggered pass.
+//
+// The accepted pass writes the promotion, the resume anchor and the failure counter, and the caller
+// closes the state store as soon as it returns. Nothing used to wait for them: on SIGTERM the
+// daemon returned and the deferred Close() closed SQLite under a pass still mid-renewal, so its
+// epilogue failed -- and the worst case is named in the code itself: an exit between an upload
+// returning an id and PutOrder recording it leaves a cloud certificate in neither table, billed and
+// never reclaimed.
+func TestDrainWaitsForABackgroundPass(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+
+	mgr := &fakeManager{onReconcile: func(string) {
+		entered <- struct{}{}
+		<-release
+	}}
+	r, _ := newTestReconciler(t, []string{"a"}, mgr)
+
+	if err := r.StartCert(context.Background(), "a"); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+
+	drained := make(chan error, 1)
+	go func() { drained <- r.Drain(context.Background()) }()
+
+	select {
+	case <-drained:
+		close(release)
+		t.Fatal("Drain returned while a pass was still running: the store would be closed under it")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Errorf("Drain reported %v after the pass finished", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain never returned after the pass finished")
+	}
+}
+
+// A pass that cannot be interrupted must not hang shutdown forever.
+//
+// lego's low-level API is context-free, so a pass inside a CA call cannot be cancelled; the caller
+// bounds the wait and says what a timeout means.
+func TestDrainIsBounded(t *testing.T) {
+	hold := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	defer close(hold)
+
+	mgr := &fakeManager{onReconcile: func(string) {
+		entered <- struct{}{}
+		<-hold
+	}}
+	r, _ := newTestReconciler(t, []string{"a"}, mgr)
+
+	if err := r.StartCert(context.Background(), "a"); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := r.Drain(ctx); err == nil {
+		t.Error("a pass that cannot finish must be reported, so the operator knows the store is " +
+			"about to be closed under it")
+	}
+}

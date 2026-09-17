@@ -136,11 +136,18 @@ const defaultEnumerationBudget = 3 * time.Minute
 
 // sslAPI is the narrow slice of the Tencent Cloud SSL client this package uses.
 //
-// *ssl.Client is a concrete struct with no interface seam, and client() used to rebuild
-// it on every call -- which left the polling logic in updateInstance and
+// *ssl.Client is a concrete struct with no interface seam, and client() rebuilds it
+// on every call -- which left the polling logic in updateInstance and
 // waitDeployRecord (the most failure-prone part of the package) impossible to
 // unit-test. Declaring only the used methods as an interface lets tests substitute a
 // fake while the production implementation stays the real SDK client.
+//
+// "Rebuilds it on every call" is literal: the SDK wraps each client in its own clone of
+// http.DefaultTransport, so every deploy, reap and binding check opens a fresh TLS
+// connection and leaves one idle for 30s. Reusing a client would be wrong for the other
+// reason client() exists (credentials are fetched per call and the instance role's are
+// temporary), and the SDK has no seam for injecting a shared transport: it applies
+// ReqTimeout by mutating the client it is handed.
 type sslAPI interface {
 	UploadCertificateWithContext(ctx context.Context, req *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error)
 	UpdateCertificateInstanceWithContext(ctx context.Context, req *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error)

@@ -263,18 +263,40 @@ func run() error {
 		// attempted nothing and skipped everything counts as trouble too, because that is a
 		// desired state that resolved to nothing.
 		rep := reconciler.RunDetailed(ctx)
-		// The pass has finished, but the notifications it triggered are delivered on
-		// their own goroutines. Returning here would exit with them in flight and lose
-		// them -- including the "result":"error" one, which is the notification an
-		// operator most needs.
+		// That pass has finished, but a webhook-triggered one may be running: the listener is
+		// started before this branch, so -once can coexist with an accepted background pass. Both
+		// it and the notifications have to be waited for before the deferred store.Close() runs.
+		drainBackground(reconciler, log)
 		drainNotifier(notifier, log)
 		return onceExit(rep)
 	}
 
 	log.Info("entering daemon mode", "interval", *interval)
 	runDaemon(ctx, *interval, log, reconciler.RunDetailed)
+	// Wait for background passes and notifications before returning: the deferred store.Close()
+	// would otherwise close SQLite under a pass that is mid-renewal, losing the promotion or the
+	// resume anchor it was writing. See Reconciler.Drain.
+	drainBackground(reconciler, log)
 	drainNotifier(notifier, log)
 	return nil
+}
+
+// backgroundDrainTimeout bounds how long a shutdown waits for webhook-triggered passes.
+//
+// A pass can be inside a CA call that lego's context-free API cannot interrupt, and a stop signal
+// must not hang forever; the timeout is generous enough for the state writes that matter, and the
+// warning says plainly what a timeout means.
+const backgroundDrainTimeout = 30 * time.Second
+
+func drainBackground(reconciler *reconcile.Reconciler, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundDrainTimeout)
+	defer cancel()
+	if err := reconciler.Drain(ctx); err != nil {
+		log.Warn("a background pass did not finish before shutdown; the state store is about to be "+
+			"closed under it, so its last write may be lost (the next pass resumes from the order URL "+
+			"that is already on disk)",
+			"waited", backgroundDrainTimeout, "err", err)
+	}
 }
 
 // dirIsWritable reports whether a directory can be written to, creating it first if it does not
