@@ -229,3 +229,38 @@ func TestPollUntilBoundStopsWhenTheCertificateAppears(t *testing.T) {
 		t.Errorf("expected two polls (one immediately, one after the capped wait), got %d", calls)
 	}
 }
+
+// The wait must update the set the assertions read.
+//
+// The wait branch used to read `bound, lastErr := pollUntilBound(...)`, which declares a NEW bound
+// and shadows the outer one: the polling found the new certificate, printed progress, and then the
+// assertions checked the stale pre-wait set and failed with "is still not bound" -- precisely the
+// case -wait exists for. The old code assigned the outer variable (`bound = ids`), so this was a
+// regression introduced when the loop moved into pollUntilBound, and nothing covered it.
+func TestTheWaitResultReachesTheAssertions(t *testing.T) {
+	calls := 0
+	fetch := func() ([]string, error) {
+		calls++
+		if calls == 1 {
+			return []string{"old-cert"}, nil
+		}
+		return []string{"new-cert"}, nil
+	}
+
+	// What run() does: poll, then assert against the set the poll produced.
+	bound, err := pollUntilBound(context.Background(), 200*time.Millisecond, fetch, "new-cert", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := assertBindings(bound, "new-cert", "old-cert", "rule for a.example.com", 200*time.Millisecond); err != nil {
+		t.Fatalf("the wait produced the expected set, so the assertion must pass: %v", err)
+	}
+
+	// And the assertion itself must still reject the two wrong states.
+	if err := assertBindings([]string{"old-cert"}, "new-cert", "", "listener", time.Second); err == nil {
+		t.Error("an absent -expect certificate is a failed assertion")
+	}
+	if err := assertBindings([]string{"new-cert", "old-cert"}, "", "old-cert", "listener", time.Second); err == nil {
+		t.Error("-not-expect must fail while the certificate is still bound")
+	}
+}
