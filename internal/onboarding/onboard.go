@@ -1158,7 +1158,22 @@ func (r *run) build() {
 	}
 
 	for _, g := range groups {
-		cov, err := g.Cover(r.o.opts.MaxNames)
+		// The settings come first, because they decide the SAN cap.
+		//
+		// Cover used the configured default cap alone, so a group whose declarations ask for a
+		// shorter profile (tlsserver / shortlived allow 25 identifiers) was split by the default
+		// -- legal at 100 for classic -- and the resulting document was then rejected by
+		// spec.WriteDocument on EVERY round for EVERY certificate: no document, no state, no
+		// report, while Run still reported mode "written". Capping by the profile the group will
+		// actually use routes that case through overLimit instead, which keeps the previous
+		// revision for that certificate and says why.
+		profile, keyType, deploy, err := r.groupSettings(g)
+		if err != nil {
+			r.overSettingsConflict(g, err)
+			continue
+		}
+
+		cov, err := g.Cover(groupNameCap(r.o.opts.MaxNames, profile))
 		if err != nil {
 			if errors.Is(err, group.ErrTooManyNames) {
 				r.overLimit(g, err)
@@ -1166,12 +1181,6 @@ func (r *run) build() {
 			}
 			r.freeze(fmt.Sprintf("certificate %q: %v", g.Name, err))
 			return
-		}
-
-		profile, keyType, deploy, err := r.groupSettings(g)
-		if err != nil {
-			r.overSettingsConflict(g, err)
-			continue
 		}
 
 		r.certs = append(r.certs, config.Certificate{
@@ -1243,6 +1252,35 @@ func (r *run) previousCert(name string) *config.Certificate {
 	return nil
 }
 
+// groupNameCap is the SAN cap a group may use: the smaller of the configured onboarding cap and
+// the cap of the profile the group will actually be issued with.
+func groupNameCap(configured int, profile string) int {
+	cap := configured
+	if pm := config.ProfileMaxNames(profile); pm > 0 && (cap <= 0 || pm < cap) {
+		cap = pm
+	}
+	return cap
+}
+
+// settingsStillApply reports whether a declaration a filter did not accept still contributes its
+// profile / keyType / deploy settings.
+//
+// It does when the names it contributes are still covered this round: applyGrace carries a
+// still-declared name whose filter rejected it, so the certificate keeps that name -- and it must
+// also keep the settings that declaration asked for. Dropping them would rebuild the certificate
+// from the onboarding defaults, which changes the document's revision, reissues the certificate,
+// and can even turn deployment ON for a declaration that said deploy=0: the opposite of "the name
+// keeps its coverage and nothing is reissued", and a second issuance on a guard wobble -- exactly
+// what the carry exists to avoid.
+func (r *run) settingsStillApply(d *Declaration) bool {
+	for _, n := range d.Names() {
+		if r.eligible[n] {
+			return true
+		}
+	}
+	return false
+}
+
 // groupSettings aggregates the metadata of the declarations in a group.
 //
 // Only declarations that survived the guards contribute: see run.accepted.
@@ -1251,9 +1289,9 @@ func (r *run) groupSettings(g group.Group) (profile, keyType string, deploy bool
 	var profileSet, keyTypeSet, deploySet bool
 
 	for _, d := range r.declarations {
-		if !r.accepted[d.Hostname] {
-			// Excluded this round (allowlist or guard 1). Its settings must not leak onto
-			// names it is not part of.
+		if !r.accepted[d.Hostname] && !r.settingsStillApply(d) {
+			// Excluded this round (allowlist or guard 1) and NOT still covered: its settings
+			// must not leak onto names it is not part of.
 			continue
 		}
 		if group.RegisteredDomain(d.Hostname) != g.Registered {

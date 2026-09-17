@@ -1,16 +1,16 @@
 package main
 
 import (
-	"io"
-	"log/slog"
-	"testing"
-
 	"bytes"
 	"context"
+	"io"
+	"log/slog"
+	"strings"
+	"testing"
+
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/reconcile"
-	"strings"
 	"sync/atomic"
 	"time"
 )

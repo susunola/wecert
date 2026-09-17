@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -97,6 +98,22 @@ var newTATClient = func(cred common.CredentialIface, region string, cpf *profile
 	return tat.NewClient(cred, region, cpf)
 }
 
+// timeoutErr turns "the deadline passed" into the message that names the invocation, whichever way
+// it surfaced.
+//
+// run() gives the context the same duration as the loop's own deadline and creates it first, so in
+// production the deadline always arrives through the context -- as an error from the SDK call or as
+// ctx.Done() -- and both used to hand back a bare "context deadline exceeded". That made the
+// diagnosable message below it unreachable, and left the operator with an error from a nested call
+// instead of the invocation id to look up. A cancellation (SIGINT) is not a timeout and is returned
+// unchanged.
+func timeoutErr(ctx context.Context, invocationID string) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("timed out waiting for the TAT result (invocation=%s)", invocationID)
+	}
+	return ctx.Err()
+}
+
 // waitForTask polls until the invocation reaches a terminal status.
 //
 // Split out of run() so the status table -- which is the whole point of this command, and where
@@ -106,6 +123,15 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 	for {
 		task, err := fetchTask(ctx, client, invocationID)
 		if err != nil {
+			// run() gives this context the same duration as the deadline below, and creates it
+			// first -- so in production the context always expires first and this returned its
+			// raw error, making the diagnosable message below unreachable: the operator saw
+			// "context deadline exceeded" from a nested SDK call instead of "the command did not
+			// finish in time, here is the invocation id". Both are the same event, and the second
+			// is the one with something to act on.
+			if ctx.Err() != nil {
+				return timeoutErr(ctx, invocationID)
+			}
 			return err
 		}
 
@@ -161,7 +187,7 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return timeoutErr(ctx, invocationID)
 		case <-time.After(interval):
 		}
 	}

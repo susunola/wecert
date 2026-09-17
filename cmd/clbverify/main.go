@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -49,8 +50,8 @@ func run() error {
 		os.Getenv("TENCENTCLOUD_SECRET_ID"),
 		os.Getenv("TENCENTCLOUD_SECRET_KEY"),
 	)
-	if cred.GetSecretId() == "" {
-		return fmt.Errorf("missing credentials: set TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY")
+	if msg := missingCredential(cred.GetSecretId(), cred.GetSecretKey()); msg != "" {
+		return fmt.Errorf("%s", msg)
 	}
 
 	cpf := profile.NewClientProfile()
@@ -81,19 +82,60 @@ func run() error {
 		return noListenersError(*lbID, *listenerID)
 	}
 
-	if *raw {
+	// The verdict comes from one place, so -raw cannot skip the assertions. It used to return
+	// here with the dump and no verdict, which silently disabled -expect/-not-expect: a script
+	// that added -raw while debugging kept exiting 0 without asserting anything.
+	return evaluateListener(os.Stdout, resp, verifyOptions{
+		raw:       *raw,
+		domain:    *domain,
+		expect:    *expect,
+		notExpect: *notExpect,
+		wait:      *wait,
+	}, func(ctx context.Context) ([]string, error) {
+		return fetchBoundCertIDs(ctx, client, *lbID, *listenerID, *domain)
+	})
+}
+
+// missingCredential reports the message to return when either credential half is empty, and "" when
+// both are present.
+//
+// Both halves are required: checking only the secret id let an empty TENCENTCLOUD_SECRET_KEY through
+// a guard whose message names both variables, so the failure surfaced later as an authentication
+// error from the API client -- a layer that cannot say which variable is empty. Split out so the
+// check itself has a test; the flags and the client are irrelevant to it.
+func missingCredential(id, key string) string {
+	if id == "" || key == "" {
+		return "missing credentials: set TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY"
+	}
+	return ""
+}
+
+// verifyOptions are the flags that decide what gets printed and asserted.
+type verifyOptions struct {
+	raw       bool
+	domain    string
+	expect    string
+	notExpect string
+	wait      time.Duration
+}
+
+// evaluateListener prints what the listener serves and applies the assertions.
+//
+// The output writer and the refetch function are parameters so this logic has a test: it is the
+// whole point of the tool, and the -raw branch is exactly where an assertion can go missing.
+func evaluateListener(w io.Writer, resp *clb.DescribeListenersResponse, o verifyOptions, refetch func(context.Context) ([]string, error)) error {
+	if o.raw {
 		// For troubleshooting: print the server's response verbatim, so that a mismatch
 		// between the field names we assume and what the API really returns is not a guess.
 		b, err := json.MarshalIndent(resp.Response, "", "  ")
 		if err != nil {
 			return fmt.Errorf("encode response: %w", err)
 		}
-		fmt.Println(string(b))
-		return nil
+		fmt.Fprintln(w, string(b))
 	}
 
 	l := resp.Response.Listeners[0]
-	fmt.Printf("listener %s  (%s:%d)\n", derefStr(l.ListenerId), derefStr(l.Protocol), derefI64(l.Port))
+	fmt.Fprintf(w, "listener %s  (%s:%d)\n", derefStr(l.ListenerId), derefStr(l.Protocol), derefI64(l.Port))
 
 	// What the listener itself carries. In CLB's SNI model this is often EMPTY and the
 	// certificates live on the forwarding rules instead: the API ignores listener-level
@@ -102,9 +144,9 @@ func run() error {
 	// tool used to do -- therefore reported a healthy, serving listener as broken.
 	listenerCerts := boundCertIDs(l.Certificate)
 	if len(listenerCerts) > 0 {
-		fmt.Printf("  listener certificates: %v\n", listenerCerts)
+		fmt.Fprintf(w, "  listener certificates: %v\n", listenerCerts)
 	} else {
-		fmt.Printf("  listener certificates: none\n")
+		fmt.Fprintf(w, "  listener certificates: none\n")
 	}
 
 	// Per-rule certificates: one per SNI name, and the set that actually decides which
@@ -112,33 +154,33 @@ func run() error {
 	// why they are printed and asserted individually rather than summarised.
 	rules := ruleCertificates(l)
 	for _, r := range rules {
-		fmt.Printf("  rule %-28s %v\n", r.domain, r.certIDs)
+		fmt.Fprintf(w, "  rule %-28s %v\n", r.domain, r.certIDs)
 	}
 
-	asserted, scope, err := assertedCertificates(l, *domain)
+	asserted, scope, err := assertedCertificates(l, o.domain)
 	if err != nil {
 		return err
 	}
 	if len(asserted) == 0 {
-		if *domain != "" {
-			return fmt.Errorf("no certificate is bound to the rule serving %q, so nothing can be asserted", *domain)
+		if o.domain != "" {
+			return fmt.Errorf("no certificate is bound to the rule serving %q, so nothing can be asserted", o.domain)
 		}
 		return fmt.Errorf("no certificate is bound to listener %s or to any of its %d rule(s)",
 			derefStr(l.ListenerId), len(rules))
 	}
-	fmt.Printf("  asserted set (%s): %v\n", scope, asserted)
+	fmt.Fprintf(w, "  asserted set (%s): %v\n", scope, asserted)
 	bound := asserted
 
 	// UpdateCertificateInstance is asynchronous: a return means only that the task was
 	// created; the real rebind waits on the backend (~15s measured), so the assertion must wait.
-	if *expect != "" && *wait > 0 && !contains(bound, *expect) {
+	if o.expect != "" && o.wait > 0 && !contains(bound, o.expect) {
 		// The wait loop needs its own, long-enough ctx.
 		//
 		// Reusing the 30-second ctx above makes every request return deadline exceeded once
 		// -wait exceeds 30s, while the continue below swallows the error -- so it spins until
 		// the deadline and then falsely reports "still not the expected value", which is
 		// precisely the one scenario this tool exists for.
-		waitCtx, cancelWait := context.WithTimeout(context.Background(), *wait+30*time.Second)
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), o.wait+30*time.Second)
 		defer cancelWait()
 
 		// `=` and a declared lastErr, not `:=`: an := here declares a NEW bound that shadows the
@@ -146,31 +188,31 @@ func run() error {
 		// stale pre-wait set -- failing exactly when the rebind did land, which is the case -wait
 		// exists for.
 		var lastErr error
-		bound, lastErr = pollUntilBound(waitCtx, *wait, func() ([]string, error) {
-			return fetchBoundCertIDs(waitCtx, client, *lbID, *listenerID, *domain)
-		}, *expect, func(ids []string, err error) {
+		bound, lastErr = pollUntilBound(waitCtx, o.wait, func() ([]string, error) {
+			return refetch(waitCtx)
+		}, o.expect, func(ids []string, err error) {
 			if err != nil {
 				// The query failing and "not switched over yet" are two different things, and
 				// both have to be visible.
-				fmt.Printf("  ...query failed, retrying shortly: %v\n", err)
+				fmt.Fprintf(w, "  ...query failed, retrying shortly: %v\n", err)
 				return
 			}
-			fmt.Printf("  ...waiting; currently bound to %v\n", ids)
+			fmt.Fprintf(w, "  ...waiting; currently bound to %v\n", ids)
 		})
-		if !contains(bound, *expect) && lastErr != nil {
-			fmt.Printf("  ...note: the final query also failed, so the assertion above may not be trustworthy: %v\n", lastErr)
+		if !contains(bound, o.expect) && lastErr != nil {
+			fmt.Fprintf(w, "  ...note: the final query also failed, so the assertion above may not be trustworthy: %v\n", lastErr)
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	// The assertions look at every certificate the listener carries, primary and SNI
 	// alike. Reporting "-not-expect <old> passed" while the old certificate is still bound
 	// as an extension cert is the exact failure this tool exists to catch.
-	if err := assertBindings(bound, *expect, *notExpect, scope, *wait); err != nil {
+	if err := assertBindings(bound, o.expect, o.notExpect, scope, o.wait); err != nil {
 		return err
 	}
-	if *expect != "" {
-		fmt.Printf("\nOK: assertion passed - %s is bound (%s)\n", *expect, scope)
+	if o.expect != "" {
+		fmt.Fprintf(w, "\nOK: assertion passed - %s is bound (%s)\n", o.expect, scope)
 	}
 	return nil
 }

@@ -71,8 +71,10 @@ const (
 // and config must not import acme's dependency graph merely to ask.
 var acmeSupportsLegoProviders = false
 
-// SetLegoProviderSupport is called by the acme package at init, so config validation can tell an
-// operator to rebuild with -tags lego_dns instead of failing later when the solver is built.
+// SetLegoProviderSupport exists for tests that need to exercise both answers of the validation in
+// one binary. The production value is set by this package's own build-tagged file
+// (lego_registry_tags.go / lego_registry_notags.go), so it can never depend on which packages a
+// binary links.
 func SetLegoProviderSupport(available bool) { acmeSupportsLegoProviders = available }
 
 // profileMaxNames is the maximum identifier count each profile allows.
@@ -709,14 +711,21 @@ type Deploy struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
-// MaxNames returns the maximum domain count allowed by this certificate's
-// profile.
-func (c *Certificate) MaxNames() int {
-	if n, ok := profileMaxNames[c.Profile]; ok {
+// ProfileMaxNames returns the identifier cap a profile allows, or 0 for an unknown profile.
+//
+// Exported because onboarding has to cap a group by the profile the group will actually be issued
+// with, not by a configured default: splitting by the default alone let a tlsserver group exceed
+// 25 identifiers, and the document was then rejected at write time on every round.
+func ProfileMaxNames(profile string) int {
+	if n, ok := profileMaxNames[profile]; ok {
 		return n
 	}
 	return 0
 }
+
+// MaxNames returns the maximum domain count allowed by this certificate's
+// profile.
+func (c *Certificate) MaxNames() int { return ProfileMaxNames(c.Profile) }
 
 // Load reads and validates the configuration file.
 func Load(path string) (*Config, error) {

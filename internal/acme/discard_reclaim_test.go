@@ -9,6 +9,7 @@ import (
 	legoacme "github.com/go-acme/lego/v4/acme"
 
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -313,5 +314,60 @@ func TestSuccessfulStagedDeployDoesNotReclaimTheCertificateItJustBound(t *testin
 	}
 	if !oldFound {
 		t.Fatalf("the superseded certificate should be reclaimed: %+v", retired)
+	}
+}
+
+// A renewal of a certificate nobody has bound yet must converge, not fail forever.
+//
+// deploy.enabled starts with one upload and a manual bind ("once bound, later renewals switch it
+// automatically"). If the renewal window arrives before that bind happens, the cloud has nothing
+// to switch: UpdateCertificateInstance answers FailedOperation.CertificateDeployInstanceEmpty
+// (observed on a real account, docs/e2e-run-2026-09-18-credentialed.md 5.3). Treating that as a
+// failed deploy meant the pass failed on every round, the promotion never ran, and the state kept
+// pointing at the certificate that was expiring -- while each cycle issued and uploaded another
+// one. It is the documented first-issuance state, so it promotes like one: the new upload becomes
+// the recorded cloud certificate, DeployConfirmed stays false, and the operator is told again
+// which certificate to bind.
+func TestARenewalWithNothingBoundYetConvergesAsAFirstBind(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	cert.Deploy.Enabled = true
+
+	dep := &stagedDeployer{uploadID: "cloud-new", rebindErr: deploy.ErrNothingBoundYet}
+	m.deployer = dep
+
+	seedIssuedCertificate(t, store, cert, "cloud-old")
+	fake.certNotAfter = time.Now().Add(90 * 24 * time.Hour)
+	fake.orders = []legoacme.ExtendedOrder{{Order: legoacme.Order{
+		Status: "valid", Certificate: "https://ca.test/new"}, Location: "https://ca.test/order/new"}}
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("nothing is bound, so there was no switch to fail: %v", err)
+	}
+
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.DeployedCertID != "cloud-new" {
+		t.Errorf("the renewed certificate must become the recorded cloud certificate, got %q; "+
+			"otherwise the state keeps pointing at the certificate that is expiring", st.DeployedCertID)
+	}
+	if st.DeployConfirmed {
+		t.Error("nothing is bound, so the deployment must not be confirmed: the deployed metric " +
+			"would claim a certificate is serving traffic when no listener has it")
+	}
+	// X.509 timestamps have second precision, so compare truncated values.
+	if !st.NotAfter.Truncate(time.Second).Equal(fake.certNotAfter.Truncate(time.Second)) {
+		t.Errorf("the renewal must be recorded (notAfter %s), got %s", fake.certNotAfter, st.NotAfter)
+	}
+	if st.ConsecutiveFailures != 0 {
+		t.Errorf("a pending first bind is not a failure, got %d consecutive failures", st.ConsecutiveFailures)
+	}
+	if dep.uploads != 1 {
+		t.Errorf("exactly one upload belongs here, got %d", dep.uploads)
+	}
+	// The next round must not re-upload: the order is gone and the state names the new id.
+	if o, err := store.GetOrder(cert.Name); err != nil || o != nil {
+		t.Errorf("the order must be finished, got %+v (err=%v)", o, err)
 	}
 }

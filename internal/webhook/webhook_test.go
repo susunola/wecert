@@ -39,6 +39,11 @@ type fakeReconciler struct {
 	// which stands for the cache CertNames() reads -- the situation a named trigger meets when a
 	// certificate was onboarded after the last pass.
 	fresh []string
+
+	// allBusy makes StartAll report every name as skipped and none as accepted, which is what the
+	// real reconciler answers when a pass already holds every claim. It returns a NIL accepted
+	// slice, as the real one does, which is the shape the response must survive.
+	allBusy bool
 }
 
 func (f *fakeReconciler) CertNames() []string { return f.names }
@@ -94,6 +99,9 @@ func (f *fakeReconciler) known(name string) bool {
 func (f *fakeReconciler) StartAll(ctx context.Context) (accepted, skipped []string, err error) {
 	if f.startAllErr != nil {
 		return nil, nil, f.startAllErr
+	}
+	if f.allBusy {
+		return nil, append([]string(nil), f.names...), nil
 	}
 	for _, n := range f.names {
 		if err := f.StartCert(ctx, n); err != nil {
@@ -1080,5 +1088,34 @@ func TestTriggerStartsACertificateTheCacheHasNotSeen(t *testing.T) {
 	}
 	if len(resp.Unknown) != 0 {
 		t.Errorf("reporting it unknown tells the caller to give up on a certificate that exists: %+v", resp)
+	}
+}
+
+// The full trigger's `accepted` must serialize as [] when nothing was accepted.
+//
+// The field is initialised to an empty slice for exactly that reason, but the full-trigger branch
+// then ASSIGNED StartAll's result over it -- and StartAll returns nil when it accepted nothing, so
+// a trigger where every certificate already held a claim answered `{"accepted": null}`. Clients
+// that iterate the field read null as "no answer", which is the one thing the initialisation was
+// there to prevent. (The named-trigger branch appends, which is why only this path regressed.)
+func TestFullTriggerWithNothingAcceptedSerializesAsEmptyArray(t *testing.T) {
+	// A pass already holds every claim, so StartAll accepts none of them -- and answers with a
+	// nil accepted slice, exactly like the real reconciler.
+	rec := &fakeReconciler{names: []string{"busy"}, allBusy: true}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", "", bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("a full trigger should answer 202, got %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"accepted": []`) {
+		t.Errorf("nothing was accepted, so the field must be an empty array (not null): %s", body)
+	}
+	if strings.Contains(body, `"accepted": null`) {
+		t.Errorf("null reads as \"no answer\" to a client that iterates the field: %s", body)
+	}
+	if !strings.Contains(body, `"skipped": [`) {
+		t.Errorf("the skipped certificate must be reported, got %s", body)
 	}
 }
