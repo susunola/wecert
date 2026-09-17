@@ -1208,3 +1208,93 @@ func TestAShortRetryAfterShortensTheARICheckInterval(t *testing.T) {
 		t.Error("23h is still inside the clamped 24h window")
 	}
 }
+
+// A failed bookkeeping write on the deploy path must cost a backoff, not a bare retry.
+//
+// The upload has already happened, so the id being persisted is the only local record of a cloud
+// object (the resume anchor, or the reclaim list for a failed deploy). Returning the bare store
+// error skipped recordFailure, so nothing escalated and the next pass ran at the pass rate --
+// uploading another copy each time.
+func TestAFailedDeployBookkeepingSchedulesARetry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{}
+	dep := &stagedDeployer{uploadID: "cloud-new", rebindErr: errors.New("tencent: try later")}
+	certs := []config.Certificate{{
+		Name: "site-example-com", Domains: []string{"a.example.com"},
+		Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+		Deploy: config.Deploy{Enabled: true},
+	}}
+	if err := config.NormalizeCertificates(certs); err != nil {
+		t.Fatal(err)
+	}
+	cert := &certs[0]
+
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, dep,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fake.orderDomains = func() []string { return cert.Domains }
+	fake.orderKeyPEM = func() []byte {
+		o, err := store.GetOrder(cert.Name)
+		if err != nil || o == nil {
+			return nil
+		}
+		return o.KeyPEM
+	}
+
+	now := time.Now()
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: now.Add(24 * time.Hour),
+		CertURL: "https://acme.test/cert/old", CertPEM: selfSignedCertPEM(t, now.Add(24*time.Hour), "a.example.com"),
+		KeyPEM: []byte("old-key"), DeployedCertID: "cloud-old", DeployConfirmed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := GenerateKey(cert.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := MarshalPrivateKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutOrder(&state.Order{CertName: cert.Name, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	scriptDNS01Order(fake, cert.Domains)
+	fake.certNotAfter = now.Add(90 * 24 * time.Hour)
+
+	// Block the order write: the upload succeeds, the anchor cannot be recorded.
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	// Only the ANCHOR write is blocked: every other order update (advancing the order, recording the
+	// certificate URL) must succeed, or the pass dies earlier and never reaches the deploy.
+	if _, err := db.Exec(`CREATE TRIGGER block_anchor_update BEFORE UPDATE ON orders
+		WHEN NEW.deployment_cert_id != OLD.deployment_cert_id
+		BEGIN SELECT RAISE(FAIL, 'the anchor write is blocked by test'); END;`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("the store refused the anchor write, so the pass must be reported as failed")
+	}
+	got, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConsecutiveFailures == 0 || got.NextAttemptAt.IsZero() {
+		t.Errorf("a failed deploy bookkeeping write recorded no failure (failures=%d nextAttempt=%v): "+
+			"the next pass then re-uploads at the pass rate instead of backing off",
+			got.ConsecutiveFailures, got.NextAttemptAt)
+	}
+	if dep.uploads == 0 {
+		t.Error("this test needs the upload to have happened, or it is not testing the bookkeeping")
+	}
+}
