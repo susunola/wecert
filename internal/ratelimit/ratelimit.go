@@ -129,7 +129,14 @@ type Snapshot struct {
 //
 // A zero At means nothing has been spent yet, so the bucket is full. That is the honest answer
 // for "this program has never done this", not a guess.
-func Remaining(s Snapshot, l Limit, now time.Time) float64 {
+// level is the token count before the public clamps: negative means the bucket is in debt.
+//
+// Remaining and Spend share it deliberately. Remaining clamps a debt to zero for callers asking
+// "how much may I spend right now"; Spend must subtract from the UNCLAMPED value, because
+// subtracting from a clamped zero forgives whatever debt lies below it -- a bucket at -5 that is
+// spent again would land at -1 instead of -6, so its next token would arrive several refill
+// intervals early, which is the opposite of what this package promises.
+func level(s Snapshot, l Limit, now time.Time) float64 {
 	if l.Capacity <= 0 {
 		return 0
 	}
@@ -146,12 +153,6 @@ func Remaining(s Snapshot, l Limit, now time.Time) float64 {
 	// Treating it as a bucket that never refills is the conservative reading: fewer tokens
 	// available means less issuance, never more.
 	if l.Refill <= 0 {
-		if s.Tokens > l.Capacity {
-			return l.Capacity
-		}
-		if s.Tokens < 0 {
-			return 0
-		}
 		return s.Tokens
 	}
 	if now.After(s.At) {
@@ -166,7 +167,14 @@ func Remaining(s Snapshot, l Limit, now time.Time) float64 {
 		frac := float64(elapsed%l.Refill) / float64(l.Refill)
 		tokens += whole + frac
 	}
-	// A clock that moved backwards must not create tokens.
+	return tokens
+}
+
+// Remaining reports how many tokens are available now, never less than zero.
+func Remaining(s Snapshot, l Limit, now time.Time) float64 {
+	tokens := level(s, l, now)
+	// A clock that moved backwards must not create tokens, and a bucket in debt cannot be spent
+	// from: both read as "nothing available".
 	if tokens > l.Capacity {
 		tokens = l.Capacity
 	}
@@ -205,7 +213,7 @@ func Spend(s Snapshot, l Limit, cost float64, now time.Time) Snapshot {
 	if now.Before(s.At) {
 		now = s.At
 	}
-	tokens := Remaining(s, l, now) - cost
+	tokens := level(s, l, now) - cost
 	// Clamp the debt. Without a floor, one catastrophic burst (or a clock jump) could leave a
 	// bucket so negative that it takes longer than the window to recover and the estimate
 	// stays pinned at zero long after the CA would have allowed the request again.
