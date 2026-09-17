@@ -5,9 +5,14 @@ import (
 	"log/slog"
 	"testing"
 
+	"bytes"
+	"context"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/reconcile"
+	"strings"
+	"sync/atomic"
+	"time"
 )
 
 // Enforce forbids certificates in the config, and its document can enable
@@ -103,6 +108,56 @@ func TestPlanStateBackupsDistinguishesEnabledFromWritable(t *testing.T) {
 	for _, tc := range cases {
 		if got := planStateBackups(tc.enabled, tc.writable); got != tc.want {
 			t.Errorf("%s: planStateBackups = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A pass that did not converge must not stop the daemon, and the pass summary must say what it did.
+//
+// This is the difference between the two run modes: the timer unit fails loudly on a bad pass, the
+// daemon logs it and comes back on the next interval -- a daemon that exits on the first unreachable
+// DNS server is worse than one that retries. The loop used to reach for a wrapper that discarded
+// the report, so "a pass ran and converged nothing" and "a pass converged everything" left the same
+// trace.
+func TestTheDaemonKeepsRunningAfterAPassThatDidNotConverge(t *testing.T) {
+	var logs bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var passes atomic.Int64
+	release := make(chan struct{})
+	pass := func(context.Context) reconcile.RunReport {
+		n := passes.Add(1)
+		if n >= 3 {
+			// Enough evidence: the loop came back after two troubled passes.
+			cancel()
+		}
+		if n == 1 {
+			close(release)
+		}
+		return reconcile.RunReport{Attempted: 2, Succeeded: 1, Failed: 1}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runDaemon(ctx, time.Millisecond, slog.New(slog.NewTextHandler(&logs, nil)), pass)
+	}()
+	<-release
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the daemon did not exit after its context was cancelled")
+	}
+
+	if got := passes.Load(); got < 3 {
+		t.Errorf("the daemon ran %d pass(es): a failed pass must not end the loop", got)
+	}
+	out := logs.String()
+	for _, want := range []string{"reconcile pass finished", "failed=1", "trouble=true"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the per-pass summary must carry %q so a pass that converged nothing is visible, got:\n%s",
+				want, out)
 		}
 	}
 }

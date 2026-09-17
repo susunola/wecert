@@ -454,21 +454,16 @@ func (r *Reconciler) issuedSANs(st *state.CertState) []string {
 
 // ── Convergence ────────────────────────────────────────────────────────────────────
 
-// RunAll runs one pass over every certificate.
-//
-// One certificate failing does not abort the pass: otherwise a certificate with
-// a mistyped domain stalls every other certificate's renewal — the most
-// dangerous kind of coupling in automation.
-//
-// Certificates already being processed elsewhere are skipped and listed.
 // RunReport summarizes what one full pass actually did.
 //
-// It exists so a caller can tell "everything worked" from "nothing ran" and from
-// "something failed". RunAll deliberately discards the per-certificate errors -- one
-// failing certificate must not stop the others, which is the whole reason the loop is
-// shaped the way it is -- but without this the information was not merely discarded, it
-// was unavailable: a one-shot run exited 0 with every certificate failing, so a systemd
-// timer reported success while the fleet went unmanaged.
+// It exists so a caller can tell "everything worked" from "nothing ran" and from "something
+// failed". A pass deliberately does not abort on the first bad certificate -- one mistyped domain
+// must not stall every other renewal, the most dangerous kind of coupling in automation -- so the
+// failures have to be reported rather than thrown.
+//
+// Without this the information was not merely discarded, it was unavailable: a one-shot run exited
+// 0 with every certificate failing, so a systemd timer reported success while the fleet went
+// unmanaged. Certificates already being processed elsewhere are skipped and listed.
 type RunReport struct {
 	// Attempted counts certificates whose pass ran, whether it succeeded or failed.
 	Attempted int
@@ -501,18 +496,17 @@ func (rep RunReport) Trouble() bool {
 	return rep.Attempted == 0 && len(rep.Skipped) > 0
 }
 
-// RunAll runs one pass over every certificate.
+// RunDetailed runs one pass over every certificate and reports what happened.
 //
-// One certificate failing does not abort the pass: otherwise a certificate with
-// a typo in its DNS would stop every other certificate from renewing. The cost is
-// that the caller cannot see the failures from here -- use RunDetailed when the outcome
-// matters.
-func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
-	return r.RunDetailed(ctx).Skipped
-}
-
-// RunDetailed runs one pass and reports what happened, for callers that must react to the
-// outcome (a one-shot timer run, an operator-facing exit code).
+// One certificate failing does not abort the pass: otherwise a certificate with a mistyped domain
+// would stall every other certificate's renewal, the most dangerous kind of coupling in
+// automation. The failures are therefore reported through RunReport rather than by aborting.
+//
+// This is the only entry point for a whole pass. There used to be three (RunOnce, RunAll and this
+// one), and the extra two were not harmless: RunOnce discarded the report entirely, which is how a
+// one-shot systemd run came to exit 0 while every certificate failed. A caller that does not care
+// about the outcome is better off saying so explicitly (`_ = r.RunDetailed(ctx)`) than calling a
+// wrapper that cannot tell it.
 func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 	var rep RunReport
 
@@ -700,14 +694,9 @@ func (r *Reconciler) anyPassInFlight() bool {
 	return len(r.running) > 0
 }
 
-// RunOnce is a compatibility alias for RunAll.
-func (r *Reconciler) RunOnce(ctx context.Context) {
-	r.RunAll(ctx)
-}
-
 // RunCert processes exactly one named certificate. An unknown name returns an
-// error; one already being processed returns ErrAlreadyRunning. Unlike RunAll,
-// the pass's own error is propagated: a caller that asked for one specific
+// error; one already being processed returns ErrAlreadyRunning. Unlike a whole pass,
+// the certificate's own error is propagated: a caller that asked for one specific
 // certificate needs to hear that it failed, not a bare "accepted".
 func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 	res := r.resolve(ctx)
@@ -863,7 +852,7 @@ func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, 
 
 // reconcileOne processes one certificate and mirrors the result into metrics
 // and notifications. The pass's error is returned for callers that need it
-// (RunCert); RunAll and startCert deliberately discard it -- one failing
+// (RunCert); a whole pass and startCert deliberately discard it -- one failing
 // certificate must not stall the others.
 func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (err error) {
 	// Contain a panic at the certificate boundary.
