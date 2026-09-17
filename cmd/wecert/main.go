@@ -253,7 +253,7 @@ func run() error {
 	}
 
 	if *once {
-		// RunDetailed, not RunOnce: the one-shot unit is what a systemd timer runs, and
+		// RunDetailed, not a wrapper that drops the report: the one-shot unit is what a systemd
 		// "exited 0 with every certificate failing" is the failure mode this report exists to
 		// prevent -- the timer would report success while the fleet went unmanaged. A pass that
 		// attempted nothing and skipped everything counts as trouble too, because that is a
@@ -268,7 +268,7 @@ func run() error {
 	}
 
 	log.Info("entering daemon mode", "interval", *interval)
-	runDaemon(ctx, reconciler, *interval, log)
+	runDaemon(ctx, *interval, log, reconciler.RunDetailed)
 	drainNotifier(notifier, log)
 	return nil
 }
@@ -410,7 +410,13 @@ func newProvider(cfg *config.Config, log *slog.Logger) (spec.Provider, error) {
 	return nil, fmt.Errorf("unknown desiredState.mode %q", cfg.DesiredState.Mode)
 }
 
-func runDaemon(ctx context.Context, r *reconcile.Reconciler, interval time.Duration, log *slog.Logger) {
+// runDaemon runs one pass after startup and then one per (jittered) interval.
+//
+// The pass is injected rather than reached through the Reconciler so the loop's own contract can
+// be tested: a pass that did not converge must NOT stop the daemon. That is the whole difference
+// between the daemon and the one-shot unit, and it is the kind of behaviour that is easy to lose
+// when the two paths are edited separately.
+func runDaemon(ctx context.Context, interval time.Duration, log *slog.Logger, pass func(context.Context) reconcile.RunReport) {
 	// Run one pass after startup, then loop on the interval; jitter avoids simultaneous knocking.
 	next := time.After(jitter(time.Second))
 	for {
@@ -422,8 +428,16 @@ func runDaemon(ctx context.Context, r *reconcile.Reconciler, interval time.Durat
 		}
 
 		start := time.Now()
-		r.RunOnce(ctx)
-		log.Info("reconcile pass finished", "duration", time.Since(start).Round(time.Millisecond))
+		// The daemon does not fail on a bad pass -- it keeps running and retries on the interval,
+		// which is the point of the daemon -- but it does say what the pass did. Without this the
+		// only signal was one line per failing certificate, and "a pass ran and converged nothing"
+		// looked the same as "a pass converged everything".
+		rep := pass(ctx)
+		log.Info("reconcile pass finished",
+			"duration", time.Since(start).Round(time.Millisecond),
+			"attempted", rep.Attempted, "succeeded", rep.Succeeded, "failed", rep.Failed,
+			"backoff", rep.Backoff, "skipped", len(rep.Skipped),
+			"trouble", rep.Trouble())
 
 		// Re-jitter every round: a fixed interval keeps all instances phase-locked.
 		next = time.After(jitter(interval))
