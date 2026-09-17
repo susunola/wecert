@@ -146,7 +146,10 @@ clear 先落盘，提升与删单在事务里。事务失败时（错误信息�
 | minor | `internal/onboarding/onboard.go:383` | `Commit` 先写报告、再写文档与状态：失败的那一轮会留下一个声称 `mode: "written"`、带一份从未写出的 revision 的报告（而报告是该流程文档化的人读产物） | 报告最后写，或在报告中如实标注本轮失败 |
 | minor | `internal/state/backup.go:96` 等 | 见 §2.5：本轮只修了冲突名排序；`pruneSnapshots` 的其余候选（`Stat` 错误被当成冲突可能自旋）留在原审查记录的 notes 里 | — |
 
-**未完成的一路**：8 个复审组里有 7 组已交结果；`internal/config`+`internal/deploy`+`internal/probe` 那一组在本次收尾时仍未返回，它的发现**不在本清单内**。
+| minor | `internal/deploy/tencent.go:756` | `progressBoundCount` 跳过 nil 条目与 nil region，且只按**已列出**的 region 判定就绪，于是半填充的 `UpdateSyncProgress`（一条 `TotalCount:0`、另一条 region 列表为空）读成 `(0, ready=true)`，`updateInstance` 因此走"立刻硬失败"分支而不是交给权威的部署记录——正是本轮已修的 `countBindings` 同一形状 | 未填充条目与 nil region 都算"未回答"，并加一个两条目混合的用例 |
+| minor | `internal/config/config.go:364` | `probe.minValidFor` 只校验为正，没有与 profile 的有效期比较（classic 90d / tlsserver 45d / shortlived 160h）：示例里的 `168h` 在 shortlived 证书上永远不可能满足，`wecert_certificate_probe_match` 恒为 0，critical 告警常亮且把原因错误地指向换绑/SNI；同一文件已拒绝同类的"`renewBefore` ≥ 有效期" | 在 `NormalizeCertificates` 之后校验 `minValidDur >= profileValidity[profile]` 并点名证书 |
+
+**已全部返回**：8 个复审组的结果都已收到（最后一组 `internal/config`+`internal/deploy`+`internal/probe` 交回 2 条 minor，即上表两行）。8 组一致确认无 blocking 级问题。
 
 ---
 
