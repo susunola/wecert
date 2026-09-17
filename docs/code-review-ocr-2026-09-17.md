@@ -140,16 +140,16 @@ clear 先落盘，提升与删单在事务里。事务失败时（错误信息�
 | `internal/state/backup.go` | 快照名字冲突探测把**任何** `os.Stat` 失败都当成「已占用」：不是 ENOENT 的失败（目录失去搜索权限、挂载不可达、符号链接自环）在**每个**候选后缀上都一样，于是 `for n := 1; ; n++` 永远转下去——备份 goroutine 烧掉一个核，快照永远写不出来，日志里什么都没有 | 抽成 `freeSnapshotName`：只有 `IsNotExist` 才算「空」，其余失败直接报错（这一轮跳过并在调用方留下日志，下一轮再试）。`TestAnUnanswerableCollisionProbeIsReported` 用自环符号链接构造 ELOOP，并同时钉住「空名字原样返回、真冲突时让到 `~1` 且仍排在后面」（把未知当占用、或不推进后缀，即变红） |
 | `internal/acme/ratelimit.go` | 桶读失败（`SQLITE_BUSY`、库已关）被当成**0 剩余**发布：`Remaining` 返回 `(0, false)`，报告把那个 `false` 丢在地上，于是这个指标做出它能做的最强断言——「配额耗尽」——仅凭一次失败的读。`wecert_ratelimit_remaining_tokens < 5` 会**对所有限额同时**误报，而下一轮成功又自动清掉，告警里看不出是哪种；同包的 `retryRevocations` 在同样情形下刻意不碰自己的指标 | `QuotaReport` 加 `Unreadable` 标记，读失败时 `PublishQuota` 跳过 `Set`（不发布 = 未知，本文件已把"缺席"定义为可接受）；`TestUnreadableQuotaIsNotPublishedAsZero` 关掉状态库后钉住"报告不提供数字、且一条序列都不发布"。两处去掉（标记或跳过）都会变红 |
 
-### 2.6 第二轮复审发现、**尚未修复**的清单（核实为真，留待下一轮）
+### 2.6 第二轮复审剩下的唯一一条：**需要你拍板**
 
-按严重度排列。每条都写明位置、为什么成立、以及修法；这些是**已核实的问题**，不是猜测。
+第二轮的 19 条发现，除下表这一条外都已核实并修复（见 §2.5），每一条都带一个「去掉修复就变红」的用例。这一条不是「没修」，而是**修法取决于产品语义**，两种读法都成立，我不替你决定。
 
 | 严重度 | 位置 | 问题 | 修法 |
 |---|---|---|---|
 | **major（待产品决策）** | `internal/onboarding/onboard.go:944` | 仍然被声明、但被 guard 1（或白名单）拒掉的名字，在同一轮就被**从期望状态里删除**：`applyGrace` 的 `stillDeclared` 分支只 `MarkPresent`，既不 carry 也不 `MarkAbsent`，因此绕过宽限期与 CLB 引用检查。guard 是网络读取的第二来源且**无法表达"结果可能不完整"**，一次规则抖动（区域缺失、部分可见、限流）就会静默剥掉线上覆盖；而 fuse 比较的是声明、声明没变，所以任何保护都不会触发。实测一次抖动 = 两次签发 + 两轮失去覆盖 | **这条我没有动手，因为它是一次语义反转，需要你拍板**。两种读法都成立：现行行为（把该名字当轮从文档里去掉，已有测试 `TestStillDeclaredNameIsNotReportedAsRemoved` 用"carry 会让 guard 1 拒绝的名字继续被签发"来钉住它）与复审主张（声明仍在，就应当保持覆盖；去掉会改 revision → 触发签发，恢复时再改一次 → 再签发一次）互斥。carry 的代价是"规则已删但声明未删"的名字会一直被证书覆盖（直到声明被删，才走宽限期 + 引用检查的正常移除路径）；不 carry 的代价是每次 guard 抖动两次签发加两轮失去覆盖。我的倾向是改成 carry，并把 `ListRuleDomains` 的"结果可能不完整"作为独立信号补上——但那要连同 `TestStillDeclaredNameIsNotReportedAsRemoved` 的语义一起改，所以留给你决定 |
 
 
-**已全部返回**：8 个复审组的结果都已收到（最后一组 `internal/config`+`internal/deploy`+`internal/probe` 交回 2 条 minor，即上表两行）。8 组一致确认无 blocking 级问题。
+**已全部返回**：8 个复审组的结果都已收到（最后一组 `internal/config`+`internal/deploy`+`internal/probe` 交回 2 条 minor，即 §2.5 表末两行）。8 组一致确认无 blocking 级问题。
 
 ---
 
