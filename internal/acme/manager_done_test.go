@@ -1169,3 +1169,42 @@ func TestAnIssuanceSpendsTheCertificateBudgets(t *testing.T) {
 		}
 	}
 }
+
+// A Retry-After shorter than our own floor must be honoured.
+//
+// The checks ran in sequence with the fixed six-hour floor first, so a server asking for an hour
+// was silently extended to six: the floor had already answered false. The adjacent comment claimed
+// the opposite, and RFC 9773 makes Retry-After the time to come back, not a lower bound on our own
+// polling interval.
+func TestAShortRetryAfterShortensTheARICheckInterval(t *testing.T) {
+	store, m, _, _ := newAPITestHarness(t, []string{"example.com"})
+	_ = store
+	checked := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+
+	st := &state.CertState{Name: "site", ARICheckedAt: checked, ARIRetryAfter: time.Hour}
+	if m.ariCheckDue(st, checked.Add(30*time.Minute)) {
+		t.Error("the server asked for an hour and only 30 minutes have passed: not due")
+	}
+	if !m.ariCheckDue(st, checked.Add(90*time.Minute)) {
+		t.Error("the server asked for an hour and 90 minutes have passed: the check is due, but the " +
+			"fixed six-hour floor made it wait until six")
+	}
+
+	// No Retry-After: the six-hour floor still applies, so renewalInfo is not polled for free.
+	st = &state.CertState{Name: "site", ARICheckedAt: checked}
+	if m.ariCheckDue(st, checked.Add(2*time.Hour)) {
+		t.Error("without a Retry-After the floor must still hold the check back")
+	}
+	if !m.ariCheckDue(st, checked.Add(7*time.Hour)) {
+		t.Error("past the floor the check is due again")
+	}
+
+	// A server asking for longer than our ceiling is clamped to the RFC's reasonableness bound.
+	st = &state.CertState{Name: "site", ARICheckedAt: checked, ARIRetryAfter: 72 * time.Hour}
+	if !m.ariCheckDue(st, checked.Add(25*time.Hour)) {
+		t.Error("a 72h Retry-After is clamped to 24h, so at 25h the check is due again")
+	}
+	if m.ariCheckDue(st, checked.Add(23*time.Hour)) {
+		t.Error("23h is still inside the clamped 24h window")
+	}
+}
