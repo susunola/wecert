@@ -43,6 +43,14 @@ var ErrDesiredStateUnavailable = errors.New("cannot read the desired state")
 // ErrUnknownCert means the requested name is not in the current desired state.
 var ErrUnknownCert = errors.New("no such certificate in the desired state")
 
+// ErrShuttingDown means the process is draining, so no new pass may start.
+//
+// It is a sentinel for the same reason as ErrDesiredStateUnavailable: "we are going away, try
+// again after the restart" is a different answer from "that certificate is already running" and
+// must not be reported as the latter. A pass started now would write its promotion, resume anchor
+// or failure counter into a state store that the shutdown path closes as soon as Drain returns.
+var ErrShuttingDown = errors.New("the reconciler is shutting down")
+
 // Notifier is notified after each certificate finishes processing. May be nil.
 //
 // It lives on this layer rather than in the webhook layer so the "renewal
@@ -119,6 +127,19 @@ type Reconciler struct {
 	// retired_certificates, so it is billed and never reclaimed. Add happens before the goroutine
 	// starts, so a pass still queued for a start slot is counted too.
 	bg sync.WaitGroup
+
+	// bgMu serializes a pass's registration against Drain's transition to draining.
+	//
+	// sync.WaitGroup requires that a positive Add which starts from zero does not run concurrently
+	// with Wait ("Note that calls with a positive delta that start when the counter is zero must
+	// happen before a Wait"). The webhook's StartAll could Add while Drain was inside Wait -- the
+	// HTTP server's Shutdown is asynchronous -- which Go reports as
+	// "sync: WaitGroup is reused before previous Wait has returned", a process-fatal panic, and
+	// which also let a pass start after Drain had returned and write into a closed store.
+	bgMu sync.Mutex
+
+	// draining is set under bgMu by Drain. After that, startCert refuses new passes.
+	draining bool
 
 	// startSlots bounds how many certificates a full trigger converges at once.
 	//
@@ -749,6 +770,10 @@ func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
 	started, alreadyRunning, unknown []string, err error,
 ) {
+	if r.drainingNow() {
+		// As in StartAll: "shutting down" is not "already running".
+		return nil, nil, nil, ErrShuttingDown
+	}
 	res := r.resolve(ctx)
 	if res == nil {
 		// No desired state: every name is unanswerable rather than unknown. Reporting
@@ -775,6 +800,10 @@ func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
 			continue
 		}
 		if err := r.startCert(ctx, res, found); err != nil {
+			if errors.Is(err, ErrShuttingDown) {
+				// Drain began between the check above and this start.
+				return nil, nil, nil, ErrShuttingDown
+			}
 			alreadyRunning = append(alreadyRunning, name)
 			continue
 		}
@@ -801,13 +830,19 @@ func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
 // sha256 of the document -- and a full trigger would otherwise pay that once per
 // certificate.
 func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.Certificate) error {
+	// Refuse while draining, and register the pass before the shutdown path can reach Wait: see
+	// beginPass. A pass admitted here is counted, so Drain waits for it.
+	if !r.beginPass() {
+		return ErrShuttingDown
+	}
 	if !r.acquire(c.Name) {
+		// This pass never starts, so undo the registration.
+		r.bg.Done()
 		return ErrAlreadyRunning
 	}
 
 	// res is heap-allocated and not reused during this pass, so referring to its
 	// elements is safe.
-	r.bg.Add(1)
 	go func() {
 		defer r.bg.Done()
 		defer r.release(c.Name)
@@ -855,6 +890,33 @@ func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 	return r.startCert(ctx, res, found)
 }
 
+// beginPass registers a background pass, or refuses it once Drain has begun.
+//
+// One mutex decides both questions, and that is the whole point: the pass is either counted before
+// Wait can be called, or it is rejected. Without it the webhook's StartAll could Add while Drain
+// was already inside Wait -- sync.WaitGroup forbids that ("calls with a positive delta that start
+// when the counter is zero must happen before a Wait") and Go turns it into a process-fatal
+// "sync: WaitGroup is reused before previous Wait has returned" panic; it also let a pass start
+// after Drain had returned, whose store writes then failed against the closed database.
+//
+// It returns false rather than an error so the caller can name the refusal in its own terms.
+func (r *Reconciler) beginPass() bool {
+	r.bgMu.Lock()
+	defer r.bgMu.Unlock()
+	if r.draining {
+		return false
+	}
+	r.bg.Add(1)
+	return true
+}
+
+// drainingNow reports whether Drain has been called.
+func (r *Reconciler) drainingNow() bool {
+	r.bgMu.Lock()
+	defer r.bgMu.Unlock()
+	return r.draining
+}
+
 // StartAll processes every certificate asynchronously and synchronously returns
 // which ones were accepted and which were skipped (already running).
 //
@@ -864,6 +926,11 @@ func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 // "accepted: all certificates" (from the last good cache) while nothing started
 // is exactly the lie this return value exists to prevent.
 func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, err error) {
+	if r.drainingNow() {
+		// Answer for the whole trigger at once. Reporting every certificate as "skipped" would
+		// mean "already running" to the caller, which is the opposite of what is happening.
+		return nil, nil, ErrShuttingDown
+	}
 	res := r.resolve(ctx)
 	if res == nil {
 		return nil, nil, ErrDesiredStateUnavailable
@@ -873,6 +940,10 @@ func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, 
 	// slice would make this O(n^2).
 	for i := range res.Certificates {
 		if err := r.startCert(ctx, res, &res.Certificates[i]); err != nil {
+			if errors.Is(err, ErrShuttingDown) {
+				// Drain began between the check above and this start: stop the walk and say so.
+				return nil, nil, ErrShuttingDown
+			}
 			skipped = append(skipped, res.Certificates[i].Name)
 		} else {
 			accepted = append(accepted, res.Certificates[i].Name)
@@ -892,6 +963,13 @@ func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, 
 // this is bounded rather than absolute: the caller decides how long a shutdown may take, and a
 // timeout is reported so the operator knows the store is about to be closed under a live pass.
 func (r *Reconciler) Drain(ctx context.Context) error {
+	// Refuse new passes from here on, and publish that to beginPass before Wait is called: an Add
+	// racing this transition is exactly what made the WaitGroup panic (see beginPass). The lock is
+	// released before waiting, so a pass already being registered can finish and be counted.
+	r.bgMu.Lock()
+	r.draining = true
+	r.bgMu.Unlock()
+
 	done := make(chan struct{})
 	go func() {
 		r.bg.Wait()
@@ -905,7 +983,7 @@ func (r *Reconciler) Drain(ctx context.Context) error {
 	}
 }
 
-// reconcileOne processes one certificate and mirrors the result into metrics// reconcileOne processes one certificate and mirrors the result into metrics
+// reconcileOne processes one certificate and mirrors the result into metrics
 // and notifications. The pass's error is returned for callers that need it
 // (RunCert); a whole pass and startCert deliberately discard it -- one failing
 // certificate must not stall the others.

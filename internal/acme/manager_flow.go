@@ -326,25 +326,39 @@ func (m *Manager) solveChallenges(
 				// new value's cleanup fires once it is the last leaver.
 				m.releaseStaleLease(a.TxtName, a.TxtValue)
 			}
-			a.ChallengeURL = chlg.URL
-			a.ChallengeToken = chlg.Token
 			// Remember when this challenge was chosen. Crash recovery probes for the record of a row
 			// that was never marked presented, and a denial is only evidence once the write would
 			// have had time to reach the authoritative servers (see reclaimUnpresentedTXT).
 			a.ChallengePreparedAt = m.now()
 
-			// Persist the challenge BEFORE any DNS write, on both paths.
+			// The refreshed instant has to be durable BEFORE the DNS write it describes: persisting
+			// it afterwards leaves a stored age older than the write, and the reclaim probe could
+			// then trust an authoritative denial for a record that is still propagating.
 			//
-			// A pass that dies between the write and the persist at the end of this loop leaves
-			// the record up while the row still says Presented=false -- and the token is then the
-			// only way to locate that record again (the probe below relies on it, and so does
-			// cleanupOrphanTXT). The timestamp has just been refreshed, and it is what crash
-			// recovery uses as its "was this write given time to appear" window, so that instant
-			// has to be durable before the record it describes can exist: persisting it afterwards
-			// leaves a stored age older than the write, and the reclaim probe could then trust an
-			// authoritative denial for a record that is still propagating.
-			if err := m.store.PutAuthorization(a); err != nil {
-				return false, m.recordFailure(st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
+			// What else may be persisted along with it depends on whether this row already names a
+			// record, because the row's token is the only clue that locates one (reclaimUnpresentedTXT
+			// derives the value it probes for from it).
+			if firstVisit {
+				// Nothing can belong to this row yet -- there is no token -- so the new one may go
+				// to disk before the write: if the pass dies in between, recovery probes for a value
+				// that was never written, is denied, and strands nothing.
+				a.ChallengeURL = chlg.URL
+				a.ChallengeToken = chlg.Token
+				if err := m.store.PutAuthorization(a); err != nil {
+					return false, m.recordFailure(st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
+				}
+			} else {
+				// The row already names the record an earlier attempt wrote, so only the refreshed
+				// age may be persisted here. Writing the new token first means that a write which
+				// then fails -- an ordinary DNSPod API error, no crash needed -- overwrites that
+				// clue: recovery probes the new value, is authoritatively denied, drops the row, and
+				// the old record stays in DNS with nothing naming it. See
+				// TestAFailedWriteOnTheRevisitPathKeepsTheTokenThatNamesTheRecord.
+				if err := m.store.PutAuthorization(a); err != nil {
+					return false, m.recordFailure(st, fmt.Errorf("persist the age of a new challenge (%s): %w", a.Identifier, err))
+				}
+				a.ChallengeURL = chlg.URL
+				a.ChallengeToken = chlg.Token
 			}
 
 			adopted := false

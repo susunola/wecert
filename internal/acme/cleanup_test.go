@@ -1149,3 +1149,130 @@ func TestTheChallengeIsPersistedBeforeTheDNSWrite(t *testing.T) {
 	}
 	_, _ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
 }
+
+// refusingProvider refuses every write, so a pass stops between selecting the challenge and the
+// record existing. Its CleanUp records calls, which is how a test sees whether the leftover record
+// was reclaimed.
+type refusingProvider struct {
+	cleanups []string
+}
+
+func (p *refusingProvider) Present(string, string, string) error {
+	return errors.New("DNSPod API: CreateRecord refused")
+}
+
+func (p *refusingProvider) CleanUp(domain, token, _ string) error {
+	p.cleanups = append(p.cleanups, domain+"|"+token)
+	return nil
+}
+
+// A failed write on the revisit path must not overwrite the clue to the record already in DNS.
+//
+// A resumed row (Presented=false, a token from an earlier attempt) carries the only pointer to the
+// TXT record that attempt wrote: reclaimUnpresentedTXT derives the value it probes for from the
+// row's token. The challenge this pass picked can be a different one -- the code says so itself,
+// which is why releaseStaleLease and releaseRowStaleLease exist -- and then persisting the new
+// token before the write means an ordinary DNSPod failure (no crash needed) leaves the old record
+// with nothing naming it: recovery probes the new value, is authoritatively denied, drops the row,
+// and the TXT stays in DNS for the rest of the certificate's life. The refreshed challenge age is
+// still persisted first, because that is what bounds how early a denial may be trusted.
+func TestAFailedWriteOnTheRevisitPathKeepsTheTokenThatNamesTheRecord(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	oldValue := dns01.GetChallengeInfo("example.com", "keyauth(tok-1)").Value
+	newValue := dns01.GetChallengeInfo("example.com", "keyauth(tok-2)").Value
+	if oldValue == newValue {
+		t.Fatal("the fixture needs two different challenge values")
+	}
+
+	// The authority holds exactly the record the interrupted attempt wrote, and serves it for every
+	// query, so a probe for the new value is denied. (The harness's third argument is the value of
+	// its own fixture, not the value the probe asks about, so it must not decide the answer.)
+	solver, rec, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			return authTXT(msg, oldValue), nil
+		})
+	provider := &refusingProvider{}
+	solver.newProvider = func(context.Context) (challenge.Provider, error) { return provider, nil }
+	solver.timeout = time.Minute
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{authzByURL: map[string]legoacme.Authorization{
+		"https://ca.test/authz/1": {
+			Status:     "pending",
+			Identifier: legoacme.Identifier{Value: "example.com"},
+			Challenges: []legoacme.Challenge{{
+				Type: "dns-01", URL: "https://ca.test/chall/2", Token: "tok-2",
+			}},
+		},
+	}}
+	m := newManager(store, fake, solver, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return now })
+	preparedAgo := now.Add(-30 * time.Minute)
+
+	// What an interrupted attempt leaves behind: the record it wrote, named by its token, and a row
+	// that says the record was never confirmed as presented.
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "https://ca.test/authz/1", Identifier: "example.com",
+		ChallengeToken: "tok-1", TxtName: rec.FQDN, TxtValue: oldValue,
+		Presented: false, ChallengePreparedAt: preparedAgo,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cert := &config.Certificate{Name: "c", Domains: []string{"example.com"}}
+	order := legoacme.ExtendedOrder{
+		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
+		Location: "https://ca.test/order/1",
+	}
+	if _, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order); err == nil {
+		t.Fatal("the provider refuses every write, so the pass must fail")
+	}
+
+	rows, err := store.ListAuthorizationsForTest("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected the row to survive the failed pass, got %d", len(rows))
+	}
+	if rows[0].ChallengeToken != "tok-1" {
+		t.Errorf("the failed pass overwrote the token that names the record still in DNS: the row "+
+			"names %q, but the only TXT at %s is the value tok-1 wrote (%q), and the token is the "+
+			"only clue that locates it", rows[0].ChallengeToken, rec.FQDN, oldValue)
+	}
+	if !rows[0].ChallengePreparedAt.Equal(now) {
+		t.Errorf("the refreshed challenge age must be on disk even when the write fails (that is "+
+			"what keeps a denial from being trusted too early), got %s, want %s",
+			rows[0].ChallengePreparedAt, now)
+	}
+	if rows[0].Presented {
+		t.Error("nothing was written, so the row must not claim a record was presented")
+	}
+
+	// A later round, past the propagation window: recovery has to be able to find the record the row
+	// names -- and a denial of the WRONG value must not be read as "there is nothing there".
+	now = now.Add(2 * time.Hour)
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+	if len(provider.cleanups) != 1 {
+		t.Errorf("the record %s (value %q, written by tok-1) must still be reclaimed: the provider's "+
+			"delete-all ran %d times, so it stays in DNS with no row naming it",
+			rec.FQDN, oldValue, len(provider.cleanups))
+	}
+	after, err := store.ListAuthorizationsForTest("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 0 {
+		t.Errorf("once the record is reclaimed the row is finished, %d left", len(after))
+	}
+}

@@ -57,6 +57,11 @@ type harness struct {
 	rules *fakeRules
 	clock *clock
 	opts  Options
+
+	// logs holds everything the round wrote to the journal. The report is the primary artifact,
+	// but some facts deliberately live only in the log (an ignored record whose hostname is
+	// declared elsewhere), and a test has to be able to see them.
+	logs *bytes.Buffer
 }
 
 func newHarness(t *testing.T, opts Options) *harness {
@@ -84,9 +89,11 @@ func newHarness(t *testing.T, opts Options) *harness {
 		rules: &fakeRules{},
 		clock: c,
 		opts:  opts,
+		logs:  &bytes.Buffer{},
 	}
 
-	ob, err := New(Sources{Declarations: h.decls, Rules: h.rules}, opts, testLogger())
+	ob, err := New(Sources{Declarations: h.decls, Rules: h.rules}, opts,
+		slog.New(slog.NewTextHandler(h.logs, nil)))
 	if err != nil {
 		t.Fatalf("constructing the onboarder failed: %v", err)
 	}
@@ -1055,16 +1062,24 @@ func TestThirdDeclarationForAConflictedHostnameIsRejectedToo(t *testing.T) {
 	if got := h.domains(t); len(got) != 1 || got[0] != "ok.example.com" {
 		t.Fatalf("the conflicted hostname must stay out, got %v", got)
 	}
-	rejections := 0
+	// Exactly one verdict for the name, and it is an exclusion: the report carries one entry per
+	// hostname (reject keeps the first reason -- the conflict -- and refuses to append another for
+	// the repeat), while the repeat itself is still refused rather than accepted.
+	var verdicts []spec.Decision
 	for _, d := range rep.Decisions {
-		if d.Hostname == "fight.example.com" && !d.Included &&
-			strings.Contains(d.Reason, "conflicting declarations") {
-			rejections++
+		if d.Hostname == "fight.example.com" {
+			verdicts = append(verdicts, d)
 		}
 	}
-	if rejections != 2 {
-		t.Errorf("both the conflict and the later repeat must be rejected, got %d rejections in %+v",
-			rejections, rep.Decisions)
+	if len(verdicts) != 1 {
+		t.Fatalf("one hostname, one verdict: got %d entries for fight.example.com in %+v",
+			len(verdicts), rep.Decisions)
+	}
+	if verdicts[0].Included {
+		t.Errorf("the third record must not resurrect a conflicted hostname: %+v", verdicts[0])
+	}
+	if !strings.Contains(verdicts[0].Reason, "conflicting declarations") {
+		t.Errorf("the entry must say why the name is out: %+v", verdicts[0])
 	}
 }
 
@@ -2061,14 +2076,16 @@ func TestAnIncludedHostnameIsNotAlsoReportedAsExcluded(t *testing.T) {
 				excluded++
 			}
 		}
+		// The label compares ZONES, not record strings: both records name the same record, so
+		// comparing Record made it print "broken-first=true" for either order.
 		if included != 1 {
 			t.Errorf("[order broken-first=%v] %s is declared by a valid record, so it must be included "+
-				"once, got %d: %+v", order[0].Record == broken.Record, host, included, rep.Decisions)
+				"once, got %d: %+v", order[0].Zone == broken.Zone, host, included, rep.Decisions)
 		}
 		if excluded != 0 {
 			t.Errorf("[order broken-first=%v] %s must not be reported as excluded as well: the report "+
 				"would say two opposite things about one name: %+v",
-				order[0].Record == broken.Record, host, rep.Decisions)
+				order[0].Zone == broken.Zone, host, rep.Decisions)
 		}
 	}
 }
@@ -2110,5 +2127,112 @@ func TestAWildcardCoveredCarryKeepsItsFilterReason(t *testing.T) {
 	}
 	if rep.CoveredByWildcard == 0 {
 		t.Error("the covered-by-wildcard count must include it")
+	}
+}
+
+// One hostname, one verdict -- whichever record the zone walk returns first, and whichever way the
+// records disagree.
+//
+// Two independent reviewers reproduced this family of holes. A conflict followed by a third record
+// appended a second exclusion with a different story; two typo'd records for one name in two zones
+// produced two or three identical exclusions; and a record written with a non-canonical spelling
+// produced an exclusion for the dotted name beside an inclusion for the clean one, because the
+// guard's key was not normalised the way ParseDeclaration normalises the declaration's Hostname.
+func TestOneVerdictPerHostname(t *testing.T) {
+	broken := RawDeclaration{Zone: "example.com", Record: DeclarationPrefix + "api.example.com", Values: []string{"unknownkey=1"}}
+	good := RawDeclaration{Zone: "sub.example.com", Record: DeclarationPrefix + "api.example.com", Values: []string{"v=wecert1"}}
+	// Same name, one trailing dot too many, and a key nothing knows: unparseable, and spelled
+	// differently from the declaration that does parse.
+	dotted := RawDeclaration{Zone: "example.com", Record: DeclarationPrefix + "api.example.com..", Values: []string{"unknownkey=1"}}
+	conflictA := RawDeclaration{Zone: "example.com", Record: DeclarationPrefix + "fight.example.com", Values: []string{"profile=classic"}}
+	conflictB := RawDeclaration{Zone: "sub.example.com", Record: DeclarationPrefix + "fight.example.com", Values: []string{"profile=tlsserver"}}
+	conflictC := RawDeclaration{Zone: "deep.example.com", Record: DeclarationPrefix + "fight.example.com", Values: []string{"profile=classic"}}
+
+	cases := []struct {
+		name     string
+		raw      []RawDeclaration
+		host     string
+		included bool
+	}{
+		{"a conflict and then a third record", []RawDeclaration{conflictA, conflictB, conflictC}, "fight.example.com", false},
+		{"two broken records for one name", []RawDeclaration{broken, good, broken}, "api.example.com", true},
+		// Nothing declares the name validly, so every one of these is an exclusion -- and they must
+		// still collapse into a single verdict, or the report lists the same typo two or three times.
+		{"only broken records for one name", []RawDeclaration{broken, {Zone: "sub.example.com", Record: broken.Record, Values: broken.Values}}, "api.example.com", false},
+		{"three broken records for one name", []RawDeclaration{broken, {Zone: "sub.example.com", Record: broken.Record, Values: broken.Values}, {Zone: "deep.example.com", Record: broken.Record, Values: broken.Values}}, "api.example.com", false},
+		{"the broken record second", []RawDeclaration{good, broken}, "api.example.com", true},
+		{"the broken record first", []RawDeclaration{broken, good}, "api.example.com", true},
+		{"a non-canonical spelling of a declared name", []RawDeclaration{dotted, good}, "api.example.com", true},
+		{"the non-canonical spelling first", []RawDeclaration{good, dotted}, "api.example.com", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Options{})
+			h.decls.raw = tc.raw
+			h.rules.domains = []string{tc.host}
+
+			rep := h.run(t)
+
+			var forHost []spec.Decision
+			for _, d := range rep.Decisions {
+				if d.Hostname == tc.host || strings.TrimSuffix(d.Hostname, ".") == tc.host {
+					forHost = append(forHost, d)
+				}
+			}
+			if len(forHost) != 1 {
+				t.Fatalf("one hostname, one verdict: got %d entries for %s in %+v",
+					len(forHost), tc.host, rep.Decisions)
+			}
+			if forHost[0].Included != tc.included {
+				t.Errorf("included=%v, want %v: %+v", forHost[0].Included, tc.included, forHost[0])
+			}
+			if forHost[0].Hostname != tc.host {
+				t.Errorf("the verdict must carry the canonical name %q, got %q (a dotted or padded "+
+					"spelling is a different string in the report, not a different name)",
+					tc.host, forHost[0].Hostname)
+			}
+		})
+	}
+}
+
+// A record that is ignored because the name is declared elsewhere still leaves a trace.
+//
+// The report cannot carry it without contradicting the declaration that won, so the journal is the
+// only place left. Without this warning a typo'd `wildcard=1` disappears silently, and the operator
+// sees a certificate that does not cover the subdomain they thought they had declared.
+func TestAnIgnoredBrokenRecordIsNamedInTheJournal(t *testing.T) {
+	h := newHarness(t, Options{})
+	h.decls.raw = []RawDeclaration{
+		decl("api.example.com"),
+		{Zone: "sub.example.com", Record: DeclarationPrefix + "api.example.com", Values: []string{"wildcard=maybe"}},
+	}
+	h.rules.domains = []string{"api.example.com"}
+
+	rep := h.run(t)
+
+	if got := h.domains(t); len(got) != 1 || got[0] != "api.example.com" {
+		t.Fatalf("the usable declaration must win, got %v", got)
+	}
+	var forHost []spec.Decision
+	for _, d := range rep.Decisions {
+		if d.Hostname == "api.example.com" {
+			forHost = append(forHost, d)
+		}
+	}
+	if len(forHost) != 1 || !forHost[0].Included {
+		t.Fatalf("one verdict for the name, and it is the inclusion: %+v", rep.Decisions)
+	}
+
+	logs := h.logs.String()
+	if !strings.Contains(logs, "could not be parsed and was ignored") {
+		t.Errorf("the ignored record must be named in the journal, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, "wildcard") || !strings.Contains(logs, "maybe") {
+		t.Errorf("the warning has to carry what was wrong with the record -- the key and the value "+
+			"that was refused -- got:\n%s", logs)
+	}
+	if !strings.Contains(logs, "sub.example.com") {
+		t.Errorf("the warning has to say which zone the ignored record came from, got:\n%s", logs)
 	}
 }
