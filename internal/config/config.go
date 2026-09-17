@@ -923,7 +923,36 @@ func (c *Config) normalize() error {
 			c.DesiredState.Mode, ModeEnforce)
 	}
 
-	return NormalizeCertificates(c.Certificates)
+	if err := NormalizeCertificates(c.Certificates); err != nil {
+		return err
+	}
+
+	// probe.minValidFor must be satisfiable by the shortest profile in use.
+	//
+	// probe.Verify fails every probe whose remaining validity is below this floor, and the runner
+	// turns that into wecert_certificate_probe_match = 0 -- so an unsatisfiable floor pins the
+	// metric at zero forever and fires the critical "not serving the deployed certificate" alert
+	// with a diagnosis that blames the rebind or SNI. The file already rejects the analogous
+	// "renewBefore >= validity" for the same reason: cheap to check, and the failure it prevents
+	// looks like something else entirely.
+	if c.Probe.MinValidDur > 0 {
+		for i := range c.Certificates {
+			cert := &c.Certificates[i]
+			validity, ok := profileValidity[cert.Profile]
+			if !ok {
+				continue
+			}
+			if c.Probe.MinValidDur >= validity {
+				return fmt.Errorf(
+					"probe.minValidFor %s is not shorter than certificate %q's %s profile validity %s, "+
+						"so every probe of it would fail while the certificate is still perfectly valid "+
+						"(wecert_certificate_probe_match stays 0 and the alert blames the rebind); "+
+						"use less than %s",
+					c.Probe.MinValidDur, cert.Name, cert.Profile, validity, validity)
+			}
+		}
+	}
+	return nil
 }
 
 func (w *Webhook) normalize() error {
