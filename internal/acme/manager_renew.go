@@ -82,15 +82,30 @@ func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
 	if st.ARICheckedAt.IsZero() {
 		return true
 	}
-	// Let's Encrypt recommends checking renewalInfo at most once every 6 hours.
-	if now.Before(st.ARICheckedAt.Add(m.ariInterval)) {
-		return false
+	// One effective interval: the shorter of our own floor and the server's Retry-After.
+	//
+	// The two used to be checked in sequence with the fixed six-hour floor first, which made a
+	// SHORTER Retry-After impossible to honour -- the floor had already returned false, so the
+	// server's "come back in an hour" was silently extended to six. The comment on the second check
+	// claimed the opposite ("respect the Retry-After the server gave us"), and RFC 9773 §4.3 makes
+	// Retry-After both the earliest and the target time.
+	//
+	// The floor still applies when the server says nothing (or asks us to wait longer than it),
+	// because renewalInfo is not free to poll; the clamps are the RFC's own reasonableness bounds.
+	// When the server gave a Retry-After, that IS the interval (clamped to the RFC's reasonableness
+	// bounds below); only without one does our own six-hour floor apply. Taking the minimum of the
+	// two would let the floor stretch a server's "come back in an hour" to six.
+	wait := m.ariInterval
+	if st.ARIRetryAfter > 0 {
+		wait = st.ARIRetryAfter
 	}
-	// And respect the Retry-After the server gave us.
-	if st.ARIRetryAfter > 0 && now.Before(st.ARICheckedAt.Add(st.ARIRetryAfter)) {
-		return false
+	if wait < time.Minute {
+		wait = time.Minute
 	}
-	return true
+	if wait > 24*time.Hour {
+		wait = 24 * time.Hour
+	}
+	return !now.Before(st.ARICheckedAt.Add(wait))
 }
 
 // issue creates an order. Mind the order of operations: persist the order (including the
