@@ -194,6 +194,17 @@ func Spend(s Snapshot, l Limit, cost float64, now time.Time) Snapshot {
 	if cost < 0 {
 		cost = 0
 	}
+	// The anchor only moves forward.
+	//
+	// Remaining already refuses to credit an interval that has not passed, but the snapshot this
+	// returns would still move its anchor back to `now`. If the clock steps backwards (NTP, a VM
+	// restored from a snapshot, a manual change), s.Tokens has already been credited up to s.At,
+	// and storing At=now makes the interval [now, s.At] creditable a second time -- free tokens,
+	// on the limits this estimate exists to stay under. An interval that has been credited can
+	// never be credited again if the anchor never goes backwards.
+	if now.Before(s.At) {
+		now = s.At
+	}
 	tokens := Remaining(s, l, now) - cost
 	// Clamp the debt. Without a floor, one catastrophic burst (or a clock jump) could leave a
 	// bucket so negative that it takes longer than the window to recover and the estimate

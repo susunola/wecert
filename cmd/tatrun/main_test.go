@@ -26,6 +26,11 @@ type fakeTAT struct {
 	// omitResult drops the TaskResult even on SUCCESS, which is how the API looks when the task
 	// record was never instrumented.
 	omitResult bool
+
+	// dropped/outputURL script a truncated answer: the API caps Output at 24KB and says how much
+	// it dropped, plus where the full log lives.
+	dropped   uint64
+	outputURL string
 }
 
 func (f *fakeTAT) RunCommandWithContext(context.Context, *tat.RunCommandRequest) (*tat.RunCommandResponse, error) {
@@ -45,6 +50,12 @@ func (f *fakeTAT) DescribeInvocationTasksWithContext(context.Context, *tat.Descr
 		task.TaskResult = &tat.TaskResult{
 			Output:   common.StringPtr(f.output),
 			ExitCode: common.Int64Ptr(f.exitCode),
+		}
+		if f.dropped > 0 {
+			task.TaskResult.Dropped = common.Uint64Ptr(f.dropped)
+		}
+		if f.outputURL != "" {
+			task.TaskResult.OutputUrl = common.StringPtr(f.outputURL)
 		}
 	}
 	if f.errorMsg != "" {
@@ -242,5 +253,37 @@ func TestWaitForTaskRefusesSucceededWithoutEvidence(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no result") {
 		t.Errorf("the error must say the result was missing, got %q", err)
+	}
+}
+
+// Truncated remote output must say so.
+//
+// The API caps Output at 24KB and reports the dropped byte count plus a link to the full log.
+// This tool is the evidence an operator greps to decide what a listener is serving, so partial
+// output presented as the whole answer turns "the certificate is missing from the log" into "this
+// listener is not serving it".
+func TestWaitForTaskWarnsWhenTheOutputIsTruncated(t *testing.T) {
+	f := &fakeTAT{
+		statuses: []string{"SUCCESS"}, output: "partial", dropped: 4096,
+		outputURL: "https://cos.example/log",
+	}
+	if err := wait(t, f); err != nil {
+		t.Fatalf("a successful command with truncated output is still a successful command: %v", err)
+	}
+
+	notice := truncationNotice(&tat.TaskResult{
+		Output: common.StringPtr("partial"), ExitCode: common.Int64Ptr(0),
+		Dropped: common.Uint64Ptr(4096), OutputUrl: common.StringPtr("https://cos.example/log"),
+	})
+	for _, want := range []string{"incomplete", "4096", "https://cos.example/log"} {
+		if !strings.Contains(notice, want) {
+			t.Errorf("the truncation warning must mention %q so the operator can find the rest, got %q",
+				want, notice)
+		}
+	}
+
+	// Whole output says nothing.
+	if got := truncationNotice(&tat.TaskResult{Output: common.StringPtr("all of it")}); got != "" {
+		t.Errorf("complete output must not warn, got %q", got)
 	}
 }

@@ -141,25 +141,13 @@ func run() error {
 		waitCtx, cancelWait := context.WithTimeout(context.Background(), *wait+30*time.Second)
 		defer cancelWait()
 
-		deadline := time.Now().Add(*wait)
-		var lastErr error
-		for time.Now().Before(deadline) {
-			time.Sleep(5 * time.Second)
-			ids, err := fetchBoundCertIDs(waitCtx, client, *lbID, *listenerID, *domain)
-			if err != nil {
-				// No more silent continue: the query itself failing and "not switched over
-				// yet" are two completely different things, and both must be visible.
-				lastErr = err
-				fmt.Printf("  ...query failed, retrying shortly: %v\n", err)
-				continue
-			}
-			lastErr = nil
-			bound = ids
+		bound, lastErr := pollUntilBound(waitCtx, *wait, func() ([]string, error) {
+			return fetchBoundCertIDs(waitCtx, client, *lbID, *listenerID, *domain)
+		}, *expect, func(ids []string) {
 			fmt.Printf("  ...waiting; currently bound to %v\n", ids)
-			if contains(bound, *expect) {
-				break
-			}
-		}
+		}, func(err error) {
+			fmt.Printf("  ...query failed, retrying shortly: %v\n", err)
+		})
 		if !contains(bound, *expect) && lastErr != nil {
 			fmt.Printf("  ...note: the final query also failed, so the assertion above may not be trustworthy: %v\n", lastErr)
 		}
@@ -181,6 +169,63 @@ func run() error {
 		fmt.Printf("\nOK: assertion passed - %s is bound (%s)\n", *expect, scope)
 	}
 	return nil
+}
+
+// pollUntilBound polls fetch until the expected certificate appears or the budget runs out, and
+// returns the last set it saw plus the last query error.
+//
+// The sleep is capped to whatever remains of the budget. Sleeping a flat interval before checking
+// the deadline meant -wait bounded the number of attempts rather than the time: `-wait 1s` blocked
+// for the full interval and then queried. The sibling tool in this repository was fixed for exactly
+// that (see wecert-probe's TestCheckOneWaitBoundsElapsedTimeNotJustAttempts); a caller that budgets
+// its own time -- CI, a systemd unit -- is entitled to have the flag mean what its help says.
+func pollUntilBound(
+	ctx context.Context,
+	budget time.Duration,
+	fetch func() ([]string, error),
+	expect string,
+	onPoll func([]string),
+	onError func(error),
+) (ids []string, lastErr error) {
+	const interval = 5 * time.Second
+	deadline := time.Now().Add(budget)
+
+	for {
+		// Query first, then wait. Sleeping before the first query meant a budget shorter than
+		// the poll interval produced no query at all, which is the opposite of what -wait asks
+		// for: it is a budget for how long to keep looking, not a delay before looking.
+		got, err := fetch()
+		if err != nil {
+			// No more silent continue: the query itself failing and "not switched over yet" are
+			// two completely different things, and both must be visible.
+			lastErr = err
+			if onError != nil {
+				onError(err)
+			}
+		} else {
+			lastErr = nil
+			ids = got
+			if onPoll != nil {
+				onPoll(got)
+			}
+			if contains(ids, expect) {
+				return ids, nil
+			}
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ids, lastErr
+		}
+		if remaining > interval {
+			remaining = interval
+		}
+		select {
+		case <-ctx.Done():
+			return ids, lastErr
+		case <-time.After(remaining):
+		}
+	}
 }
 
 // ruleCert is one forwarding rule's SNI binding.
@@ -358,3 +403,7 @@ func derefI64(v *int64) int64 {
 	}
 	return *v
 }
+
+// retryIntervalForTest exposes the poll interval so a test can assert it exceeds the budget it
+// uses -- the assertion only means something while the production interval is the larger of the two.
+func retryIntervalForTest() time.Duration { return 5 * time.Second }
