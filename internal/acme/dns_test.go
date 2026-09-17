@@ -633,3 +633,101 @@ func TestPropagatedVerdictLogsItsEvidenceIncludingUnreachableAuthorities(t *test
 		}
 	}
 }
+
+// recursiveTestSolver builds a solver whose authoritative servers always confirm the value and
+// whose single configured recursive resolver answers however the test says.
+func recursiveTestSolver(t *testing.T, logs *bytes.Buffer, resolver func(*dns.Msg) (*dns.Msg, error)) *DNSSolver {
+	t.Helper()
+	const resolverAddr = "192.0.2.53:53"
+	return &DNSSolver{
+		recursiveNameservers: []string{resolverAddr},
+		log:                  slog.New(slog.NewTextHandler(logs, nil)),
+		interval:             time.Millisecond,
+		timeout:              2 * time.Second,
+		exchange: func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+			if server == resolverAddr {
+				return resolver(msg)
+			}
+			resp := dnsReply(msg, &dns.TXT{
+				Hdr: dns.RR_Header{Name: msg.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+				Txt: []string{"wanted"},
+			})
+			resp.Authoritative = true
+			return resp, nil
+		},
+	}
+}
+
+func recursiveTestServers() []nsServer {
+	return []nsServer{
+		{ns: "ns1.example.net.", addr: "198.51.100.1:53"},
+		{ns: "ns2.example.net.", addr: "198.51.100.2:53"},
+	}
+}
+
+func recursiveTestBudget(d time.Duration) zoneBudget {
+	now := time.Now()
+	return zoneBudget{passStart: now, zoneStart: now, deadline: now.Add(d)}
+}
+
+// The verdict must not be handed to the CA while the path the CA actually uses says no.
+//
+// This is the production failure this check exists for: every authoritative server wecert
+// could reach confirmed the value, so the old rule said "propagated", and the CA -- resolving
+// through a recursive resolver that reached a lagging authority -- was told NXDOMAIN. The
+// failed validation then cost a quota slot (5 per hour per identifier) for a round that could
+// simply have waited.
+func TestRecursiveDenialBlocksAnOtherwiseConfirmedVerdict(t *testing.T) {
+	var logs bytes.Buffer
+	solver := recursiveTestSolver(t, &logs, func(msg *dns.Msg) (*dns.Msg, error) {
+		resp := new(dns.Msg)
+		resp.SetRcode(msg, dns.RcodeNameError)
+		return resp, nil
+	})
+	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
+
+	err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), recs,
+		recursiveTestBudget(60*time.Millisecond))
+	if err == nil {
+		t.Fatal("every recursive resolver answered NXDOMAIN, which is exactly what the CA would be " +
+			"handed; reporting this as propagated spends a failed-validation quota slot for nothing")
+	}
+	if !strings.Contains(err.Error(), "recursive") {
+		t.Errorf("the timeout must say the recursive view is what held it back, got: %v", err)
+	}
+}
+
+// A recursive resolver that has the value is the happy path, and it must still pass.
+func TestRecursiveConfirmationAllowsTheVerdict(t *testing.T) {
+	var logs bytes.Buffer
+	solver := recursiveTestSolver(t, &logs, func(msg *dns.Msg) (*dns.Msg, error) {
+		return dnsReply(msg, &dns.TXT{
+			Hdr: dns.RR_Header{Name: msg.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+			Txt: []string{"wanted"},
+		}), nil
+	})
+	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
+
+	if err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), recs,
+		recursiveTestBudget(2*time.Second)); err != nil {
+		t.Fatalf("both views have the value, so this is propagated: %v", err)
+	}
+}
+
+// "Nobody answered" must not become "refuse to issue": a host with no usable public DNS still
+// has to be able to get certificates, and the authoritative verdict already passed.
+func TestUnreachableRecursiveResolversDegradeToAWarning(t *testing.T) {
+	var logs bytes.Buffer
+	solver := recursiveTestSolver(t, &logs, func(*dns.Msg) (*dns.Msg, error) {
+		return nil, errors.New("network unreachable")
+	})
+	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
+
+	if err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), recs,
+		recursiveTestBudget(2*time.Second)); err != nil {
+		t.Fatalf("no recursive resolver was reachable, so the authoritative verdict stands: %v", err)
+	}
+	if !strings.Contains(logs.String(), "no recursive resolver could answer") {
+		t.Errorf("degrading must be visible in the log, got:\n%s", logs.String())
+	}
+}

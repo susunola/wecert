@@ -324,6 +324,15 @@ func (s *DNSSolver) waitZone(
 		}
 
 		if len(pending) == 0 {
+			// The authoritative servers agree. That is necessary but not sufficient: the CA
+			// validates through a recursive resolver, so ask that path too before telling the CA
+			// to look (see probeRecursive for why the two views can disagree).
+			if ready, why := s.recursiveReady(ctx, recs); !ready {
+				pending = why
+			}
+		}
+
+		if len(pending) == 0 {
 			// The evidence goes into the success line too, not just into the timeout error.
 			//
 			// This verdict is a lower bound on global propagation and it is derived from this
@@ -520,6 +529,101 @@ func probeReady(servers []nsServer, fqdn, want string) (bool, string) {
 		resp, _, err := client.Exchange(msg, server)
 		return resp, err
 	})
+}
+
+// recursiveVerdict is what the CA-shaped view says about one record.
+//
+// A validator resolves through a recursive resolver, not by asking authoritative servers
+// directly, so this is the closest thing wecert has to the CA's own view -- and the two views
+// can disagree. Observed on a real account: the authoritative probe saw every reachable server
+// confirm the value while the CA was told NXDOMAIN for the same name, because a lagging
+// authority was unreachable from wecert's host and reachable from the CA's resolver. The cost
+// of that disagreement is a failed-validation quota slot (5 per hour per identifier), spent on
+// a round that could simply have waited.
+type recursiveVerdict struct {
+	confirmed bool // at least one resolver returned the value
+	denied    bool // at least one resolver answered definitively without it
+	reachable int  // resolvers that gave one of those two answers
+	summary   string
+}
+
+// probeRecursive asks every configured recursive resolver for the TXT value.
+//
+// The three-way split mirrors the authoritative probe, and for the same reason: "denied" and
+// "could not tell" are different answers and must not be collapsed.
+//
+//   - NOERROR with the value          -> confirmed
+//   - NXDOMAIN, or NOERROR without it -> denied (this includes a negatively cached answer,
+//     which is exactly what the CA would be handed, so waiting is the correct response)
+//   - anything else (timeout, SERVFAIL, REFUSED, truncation) -> inconclusive
+//
+// Callers block on a denial and require a confirmation, unless every resolver was
+// inconclusive: a host with no usable public DNS must still be able to issue certificates, so
+// "nobody answered" degrades to a warning rather than a refusal.
+func (s *DNSSolver) probeRecursive(ctx context.Context, fqdn, want string) recursiveVerdict {
+	v := recursiveVerdict{}
+	notes := make([]string, 0, len(s.recursiveNameservers))
+	for _, resolver := range s.recursiveNameservers {
+		msg := new(dns.Msg)
+		msg.SetQuestion(dns.Fqdn(fqdn), dns.TypeTXT)
+		msg.RecursionDesired = true
+		msg.SetEdns0(4096, false)
+
+		resp, err := s.exchange(ctx, msg, resolver)
+		switch {
+		case err != nil:
+			notes = append(notes, resolver+" unreachable")
+		case resp == nil:
+			notes = append(notes, resolver+" no response")
+		case resp.Truncated:
+			notes = append(notes, resolver+" truncated answer (TCP retry failed)")
+		case resp.Rcode == dns.RcodeSuccess:
+			v.reachable++
+			if responseHasTXT(resp, want) {
+				v.confirmed = true
+				notes = append(notes, resolver+" has the value")
+			} else {
+				v.denied = true
+				notes = append(notes, resolver+" answered NOERROR without the value")
+			}
+		case resp.Rcode == dns.RcodeNameError:
+			v.reachable++
+			v.denied = true
+			notes = append(notes, resolver+" answered NXDOMAIN")
+		default:
+			notes = append(notes, resolver+" answered "+dns.RcodeToString[resp.Rcode])
+		}
+	}
+	v.summary = fmt.Sprintf("recursive: confirmed=%t denied=%t reachable=%d/%d (%s)",
+		v.confirmed, v.denied, v.reachable, len(s.recursiveNameservers), strings.Join(notes, "; "))
+	return v
+}
+
+// recursiveReady reports whether the CA-shaped view permits the verdict, and why not.
+func (s *DNSSolver) recursiveReady(ctx context.Context, recs []DNSRecord) (bool, []string) {
+	var pending []string
+	for _, r := range recs {
+		v := s.probeRecursive(ctx, r.FQDN, r.Value)
+		if v.denied {
+			pending = append(pending, fmt.Sprintf(
+				"%s = %s (a recursive resolver, which is what the CA talks to, answered without the value: %s)",
+				r.FQDN, r.Value, v.summary))
+			continue
+		}
+		if !v.confirmed && v.reachable == 0 && len(s.recursiveNameservers) > 0 {
+			// Not one resolver could answer. Refusing here would make issuance impossible on a
+			// host without public DNS egress -- a configuration wecert supports -- and the
+			// authoritative verdict above already passed, so this is a warning, not a blocker.
+			s.log.Warn("no recursive resolver could answer; falling back to the authoritative verdict alone",
+				"name", r.FQDN)
+			continue
+		}
+		if !v.confirmed {
+			pending = append(pending, fmt.Sprintf(
+				"%s = %s (no recursive resolver returned the value yet: %s)", r.FQDN, r.Value, v.summary))
+		}
+	}
+	return len(pending) == 0, pending
 }
 
 // challengeLeases tracks, per effective challenge FQDN, the TXT values this process
