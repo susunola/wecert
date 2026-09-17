@@ -258,6 +258,34 @@ func (m *Manager) solveChallenges(
 
 			return false, m.recordFailure(st, fmt.Errorf(
 				"the authorization for identifier %s is invalid: %s", targeted, authzError(cur)))
+
+		case "deactivated", "expired", "revoked":
+			// RFC 8555 section 7.1.6: these statuses are closed. The authorization can never
+			// become valid again, so the order carrying it can never be finalized -- but with no
+			// case for them the pass treated them as pending and re-presented a challenge (a real
+			// TXT write plus a propagation wait), POSTed AcceptChallenge for a closed
+			// authorization, and then polled it for the whole authzWait, every pass, until the
+			// order's own 7-day TTL expired.
+			//
+			// Discarding the order is what ends that: the next pass places a fresh one, whose
+			// authorizations are new. No identifier failure is booked -- nothing about the name
+			// failed validation, and booking one would arm the pre-expiry fallback against a
+			// healthy identifier.
+			if perr := m.store.PutAuthorization(a); perr != nil {
+				m.log.Warn("failed to record the closed authorization",
+					"cert", c.Name, "identifier", targeted, "status", cur.Status, "err", perr)
+			}
+			m.log.Warn("the authorization is closed and can never be satisfied; discarding the order "+
+				"so the next pass places a fresh one",
+				"cert", c.Name, "identifier", targeted, "status", cur.Status, "authz", a.AuthzURL)
+			if derr := m.discardOrder(ctx, c.Name); derr != nil {
+				return false, m.recordFailure(st, fmt.Errorf(
+					"the authorization for %s is %s and discarding the order failed: %w",
+					targeted, cur.Status, derr))
+			}
+			return false, m.recordFailure(st, fmt.Errorf(
+				"the authorization for identifier %s is %s, which cannot be satisfied; a fresh order "+
+					"will be placed on the next pass", targeted, cur.Status))
 		}
 
 		if !a.Presented {

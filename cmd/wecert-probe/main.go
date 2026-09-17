@@ -113,7 +113,7 @@ Flags:
 
 	worst := exitOK
 	for _, host := range hosts {
-		worst = worseExitCode(worst, checkOne(ctx, host, opts, e, *wait, *asJSON, probe.Probe))
+		worst = worseExitCode(worst, checkOne(ctx, host, opts, e, *wait, *asJSON, probe.ProbeAll))
 	}
 	return worst
 }
@@ -152,7 +152,7 @@ const minAttemptBudget = 250 * time.Millisecond
 var retryInterval = 5 * time.Second
 
 // checkOne probes one name, polling while there is time, and returns its exit code.
-func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expectation, wait time.Duration, asJSON bool, prober func(context.Context, string, probe.Options) (*probe.Result, error)) int {
+func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expectation, wait time.Duration, asJSON bool, prober func(context.Context, string, probe.Options) ([]probe.Attempt, error)) int {
 	deadline := time.Time{}
 	if wait > 0 {
 		deadline = time.Now().Add(wait)
@@ -235,11 +235,11 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 }
 
 // attemptOnce probes once. A true retry means "waiting a little longer might help".
-func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.Expectation, asJSON bool, attempt int, prober func(context.Context, string, probe.Options) (*probe.Result, error)) (code int, retry bool) {
-	res, err := prober(ctx, host, opts)
+func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.Expectation, asJSON bool, attempt int, prober func(context.Context, string, probe.Options) ([]probe.Attempt, error)) (code int, retry bool) {
+	attempts, err := prober(ctx, host, opts)
 	if err != nil {
 		if asJSON {
-			emitJSON(map[string]any{"host": host, "error": err.Error()})
+			emitJSON(map[string]any{"host": host, "error": err.Error(), "attempt": attempt})
 		} else {
 			fmt.Printf("%s\n  unreachable: %v\n\n", host, err)
 		}
@@ -250,19 +250,45 @@ func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.E
 	if e.Now.IsZero() {
 		e.Now = time.Now()
 	}
-	v := res.Verify(e)
 
-	if asJSON {
-		emitJSON(map[string]any{"host": host, "result": res, "verdict": v, "attempt": attempt})
-	} else {
-		printHuman(res, v, e.Now)
+	// EVERY resolved address decides the verdict, not the first one that answered.
+	//
+	// Probe (the first successful address) was what this used, while the daemon's runner uses
+	// ProbeAll so that "an updated node cannot hide a node still serving an old cert". A rebind
+	// rolls through the backends one at a time, so the CLI's whole reason to exist -- "wait until
+	// the certificate took effect" -- was answered by whichever address happened to answer first,
+	// next to a printed list of every resolved IP.
+	code = exitOK
+	for i, a := range attempts {
+		if a.Err != nil {
+			if asJSON {
+				emitJSON(map[string]any{"host": host, "address": a.Address, "error": a.Err.Error(), "attempt": attempt})
+			} else {
+				fmt.Printf("%s (%s)\n  unreachable: %v\n\n", host, a.Address, a.Err)
+			}
+			code = worseExitCode(code, exitUnreachable)
+			continue
+		}
+		if a.Result == nil {
+			continue
+		}
+		v := a.Result.Verify(e)
+		if asJSON {
+			emitJSON(map[string]any{
+				"host": host, "address": a.Address, "result": a.Result, "verdict": v,
+				"attempt": attempt, "addressIndex": i,
+			})
+		} else {
+			printHuman(a.Result, v, e.Now)
+		}
+		if !v.OK {
+			code = worseExitCode(code, exitMismatch)
+		}
 	}
 
-	if v.OK {
-		return exitOK, false
-	}
-	// Retry on a bad verdict too: seeing the old certificate in the ~15s after a rebind is normal.
-	return exitMismatch, true
+	// A mismatch outranks unreachable (see worseExitCode), and any bad answer means "waiting a
+	// little longer might help": seeing the old certificate in the ~15s after a rebind is normal.
+	return code, code != exitOK
 }
 
 func printHuman(res *probe.Result, v probe.Verdict, now time.Time) {

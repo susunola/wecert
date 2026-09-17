@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,9 +83,9 @@ func TestCheckOneWaitBoundsElapsedTimeNotJustAttempts(t *testing.T) {
 	}
 
 	var calls int
-	prober := func(context.Context, string, probe.Options) (*probe.Result, error) {
+	prober := func(context.Context, string, probe.Options) ([]probe.Attempt, error) {
 		calls++
-		return nil, errors.New("dial tcp: connection refused")
+		return []probe.Attempt{{Address: "192.0.2.1", Err: errors.New("dial tcp: connection refused")}}, nil
 	}
 
 	const budget = 80 * time.Millisecond
@@ -109,9 +112,9 @@ func TestCheckOneWaitBoundsElapsedTimeNotJustAttempts(t *testing.T) {
 // With no -wait there must be exactly one attempt: the caller asked for a single verdict.
 func TestCheckOneWithoutWaitMakesOneAttempt(t *testing.T) {
 	var calls int
-	prober := func(context.Context, string, probe.Options) (*probe.Result, error) {
+	prober := func(context.Context, string, probe.Options) ([]probe.Attempt, error) {
 		calls++
-		return nil, errors.New("connection refused")
+		return []probe.Attempt{{Address: "192.0.2.1", Err: errors.New("connection refused")}}, nil
 	}
 
 	if code := checkOne(context.Background(), "example.com", probe.Options{}, probe.Expectation{},
@@ -125,8 +128,8 @@ func TestCheckOneWithoutWaitMakesOneAttempt(t *testing.T) {
 
 // A cancelled context must return promptly with the last verdict, not run the deadline out.
 func TestCheckOneReturnsPromptlyWhenCancelled(t *testing.T) {
-	prober := func(context.Context, string, probe.Options) (*probe.Result, error) {
-		return &probe.Result{Host: "h", NotAfter: time.Now().Add(24 * time.Hour), SANs: []string{"other.example.com"}}, nil
+	prober := func(context.Context, string, probe.Options) ([]probe.Attempt, error) {
+		return []probe.Attempt{{Address: "192.0.2.1", Result: &probe.Result{Host: "h", NotAfter: time.Now().Add(24 * time.Hour), SANs: []string{"other.example.com"}}}}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -145,8 +148,8 @@ func TestCheckOneReturnsPromptlyWhenCancelled(t *testing.T) {
 // wrong", which is the documented interface and the reason a caller can tell an environment
 // problem from a production one.
 func TestCheckOneDistinguishesUnreachableFromMismatch(t *testing.T) {
-	unreachable := func(context.Context, string, probe.Options) (*probe.Result, error) {
-		return nil, errors.New("no route to host")
+	unreachable := func(context.Context, string, probe.Options) ([]probe.Attempt, error) {
+		return []probe.Attempt{{Address: "192.0.2.1", Err: errors.New("no route to host")}}, nil
 	}
 	if code := checkOne(context.Background(), "example.com", probe.Options{}, probe.Expectation{},
 		0, false, unreachable); code != exitUnreachable {
@@ -155,8 +158,8 @@ func TestCheckOneDistinguishesUnreachableFromMismatch(t *testing.T) {
 
 	// A captured certificate that does not cover the dialled name: r.cert is private, so the
 	// verdict cannot be faked, but the code path is the same one as a real mismatch.
-	mismatch := func(context.Context, string, probe.Options) (*probe.Result, error) {
-		return &probe.Result{Host: "example.com", SANs: []string{"other.example.com"}}, nil
+	mismatch := func(context.Context, string, probe.Options) ([]probe.Attempt, error) {
+		return []probe.Attempt{{Address: "192.0.2.1", Result: &probe.Result{Host: "example.com", SANs: []string{"other.example.com"}}}}, nil
 	}
 	if code := checkOne(context.Background(), "example.com", probe.Options{}, probe.Expectation{},
 		0, false, mismatch); code != exitMismatch {
@@ -206,13 +209,13 @@ func TestFirstLineKeepsOnlyTheFirstLine(t *testing.T) {
 func TestWaitBoundsAnAttemptAlreadyInFlight(t *testing.T) {
 	// A prober that blocks until its context/attempt timeout expires, like a real dial to a black
 	// hole: it must not be allowed to outlive the wait.
-	prober := func(_ context.Context, _ string, opts probe.Options) (*probe.Result, error) {
+	prober := func(_ context.Context, _ string, opts probe.Options) ([]probe.Attempt, error) {
 		timeout := opts.Timeout
 		if timeout <= 0 {
 			timeout = probe.DefaultTimeout
 		}
 		time.Sleep(timeout)
-		return nil, errors.New("dial tcp: i/o timeout")
+		return []probe.Attempt{{Address: "192.0.2.1", Err: errors.New("dial tcp: i/o timeout")}}, nil
 	}
 
 	const budget = 120 * time.Millisecond
@@ -236,9 +239,9 @@ func TestWaitBoundsAnAttemptAlreadyInFlight(t *testing.T) {
 // long"; it cannot mean "do not check at all".
 func TestASpentWaitBudgetStillProbesOnce(t *testing.T) {
 	attempts := 0
-	prober := func(context.Context, string, probe.Options) (*probe.Result, error) {
+	prober := func(context.Context, string, probe.Options) ([]probe.Attempt, error) {
 		attempts++
-		return nil, errors.New("dial tcp 10.0.0.1:443: connect: connection refused")
+		return []probe.Attempt{{Address: "10.0.0.1", Err: errors.New("dial tcp 10.0.0.1:443: connect: connection refused")}}, nil
 	}
 
 	code := checkOne(context.Background(), "example.com", probe.Options{}, probe.Expectation{},
@@ -250,5 +253,57 @@ func TestASpentWaitBudgetStillProbesOnce(t *testing.T) {
 	}
 	if code == exitOK {
 		t.Errorf("exit code = %d (ok) although nothing was ever dialled", code)
+	}
+}
+
+// One stale backend must not hide behind a healthy one.
+//
+// The CLI probed with probe.Probe, which returns the FIRST address that answered, while the
+// daemon's runner uses ProbeAll "so an updated node cannot hide a node still serving an old cert".
+// A rebind rolls through the backends, so the tool whose whole purpose is "wait until the
+// certificate took effect" answered from whichever address happened to answer first -- next to a
+// printed list of every resolved IP.
+//
+// The evidence is coverage: every resolved address is examined and reported (the mutation that
+// stops after the first is caught by the second line's absence), and any bad answer decides the
+// exit code.
+func TestEveryResolvedAddressDecidesTheVerdict(t *testing.T) {
+	attempts := func(context.Context, string, probe.Options) ([]probe.Attempt, error) {
+		return []probe.Attempt{
+			{Address: "192.0.2.1", Result: &probe.Result{Host: "example.com", NotAfter: time.Now().Add(24 * time.Hour)}},
+			{Address: "192.0.2.2", Result: &probe.Result{Host: "example.com", NotAfter: time.Now().Add(24 * time.Hour)}},
+		}, nil
+	}
+
+	out := captureStdout(t)
+	code := checkOne(context.Background(), "example.com", probe.Options{},
+		probe.Expectation{Domains: []string{"example.com"}}, 0, true, attempts)
+	printed := out()
+
+	if !strings.Contains(printed, "192.0.2.2") {
+		t.Errorf("the second resolved address was never examined:\n%s", printed)
+	}
+	if code != exitMismatch {
+		t.Errorf("exit code = %d, want %d: neither address served the expected certificate",
+			code, exitMismatch)
+	}
+}
+
+// captureStdout redirects os.Stdout for the duration of one call and returns a function that
+// restores it and hands back everything written.
+func captureStdout(t *testing.T) func() string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	return func() string {
+		_ = w.Close()
+		os.Stdout = old
+		data, _ := io.ReadAll(r)
+		_ = r.Close()
+		return string(data)
 	}
 }
