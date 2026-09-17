@@ -22,6 +22,12 @@ const backupSuffix = ".backup-"
 // lexicographic order is chronological order.
 const snapshotStamp = "20060102T150405.000Z"
 
+// snapshotCopied runs after the copy lands and before its permissions are tightened. Tests use it
+// to observe the mode the copy was CREATED with: the chmod that follows makes the window invisible
+// to any assertion made after Snapshot returns, so without this hook the umask above could be
+// dropped without a test noticing.
+var snapshotCopied = func(string) {}
+
 // Snapshot writes a consistent copy of the state database, and prunes older snapshots.
 //
 // Why VACUUM INTO rather than copying the file: the database runs in WAL mode, so the
@@ -90,8 +96,21 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 		final = filepath.Join(dir, s.snapshotName(fmt.Sprintf("%s-%d", stamp, n)))
 	}
 
-	if _, err := s.db.Exec(`VACUUM INTO ?`, tmpName); err != nil {
-		return "", fmt.Errorf("snapshot state database: %w", err)
+	// The copy is born under a restrictive umask, not tightened afterwards.
+	//
+	// Open() does the same for the database it migrates (see restrictiveUmask in state.go) for the
+	// same reason: this file is a logical copy of the ACME account key and every certificate private
+	// key, and the driver creates it with the process umask -- 0644 on a default system. Chmod after
+	// the copy left a window in which any local user could read it, and a crash inside that window
+	// left behind a world-readable `.snapshot-*.tmp` that nothing ever revisits (listing matches
+	// only the final `<base>.backup-<stamp>.db` names). The chmod stays as the backstop for a file
+	// that already existed.
+	restoreUmask := restrictiveUmask()
+	_, execErr := s.db.Exec(`VACUUM INTO ?`, tmpName)
+	restoreUmask()
+	snapshotCopied(tmpName)
+	if execErr != nil {
+		return "", fmt.Errorf("snapshot state database: %w", execErr)
 	}
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return "", fmt.Errorf("tighten snapshot permissions: %w", err)

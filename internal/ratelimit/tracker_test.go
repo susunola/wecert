@@ -4,12 +4,14 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 )
 
 // fakeStore is an in-memory bucketStore.
 type fakeStore struct {
+	mu      sync.Mutex
 	rows    map[string]*BucketRecord
 	getErr  error
 	putErr  error
@@ -19,6 +21,33 @@ type fakeStore struct {
 func newFakeStore() *fakeStore { return &fakeStore{rows: map[string]*BucketRecord{}} }
 
 func key(limit, scope string) string { return limit + "\x00" + scope }
+
+// UpdateRateBucket mirrors the real store: the whole read-modify-write happens under one lock, so
+// two callers cannot both read the same token count. Get and Put stay individually atomic, which
+// is exactly why a tracker doing Get...Put loses updates.
+func (f *fakeStore) UpdateRateBucket(limit, scope string, fn func(*BucketRecord) error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.getErr != nil {
+		return f.getErr
+	}
+	rec := &BucketRecord{LimitName: limit, ScopeID: scope}
+	if r, ok := f.rows[key(limit, scope)]; ok {
+		cp := *r
+		rec = &cp
+	}
+	if err := fn(rec); err != nil {
+		return err
+	}
+	if f.putErr != nil {
+		return f.putErr
+	}
+	cp := *rec
+	f.rows[key(limit, scope)] = &cp
+	f.putSeen++
+	return nil
+}
 
 func (f *fakeStore) GetRateBucket(limit, scope string) (*BucketRecord, error) {
 	if f.getErr != nil {
@@ -181,5 +210,40 @@ func TestSummarizeSkipsLimitsWithoutAScope(t *testing.T) {
 	lines = tr.Summarize(map[string]string{"registered-domain": "example.com"})
 	if len(lines) != 2 {
 		t.Fatalf("expected the account-wide limit plus the supplied scope, got %v", lines)
+	}
+}
+
+// Concurrent spends on one bucket must all count.
+//
+// The manager reconciles one goroutine per certificate and every one of them spends on the SAME
+// account-scoped bucket. A read-modify-write through Get then Put loses updates in exactly that
+// shape -- the certificate path hit the same bug ("a run of 50 concurrent GetCert/++/PutCert
+// cycles landed as 3") and fixed it with UpdateCert -- and the local estimate is what keeps the
+// fleet under the CA's limits, including the one with no override path.
+func TestConcurrentSpendsOnOneBucketAllCount(t *testing.T) {
+	store := newFakeStore()
+	tr := testTracker(t, store, time.Now())
+
+	const spenders = 32
+	var wg sync.WaitGroup
+	for i := 0; i < spenders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tr.Spend(NewOrdersPerAccount, "", 1)
+		}()
+	}
+	wg.Wait()
+
+	rec, err := store.GetRateBucket(NewOrdersPerAccount.Name, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := NewOrdersPerAccount.Capacity - spenders
+	if rec.Tokens != want {
+		t.Errorf("after %d concurrent spends the bucket holds %v tokens, want %v: %d spend(s) were "+
+			"lost to a read-modify-write race, so the estimate is optimistic about a limit that "+
+			"blocks every certificate on the account",
+			spenders, rec.Tokens, want, int(want-rec.Tokens))
 	}
 }

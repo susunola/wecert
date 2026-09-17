@@ -41,6 +41,29 @@ func (a rateBucketAdapter) PutRateBucket(rec *ratelimit.BucketRecord) error {
 	})
 }
 
+// UpdateRateBucket translates the boundary type and applies fn inside the store's own lock, so a
+// spend cannot be lost to a concurrent pass spending on the same account-scoped bucket.
+func (a rateBucketAdapter) UpdateRateBucket(limitName, scopeID string, fn func(*ratelimit.BucketRecord) error) error {
+	return a.store.UpdateRateBucket(limitName, scopeID, func(rec *state.RateBucket) error {
+		out := &ratelimit.BucketRecord{
+			LimitName:   rec.LimitName,
+			ScopeID:     rec.ScopeID,
+			Tokens:      rec.Tokens,
+			ObservedAt:  rec.ObservedAt,
+			ResetAt:     rec.ResetAt,
+			ResetReason: rec.ResetReason,
+		}
+		if err := fn(out); err != nil {
+			return err
+		}
+		rec.Tokens = out.Tokens
+		rec.ObservedAt = out.ObservedAt
+		rec.ResetAt = out.ResetAt
+		rec.ResetReason = out.ResetReason
+		return nil
+	})
+}
+
 // QuotaReport is one limit's state, for metrics, logs and diagnostics.
 type QuotaReport struct {
 	Limit        string

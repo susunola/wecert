@@ -413,3 +413,46 @@ func TestForeignFilesInTheBackupDirectoryAreLeftAlone(t *testing.T) {
 		t.Errorf("only our own snapshots may be listed, got %v", seen)
 	}
 }
+
+// The snapshot must be CREATED with restrictive permissions, not tightened after the fact.
+//
+// The file is a logical copy of the ACME account key and every certificate private key, and SQLite
+// creates it with the process umask -- 0644 on a default system. Chmod'ing afterwards leaves a
+// window any local user can read through, and a crash inside the window leaves a world-readable
+// `.snapshot-*.tmp` behind that nothing revisits: the listing matches only the final
+// `<base>.backup-<stamp>.db` names. Asserting the final mode cannot see the difference (the chmod
+// is a backstop), so the mode is observed at the moment the copy lands.
+func TestSnapshotIsBornWithRestrictivePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no POSIX permission assertions on Windows")
+	}
+
+	old := setUmask(0)
+	defer setUmask(old)
+
+	saved := snapshotCopied
+	var modeAtCopy os.FileMode
+	var statErr error
+	snapshotCopied = func(path string) {
+		info, err := os.Stat(path)
+		if err != nil {
+			statErr = err
+			return
+		}
+		modeAtCopy = info.Mode().Perm()
+	}
+	defer func() { snapshotCopied = saved }()
+
+	s, dir := snapshotStore(t)
+	if _, err := s.Snapshot(filepath.Join(dir, "backups"), 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if statErr != nil {
+		t.Fatalf("the snapshot was not readable when the copy landed: %v", statErr)
+	}
+	if modeAtCopy&0o077 != 0 {
+		t.Errorf("the snapshot was created with mode %o (umask 0): group and other can read every "+
+			"private key for the whole duration of the copy, and a crash in that window leaves a "+
+			"world-readable temp file nothing ever cleans up (want 0600 from the start)", modeAtCopy)
+	}
+}
