@@ -11,7 +11,7 @@
 | 小轮 | 覆盖面 | 状态 |
 |---|---|---|
 | 第 1 轮 | ACME 订单状态机；DNS 挑战层/ARI/吊销/配额记账；state + ratelimit；onboarding + spec + config；deploy + probe + reconcile + webhook + cmd | **已完成**（7 组复审返回，见 §2） |
-| 第 2 轮 | 第 1 轮剩下未修的项 + 并发/生命周期/资源泄漏视角 | 待做 |
+| 第 2 轮 | 第 1 轮剩下未修的项 + 并发/生命周期/资源泄漏视角 | **已完成**（见 §3） |
 | 第 3 轮 | 对本次会话全部改动的对抗性复审 + 不变量与属性/模糊测试 | 待做 |
 | 第 4 轮 | 跨面：文档 vs 行为、cmd/*、scripts、deploy、testenv，以及遗留项收口 | 待做 |
 
@@ -89,3 +89,38 @@
 
 | 位置 | 问题 | 计划 |
 |---|---|---|
+---
+
+## 3. 第 2 轮：生命周期 / 并发 / 资源视角（1 个复审者 + 我的机械核查）
+
+复审者只看「谁的生命周期比谁长」：goroutine、context、锁、资源清理；结论写进 `/tmp/wecert-review-r4b/lifecycle.json`（4 条）。另有两条是我自己的机械核查：Schema/SQL 列对照、旧库迁移、被吞掉的错误、ticker/response body/goroutine 的数量与终止条件。
+
+### 3.1 已修复
+
+| # | 位置 | 缺陷 | 修法与用例 |
+|---|---|---|---|
+| 1 | `internal/acme/manager_flow.go` | **租约登记与注销用的不是同一个值**：`registerRecoveredLeases` 登记行里**持久化的** `txt_value`（那是「DNS 里确实是这个值」的记录），而 `CleanUp` 注销的是由 `challenge_token` 推导出来的值（lego 的 provider 按它删）。代码自己的注释就承认存在「token 刷新过、TxtValue 不再匹配」的旧行 —— 对那种行，**登记进去的租约永远注销不掉**：该名字之后每一次清理都走「还有别的挑战在线」分支，provider 的 delete-all 在进程重启前再也不会执行，这条记录就留在 DNS 里 | 新增 `releaseRowStaleLease`（在两条清理路径上、调 provider 之前调用）：当本行的持久化值与 token 推导值不一致时释放本行自己的租约；「另一个 presented 行还声称同名同值」的检查要**排除本行自身**（否则它永远声称着）。`TestARowWhoseTokenChangedDoesNotBlockItsOwnCleanup`（断言 delete-all 确实触发、旧值租约被释放；去掉释放即变红） |
+| 2 | `internal/reconcile` + `cmd/wecert` | **webhook 触发的 pass 无人 join**：SIGTERM 时 `runDaemon` 返回、`drainNotifier` 只等通知、`run()` 返回后 `defer store.Close()` 就把 SQLite 关在了仍在跑的 pass 底下——它的 epilogue（提升、resume anchor 的 `PutOrder`、授权行、`recordFailure`）全部失败。代码自己写过的极端情形：在 `staged.Upload` 返回 id 与 `PutOrder` 落盘之间退出，那张云证书既不在 `certificates` 也不在 `retired_certificates` 里，计费且永不回收。-once 模式同样可达（webhook 监听在 -once 分支之前就起来了） | `Reconciler` 增加 `bg sync.WaitGroup`（`Add` 在 goroutine 启动前，排队等 start slot 的也算）与 `Drain(ctx) error`；`cmd/wecert` 在两条退出路径上都先 `drainBackground`（30s 上限，超时明确告警说明「存储即将在活着的 pass 底下关闭，下一轮会从已落盘的 order URL 续上」）。`TestDrainWaitsForABackgroundPass`、`TestDrainIsBounded`（去掉计数即变红） |
+
+### 3.2 核实后**故意不改**（如实记录，不是遗漏）
+
+| 位置 | 复审说法 | 为什么不动 |
+|---|---|---|
+| `internal/acme/dns.go`、`internal/deploy/tencent.go` | 每次调用都新建 SDK client，而 SDK 的 `Init` 会 clone `http.DefaultTransport`：DNS 的每次 Present/CleanUp、部署的每次调用都是一次全新的 TLS 握手，外加一条 30s 的 idle 连接；`common.DefaultHttpClient` 本仓库从未设置 | **核实为真**（`common.Client.Init` / `WithProfile` 的源码在案）。但它**不是**「改一行就好了」：SDK 通过 `c.httpClient.Timeout = ReqTimeout` **修改它拿到的那只 client**，所以把 `DefaultHttpClient` 设成共享 client 会让不相关的超时互相覆盖；SDK 也没有注入 transport 的接口。代价是「每次调用一次握手 + 一条 30s idle fd」，在数百张证书的规模下才值得为它设计（那时正确做法是自建 per-credential 的 client+共享 transport 池并在两处统一 ReqTimeout）。本轮把两处**误导性注释**改成事实（原文写「negligible cost」/「used to rebuild it on every call」），并把上面这段理由写进注释 |
+| `internal/acme/manager_flow.go` | `releaseStaleLease` 可能释放掉某名字最后一个租约而不触发 delete-all，于是别的行先前「留给最后一个离开者」的记录被搁浅 | 后果是「一条 TXT 记录滞留」，不是验证失败，而且要构造出「A 的清理因 B 的租约而跳过、随后 B 的租约又由 releaseStaleLease 释放」这个次序；在正常流程里该名字随后还会被写一次（新值的 delete-all 会把旧的带上）。**记为已知取舍**，不为它引入「按名字主动 delete-all」的新路径（那才是真会误删别人记录的方向） |
+| `internal/acme/manager_done.go`（回收循环） | （我自己查的）云端删除成功但 `DeleteRetiredCert` 失败时，下一轮会对同一 id 再删一次 | 再删一次的失败会一直留下该行并每轮告警；反向顺序（先删行再删云）才是会造成真正泄漏的写法。记录在案，不改 |
+
+### 3.3 机械核查结果（无发现，作为「这些面已经查过」的证据）
+
+- **Schema/SQL 列对照**：9 张表、全部 SQL 语句的列都已在 `schema`/`schemaColumns` 中声明（脚本对照，0 不一致）。
+- **旧库迁移**：手工建一份「缺少最新两列」的旧库，`Open` 后两列都被补上，`PutAuthorization` 不写年龄时**保留**原值（`CASE WHEN excluded > 0`），`revoke_requests.cert_identity` 往返正常 → `TestLegacyDatabaseGainsTheNewColumns`。
+- **被吞掉的错误**：13 处 `_ =` / `_, _ =` 逐条看过，全部是「HTTP 响应写失败（对端已走）」「hash.Write」「drain body」「Flock 解锁」「清理路径的 Close」这类无可作为的情形。
+- **资源终止条件**：`time.NewTicker` 有 `defer Stop` + ctx 退出；HTTP body 有 Close；goroutine 扇出都有上界（`startSlots`、`maxProbeConcurrency`、`maxNotifyInFlight`）且都等或可取消；shutdown goroutine 由 ctx 与超时界定。
+
+### 3.4 顺带修掉的仓库卫生问题（我自己引入的）
+
+`git add -A` 把仓库内一份 **GOCACHE（1,963 个文件、约 146MB）** 和三个 terraform plan 二进制提交进了 `770d018`。已从工作树移除并加进 `.gitignore`（`.gocache/`、`gomodcache/`、`gopath/`、`tfplan-*`），跟踪文件数 2,196 → 232。**历史里的 blob 还在**（这次没有改写历史）；要彻底回收体积需要一次 `git filter-repo`，那会重写这个分支的提交，留给你决定。
+
+---
+
+## 3. 精度说明

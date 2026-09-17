@@ -608,6 +608,16 @@ func (m *Manager) registerRecoveredLeases() {
 // cannot be read keeps the lease -- the safe direction, because a leftover lease only delays a
 // delete-all, while dropping a live one takes out a record another certificate is waiting on.
 func (m *Manager) releaseStaleLease(fqdn, value string) {
+	m.releaseStaleLeaseExcept(fqdn, value, nil)
+}
+
+// releaseStaleLeaseExcept is releaseStaleLease with one row excluded from the "another row still
+// claims this value" check.
+//
+// The exclusion exists for the row being cleaned up right now: that row is itself a presented
+// authorization claiming (name, TxtValue), so asking "does any presented row still need this value"
+// would always answer yes and the lease would never be released. See releaseRowStaleLease.
+func (m *Manager) releaseStaleLeaseExcept(fqdn, value string, except *state.Authorization) {
 	if fqdn == "" || value == "" {
 		return
 	}
@@ -618,6 +628,9 @@ func (m *Manager) releaseStaleLease(fqdn, value string) {
 		return
 	}
 	for _, r := range rows {
+		if except != nil && r.CertName == except.CertName && r.AuthzURL == except.AuthzURL {
+			continue
+		}
 		if r.TxtName == fqdn && r.TxtValue == value {
 			return
 		}
@@ -629,6 +642,28 @@ func (m *Manager) releaseStaleLease(fqdn, value string) {
 	}
 	m.log.Info("released a TXT lease whose record is gone; the name can be cleaned up again",
 		"name", fqdn)
+}
+
+// releaseRowStaleLease drops the lease a row's PERSISTED value is holding when its token no longer
+// hashes to that value.
+//
+// The registry has two writers for one row. registerRecoveredLeases (and Present) register
+// a.TxtValue, because that is the value recorded as being in DNS; CleanUp removes the value derived
+// from the challenge token, because that is what lego's provider deletes by. For a row written
+// before the token was refreshed -- the shape the comment in removeAuthzTXT describes as real -- the
+// two differ, so the lease that went in can never come out: every later cleanup at that name takes
+// the "another challenge is still live" branch, the provider's delete-all never fires again for the
+// process lifetime, and the record this row owns stays in DNS. Releasing it here is what makes the
+// decision correct rather than making it earlier: the value is this row's own record, and the
+// exclusion keeps a different certificate's claim on it intact.
+func (m *Manager) releaseRowStaleLease(a *state.Authorization, keyAuth string) {
+	if a == nil || a.TxtName == "" || a.TxtValue == "" {
+		return
+	}
+	if dns01.GetChallengeInfo(a.Identifier, keyAuth).Value == a.TxtValue {
+		return
+	}
+	m.releaseStaleLeaseExcept(a.TxtName, a.TxtValue, a)
 }
 
 // cleanup deletes every TXT this round wrote. It is only called once all authorizations pass.
@@ -685,6 +720,9 @@ func (m *Manager) removeAuthzTXT(ctx context.Context, a *state.Authorization) (c
 	if a.TxtName != "" {
 		challengeLeases.add(a.TxtName, dns01.GetChallengeInfo(a.Identifier, keyAuth).Value)
 	}
+	// And release the lease the row's own persisted value is holding, if it is not the value this
+	// call is about to remove: otherwise that lease blocks the delete-all forever.
+	m.releaseRowStaleLease(a, keyAuth)
 	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
 		return false, fmt.Errorf("clean up TXT %s: %w", a.TxtName, err)
 	}
@@ -820,6 +858,9 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 	// this value is invisible to the registry and the delete-all would go ahead -- taking
 	// out any other certificate's record at the same name.
 	challengeLeases.add(rec.FQDN, rec.Value)
+	// The row's persisted value may be a different one (a token refresh before either was written);
+	// its lease would block the delete-all for the rest of the process. See releaseRowStaleLease.
+	m.releaseRowStaleLease(a, keyAuth)
 	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
 		m.log.Warn("failed to reclaim the TXT of an interrupted pass; keeping the row",
 			"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN, "err", err)

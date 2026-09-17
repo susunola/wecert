@@ -1015,3 +1015,59 @@ func TestChoosingAChallengeRecordsWhenItWasChosen(t *testing.T) {
 			as[0].ChallengePreparedAt, now)
 	}
 }
+
+// A row whose token no longer hashes to its persisted value must not block its own cleanup.
+//
+// The registry has two writers for one row: registerRecoveredLeases registers the row's PERSISTED
+// txt_value (that is the value recorded as being in DNS), while CleanUp removes the value derived
+// from the challenge_token (that is what lego's provider deletes by). For a row written before the
+// token was refreshed -- the shape removeAuthzTXT's own comment describes as real -- the two
+// differ, so the lease that went in could never come out: every later cleanup at that name took the
+// "another challenge is still live" branch, the provider's delete-all never fired again for the
+// process lifetime, and the record that row owned stayed in DNS, consuming record quota and
+// poisoning later challenges at the same name.
+func TestARowWhoseTokenChangedDoesNotBlockItsOwnCleanup(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	solver, rec, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			resp := dnsReply(msg)
+			resp.Rcode = dns.RcodeNameError
+			resp.Authoritative = true
+			return resp, nil
+		})
+	provider := &recordingProvider{}
+	solver.newProvider = func(context.Context) (challenge.Provider, error) { return provider, nil }
+	solver.timeout = time.Millisecond
+
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+
+	// The legacy shape: the row carries the value an older build wrote, while its token now hashes
+	// to something else.
+	staleValue := dns01.GetChallengeInfo("example.com", "keyauth(tok-old)").Value
+	derived := dns01.GetChallengeInfo("example.com", "keyauth(tok-1)").Value
+	if staleValue == derived {
+		t.Fatal("the fixture must have two different values")
+	}
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+		ChallengeToken: "tok-1", TxtName: rec.FQDN, TxtValue: staleValue, Presented: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// What a previous process would have registered for it.
+	challengeLeases.add(rec.FQDN, staleValue)
+
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+
+	if len(provider.cleanups) != 1 {
+		t.Errorf("the provider's delete-all must fire: the only lease left at the name was this "+
+			"row's own stale value, and holding it back leaves the record in DNS for the life of "+
+			"the process (cleanups=%v)", provider.cleanups)
+	}
+	if hasTXTLease(rec.FQDN, staleValue) {
+		t.Error("the row's stale lease must be released before its own cleanup runs")
+	}
+}
