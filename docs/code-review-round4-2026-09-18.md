@@ -70,10 +70,15 @@
 | `internal/acme/manager_renew.go`（限流归类） | 任何 newOrder 拒绝都记到 `new-orders`：exact-set 的拒绝会点亮错误的序列，而「没有任何 override」的那条限额继续读得偏乐观 | `refusedLimits` 按 CA 的原话（Boulder 的三种措辞）归类到对应限额，scope 与记账路径一致；`TestARefusalIsBookedAgainstTheLimitItNames` 三个子例 |
 | `deploy/prometheus/wecert-alerts.yml` + `internal/metrics` | fallback 的 CRITICAL 告警 `{{ $value }}` 取的是 `== 1` 的 gauge，永远说「missing 1 name(s)」；而 gauge 的 Help 说「正在服务一张部分证书」，实际是在**决定**时就置位 | 注解不再插值错误的数字（真正的数量在 `wecert_certificate_fallback_dropped_names`，模板无法 join）；Help/描述改成「fallback 生效中（即将或正在服务部分证书）」，并把「为什么在决定时置位」写进注释（决定才是可行动事件；等部署会掩盖一个自身签发也在失败的 fallback） |
 
-### 2.5 仍未修（留给后面 3 个小轮，逐条已核实）
+### 2.5 第 1 轮的最后两条（也已修复）
+
+| 位置 | 缺陷 | 修法与用例 |
+|---|---|---|
+| `internal/acme/manager_flow.go` | RFC 8555 §7.1.6 的 `deactivated`/`expired`/`revoked` 三种「已关闭」授权状态没有分支，被当成 pending：每轮都重新呈现挑战（真写 DNS + 等传播）、对已关闭的授权 POST `AcceptChallenge`、再等满 `authzWait`，直到订单自己的 7 天 TTL 到期 | 新增分支：丢弃订单（下一轮下新单，新单的授权是新的），并且**不记 identifier 失败**（名字并没有验证失败，记账会让 fallback 误伤健康名字）。`TestAClosedAuthorizationDiscardsTheOrder`（三种状态各一例，断言订单被丢弃、账本为空、DNS 无写入） |
+| `cmd/wecert-probe/main.go` | CLI 用 `probe.Probe`（**第一个**应答的地址）判定，而守护进程用 `ProbeAll`（「更新过的节点不能藏住还在服务旧证书的节点」）：换绑是逐个后端生效的，于是这个工具最核心的用途（等换绑生效）由「碰巧先应答的那个地址」回答，旁边还打印着全部解析地址 | 改用 `ProbeAll`：每个解析地址都判定、都输出，任一地址不匹配即退出码 2（不匹配优先于不可达）。`TestEveryResolvedAddressDecidesTheVerdict` 用 stdout 捕获断言「第二个地址确实被检查过」（去掉遍历即变红） |
+
+### 2.6 仍未修（留给后面 3 个小轮，逐条已核实）
 
 | 位置 | 问题 | 计划 |
 |---|---|---|
 | `internal/acme/manager_flow.go` | `reclaimUnpresentedTXT` 把「权威否认」当成「写入从未发生」，但 DNSPod 的写入传播可以滞后（本轮实测删除传播到所有权威最多 60s） | 给授权行加「挑战准备时间」列，滞后窗口内不采信否认 |
-| `internal/acme/manager.go` | 授权状态 `expired`/`deactivated`/`revoked` 没有分支，按 pending 处理（重新呈现 + 等满 3 分钟） | 视为订单不可用并丢弃订单 |
-| `cmd/wecert-probe/main.go` | CLI 用 `probe.Probe`（第一个成功的地址）判定，而守护进程用 `ProbeAll`（多地址时一个旧证书就能藏住） | 决定语义后统一 |

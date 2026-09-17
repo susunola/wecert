@@ -777,3 +777,76 @@ func TestAStaleLeaseIsKeptWhileAnotherPresentedRowClaimsIt(t *testing.T) {
 			"the name un-cleanable for the rest of the process")
 	}
 }
+
+// A closed authorization must end the order, not be polled to the order's TTL.
+//
+// RFC 8555 section 7.1.6 defines deactivated, expired and revoked as closed: they can never become
+// valid, so the order carrying one can never be finalized. With no case for them the pass treated
+// the status as pending and re-presented a challenge (a real TXT write plus a propagation wait),
+// POSTed AcceptChallenge for a closed authorization and polled it for the whole authzWait -- every
+// pass, until the order's own 7-day TTL ran out. Discarding the order makes the next pass place a
+// fresh one; no identifier failure is booked, because nothing about the name failed validation.
+func TestAClosedAuthorizationDiscardsTheOrder(t *testing.T) {
+	for _, status := range []string{"deactivated", "expired", "revoked"} {
+		t.Run(status, func(t *testing.T) {
+			solver := &fakeSolver{}
+			store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+
+			fake := &fakeAPI{authzByURL: map[string]legoacme.Authorization{
+				"https://ca.test/authz/1": {
+					Status:     status,
+					Identifier: legoacme.Identifier{Value: "example.com"},
+				},
+			}}
+			m := newManager(store, fake, solver, fakeKeyAuth{}, deploy.Noop{},
+				slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			if err := store.PutOrder(&state.Order{
+				CertName: "c", OrderURL: "https://ca.test/order/1",
+				FinalizeURL: "https://ca.test/finalize/1", Status: "pending",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.PutAuthorization(&state.Authorization{
+				CertName: "c", AuthzURL: "https://ca.test/authz/1", Identifier: "example.com",
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			cert := &config.Certificate{Name: "c", Domains: []string{"example.com"}}
+			st := &state.CertState{Name: "c", NotAfter: time.Now().Add(24 * time.Hour)}
+			order := legoacme.ExtendedOrder{
+				Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
+				Location: "https://ca.test/order/1",
+			}
+
+			done, err := m.solveChallenges(context.Background(), cert, st, order)
+			if err == nil {
+				t.Fatal("a closed authorization means the order cannot complete, so the pass must fail")
+			}
+			if done {
+				t.Error("the pass must not report the challenges as solved")
+			}
+			if !strings.Contains(err.Error(), status) {
+				t.Errorf("the error must name the status, got %v", err)
+			}
+			if o, err := store.GetOrder("c"); err != nil || o != nil {
+				t.Errorf("the order must be discarded so the next pass places a fresh one (order=%+v err=%v)", o, err)
+			}
+			// Nothing about the name failed validation, so the identifier ledger must stay empty:
+			// a booked failure would arm the pre-expiry fallback against a healthy identifier.
+			if fails, err := store.ListIdentifierFailures("c"); err != nil {
+				t.Fatal(err)
+			} else if len(fails) != 0 {
+				t.Errorf("no identifier failure belongs here, got %+v", fails)
+			}
+			if len(solver.presented) != 0 {
+				t.Errorf("nothing may be written to DNS for a closed authorization, got %v", solver.presented)
+			}
+		})
+	}
+}
