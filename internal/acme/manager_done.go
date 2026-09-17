@@ -154,7 +154,14 @@ func (m *Manager) download(
 			if derr == nil {
 				o.DeploymentCertID = id
 				if err := m.store.PutOrder(o); err != nil {
-					return err
+					// The certificate is uploaded; only recording its id failed. That id is the resume
+					// anchor, so losing it means the next pass uploads a SECOND copy and leaks the
+					// first -- and a bare `return err` also skips the backoff, so it retries at the
+					// pass rate instead. recordFailure keeps both (it schedules the retry and leaves
+					// the failure visible), which is what the sibling call sites already do.
+					return m.recordFailure(st, fmt.Errorf(
+						"the certificate %s was uploaded but recording it for the resume anchor failed: %w",
+						id, err))
 				}
 				id, derr = staged.DeployUploaded(ctx, c.Name, oldDeployedID, id)
 			}
@@ -186,7 +193,10 @@ func (m *Manager) download(
 				if id != "" {
 					o.DeploymentCertID = id
 					if err := m.store.PutOrder(o); err != nil {
-						return err
+						// As above: the upload happened, so the id is the only record of a cloud object,
+						// and the failure has to cost a backoff rather than a bare retry.
+						return m.recordFailure(st, fmt.Errorf(
+							"the certificate %s was uploaded but recording it for reclaim failed: %w", id, err))
 					}
 				}
 				return m.recordFailure(st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
