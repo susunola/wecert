@@ -656,7 +656,14 @@ func (r *run) parse(raw []RawDeclaration) {
 	for _, rec := range raw {
 		d, err := ParseDeclaration(rec.Zone, rec.Record, rec.Values)
 		if err != nil {
-			r.reject(hostnameFromRecord(rec.Record), fmt.Sprintf("unparseable declaration: %v", err))
+			// Do not report a hostname as excluded when another record already gave it a usable
+			// declaration. The mirror of this rule is the unreject below: a name that ends up
+			// included must carry exactly one verdict, and which record the zone walk happened to
+			// return first is not something the report should depend on.
+			host := hostnameFromRecord(rec.Record)
+			if _, usable := byHost[host]; !usable {
+				r.reject(host, fmt.Sprintf("unparseable declaration: %v", err))
+			}
 			continue
 		}
 		if rejected[d.Hostname] {

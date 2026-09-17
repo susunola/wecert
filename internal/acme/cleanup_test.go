@@ -1071,3 +1071,81 @@ func TestARowWhoseTokenChangedDoesNotBlockItsOwnCleanup(t *testing.T) {
 		t.Error("the row's stale lease must be released before its own cleanup runs")
 	}
 }
+
+// The challenge's timestamp must be on disk before the DNS write it describes.
+//
+// A resumed row (Presented=false, a token from an earlier attempt) had the new challenge and the
+// refreshed challenge_prepared_at only in memory until the end of the loop: a pass that died
+// between the DNS write and that persist left a stored age OLDER than the write, and the reclaim
+// probe -- which trusts an authoritative denial once the stored age exceeds the propagation window
+// -- could then delete the row of a record that was still propagating, leaving the record in DNS.
+// The first-visit path always persisted first; now both do.
+func TestTheChallengeIsPersistedBeforeTheDNSWrite(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	// The provider is installed below; the harness deliberately leaves newProvider nil so that a
+	// test that forgets to install one fails loudly instead of silently writing to real DNS.
+	solver, _, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			resp := dnsReply(msg)
+			resp.Rcode = dns.RcodeNameError
+			resp.Authoritative = true
+			return resp, nil
+		})
+	solver.timeout = time.Millisecond
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{authzByURL: map[string]legoacme.Authorization{
+		"https://ca.test/authz/1": {
+			Status:     "pending",
+			Identifier: legoacme.Identifier{Value: "example.com"},
+			Challenges: []legoacme.Challenge{{
+				Type: "dns-01", URL: "https://ca.test/chall/2", Token: "tok-2",
+			}},
+		},
+	}}
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-30 * time.Minute)
+	provider := &recordingProvider{}
+	solver.newProvider = func(context.Context) (challenge.Provider, error) { return provider, nil }
+	provider.onPresent = func() {
+		// What is on disk at the moment the DNS write starts.
+		stored, err := store.ListAuthorizationsForTest("c")
+		if err != nil {
+			t.Errorf("reading the row from inside Present: %v", err)
+			return
+		}
+		if len(stored) != 1 {
+			t.Errorf("expected one authorization row, got %d", len(stored))
+			return
+		}
+		if !stored[0].ChallengePreparedAt.Equal(now) {
+			t.Errorf("the row's challenge timestamp must be on disk before the DNS write, got %s "+
+				"(the previous value was %s)", stored[0].ChallengePreparedAt, old)
+		}
+	}
+
+	m := newManager(store, fake, solver, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m.SetNow(func() time.Time { return now })
+
+	// The resumed shape: a token from an earlier attempt, unpresented, with a stale timestamp.
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "https://ca.test/authz/1", Identifier: "example.com",
+		ChallengeToken: "tok-1", Presented: false, ChallengePreparedAt: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cert := &config.Certificate{Name: "c", Domains: []string{"example.com"}}
+	order := legoacme.ExtendedOrder{
+		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
+		Location: "https://ca.test/order/1",
+	}
+	_, _ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
+}

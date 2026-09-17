@@ -333,17 +333,22 @@ func (m *Manager) solveChallenges(
 			// have had time to reach the authoritative servers (see reclaimUnpresentedTXT).
 			a.ChallengePreparedAt = m.now()
 
+			// Persist the challenge BEFORE any DNS write, on both paths.
+			//
+			// A pass that dies between the write and the persist at the end of this loop leaves
+			// the record up while the row still says Presented=false -- and the token is then the
+			// only way to locate that record again (the probe below relies on it, and so does
+			// cleanupOrphanTXT). The timestamp has just been refreshed, and it is what crash
+			// recovery uses as its "was this write given time to appear" window, so that instant
+			// has to be durable before the record it describes can exist: persisting it afterwards
+			// leaves a stored age older than the write, and the reclaim probe could then trust an
+			// authoritative denial for a record that is still propagating.
+			if err := m.store.PutAuthorization(a); err != nil {
+				return false, m.recordFailure(st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
+			}
+
 			adopted := false
-			if firstVisit {
-				// First visit: persist the challenge **before** writing DNS. A pass that
-				// dies between the write and the persist below leaves the record up while
-				// the row still says Presented=false -- and the token is then the only
-				// way to locate that record again (the probe right below relies on it,
-				// and so does cleanupOrphanTXT).
-				if err := m.store.PutAuthorization(a); err != nil {
-					return false, m.recordFailure(st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
-				}
-			} else {
+			if !firstVisit {
 				// Been here before: an earlier pass was interrupted between the DNS write
 				// and marking Presented. Re-Present blindly and the record is duplicated;
 				// probe first and, if the old record is already up, adopt it instead.
