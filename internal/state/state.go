@@ -807,6 +807,22 @@ CREATE TABLE IF NOT EXISTS rate_buckets (
 	return nil
 }
 
+// schemaTables are the tables this binary creates.
+//
+// Declared as data for the same reason schemaColumns is: an unlocked open has to be able to say
+// whether the database in front of it is one this build understands, without applying anything.
+var schemaTables = []string{
+	"accounts",
+	"certificates",
+	"orders",
+	"authorizations",
+	"retired_certificates",
+	"identifier_failures",
+	"cert_fallback",
+	"revoke_requests",
+	"rate_buckets",
+}
+
 // schemaColumns are the columns added to tables that predate them.
 //
 // Declared as data, and read by both migrate (which adds them) and pendingMigrations (which only
@@ -831,6 +847,23 @@ var schemaColumns = []struct{ table, column, decl string }{
 // which names neither the cause nor the fix.
 func (s *Store) pendingMigrations() ([]string, error) {
 	var out []string
+	// Tables first, then columns.
+	//
+	// Checking only columns let an unlocked open accept a database that was missing one of the
+	// tables this build adds (the column check cannot see a table that is not there at all), and the
+	// operator then got a raw `no such table: revoke_requests` from whichever operation happened to
+	// touch it, instead of the "this binary needs a schema update, stop the process and run wecert
+	// -once" instruction that exists for exactly this. Reachable for any database written by a build
+	// whose column set is current but which predates a table -- which is every release that adds one.
+	for _, t := range schemaTables {
+		exists, err := s.tableExists(t)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			out = append(out, t)
+		}
+	}
 	for _, m := range schemaColumns {
 		exists, err := s.columnExists(m.table, m.column)
 		if err != nil {
@@ -841,6 +874,17 @@ func (s *Store) pendingMigrations() ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// tableExists reports whether the store's schema contains a table.
+func (s *Store) tableExists(table string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("check table %s: %w", table, err)
+	}
+	return n > 0, nil
 }
 
 // ensureColumn adds a column to a table (when it does not already exist).
