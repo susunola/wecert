@@ -10,6 +10,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	legoacme "github.com/go-acme/lego/v4/acme"
+	"github.com/go-acme/lego/v4/challenge"
+	"github.com/go-acme/lego/v4/challenge/dns01"
+	"github.com/miekg/dns"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
@@ -581,5 +587,193 @@ func TestManagerCleanupOrphanIsANoOpWithNothingInFlight(t *testing.T) {
 	}
 	if got := solver.cleanCount(); got != 0 {
 		t.Errorf("no DNS call belongs in a no-op cleanup, got %d", got)
+	}
+}
+
+// hasTXTLease reports whether the registry still holds this exact value at this name.
+//
+// A non-destructive read on purpose: remove() answers "is another value still live", which is false
+// both when the lease was released and when it was the last one, so it cannot tell the two apart.
+func hasTXTLease(fqdn, value string) bool {
+	challengeLeases.mu.Lock()
+	defer challengeLeases.mu.Unlock()
+	e := challengeLeases.entries[fqdn]
+	return e != nil && e.values[value]
+}
+
+// privateLeaseRegistry gives one test its own registry, so its assertions do not depend on what
+// other tests in this package left behind.
+func privateLeaseRegistry(t *testing.T) {
+	t.Helper()
+	saved := challengeLeases
+	challengeLeases = newTXTLeases()
+	t.Cleanup(func() { challengeLeases = saved })
+}
+
+// A record proven absent must have its lease released.
+//
+// The registry holds a value until someone removes it, and while one is held every later cleanup at
+// the name takes the "another challenge is still live" branch -- so the provider's delete-EVERY-TXT
+// call never fires again for the rest of the process and every record written at that name
+// afterwards stays in DNS until a restart. A probe that every reachable authority answered "no such
+// value" is exactly the evidence that the lease is dead, and it is the same evidence the row
+// deletion already rests on.
+func TestAProvenAbsentRecordReleasesItsLease(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	// The authority denies the record, which is what licenses deleting the row.
+	solver, rec, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			resp := dnsReply(msg)
+			resp.Rcode = dns.RcodeNameError
+			resp.Authoritative = true
+			return resp, nil
+		})
+	solver.newProvider = func(context.Context) (challenge.Provider, error) {
+		return &recordingProvider{}, nil
+	}
+
+	// The value this row's token hashes to -- which is what the probe searches for and what an
+	// interrupted Present registered.
+	value := dns01.GetChallengeInfo("example.com", "keyauth(tok-1)").Value
+
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+		ChallengeToken: "tok-1", TxtName: rec.FQDN, TxtValue: value, Presented: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// What the interrupted Present left behind in this process.
+	challengeLeases.add(rec.FQDN, value)
+	if !hasTXTLease(rec.FQDN, value) {
+		t.Fatal("the fixture must register the lease it is about to check")
+	}
+
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+
+	if as, _ := store.ListAuthorizations("c"); len(as) != 0 {
+		t.Fatalf("the row is deleted on this evidence, so this test is not exercising the release: %d remain", len(as))
+	}
+	if hasTXTLease(rec.FQDN, value) {
+		t.Error("the lease of a record proven absent must be released; while it is held, every later " +
+			"cleanup at this name defers the provider's delete-all and no record written here is ever " +
+			"collected again for the lifetime of this process")
+	}
+}
+
+// A row repointed at a fresh challenge token must release the record its old token owned.
+//
+// This is the other half of the same leak, and the one the code next to it already worried about:
+// after the token is refreshed, CleanUp derives a value the row no longer uses, so the old value's
+// lease is never matched by any removal and stays in the registry forever. The record it stands for
+// is not the new challenge's, so nothing later can collect it either.
+func TestARefreshedChallengeTokenReleasesTheOldRecordsLease(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	solver, _, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			// No record at the name yet: the pass writes the new value.
+			resp := dnsReply(msg)
+			resp.Rcode = dns.RcodeNameError
+			resp.Authoritative = true
+			return resp, nil
+		})
+	provider := &recordingProvider{}
+	solver.newProvider = func(context.Context) (challenge.Provider, error) { return provider, nil }
+	// The propagation wait is not what this test is about, and a zero budget fails it immediately
+	// instead of spending the real one.
+	solver.timeout = time.Millisecond
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	m := newManager(store, &fakeAPI{}, solver, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// The row as a failed propagation left it: the challenge written by an earlier round this
+	// process ran, with its token and the value that token hashed to.
+	oldValue := dns01.GetChallengeInfo("example.com", "keyauth(tok-1)").Value
+	oldName := dns.Fqdn(dns01.GetChallengeInfo("example.com", "keyauth(tok-1)").EffectiveFQDN)
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "https://ca.test/authz/1", Identifier: "example.com",
+		ChallengeToken: "tok-1", TxtName: oldName, TxtValue: oldValue, Presented: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	challengeLeases.add(oldName, oldValue)
+
+	// The CA now offers a different challenge for the same authorization.
+	fake := m.core.(*fakeAPI)
+	fake.authzByURL = map[string]legoacme.Authorization{
+		"https://ca.test/authz/1": {
+			Status:     "pending",
+			Identifier: legoacme.Identifier{Value: "example.com"},
+			Challenges: []legoacme.Challenge{{
+				Type: "dns-01", URL: "https://ca.test/chall/2", Token: "tok-2",
+			}},
+		},
+	}
+
+	st := &state.CertState{Name: "c"}
+	cert := &config.Certificate{Name: "c", Domains: []string{"example.com"}}
+	order := legoacme.ExtendedOrder{
+		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
+		Location: "https://ca.test/order/1",
+	}
+	// Whatever the propagation wait then decides, the refresh branch has run by the time this
+	// returns.
+	_, _ = m.solveChallenges(context.Background(), cert, st, order)
+
+	if hasTXTLease(oldName, oldValue) {
+		t.Error("a refreshed challenge token must release the lease of the record the old token " +
+			"owned; otherwise every later cleanup at this name defers the provider's delete-all for " +
+			"the rest of the process and the old record can never be collected")
+	}
+	if len(provider.presents) == 0 {
+		t.Error("the new challenge must still be written: releasing a lease must not skip the write")
+	}
+}
+
+// A value another presented row still claims must keep its lease.
+//
+// The release is only sound because of this check: a value can be dead for the row that is giving
+// it up and still be the record a different certificate at the same name is waiting on, and
+// dropping that lease would let the next cleanup's delete-EVERY-TXT call take out a record the CA
+// is about to validate -- a billed authorization failure against the per-identifier limit.
+func TestAStaleLeaseIsKeptWhileAnotherPresentedRowClaimsIt(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	m, store := newTestManager(t, &fakeSolver{}, fakeKeyAuth{})
+
+	const fqdn = "_acme-challenge.example.com."
+	const value = "shared-value"
+	challengeLeases.add(fqdn, value)
+
+	// A different certificate's presented row still needs exactly this record.
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "other", AuthzURL: "authz-other", Identifier: "example.com",
+		ChallengeToken: "tok-2", TxtName: fqdn, TxtValue: value, Presented: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.releaseStaleLease(fqdn, value)
+	if !hasTXTLease(fqdn, value) {
+		t.Fatal("a presented row still claims this record: releasing its lease lets the next cleanup " +
+			"delete a record another certificate is waiting to be validated on")
+	}
+
+	// Once that row is gone the value is nobody's, and the lease must go.
+	if err := store.DeleteAuthorization("other", "authz-other"); err != nil {
+		t.Fatal(err)
+	}
+	m.releaseStaleLease(fqdn, value)
+	if hasTXTLease(fqdn, value) {
+		t.Error("no presented row claims the value any more, so a lease that is never released keeps " +
+			"the name un-cleanable for the rest of the process")
 	}
 }

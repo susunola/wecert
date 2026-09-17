@@ -207,19 +207,6 @@ func (r *Reconciler) release(name string) {
 	delete(r.running, name)
 }
 
-// isClaimable reports whether no pass currently holds this certificate.
-//
-// It reads the claim without taking it, for callers that need to know "is anyone working on
-// this right now" rather than "may I start". Taking the claim instead would be wrong for
-// those callers: the orphan teardown is not a convergence pass, it must not block one, and
-// a claim it failed to acquire would otherwise have to be released on every path.
-func (r *Reconciler) isClaimable(name string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, busy := r.running[name]
-	return !busy
-}
-
 // ── Desired state ────────────────────────────────────────────────────────────────
 
 // Prime resolves the desired state once and caches it, triggering no
@@ -359,54 +346,73 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		// So leave a claimed name alone: its own pass owns the teardown, and the next round
 		// reaps it once the claim is released. This is the same check the convergence loop
 		// below makes; this function used to skip it.
-		if !r.isClaimable(name) {
+		//
+		// The claim is TAKEN, not merely looked at. Reading the flag and releasing the lock
+		// immediately left a window in which a webhook-triggered pass claims the name, and the
+		// teardown that follows deletes the TXT records and the order that pass is waiting on --
+		// the exact interleaving the paragraph above exists to prevent, and it needs a webhook
+		// request to arrive during the store read a few lines down. Holding the claim for the
+		// teardown closes it: a pass that starts meanwhile is refused (and retried by its caller)
+		// rather than run against a name being dismantled. The teardown is not a convergence pass,
+		// so it claims the name only for the length of this block.
+		if !r.acquire(name) {
 			r.log.Info("skipping the orphan teardown: a pass for this certificate is still running",
 				"cert", name)
 			continue
 		}
 
 		orphans++
-
-		st, stErr := r.store.GetCert(name)
-
-		// Reclaim whatever an in-flight issuance left behind. Until now nothing
-		// ever tore down an order whose certificate left the desired state
-		// mid-flight: its challenge leases stayed on DNSPod forever, and a stale
-		// TXT value poisons every other certificate that writes the same
-		// _acme-challenge name (a wildcard and its apex always share one).
-		if err := r.manager.CleanupOrphan(ctx, name); err != nil {
-			r.log.Warn("failed to reclaim the orphaned order and its TXT records", "cert", name, "err", err)
-		}
-
-		// Reclaim the per-certificate series. Nothing else ever revisits a name that
-		// has left the desired state, so its gauges would sit at their last value
-		// forever -- and a not_after frozen at its last value trips the documented
-		// expiry rule permanently, for a certificate that no longer exists.
-		metrics.DeleteCertSeries(name)
-
-		// The probe side has the same leak, per host: the served-certificate series
-		// stay at their last value and the prober's transition memory grows with
-		// every host ever seen. The hosts are not in the desired state anymore, so
-		// they are recovered from the last issued certificate's SANs.
-		if stErr == nil && st != nil {
-			for _, host := range r.orphanProbeHosts(st) {
-				metrics.DeleteProbeSeries(host)
-				if r.prober != nil {
-					r.prober.Forget(host)
-				}
-			}
-		}
-
-		attrs := []any{"cert", name}
-		if stErr == nil && st != nil && !st.NotAfter.IsZero() {
-			attrs = append(attrs, "notAfter", st.NotAfter,
-				"daysLeft", config.DaysUntil(st.NotAfter, time.Now()))
-		}
-		r.log.Error("this certificate is no longer in the desired state, so it will not be renewed "+
-			"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard",
-			attrs...)
+		r.tearDownOrphan(ctx, name)
 	}
 	metrics.OrphanedCertificates.Set(float64(orphans))
+}
+
+// tearDownOrphan reclaims everything a certificate that left the desired state still holds.
+//
+// The claim on the name is already held by the caller (see publishOrphans); this function
+// releases it on every path, including a panic in the middle of the teardown, so a failure here
+// cannot wedge the name against every later pass.
+func (r *Reconciler) tearDownOrphan(ctx context.Context, name string) {
+	defer r.release(name)
+
+	st, stErr := r.store.GetCert(name)
+
+	// Reclaim whatever an in-flight issuance left behind. Until now nothing
+	// ever tore down an order whose certificate left the desired state
+	// mid-flight: its challenge leases stayed on DNSPod forever, and a stale
+	// TXT value poisons every other certificate that writes the same
+	// _acme-challenge name (a wildcard and its apex always share one).
+	if err := r.manager.CleanupOrphan(ctx, name); err != nil {
+		r.log.Warn("failed to reclaim the orphaned order and its TXT records", "cert", name, "err", err)
+	}
+
+	// Reclaim the per-certificate series. Nothing else ever revisits a name that
+	// has left the desired state, so its gauges would sit at their last value
+	// forever -- and a not_after frozen at its last value trips the documented
+	// expiry rule permanently, for a certificate that no longer exists.
+	metrics.DeleteCertSeries(name)
+
+	// The probe side has the same leak, per host: the served-certificate series
+	// stay at their last value and the prober's transition memory grows with
+	// every host ever seen. The hosts are not in the desired state anymore, so
+	// they are recovered from the last issued certificate's SANs.
+	if stErr == nil && st != nil {
+		for _, host := range r.orphanProbeHosts(st) {
+			metrics.DeleteProbeSeries(host)
+			if r.prober != nil {
+				r.prober.Forget(host)
+			}
+		}
+	}
+
+	attrs := []any{"cert", name}
+	if stErr == nil && st != nil && !st.NotAfter.IsZero() {
+		attrs = append(attrs, "notAfter", st.NotAfter,
+			"daysLeft", config.DaysUntil(st.NotAfter, time.Now()))
+	}
+	r.log.Error("this certificate is no longer in the desired state, so it will not be renewed "+
+		"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard",
+		attrs...)
 }
 
 // orphanProbeHosts recovers the dialable names of a dropped certificate from the

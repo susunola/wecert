@@ -60,6 +60,12 @@ type fakeManager struct {
 	onReconcile func(name string)
 
 	reapBefore chan struct{}
+
+	// orphanEntered is signalled on every CleanupOrphan, and orphanRelease makes it block until
+	// closed. Together they hold the orphan teardown open so a test can observe what may happen
+	// while it runs.
+	orphanEntered chan struct{}
+	orphanRelease chan struct{}
 }
 
 func (f *fakeManager) Reconcile(_ context.Context, c *config.Certificate) error {
@@ -127,8 +133,18 @@ func (f *fakeManager) publishedQuota() []map[string]string {
 
 func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.cleaned = append(f.cleaned, certName)
+	entered, release := f.orphanEntered, f.orphanRelease
+	f.mu.Unlock()
+
+	// Blocking happens outside the mutex: a test holds this call open while it reads the
+	// reconciler's own state, and holding the fake's lock would deadlock that read.
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
 	return nil
 }
 
@@ -1559,5 +1575,55 @@ func TestAWebhookTriggeredPassPublishesQuotaWhenItFinishes(t *testing.T) {
 				"an hour away is too late for a deadline that is shorter than that")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The orphan teardown must hold the claim while it runs, not just look at it.
+//
+// The check that protects an in-flight pass from having its TXT records and order deleted
+// underneath it used to read the claim and release the lock immediately, so a webhook-triggered
+// pass could claim the name in the gap before CleanupOrphan ran -- the exact destructive
+// interleaving the check exists to prevent. It is reachable: the desired state is resolved twice
+// (once by the pass that sees the name as an orphan, once by the webhook after the declaration was
+// restored), and a document revision can land in between.
+func TestTheOrphanTeardownHoldsTheClaimWhileItRuns(t *testing.T) {
+	const orphan = "orphan-cert"
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	mgr := &fakeManager{orphanEntered: entered, orphanRelease: release}
+	r, store := newTestReconciler(t, []string{"kept"}, mgr)
+
+	// In the store but not in the desired state: an orphan.
+	if err := store.PutCert(&state.CertState{Name: orphan}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.RunDetailed(context.Background())
+	}()
+	<-entered
+
+	// The teardown is inside CleanupOrphan. Anything that wants to claim this name now has to be
+	// refused -- that is what startCert asks, and a "yes" here means the pass would run against a
+	// name whose order and TXT records are being deleted.
+	if r.acquire(orphan) {
+		r.release(orphan)
+		t.Error("the teardown must hold the claim for its whole duration: a pass that claims the " +
+			"name now has its order and TXT records deleted underneath it, fails with a propagation " +
+			"error, and re-orders into the exact-set quota")
+	}
+
+	close(release)
+	<-done
+
+	// And the claim is released when the teardown ends, so the name is not wedged against every
+	// later pass.
+	if !r.acquire(orphan) {
+		t.Error("the teardown must release the claim when it finishes")
+	} else {
+		r.release(orphan)
 	}
 }
