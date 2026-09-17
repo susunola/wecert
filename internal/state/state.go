@@ -774,6 +774,12 @@ CREATE TABLE IF NOT EXISTS cert_fallback (
 CREATE TABLE IF NOT EXISTS revoke_requests (
     cert_name   TEXT PRIMARY KEY,
     reason      INTEGER NOT NULL DEFAULT 0,
+    -- The certificate the operator asked to revoke, as an identity derived from its material
+    -- (see acme.certIdentity). Without it the retry revoked "whatever is stored under this name
+    -- now" -- and a renewal between the request and the retry replaces exactly that, so the
+    -- request could revoke the NEW certificate while the compromised one stayed valid, then
+    -- clear itself as a success. Empty means unknown: a request recorded by an older build.
+    cert_identity TEXT NOT NULL DEFAULT '',
     requested_at INTEGER NOT NULL DEFAULT 0,
     attempts    INTEGER NOT NULL DEFAULT 0,
     last_error  TEXT NOT NULL DEFAULT '',
@@ -838,6 +844,11 @@ var schemaColumns = []struct{ table, column, decl string }{
 	// value would look like a usable (empty) certificate.
 	{"retired_certificates", "cert_pem", "BLOB"},
 	{"retired_certificates", "key_pem", "BLOB"},
+	// Certificate identity on a pending revocation. Legacy rows keep the empty default, which
+	// reads as "unknown" and makes the retry fall back to the pre-column behaviour (revoke the
+	// material stored now); inventing an identity would make the retry refuse to act on the
+	// operator's request for a reason that was not true when they made it.
+	{"revoke_requests", "cert_identity", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // pendingMigrations reports schema changes this binary would apply, without applying them.
@@ -1412,6 +1423,39 @@ func (s *Store) ListRetiredCertsBefore(cutoff time.Time) ([]*RetiredCert, error)
 		var retiredAt int64
 		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt, &r.CertPEM, &r.KeyPEM); err != nil {
 			return nil, fmt.Errorf("scan retired cert: %w", err)
+		}
+		r.RetiredAt = fromUnix(retiredAt)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListRetiredCertMaterial returns the archived certificate material of every retired certificate
+// recorded under one name, newest first.
+//
+// Rows without material are skipped: the orphan path records a certificate wecert merely uploaded
+// and never held a copy of, and an empty blob would look like a usable (empty) certificate. What
+// this answers is "is the certificate the operator asked to revoke still here somewhere", which is
+// how a revocation request that outlives its renewal can still be honoured.
+func (s *Store) ListRetiredCertMaterial(certName string) ([]*RetiredCert, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`
+		SELECT cert_id, cert_name, retired_at, cert_pem, key_pem
+		FROM retired_certificates
+		WHERE cert_name = ? AND cert_pem IS NOT NULL
+		ORDER BY retired_at DESC`, certName)
+	if err != nil {
+		return nil, fmt.Errorf("list archived material for %s: %w", certName, err)
+	}
+	defer rows.Close()
+
+	var out []*RetiredCert
+	for rows.Next() {
+		r := &RetiredCert{}
+		var retiredAt int64
+		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt, &r.CertPEM, &r.KeyPEM); err != nil {
+			return nil, fmt.Errorf("scan archived material for %s: %w", certName, err)
 		}
 		r.RetiredAt = fromUnix(retiredAt)
 		out = append(out, r)

@@ -364,7 +364,10 @@ func (f *fakeAPI) RevokeCertificate(der []byte, reason int) error {
 	f.enter("RevokeCertificate")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.revoked = append(f.revoked, revokedCall{Reason: reason, DERLen: len(der)})
+	// The bytes are kept, not just their length: a revocation that sends the wrong certificate is
+	// a well-formed request for a harmful action, which the length cannot tell apart from the
+	// right one.
+	f.revoked = append(f.revoked, revokedCall{Reason: reason, DERLen: len(der), DER: append([]byte(nil), der...)})
 	if f.revokeErr != nil {
 		return f.revokeErr
 	}
@@ -374,6 +377,7 @@ func (f *fakeAPI) RevokeCertificate(der []byte, reason int) error {
 type revokedCall struct {
 	Reason int
 	DERLen int
+	DER    []byte
 }
 
 func (f *fakeAPI) GetRenewalInfo(string) (*http.Response, error) {

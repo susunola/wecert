@@ -9,6 +9,8 @@ import (
 	legoacme "github.com/go-acme/lego/v4/acme"
 	"strings"
 	"time"
+
+	"github.com/susunola/wecert/internal/state"
 )
 
 // RevocationReasons are the RFC 5280 CRLReason codes an operator may choose.
@@ -62,7 +64,32 @@ func (m *Manager) RequestRevocation(ctx context.Context, certName string, reason
 		return fmt.Errorf("%w: %w", ErrRevocationNotRecorded, err)
 	}
 
-	if err := m.store.AddRevokeRequest(certName, reason, m.now()); err != nil {
+	// The identity of the certificate being revoked, recorded with the request. A retry can be
+	// days later, and a renewal in between replaces the material stored under this name -- see
+	// processRevocation for what the retry does with it.
+	identity := ""
+	if leaf, err := leafCertificate(st.CertPEM); err == nil {
+		identity = certIdentity(leaf)
+		// Asking again after a renewal is a new decision about a different certificate, and the
+		// refresh below silently retargets the request. Say so: the previous certificate is then
+		// only revoked if its own request is still outstanding.
+		if prev, perr := m.store.GetRevokeRequest(certName); perr == nil && prev != nil &&
+			prev.CertIdentity != "" && prev.CertIdentity != identity {
+			m.log.Warn("the certificate stored for this name is not the one the outstanding request "+
+				"targets; this new request retargets it at the certificate stored now, and the "+
+				"previous one is revoked only if its request is still outstanding",
+				"cert", certName, "outstanding", prev.CertIdentity, "now", identity)
+		}
+	} else {
+		// Material that does not parse cannot be identified. Recording the request anyway keeps
+		// the operator's decision (the alternative is telling them nothing was recorded, for a
+		// request that is in fact queued), and the empty identity makes the retry fall back to
+		// revoking the stored material, which is what this did before identities existed.
+		m.log.Warn("cannot identify the stored certificate, so the revocation request will not be "+
+			"able to tell later whether it was replaced in the meantime", "cert", certName, "err", err)
+	}
+
+	if err := m.store.AddRevokeRequest(certName, reason, identity, m.now()); err != nil {
 		return fmt.Errorf("%w: %w", ErrRevocationNotRecorded, err)
 	}
 	m.log.Error("revocation requested; the request is recorded and will be retried until the CA accepts it",
@@ -162,20 +189,10 @@ func (m *Manager) processRevocation(ctx context.Context, certName string) error 
 		return nil
 	}
 
-	st, err := m.store.GetCert(certName)
+	der, err := m.revocationMaterial(certName, req)
 	if err != nil {
-		return err
-	}
-	if st == nil || len(st.CertPEM) == 0 {
-		// Nothing to revoke with. Clearing the request would lose the operator's decision, so
-		// it is left outstanding and reported by PendingRevocations.
-		err := errors.New("no stored certificate material to revoke")
-		_ = m.store.RecordRevokeAttempt(certName, err, m.now())
-		return err
-	}
-
-	der, err := leafDER(st.CertPEM)
-	if err != nil {
+		// Clearing the request would lose the operator's decision, so it is left outstanding and
+		// reported by PendingRevocations.
 		_ = m.store.RecordRevokeAttempt(certName, err, m.now())
 		return err
 	}
@@ -218,8 +235,63 @@ func (m *Manager) processRevocation(ctx context.Context, certName string) error 
 	return nil
 }
 
-// leafDER extracts the first certificate's DER bytes from a PEM bundle.
-func leafDER(certPEM []byte) ([]byte, error) {
+// revocationMaterial decides which certificate bytes a request must send.
+//
+// Revoking the certificate stored *now* is only correct while it is still the certificate the
+// request was made about. A renewal replaces it, and reconcile retries revocations after the
+// certificate loop -- so the same pass can install a new certificate and then revoke it, while the
+// compromised one stays valid and the request row is cleared as a success. That is the exact
+// opposite of what was asked for, so the identity recorded with the request decides.
+func (m *Manager) revocationMaterial(certName string, req *state.RevokeRequest) ([]byte, error) {
+	st, err := m.store.GetCert(certName)
+	if err != nil {
+		return nil, err
+	}
+
+	var stored *x509.Certificate
+	if st != nil && len(st.CertPEM) > 0 {
+		stored, err = leafCertificate(st.CertPEM)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	switch {
+	case stored == nil:
+		// No usable material under the name (never issued, or the row holds none). The archive is
+		// then the only way to honour the request, and without an identity there is nothing to
+		// look for and nothing to send.
+		if req.CertIdentity == "" {
+			return nil, errors.New("no stored certificate material to revoke")
+		}
+		return m.archivedDER(certName, req.CertIdentity)
+	case req.CertIdentity == "":
+		// Recorded before the identity was stored. There is nothing to compare against, so the
+		// material at hand is revoked -- the pre-existing behaviour -- and the gap is stated
+		// rather than hidden.
+		m.log.Warn("this revocation request carries no certificate identity, so the certificate "+
+			"stored now is revoked whichever one that is", "cert", certName)
+		return stored.Raw, nil
+	case certIdentity(stored) == req.CertIdentity:
+		// The ordinary case: the certificate to revoke is still the stored one.
+		return stored.Raw, nil
+	default:
+		archived, aerr := m.archivedDER(certName, req.CertIdentity)
+		if aerr != nil {
+			return nil, aerr
+		}
+		m.log.Warn("the certificate stored for this name is not the one this request targets, so "+
+			"the archived copy is revoked instead of the live certificate",
+			"cert", certName, "requested", req.CertIdentity, "stored", certIdentity(stored))
+		return archived, nil
+	}
+}
+
+// leafCertificate parses the first certificate of a PEM bundle.
+//
+// A revocation is about the leaf: the intermediates in the bundle are the CA's, not something this
+// program may ask to revoke.
+func leafCertificate(certPEM []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
 		return nil, errors.New("no PEM block found in the stored certificate")
@@ -227,8 +299,65 @@ func leafDER(certPEM []byte) ([]byte, error) {
 	if block.Type != "CERTIFICATE" {
 		return nil, fmt.Errorf("expected a CERTIFICATE block, got %q", block.Type)
 	}
-	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
 		return nil, fmt.Errorf("stored certificate does not parse: %w", err)
 	}
-	return block.Bytes, nil
+	return leaf, nil
+}
+
+// leafDER extracts the first certificate's DER bytes from a PEM bundle.
+func leafDER(certPEM []byte) ([]byte, error) {
+	leaf, err := leafCertificate(certPEM)
+	if err != nil {
+		return nil, err
+	}
+	return leaf.Raw, nil
+}
+
+// certIdentity names a certificate for the revocation bookkeeping.
+//
+// It is the ARI certID -- base64url(AKI keyIdentifier) "." base64url(DER serial), RFC 9773
+// section 4.1 -- because that is already this codebase's answer to "which certificate is this",
+// and it is derived from the certificate itself rather than from anything this program stores
+// beside it. A leaf without an Authority Key Identifier falls back to its serial, which still
+// tells a renewal apart; both forms are produced here, so the stored value and the compared value
+// can never disagree about their spelling.
+func certIdentity(leaf *x509.Certificate) string {
+	if id, err := CertID(leaf); err == nil {
+		return id
+	}
+	return "serial:" + strings.ToUpper(leaf.SerialNumber.Text(16))
+}
+
+// archivedDER finds the retired copy of the certificate a revocation request targets.
+//
+// The request is not abandoned just because the material under the name changed: the certificate
+// the operator asked about is the one that must stop being trusted (the reason code is usually
+// keyCompromise), and wecert deliberately keeps retired material for rollback. Revoking an
+// archived certificate works because the ACME revocation is signed with the ACCOUNT key -- lego's
+// api.Core builds every JWS from the account's kid and private key, not from the certificate's own
+// key -- so it does not matter that the private key that served it is no longer in use.
+//
+// When the archive no longer holds it (retention reclaims retired rows, and their material with
+// them) there is nothing to send and nothing that can be done from here, so the error says exactly
+// that and the request stays outstanding, keeping wecert_revocation_pending up until someone acts.
+func (m *Manager) archivedDER(certName, identity string) ([]byte, error) {
+	cands, err := m.store.ListRetiredCertMaterial(certName)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range cands {
+		leaf, err := leafCertificate(c.CertPEM)
+		if err != nil {
+			// A retired row whose material does not parse cannot be the certificate asked about,
+			// and the operator's own row is the one worth reporting on.
+			continue
+		}
+		if certIdentity(leaf) == identity {
+			return leaf.Raw, nil
+		}
+	}
+	return nil, fmt.Errorf("the certificate this request targets (%s) is not the one stored for %q "+
+		"and no archived copy of it is held: it has to be revoked at the CA", identity, certName)
 }
