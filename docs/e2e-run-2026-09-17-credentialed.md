@@ -10,7 +10,11 @@
 
 ## 1. 一句话结论
 
-本轮用真实 LE staging 签出了证书，首次在真实 CLB 上证明了**只换掉一张证书不会动到同一监听器上的另一张**（SNI 按规则隔离，独立 TLS 握手机位复核），并在一台真机 Ubuntu 上跑通了 **systemd + CVM 角色**的一轮完整签发（`install.sh` 装出的路径约定与加固项都成立，机器上没有任何静态密钥）；但同时也证明了两件事在**当前账号条件**下不可用：DNS 传播判据会因权威节点对本机**瞬时不可达**而放行尚未全局传播的记录（第一次 L1 因此被 CA 判 `NXDOMAIN`），以及部署校验的 30s 固定预算会让**云端已经成功**的换绑永远无法回写成功状态，`deployed_cert_id` 停留在旧证书、`not_after` 停留在 0（该缺陷已修复，并在同一账号同场景复跑一次即收敛，见 4.6 与 5.2）。
+本轮在真实账号（真实 LE **staging** + 真实 DNSPod + 真实 CLB/CVM）上把此前**所有未跑的用例跑完了**：apex + `*.apex` 共用一个 TXT 名（两个值在 8 个权威地址上同时在线）、`profile: tlsserver` 的 45 天证书与一次完整自动续期、以及 Stage C 的"真机 systemd + `cvm-role`，首签 → 手工绑定 → 自动续期并换绑"。SNI 隔离在两种执行者下都成立：本地续期一张证书、真机守护进程续期另一张，互不影响。
+
+同时本轮发现并修复了四个缺陷，全部有真机证据、测试与变异校验：**部署校验的 30s 固定预算**把"未验证"写成"失败"、导致续期在本账号**永不收敛**（4.4/4.6、5.2）；**DNS 传播判据只看权威服务器**，与 CA 实际走的递归解析路径可能不一致，从而把尚未全局传播的记录判过并烧掉失败配额（4.1/4.2、5.1）；**lego 的 SOA 走查**会把"解析器答不出"报成"DNSPod 里没有这个域名"，误导排障方向（5.6）；以及一个**按墙钟到期的测试**，距今约 20 分钟前自己变红（5.5）。
+
+仍未验证的只有两类，且都在第 6 节写明：真实时间流逝下的自然续期（本轮续期窗口都是用状态库推到当下的），以及真实生产 LE（全程 staging）。
 
 ---
 
@@ -38,6 +42,10 @@
 | 双 SAN 泛域名 + SNI 隔离 | `testenv/` + 规则级证书绑定 + `UpdateCertificateInstance` | **通过** | 换绑后 alpha 变为 `CN = *.alpha.atomwangnus.com`，beta 指纹与基线逐字节一致（见 4.3） |
 | 部署状态回写 | 上述换绑后 wecert 的校验阶段 | **失败** | 连续 3 次 `success=1 failed=0` 但枚举超时；`deployed_cert_id=ariXUn7n`、`not_after=0`、`consecutive_failures=3` |
 | 部署状态回写（修复后复跑） | 同上，二进制 `355655e` | **通过** | 一次 pass 内收敛：`deployed_cert_id=asH7jREM`、`not_after=2026-12-16`、`consecutive_failures=0`、`orders=0`，旧证书 `asGojB81` 进入回收清单；规则级握手复核新证书已在服务（见 4.6） |
+| apex + `*.apex` 共用 TXT 名（真实 DNSPod） | `atomwangnus.com` + `*.atomwangnus.com` | **通过** | 同名两条挑战值在 8 个权威地址上同时在线、`records=2`、订单收尾无失败（4.7） |
+| `profile: tlsserver`（45 天）真实签发 | 真实 LE staging | **通过** | 订单带 `profile=tlsserver`，实测 45 天（4.8） |
+| 完整自动续期闭环（真实 LE staging） | 推窗到现在的续期 + 换绑 | **通过** | 续期成功、`success=1`、旧证书进回收、规则级握手确认新证书在服务（4.8） |
+| Stage C 首签 → 手工绑定 → 自动续期/换绑 | 真机 systemd + `cvm-role` | **通过** | 上传 `asJfCWAP` → 绑规则 → 守护进程续期到 `asK2pula`，指标确认部署，同一监听器上另一张证书未受影响（4.9） |
 | Stage C 安装 + systemd + 角色 | `install.sh` on Ubuntu 22.04 CVM + `systemctl enable --now wecert` | **通过** | `install.sh` 装出 `/usr/local/bin/wecert`（sha256 与本机交叉编译产物逐字节一致）、`/etc/wecert/config.yaml 0640 root:wecert`、`/var/lib/wecert 0700 wecert:wecert`；unit `active`；`credentialMode=cvm-role` 下完成一轮真实签发并上传（见 4.5） |
 | apex + `*.apex` 单证书（真实 LE） | — | **未跑** | 本轮未执行 |
 | `profile: tlsserver`（45 天）真实续期 | — | **未跑** | 真实 LE 侧未跑；profile 选择仅由离线 pebble e2e 覆盖 |
@@ -235,6 +243,98 @@ subject=CN = *.alpha.atomwangnus.com   issuer=C = US, O = Let's Encrypt, CN = (S
 - 这次**修复后的真实路径不是哨兵分支**：预算放宽到 3 分钟后，枚举在预算内给出了答案，于是走的是既有的"旧证书 0 绑定、新证书有绑定 -> 认定切换已发生"的恢复判定（上面那条 WARN）。哨兵分支（枚举超时 / 未覆盖全部 region）本轮在真实账号上**没有被触发**，它只有单元测试与变异校验覆盖。
 - 本轮 `TXT propagated` 报的是 `nameservers=9`（前几次是 10），即探测时有一个权威地址不可达；结论仍要求"无否认 + >= 2 个 NS 名确认"，5.1 描述的口径问题不因这次通过而消失。
 
+### 4.7 apex + `*.apex` 共用一个 TXT 名（真实 DNSPod）
+
+配置 `atomwangnus.com` 与 `*.atomwangnus.com`，`deploy.enabled: false`（本用例只看 DNS 路径）。运行期用采样器每 2 秒查一遍全部权威地址：
+
+```
+20:47:21 INFO "TXT presented" identifier=atomwangnus.com name=_acme-challenge.atomwangnus.com.
+20:47:22 INFO "TXT presented" identifier=atomwangnus.com name=_acme-challenge.atomwangnus.com.
+20:49:14 INFO "TXT propagated" zone=atomwangnus.com. nameservers=10 records=2 evidence="..."
+20:49:19 INFO "another challenge is still live at the TXT name; leaving its cleanup to the last leaver"
+20:49:35 INFO "certificate issued and recorded locally (cloud deploy is off)" notAfter=2026-12-16T11:50:53Z daysLeft=90
+```
+
+采样器在同一时刻抓到**八个权威地址同时返回两个值**——这正是 wildcard + apex 必须"写全部、一起验、一起清"的原因：
+
+```
+20:47:23 t+20.5   s 101.227.168.75:53   NOERROR AA VRjeLz6PEz,qQmNtPHniR
+20:47:23 t+20.5   s 117.135.128.175:53  NOERROR AA VRjeLz6PEz,qQmNtPHniR
+20:47:23 t+20.5   s 43.130.172.75:53    NOERROR AA VRjeLz6PEz,qQmNtPHniR
+20:47:23 t+20.5   s 163.177.5.79:53     NOERROR AA VRjeLz6PEz,qQmNtPHniR
+20:47:23 t+20.5   s 220.196.136.75:53   NOERROR AA VRjeLz6PEz,qQmNtPHniR
+20:47:23 t+20.5   s 43.161.3.75:53      NOERROR AA VRjeLz6PEz,qQmNtPHniR
+20:47:23 t+20.5   s 125.94.59.175:53    NOERROR AA VRjeLz6PEz,qQmNtPHniR
+20:47:23 t+20.5   s 43.134.249.75:53    NOERROR AA VRjeLz6PEz,qQmNtPHniR
+```
+
+状态：`not_after=2026-12-16`、`ari_cert_id` 已写、`orders=0`、`consecutive_failures=0`。`TXT propagated` 判定发生在共存出现之后约 110s——比之前的 21s/66s 都长，与新增的递归视角（5.1）一致。
+
+### 4.8 `profile: tlsserver`（45 天）与一次完整自动续期
+
+```
+INFO "ACME order created" cert=tls-renewal status=pending names=1 profile=tlsserver replaces=false
+INFO "certificate uploaded; waiting for a one-time manual bind in the CLB console"
+     notAfter=2026-11-01T11:55:59.000Z uploadedCertId=asJ7891R
+```
+
+签发于 2026-09-17T11:56Z、到期 2026-11-01T11:55:59Z，即 **45 天**（classic 为 90 天）：真实 LE staging 接受了该 profile 并据此签发。
+
+随后把这张证书按"控制台那一次手工绑定"绑到 `test.alpha.atomwangnus.com` 规则，再用状态库把续期窗口推到现在（`not_after=now+2h`、ARI 窗口整体落在过去、`ari_checked_at=now`），跑第二遍：
+
+```
+INFO "one-click update progress" deployRecordId=15364 success=1 failed=0 running=0 pending=0
+INFO "certificate renewed and live" cert=tls-renewal notAfter=2026-11-01T11:57:05.000Z daysLeft=45 deployedCertId=asJBzZXT ariCertId=true
+state: not_after=2026-11-01 11:57:05 | deployed_cert_id=asJBzZXT | failures=0 | orders=0 | retired=[asJ7891R]
+```
+
+独立机位复核（CVM 内握手，VIP `10.99.1.11`）：`test.alpha...` 规则服务的证书 `notBefore=Sep 17 11:57:06 2026 GMT`、`notAfter=Nov 1 11:57:05 2026 GMT`，即刚续期的那一张。
+
+如实说明：这是**用状态库把窗口推到现在**的完整续期闭环，不是等 30 天自然到期；它验证判定、签发、换绑、记账、回收这条链路，不验证真实时间流逝。
+
+同一次运行另有一条 ERROR：
+
+```
+ERROR "cannot reach this name to check which certificate it serves" host=atomwangnus.com state=unreachable
+      err="probe: resolve atomwangnus.com: lookup atomwangnus.com: no such host"
+```
+
+这是网络侧探测在如实报告"该域名在公网 DNS 里没有 A 记录"（本 zone 只用于 ACME 测试，没有建站记录），不是故障；但它说明该探测会对"证书覆盖了一个不解析的名字"持续报 ERROR，真部署里应视为配置告警。
+
+### 4.9 Stage C 完整链路：首签 → 手工绑定 → 自动续期 + 自动换绑（systemd + CVM 角色）
+
+真机 Ubuntu 22.04（`ins-5qfzvo6i`），`install.sh` 安装，systemd 以 `User=wecert` 常驻，`credentialMode: cvm-role`，证书 `*.beta.atomwangnus.com`：
+
+```
+INFO "Tencent Cloud deploy enabled" credentialMode=cvm-role resourceTypes=[clb] regions=[ap-guangzhou]
+INFO "TXT presented" cert=beta-cert identifier=beta.atomwangnus.com name=_acme-challenge.beta.atomwangnus.com.
+INFO "TXT propagated" zone=atomwangnus.com. nameservers=10 records=1 evidence="_acme-challenge.beta... (confirmed 3/3 server(s) / ...)"
+INFO "certificate uploaded; waiting for a one-time manual bind in the CLB console" uploadedCertId=asJfCWAP
+```
+
+（注意 `evidence=` 字段：5.1 里"成功日志必须带证据"的改动已经在真机日志里生效。）
+
+把 `asJfCWAP` 绑到 `test.beta.atomwangnus.com` 规则（对应控制台的一次性手工绑定），再把续期窗口推到现在并重启服务，守护进程自动完成续期与换绑：
+
+```
+INFO "one-click update progress" deployRecordId=15365 success=1 failed=0 running=0 pending=0
+INFO "certificate renewed and live" cert=beta-cert notAfter=2026-12-16T12:09:30.000Z daysLeft=90 deployedCertId=asK2pula ariCertId=true
+state: not_after=2026-12-16 | deployed_cert_id=asK2pula | failures=0 | orders=0 | retired=[asJfCWAP]
+metrics: wecert_certificate_deployed{cert="beta-cert"} 1   wecert_reconcile_total{cert="beta-cert",result="ok"} 1
+```
+
+同一条监听器上的**另一张证书不受影响**——本轮最强的隔离证据，来自两个独立执行者、两张不同证书：
+
+```
+== test.alpha.atomwangnus.com
+notBefore=Sep 17 11:57:06 2026 GMT notAfter=Nov  1 11:57:05 2026 GMT   SAN: DNS:atomwangnus.com
+== test.beta.atomwangnus.com
+notBefore=Sep 17 12:09:31 2026 GMT notAfter=Dec 16 12:09:30 2026 GMT   SAN: DNS:*.beta.atomwangnus.com
+```
+
+alpha 上仍是 4.8 那张 45 天证书（本地那次续期的结果），beta 上已是守护进程刚签发的 90 天证书；两次换绑互不干扰。
+
+
 ---
 
 ## 5. 发现的问题
@@ -246,7 +346,9 @@ subject=CN = *.alpha.atomwangnus.com   issuer=C = US, O = Let's Encrypt, CN = (S
 - **根因**：判据是"**没有可达的权威服务器否认该值，且至少 1 个确认**（多权威时要求 >= 2 个 NS 名）"（`internal/acme/dns.go`，`probeReadyWithExchange`）。一个**此刻从 wecert 主机不可达**的滞后节点贡献不了任何信息，于是判据可以在它其实还在发 `NXDOMAIN` 的时候判过。**该判据是全局传播的下界，且其结论依赖于 wecert 所处的网络机位**；而 CA 的解析器恰恰能到达那个节点。
 - **影响**：授权验证失败会消耗 **5 authorization failures per identifier / 小时** 这一不可恢复配额；更糟的是它表现为"偶发"，容易被误判成 CA 侧抖动而重试，从而继续烧配额。
 - **已实现（本轮，零风险的一半）**：`TXT propagated` 这条**成功**日志现在带上它据以判断的证据，而不只是服务器数量——每轮的完整 summary（`confirmed N/M server(s) / denied … / non-authoritative … / unreachable …`）都会打印出来。理由是这条判定是全局传播的**下界**、且来自本机视角，出了事故回头看日志时，"当时有多少权威地址其实是看不见的"必须可查；此前只有 `nameservers=10 records=1`，看不出来。已加测试 `TestPropagatedVerdictLogsItsEvidenceIncludingUnreachableAuthorities` 并做变异校验（把该字段去掉，测试立刻变红）。
-- **建议修法（仍未实现）**：把"看不见"从"没问题"里拆出来。（a）在 `probeReadyWithExchange` 里区分"**明确否认**"与"**不可达**"，并对**不可达**单独设阈值：当可达权威地址数低于该 zone 的一个比例（例如写死一个下限，或要求 >= 2/3 的 NS 名）时，**不判过**而是继续等，并把 `unreachable` 计入决策而不是只计入 summary 文本。（b）对同一地址做**连续多轮确认**，用"连续 N 轮一致"代替单轮快照，避免一次 ICMP/UDP 抖动就改变结论。（c）把每条记录的实测等待时长与最终 `unreachable` 计数写进日志与指标，让"这次是靠运气过的"在事后可查。
+- **已实现（本轮，行为改动）**：把 CA 的解析路径本身变成判据的一部分。`probeRecursive`（`internal/acme/dns.go`）在宣布传播完成之前，向配置的递归解析器（`dns.recursiveNameservers`，默认取 `/etc/resolv.conf`）查询同一个 TXT 值，沿用与权威探测相同的三分法：**拿到值 = 确认**；**NXDOMAIN 或 NOERROR 但没有该值（含被负缓存的答案）= 否认**；**超时 / SERVFAIL / REFUSED / 截断 = 无法判断**。规则是：**任一可达递归解析器否认就不判过**（那正是 CA 会拿到的答案，等待是正确反应），**至少一个确认**；**全部无法判断时降级为警告**并沿用权威结论——否则没有公网 DNS 出口的主机将永远无法签发。
+  三条性质各有一个测试（否认阻止 / 确认通过 / 无人应答降级）并把两处都做了变异校验：去掉递归检查、或让"无人应答"变成阻止，测试立刻变红。`make e2e`（3/3 套件）与 `make test-pebble`（2/2）仍通过——它们的递归解析器就是本地测试权威。
+- **仍未实现（可选的进一步收紧）**：对同一地址做**连续多轮确认**，用"连续 N 轮一致"替代单轮快照，避免一次 UDP 抖动改变结论。本轮没有做，因为它的收益小于它引入的等待时间，且递归视角已经覆盖了最主要的不对称。
 
 ### 5.2 部署校验的 30s 固定预算，把"未验证"写成"失败"（最严重）
 
@@ -295,6 +397,21 @@ subject=CN = *.alpha.atomwangnus.com   issuer=C = US, O = Let's Encrypt, CN = (S
 - **影响**：套件会在某个固定时刻之后无条件变红，与代码质量无关；这类失败最容易被误读成"上一个提交改坏了"，本轮确实先花时间排除了自己的改动。
 - **修法**：已把边界改成存储层时钟（`ListRetiredCertsBefore(time.Now().Add(time.Hour))`）并写明理由——断言关心的是"旧证书的材料有没有被归档"，不是"何时归档"。同时确认它仍在测该测的东西：把 `retireOld` 置为 `false` 后该测试立刻变红。一般规则：断言带时间戳的状态时，边界要用**写状态的那个时钟**，不要用被测对象注入的时钟反推。
 
+### 5.6 lego 的 SOA 走查会把"解析不到"报成"DNSPod 里没有这个域名"
+
+- **现象**：`tlsserver` 那轮第一次执行直接失败：
+
+  ```
+  err="present TXT (atomwangnus.com): present TXT: tencentcloud: failed to get hosted zone:
+       zone com. not found in dnspod for domain _acme-challenge.atomwangnus.com."
+  ```
+
+  报错读起来像"DNSPod 账号里没有这个域名"，但同一账号、同一域名在同一分钟里刚刚成功签发过（4.7 那次）。
+- **证据**：同一次执行的 `DescribeDomainList` 返回 14 个域名且 `atomwangnus.com` 在列；`/etc/resolv.conf` 里只有一台本机路由器（`192.168.31.1`），它在那段时间对 `atomwangnus.com` 的 SOA 查询没有给出答案。lego 的实现（`providers/dns/tencentcloud/wrapper.go`）先用 `FindZoneByFqdn` 走 SOA 上溯，而它对"走到了公共后缀"没有任何防护：更深的名字拿不到答案时就继续上溯，直到 `com.` 给出 SOA，于是 zone 被判成 `com.`。
+- **根因**：本机递归解析器不稳定 → SOA 上溯失败 → lego 把"解析不到"当成"zone 就是上层"，报出的是一个**症状**（账号里没有 com）而不是**原因**（解析器答不出 SOA）。wecert 自己的 `findZone` 早就有这个防护（"SOA 走查停在公共后缀"时直接报错并提示检查域名拼写），但它在 lego 的 `Present` **之后**才被用到。
+- **影响**：一个偶发的解析器抖动被报成账号配置问题，排障方向会被带偏；对自动化来说，它表现为"偶尔有一次签发失败"，而错误信息里没有任何指向 DNS 解析的线索。
+- **修法（已实现）**：`Present` 现在先自己 `findZone` 再交给 provider 写记录，于是那条既有的一行错误（"SOA 走查停在公共后缀 com."）会先出来，provider 不会被要求往一个我们解析不出的 zone 里写。代价是每次写入多一次很短的 SOA 走查（lego 本来也要做）。测试 `TestPresentReportsTheZoneInsteadOfLettingLegoBlameTheAccount` 断言错误里要出现 "public suffix"、且 provider 一次都没被调用；去掉这道防护测试立刻变红。本轮三组真机运行也把 `dns.recursiveNameservers` 显式配成 `8.8.8.8` / `223.5.5.5`（该网络上这两台可靠），并在配置注释里写明了原因。
+
 ---
 
 ## 6. 未跑 / 不能证明的东西
@@ -303,15 +420,17 @@ subject=CN = *.alpha.atomwangnus.com   issuer=C = US, O = Let's Encrypt, CN = (S
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| apex + `*.apex` 单证书（真实 LE staging） | **未跑** | 本轮只跑了单域名与双泛域名 SAN；共享 TXT 名的合并逻辑仅由离线 pebble 轮覆盖 |
-| 共享 apex + wildcard TXT 名（真实 DNSPod） | **未跑** | 真实 DNSPod 上未验证两个值是否同时在线 |
-| `profile: tlsserver`（45 天）真实 LE 续期 | **未跑** | 真实 LE 侧未跑完整自动续期；profile 选择只有离线 pebble e2e 覆盖 |
+| apex + `*.apex` 单证书（真实 LE staging） | **通过** | 见 4.7：两个值在 8 个权威地址上同时在线，`records=2` |
+| 共享 apex + wildcard TXT 名（真实 DNSPod） | **通过** | 见 4.7 |
+| `profile: tlsserver`（45 天）真实续期 | **通过（窗口是推出来的）** | 见 4.8：45 天已核实；续期窗口由状态库推到当下，不是等 30 天自然到期 |
+| 真实时间流逝下的自然续期（等 30 天） | **未跑** | 本轮的续期窗口都是推出来的 |
 | Stage C 安装 / systemd / 角色凭证路径 | **通过** | 见 4.5：`install.sh` 装出的路径约定、加固项、`cvm-role` 下的一轮真实签发与上传都成立 |
-| Stage C 的"首签后手工绑定 → 之后自动换绑" | **未跑** | 本轮未在 CLB 控制台做那次一次性手工绑定，因此这一段链路未验证 |
+| Stage C 的"首签后手工绑定 → 之后自动换绑" | **通过** | 见 4.9：手工绑定用 API 完成（对应控制台那一次），随后守护进程自动续期并换绑 |
 | 传播判据在其它域名/网络机位是否同样偏乐观 | **未验证** | 只有 `atomwangnus.com` 一个 zone 的采样数据 |
 | 5.2 的修法能否在本账号收敛 | **已验证** | 修复后同场景复跑一次即收敛（见 4.6）；但触发的是恢复判定而非哨兵分支，哨兵分支仅有单元测试覆盖 |
 | 关闭 SNI 后 Stage B 原路径是否可用 | **未验证** | 本账号无法关闭 SNI，因此这条路径无法被本账号证伪或证实 |
 | 生产（非 staging）LE 配额与签发行为 | **未跑** | 全程 staging |
+| 5.1 的递归视角在解析器负缓存很深时是否过慢 | **未验证** | 判据会等到负缓存过期（受 SOA minimum 限制），本轮未构造该场景 |
 
 另外要明确：**"L1 通过"只说明第二次那一条命令在该时刻成功**，不说明传播等待时长是确定的；两次尝试的差异恰恰是本报告 5.1 的主题。
 
