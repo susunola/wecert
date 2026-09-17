@@ -284,6 +284,12 @@ type Report struct {
 	// decisions are made this round.
 	GuardUnavailable bool `json:"guardUnavailable,omitempty"`
 
+	// GuardIncomplete means the guard ANSWERED, but short of what the API said existed. It is
+	// reported apart from GuardUnavailable on purpose: both suppress removals, but this one is
+	// not weather to retry -- it means the rule list itself is being truncated, and the names it
+	// did not mention were never checked against anything.
+	GuardIncomplete bool `json:"guardIncomplete,omitempty"`
+
 	Declared          int `json:"declared"`
 	Included          int `json:"included"`
 	CoveredByWildcard int `json:"coveredByWildcard"`
@@ -594,6 +600,18 @@ func (r *run) loadRules(ctx context.Context) {
 	}
 
 	domains, err := r.o.src.Rules.ListRuleDomains(ctx)
+	if errors.Is(err, errIncompleteRuleList) {
+		// Answering with the rules that did arrive would be read as "every other name has no
+		// rule", and that is the shape that removes coverage of a name that is still served.
+		r.guardUnavailable = true
+		r.rep.GuardUnavailable = true
+		r.rep.GuardIncomplete = true
+		r.o.log.Warn("the CLB rule list came back incomplete, so this round treats the guard as "+
+			"unavailable: no name will be removed, and additions are not checked against a list "+
+			"that is known to be short",
+			"err", err)
+		return
+	}
 	if err != nil {
 		// A broken guard is not "all rules are gone".
 		//
@@ -920,20 +938,24 @@ func (r *run) applyGrace() {
 	sort.Strings(absent)
 
 	// A name covered last round but not eligible now is only "absent" in the sense that it
-	// left the certificate. It has NOT necessarily stopped being declared: guard 1 rejects a
-	// declaration whose name no CLB rule serves, and a declaration that failed the conflict
-	// check never reaches the eligible set either. Treating those as removed produced two
-	// lies at once:
+	// left the accepted set. It has NOT necessarily stopped being declared: guard 1 rejects a
+	// declaration whose name no CLB rule serves, the allowlist rejects a declaration outside
+	// it, and a declaration that failed the conflict check never reaches the eligible set
+	// either. Treating those as removed was wrong twice over:
 	//
 	//   - the report said "no longer declared, but only absent for 0s" about a name that is
 	//     declared right now, and
-	//   - because carry() puts the name back into eligible, the round then kept converging
-	//     on a name the guard had just rejected -- re-issuing a certificate for a name with
-	//     no rule, which is precisely what guard 1 exists to prevent.
+	//   - dropping it from the document changes the revision, so the certificate is reissued
+	//     without the name -- and when the filter recovers (a rule flaps back, a region becomes
+	//     visible again) the revision changes back and the name is issued all over again. One
+	//     wobble in a network-read guard therefore cost two issuances AND two rounds without
+	//     coverage of a name that never stopped being declared.
 	//
-	// So the grace period applies only to names that genuinely stopped being declared. A
-	// still-declared name that a guard filtered out is reported once, by that guard, with the
-	// real reason.
+	// So the rule is: a DECLARATION keeps a name covered. A filter that does not accept it --
+	// a guard read, or an allowlist a human narrowed -- prevents new coverage and is reported
+	// with its own reason, but it never removes coverage that exists. Removing coverage is done
+	// by removing the declaration, which then goes through the grace period and the reference
+	// check below like any other removal (or with -force, for an operator who wants it now).
 	declaredNow := r.declaredNameSet()
 	stillDeclared := make([]string, 0)
 	genuinelyAbsent := make([]string, 0, len(absent))
@@ -947,12 +969,18 @@ func (r *run) applyGrace() {
 	absent = genuinelyAbsent
 
 	for _, n := range stillDeclared {
-		// Deliberately not carried and deliberately not marked absent: the name is still
-		// here, it just did not pass a guard. MarkAbsent would start a grace clock for a
-		// name that never left.
+		// MarkPresent because the name is here right now: a stale absence marker from an
+		// earlier round must not shorten the grace period if the declaration is later removed.
+		// MarkAbsent would start a grace clock for a name that never left.
 		r.st.MarkPresent(n)
-		r.o.log.Debug("a declared name did not reach the certificate this round; the guard that "+
-			"filtered it already reported the reason", "hostname", n)
+
+		// One verdict per hostname in the report: the filter's exclusion is replaced by the
+		// carry, with the filter's own words explaining why it was not accepted on its merits.
+		reason := r.stillDeclaredReason(n)
+		r.unreject(n)
+		r.carry(n, reason)
+		r.o.log.Info("a declared name did not pass a filter this round; keeping its coverage",
+			"hostname", n, "reason", reason)
 	}
 
 	for _, n := range absent {
@@ -1037,6 +1065,40 @@ func (r *run) carry(name, reason string) {
 	r.eligible[name] = true
 	r.reasons[name] = reason
 	r.rep.CarriedForward++
+}
+
+// stillDeclaredReason explains why a still-declared name was not accepted this round.
+//
+// The wording comes from the decision the filter already recorded for it -- guard 1 and the
+// allowlist each reject with their own reason -- so the report does not grow a second vocabulary
+// for the same fact. A name with no recorded decision (a conflict, or a wildcard whose declaration
+// was rejected under its apex name) falls back to a sentence that says what is known: it is
+// declared, it did not pass, and it keeps what it has.
+func (r *run) stillDeclaredReason(name string) string {
+	for _, d := range r.rep.Decisions {
+		if d.Hostname == name && !d.Included {
+			return fmt.Sprintf("%s; the declaration is still there, so the name keeps its coverage "+
+				"(removing coverage means removing the declaration)", d.Reason)
+		}
+	}
+	return "declared, but it did not pass a filter this round; keeping its coverage " +
+		"(removing coverage means removing the declaration)"
+}
+
+// unreject drops the exclusion decision recorded for a hostname this round carries anyway.
+//
+// The report carries ONE verdict per hostname, and the verdict for a name that keeps its coverage
+// is "included". Leaving the earlier exclusion in place showed the same name twice with opposite
+// answers, in the artifact a human reads to find out what happened.
+func (r *run) unreject(hostname string) {
+	kept := r.rep.Decisions[:0]
+	for _, d := range r.rep.Decisions {
+		if d.Hostname == hostname && !d.Included {
+			continue
+		}
+		kept = append(kept, d)
+	}
+	r.rep.Decisions = kept
 }
 
 // referenced reports whether a name is still referenced by some CLB rule.
