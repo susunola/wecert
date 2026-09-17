@@ -12,6 +12,10 @@ import (
 type bucketStore interface {
 	GetRateBucket(limitName, scopeID string) (*BucketRecord, error)
 	PutRateBucket(*BucketRecord) error
+	// UpdateRateBucket applies fn to the stored bucket as one operation. A read-modify-write
+	// through Get/Put loses concurrent updates: the manager runs one goroutine per certificate
+	// and they all spend on the same account-scoped bucket.
+	UpdateRateBucket(limitName, scopeID string, fn func(*BucketRecord) error) error
 }
 
 // BucketRecord mirrors state.RateBucket.
@@ -71,24 +75,21 @@ func (t *Tracker) Spend(l Limit, scopeID string, cost float64) {
 		return
 	}
 	now := t.now()
-	rec, err := t.store.GetRateBucket(l.Name, scopeID)
+	// One operation, not Get then Put: a concurrent pass spending on the same bucket would
+	// otherwise read the same token count and overwrite this spend, and the estimate is what keeps
+	// the fleet under the CA's limits.
+	err := t.store.UpdateRateBucket(l.Name, scopeID, func(rec *BucketRecord) error {
+		snap := Snapshot{Tokens: rec.Tokens, At: rec.ObservedAt}
+		next := Spend(snap, l, cost, now)
+		// The deadline travels with the estimate. The real store also guards this with a
+		// COALESCE, but relying on that would make the tracker's behaviour depend on which
+		// implementation is behind the interface -- and a spend that silently dropped a
+		// CA-reported deadline would unblock issuance the CA has already refused.
+		rec.Tokens = next.Tokens
+		rec.ObservedAt = next.At
+		return nil
+	})
 	if err != nil {
-		t.log.Warn("cannot read the rate-limit bucket; the local quota estimate will drift",
-			"limit", l.Name, "scope", scopeID, "err", err)
-		return
-	}
-	snap := Snapshot{Tokens: rec.Tokens, At: rec.ObservedAt}
-	next := Spend(snap, l, cost, now)
-
-	// The deadline travels with the estimate. The real store also guards this with a
-	// COALESCE, but relying on that would make the tracker's behaviour depend on which
-	// implementation is behind the interface -- and a spend that silently dropped a
-	// CA-reported deadline would unblock issuance the CA has already refused.
-	if err := t.store.PutRateBucket(&BucketRecord{
-		LimitName: l.Name, ScopeID: scopeID,
-		Tokens: next.Tokens, ObservedAt: next.At,
-		ResetAt: rec.ResetAt, ResetReason: rec.ResetReason,
-	}); err != nil {
 		t.log.Warn("cannot record the rate-limit spend; the local quota estimate will drift",
 			"limit", l.Name, "scope", scopeID, "err", err)
 	}
@@ -144,13 +145,11 @@ func (t *Tracker) NoteRetryAfter(l Limit, scopeID, errMsg string) (time.Time, bo
 	if !ok {
 		return time.Time{}, false
 	}
-	rec, err := t.store.GetRateBucket(l.Name, scopeID)
-	if err != nil {
-		return time.Time{}, false
-	}
-	rec.ResetAt = at
-	rec.ResetReason = l.Name
-	if err := t.store.PutRateBucket(rec); err != nil {
+	if err := t.store.UpdateRateBucket(l.Name, scopeID, func(rec *BucketRecord) error {
+		rec.ResetAt = at
+		rec.ResetReason = l.Name
+		return nil
+	}); err != nil {
 		t.log.Warn("cannot record the CA-reported rate-limit deadline",
 			"limit", l.Name, "scope", scopeID, "until", at, "err", err)
 		return time.Time{}, false
