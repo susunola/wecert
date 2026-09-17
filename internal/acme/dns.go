@@ -156,6 +156,17 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Resolve the zone before handing the write to the provider, so its answer is ours to
+	// report. lego does the same SOA walk internally but has no guard against the walk
+	// climbing to the public suffix: when the resolver answers for `com.` but not for the
+	// domain, lego concludes the zone is `com.` and the write fails with "zone com. not found
+	// in dnspod for domain ...", which reads like a DNSPod account problem and is not. This
+	// costs one short SOA walk (findZone already refuses to return a public suffix) and only
+	// runs when a record is about to be written.
+	if _, err := s.findZone(ctx, rec.FQDN); err != nil {
+		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
+	}
+
 	if err := provider.Present(domain, token, keyAuth); err != nil {
 		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
 	}
