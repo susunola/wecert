@@ -324,8 +324,24 @@ func (s *DNSSolver) waitZone(
 		}
 
 		if len(pending) == 0 {
+			// The evidence goes into the success line too, not just into the timeout error.
+			//
+			// This verdict is a lower bound on global propagation and it is derived from this
+			// host's view: a lagging authority that happens to be unreachable from here
+			// contributes nothing, while the CA's own resolver may reach it and be told the
+			// record does not exist. That asymmetry is exactly what turned a "propagated" verdict
+			// into an NXDOMAIN at the CA in production, and with only a server count in the log
+			// there was no way to see afterwards how thin the evidence had been. Every round
+			// re-probes every address, so the summary printed here is the state of the round that
+			// decided it.
+			readiness := make([]string, 0, len(results))
+			for _, res := range results {
+				readiness = append(readiness, fmt.Sprintf("%s = %s (%s)",
+					res.record.FQDN, res.record.Value, res.summary))
+			}
 			s.log.Info("TXT propagated",
-				"zone", zone, "nameservers", len(servers), "records", len(recs))
+				"zone", zone, "nameservers", len(servers), "records", len(recs),
+				"evidence", strings.Join(readiness, " | "))
 			return nil
 		}
 

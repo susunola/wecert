@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -581,4 +582,54 @@ func oneAuthority(addrs ...string) []nsServer {
 		out = append(out, nsServer{ns: "ns1.example.net.", addr: a})
 	}
 	return out
+}
+
+// The success verdict must carry the evidence it rests on, not just a server count.
+//
+// "TXT propagated" is a lower bound on global propagation derived from this host's view: an
+// authority that is unreachable from here contributes nothing, while the CA's resolver may
+// reach it and be told the record does not exist. That asymmetry is what turned a
+// "propagated" verdict into an NXDOMAIN at the CA in production, and with only
+// `nameservers=10 records=1` in the log there was no way to see afterwards how thin the
+// evidence had been.
+func TestPropagatedVerdictLogsItsEvidenceIncludingUnreachableAuthorities(t *testing.T) {
+	var logs bytes.Buffer
+	solver := &DNSSolver{
+		recursiveNameservers: []string{"192.0.2.53:53"},
+		log:                  slog.New(slog.NewTextHandler(&logs, nil)),
+		interval:             time.Millisecond,
+		timeout:              5 * time.Second,
+		exchange: func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+			switch server {
+			case "198.51.100.1:53", "198.51.100.2:53":
+				resp := dnsReply(msg, &dns.TXT{
+					Hdr: dns.RR_Header{Name: msg.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+					Txt: []string{"wanted"},
+				})
+				resp.Authoritative = true
+				return resp, nil
+			}
+			// One authority is unreachable from here -- exactly the case that used to be
+			// invisible in the success line.
+			return nil, errors.New("network unreachable")
+		},
+	}
+	servers := []nsServer{
+		{ns: "ns1.example.net.", addr: "198.51.100.1:53"},
+		{ns: "ns2.example.net.", addr: "198.51.100.2:53"},
+		{ns: "ns3.example.net.", addr: "198.51.100.3:53"},
+	}
+	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
+	now := time.Now()
+	budget := zoneBudget{passStart: now, zoneStart: now, deadline: now.Add(5 * time.Second)}
+
+	if err := solver.waitZone(context.Background(), "example.com.", servers, recs, budget); err != nil {
+		t.Fatalf("two authorities confirmed and none denied, so this is propagated: %v", err)
+	}
+	out := logs.String()
+	for _, want := range []string{"TXT propagated", "confirmed 2/3 server(s)", "unreachable 1 (of 3 addresses)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the success line must carry the evidence it rests on; %q is missing from:\n%s", want, out)
+		}
+	}
 }
