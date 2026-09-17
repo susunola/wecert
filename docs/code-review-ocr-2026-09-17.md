@@ -119,6 +119,7 @@ clear 先落盘，提升与删单在事务里。事务失败时（错误信息�
 | `internal/state/backup.go` | 同毫秒冲突名 `<stamp>-1.db` 的 `-`（0x2D）排在 `.`（0x2E）**之前**，于是 `keep=1` 删掉的是**更新**的那份——与代码注释声称的正好相反 | 分隔符改为 `~`（0x7E），旧的 `-` 形式仍被识别（否则老快照永远不被清理）；`TestACollisionSnapshotSortsLastAndStillCountsAsOurs` |
 | `cmd/wecert/main.go` | 函数拆分时 `startMetricsServer` 与 `startStateBackups` 的文档注释连成一段，`startMetricsServer` 反而没有文档 | 补空行并说明 |
 | `internal/spec/observe.go` | shadow diff 只比较 profile/keyType/deploy，**`renewBefore` 的差异被报成"无差异"**，而 `Revision()` 把它算进哈希——切 enforce 的判据（diff==0）会在续期提前量变化时保持安静 | 纳入 `changed` 列表 |
+| `internal/onboarding/declaration.go` + `internal/config/config.go` | 声明里的 `profile`/`keyType` 值不校验，直到 `spec.WriteDocument` 才失败：一个写错的 TXT 值会让 `Run()` 报 `written`、`Commit` 永远失败，**文档与状态文件都不写**，每轮每条证书都失败直到有人改 DNS；与本包"一条坏声明只影响它自己"的既有约定矛盾 | 取值集合收敛到 `config.ValidProfile`/`config.ValidKeyType`（`normalize` 也改用它们），解析处即拒绝非法值，于是它变成"那一条声明被拒"；`TestParseDeclarationRejectsUnknownProfileAndKeyType`，去掉校验即变红 |
 | `internal/webhook/webhook.go` | `reconcileResponse.Accepted` 无初值，什么都没接受时回 `202 {"accepted": null}`，与本包 `/hook/status` 已文档化并测试过的"空数组"约定相反 | 初始化为空切片 |
 
 ### 2.6 第二轮复审发现、**尚未修复**的清单（核实为真，留待下一轮）
@@ -129,7 +130,6 @@ clear 先落盘，提升与删单在事务里。事务失败时（错误信息�
 |---|---|---|---|
 | **major** | `internal/state/revoke.go:43` | 持久化的吊销请求**不记录证书身份**（表里只有 name/reason/时间/次数）。重试时 `processRevocation` 读的是**当前** `certificates.cert_pem`，而续期会覆盖它；reconcile 又在每轮证书循环**之后**重试吊销——于是同一轮里可以先提升新证书再把它吊销：新证书被吊销、泄露的旧证书继续有效，而请求行被当作成功清掉 | 把叶子身份（serial/AKI 或 NotBefore）随请求落库（`schemaColumns` 已支持），吊销前校验当前证书是否匹配；不匹配则改吊 `retired_certificates` 里的归档副本 |
 | **major** | `internal/onboarding/onboard.go:944` | 仍然被声明、但被 guard 1（或白名单）拒掉的名字，在同一轮就被**从期望状态里删除**：`applyGrace` 的 `stillDeclared` 分支只 `MarkPresent`，既不 carry 也不 `MarkAbsent`，因此绕过宽限期与 CLB 引用检查。guard 是网络读取的第二来源且**无法表达"结果可能不完整"**，一次规则抖动（区域缺失、部分可见、限流）就会静默剥掉线上覆盖；而 fuse 比较的是声明、声明没变，所以任何保护都不会触发。实测一次抖动 = 两次签发 + 两轮失去覆盖 | `stillDeclared` 分支改为 carry（保持 revision 不变，不触发签发），或在 `ListRuleDomains` 上引入"不完整"信号并让 guard 缺失时不删除 |
-| **major** | `internal/onboarding/onboard.go:401` + `internal/onboarding/declaration.go:120-123` | 声明里的 `profile`/`keyType` 值不校验，直到 `spec.WriteDocument` 才失败：一个写错的 TXT 值会让 `Run()` 报 `written`、`Commit` 永远失败（`unknown profile "nonsense"`），**文档与状态文件都不写**——每一轮、每条证书都失败，直到有人改 DNS；这与本包已钉住的"一条坏声明只影响它自己"相矛盾 | 在解析处按 `config` 的取值集合校验（与 `v` 的处理一致），非法值记为该条声明的拒绝决定 |
 | minor | `internal/state/state.go:832` | `pendingMigrations` 只看列，不看表：缺了本分支新增的四张表之一时 `OpenUnlocked` 会接受，随后报原始 `no such table`，而不是"需要 schema 更新，请跑 wecert -once" | 表清单也纳入检查 |
 | minor | `internal/acme/revoke.go:163` | ACME `alreadyRevoked` 被当成可重试：`ClearRevokeRequest` 只在成功路径，于是请求行永不清理，`wecert_revocation_pending` 恒 ≥1，CRITICAL 告警 `WecertRevocationPending` 永不清除，CLI 对**已吊销**的证书持续说"会重试" | 识别 `urn:ietf:params:acme:error:alreadyRevoked` 为终态并清行 |
 | minor | `internal/state/state.go:1327` | 退役表的 upsert 用 COALESCE 刷新材料却不刷新 `retired_at`：先被 orphan 路径写入的行会按 orphan 的时间戳被回收，刚归档的回滚材料随之被删 | `retired_at = excluded.retired_at`，或把"待回收"与"已退役"分开 |

@@ -967,6 +967,28 @@ func (w *Webhook) normalize() error {
 	return nil
 }
 
+// ValidProfile reports whether name is a certificate profile this build knows.
+//
+// Exported so the callers that produce a profile BEFORE a Certificate exists -- the declaration
+// parser in internal/onboarding, which reads "profile=tlsserver" out of a TXT record -- can reject
+// a bad value where it is written, instead of letting it reach NormalizeCertificates at document
+// write time. That path made one typo in one TXT record fail Commit for EVERY certificate, every
+// round, until a human edited DNS.
+func ValidProfile(name string) bool {
+	_, ok := profileMaxNames[name]
+	return ok
+}
+
+// ValidKeyType reports whether kt is a key type this build can generate.
+func ValidKeyType(kt string) bool {
+	switch kt {
+	case KeyTypeECDSAP256, KeyTypeECDSAP384, KeyTypeRSA2048, KeyTypeRSA4096:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Certificate) normalize(seen map[string]bool) error {
 	if c.Name == "" {
 		return fmt.Errorf("certificates[].name is required")
@@ -988,9 +1010,7 @@ func (c *Certificate) normalize(seen map[string]bool) error {
 	if c.KeyType == "" {
 		c.KeyType = KeyTypeECDSAP256
 	}
-	switch c.KeyType {
-	case KeyTypeECDSAP256, KeyTypeECDSAP384, KeyTypeRSA2048, KeyTypeRSA4096:
-	default:
+	if !ValidKeyType(c.KeyType) {
 		return fmt.Errorf("certificate %q: unknown keyType %q", c.Name, c.KeyType)
 	}
 

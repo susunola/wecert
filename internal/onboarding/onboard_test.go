@@ -1725,3 +1725,33 @@ func TestQuotaLedgerIsPrunedOnEveryRound(t *testing.T) {
 			"not consult the budget, got %d entries", n)
 	}
 }
+
+// A declaration's profile/keyType value is rejected where it is written, so one typo cannot stop
+// every certificate from updating.
+//
+// The values used to be copied into the certificate verbatim and validated only inside
+// spec.WriteDocument at Commit: Run() reported "written", Commit then failed with `unknown profile
+// "tlsserver2"`, and neither the document nor the state file was written -- every later round failed
+// identically for EVERY certificate until a human edited DNS. This package's contract is that one
+// bad declaration is recorded as a rejection and skipped (TestOneBadDeclarationDoesNotFreezeEverything).
+func TestParseDeclarationRejectsUnknownProfileAndKeyType(t *testing.T) {
+	if _, err := ParseDeclaration("example.com", "_wecert.api.example.com", []string{"profile=tlsserver2"}); err == nil {
+		t.Error("an unknown profile must be refused where it is parsed, not at document-write time")
+	} else if !strings.Contains(err.Error(), "tlsserver2") {
+		t.Errorf("the error must name the offending value, got %q", err)
+	}
+	if _, err := ParseDeclaration("example.com", "_wecert.api.example.com", []string{"keytype=rsa-2048"}); err == nil {
+		t.Error("an unknown keytype must be refused at parse time too")
+	}
+
+	// The real values still parse, including the empty/absent case (the key simply not appearing).
+	for _, ok := range [][]string{
+		{"profile=tlsserver", "keytype=ecdsa-p256"},
+		{"keytype=rsa4096"},
+		{""},
+	} {
+		if _, err := ParseDeclaration("example.com", "_wecert.api.example.com", ok); err != nil {
+			t.Errorf("%v must parse: %v", ok, err)
+		}
+	}
+}
