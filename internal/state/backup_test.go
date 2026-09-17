@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // snapshotStore builds a store with one row worth protecting, in its own directory so the
@@ -490,5 +491,51 @@ func TestACollisionSnapshotSortsLastAndStillCountsAsOurs(t *testing.T) {
 	// build stay on disk forever.
 	if _, ok := s.snapshotStampOf(s.snapshotName(stamp + "-1")); !ok {
 		t.Error("the old '-' collision suffix must keep counting as a snapshot")
+	}
+}
+
+// Retiring a certificate restarts the retention clock.
+//
+// The orphan path records a certificate that was merely uploaded (no material) so the reaper can
+// delete it; the retirement path later records the same cert_id WITH the fullchain and key, which is
+// the material docs/recovery.md's manual rollback needs. The upsert refreshed the material but not
+// retired_at, so the row was reaped on the orphan's clock: the cloud copy and the just-archived
+// rollback material went away as soon as the earlier window expired.
+func TestRetiringACertificateRestartsTheRetentionClock(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// The orphan write: no material, and an old timestamp.
+	if err := store.AddRetiredCert("cert-1", "site", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	orphanAt := time.Now().Add(-6 * 24 * time.Hour)
+	if _, err := store.db.Exec(`UPDATE retired_certificates SET retired_at = ? WHERE cert_id = ?`,
+		orphanAt.Unix(), "cert-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The retirement write: real material, now.
+	if err := store.AddRetiredCert("cert-1", "site", []byte("fullchain"), []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+
+	retired, err := store.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retired) != 1 {
+		t.Fatalf("expected one retired row, got %+v", retired)
+	}
+	if !retired[0].RetiredAt.After(orphanAt.Add(time.Hour)) {
+		t.Errorf("retired_at is still the orphan's timestamp (%v): retention would reap this row -- "+
+			"cloud copy and archived key material included -- on the earlier clock, not from the "+
+			"retirement", retired[0].RetiredAt)
+	}
+	if string(retired[0].CertPEM) != "fullchain" {
+		t.Errorf("the archived material must survive the upsert, got %q", retired[0].CertPEM)
 	}
 }
