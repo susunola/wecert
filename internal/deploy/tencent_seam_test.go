@@ -1139,3 +1139,60 @@ func updateRespWithStatus(recordID uint64, bound, status int64) *ssl.UpdateCerti
 	resp.Response.DeployStatus = common.Int64Ptr(status)
 	return resp
 }
+
+// An enumeration that never answers is not the same answer as "nothing is bound".
+//
+// The deploy record -- the authoritative account of the switch -- already reported it done,
+// and the enumeration is an asynchronous server-side cache whose latency belongs to the
+// server. Treating that timeout as a failed deploy is what put a real account into a loop
+// where every round re-ran the same switch, hit the same timeout, and never recorded the
+// certificate that was serving traffic. The caller gets a distinguishable answer instead, so
+// it can record the certificate as deployed-but-unconfirmed and let the cheap binding probe
+// settle it on the next pass.
+func TestAdoptedTaskWhoseEnumerationNeverAnswersIsUnverifiedNotFailed(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+
+	fake := &fakeSSLAPI{
+		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
+			return &ssl.UploadCertificateResponse{
+				Response: &ssl.UploadCertificateResponseParams{CertificateId: common.StringPtr("new-id")},
+			}, nil
+		},
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			// A task is already in progress and this is its record.
+			return updateRespWithStatus(42, 1, 0), nil
+		},
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			return detailResp(1, 0, 0), nil
+		},
+		createTaskFn: stubCreateTask("new-id", "task-1"),
+		// The task never reaches Status=1, so the polling loop runs out its budget.
+		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			return &ssl.DescribeCertificateBindResourceTaskResultResponse{
+				Response: &ssl.DescribeCertificateBindResourceTaskResultResponseParams{
+					SyncTaskBindResourceResult: []*ssl.SyncTaskBindResourceResult{{
+						TaskId: common.StringPtr("task-1"),
+						Status: common.Uint64Ptr(0),
+					}},
+				},
+			}, nil
+		},
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(clock.now)
+	id, err := d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if !errors.Is(err, ErrSwitchUnverified) {
+		t.Fatalf("an enumeration that never answers must be reported as unverified, so the caller "+
+			"can record the certificate and re-check later; got err = %v", err)
+	}
+	// The uploaded certificate must still be identified: without the ID the caller has
+	// nothing to record and the certificate leaks in the cloud account.
+	if id != "new-id" {
+		t.Errorf("id = %q, want new-id even on the unverified path", id)
+	}
+}

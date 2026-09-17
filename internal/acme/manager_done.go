@@ -109,6 +109,10 @@ func (m *Manager) download(
 	// the flag belongs to the promotion, and the promotion is not real until the transaction that
 	// records it commits.
 	forceUndeployed := false
+	// Set when the switch is reported done but its binding could not be verified in time
+	// (deploy.ErrSwitchUnverified): the certificate is promoted, but not as a confirmed
+	// deployment.
+	unverified := false
 	if c.Deploy.Enabled {
 		var id string
 		var derr error
@@ -137,13 +141,29 @@ func (m *Manager) download(
 			// certificates table nor the retired table, ReapRetired never sees it, and one
 			// failure leaks one certificate in Tencent Cloud until the account quota is hit.
 			// The reclaim machinery exists precisely to prevent that.
-			if id != "" {
-				o.DeploymentCertID = id
-				if err := m.store.PutOrder(o); err != nil {
-					return err
+			//
+			// One error is not a failure: ErrSwitchUnverified means the cloud already reported
+			// the switch as done and only the independent binding enumeration did not answer in
+			// time. Failing the pass there is not self-correcting -- the old certificate has no
+			// bindings left by then, so every later round re-runs the same deploy and the state
+			// never records the certificate that is serving traffic. It is recorded as deployed
+			// but unconfirmed instead, which the next pass's binding probe turns into a
+			// confirmed deployment; DeployConfirmed stays false until then, so the deployed
+			// metric keeps telling the truth.
+			if errors.Is(derr, deploy.ErrSwitchUnverified) && id != "" {
+				m.log.Warn("the one-click switch is reported as done but its binding could not be verified in time; "+
+					"recording the new certificate as deployed but unconfirmed",
+					"cert", c.Name, "certId", id, "err", derr)
+				unverified = true
+			} else {
+				if id != "" {
+					o.DeploymentCertID = id
+					if err := m.store.PutOrder(o); err != nil {
+						return err
+					}
 				}
+				return m.recordFailure(st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
 			}
-			return m.recordFailure(st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
 		}
 		deployedID = id
 		o.DeploymentCertID = ""
@@ -222,6 +242,13 @@ func (m *Manager) download(
 	} else if oldDeployedID == "" {
 		// First upload: record the CertId so a human can bind it, but the metric should still
 		// read "not deployed".
+		promoted.DeployConfirmed = false
+	}
+	if unverified {
+		// Last word on the flag: the switch is reported as done but was not independently
+		// confirmed, so "deployed" is not something this program can claim yet. The next
+		// pass's binding probe sets it once the enumeration answers (see confirmBinding),
+		// which is why this does not have to be settled here.
 		promoted.DeployConfirmed = false
 	}
 	promoted.ARICertID = ariCertID
