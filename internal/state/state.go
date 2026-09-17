@@ -1274,6 +1274,12 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 	return out, rows.Err()
 }
 
+// ListAuthorizationsForTest is ListAuthorizations, exposed for tests in other packages that need to
+// observe what is on disk at a specific moment (see the acme package's Present hook).
+func (s *Store) ListAuthorizationsForTest(certName string) ([]*Authorization, error) {
+	return s.ListAuthorizations(certName)
+}
+
 // ListPresentedAuthorizations lists every authorization this state store still believes
 // has a TXT record in DNS, across all certificates.
 //

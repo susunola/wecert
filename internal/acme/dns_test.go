@@ -212,9 +212,16 @@ func TestResponseHasTXT(t *testing.T) {
 type recordingProvider struct {
 	presents []string
 	cleanups []string
+
+	// onPresent runs before the write is recorded, so a test can observe the state of the world at
+	// the moment the DNS write starts.
+	onPresent func()
 }
 
 func (p *recordingProvider) Present(domain, _, _ string) error {
+	if p.onPresent != nil {
+		p.onPresent()
+	}
 	p.presents = append(p.presents, domain)
 	return nil
 }

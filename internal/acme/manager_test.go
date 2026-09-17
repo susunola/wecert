@@ -209,3 +209,37 @@ func dropTable(t *testing.T, path, table string) {
 		t.Fatalf("drop %s: %v", table, err)
 	}
 }
+
+// A failed order read must schedule the retry like every other failed decision.
+//
+// Reconcile's own comment promises that a decision which failed schedules the retry, and this path
+// returned the bare store error: no ConsecutiveFailures, no NextAttemptAt, no in-memory transient
+// backoff. A state store failing exactly this read was then invisible in
+// wecert_certificate_consecutive_failures and retried at the pass rate.
+func TestAFailedOrderReadSchedulesTheRetry(t *testing.T) {
+	store, m, _, cert, dbPath := newDBFaultHarness(t)
+
+	if err := store.PutCert(&state.CertState{
+		Name:     cert.Name,
+		NotAfter: time.Now().Add(60 * 24 * time.Hour),
+		CertPEM:  selfSignedCertPEM(t, time.Now().Add(60*24*time.Hour), "example.com"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dropTable(t, dbPath, "orders")
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("an unreadable order row must be reported as a failed pass")
+	}
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ConsecutiveFailures == 0 {
+		t.Error("the failure must be counted: without it the pass is invisible in " +
+			"wecert_certificate_consecutive_failures")
+	}
+	if st.NextAttemptAt.IsZero() {
+		t.Error("the failure must schedule a retry, otherwise the next pass repeats it immediately")
+	}
+}
