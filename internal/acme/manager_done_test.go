@@ -852,3 +852,189 @@ func TestUnverifiedSwitchIsRecordedAsDeployedButUnconfirmed(t *testing.T) {
 			"without another deploy")
 	}
 }
+
+// A renewal that resumes an already-uploaded certificate must not queue that certificate for
+// reclaim.
+//
+// The reclaim guard asks "is the order's uploaded id the one now in service?", and on this path
+// the honest answer is the id this pass is about to promote. It used to read
+// certificates.deployed_cert_id instead, which at that moment still names the OUTGOING
+// certificate -- the promotion is staged on a copy until the epilogue transaction commits -- so
+// the comparison could never match and the certificate that was about to serve traffic was
+// written to the reclaim list by the very transaction that promoted it. ReapRetired would then
+// delete it once the retention window passed, with only the cloud's own IsCheckResource standing
+// in the way.
+func TestAResumedCertificateIsNotQueuedForReclaim(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{}
+	certs := []config.Certificate{{
+		Name: "site-example-com", Domains: []string{"a.example.com"},
+		Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+		Deploy: config.Deploy{Enabled: true},
+	}}
+	if err := config.NormalizeCertificates(certs); err != nil {
+		t.Fatal(err)
+	}
+	cert := &certs[0]
+
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, &recordingDeployer{id: "cloud-new"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fake.orderDomains = func() []string { return cert.Domains }
+	fake.orderKeyPEM = func() []byte {
+		o, err := store.GetOrder(cert.Name)
+		if err != nil || o == nil {
+			return nil
+		}
+		return o.KeyPEM
+	}
+
+	now := time.Now()
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: now.Add(24 * time.Hour),
+		CertURL: "https://acme.test/cert/old", CertPEM: selfSignedCertPEM(t, now.Add(24*time.Hour), "a.example.com"),
+		KeyPEM: []byte("old-key"), DeployedCertID: "cloud-old", DeployConfirmed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := GenerateKey(cert.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := MarshalPrivateKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An earlier pass uploaded this certificate and then failed before the rebind could finish,
+	// so the order carries the resume anchor and this pass deploys exactly that id.
+	if err := store.PutOrder(&state.Order{
+		CertName: cert.Name, KeyPEM: keyPEM, DeploymentCertID: "cloud-new",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDNS01Order(fake, cert.Domains)
+	fake.certNotAfter = now.Add(90 * 24 * time.Hour)
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DeployedCertID != "cloud-new" {
+		t.Fatalf("DeployedCertID = %q, want cloud-new", got.DeployedCertID)
+	}
+	retired, err := store.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retired) != 1 || retired[0].CertID != "cloud-old" {
+		t.Fatalf("the reclaim list must hold the outgoing certificate and nothing else, got %+v", retired)
+	}
+}
+
+// When the epilogue transaction fails, the order must still carry the certificate it uploaded.
+//
+// That ID is the resume anchor: it is what lets the next pass call ResumeDeploy instead of
+// uploading a second copy of the same certificate, and it is the only local record of a cloud
+// object that nothing else in the state store mentions. Clearing it was a durable write outside
+// the transaction ("best-effort: a successful issuance must not fail because a bookkeeping write
+// did"), so a rollback left the order without it -- and, because the reclaim guard reads the
+// order back, a *successful* write of that clear was also what made the guard compare against the
+// outgoing certificate. The delete inside the transaction removes the row and the ID together.
+func TestAFailedEpilogueKeepsTheOrdersResumeAnchor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{}
+	dep := &stagedDeployer{uploadID: "cloud-new"}
+	certs := []config.Certificate{{
+		Name: "site-example-com", Domains: []string{"a.example.com"},
+		Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+		Deploy: config.Deploy{Enabled: true},
+	}}
+	if err := config.NormalizeCertificates(certs); err != nil {
+		t.Fatal(err)
+	}
+	cert := &certs[0]
+
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, dep,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fake.orderDomains = func() []string { return cert.Domains }
+	fake.orderKeyPEM = func() []byte {
+		o, err := store.GetOrder(cert.Name)
+		if err != nil || o == nil {
+			return nil
+		}
+		return o.KeyPEM
+	}
+
+	now := time.Now()
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: now.Add(24 * time.Hour),
+		CertURL: "https://acme.test/cert/old", CertPEM: selfSignedCertPEM(t, now.Add(24*time.Hour), "a.example.com"),
+		KeyPEM: []byte("old-key"), DeployedCertID: "cloud-old", DeployConfirmed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := GenerateKey(cert.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := MarshalPrivateKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutOrder(&state.Order{CertName: cert.Name, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDNS01Order(fake, cert.Domains)
+	fake.certNotAfter = now.Add(90 * 24 * time.Hour)
+
+	// Fail the last statement of the epilogue, so everything before it has already run.
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER block_order_delete BEFORE DELETE ON orders
+		BEGIN SELECT RAISE(FAIL, 'orders blocked by test'); END;`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("the epilogue failed, so the pass must be reported as failed")
+	}
+
+	o, err := store.GetOrder(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o == nil {
+		t.Fatal("the order must survive a rolled-back epilogue")
+	}
+	if o.DeploymentCertID != "cloud-new" {
+		t.Errorf("the rolled-back epilogue lost the resume anchor (DeploymentCertID=%q, want cloud-new): "+
+			"the next pass uploads a second copy of a certificate that is already in the cloud, and the "+
+			"first copy is recorded nowhere", o.DeploymentCertID)
+	}
+	if got, err := store.GetCert(cert.Name); err != nil {
+		t.Fatal(err)
+	} else if got.DeployedCertID != "cloud-old" || got.CertURL != "https://acme.test/cert/old" {
+		t.Errorf("the promotion committed despite the failed transaction: %+v", got)
+	}
+	if retired, _ := store.ListRetiredCertsBefore(time.Now().Add(time.Hour)); len(retired) != 0 {
+		t.Errorf("a rolled-back epilogue left reclaim records: %+v", retired)
+	}
+}
