@@ -290,6 +290,13 @@ func (m *Manager) solveChallenges(
 			// so. markResumedUnpresented clears Presented for the same reason and forgot this one.
 			if a.ChallengeToken != chlg.Token {
 				a.ChallengeSent = false
+				// The old token hashed to a record this row no longer uses, so its lease is dead.
+				// Releasing it is what keeps the name cleanable: while a lease is held, every
+				// later cleanup here takes the "another challenge is still live" branch, and the
+				// provider's delete-EVERY-TXT call never fires again for the rest of the process.
+				// The record itself (if it is still up) goes with the next delete-all, which the
+				// new value's cleanup fires once it is the last leaver.
+				m.releaseStaleLease(a.TxtName, a.TxtValue)
 			}
 			a.ChallengeURL = chlg.URL
 			a.ChallengeToken = chlg.Token
@@ -553,6 +560,45 @@ func (m *Manager) registerRecoveredLeases() {
 	}
 }
 
+// releaseStaleLease drops one TXT lease whose value the caller has established is dead.
+//
+// The registry cannot tell a dead value from a live one by itself: a value stays in it until
+// someone removes it, and while one is held every later cleanup at that name takes the "another
+// challenge is still live" branch -- so the provider's delete-EVERY-TXT call never fires again for
+// the rest of the process, every TXT record written at that name afterwards stays in DNS until a
+// restart, and the name's record quota fills up with values nothing will ever collect. The two
+// callers are the places where a value's fate is actually known: a row repointed at a different
+// challenge token, and a probe that proved the record absent.
+//
+// A presented authorization row that still claims the same (name, value) keeps the lease. That is
+// the one way a value the caller has given up on can still be needed: another certificate's record
+// at the same name, whose rows this call does not own. The check reads the store, so a store that
+// cannot be read keeps the lease -- the safe direction, because a leftover lease only delays a
+// delete-all, while dropping a live one takes out a record another certificate is waiting on.
+func (m *Manager) releaseStaleLease(fqdn, value string) {
+	if fqdn == "" || value == "" {
+		return
+	}
+	rows, err := m.store.ListPresentedAuthorizations()
+	if err != nil {
+		m.log.Warn("cannot check whether another authorization still needs a TXT record; keeping its lease",
+			"name", fqdn, "err", err)
+		return
+	}
+	for _, r := range rows {
+		if r.TxtName == fqdn && r.TxtValue == value {
+			return
+		}
+	}
+	if othersLive := challengeLeases.remove(fqdn, value); othersLive {
+		m.log.Info("another challenge is still live at the TXT name; the provider's delete-all waits for the last leaver",
+			"name", fqdn)
+		return
+	}
+	m.log.Info("released a TXT lease whose record is gone; the name can be cleaned up again",
+		"name", fqdn)
+}
+
 // cleanup deletes every TXT this round wrote. It is only called once all authorizations pass.
 func (m *Manager) cleanup(ctx context.Context, certName string, authzs []*state.Authorization) {
 	m.registerRecoveredLeases()
@@ -702,6 +748,15 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 		// only answer that licenses deleting the row: the write genuinely never
 		// happened. Any other outcome -- including one that merely could not be
 		// confirmed -- reaches the caller as err, and the row is kept.
+		//
+		// The lease an interrupted Present registered for this value is dead for the same
+		// reason, and leaving it behind is not harmless: the registry would keep reporting
+		// "another challenge is still live at this name" for a record that is not there, so
+		// the provider's delete-EVERY-TXT call would never fire again for the rest of the
+		// process and every record written here afterwards would stay in DNS. Proof of
+		// absence is what makes dropping it safe: nothing can depend on a record that is not
+		// there, and the probe is the same evidence the row deletion rests on.
+		m.releaseStaleLease(rec.FQDN, rec.Value)
 		return true
 	}
 	m.log.Info("found the TXT of an interrupted pass; reclaiming it before deleting the row",
