@@ -733,6 +733,12 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready 
 	var n int64
 	listed := 0
 	answered := 0
+	// An entry -- or a region -- that is present but says nothing is an UNANSWERED part of the
+	// response, not an absent one. Counting only what was listed made a half-populated answer read
+	// as a finished one, and a finished answer of zero is what licenses the caller's hard
+	// noResourceBoundError branch instead of deferring to the authoritative deploy record. Same
+	// shape as countBindings, which was fixed for exactly this.
+	unanswered := 0
 	for _, p := range progress {
 		// The SDK hands back []*T; a nil element is not a "region with no count", it is a
 		// missing entry, and dereferencing it panics inside updateInstance -- after the
@@ -740,10 +746,17 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready 
 		// survives, but recordFailure never runs: no backoff, no last_error, and the deploy
 		// never completes. Every other SDK list in this file is guarded; these two were not.
 		if p == nil {
+			unanswered++
 			continue
+		}
+		if len(p.UpdateSyncProgressRegions) == 0 {
+			// The resource type came back with no regions at all: whatever it was bound to is not
+			// in this answer.
+			unanswered++
 		}
 		for _, r := range p.UpdateSyncProgressRegions {
 			if r == nil {
+				unanswered++
 				continue
 			}
 			listed++
@@ -753,7 +766,7 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready 
 			}
 		}
 	}
-	return n, listed > 0 && answered == listed
+	return n, listed > 0 && answered == listed && unanswered == 0
 }
 
 // noResourceBoundError is the diagnosis shared by the two places that can conclude the
