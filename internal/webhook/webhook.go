@@ -15,6 +15,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -236,8 +237,23 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap the body with MaxBytesReader rather than a LimitReader.
+	//
+	// LimitReader reports a clean EOF at the cap, so an oversized body was silently truncated and
+	// then parsed as if it were the whole request: a body cut at a valid JSON boundary was accepted,
+	// and one cut mid-value failed as "invalid JSON", which sends the caller looking at their JSON
+	// instead of at the size. MaxBytesReader reports the overflow, and the two answers stay apart.
+	r.Body = http.MaxBytesReader(w, r.Body, maxTriggerBody)
+
 	req, err := parseTrigger(r)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+				"error": fmt.Sprintf("request body exceeds %d bytes", maxTriggerBody),
+			})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -307,6 +323,10 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
+// maxTriggerBody bounds a trigger request body. This endpoint names certificates; it has no
+// legitimate large payload.
+const maxTriggerBody = 64 << 10
+
 // parseTrigger reads the request body. An empty body is legal and means a full
 // trigger.
 func parseTrigger(r *http.Request) (reconcileRequest, error) {
@@ -315,9 +335,9 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 		return req, nil
 	}
 
-	// Cap the size: this is a trigger endpoint and has no reason to accept large
-	// bodies.
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	// The caller has already wrapped the body in http.MaxBytesReader (see handleReconcile), so an
+	// oversized request surfaces here as an error rather than as a truncated read.
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return req, err
 	}
@@ -397,6 +417,10 @@ type certStatus struct {
 	ConsecutiveFailures int    `json:"consecutiveFailures"`
 	NextAttemptAt       string `json:"nextAttemptAt,omitempty"`
 	LastError           string `json:"lastError,omitempty"`
+
+	// Error reports that this certificate's state could not be read at all. Without it the entry
+	// is the zero value, which a caller cannot tell from "no state recorded yet".
+	Error string `json:"error,omitempty"`
 }
 
 // handleStatus lets the caller look up the result after triggering.
@@ -427,7 +451,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 		rec, err := s.store.GetCert(name)
 		if err != nil {
+			// Say that the state could not be READ, rather than answering with the zero value.
+			//
+			// The zero certStatus is indistinguishable from "this certificate has no state yet",
+			// so a caller polling after a trigger could not tell "the store is unreadable" from
+			// "nothing happened" -- on the endpoint whose whole job is to answer whether the
+			// trigger worked.
 			s.log.Warn("failed to read the certificate state", "cert", name, "err", err)
+			st.Error = err.Error()
 			out.Certificates = append(out.Certificates, st)
 			continue
 		}

@@ -397,6 +397,19 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	rd := round{}
 	if fb, ferr := m.store.GetFallback(c.Name); ferr == nil {
 		rd.fallbackActive = fb != nil
+	} else {
+		// A read that failed is not "no fallback is in force".
+		//
+		// The drift branch below reads fallbackActive to decide whether a missing SAN is the
+		// degradation working or a config change to converge on. Treating an unreadable store as
+		// "no fallback" ordered the full -- known-bad -- identifier set immediately, while the
+		// sibling decision in fallback.go holds on the very same failure. Holding costs one pass;
+		// the other direction spends an order on the set whose broken identifier caused the
+		// degradation, which is the oscillation the fallback exists to stop.
+		rd.fallbackActive = true
+		m.log.Warn("cannot read whether a degradation is in force; holding the current certificate "+
+			"this pass rather than reissuing the full identifier set",
+			"cert", c.Name, "err", ferr)
 	}
 	// Skip straight through the backoff window. Once a retry is scheduled, stop knocking
 	// on the CA's door.
@@ -439,7 +452,11 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	// Invariant 1: with an unexpired order in progress, keep advancing it, never create a
 	// new one.
 	if o, err := m.store.GetOrder(c.Name); err != nil {
-		return err
+		// recordFailure, not a bare return: the doc comment above promises that a failed decision
+		// schedules the retry, and a bare return skipped the counter, the backoff and the in-memory
+		// transient backoff -- so a state store that fails this read was invisible in
+		// wecert_certificate_consecutive_failures and retried at the pass rate.
+		return m.recordFailure(st, fmt.Errorf("read the order in progress: %w", err))
 	} else if o != nil {
 		switch {
 		// A zero ExpiresAt means the server gave no expiry: keep advancing and let the CA

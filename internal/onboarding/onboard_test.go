@@ -2025,3 +2025,83 @@ func containsAllDomains(got []string, want ...string) bool {
 	}
 	return true
 }
+
+// A hostname that ends up included must not also be reported as excluded.
+//
+// The parse loop records an exclusion for an unparseable record, and that exclusion was never
+// cleared when another record for the SAME hostname parsed and was accepted -- which happens
+// whenever the same name is declared in a parent zone and in a delegated subzone, one of them
+// with a typo. The report is the artifact a human reads to find out what happened, and it said
+// both things at once; stillDeclaredReason could also quote the stale text for a name it carries.
+func TestAnIncludedHostnameIsNotAlsoReportedAsExcluded(t *testing.T) {
+	const host = "api.example.com"
+	h := newHarness(t, Options{RequireRule: true})
+
+	// One record for api.example.com is a typo; another (from the delegated subzone) is valid.
+	broken := RawDeclaration{Zone: "example.com", Record: DeclarationPrefix + host, Values: []string{"unknownkey=1"}}
+	good := RawDeclaration{Zone: "sub.example.com", Record: DeclarationPrefix + host, Values: []string{"v=wecert1"}}
+	h.decls.raw = []RawDeclaration{broken, good}
+	h.rules.domains = []string{host}
+
+	rep := h.run(t)
+
+	var included, excluded int
+	for _, d := range rep.Decisions {
+		if d.Hostname != host {
+			continue
+		}
+		if d.Included {
+			included++
+		} else {
+			excluded++
+		}
+	}
+	if included != 1 {
+		t.Errorf("%s is declared by a valid record, so it must be included once, got %d: %+v",
+			host, included, rep.Decisions)
+	}
+	if excluded != 0 {
+		t.Errorf("%s must not be reported as excluded as well: the report would say two opposite "+
+			"things about one name: %+v", host, rep.Decisions)
+	}
+}
+
+// The wildcard note must not erase the reason a filter gave.
+//
+// A name that is covered by a declared wildcard AND was rejected by a filter this round (so it is
+// carried) used to end up with only "covered by the declared wildcard ...": the guard that is
+// dropping it disappeared from the report, which is the artifact an operator reads to find out why
+// something is not being issued.
+func TestAWildcardCoveredCarryKeepsItsFilterReason(t *testing.T) {
+	const apex = "example.com"
+	const api = "api.example.com"
+
+	h := newHarness(t, Options{RequireRule: true})
+
+	// Round 1: the wildcard and the concrete name are both declared and both served.
+	h.decls.raw = []RawDeclaration{decl(apex, "wildcard=1"), decl(api)}
+	h.rules.domains = []string{apex, api}
+	h.run(t)
+
+	// Round 2: the rule for api.example.com disappears, so guard 1 rejects that declaration --
+	// but *.example.com is still declared and served, so the name stays covered by it.
+	h.rules.domains = []string{apex}
+	rep := h.run(t)
+
+	d, ok := decisionFor(rep, api)
+	if !ok {
+		t.Fatalf("%s must still be reported: %+v", api, rep.Decisions)
+	}
+	if !d.Included {
+		t.Fatalf("%s is still covered by the declared wildcard: %+v", api, d)
+	}
+	if !strings.Contains(d.Reason, "no CLB rule serves this name") {
+		t.Errorf("the reason must still say a filter rejected it, got %q", d.Reason)
+	}
+	if !strings.Contains(d.Reason, "covered by the declared wildcard") {
+		t.Errorf("and it must still say the wildcard covers it, got %q", d.Reason)
+	}
+	if rep.CoveredByWildcard == 0 {
+		t.Error("the covered-by-wildcard count must include it")
+	}
+}
