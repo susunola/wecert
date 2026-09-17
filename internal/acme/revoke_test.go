@@ -778,10 +778,12 @@ func TestARateLimitRefusalFromTheRetryStillSetsTheDeadline(t *testing.T) {
 // -- the limit with NO override path, and the one whose alert is `< 5` -- kept reading optimistic:
 // the estimate was wrong in the direction that leads to an order the CA will reject.
 func TestARefusalIsBookedAgainstTheLimitItNames(t *testing.T) {
-	store, m, fake, cert := newAPITestHarness(t, []string{"a.example.com"})
+	store, m, fake, cert := newAPITestHarness(t, []string{"b.other.com"})
 	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	m.SetNow(func() time.Time { return fixed })
-	cert.Domains = []string{"a.example.com"}
+	// Two registered domains, the one the CA names second, so a "first registered domain" guess
+	// cannot pass by accident.
+	cert.Domains = []string{"b.other.com", "a.example.com"}
 
 	cases := []struct {
 		name     string
@@ -801,9 +803,15 @@ func TestARefusalIsBookedAgainstTheLimitItNames(t *testing.T) {
 			unmarked: ratelimit.NewOrdersPerAccount,
 		},
 		{
+			// Boulder's real wording for this limit names the domain it counted, and does NOT say
+			// "registered domain":
+			//   too many certificates (%d) already issued for %q in the last %s, retry after %s
+			// The certificate covers two registered domains with the exhausted one second, so the
+			// scope can only come from the message.
 			name: "registered domain",
 			message: "acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: too many certificates " +
-				"already issued for this registered domain, retry after 2026-09-16 15:00:00 UTC",
+				"(50) already issued for \"example.com\" in the last 168h0m0s, retry after " +
+				"2026-09-16 15:00:00 UTC: see https://letsencrypt.org/docs/rate-limits/#certificates-per-registered-domain",
 			limit:    ratelimit.CertsPerRegisteredDomain,
 			scope:    "example.com",
 			unmarked: ratelimit.NewOrdersPerAccount,

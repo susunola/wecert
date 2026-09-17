@@ -381,6 +381,15 @@ func (m *Manager) download(
 	// would delete, 7 days later, the very certificate a human just bound.
 	retireOld := rebound && oldDeployedID != "" && oldDeployedID != deployedID
 
+	// A renewed certificate that replaces an upload nobody ever bound is not "retired" in the
+	// rollback sense -- nothing is serving it -- but the row that named it is about to be
+	// overwritten, so without this the id is lost: not in certificates, not in retired_certificates,
+	// and therefore never deleted. It is billed against the account's uploaded-certificate quota
+	// forever. Reclaiming it is safe because the deployer only reports ErrNothingBoundYet from
+	// COMPLETE enumerations of both certificates (see nothingBoundYet), and the delete itself still
+	// asks the cloud to refuse if anything is bound.
+	reclaimFirstBind := waitingFirstBind && oldDeployedID != "" && oldDeployedID != deployedID
+
 	// The order may also carry the ID of a certificate that was uploaded but never rebound. Hand it
 	// to the reclaim list inside the same transaction -- see discardOrder for why losing it is
 	// expensive.
@@ -397,7 +406,7 @@ func (m *Manager) download(
 		if err := tx.PutCert(&promoted); err != nil {
 			return fmt.Errorf("promote the new certificate: %w", err)
 		}
-		if retireOld {
+		if retireOld || reclaimFirstBind {
 			if err := tx.AddRetiredCert(oldDeployedID, c.Name, oldCertPEM, oldKeyPEM); err != nil {
 				return fmt.Errorf("retire the previous certificate: %w", err)
 			}

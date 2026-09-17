@@ -370,4 +370,22 @@ func TestARenewalWithNothingBoundYetConvergesAsAFirstBind(t *testing.T) {
 	if o, err := store.GetOrder(cert.Name); err != nil || o != nil {
 		t.Errorf("the order must be finished, got %+v (err=%v)", o, err)
 	}
+
+	// The upload being replaced must not be forgotten. Nothing is bound to it (which is what makes
+	// the pending-first-bind reading correct), and the row that named it has just been overwritten,
+	// so without a reclaim record the id is in neither certificates nor retired_certificates and the
+	// certificate is billed against the account quota forever.
+	retired, err := store.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reclaimed bool
+	for _, r := range retired {
+		if r.CertID == "cloud-old" {
+			reclaimed = true
+		}
+	}
+	if !reclaimed {
+		t.Errorf("the replaced upload (%q) must be queued for reclamation, got %+v", "cloud-old", retired)
+	}
 }

@@ -106,14 +106,15 @@ func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) {
 
 	blocked := false
 	for _, l := range named {
-		at, ok := m.quota.NoteRetryAfter(l, newOrderRefusalScope(l, c), err.Error())
+		scope := newOrderRefusalScope(l, c, err.Error())
+		at, ok := m.quota.NoteRetryAfter(l, scope, err.Error())
 		if !ok {
 			continue
 		}
 		blocked = true
 		m.log.Error("the CA refused a new order against a documented rate limit; every request "+
 			"against that limit must wait for the reported instant",
-			"cert", c.Name, "limit", l.Name, "scope", newOrderRefusalScope(l, c), "until", at)
+			"cert", c.Name, "limit", l.Name, "scope", scope, "until", at)
 	}
 	if !blocked {
 		return
@@ -122,11 +123,20 @@ func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) {
 
 // newOrderRefusalScope is the bucket a refused limit is recorded against, matching the scope the
 // spend path uses for the same limit.
-func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate) string {
+//
+// For the registered-domain limit the CA names the domain it counted (Boulder:
+// `too many certificates (%d) already issued for %q in the last %s, retry after %s`), and that name
+// is preferred over guessing from the certificate's own domains: a certificate spanning several
+// registered domains would otherwise have the deadline recorded against whichever one happens to
+// come first, and the alert would point the operator at a domain that is not the exhausted one.
+func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate, msg string) string {
 	switch l.Name {
 	case ratelimit.CertsPerExactIdentifierSet.Name:
 		return c.DomainKey()
 	case ratelimit.CertsPerRegisteredDomain.Name:
+		if named := quotedIssuedDomain(msg); named != "" {
+			return named
+		}
 		if doms := uniqueRegisteredDomains(c.Domains); len(doms) > 0 {
 			return doms[0]
 		}
@@ -134,31 +144,60 @@ func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate) string {
 	return ""
 }
 
+// quotedIssuedDomain extracts the domain from the CA's "already issued for %q" wording, or "" when
+// the message does not carry one.
+func quotedIssuedDomain(msg string) string {
+	const marker = "already issued for "
+	i := indexOfFold(msg, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := msg[i+len(marker):]
+	if !strings.HasPrefix(rest, "\"") {
+		return ""
+	}
+	rest = rest[1:]
+	if j := strings.IndexByte(rest, '"'); j >= 0 {
+		return strings.ToLower(rest[:j])
+	}
+	return ""
+}
+
 // refusedLimits maps the CA's own wording to the limits it refused.
 //
-// The phrases are the ones Boulder publishes (and the ones its own tests assert):
+// The phrases are Boulder's, taken from the limiter that produces them
+// (ratelimits/limiter.go):
 //
-//	too many new orders recently ...
-//	too many certificates already issued for this exact set of identifiers ...
-//	too many certificates already issued for this registered domain ...
+//	too many new orders (%d) from this account in the last %s, retry after %s
+//	too many certificates (%d) already issued for %q in the last %s, retry after %s
+//	too many certificates (%d) already issued for this exact set of identifiers in the last %s, retry after %s
 //
 // Matching text is not ideal -- the wording is the CA's to choose -- but a rate-limit refusal is
 // exactly the case the protocol gives no machine-readable field for (the deadline itself is inside
-// free text too, see ParseRetryAfter). An unrecognised message falls back to new-orders, which is
-// where every refusal used to be booked.
+// free text too, see ParseRetryAfter). Note the registered-domain message does NOT contain the words
+// "registered domain": it names the domain instead, which is why the match is on the
+// "already issued for \"..." shape. An unrecognised message falls back to new-orders, which is where
+// every refusal used to be booked.
 func refusedLimits(msg string) []ratelimit.Limit {
 	lower := strings.ToLower(msg)
 	var out []ratelimit.Limit
-	if strings.Contains(lower, "exact set of identifiers") || strings.Contains(lower, "exact-identifier-set") {
+	exactSet := strings.Contains(lower, "exact set of identifiers") ||
+		strings.Contains(lower, "exact-identifier-set")
+	if exactSet {
 		out = append(out, ratelimit.CertsPerExactIdentifierSet)
 	}
-	if strings.Contains(lower, "registered domain") || strings.Contains(lower, "registered-domain") {
+	if !exactSet && strings.Contains(lower, "already issued for") {
 		out = append(out, ratelimit.CertsPerRegisteredDomain)
 	}
 	if strings.Contains(lower, "new orders") || strings.Contains(lower, "new-orders") {
 		out = append(out, ratelimit.NewOrdersPerAccount)
 	}
 	return out
+}
+
+// indexOfFold is strings.Index for a case-insensitive needle.
+func indexOfFold(s, sub string) int {
+	return strings.Index(strings.ToLower(s), strings.ToLower(sub))
 }
 
 func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
