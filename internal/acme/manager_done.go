@@ -412,9 +412,11 @@ func (m *Manager) download(
 		metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(0)
 	}
 	if !rd.fullSet && rd.degraded {
+		// c.Domains is the set that was ORDERED (the kept subset), so labelling it "dropped" told an
+		// operator the opposite of what happened -- and the count they need is on the ledger rows.
 		m.log.Warn("issued the degraded name set; keeping the identifier failure ledger so the "+
 			"next pass does not immediately re-order the full set",
-			"cert", c.Name, "dropped", len(c.Domains))
+			"cert", c.Name, "issued", len(c.Domains))
 	}
 	if orphanID != "" {
 		m.log.Info("the certificate uploaded during the failed deploy has been recorded for reclaim "+

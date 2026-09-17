@@ -49,7 +49,7 @@ func (f *fakeTAT) DescribeInvocationTasksWithContext(context.Context, *tat.Descr
 	task := &tat.InvocationTask{TaskStatus: common.StringPtr(status)}
 	if !f.omitResult && (status == "SUCCESS" || f.output != "") {
 		task.TaskResult = &tat.TaskResult{
-			// The real API returns Base64 ("Base64编码后的命令输出"); feeding plain text here is
+			// The real API returns Base64-encoded output; feeding plain text here is
 			// what let the tool print a blob for its whole life without a test noticing.
 			Output:   common.StringPtr(base64.StdEncoding.EncodeToString([]byte(f.output))),
 			ExitCode: common.Int64Ptr(f.exitCode),

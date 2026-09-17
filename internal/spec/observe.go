@@ -187,6 +187,15 @@ func diffCert(cur, want *config.Certificate) *CertificateChange {
 	if cur.Deploy.Enabled != want.Deploy.Enabled {
 		ch.Changed = append(ch.Changed, "deploy")
 	}
+	// renewBefore counts as a difference even though it changes no certificate name.
+	//
+	// Revision() hashes it and the onboarding generator never sets it, so a document that only
+	// differs there produced two different revisions and an EMPTY diff -- and an empty diff is the
+	// documented gate for switching to enforce ("stay at 0 before switching"). The operator would
+	// have promoted a change that moves how far ahead renewals start.
+	if cur.RenewBefore != want.RenewBefore {
+		ch.Changed = append(ch.Changed, "renewBefore")
+	}
 
 	if len(ch.Added) == 0 && len(ch.Removed) == 0 && len(ch.Changed) == 0 {
 		return nil
