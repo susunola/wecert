@@ -474,7 +474,7 @@ Exit codes: `0` written (or unchanged), `1` the program failed, `2` **deliberate
 | `-bindings` | Dump the raw bind-resource result for one certificate ID (debugging the "0 bound" verdict) |
 | `-yes` | Skip the confirmation prompt for `-prune-certs` |
 
-> `-prune-certs` matches on the alias prefix `wecert/`, which wecert applies to **every** certificate it uploads — including the one currently serving. It prints the list and requires confirmation; non-interactive stdin is treated as "no".
+> `-prune-certs` matches on the alias prefix `wecert/`, which wecert applies to **every** certificate it uploads — including the one currently serving. It prints the list and requires confirmation; non-interactive stdin is treated as "no". A delete the API refuses (`DeleteResult=false`) is reported as a failure and makes the command exit non-zero, rather than being reported as a deletion that did not happen.
 
 ### `wecert-probe` (network-side evidence)
 
@@ -489,7 +489,7 @@ Dials a real TLS connection and reports the certificate the far end actually ser
 | `-expect-san` | — | SAN set that was deployed; the served set must match exactly |
 | `-expect-not-after` | — | RFC3339 `notAfter` of the deployed certificate; catches a rebind that did not take effect |
 | `-wait` | `0` | Poll until the verdict is ok or this long elapses (e.g. `90s`) — useful right after a rebind |
-| `-json` | `false` | Print the raw result as JSON |
+| `-json` | `false` | Print each attempt as one JSON object (NDJSON, so a retry under `-wait`, or a host that resolves to several addresses, produces one line per attempt) |
 
 Exit codes: `0` served as expected · `1` could not complete a probe · `2` probed successfully but the certificate served was not the expected one.
 
