@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -353,5 +355,52 @@ func TestWaitForTaskPrintsDecodedOutput(t *testing.T) {
 	}
 	if got := decodeRemoteOutput(""); got != "" {
 		t.Errorf("empty output stays empty, got %q", got)
+	}
+}
+
+// A failing command's output must be readable.
+//
+// The API returns Output Base64-encoded, and the failure path printed it raw: the one moment the
+// output matters most -- the remote command failed and the operator is reading its stderr -- was
+// the one moment the tool handed over a blob. Found by running the tool against a real CVM, where
+// a command whose last statement exited non-zero printed its error as Base64.
+func TestAFailedTaskPrintsItsOutputDecoded(t *testing.T) {
+	f := &fakeTAT{
+		statuses: []string{"FAILED"},
+		output:   "cat: /etc/wecert/config.yaml: No such file or directory\n",
+		errorMsg: "the command exited with a non-zero status",
+	}
+
+	restore := captureStdout(t)
+	err := wait(t, f)
+	out := restore()
+
+	if err == nil {
+		t.Fatal("a FAILED task must be reported as a failure")
+	}
+	if !strings.Contains(out, "No such file or directory") {
+		t.Errorf("the failing command's output must be readable, got %q", out)
+	}
+	if strings.Contains(out, "Y2F0Og") {
+		t.Errorf("the output was printed as Base64: %q", out)
+	}
+}
+
+// captureStdout redirects os.Stdout for the duration of one call and returns a function that
+// restores it and hands back everything written.
+func captureStdout(t *testing.T) func() string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	return func() string {
+		_ = w.Close()
+		os.Stdout = old
+		data, _ := io.ReadAll(r)
+		_ = r.Close()
+		return string(data)
 	}
 }
