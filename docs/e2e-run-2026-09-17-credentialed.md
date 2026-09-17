@@ -245,7 +245,8 @@ subject=CN = *.alpha.atomwangnus.com   issuer=C = US, O = Let's Encrypt, CN = (S
 - **证据**：4.1 的两条日志行；4.2 的采样器结果（9/10 权威 + 3 递归在 ~7s 内可见，`112.80.181.175` 在 t+6.7s 以 AA 回答 `NXDOMAIN`、t+76.2s 才确认）；同批地址在本机反复 `UNREACHABLE`；失败轮 TXT 残留后 `112.80.181.175` 仍同时持有两个旧值，而 DNSPod API 侧记录数为 0。
 - **根因**：判据是"**没有可达的权威服务器否认该值，且至少 1 个确认**（多权威时要求 >= 2 个 NS 名）"（`internal/acme/dns.go`，`probeReadyWithExchange`）。一个**此刻从 wecert 主机不可达**的滞后节点贡献不了任何信息，于是判据可以在它其实还在发 `NXDOMAIN` 的时候判过。**该判据是全局传播的下界，且其结论依赖于 wecert 所处的网络机位**；而 CA 的解析器恰恰能到达那个节点。
 - **影响**：授权验证失败会消耗 **5 authorization failures per identifier / 小时** 这一不可恢复配额；更糟的是它表现为"偶发"，容易被误判成 CA 侧抖动而重试，从而继续烧配额。
-- **建议修法**：把"看不见"从"没问题"里拆出来。（a）在 `probeReadyWithExchange` 里区分"**明确否认**"与"**不可达**"，并对**不可达**单独设阈值：当可达权威地址数低于该 zone 的一个比例（例如写死一个下限，或要求 >= 2/3 的 NS 名）时，**不判过**而是继续等，并把 `unreachable` 计入决策而不是只计入 summary 文本。（b）对同一地址做**连续多轮确认**，用"连续 N 轮一致"代替单轮快照，避免一次 ICMP/UDP 抖动就改变结论。（c）把每条记录的实测等待时长与最终 `unreachable` 计数写进日志与指标，让"这次是靠运气过的"在事后可查。
+- **已实现（本轮，零风险的一半）**：`TXT propagated` 这条**成功**日志现在带上它据以判断的证据，而不只是服务器数量——每轮的完整 summary（`confirmed N/M server(s) / denied … / non-authoritative … / unreachable …`）都会打印出来。理由是这条判定是全局传播的**下界**、且来自本机视角，出了事故回头看日志时，"当时有多少权威地址其实是看不见的"必须可查；此前只有 `nameservers=10 records=1`，看不出来。已加测试 `TestPropagatedVerdictLogsItsEvidenceIncludingUnreachableAuthorities` 并做变异校验（把该字段去掉，测试立刻变红）。
+- **建议修法（仍未实现）**：把"看不见"从"没问题"里拆出来。（a）在 `probeReadyWithExchange` 里区分"**明确否认**"与"**不可达**"，并对**不可达**单独设阈值：当可达权威地址数低于该 zone 的一个比例（例如写死一个下限，或要求 >= 2/3 的 NS 名）时，**不判过**而是继续等，并把 `unreachable` 计入决策而不是只计入 summary 文本。（b）对同一地址做**连续多轮确认**，用"连续 N 轮一致"代替单轮快照，避免一次 ICMP/UDP 抖动就改变结论。（c）把每条记录的实测等待时长与最终 `unreachable` 计数写进日志与指标，让"这次是靠运气过的"在事后可查。
 
 ### 5.2 部署校验的 30s 固定预算，把"未验证"写成"失败"（最严重）
 
