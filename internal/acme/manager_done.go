@@ -166,14 +166,21 @@ func (m *Manager) download(
 			}
 		}
 		deployedID = id
-		o.DeploymentCertID = ""
-		// Persist the clear, not just the in-memory field. discardOrder below re-reads the
-		// order from the store, and a stale ID left there would be reclaimed as an orphan
-		// even though this certificate is the one now in service. Best-effort: a successful
-		// issuance must not fail because a bookkeeping write did.
-		if err := m.store.PutOrder(o); err != nil {
-			m.log.Warn("cannot persist the cleared deployment ID", "cert", c.Name, "err", err)
-		}
+		// The order's DeploymentCertID is deliberately NOT cleared here.
+		//
+		// It used to be, with a best-effort PutOrder that was allowed to fail ("a successful
+		// issuance must not fail because a bookkeeping write did"). Two things were wrong with
+		// that. The write is a durable statement outside the transaction below, so a rollback
+		// left the order without its resume anchor: the uploaded certificate was then in neither
+		// certificates nor retired_certificates, the next pass uploaded a second copy of it
+		// instead of resuming, and the first copy leaked against the account quota. And the
+		// orphan decision below reads the order back from the store, so when that write failed
+		// the order still named the certificate being promoted -- which the guard, comparing
+		// against the not-yet-promoted row, could only read as "an orphan".
+		//
+		// tx.DeleteOrder below removes the row (and with it the ID) inside the transaction, which
+		// is both atomic and sufficient: on success nothing stale survives, and on failure the
+		// anchor survives too, which is what lets the next pass resume instead of re-uploading.
 		rebound = oldDeployedID != ""
 	} else {
 		// A local-only renewal must never claim the older cloud certificate is this
@@ -314,7 +321,7 @@ func (m *Manager) download(
 	// The order may also carry the ID of a certificate that was uploaded but never rebound. Hand it
 	// to the reclaim list inside the same transaction -- see discardOrder for why losing it is
 	// expensive.
-	orphanID, orphanPEM, orphanKey := m.orphanToRecord(c.Name)
+	orphanID, orphanPEM, orphanKey := m.orphanToRecord(c.Name, deployedID)
 
 	// The TXT records first: idempotent, repeatable, and useless to redo if the state change fails.
 	if err := m.cleanupOrphanTXT(ctx, c.Name); err != nil {
@@ -505,7 +512,8 @@ func (m *Manager) recordFailure(st *state.CertState, err error) error {
 // still has to be cleaned up and removed). The renewal epilogue does the same work through one
 // transaction instead; see orphanToRecord for the half of it that has to be decided in advance.
 func (m *Manager) discardOrder(ctx context.Context, certName string) error {
-	orphanID, orphanPEM, orphanKey := m.orphanToRecord(certName)
+	// No promotion is in flight on this path, so the store's deployed_cert_id is the live one.
+	orphanID, orphanPEM, orphanKey := m.orphanToRecord(certName, "")
 
 	if err := m.cleanupOrphanTXT(ctx, certName); err != nil {
 		// A cleanup failure must not stop us discarding the order -- that would leave us stuck
@@ -538,10 +546,18 @@ func (m *Manager) discardOrder(ctx context.Context, certName string) error {
 // sees it, and it occupies the account's uploaded-certificate quota forever -- and quota exhaustion
 // is what stops renewal.
 //
+// promotedID is the certificate id this pass is about to make live, and it is not optional
+// information: on the renewal path the promotion is still staged on a copy when this decision is
+// made (the transaction that writes it has not opened yet), so certificates.deployed_cert_id still
+// names the OUTGOING certificate. Comparing the order's id against that stale value could never
+// match the id being promoted, so the guard silently stopped guarding and the certificate that was
+// about to serve traffic was written to the reclaim list in the same transaction that promoted it.
+// Callers that are not promoting anything pass "" and the store's value is used instead.
+//
 // Split out of discardOrder because the renewal epilogue has to make this decision *before* it
 // opens the transaction that writes it: the store's reads use the pool, and the pool's connection
 // is held by the transaction while it is open.
-func (m *Manager) orphanToRecord(certName string) (certID string, certPEM, keyPEM []byte) {
+func (m *Manager) orphanToRecord(certName, promotedID string) (certID string, certPEM, keyPEM []byte) {
 	o, err := m.store.GetOrder(certName)
 	if err != nil {
 		m.log.Warn("cannot read the order before discarding it; an uploaded certificate may be left unreclaimed",
@@ -552,11 +568,13 @@ func (m *Manager) orphanToRecord(certName string) (certID string, certPEM, keyPE
 		return "", nil, nil
 	}
 
-	liveID := ""
-	if st, cerr := m.store.GetCert(certName); cerr != nil {
-		m.log.Warn("cannot read the certificate before discarding its order", "cert", certName, "err", cerr)
-	} else if st != nil {
-		liveID = st.DeployedCertID
+	liveID := promotedID
+	if liveID == "" {
+		if st, cerr := m.store.GetCert(certName); cerr != nil {
+			m.log.Warn("cannot read the certificate before discarding its order", "cert", certName, "err", cerr)
+		} else if st != nil {
+			liveID = st.DeployedCertID
+		}
 	}
 	// liveID == "" errs toward reclaiming: recordOrphanCert only skips on an exact match, and a
 	// certificate still bound to a listener is protected by IsCheckResource refusing the delete.
