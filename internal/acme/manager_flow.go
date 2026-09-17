@@ -328,6 +328,10 @@ func (m *Manager) solveChallenges(
 			}
 			a.ChallengeURL = chlg.URL
 			a.ChallengeToken = chlg.Token
+			// Remember when this challenge was chosen. Crash recovery probes for the record of a row
+			// that was never marked presented, and a denial is only evidence once the write would
+			// have had time to reach the authoritative servers (see reclaimUnpresentedTXT).
+			a.ChallengePreparedAt = m.now()
 
 			adopted := false
 			if firstVisit {
@@ -772,6 +776,28 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 		return false
 	}
 	if !found {
+		// A denial is only evidence once the write would have had time to appear.
+		//
+		// The row this probes exists for the pass that died between the DNS write and the state
+		// persist -- but it also exists for the one that died between persisting the challenge and
+		// writing DNS, and the two are indistinguishable from the record alone. What separates them
+		// is time: if the challenge was chosen moments ago, every authoritative server may simply
+		// not have it yet (DNSPod's addresses lag the API write, measured at up to ~60s for a
+		// deletion this session), and deleting the row then drops the only clue to a record that is
+		// about to appear -- which stays in DNS and can poison a later challenge at the same name.
+		//
+		// A row with no timestamp predates the column, so its age is unknown and the previous
+		// behaviour is kept: refusing to delete those would strand every one of them forever.
+		if age := m.now().Sub(a.ChallengePreparedAt); !a.ChallengePreparedAt.IsZero() &&
+			age < m.dns.PropagationTimeout() {
+			m.log.Info("an unpresented row's record was denied, but its challenge is newer than the "+
+				"propagation window; keeping the row so a record that is still propagating is not lost",
+				"cert", a.CertName, "identifier", a.Identifier, "name", a.TxtName,
+				"preparedAgo", age.Round(time.Second),
+				"window", m.dns.PropagationTimeout())
+			return false
+		}
+
 		// Every reachable authoritative nameserver denied this value, which is the
 		// only answer that licenses deleting the row: the write genuinely never
 		// happened. Any other outcome -- including one that merely could not be
