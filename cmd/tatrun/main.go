@@ -20,6 +20,7 @@ import (
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	tat "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/tat/v20201028"
 	"net/url"
+	"strings"
 )
 
 func main() {
@@ -119,7 +120,7 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 					return fmt.Errorf("the TAT task reported SUCCESS for invocation=%s but returned no "+
 						"result, so there is no evidence to report", invocationID)
 				}
-				out := deref(task.TaskResult.Output)
+				out := decodeRemoteOutput(deref(task.TaskResult.Output))
 				exitCode := derefI64(task.TaskResult.ExitCode)
 				if !quiet {
 					fmt.Fprintf(os.Stderr, "--- command output (exit=%d) ---\n", exitCode)
@@ -202,6 +203,31 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// decodeRemoteOutput turns the API's encoding of a command's output into what the command printed.
+//
+// TaskResult.Output is documented as "Base64编码后的命令输出" (Base64-encoded, up to 24KB), and the
+// API really does return it that way -- the captures in this repository's own e2e runs decode from
+// Base64 to the openssl output they were checking. Printing the field verbatim therefore made the
+// tool's entire evidence a blob: `-quiet | grep` matched nothing, and a reader had to know to decode
+// it before they could tell which certificate a listener was serving.
+//
+// An undecodable value is printed as-is rather than dropped: whatever the server sent is still the
+// only evidence there is, and silently printing nothing would be worse than printing something
+// unreadable. The caller is told which happened.
+func decodeRemoteOutput(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw)); err == nil {
+		return string(decoded)
+	}
+	// Some encoders omit padding; try the unpadded alphabet before giving up.
+	if decoded, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(strings.TrimSpace(raw), "=")); err == nil {
+		return string(decoded)
+	}
+	return raw
 }
 
 // truncationNotice words the warning for a truncated TaskResult, or returns "" when the output is
