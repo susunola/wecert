@@ -10,7 +10,7 @@
 
 ## 1. 一句话结论
 
-本轮用真实 LE staging 签出了证书，首次在真实 CLB 上证明了**只换掉一张证书不会动到同一监听器上的另一张**（SNI 按规则隔离，独立 TLS 握手机位复核），并在一台真机 Ubuntu 上跑通了 **systemd + CVM 角色**的一轮完整签发（`install.sh` 装出的路径约定与加固项都成立，机器上没有任何静态密钥）；但同时也证明了两件事在**当前账号条件**下不可用：DNS 传播判据会因权威节点对本机**瞬时不可达**而放行尚未全局传播的记录（第一次 L1 因此被 CA 判 `NXDOMAIN`），以及部署校验的 30s 固定预算会让**云端已经成功**的换绑永远无法回写成功状态，`deployed_cert_id` 停留在旧证书、`not_after` 停留在 0。
+本轮用真实 LE staging 签出了证书，首次在真实 CLB 上证明了**只换掉一张证书不会动到同一监听器上的另一张**（SNI 按规则隔离，独立 TLS 握手机位复核），并在一台真机 Ubuntu 上跑通了 **systemd + CVM 角色**的一轮完整签发（`install.sh` 装出的路径约定与加固项都成立，机器上没有任何静态密钥）；但同时也证明了两件事在**当前账号条件**下不可用：DNS 传播判据会因权威节点对本机**瞬时不可达**而放行尚未全局传播的记录（第一次 L1 因此被 CA 判 `NXDOMAIN`），以及部署校验的 30s 固定预算会让**云端已经成功**的换绑永远无法回写成功状态，`deployed_cert_id` 停留在旧证书、`not_after` 停留在 0（该缺陷已修复，并在同一账号同场景复跑一次即收敛，见 4.6 与 5.2）。
 
 ---
 
@@ -37,6 +37,7 @@
 | L1 首次尝试 | 同上（11:55 那次） | **失败** | 传播检查 21s 即返回 `TXT propagated`，随后 CA 回 `NXDOMAIN looking up TXT for _acme-challenge.atomwangnus.com` |
 | 双 SAN 泛域名 + SNI 隔离 | `testenv/` + 规则级证书绑定 + `UpdateCertificateInstance` | **通过** | 换绑后 alpha 变为 `CN = *.alpha.atomwangnus.com`，beta 指纹与基线逐字节一致（见 4.3） |
 | 部署状态回写 | 上述换绑后 wecert 的校验阶段 | **失败** | 连续 3 次 `success=1 failed=0` 但枚举超时；`deployed_cert_id=ariXUn7n`、`not_after=0`、`consecutive_failures=3` |
+| 部署状态回写（修复后复跑） | 同上，二进制 `355655e` | **通过** | 一次 pass 内收敛：`deployed_cert_id=asH7jREM`、`not_after=2026-12-16`、`consecutive_failures=0`、`orders=0`，旧证书 `asGojB81` 进入回收清单；规则级握手复核新证书已在服务（见 4.6） |
 | Stage C 安装 + systemd + 角色 | `install.sh` on Ubuntu 22.04 CVM + `systemctl enable --now wecert` | **通过** | `install.sh` 装出 `/usr/local/bin/wecert`（sha256 与本机交叉编译产物逐字节一致）、`/etc/wecert/config.yaml 0640 root:wecert`、`/var/lib/wecert 0700 wecert:wecert`；unit `active`；`credentialMode=cvm-role` 下完成一轮真实签发并上传（见 4.5） |
 | apex + `*.apex` 单证书（真实 LE） | — | **未跑** | 本轮未执行 |
 | `profile: tlsserver`（45 天）真实续期 | — | **未跑** | 真实 LE 侧未跑；profile 选择仅由离线 pebble e2e 覆盖 |
@@ -199,6 +200,41 @@ wecert_reconcile_total{cert="stage-c",result="ok"} 1
 
 注意：`certificate uploaded; waiting for a one-time manual bind in the CLB console` 是产品设计的**首签行为**（CLB 控制台手工绑定一次，之后靠 `UpdateCertificateInstance` 自动换绑）；本轮未做这次手工绑定，所以 Stage C 的"之后自动重绑"这一段仍未跑，见第 6 节。
 
+
+### 4.6 修复后在真实账号上的复核（同一场景重跑）
+
+同一账号、同一场景（内部 CLB + 两个规则绑着一张占位证书 + 双泛域名 SAN），换成带修复的二进制（`main.version=355655e`）重跑一次签发 + 换绑：
+
+```
+level=INFO msg="TXT propagated" zone=atomwangnus.com. nameservers=9 records=2
+level=WARN msg="the one-click update reported nothing to switch, but the new certificate is bound and the old one is not; treating the switch as done (the rebind succeeded without being recorded)" oldCertId=asGojB81 newCertId=asH7jREM boundResources=1
+level=INFO msg="certificate renewed and live" cert=two-san-wildcard notAfter=2026-12-16T11:26:57.000Z daysLeft=90 deployedCertId=asH7jREM ariCertId=true
+```
+
+状态库（`/tmp/wecert-e2e/state-fix.db`）：
+
+```
+two-san-wildcard|asH7jREM|2026-12-16 11:26:57|0|      # name | deployed_cert_id | not_after | consecutive_failures
+orders|0                                              # 订单已收尾，不再每轮重跑
+retired|asGojB81                                      # 旧证书进入回收清单
+```
+
+独立机位复核（CVM 内 TLS 握手，VIP `10.99.1.16`）：
+
+```
+== SNI test.alpha.atomwangnus.com
+subject=CN = *.alpha.atomwangnus.com   issuer=C = US, O = Let's Encrypt, CN = (STAGING) Artificial Amaranth YE1
+== SNI test.beta.atomwangnus.com
+subject=CN = *.alpha.atomwangnus.com   issuer=C = US, O = Let's Encrypt, CN = (STAGING) Artificial Amaranth YE1
+```
+
+收尾幂等：紧接着再跑一次 `-once`，没有新订单、`deployed_cert_id` 与 `not_after` 不变，只刷新了 ARI 窗口。
+
+两点如实说明：
+
+- 这次**修复后的真实路径不是哨兵分支**：预算放宽到 3 分钟后，枚举在预算内给出了答案，于是走的是既有的"旧证书 0 绑定、新证书有绑定 -> 认定切换已发生"的恢复判定（上面那条 WARN）。哨兵分支（枚举超时 / 未覆盖全部 region）本轮在真实账号上**没有被触发**，它只有单元测试与变异校验覆盖。
+- 本轮 `TXT propagated` 报的是 `nameservers=9`（前几次是 10），即探测时有一个权威地址不可达；结论仍要求"无否认 + >= 2 个 NS 名确认"，5.1 描述的口径问题不因这次通过而消失。
+
 ---
 
 ## 5. 发现的问题
@@ -217,10 +253,10 @@ wecert_reconcile_total{cert="stage-c",result="ok"} 1
 - **证据**：4.4 的代码行、三次 `taskId`（`2562464` / `2562489` / `2562034`）、6 次 poll 同一 `CacheTime`、状态库读出 `('two-san-wildcard','ariXUn7n',0,3)`、退避 60s -> 120s -> 240s。
 - **根因**：`internal/deploy/tencent.go` 里延迟枚举的预算是**常量 30s**，而本账号的同一枚举**已缓存时约 25s**、冷启动更久——预算与真实耗时同一个量级，必然间歇性击穿。而击穿的处理方式是 `return ... error`，于是一次**校验超时**被当成一次**部署失败**：云端早已成功，状态层却退回旧状态。代码里"拒绝在未经验证的切换上报告成功"的意图是对的，错在把两种不同的东西合并成了同一种失败。
 - **影响**：状态库显示"未部署 / 到期时间 1970"，而 CLB 实际在服务新证书。真实的续期**永远不会被记为完成**，到期类指标与告警会对着一个健康证书报过期（告警不可信，正是 `docs/test-plan.md` 列为最高代价的失效形态）；同时因为 `deployed_cert_id` 指向旧证书，后续 pass 仍会认为"该换绑"而重复动作。**在当前账号上，"继续失败"这条路径可证明不收敛**：同一枚举耗时稳定压在 30s 附近，重试只会重复同一个超时。
-- **建议修法**：两件事一起做。
-  1. **预算可配**：把 30s 换成带默认值的可配置项（例如 `deploy.verifyTimeout`，默认取 30s 的几个倍数量级），并让日志打印实际耗时与 `taskId`，使预算能按账号/环境调整而不是改代码。
-  2. **把"已成功但未验证"建成一个显式状态**：当部署记录已报成功、而枚举在读超时之前没读完时，**记录新证书 ID**（`deployed_cert_id` 更新为 `arqodPGa`），把状态标为 `deployed but unverified`，发出告警，并让**下一个 pass 用一次便宜的重验**（重新枚举/查绑定）来消解该标记——而不是让 pass 失败并保留旧状态。
-  这样 `not_after` 与真实服务状态一致，告警只对"未验证"发声，且不需要把 30s 硬撑大就能收敛；单纯保留"失败"语义则在本账号上不收敛。
+- **修法（已实现，见 4.6 的真实账号复核）**：两件事一起做，一个改动对应一条性质。
+  1. **预算可配且足够长**：30s 常量换成部署器上的 `enumerationBudget`（默认 `defaultEnumerationBudget = 3 * time.Minute`，测试可缩短）。理由写在常量注释里：枚举是服务端的异步缓存，耗时不属于我们；一个"永远答不上来"的校验比"多等一会儿"更糟，而它每次部署只跑一次。
+  2. **把"已成功但未验证"建成显式结果**：新增哨兵错误 `deploy.ErrSwitchUnverified`（`internal/deploy/deployer.go`）。枚举**超时**、或**没覆盖全部 region** 这两种"不知道"的情况返回它，而**"枚举已完成且绑定数为 0"仍然是硬失败**——那确实是一次没有发生的切换。ACME 层（`internal/acme/manager_done.go`）识别该哨兵后：记录新证书 ID、**完成订单**（不再每轮重跑同一个 deploy）、`DeployConfirmed` 保持 `false`（部署指标在确认前不说谎），下一轮由既有的绑定探测（`confirmBinding`）确认后自动置真。
+  两条性质各自被测试钉住（`TestAdoptedTaskWhoseEnumerationNeverAnswersIsUnverifiedNotFailed`、`TestUnverifiedSwitchIsRecordedAsDeployedButUnconfirmed`），并做了变异校验：把哨兵换掉、或把 `unverified` 分支关掉，测试立刻变红。
 
 ### 5.3 默认镜像不带 TAT agent，Stage C runbook 起不来
 
@@ -244,6 +280,20 @@ wecert_reconcile_total{cert="stage-c",result="ok"} 1
 - **影响**：新环境按 README 走会在 `terraform apply` 或 Stage B 第一步失败，且两次失败的报错都不直接指向根因（角色缺失 / SNI 强制）。
 - **建议修法**：把 CAM 角色与策略的创建写成可选 terraform 资源（或独立的 `bootstrap` 目录）并在 README 里列为步骤 0；在 Stage A/B 脚本里加一条前置探测——读监听器的 SNI 开关与证书绑定状态，若"SNI 强开且监听器无证书"就直接跳过 Stage B 并提示改用规则级绑定，而不是等到 pre-rebind 检查再中止。
 
+### 5.5 一个按"到期时刻"变红的测试：断言边界用了错误的时钟
+
+- **现象**：本轮加修复后跑 `go test -race ./...` 时，`TestRenewalArchivesTheOutgoingCertificateMaterial` 变红（`expected the outgoing certificate on the reclaim list, got []`），而该行为在当时的提交上并没有被改动；把工作区回到 HEAD 单独跑，它同样变红。
+- **证据**：该测试把 manager 的时钟钉在 `fixed = 2026-09-16 12:00 UTC`，却用 `ListRetiredCertsBefore(fixed.Add(24 * time.Hour))` 去查回收清单；而 `internal/state/state.go` 的 `addRetiredCertExec` 写 `retired_at` 用的是**存储层自己的** `time.Now().Unix()`。临时插入的调试输出（验证后已删）说明了一切：
+
+  ```
+  fixed=2026-09-16 12:00:00 +0000 UTC   bound=2026-09-17 12:00:00 +0000 UTC   realNow=2026-09-17 12:20:00 +0000 UTC
+  ```
+
+  即：它只在真实时钟早于 `2026-09-17 12:00 UTC` 时通过，本轮跑到 12:20 UTC 时它自己到期了。
+- **根因**：断言的时间边界来自被测对象**注入的**时钟，而被断言的状态由存储层**自己的**时钟写入——两个时钟不同源，测试里因此埋了一个绝对的"到期时刻"（正是 `docs/test-plan.md` 里"墙钟语义"那一类问题的测试侧版本）。
+- **影响**：套件会在某个固定时刻之后无条件变红，与代码质量无关；这类失败最容易被误读成"上一个提交改坏了"，本轮确实先花时间排除了自己的改动。
+- **修法**：已把边界改成存储层时钟（`ListRetiredCertsBefore(time.Now().Add(time.Hour))`）并写明理由——断言关心的是"旧证书的材料有没有被归档"，不是"何时归档"。同时确认它仍在测该测的东西：把 `retireOld` 置为 `false` 后该测试立刻变红。一般规则：断言带时间戳的状态时，边界要用**写状态的那个时钟**，不要用被测对象注入的时钟反推。
+
 ---
 
 ## 6. 未跑 / 不能证明的东西
@@ -258,7 +308,7 @@ wecert_reconcile_total{cert="stage-c",result="ok"} 1
 | Stage C 安装 / systemd / 角色凭证路径 | **通过** | 见 4.5：`install.sh` 装出的路径约定、加固项、`cvm-role` 下的一轮真实签发与上传都成立 |
 | Stage C 的"首签后手工绑定 → 之后自动换绑" | **未跑** | 本轮未在 CLB 控制台做那次一次性手工绑定，因此这一段链路未验证 |
 | 传播判据在其它域名/网络机位是否同样偏乐观 | **未验证** | 只有 `atomwangnus.com` 一个 zone 的采样数据 |
-| 5.2 的修法能否在本账号收敛 | **未验证** | 属建议，未实现、未跑 |
+| 5.2 的修法能否在本账号收敛 | **已验证** | 修复后同场景复跑一次即收敛（见 4.6）；但触发的是恢复判定而非哨兵分支，哨兵分支仅有单元测试覆盖 |
 | 关闭 SNI 后 Stage B 原路径是否可用 | **未验证** | 本账号无法关闭 SNI，因此这条路径无法被本账号证伪或证实 |
 | 生产（非 staging）LE 配额与签发行为 | **未跑** | 全程 staging |
 
