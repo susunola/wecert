@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -203,7 +204,12 @@ func TestRenewalArchivesTheOutgoingCertificateMaterial(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	retired, err := store.ListRetiredCertsBefore(fixed.Add(24 * time.Hour))
+	// The bound has to come from the store's own clock, not from the manager's injected one:
+	// AddRetiredCert stamps retired_at with time.Now(), so a bound derived from fixed made this
+	// test pass only until the wall clock reached fixed+24h -- at which point it failed for a
+	// reason that had nothing to do with the behaviour under test. The assertion is about the
+	// archived material, not about when it was archived.
+	retired, err := store.ListRetiredCertsBefore(time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -740,5 +746,109 @@ func TestRateLimitErrorRecordsTheCAsDeadline(t *testing.T) {
 	}
 	if !found {
 		t.Error("the account limit must be in the quota report")
+	}
+}
+
+// unverifiedDeployer is what the Tencent Cloud deployer looks like when the one-click switch
+// is reported as done but the asynchronous bind-resource enumeration does not answer in time:
+// it returns the uploaded certificate's ID together with a wrapped ErrSwitchUnverified.
+type unverifiedDeployer struct{ id string }
+
+func (d *unverifiedDeployer) Deploy(context.Context, string, string, []byte, []byte) (string, error) {
+	return d.id, fmt.Errorf("UpdateCertificateInstance: %w: the enumeration did not answer",
+		deploy.ErrSwitchUnverified)
+}
+func (d *unverifiedDeployer) Delete(context.Context, string) error { return nil }
+func (d *unverifiedDeployer) Bindings(context.Context, string) (int, bool, error) {
+	return 0, false, nil
+}
+
+// A switch the cloud reports as done but wecert could not confirm must be RECORDED, not
+// retried forever.
+//
+// Observed on a real shared account: the deploy record reported success=1 on three
+// consecutive passes, each pass then failed on the enumeration timeout, and the state kept
+// the old certificate with not_after at 0 -- because the old certificate has no bindings
+// left, every round re-ran the same switch and nothing ever converged. The honest outcome is
+// "deployed, but not confirmed": the certificate is promoted so the next round is a cheap
+// binding probe instead of another deploy, and DeployConfirmed stays false so the deployed
+// metric does not claim a confirmation that never happened.
+func TestUnverifiedSwitchIsRecordedAsDeployedButUnconfirmed(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	cert.Deploy.Enabled = true
+	m.deployer = &unverifiedDeployer{id: "cloud-new"}
+
+	oldExpiry, newExpiry := time.Now().Add(24*time.Hour), time.Now().Add(90*24*time.Hour)
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: oldExpiry,
+		CertURL: "https://ca.test/old", CertPEM: selfSignedCertPEM(t, oldExpiry, "example.com"),
+		KeyPEM: []byte("old-key"), DeployedCertID: "cloud-old", DeployConfirmed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := GenerateKey(cert.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := MarshalPrivateKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutOrder(&state.Order{CertName: cert.Name, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	fake.certNotAfter = newExpiry
+	fake.orders = []legoacme.ExtendedOrder{{
+		Order:    legoacme.Order{Status: "valid", Certificate: "https://ca.test/new"},
+		Location: "https://ca.test/order/new",
+	}}
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("an unconfirmed switch is not a failed renewal; failing here never converges: %v", err)
+	}
+
+	got, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DeployedCertID != "cloud-new" {
+		t.Errorf("DeployedCertID = %q, want cloud-new: the certificate that is serving traffic must be "+
+			"recorded, otherwise every later round re-runs the same switch", got.DeployedCertID)
+	}
+	if got.DeployConfirmed {
+		t.Error("the binding was never confirmed, so DeployConfirmed must stay false and the deployed " +
+			"metric must keep saying so until the next pass's probe confirms it")
+	}
+	if got.ConsecutiveFailures != 0 {
+		t.Errorf("this is not a failure, so it must not enter backoff: ConsecutiveFailures = %d",
+			got.ConsecutiveFailures)
+	}
+	if o, err := store.GetOrder(cert.Name); err != nil {
+		t.Fatal(err)
+	} else if o != nil {
+		t.Errorf("the order must be finished, or the next round resumes it and deploys again: %+v", o)
+	}
+	retired, err := store.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retired) != 1 || retired[0].CertID != "cloud-old" {
+		t.Errorf("the outgoing certificate belongs on the reclaim list (the cloud refuses to delete a "+
+			"certificate that is still bound), got %+v", retired)
+	}
+
+	// And the loop closes: the state this leaves behind is exactly what the cheap binding probe
+	// acts on, so the next pass settles the question instead of repeating the switch.
+	m.deployer = &fakeDeployer{bindings: 2}
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("the confirming pass must not fail: %v", err)
+	}
+	confirmed, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !confirmed.DeployConfirmed {
+		t.Error("the next pass found the certificate bound, so the deployment must become confirmed " +
+			"without another deploy")
 	}
 }

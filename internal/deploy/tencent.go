@@ -25,6 +25,17 @@ type TencentCLB struct {
 	types      []string
 	log        *slog.Logger
 	now        func() time.Time
+	// enumerationBudget overrides defaultEnumerationBudget when non-zero. Tests set it to
+	// keep the polling loop short in real time; production uses the default.
+	enumerationBudget time.Duration
+}
+
+// enumerationWait is the effective bind-resource enumeration budget.
+func (d *TencentCLB) enumerationWait() time.Duration {
+	if d.enumerationBudget > 0 {
+		return d.enumerationBudget
+	}
+	return defaultEnumerationBudget
 }
 
 // LazyTencentCLB creates the Tencent Cloud deployer only when an operation
@@ -110,6 +121,18 @@ func NewTencentCLB(cfg config.Tencent, log *slog.Logger) (*TencentCLB, error) {
 // deployRecordGrace is how long a deploy record may report all-zero counters before the
 // wait concludes that nothing was bound. See waitDeployRecord.
 const deployRecordGrace = 15 * time.Second
+
+// defaultEnumerationBudget is how long the bind-resource enumeration may take before the
+// verification gives up and reports ErrSwitchUnverified instead of an answer.
+//
+// The enumeration is asynchronous and its latency belongs to the server, not to us:
+// measured on a shared account holding 36 certificates, a task that was already cached
+// answered in about 25s and fresh ones took longer than the 30s this used to allow --
+// which turned an already-successful rebind into a failed pass on every attempt, with the
+// state never recording the certificate that was serving traffic. The budget is generous
+// on purpose: it costs one wait per deployment, and the alternative to waiting is a
+// verification that never answers.
+const defaultEnumerationBudget = 3 * time.Minute
 
 // sslAPI is the narrow slice of the Tencent Cloud SSL client this package uses.
 //
@@ -362,18 +385,20 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 				// cached task result from before the switch answers a different question.
 				n, berr := d.bindingsWith(ctx, client, newID, false)
 				if berr != nil {
-					return fmt.Errorf("the in-progress update task finished, but verifying whether %s is "+
-						"bound failed: %w (refusing to report success on an unverified switch)", newID, berr)
+					// The task is done and the record says it succeeded, but the enumeration that
+					// would confirm which certificate ended up bound did not answer in time. That is
+					// "unknown", not "failed" -- see ErrSwitchUnverified for why failing here never
+					// converges.
+					return fmt.Errorf("%w: the in-progress update task finished, but enumerating the "+
+						"bindings of %s failed: %v", ErrSwitchUnverified, newID, berr)
 				}
 				if n.count == 0 && !n.complete {
 					// Not the same as "it is not bound": at least one region went unanswered, so
 					// this program cannot tell. Reporting failure here would be wrong about a
 					// switch that did happen, and reporting success would be wrong about one that
-					// did not, so it says which it is and refuses to guess.
-					return fmt.Errorf("an update task was already in progress and finished, but the "+
-						"bind-resource enumeration for %s did not cover every region, so whether this "+
-						"switch took effect is unknown (refusing to report success on an unverified switch)",
-						newID)
+					// did not -- so it reports the uncertainty and lets the binding probe settle it.
+					return fmt.Errorf("%w: an update task was already in progress and finished, but the "+
+						"bind-resource enumeration for %s did not cover every region", ErrSwitchUnverified, newID)
 				}
 				if n.count == 0 {
 					return fmt.Errorf("an update task was already in progress, and this certificate (%s) is "+
@@ -854,9 +879,11 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 		return bindingCount{complete: false}, nil
 	}
 
-	// Enumeration is asynchronous, so poll until there is a result. Keep the ceiling short:
-	// this is only a confirmation action and not worth blocking reconciliation on for long.
-	deadline := d.now().Add(30 * time.Second)
+	// Enumeration is asynchronous, so poll until there is a result. The ceiling comes from
+	// enumerationWait: this is only a confirmation action, but a budget shorter than the
+	// server's own latency produces a verification that never answers, which is worse than
+	// waiting (see defaultEnumerationBudget).
+	deadline := d.now().Add(d.enumerationWait())
 	for {
 		queryReq := ssl.NewDescribeCertificateBindResourceTaskResultRequest()
 		queryReq.TaskIds = []*string{common.StringPtr(taskID)}
@@ -885,7 +912,8 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 		}
 
 		if d.now().After(deadline) {
-			return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within 30s (taskId=%s)", taskID)
+			return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within %s (taskId=%s)",
+				d.enumerationWait(), taskID)
 		}
 		if err := waitBetweenPolls(ctx, 2*time.Second); err != nil {
 			return bindingCount{}, err
