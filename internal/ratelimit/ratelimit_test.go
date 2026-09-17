@@ -257,3 +257,45 @@ func TestZeroInstantIsNotADeadline(t *testing.T) {
 		t.Error("the documented format must still parse")
 	}
 }
+
+// Spending while in debt must carry the debt, not forgive it.
+//
+// Spend subtracted from Remaining(), which clamps a debt to zero: a bucket at -5 that was spent
+// again landed at -1 instead of -6, so the next token arrived several refill intervals early. The
+// package's own contract is the opposite ("an over-spend is not silently forgiven"), and the
+// existing over-spend test only ever READS the bucket afterwards, so it never saw this.
+func TestSpendingWhileInDebtCarriesTheDebt(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	l := AuthzFailuresPerIdentifier // capacity 5, one token back every 12m
+
+	// Ten against a capacity of five: five spent, five of debt.
+	s := Spend(Snapshot{}, l, 10, now)
+	if s.Tokens != -5 {
+		t.Fatalf("an over-spend of 5 against a capacity of 5 must leave -5, got %v", s.Tokens)
+	}
+
+	// One refill interval later, one more spend. Remaining() would report 0 here, so subtracting
+	// from it turns -5 into -1 and hands back four tokens that do not exist.
+	after := now.Add(l.Refill)
+	s = Spend(s, l, 1, after)
+	if s.Tokens != -5 {
+		t.Errorf("spending 1 while in debt must leave -5 (one refill earned, one token spent), got %v: "+
+			"the debt below zero was forgiven", s.Tokens)
+	}
+	if got := Remaining(s, l, after); got != 0 {
+		t.Errorf("a bucket in debt has nothing available, got %v", got)
+	}
+
+	// The debt is worked off by refills, not forgiven: the bucket is at -5, so five refills bring it
+	// to exactly zero and the sixth is the first spendable token.
+	if got := Remaining(s, l, after.Add(4*l.Refill)); got != 0 {
+		t.Errorf("after 4 more refills the bucket is still in debt, got %v", got)
+	}
+	if got := Remaining(s, l, after.Add(5*l.Refill)); got != 0 {
+		t.Errorf("five refills clear the debt to exactly zero, got %v", got)
+	}
+	if got := Remaining(s, l, after.Add(6*l.Refill)); got != 1 {
+		t.Errorf("the sixth refill is the first available token, got %v (forgiven debt shows up here "+
+			"as several)", got)
+	}
+}
