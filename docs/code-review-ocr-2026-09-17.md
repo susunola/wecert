@@ -104,7 +104,49 @@ clear 先落盘，提升与删单在事务里。事务失败时（错误信息�
 
 同轮依据 `code-review-expert` 复审结果补的小改动：日志 URL 去签名（P2）、`UpdateRateBucket` 的回调不得重入 store 的契约写明（P2）、DNSPod 空结果判定收敛到新的 `internal/tcerr`（P2，原先 `cmd/preflight` 与 `internal/onboarding` 各一份）、`bucketStore` 拆成读/写两个接口并删掉已无人使用的 `PutRateBucket`（P2）、采纳任务校验成功后打印耗时与绑定数（P2）、`pollUntilBound` 的回调合二为一并把轮询间隔提成常量（P3）。
 
-**刻意留下的清理项**（`code-review-expert` 的 removal plan 里标为「defer with plan」）：`reconcile.RunOnce` 现在只有一个生产调用者（守护进程循环），`RunAll` 的返回值在那里被丢弃——把两者收敛成一个入口是安全的，但会动到守护进程路径，值得单独一个提交和一轮它自己的测试；本轮没有顺手做，以免把一次「关闭已知缺陷」的改动混进一次行为重构。
+**清理项（已做）**：`reconcile` 原先有三个整轮入口——`RunOnce`（`RunAll` 的兼容别名）、`RunAll`（包一层 `RunDetailed` 并丢掉报告）、`RunDetailed`。现在只剩 `RunDetailed` 一个；不需要结果的调用方写 `_ =` 明确表示，而不是调用一个「没法把结果交出来」的包装。守护进程的行为不变（一轮失败不会结束循环），但它现在会把每轮结果打出来（`attempted/succeeded/failed/backoff/skipped/trouble`）——此前「跑了一轮什么都没收敛」和「全部收敛」留下的痕迹是一样的。为了让这条契约可测，整轮入口作为参数注入 `runDaemon`，测试连跑三轮失败以证明循环存活并如实汇报（提交 `0ad34c7`）。
+
+### 2.5 第二轮 OCR 复审（recover 被截断的发现）——本轮已修
+
+第一轮的 workflow 结果落盘时被截断，36 条里只完整回收了 21 条。这一轮按包重新跑了一遍 delegation 复审，**每个审查组把结论写进文件**（不再经过会被截断的返回值），共回收 **19 条**新发现。本轮的修复：
+
+| 位置 | 问题 | 修复与用例 |
+|---|---|---|
+| `cmd/clbverify/main.go` | 我上一轮抽取 `pollUntilBound` 时写成 `bound, lastErr := …`，**遮蔽**了外层 `bound`：等待轮询到了新证书、打印了进度，断言却读旧集合，于是**恰好在换绑成功时报失败**（`-wait` 存在的唯一场景） | 改回赋值并加注释；`assertBindings` 独立成可测函数；`TestTheWaitResultReachesTheAssertions` 把轮询与断言串起来测 |
+| `cmd/tatrun/main.go` | `TaskResult.Output` 是 **Base64**（SDK 字段文档即如此，本仓库自己的 e2e 采集也是 Base64），工具却原样打印——所有取证输出是乱码，`-quiet \| grep` 永远匹配不到 | 解码后打印，解不出来则原样透出；测试的假客户端改为喂 Base64（这正是它藏了这么久的原因） |
+| `internal/acme/manager_done.go` | 日志字段名 `dropped` 里装的是**保留**的域名个数（`len(c.Domains)` 是本次下发的集合） | 改名为 `issued` 并注明真正的数量在 ledger 行里 |
+| `internal/state/revoke.go` | `RecordRevokeAttempt` 原样存 CA 错误，是包内唯一不截断的 `last_error` 写入者 | 走 `truncate(…, maxLastErrorBytes)` |
+| `internal/state/backup.go` | 同毫秒冲突名 `<stamp>-1.db` 的 `-`（0x2D）排在 `.`（0x2E）**之前**，于是 `keep=1` 删掉的是**更新**的那份——与代码注释声称的正好相反 | 分隔符改为 `~`（0x7E），旧的 `-` 形式仍被识别（否则老快照永远不被清理）；`TestACollisionSnapshotSortsLastAndStillCountsAsOurs` |
+| `cmd/wecert/main.go` | 函数拆分时 `startMetricsServer` 与 `startStateBackups` 的文档注释连成一段，`startMetricsServer` 反而没有文档 | 补空行并说明 |
+| `internal/spec/observe.go` | shadow diff 只比较 profile/keyType/deploy，**`renewBefore` 的差异被报成"无差异"**，而 `Revision()` 把它算进哈希——切 enforce 的判据（diff==0）会在续期提前量变化时保持安静 | 纳入 `changed` 列表 |
+| `internal/webhook/webhook.go` | `reconcileResponse.Accepted` 无初值，什么都没接受时回 `202 {"accepted": null}`，与本包 `/hook/status` 已文档化并测试过的"空数组"约定相反 | 初始化为空切片 |
+
+### 2.6 第二轮复审发现、**尚未修复**的清单（核实为真，留待下一轮）
+
+按严重度排列。每条都写明位置、为什么成立、以及修法；这些是**已核实的问题**，不是猜测。
+
+| 严重度 | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| **major** | `internal/state/revoke.go:43` | 持久化的吊销请求**不记录证书身份**（表里只有 name/reason/时间/次数）。重试时 `processRevocation` 读的是**当前** `certificates.cert_pem`，而续期会覆盖它；reconcile 又在每轮证书循环**之后**重试吊销——于是同一轮里可以先提升新证书再把它吊销：新证书被吊销、泄露的旧证书继续有效，而请求行被当作成功清掉 | 把叶子身份（serial/AKI 或 NotBefore）随请求落库（`schemaColumns` 已支持），吊销前校验当前证书是否匹配；不匹配则改吊 `retired_certificates` 里的归档副本 |
+| **major** | `internal/onboarding/onboard.go:944` | 仍然被声明、但被 guard 1（或白名单）拒掉的名字，在同一轮就被**从期望状态里删除**：`applyGrace` 的 `stillDeclared` 分支只 `MarkPresent`，既不 carry 也不 `MarkAbsent`，因此绕过宽限期与 CLB 引用检查。guard 是网络读取的第二来源且**无法表达"结果可能不完整"**，一次规则抖动（区域缺失、部分可见、限流）就会静默剥掉线上覆盖；而 fuse 比较的是声明、声明没变，所以任何保护都不会触发。实测一次抖动 = 两次签发 + 两轮失去覆盖 | `stillDeclared` 分支改为 carry（保持 revision 不变，不触发签发），或在 `ListRuleDomains` 上引入"不完整"信号并让 guard 缺失时不删除 |
+| **major** | `internal/onboarding/onboard.go:401` + `internal/onboarding/declaration.go:120-123` | 声明里的 `profile`/`keyType` 值不校验，直到 `spec.WriteDocument` 才失败：一个写错的 TXT 值会让 `Run()` 报 `written`、`Commit` 永远失败（`unknown profile "nonsense"`），**文档与状态文件都不写**——每一轮、每条证书都失败，直到有人改 DNS；这与本包已钉住的"一条坏声明只影响它自己"相矛盾 | 在解析处按 `config` 的取值集合校验（与 `v` 的处理一致），非法值记为该条声明的拒绝决定 |
+| minor | `internal/state/state.go:832` | `pendingMigrations` 只看列，不看表：缺了本分支新增的四张表之一时 `OpenUnlocked` 会接受，随后报原始 `no such table`，而不是"需要 schema 更新，请跑 wecert -once" | 表清单也纳入检查 |
+| minor | `internal/acme/revoke.go:163` | ACME `alreadyRevoked` 被当成可重试：`ClearRevokeRequest` 只在成功路径，于是请求行永不清理，`wecert_revocation_pending` 恒 ≥1，CRITICAL 告警 `WecertRevocationPending` 永不清除，CLI 对**已吊销**的证书持续说"会重试" | 识别 `urn:ietf:params:acme:error:alreadyRevoked` 为终态并清行 |
+| minor | `internal/state/state.go:1327` | 退役表的 upsert 用 COALESCE 刷新材料却不刷新 `retired_at`：先被 orphan 路径写入的行会按 orphan 的时间戳被回收，刚归档的回滚材料随之被删 | `retired_at = excluded.retired_at`，或把"待回收"与"已退役"分开 |
+| minor | `internal/acme/dns.go:200` | `WaitAll` 注册的 TXT 租约可能**活得比它的授权久**（未呈现行的回收不调 `CleanUp` 就删行；令牌刷新后 `CleanUp` 推导出的值也变了），于是该名字后续所有清理都会走"还有别的挑战在线"分支，**provider 的 delete-all 在进程重启前再也不会执行**，TXT 记录滞留在那里 | 在那两条丢失路径上释放租约，或让 `CleanUp` 用 store 里仍标记为 presented 的行来对账 |
+| minor | `internal/acme/ratelimit.go:83` | 桶读失败（例如 SQLITE_BUSY）被当成 0 剩余并发布，于是 `wecert_ratelimit_remaining_tokens < 5`（15m）对**所有**限额误报"配额耗尽"，直到下一轮成功；同一包的 `retryRevocations` 在同样情形下刻意不动自己的指标 | `QuotaReport` 加"不可读"标记，读失败时不 `Set`（不发布 = 未知，本文件已把"缺席"定义为可接受） |
+| minor | `internal/ratelimit/ratelimit.go:208` | `Spend` 从**已钳零**的 `Remaining` 里扣减，于是在欠债状态下再消费会**一笔勾销**零以下的债务（实测：-5 的债在下次消费后变 -1，配额提前 3 个补充周期回来），与 `Spend` 自己的注释"over-spend is not silently forgiven"矛盾 | 抽出未钳零的 `level()`，`Remaining` 在末尾钳零，`Spend` 用未钳零值 |
+| minor | `internal/reconcile/reconcile.go:576` | `publishQuota` 只有 `RunDetailed` 末尾一个调用者：webhook 触发的 pass 会花配额、也会记录 CA 的 Retry-After，但**从不发布**这两个指标；比轮询间隔（默认 1h）短的 deadline 更是永远来不及被发布成 blocked，critical 告警不会响 | `StartAll`/`StartNamed` 也调用 `publishQuota`（两者都已持有解析好的 Result） |
+| minor | `internal/reconcile/reconcile.go:362` | `publishOrphans` 只是**窥探** claim（`isClaimable` 马上释放锁）再在 store 读之后调 `CleanupOrphan`：webhook 触发的同步 claim 可以插进这个缝里，于是它的 TXT 记录/订单被拆掉——正是该处注释声称要防的破坏性交错 | 在整个拆除期间持有 claim |
+| minor | `internal/acme/manager_renew.go:86` | `ariCheckDue` 先判固定的 6h `ariInterval`，再看 `ARIRetryAfter`，于是**比 6 小时更短的 Retry-After 永远不会生效**，与相邻注释（及 RFC 9773 §4.3）矛盾；当前 Boulder 恰好发 21600 才没暴露 | 取 `min(ariInterval, retryAfter)`（并保留 1m/24h 的合理性钳制） |
+| minor | `internal/acme/manager_renew.go:137-146` | 新订单配额记在**第一次** `NewOrder` 成功上；真正创建订单的 `replaces` 重试不记账，其错误也没走 `NoteRetryAfter`，于是发布的"下界"偏乐观 1，且一次限流拒绝被静默丢弃 | 记账与 `NoteRetryAfter` 都放在真正成功/失败的那次调用上 |
+| minor | `internal/acme/manager_done.go:156-158,186-190` | 部署路径上的 `PutOrder` 失败直接 `return err` 而不是走 `recordFailure`：没有退避（连为这种情形准备的进程内 `transientBackoff` 也没有），且刚上传的云证书 ID 丢失，下一轮重新 `Upload`，每轮泄漏一张云证书 | 与 `manager_flow.go` 的同族修复一致，统一走 `recordFailure` |
+| minor | `internal/acme/manager.go:575-583` | ARI 守卫 `return ariErr` 绕过 `recordFailure`，而 `ARICheckedAt` 正是 `ariCheckDue` 的依据：状态库故障时会**每轮**重查 renewalInfo（按文档的 1 分钟间隔约 1440 次/天/证书），正是 `default:` 分支注释说要避免的循环 | 走 `recordFailure`（ctx 取消会被它透传，安全） |
+| minor | `cmd/wecert-probe/main.go:178` | `-wait` 只在两次尝试之间检查，进行中的一次会用满 `-timeout`（默认 10s）：实测 `-wait 1s` 用 10.009s，与本文件"不得等超过要求的时长"的自我要求矛盾 | 每次尝试的预算取剩余时间 |
+| minor | `internal/onboarding/onboard.go:383` | `Commit` 先写报告、再写文档与状态：失败的那一轮会留下一个声称 `mode: "written"`、带一份从未写出的 revision 的报告（而报告是该流程文档化的人读产物） | 报告最后写，或在报告中如实标注本轮失败 |
+| minor | `internal/state/backup.go:96` 等 | 见 §2.5：本轮只修了冲突名排序；`pruneSnapshots` 的其余候选（`Stat` 错误被当成冲突可能自旋）留在原审查记录的 notes 里 | — |
+
+**未完成的一路**：8 个复审组里有 7 组已交结果；`internal/config`+`internal/deploy`+`internal/probe` 那一组在本次收尾时仍未返回，它的发现**不在本清单内**。
 
 ---
 

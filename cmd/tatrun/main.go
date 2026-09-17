@@ -207,7 +207,7 @@ func deref(s *string) string {
 
 // decodeRemoteOutput turns the API's encoding of a command's output into what the command printed.
 //
-// TaskResult.Output is documented as "Base64编码后的命令输出" (Base64-encoded, up to 24KB), and the
+// TaskResult.Output is documented as Base64-encoded command output (up to 24KB), and the
 // API really does return it that way -- the captures in this repository's own e2e runs decode from
 // Base64 to the openssl output they were checking. Printing the field verbatim therefore made the
 // tool's entire evidence a blob: `-quiet | grep` matched nothing, and a reader had to know to decode

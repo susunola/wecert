@@ -244,7 +244,11 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 
 	targets := requestedTargets(req)
 
-	resp := reconcileResponse{}
+	// Initialised, not nil: a trigger where nothing was accepted otherwise answers
+	// `{"accepted": null, "skipped": [...]}`, and this package's own /hook/status documents the
+	// convention that "clients that iterate the field read null as 'no answer'". An empty array is
+	// the honest answer here -- we know nothing was accepted.
+	resp := reconcileResponse{Accepted: []string{}}
 
 	// No cert/certs means a full trigger.
 	if len(targets) == 0 {
