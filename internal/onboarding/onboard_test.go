@@ -2040,29 +2040,36 @@ func TestAnIncludedHostnameIsNotAlsoReportedAsExcluded(t *testing.T) {
 	// One record for api.example.com is a typo; another (from the delegated subzone) is valid.
 	broken := RawDeclaration{Zone: "example.com", Record: DeclarationPrefix + host, Values: []string{"unknownkey=1"}}
 	good := RawDeclaration{Zone: "sub.example.com", Record: DeclarationPrefix + host, Values: []string{"v=wecert1"}}
-	h.decls.raw = []RawDeclaration{broken, good}
-	h.rules.domains = []string{host}
 
-	rep := h.run(t)
+	// BOTH orders matter: which record the zone walk returns first is not something the report may
+	// depend on. The first version of this fix only cleared the exclusion when the valid record came
+	// second, so the other order still reported the name twice with opposite verdicts.
+	for _, order := range [][]RawDeclaration{{broken, good}, {good, broken}} {
+		h.decls.raw = order
+		h.rules.domains = []string{host}
 
-	var included, excluded int
-	for _, d := range rep.Decisions {
-		if d.Hostname != host {
-			continue
+		rep := h.run(t)
+
+		var included, excluded int
+		for _, d := range rep.Decisions {
+			if d.Hostname != host {
+				continue
+			}
+			if d.Included {
+				included++
+			} else {
+				excluded++
+			}
 		}
-		if d.Included {
-			included++
-		} else {
-			excluded++
+		if included != 1 {
+			t.Errorf("[order broken-first=%v] %s is declared by a valid record, so it must be included "+
+				"once, got %d: %+v", order[0].Record == broken.Record, host, included, rep.Decisions)
 		}
-	}
-	if included != 1 {
-		t.Errorf("%s is declared by a valid record, so it must be included once, got %d: %+v",
-			host, included, rep.Decisions)
-	}
-	if excluded != 0 {
-		t.Errorf("%s must not be reported as excluded as well: the report would say two opposite "+
-			"things about one name: %+v", host, rep.Decisions)
+		if excluded != 0 {
+			t.Errorf("[order broken-first=%v] %s must not be reported as excluded as well: the report "+
+				"would say two opposite things about one name: %+v",
+				order[0].Record == broken.Record, host, rep.Decisions)
+		}
 	}
 }
 

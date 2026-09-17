@@ -198,11 +198,20 @@ func (m *Manager) download(
 				// before this case existed the pass failed every time, the promotion below never
 				// ran, and the state kept pointing at the certificate that was expiring while
 				// each cycle issued and uploaded another one.
+				//
+				// The hint names THIS certificate rather than "either certificate": the promotion
+				// below retires the predecessor onto the reclaim list, so binding that one would
+				// leave the row this program tracks unbound -- the next pass would report "nothing
+				// bound yet" again, overwrite the promoted row with a third upload, and burn one
+				// issuance per cycle. Naming the uploaded id (the field above) is what makes the
+				// instruction followable.
 				m.log.Warn("the renewed certificate is uploaded but neither it nor its predecessor is "+
 					"bound to any cloud resource; nothing was switched, and the one-time manual bind "+
 					"is still outstanding",
 					"cert", c.Name, "certId", id, "hint",
-					"bind either certificate once in the CLB console; later renewals switch it automatically")
+					"bind this certificate (the certId above, also recorded as the deployed id) once "+
+						"in the CLB console; later renewals switch the binding automatically, and the "+
+						"unbound predecessor is deleted only once the cloud confirms nothing references it")
 				waitingFirstBind = true
 			} else {
 				if id != "" {
