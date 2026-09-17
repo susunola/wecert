@@ -78,6 +78,25 @@ func (m *Manager) renewalDecision(
 	return DeterministicTime(c.Name, base, c.RenewBeforeDur/8), st.ARICertID, ariErr
 }
 
+// spendNewOrder records one new-order spend against the account-wide bucket.
+func (m *Manager) spendNewOrder() {
+	m.quota.Spend(ratelimit.NewOrdersPerAccount, "", 1)
+}
+
+// noteNewOrderRefusal turns a new-order failure into the CA's deadline when it names one.
+//
+// NoteRetryAfter only answers for errors that actually carry a Retry-After, so a refusal of any
+// other kind is left to the caller's own failure accounting.
+func (m *Manager) noteNewOrderRefusal(certName string, err error) {
+	at, ok := m.quota.NoteRetryAfter(ratelimit.NewOrdersPerAccount, "", err.Error())
+	if !ok {
+		return
+	}
+	m.log.Error("the account is out of new-order quota; every certificate must wait for the "+
+		"reported instant, not just this one",
+		"cert", certName, "until", at)
+}
+
 func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
 	if st.ARICheckedAt.IsZero() {
 		return true
@@ -149,15 +168,22 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		Profile:        c.Profile,
 		ReplacesCertID: replaces,
 	})
+	// Accounting sits here, before the retry below, and NOT only on the final error.
+	//
+	// Both halves used to run on the first call alone, which is wrong in exactly the case the
+	// retry exists for. A `replaces` attempt refused by the CA created no order, so counting it
+	// made the published lower bound optimistic by one -- in the flow that spends orders in
+	// bursts -- and a rate-limit refusal from the retry was dropped on the floor instead of
+	// becoming the deadline that gates every other certificate.
 	if err == nil {
 		// An order was created, so it counts -- whether or not this pass goes on to finish.
 		// The CA's own documentation is explicit that the resource is consumed at new-order
 		// time, which is why deleting or failing later does not return the quota.
-		m.quota.Spend(ratelimit.NewOrdersPerAccount, "", 1)
-	} else if at, ok := m.quota.NoteRetryAfter(ratelimit.NewOrdersPerAccount, "", err.Error()); ok {
-		m.log.Error("the account is out of new-order quota; every certificate must wait for the "+
-			"reported instant, not just this one",
-			"cert", c.Name, "until", at)
+		m.spendNewOrder()
+	} else {
+		// Worth reading even though a retry follows: a rate-limited account is not a `replaces`
+		// problem, and the instant it names governs every certificate on this account.
+		m.noteNewOrderRefusal(c.Name, err)
 	}
 	if err != nil && replaces != "" {
 		// A `replaces` that the CA will not honour must never be a dead end, so retry once
@@ -190,6 +216,13 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 			"rate-limit exemption)",
 			"cert", c.Name, "replaces", replaces, "err", err)
 		order, err = m.core.NewOrder(c.Domains, &api.OrderOptions{Profile: c.Profile})
+		if err == nil {
+			m.spendNewOrder()
+		} else {
+			// The retry is the attempt that decided the outcome, so its refusal is the one that
+			// must be read: this is where a rate-limit deadline was being lost.
+			m.noteNewOrderRefusal(c.Name, err)
+		}
 	}
 	if err != nil {
 		return m.recordFailure(st, fmt.Errorf("create order: %w", err))

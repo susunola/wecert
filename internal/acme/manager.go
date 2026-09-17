@@ -579,7 +579,15 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		// overdue" -- so without this guard a shutdown (or a state-store hiccup) would
 		// place a real new order, burning the exact-set rate-limit quota. Stop the round
 		// instead; the next pass decides again.
-		return ariErr
+		//
+		// Recorded as a pass failure rather than returned bare. The write that failed is the one
+		// carrying ARICheckedAt, which is the only thing throttling the ARI call, so a bare return
+		// means the next pass queries renewalInfo again -- at the pass rate, for every certificate,
+		// for as long as the store is broken. That is the loop renewalDecision's own default branch
+		// exists to avoid, and recordFailure's unpersisted backoff is what breaks it. A cancelled
+		// pass is filtered inside recordFailure, so a shutdown still does not lock the certificate
+		// out of the next window.
+		return m.recordFailure(st, ariErr)
 	}
 	if ariErr != nil {
 		m.log.Warn("ARI lookup failed; falling back to a time-based threshold", "cert", c.Name, "err", ariErr)

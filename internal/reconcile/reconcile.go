@@ -808,6 +808,17 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		}
 
 		r.reconcileOne(ctx, c)
+
+		// Publish the rate-limit gauges when a webhook-triggered pass finishes.
+		//
+		// RunDetailed publishes them at the end of a scheduled round, and this path used to have
+		// no equivalent: a pass started from the webhook spends quota and records the CA's
+		// Retry-After just the same, but nothing republished either gauge. A deadline shorter than
+		// the polling interval (an hour by default) was therefore never shown as blocked at all,
+		// which is exactly the window it describes -- the critical WecertRateLimitBlocked alert
+		// could not fire for it. Publishing here also means the spend is in the number, which it
+		// would not be if this only ran before the pass started.
+		r.publishQuota(res)
 	}()
 	return nil
 }
