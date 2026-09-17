@@ -196,3 +196,33 @@ func TestFirstLineKeepsOnlyTheFirstLine(t *testing.T) {
 		t.Errorf("firstLine(\"\") = %q, want the placeholder phrase", got)
 	}
 }
+
+// -wait must bound the attempt that is already in flight, not just the sleep between attempts.
+//
+// The deadline was checked only between attempts, so each attempt ran to its full per-attempt
+// timeout: with the default 10s timeout `-wait 1s` took ten seconds (measured), and with
+// -timeout 5s it took five. The flag's own help and the sleep comment both say -wait is how long
+// the command may take.
+func TestWaitBoundsAnAttemptAlreadyInFlight(t *testing.T) {
+	// A prober that blocks until its context/attempt timeout expires, like a real dial to a black
+	// hole: it must not be allowed to outlive the wait.
+	prober := func(_ context.Context, _ string, opts probe.Options) (*probe.Result, error) {
+		timeout := opts.Timeout
+		if timeout <= 0 {
+			timeout = probe.DefaultTimeout
+		}
+		time.Sleep(timeout)
+		return nil, errors.New("dial tcp: i/o timeout")
+	}
+
+	const budget = 120 * time.Millisecond
+	start := time.Now()
+	checkOne(context.Background(), "example.com", probe.Options{Timeout: 5 * time.Second},
+		probe.Expectation{}, budget, false, prober)
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("a %s wait took %s: the in-flight attempt ran to its own -timeout instead of what "+
+			"was left of the wait, so -wait does not bound the command", budget, elapsed)
+	}
+}
