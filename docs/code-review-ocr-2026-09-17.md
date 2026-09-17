@@ -97,7 +97,8 @@ clear 先落盘，提升与删单在事务里。事务失败时（错误信息�
 |---|---|---|---|
 | N1 | `cmd/wecert/main.go`（`-once` 路径） | `RunOnce` 丢弃 `RunReport`，于是 `wecert-once.service` 在**每条证书都失败**时仍退出 0；`Trouble()` 没有任何生产调用者 | 已修：改用 `RunDetailed`，`Trouble()` 为真即返回错误；`onceExit` 的三种 trouble 形态与两种健康形态各有断言 |
 | N2 | `internal/spec/observe.go` | 文件源首次读取成功后再也**不返回错误**，而是返回 frozen + nil error；于是 observe 模式对着读不出来的文档算出一份「安静」的差异，`ShadowReport.Error` 为空，切 enforce 的判据（`shadow_errors_total` / `shadow_last_read`）看起来一切正常 | 已修：frozen 的 shadow 报成「没有比较」；用例 `TestObserverReportsAFrozenShadowAsNoComparison`（去掉即变红） |
-| N3 | `internal/ratelimit/ratelimit.go` | `Spend` 把快照锚点写成 `now`，即使时钟回拨；`Tokens` 已经计息到旧锚点，于是 `[now, s.At]` 会被**重复计息**，凭空多出配额 | 已修：锚点只向前走；用例 `TestASpendOnABackwardClockDoesNotReAnchorTheSnapshot` |
+| N3 | `internal/config/config.go`（`probe.minValidFor`） | 只校验为正，没和 profile 的有效期比较：示例里的 `168h` 在 shortlived（160h）证书上永远不可能满足，`probe.Verify` 每次都失败 → `wecert_certificate_probe_match` 恒为 0 → critical 告警常亮且把原因错指向换绑/SNI；同一文件已拒绝同类的「`renewBefore` ≥ 有效期」 | 在证书归一化之后校验 `minValidFor < profileValidity[profile]` 并点名证书与 profile；`TestProbeMinValidForMustBeSatisfiableByTheProfile`（去掉校验即变红）。已确认随包示例（classic，90 天）不受影响 |
+| `internal/ratelimit/ratelimit.go` | `Spend` 把快照锚点写成 `now`，即使时钟回拨；`Tokens` 已经计息到旧锚点，于是 `[now, s.At]` 会被**重复计息**，凭空多出配额 | 已修：锚点只向前走；用例 `TestASpendOnABackwardClockDoesNotReAnchorTheSnapshot` |
 | N4 | `cmd/tatrun/main.go` | 截断的远端输出被当成完整结果打印，`Dropped` / `OutputUrl` 完全没用 | 已修：给出截断警告，且**不打印签名部分**（见下一条 P2）；用例断言警告包含丢弃字节数、不含 `q-signature` 等凭据 |
 | N5 | `cmd/wecert/main.go` | 「快照已启用但目录不可写」分支**不可达**（`EnabledOr` 把显式设置直接返回，第一个分支已经吃掉），循环照常启动、每轮失败并打 ERROR | 已修：`planStateBackups` 把「开关」与「目录」分开判定；用例枚举五种组合 |
 | N6 | `cmd/clbverify/main.go` | `-wait` 只限定尝试次数不限定耗时：先睡满一个间隔才看截止时间，`-wait 1s` 会阻塞 5s | 已修：先查一次、sleep 上限取剩余预算；用例断言 80ms 预算的耗时上限，并在把 sleep 改回固定间隔后变红 |
@@ -147,7 +148,6 @@ clear 先落盘，提升与删单在事务里。事务失败时（错误信息�
 | minor | `internal/onboarding/onboard.go:383` | `Commit` 先写报告、再写文档与状态：失败的那一轮会留下一个声称 `mode: "written"`、带一份从未写出的 revision 的报告（而报告是该流程文档化的人读产物） | 报告最后写，或在报告中如实标注本轮失败 |
 | minor | `internal/state/backup.go:96` 等 | 见 §2.5：本轮只修了冲突名排序；`pruneSnapshots` 的其余候选（`Stat` 错误被当成冲突可能自旋）留在原审查记录的 notes 里 | — |
 
-| minor | `internal/config/config.go:364` | `probe.minValidFor` 只校验为正，没有与 profile 的有效期比较（classic 90d / tlsserver 45d / shortlived 160h）：示例里的 `168h` 在 shortlived 证书上永远不可能满足，`wecert_certificate_probe_match` 恒为 0，critical 告警常亮且把原因错误地指向换绑/SNI；同一文件已拒绝同类的"`renewBefore` ≥ 有效期" | 在 `NormalizeCertificates` 之后校验 `minValidDur >= profileValidity[profile]` 并点名证书 |
 
 **已全部返回**：8 个复审组的结果都已收到（最后一组 `internal/config`+`internal/deploy`+`internal/probe` 交回 2 条 minor，即上表两行）。8 组一致确认无 blocking 级问题。
 

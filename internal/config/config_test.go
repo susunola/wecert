@@ -954,3 +954,43 @@ func TestDNSLoginTokenCanComeFromAFileOrTheEnvironment(t *testing.T) {
 		}
 	})
 }
+
+// probe.minValidFor must be satisfiable by the shortest profile in use.
+//
+// The check exists because the failure is so misleading: probe.Verify fails every probe whose
+// remaining validity is below the floor, the runner turns that into
+// wecert_certificate_probe_match = 0, and the critical alert that watches it blames the rebind or
+// SNI -- while the real cause is a threshold no certificate of that profile can ever meet (the
+// shipped example uses 168h, which a shortlived certificate's 160h can never satisfy).
+func TestProbeMinValidForMustBeSatisfiableByTheProfile(t *testing.T) {
+	const certs = `
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+    profile: shortlived
+`
+	// 168h cannot be satisfied by a 160h certificate: refused, naming the setting and the profile.
+	path := writeConfig(t, minimalPrefix+`
+probe:
+  minValidFor: 168h
+`+certs)
+	if _, err := Load(path); err == nil {
+		t.Error("168h cannot be satisfied by a 160h shortlived certificate, so this must be refused " +
+			"rather than pinning the probe metric at zero forever")
+	} else if !strings.Contains(err.Error(), "minValidFor") || !strings.Contains(err.Error(), "shortlived") {
+		t.Errorf("the error must name the setting and the profile, got %q", err)
+	}
+
+	// A satisfiable floor, and the default (unset), both load.
+	path = writeConfig(t, minimalPrefix+`
+probe:
+  minValidFor: 24h
+`+certs)
+	if _, err := Load(path); err != nil {
+		t.Errorf("24h is satisfiable by shortlived, got %v", err)
+	}
+	path = writeConfig(t, minimalPrefix+certs)
+	if _, err := Load(path); err != nil {
+		t.Errorf("an unset floor must stay accepted, got %v", err)
+	}
+}
