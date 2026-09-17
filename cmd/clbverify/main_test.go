@@ -177,9 +177,9 @@ func TestAssertedCertificatesWithNoListenerLevelCertificate(t *testing.T) {
 // full interval and only then queried -- the flag's own help says it is how long to poll. A caller
 // budgeting its own time (CI, a systemd unit) reads that as a promise.
 func TestPollUntilBoundBoundsElapsedTime(t *testing.T) {
-	if retryIntervalForTest() <= 80*time.Millisecond {
+	if bindingsPollInterval <= 80*time.Millisecond {
 		t.Fatalf("this test needs the production poll interval to exceed the budget to mean anything; "+
-			"it is %s", retryIntervalForTest())
+			"it is %s", bindingsPollInterval)
 	}
 
 	var calls int
@@ -190,7 +190,7 @@ func TestPollUntilBoundBoundsElapsedTime(t *testing.T) {
 
 	const budget = 80 * time.Millisecond
 	start := time.Now()
-	ids, err := pollUntilBound(context.Background(), budget, fetch, "new-cert", nil, nil)
+	ids, err := pollUntilBound(context.Background(), budget, fetch, "new-cert", nil)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -218,7 +218,7 @@ func TestPollUntilBoundStopsWhenTheCertificateAppears(t *testing.T) {
 		}
 		return []string{"old-cert"}, nil
 	}
-	ids, err := pollUntilBound(context.Background(), 200*time.Millisecond, fetch, "new-cert", nil, nil)
+	ids, err := pollUntilBound(context.Background(), 200*time.Millisecond, fetch, "new-cert", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

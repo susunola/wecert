@@ -11,6 +11,8 @@ import (
 	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	dnspod "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
+
+	"github.com/susunola/wecert/internal/tcerr"
 )
 
 // The delegation check is the highest-value check this tool runs, and its old
@@ -299,8 +301,8 @@ func TestIsNoRecordOnlyMatchesTheAbsenceCode(t *testing.T) {
 		if tc.code != "" {
 			err = tcerrors.NewTencentCloudSDKError(tc.code, "message", "request-1")
 		}
-		if got := isNoRecord(err); got != tc.want {
-			t.Errorf("isNoRecord(%q) = %v, want %v", tc.code, got, tc.want)
+		if got := tcerr.IsNoDataOfRecord(err); got != tc.want {
+			t.Errorf("tcerr.IsNoDataOfRecord(%q) = %v, want %v", tc.code, got, tc.want)
 		}
 	}
 }
@@ -308,13 +310,13 @@ func TestIsNoRecordOnlyMatchesTheAbsenceCode(t *testing.T) {
 // A non-SDK error still gets the substring check, which is what a wrapped or re-worded error
 // from a different layer looks like.
 func TestIsNoRecordFallsBackToTheSubstring(t *testing.T) {
-	if !isNoRecord(errors.New("dnspod: ResourceNotFound.NoDataOfRecord")) {
+	if !tcerr.IsNoDataOfRecord(errors.New("dnspod: ResourceNotFound.NoDataOfRecord")) {
 		t.Error("a non-SDK error carrying the code should still be recognised")
 	}
-	if isNoRecord(errors.New("dnspod: something else went wrong")) {
+	if tcerr.IsNoDataOfRecord(errors.New("dnspod: something else went wrong")) {
 		t.Error("an unrelated error must not be read as an absent record")
 	}
-	if isNoRecord(nil) {
+	if tcerr.IsNoDataOfRecord(nil) {
 		t.Error("nil must not be read as an absent record")
 	}
 }

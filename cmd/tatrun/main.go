@@ -19,6 +19,7 @@ import (
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	tat "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/tat/v20201028"
+	"net/url"
 )
 
 func main() {
@@ -220,7 +221,33 @@ func truncationNotice(r *tat.TaskResult) string {
 		return ""
 	}
 	return fmt.Sprintf("WARNING: the remote output is incomplete: dropped=%d bytes, full log: %s",
-		dropped, full)
+		dropped, redactSignedURL(full))
+}
+
+// redactSignedURL strips the query string from a log URL before it is printed.
+//
+// TAT stores the full output in COS and returns a link to it. A presigned link IS the credential:
+// anyone holding it can fetch the object until it expires, and this warning goes to stderr, which
+// under systemd means the journal -- routinely shipped somewhere with a wider audience than the
+// command's owner. The operator needs to know where the rest of the log is, not to be handed a
+// bearer token for it in a log line: the signature is dropped and the command that can fetch it
+// again is named instead.
+func redactSignedURL(raw string) string {
+	if raw == "" {
+		return "(no URL returned)"
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Unparseable: printing it verbatim is the one thing that must not happen, because the
+		// query cannot be separated from the credential.
+		return "(URL withheld: it may carry a signature)"
+	}
+	if u.RawQuery == "" && u.Fragment == "" {
+		return raw
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String() + " (query stripped: re-read it with the TAT console or DescribeInvocationTasks)"
 }
 
 func derefU64(v *uint64) uint64 {
