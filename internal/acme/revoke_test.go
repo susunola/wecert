@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/susunola/wecert/internal/state"
+
+	legoacme "github.com/go-acme/lego/v4/acme"
 )
 
 // A revocation the CA does not accept must survive as a durable request.
@@ -215,4 +217,50 @@ func indexOfStr(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// "Already revoked" is the desired state, so the request must be cleared, not retried forever.
+//
+// ClearRevokeRequest only runs on success, so an alreadyRevoked answer left the row outstanding:
+// wecert_revocation_pending stayed >= 1 and the critical WecertRevocationPending alert never
+// cleared, every pass re-attempted the revocation, and `wecert -revoke` kept telling the operator
+// that a certificate the CA had already revoked "will be retried". The code's own comment called
+// that retry harmless; it is not.
+func TestAlreadyRevokedIsTerminalAndClearsTheRequest(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(30 * 24 * time.Hour),
+		CertPEM: selfSignedCertPEM(t, fixed.Add(30*24*time.Hour), "example.com"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The CA answers with the registered problem type, as lego hands it back.
+	fake.revokeErr = &legoacme.ProblemDetails{
+		Type:   "urn:ietf:params:acme:error:alreadyRevoked",
+		Detail: "Certificate already revoked",
+	}
+
+	if err := m.RequestRevocation(context.Background(), cert.Name, RevocationReasons["keyCompromise"]); err != nil {
+		t.Fatalf("an already-revoked certificate is the desired state, not a failure to report: %v", err)
+	}
+	req, err := store.GetRevokeRequest(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req != nil {
+		t.Errorf("the request row must be cleared, or the pending gauge and its CRITICAL alert stay "+
+			"up forever and every pass retries: %+v", req)
+	}
+
+	// A plain failure is still retryable: the row stays and the error surfaces.
+	fake.revokeErr = errors.New("acme: error: 503 :: service unavailable")
+	if err := m.RequestRevocation(context.Background(), cert.Name, RevocationReasons["keyCompromise"]); err == nil {
+		t.Fatal("a transport failure must still be reported")
+	}
+	if again, err := store.GetRevokeRequest(cert.Name); err != nil || again == nil {
+		t.Errorf("a retryable failure must leave the request outstanding (req=%+v err=%v)", again, err)
+	}
 }

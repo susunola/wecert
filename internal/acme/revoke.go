@@ -6,6 +6,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	legoacme "github.com/go-acme/lego/v4/acme"
+	"strings"
 	"time"
 )
 
@@ -126,6 +128,24 @@ func (m *Manager) PendingRevocations() (int, error) {
 	return len(reqs), nil
 }
 
+// isAlreadyRevoked reports whether the CA answered "this certificate is already revoked".
+//
+// The ACME problem type is the contract (RFC 8555 §6.7 registers alreadyRevoked); lego hands the
+// ball back as *acme.ProblemDetails, and an implementation that wrapped it into a plain error still
+// carries the type string, so the text is checked as a fallback -- the same belt-and-braces the
+// DNSPod error predicate uses.
+func isAlreadyRevoked(err error) bool {
+	if err == nil {
+		return false
+	}
+	const problemType = "urn:ietf:params:acme:error:alreadyRevoked"
+	var prob *legoacme.ProblemDetails
+	if errors.As(err, &prob) && prob.Type == problemType {
+		return true
+	}
+	return strings.Contains(err.Error(), problemType)
+}
+
 // processRevocation performs one attempt for a recorded request.
 //
 // ctx is accepted and not threaded into the CA call, because lego's low-level api.Core is
@@ -161,6 +181,23 @@ func (m *Manager) processRevocation(ctx context.Context, certName string) error 
 	}
 
 	if err := m.core.RevokeCertificate(der, req.Reason); err != nil {
+		// "Already revoked" is the CA telling us the desired state is in place. Treating it as
+		// retryable left the row outstanding forever: ClearRevokeRequest only runs on success, so
+		// wecert_revocation_pending stayed >= 1, the critical WecertRevocationPending alert never
+		// cleared, every pass re-attempted, and `wecert -revoke` kept telling the operator of a
+		// revoked certificate that the request "will be retried". Reachable without any mistake
+		// here -- another client revoking through the console, or a state.db restored from a
+		// snapshot taken before the row was cleared, both land on it.
+		if isAlreadyRevoked(err) {
+			if cerr := m.store.ClearRevokeRequest(certName); cerr != nil {
+				m.log.Warn("the CA reports the certificate already revoked, but the request row "+
+					"could not be cleared", "cert", certName, "err", cerr)
+				return nil
+			}
+			m.log.Info("the CA reports the certificate already revoked; the request is cleared",
+				"cert", certName, "reason", ReasonName(req.Reason))
+			return nil
+		}
 		_ = m.store.RecordRevokeAttempt(certName, err, m.now())
 		return fmt.Errorf("revoke %s: %w", certName, err)
 	}
