@@ -4,8 +4,10 @@ import (
 	"strings"
 	"testing"
 
+	"context"
 	clb "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
+	"time"
 )
 
 // The assertion has to see every certificate a listener carries.
@@ -166,5 +168,64 @@ func TestAssertedCertificatesWithNoListenerLevelCertificate(t *testing.T) {
 	}
 	if len(ids) != 1 || ids[0] != "rule-a" {
 		t.Errorf("the rule's certificate is the binding that matters here, got %v", ids)
+	}
+}
+
+// -wait must bound elapsed time, not just the number of attempts.
+//
+// The loop slept a flat interval before evaluating the deadline, so `-wait 1s` blocked for the
+// full interval and only then queried -- the flag's own help says it is how long to poll. A caller
+// budgeting its own time (CI, a systemd unit) reads that as a promise.
+func TestPollUntilBoundBoundsElapsedTime(t *testing.T) {
+	if retryIntervalForTest() <= 80*time.Millisecond {
+		t.Fatalf("this test needs the production poll interval to exceed the budget to mean anything; "+
+			"it is %s", retryIntervalForTest())
+	}
+
+	var calls int
+	fetch := func() ([]string, error) {
+		calls++
+		return []string{"old-cert"}, nil
+	}
+
+	const budget = 80 * time.Millisecond
+	start := time.Now()
+	ids, err := pollUntilBound(context.Background(), budget, fetch, "new-cert", nil, nil)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("a query that succeeds is not an error: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "old-cert" {
+		t.Errorf("the last observed set must be returned, got %v", ids)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("a %s wait took %s: the sleep between polls is not capped to what is left of the "+
+			"budget, so -wait does not bound the command's runtime", budget, elapsed)
+	}
+	if calls == 0 {
+		t.Error("the first poll must happen within the budget, not after a flat interval")
+	}
+}
+
+// The expected certificate appearing ends the wait immediately.
+func TestPollUntilBoundStopsWhenTheCertificateAppears(t *testing.T) {
+	calls := 0
+	fetch := func() ([]string, error) {
+		calls++
+		if calls >= 2 {
+			return []string{"new-cert"}, nil
+		}
+		return []string{"old-cert"}, nil
+	}
+	ids, err := pollUntilBound(context.Background(), 200*time.Millisecond, fetch, "new-cert", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(ids, "new-cert") {
+		t.Errorf("the wait must return as soon as the expected certificate is bound, got %v", ids)
+	}
+	if calls != 2 {
+		t.Errorf("expected two polls (one immediately, one after the capped wait), got %d", calls)
 	}
 }

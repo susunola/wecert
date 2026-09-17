@@ -226,12 +226,18 @@ func run() error {
 	if backupDir == "" {
 		backupDir = filepath.Dir(cfg.StatePath)
 	}
-	if cfg.StateBackup.EnabledOr(dirIsWritable(backupDir)) {
+	// The switch and the directory are checked separately. Treating "enabled" as sufficient
+	// (EnabledOr returns the explicit setting whenever it is set) made the unwritable case fall
+	// into the running branch: the loop started, took a snapshot every interval, failed, and
+	// logged an ERROR each time -- while the branch written to say exactly that was unreachable,
+	// because its guard was the same condition the first branch had already consumed.
+	switch planStateBackups(cfg.StateBackup.Enabled, dirIsWritable(backupDir)) {
+	case backupsRun:
 		startStateBackups(ctx, store, cfg, log)
-	} else if cfg.StateBackup.Enabled != nil && *cfg.StateBackup.Enabled {
+	case backupsEnabledButUnwritable:
 		log.Error("periodic state database snapshots are ENABLED but the directory is not writable, "+
 			"so none will be taken", "dir", backupDir)
-	} else {
+	default:
 		log.Warn("periodic state database snapshots are DISABLED: losing state.db means a new ACME " +
 			"account and re-placed orders, and nothing here will be able to restore it")
 	}
@@ -247,13 +253,18 @@ func run() error {
 	}
 
 	if *once {
-		reconciler.RunOnce(ctx)
+		// RunDetailed, not RunOnce: the one-shot unit is what a systemd timer runs, and
+		// "exited 0 with every certificate failing" is the failure mode this report exists to
+		// prevent -- the timer would report success while the fleet went unmanaged. A pass that
+		// attempted nothing and skipped everything counts as trouble too, because that is a
+		// desired state that resolved to nothing.
+		rep := reconciler.RunDetailed(ctx)
 		// The pass has finished, but the notifications it triggered are delivered on
 		// their own goroutines. Returning here would exit with them in flight and lose
 		// them -- including the "result":"error" one, which is the notification an
 		// operator most needs.
 		drainNotifier(notifier, log)
-		return nil
+		return onceExit(rep)
 	}
 
 	log.Info("entering daemon mode", "interval", *interval)
@@ -279,6 +290,53 @@ func dirIsWritable(dir string) bool {
 	_ = f.Close()
 	_ = os.Remove(name)
 	return true
+}
+
+// backupPlan is what the state-backup switch and the directory's writability together imply.
+type backupPlan int
+
+const (
+	backupsDisabled backupPlan = iota
+	backupsEnabledButUnwritable
+	backupsRun
+)
+
+// planStateBackups decides between running, refusing loudly, and warning.
+//
+// The two inputs are independent and that is the whole point: "enabled" says what the operator
+// asked for, "writable" says whether it can happen. Collapsing them (treating an explicit true as
+// sufficient) started the loop against an unwritable directory, where it failed and logged an
+// ERROR every interval -- noise that trains the reader to ignore the one line that means the
+// recovery posture is gone -- while the branch written to report exactly that was unreachable.
+func planStateBackups(enabled *bool, writable bool) backupPlan {
+	switch {
+	case enabled != nil && *enabled:
+		if writable {
+			return backupsRun
+		}
+		return backupsEnabledButUnwritable
+	case enabled != nil && !*enabled:
+		return backupsDisabled
+	case writable:
+		// Unset means "take them when the directory allows it", the documented default.
+		return backupsRun
+	default:
+		return backupsDisabled
+	}
+}
+
+// onceExit turns a one-shot pass's report into the process outcome.
+//
+// A systemd timer runs this with -once, so exiting 0 while every certificate failed reports
+// success for a fleet that went unmanaged. A pass that attempted nothing and skipped everything
+// counts as trouble too: it means the desired state resolved to nothing to do.
+func onceExit(rep reconcile.RunReport) error {
+	if !rep.Trouble() {
+		return nil
+	}
+	return fmt.Errorf("the pass did not converge: attempted=%d succeeded=%d failed=%d skipped=%d "+
+		"desiredStateUnreadable=%t", rep.Attempted, rep.Succeeded, rep.Failed, len(rep.Skipped),
+		rep.DesiredStateUnreadable)
 }
 
 // drainNotifier waits briefly for accepted notifications to be delivered.
