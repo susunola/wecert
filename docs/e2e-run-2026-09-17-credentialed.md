@@ -12,9 +12,9 @@
 
 本轮在真实账号（真实 LE **staging** + 真实 DNSPod + 真实 CLB/CVM）上把此前**所有未跑的用例跑完了**：apex + `*.apex` 共用一个 TXT 名（两个值在 8 个权威地址上同时在线）、`profile: tlsserver` 的 45 天证书与一次完整自动续期、以及 Stage C 的"真机 systemd + `cvm-role`，首签 → 手工绑定 → 自动续期并换绑"。SNI 隔离在两种执行者下都成立：本地续期一张证书、真机守护进程续期另一张，互不影响。
 
-同时本轮发现并修复了四个缺陷，全部有真机证据、测试与变异校验：**部署校验的 30s 固定预算**把"未验证"写成"失败"、导致续期在本账号**永不收敛**（4.4/4.6、5.2）；**DNS 传播判据只看权威服务器**，与 CA 实际走的递归解析路径可能不一致，从而把尚未全局传播的记录判过并烧掉失败配额（4.1/4.2、5.1）；**lego 的 SOA 走查**会把"解析器答不出"报成"DNSPod 里没有这个域名"，误导排障方向（5.6）；以及一个**按墙钟到期的测试**，距今约 20 分钟前自己变红（5.5）。
+**产品代码**因此修掉三个缺陷，都有真机证据、测试与变异校验：**部署校验的 30s 固定预算**把"未验证"写成"失败"、导致续期在本账号**永不收敛**（4.4/4.6、5.2）；**DNS 传播判据只看权威服务器**，与 CA 实际走的递归解析路径可能不一致，从而把尚未全局传播的记录判过并烧掉失败配额（4.1/4.2、5.1）；**lego 的 SOA 走查**会把"解析器答不出"报成"DNSPod 里没有这个域名"，误导排障方向（5.6）。
 
-仍未验证的只有两类，且都在第 6 节写明：真实时间流逝下的自然续期（本轮续期窗口都是用状态库推到当下的），以及真实生产 LE（全程 staging）。
+`testenv/`（我搭的测试脚手架）另外有两条环境问题（5.3、5.4）和一个仓库测试的墙钟问题（5.5），都已单独归类——它们不是产品缺陷。
 
 ---
 
@@ -45,7 +45,7 @@
 | apex + `*.apex` 共用 TXT 名（真实 DNSPod） | `atomwangnus.com` + `*.atomwangnus.com` | **通过** | 同名两条挑战值在 8 个权威地址上同时在线、`records=2`、订单收尾无失败（4.7） |
 | `profile: tlsserver`（45 天）真实签发 | 真实 LE staging | **通过** | 订单带 `profile=tlsserver`，实测 45 天（4.8） |
 | 完整自动续期闭环（真实 LE staging） | 推窗到现在的续期 + 换绑 | **通过** | 续期成功、`success=1`、旧证书进回收、规则级握手确认新证书在服务（4.8） |
-| Stage C 首签 → 手工绑定 → 自动续期/换绑 | 真机 systemd + `cvm-role` | **通过** | 上传 `asJfCWAP` → 绑规则 → 守护进程续期到 `asK2pula`，指标确认部署，同一监听器上另一张证书未受影响（4.9） |
+| Stage C 首签 → 手工绑定 → 自动续期/换绑（用到脚手架） | 真机 systemd + `cvm-role` | **通过** | 上传 `asJfCWAP` → 绑规则 → 守护进程续期到 `asK2pula`，指标确认部署，同一监听器上另一张证书未受影响（4.9） |
 | Stage C 安装 + systemd + 角色 | `install.sh` on Ubuntu 22.04 CVM + `systemctl enable --now wecert` | **通过** | `install.sh` 装出 `/usr/local/bin/wecert`（sha256 与本机交叉编译产物逐字节一致）、`/etc/wecert/config.yaml 0640 root:wecert`、`/var/lib/wecert 0700 wecert:wecert`；unit `active`；`credentialMode=cvm-role` 下完成一轮真实签发并上传（见 4.5） |
 | apex + `*.apex` 单证书（真实 LE） | — | **未跑** | 本轮未执行 |
 | `profile: tlsserver`（45 天）真实续期 | — | **未跑** | 真实 LE 侧未跑；profile 选择仅由离线 pebble e2e 覆盖 |
@@ -339,6 +339,16 @@ alpha 上仍是 4.8 那张 45 天证书（本地那次续期的结果），beta 
 
 ## 5. 发现的问题
 
+先按**归属**分组，避免把脚手架的问题和产品的问题混在一起看：
+
+| 组 | 条目 | 归属 |
+|---|---|---|
+| **A. 产品代码** | 5.1 传播判据只看权威服务器、5.2 部署校验把"未验证"写成"失败"、5.6 zone 报错把解析失败说成账号问题 | wecert 本身（`internal/acme`、`internal/deploy`） |
+| **B. 测试脚手架** | 5.3 默认镜像不带 TAT agent、5.4 CAM 角色需预建 / Stage B 在本账号不可达 | `testenv/`（**我自己的测试环境，不是产品缺陷**；列出来只是让下次跑这套环境的人少踩一次） |
+| **C. 仓库测试** | 5.5 一个按墙钟到期的测试 | 测试代码本身 |
+
+本轮对产品代码的改动只有三处，都在 A 组：`355655e`（5.2）、`b032f1d`（5.1）、`44290b9`（5.6）。
+
 ### 5.1 DNS 传播判据把"看不见"当成"没问题"
 
 - **现象**：第一次 L1 在 21s 就宣布 `TXT propagated`，CA 随即以 `NXDOMAIN` 拒绝；同一命令第二次等 66s 即通过。
@@ -361,7 +371,7 @@ alpha 上仍是 4.8 那张 45 天证书（本地那次续期的结果），beta 
   2. **把"已成功但未验证"建成显式结果**：新增哨兵错误 `deploy.ErrSwitchUnverified`（`internal/deploy/deployer.go`）。枚举**超时**、或**没覆盖全部 region** 这两种"不知道"的情况返回它，而**"枚举已完成且绑定数为 0"仍然是硬失败**——那确实是一次没有发生的切换。ACME 层（`internal/acme/manager_done.go`）识别该哨兵后：记录新证书 ID、**完成订单**（不再每轮重跑同一个 deploy）、`DeployConfirmed` 保持 `false`（部署指标在确认前不说谎），下一轮由既有的绑定探测（`confirmBinding`）确认后自动置真。
   两条性质各自被测试钉住（`TestAdoptedTaskWhoseEnumerationNeverAnswersIsUnverifiedNotFailed`、`TestUnverifiedSwitchIsRecordedAsDeployedButUnconfirmed`），并做了变异校验：把哨兵换掉、或把 `unverified` 分支关掉，测试立刻变红。
 
-### 5.3 默认镜像不带 TAT agent，Stage C runbook 起不来
+### 5.3 （脚手架）默认镜像不带 TAT agent，Stage C runbook 起不来
 
 - **现象**：`wecert-tatrun` 每次调用都失败 `ResourceUnavailable.AgentNotInstalled`，`DescribeAutomationAgentStatus` 返回空集。
 - **证据**：本模块默认的公共 Ubuntu 镜像 `img-487zeit5` 启动后**没有 TAT agent**；`testenv/README.md` 与 `docs/stage-c-cvm-systemd.md` 却把整个 Stage C 流程都建立在 TAT 之上。在 `testenv/cvm.tf` 的 `runcmd` 里补上官方安装步骤后重建实例，agent 报 `AgentStatus: Online`（版本 1.2.2），TAT 命令才可执行：
@@ -374,7 +384,7 @@ alpha 上仍是 4.8 那张 45 天证书（本地那次续期的结果），beta 
 - **影响**：Stage C 的所有步骤在第一步就失败，且失败信息（`AgentNotInstalled`）指向的是"命令没跑成"，容易被误读成权限或参数问题。
 - **建议修法**：保留 `cvm.tf` 里的安装步骤（已生效），并把"agent 在线"做成 runbook 的**前置断言**：进入 TAT 步骤前先 `DescribeAutomationAgentStatus`，非 `Online` 就直接失败并给出安装/重建指引；同时在 `testenv/README.md` 注明该镜像需要自装 agent。
 
-### 5.4 环境前置条件未文档化：CAM 角色需预建，Stage B 在本账号不可达
+### 5.4 （脚手架）环境前置条件未文档化：CAM 角色需预建，Stage B 在本账号不可达
 
 - **现象（角色）**：`terraform apply` 失败 `AuthFailure.CamRoleNameAuthenticateFailed: The specified CamRoleName wecert-test-role authenticate failed.`
 - **现象（Stage B）**：`scripts/run-stage-ab.sh` 在 pre-rebind 检查处中止，`wecert-clbverify` 报 "the listener has no certificate bound"。
@@ -383,7 +393,7 @@ alpha 上仍是 4.8 那张 45 天证书（本地那次续期的结果），beta 
 - **影响**：新环境按 README 走会在 `terraform apply` 或 Stage B 第一步失败，且两次失败的报错都不直接指向根因（角色缺失 / SNI 强制）。
 - **建议修法**：把 CAM 角色与策略的创建写成可选 terraform 资源（或独立的 `bootstrap` 目录）并在 README 里列为步骤 0；在 Stage A/B 脚本里加一条前置探测——读监听器的 SNI 开关与证书绑定状态，若"SNI 强开且监听器无证书"就直接跳过 Stage B 并提示改用规则级绑定，而不是等到 pre-rebind 检查再中止。
 
-### 5.5 一个按"到期时刻"变红的测试：断言边界用了错误的时钟
+### 5.5 （仓库测试）一个按"到期时刻"变红的测试：断言边界用了错误的时钟
 
 - **现象**：本轮加修复后跑 `go test -race ./...` 时，`TestRenewalArchivesTheOutgoingCertificateMaterial` 变红（`expected the outgoing certificate on the reclaim list, got []`），而该行为在当时的提交上并没有被改动；把工作区回到 HEAD 单独跑，它同样变红。
 - **证据**：该测试把 manager 的时钟钉在 `fixed = 2026-09-16 12:00 UTC`，却用 `ListRetiredCertsBefore(fixed.Add(24 * time.Hour))` 去查回收清单；而 `internal/state/state.go` 的 `addRetiredCertExec` 写 `retired_at` 用的是**存储层自己的** `time.Now().Unix()`。临时插入的调试输出（验证后已删）说明了一切：
@@ -510,5 +520,17 @@ vpc-list  -> 无 wecert-test-*  # 旧 VPC 已删
 DescribeInstances -> 空        # 没有遗留 CVM
 DescribeRecordList(_acme-challenge) -> NoDataOfRecord
 ```
+
+### 本轮改动按归属
+
+| 改动 | 文件 | 归属 |
+|---|---|---|
+| `355655e` 部署校验：预算 3 分钟 + `ErrSwitchUnverified` + deployed-but-unconfirmed | `internal/deploy/deployer.go`、`internal/deploy/tencent.go`、`internal/acme/manager_done.go`（+ 测试） | **产品** |
+| `b032f1d` 传播判据要求递归视角 | `internal/acme/dns.go`（+ 测试） | **产品** |
+| `44290b9` `Present` 先自己解析 zone | `internal/acme/dns.go`（+ 测试） | **产品** |
+| TAT agent 自装 | `testenv/cvm.tf` | 脚手架（只为让 Stage C 跑得起来；你要自己管这个目录的话，删掉这一段不影响产品） |
+| 三份报告与证据日志 | `docs/` | 文档 |
+
+---
 
 **未触碰**：共享账号上已存在的 `wecert/two-san-wildcard`、`wecert/jerryzhou-live` 等证书，以及他人的任何资源。**刻意未使用** `-prune-certs`：它会删除所有以 `wecert/` 为别名前缀的证书，其中可能包含正在线上服务的证书。
