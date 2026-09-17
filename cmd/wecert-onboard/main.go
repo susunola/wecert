@@ -262,7 +262,10 @@ func printSummary(w io.Writer, rep *onboarding.Report, out string, dryRun, quiet
 		fmt.Fprintf(w, "  covered by a declared wildcard: %d (these cost no extra issuance)\n", rep.CoveredByWildcard)
 		fmt.Fprintf(w, "  carried forward from the previous revision: %d\n", rep.CarriedForward)
 		fmt.Fprintf(w, "certificates:    %d\n", rep.Certificates)
-		if rep.GuardUnavailable {
+		if rep.GuardIncomplete {
+			fmt.Fprintf(w, "guard 1 (CLB rules): INCOMPLETE this round (the API reported more objects "+
+				"than it returned), so no name was removed\n")
+		} else if rep.GuardUnavailable {
 			fmt.Fprintf(w, "guard 1 (CLB rules): UNAVAILABLE this round, so no name was removed\n")
 		}
 		fmt.Fprintln(w)

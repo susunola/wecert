@@ -1576,7 +1576,16 @@ func TestLostStateFileDoesNotDeleteNamesWithoutAGracePeriod(t *testing.T) {
 // no longer declared and only absent for 0s -- and worse, carry() put them back into the
 // eligible set, so the round kept converging on a name the guard had just rejected. That is
 // exactly the certificate-without-a-rule that guard 1 exists to prevent.
-func TestStillDeclaredNameIsNotReportedAsRemoved(t *testing.T) {
+// A guard that stops serving a still-declared name must not strip its coverage.
+//
+// The reversal is deliberate. Guard 1 is a NETWORK read and cannot express "my answer may be
+// incomplete" (a region that did not answer, a rule that a partial list omitted), so a wobble in
+// it used to change the document: the name left the certificate, wecert reissued without it, the
+// guard recovered, and the name was issued all over again -- two issuances and two rounds without
+// coverage, for a name that never stopped being declared. What the guard is for is preventing NEW
+// coverage of a name no rule serves; that job is intact (see
+// TestADeclarationWithNoRuleIsStillNotIssued).
+func TestAGuardWobbleDoesNotStripCoverageOfADeclaredName(t *testing.T) {
 	const served = "served.example.com"
 	const unserved = "unserved.example.com"
 
@@ -1589,41 +1598,84 @@ func TestStillDeclaredNameIsNotReportedAsRemoved(t *testing.T) {
 	if first.Certificates != 1 {
 		t.Fatalf("round 1 should cover both names, got %d certificates", first.Certificates)
 	}
+	if got := h.domains(t); len(got) != 2 {
+		t.Fatalf("round 1 domains = %v, want both names", got)
+	}
 
-	// Round 2: the rule for `unserved` disappears, but its declaration stays in DNS.
-	// Guard 1 must reject it -- once, with the guard's own reason.
+	// Round 2: the rule for `unserved` disappears from the guard, but its declaration stays.
 	h.rules.domains = []string{served}
 	second := h.run(t)
 
-	var rejections, carries int
-	var reasons []string
-	for _, d := range second.Decisions {
-		if d.Hostname != unserved {
-			continue
-		}
-		if d.Included {
-			carries++
-			reasons = append(reasons, "included: "+d.Reason)
-		} else {
-			rejections++
-			reasons = append(reasons, "rejected: "+d.Reason)
+	d, ok := decisionFor(second, unserved)
+	if !ok {
+		t.Fatalf("%s must still be reported; decisions: %+v", unserved, second.Decisions)
+	}
+	if !d.Included {
+		t.Errorf("%s is still declared, so it keeps its coverage; got excluded: %s", unserved, d.Reason)
+	}
+	if !strings.Contains(d.Reason, "no CLB rule serves this name") {
+		t.Errorf("the report must still say why the guard did not accept it, got %q", d.Reason)
+	}
+	if strings.Contains(d.Reason, "no longer declared") {
+		t.Errorf("a name that is declared right now was reported as no longer declared: %s", d.Reason)
+	}
+	// Exactly one verdict for this hostname: an exclusion plus a carry would show the same name
+	// twice with opposite answers.
+	var verdicts int
+	for _, x := range second.Decisions {
+		if x.Hostname == unserved {
+			verdicts++
 		}
 	}
-	for _, r := range reasons {
-		t.Logf("decision for %s -> %s", unserved, r)
+	if verdicts != 1 {
+		t.Errorf("%s must get exactly one decision, got %d: %+v", unserved, verdicts, second.Decisions)
 	}
 
-	if carries > 0 {
-		t.Errorf("%s is still declared but has no CLB rule; it must not be carried forward, "+
-			"because that keeps issuing a certificate for a name guard 1 rejected", unserved)
+	// The document is unchanged, which is the whole point: the same revision means no reissue.
+	if second.Revision != first.Revision {
+		t.Errorf("a guard wobble changed the revision (%s -> %s), so wecert reissues the certificate "+
+			"without the name -- and reissues again when the guard recovers",
+			first.Revision, second.Revision)
 	}
-	if rejections != 1 {
-		t.Errorf("%s must get exactly one decision (the guard's), got %d", unserved, rejections)
+	if got := h.domains(t); len(got) != 2 {
+		t.Errorf("the covered set must not shrink on a guard wobble, got %v", got)
 	}
-	for _, r := range reasons {
-		if strings.Contains(r, "no longer declared") {
-			t.Errorf("a name that is declared right now was reported as no longer declared: %s", r)
-		}
+
+	// Round 3: the rule comes back. Nothing changed, so nothing is issued again.
+	h.rules.domains = []string{served, unserved}
+	third := h.run(t)
+	if third.Revision != first.Revision {
+		t.Errorf("recovery changed the revision (%s -> %s); the guard's own recovery must not cost "+
+			"a second issuance", first.Revision, third.Revision)
+	}
+	if got := h.domains(t); len(got) != 2 {
+		t.Errorf("domains after recovery = %v, want both names", got)
+	}
+}
+
+// The guard's actual job -- "do not issue a name no rule serves" -- must survive the carry.
+//
+// A declaration that was never covered has no coverage to keep, so it is excluded as before: the
+// carry applies to names that are in the certificate, not to new ones.
+func TestADeclarationWithNoRuleIsStillNotIssued(t *testing.T) {
+	h := newHarness(t, Options{RequireRule: true})
+
+	h.decls.raw = []RawDeclaration{decl("new.example.com")}
+	h.rules.domains = []string{"other.example.com"}
+
+	rep := h.run(t)
+	d, ok := decisionFor(rep, "new.example.com")
+	if !ok {
+		t.Fatalf("the declaration must be reported; decisions: %+v", rep.Decisions)
+	}
+	if d.Included {
+		t.Errorf("a name that was never covered and that no CLB rule serves must not be issued, got %q", d.Reason)
+	}
+	// Nothing is covered, so the round refuses to write an empty document (an empty one is
+	// indistinguishable from a failed generation). That is the pre-existing behaviour and it is
+	// what "the guard still prevents new coverage" looks like from the outside.
+	if !rep.Frozen() {
+		t.Errorf("with no name covered the round must freeze rather than write an empty document, mode=%s", rep.Mode)
 	}
 }
 
@@ -1809,5 +1861,48 @@ func TestAFailedCommitWritesNoReport(t *testing.T) {
 	}
 	if _, err := os.Stat(reportPath); err != nil {
 		t.Errorf("a completed round must leave its report behind: %v", err)
+	}
+}
+
+// A guard answer that is short of what the API reported must be its own signal.
+//
+// "The guard could not be read" and "the guard answered, but not about everything" both suppress
+// removals, and an operator has to be able to tell them apart: the first is weather to retry, the
+// second means the rule list itself is being truncated, and every name it did not mention was never
+// checked against anything. Treating a short answer as a complete one is what let a guard bug
+// become lost coverage; treating it as an ordinary error hides that the API is truncating.
+func TestATruncatedGuardAnswerIsReportedAndRemovesNothing(t *testing.T) {
+	// Grace period 0 and a high fuse threshold: the only thing standing between this round and a
+	// removal is the guard's answer.
+	h := newHarness(t, Options{DropThreshold: 0.9})
+
+	h.decls.raw = []RawDeclaration{decl("a.example.com"), decl("b.example.com")}
+	h.rules.domains = []string{"a.example.com", "b.example.com"}
+	h.run(t)
+
+	// b's declaration is gone, and the guard cannot be trusted this round: the API reported more
+	// rules than it returned.
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	h.rules.domains = []string{"a.example.com"}
+	h.rules.err = errIncompleteRuleList
+
+	rep := h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("a truncated guard must not freeze the round: %v", rep.FreezeReasons)
+	}
+	if !rep.GuardIncomplete {
+		t.Error("the report must say the guard answered INCOMPLETELY; without it, this is " +
+			"indistinguishable from a transient read failure that an operator would just retry")
+	}
+	if !rep.GuardUnavailable {
+		t.Error("an incomplete guard must also count as unavailable for the removal decisions")
+	}
+	if got := h.domains(t); len(got) != 2 {
+		t.Errorf("a name must not be removed on the strength of a rule list that is known to be "+
+			"short, got %v", got)
+	}
+	d, ok := decisionFor(rep, "b.example.com")
+	if !ok || !d.Included {
+		t.Errorf("b must be kept and reported as kept, got %+v", d)
 	}
 }

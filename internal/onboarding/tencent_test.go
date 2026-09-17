@@ -376,6 +376,11 @@ type fakeCLB struct {
 	// forward records the generation filter the last DescribeLoadBalancers call sent, so a
 	// test can assert that none is sent.
 	forward *int64
+
+	// lbTotal and listenerTotal override the count each response reports, so a test can model a
+	// TRUNCATED answer: the API says more objects exist than it returned.
+	lbTotal       *uint64
+	listenerTotal *uint64
 }
 
 func (f *fakeCLB) DescribeLoadBalancersWithContext(_ context.Context, req *clbsdk.DescribeLoadBalancersRequest) (*clbsdk.DescribeLoadBalancersResponse, error) {
@@ -390,9 +395,13 @@ func (f *fakeCLB) DescribeLoadBalancersWithContext(_ context.Context, req *clbsd
 	for _, v := range f.lbs {
 		out = append(out, v...)
 	}
+	total := uint64(len(out))
+	if f.lbTotal != nil {
+		total = *f.lbTotal
+	}
 	return &clbsdk.DescribeLoadBalancersResponse{
 		Response: &clbsdk.DescribeLoadBalancersResponseParams{
-			TotalCount: common.Uint64Ptr(uint64(len(out))), LoadBalancerSet: out,
+			TotalCount: common.Uint64Ptr(total), LoadBalancerSet: out,
 		},
 	}, nil
 }
@@ -416,9 +425,13 @@ func (f *fakeCLB) DescribeListenersWithContext(_ context.Context, req *clbsdk.De
 		})
 	}
 	listeners := []*clbsdk.Listener{{ListenerId: common.StringPtr("lbl-0"), Rules: rules}}
+	total := uint64(len(listeners))
+	if f.listenerTotal != nil {
+		total = *f.listenerTotal
+	}
 	return &clbsdk.DescribeListenersResponse{
 		Response: &clbsdk.DescribeListenersResponseParams{
-			TotalCount: common.Uint64Ptr(uint64(len(listeners))), Listeners: listeners,
+			TotalCount: common.Uint64Ptr(total), Listeners: listeners,
 		},
 	}, nil
 }
@@ -647,7 +660,12 @@ func TestEnumerationSkipsNilListElements(t *testing.T) {
 		}
 	})
 
-	t.Run("load balancers and rules", func(t *testing.T) {
+	t.Run("load balancers", func(t *testing.T) {
+		// A nil element is not dereferenced -- and it is not skipped either. An element without an
+		// id is a load balancer whose listeners can never be enumerated, so its rules are missing
+		// from the list the guard checks declarations against: answering with the rules of the
+		// OTHER load balancers is a knowingly short answer, and a short guard list is what makes a
+		// served name look unreferenced.
 		fake := &fakeCLB{
 			lbs: map[string][]*clbsdk.LoadBalancer{
 				"ap-guangzhou": {nil, {LoadBalancerId: common.StringPtr("lb-1")}},
@@ -655,12 +673,63 @@ func TestEnumerationSkipsNilListElements(t *testing.T) {
 			rules: map[string][]string{"lb-1": {"api.example.com"}},
 		}
 		stubCLB(t, fake)
-		got, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
-		if err != nil {
-			t.Fatalf("a nil element must be skipped, got %v", err)
+		_, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
+		if err == nil {
+			t.Fatal("an unusable element must make the read fail as incomplete, not silently drop the " +
+				"rules of the load balancer it names")
 		}
-		if len(got) != 1 || got[0] != "api.example.com" {
-			t.Errorf("got %v, want the rule of the non-nil load balancer only", got)
+		if !errors.Is(err, errIncompleteRuleList) {
+			t.Errorf("the failure must be recognisable as an incomplete list, got %v", err)
+		}
+	})
+}
+
+// A response that reports more objects than it returned must not be used as a complete list.
+//
+// Both enumerations feed the CLB guard, and the guard's answer decides whether a name still has a
+// rule. A silently short list therefore reads "this name is unserved", which (before the carry rule)
+// took the name out of the desired state -- a guard bug turning into lost coverage. The count the
+// API sends with the response is what makes that failure visible.
+func TestListRuleDomainsRefusesATruncatedAnswer(t *testing.T) {
+	t.Run("load balancers", func(t *testing.T) {
+		fake := &fakeCLB{
+			lbs: map[string][]*clbsdk.LoadBalancer{
+				"ap-guangzhou": {{LoadBalancerId: common.StringPtr("lb-1")}},
+			},
+			rules: map[string][]string{"lb-1": {"api.example.com"}},
+		}
+		// The API says three instances exist and hands over one.
+		fake.lbTotal = common.Uint64Ptr(3)
+		stubCLB(t, fake)
+
+		_, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
+		if err == nil {
+			t.Fatal("a load-balancer list shorter than the reported total must not be used as the guard")
+		}
+		if !errors.Is(err, errIncompleteRuleList) {
+			t.Errorf("the failure must be recognisable as an incomplete list, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "3") {
+			t.Errorf("the error must carry the counts, got %v", err)
+		}
+	})
+
+	t.Run("listeners", func(t *testing.T) {
+		fake := &fakeCLB{
+			lbs: map[string][]*clbsdk.LoadBalancer{
+				"ap-guangzhou": {{LoadBalancerId: common.StringPtr("lb-1")}},
+			},
+			rules: map[string][]string{"lb-1": {"api.example.com"}},
+		}
+		fake.listenerTotal = common.Uint64Ptr(4)
+		stubCLB(t, fake)
+
+		_, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
+		if err == nil {
+			t.Fatal("a listener list shorter than the reported total must not be used as the guard")
+		}
+		if !errors.Is(err, errIncompleteRuleList) {
+			t.Errorf("the failure must be recognisable as an incomplete list, got %v", err)
 		}
 	})
 }
