@@ -39,7 +39,7 @@ processes are running.
 
 | Option | What it survives | What it costs | Does it fit this product? |
 |---|---|---|---|
-| **A. Faster recovery from backup** — snapshot to object storage, and script the restore | Host loss, with a recovery window measured in minutes and manual steps | Almost nothing; the snapshot machinery already exists (`Store.Snapshot` in `internal/state/backup.go`, driven by `stateBackup` in the config, documented in `docs/recovery.md`) | **Yes.** This is the honest answer to "the host died" today, and it is the only option that adds no new runtime dependency |
+| **A. Faster recovery from backup** — snapshot to object storage | Host loss, with a recovery window measured in minutes | Almost nothing; the snapshot machinery exists (`Store.Snapshot` in `internal/state/backup.go`, driven by `stateBackup` in the config), **restore is one command** (`wecert -restore latest`, which keeps the database it replaces and records the rate-limit caveat for the next start), and `docs/recovery.md` is the procedure | **Yes.** This is the honest answer to "the host died" today, and it is the only option that adds no new runtime dependency |
 | **B. Two hosts, one shared database** — `state.db` on network storage both instances can reach | Host loss, with failover | `flock` over network filesystems is unreliable, and SQLite's locking over NFS is a well-known source of corruption. This would require replacing the state layer with a client for a real coordination store (etcd/Redis): the lock, the buckets, the fallback ledger and the order state machine all move | **No, not as-is.** It converts a self-contained binary into a distributed system, and the failure modes it introduces (split brain, partial writes across a network) are worse than the outage it prevents |
 | **C. Per-instance state (sharding)** — each instance owns a disjoint set of certificates, with its own `state.db` | Host loss for the certificates the surviving instance owns | A second source of truth for "which instance owns what". Certificate sets that share a registered domain share quota, so sharding has to respect the exact-set and per-domain limits, which are global — the shard boundary is now a quota boundary | **Partly.** It has no external dependency, which suits this product, but it makes the quota arithmetic (the thing this program exists to protect) a function of the shard map |
 
@@ -48,10 +48,10 @@ processes are running.
 **Do A now, and treat B/C as a product decision rather than a fix.**
 
 A is a small, self-contained piece of work with no new dependency and it addresses the actual
-exposure: how long it takes to get certificates renewing again after a host is lost. The
-snapshot format, retention and restore procedure already exist; the missing part is getting the
-snapshot off the host automatically and making the restore one command instead of a documented
-sequence.
+exposure: how long it takes to get certificates renewing again after a host is lost. The snapshot
+format, retention and the restore command (`wecert -restore`) already exist; the missing part is
+getting the snapshot off the host automatically, which needs a decision about where it goes and
+what recovery time is being bought.
 
 B and C change what the program *is* — B makes it a distributed system, C makes quota analysis
 shard-dependent — so they should be decided against a concrete availability target, not adopted
