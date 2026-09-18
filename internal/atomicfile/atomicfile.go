@@ -20,6 +20,14 @@ import (
 	"syscall"
 )
 
+// syncFile is (*os.File).Sync, as a seam.
+//
+// The fsync cannot be observed from outside the process -- whether the pages reached the platter is
+// the kernel's business -- but WHICH file it is called on, and before which rename, is exactly the
+// durability property this package promises. A test substitutes this function and records the order
+// (see TestWriteSyncsTheTemporaryFileBeforeTheRename); production always takes the line below.
+var syncFile = func(f *os.File) error { return f.Sync() }
+
 // Write replaces path with data, creating it with perm.
 //
 // perm is applied to the temporary file BEFORE the rename rather than to the target afterwards.
@@ -67,7 +75,7 @@ func Write(path string, data []byte, perm os.FileMode) error {
 		tmp.Close()
 		return fmt.Errorf("write %s: %w", path, err)
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := syncFile(tmp); err != nil {
 		tmp.Close()
 		return fmt.Errorf("sync %s: %w", path, err)
 	}

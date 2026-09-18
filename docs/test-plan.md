@@ -9,7 +9,7 @@
 > | 本文 | 分层策略、覆盖基线、缺口优先级、发布判据 |
 > | [`docs/lifecycle-acceptance.md`](lifecycle-acceptance.md) | 端到端验收用例 TC-LIFECYCLE-01（Part A 生命周期 A0–A9 / Part B 声明层 B0–B5b） |
 > | [`testenv/README.md`](../testenv/README.md) | 部署侧 Stage A / B / B2 / B3 / C，含真实 CLB 与 SNI |
-> | [`docs/stage-c-cvm-systemd.md`](stage-c-cvm-systemd.md) | L4 · Stage C：真机 + systemd + CVM 角色（**未跑**） |
+> | [`docs/stage-c-cvm-systemd.md`](stage-c-cvm-systemd.md) | L4 · Stage C：真机 + systemd + CVM 角色（**已跑**：2026-09-17 §4.5/§4.9、2026-09-18 §4.7） |
 > | [`docs/sni-multicert.md`](sni-multicert.md) | L4 · SNI 多证书互不干扰 + `scripts/e2e-sni.sh`（**未跑**） |
 
 ---
@@ -42,7 +42,7 @@
 | **L3 端到端（staging）** | 真实 ACME + 真实 DNSPod 的全流程 | `docs/lifecycle-acceptance.md`、`scripts/e2e-test.sh` | 本地，人工 | 发版前 / 改动触及状态机时 |
 | **L3 端到端（staging，自动化）** | 同上，但由 `wecert-onboard` 驱动声明、`wecert-probe` 独立佐证 | `scripts/e2e.sh` 输出的 [实跑报告](e2e-run-2026-09-17.html) | 本地，人工 | 同上 |
 | **L4 部署验收** | 真实 CLB 绑定、SNI、TLS 实际握手、CVM 角色 | `testenv/`（Terraform）、`scripts/run-stage-ab.sh`、`scripts/validate-cloudinit.py` | 腾讯云测试账号，人工 | 发版前 / 改动触及部署时 |
-| **L4 部署验收 · Stage C（未跑）** | 真机 + systemd + **CVM 角色**（不落任何静态密钥）一路跑到一次真续期 | [`docs/stage-c-cvm-systemd.md`](stage-c-cvm-systemd.md)、`testenv/`（`create_cvm=true` + `enable_cvm_role=true`）、`install.sh`、`deploy/systemd/*.unit` | 腾讯云测试账号 + 测试域名 + 公网出口，**人工 / 需要账号** | 发版前 / 改动触及 systemd、安装脚本或凭证路径时 |
+| **L4 部署验收 · Stage C（已跑）** | 真机 + systemd + **CVM 角色**（不落任何静态密钥）一路跑到一次真续期 | [`docs/stage-c-cvm-systemd.md`](stage-c-cvm-systemd.md)、`testenv/`（`create_cvm=true` + `enable_cvm_role=true`）、`install.sh`、`deploy/systemd/*.unit` | 腾讯云测试账号 + 测试域名 + 公网出口，**人工 / 需要账号** | 发版前 / 改动触及 systemd、安装脚本或凭证路径时 |
 | **L4 部署验收 · SNI 多证书（未跑）** | 同一 listener 上两张证书，续期其中一张不能动另一张 | [`docs/sni-multicert.md`](sni-multicert.md)、`scripts/e2e-sni.sh`、`bin/wecert-clbverify` | 腾讯云测试账号（`clb:DescribeListeners`）+ 一个多证书 SNI listener，**人工 / 需要账号** | 发版前 / 改动触及部署、`UpdateCertificateInstance` 调用或 CLB 行为时 |
 | **L5 线上巡检** | 生产上"证书真的在服务" | `wecert-probe`、`tatrun`、Prometheus 指标 | 生产 | 持续 |
 
@@ -97,9 +97,16 @@
 
 | 类别 | 例子 | 该不该追 |
 |---|---|---|
-| **A. 接缝（不该追）** | `internal/acme/api.go` 的 `coreAPI` 全部方法、`LazyTencentCLB` 的 `Deploy`/`Delete`/`Bindings` | ❌ **不追**。它们是一行转发：`return c.core.Orders.UpdateForCSR(...)`。存在的意义是**让替身可注入**，而正因为它们存在，`internal/acme` 才有 67.9% —— 逻辑在替身那一侧被测了，适配器本身只在真实 lego 上运行。为它们写测试只能测出"我调用了我自己" |
+| **A. 接缝（多数不该追）** | `internal/acme/api.go` 的 `coreAPI`、`LazyTencentCLB` 的 `Deploy`/`Delete`/`Bindings` | ❌ **不追**。它们是一行转发：`return c.core.Orders.UpdateForCSR(...)`。存在的意义是**让替身可注入**，而正因为它们存在，`internal/acme` 才有 67.9% —— 逻辑在替身那一侧被测了。为它们写测试只能测出"我调用了我自己" |
 | **B. 真实缺口** | `internal/onboarding/tencent.go` 的 11 个函数、`Noop` 的三个方法 | ✅ **追**。见 P1-1、P1-2 |
 | **C. 顶层编排** | `dns.go` 的 `WaitAll`/`waitZone`、`client.go` 的 `EnsureAccount` | ✅ 追，接缝已存在（见 P1-3） |
+
+> **2026-09-18 复核（A 类已经不是"全零"）：** 第 8 轮的契约用例（`9f711a1`）给 `LazyTencentCLB`
+> 补了三条行为用例（`internal/deploy/contract_test.go`：构造不解析凭证、首次使用才报凭证错误、首次
+> 使用才建内层 deployer），`internal/acme/account_contract_test.go` 也用一个 `httptest` 的 ACME 服务端
+> 驱动真实的 lego core，因此 `coreAPI` 的 `NewOrder` / `GetOrder` / `GetRenewalInfo` 有覆盖。
+> 仍然是 0% 的是 `UpdateOrderForCSR` / `GetAuthorization` / `AcceptChallenge` / `GetCertificate` /
+> `RevokeCertificate` / `GetKeyAuthorization` —— 这些依旧按上面的理由**不追**。
 
 对照参考：**已经打满的可注入内层**（说明测试架构是健康的）：
 
@@ -178,12 +185,16 @@ awk -v t="$total" 'BEGIN{ if (t+0 < 60.0) { print "coverage regressed: "t"% < 60
 **现象**：
 
 ```
-make check   = check-english fmt-check vet test-race          （4 项）
+make check   = check-english fmt-check vet test-race test-tags
+               check-scripts check-alerts                     （7 项，Makefile:272）
 CI 实际跑     = gofmt + check-english + vet + govulncheck
-               + test -race + build + cross build             （7 项）
+               + test -race + test-tags + check-alerts
+               + check-scripts + build + cross build           （9 步，ci.yml）
 ```
 
-`govulncheck`、`make build`、`make release`（交叉编译）**只在 CI 跑**。本地全绿不等于 CI 会绿 —— 这正是历史上"改完提交才发现构建不过"的成因。
+`govulncheck`、`make build`、`make release`（交叉编译）**只在 CI 跑**（`make check` 里没有对应目标）。
+CI 的 `gofmt` / English 两步是内联命令，等价于 `make fmt-check` / `make check-english`；其余每一步都能在
+`make check` 里找到。所以本地全绿不等于 CI 会绿 —— 这正是历史上"改完提交才发现构建不过"的成因。
 
 **怎么补**：让 `make check` 成为 CI 的超集（至少加 `build` 与 `release`；`govulncheck` 可选，因为它要联网拉漏洞库）。
 
@@ -389,7 +400,7 @@ spec / 熔断      ██████░░░░░░░░░░░░░░ 
 
 ```bash
 # L0–L2：本地门禁（注意：目前仍少于 CI，见 P0-4）
-make check             # check-english + fmt-check + vet + test-race
+make check             # check-english + fmt-check + vet + test-race + test-tags + check-scripts + check-alerts
 make test              # 单元测试
 make test-race         # 带竞态检测（多 SAN 时 DNS 探测与授权轮询并发）
 make cover             # 覆盖率
@@ -432,3 +443,4 @@ make check-scripts     # shell 脚本的自测（目前只覆盖 e2e-wildcard）
 |---|---|
 | 2026-09-16 | 首版。基线 `c6d6a51` / v0.4.2：总覆盖率 61.0%，384 个用例，识别出 4 个 P0 缺口 |
 | 2026-09-17 | 第 2 节新增两条 L4 行：Stage C（真机 + systemd + CVM 角色）与 SNI 多证书，均**未跑**、人工 / 需要账号；配套 `docs/stage-c-cvm-systemd.md`、`docs/sni-multicert.md`、`scripts/e2e-sni.sh` |
+| 2026-09-18 | P0-4 与附录的命令清单按当前 Makefile / ci.yml 重算：`make check` 已从 4 项长到 7 项（`test-tags`、`check-scripts`、`check-alerts` 已接入），CI 现在是 9 步；结论不变 —— `govulncheck`、`build`、`release` 仍只在 CI 跑。P0-3（CI 无覆盖率下限）复核后仍成立。第 2 节的 **Stage C 两行**从"未跑"更正为"已跑"（2026-09-17 §4.5/§4.9、2026-09-18 §4.7）；3.3 节 A 类接缝补注已覆盖的部分 |

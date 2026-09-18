@@ -1,9 +1,11 @@
 package atomicfile
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -153,5 +155,99 @@ func TestInstallRefusesANonRegularTemporaryFile(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o644 {
 		t.Errorf("the unrelated file's mode changed to %04o", info.Mode().Perm())
+	}
+}
+
+// The fsync has to happen on the TEMPORARY file, before the rename.
+//
+// This is the round-4 change that was recorded as having no behavioural test ("a crash cannot be
+// manufactured in a test"): the onboarding report writer used to rename without syncing, so a
+// crash -- or just a lost page cache -- could leave a renamed, truncated (or zero-byte) report
+// behind a round that otherwise completed. Whether the bytes reached the platter is not observable
+// from inside the process, but the two things the fix actually changed are: which file is synced,
+// and that it is synced before the rename. Both are pinned here through the syncFile seam.
+func TestWriteSyncsTheTemporaryFileBeforeTheRename(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "onboarding-report.json")
+
+	var mu sync.Mutex
+	var synced []string
+	orig := syncFile
+
+	syncFile = func(f *os.File) error {
+		mu.Lock()
+		defer mu.Unlock()
+		synced = append(synced, f.Name())
+		// At the moment of the sync the target must NOT exist yet: a sync after the rename would
+		// be syncing the wrong name, and the durability claim is about the temp file's contents.
+		if _, err := os.Stat(target); err == nil {
+			t.Errorf("the target already exists when Sync runs (%s): the sync must precede the rename", f.Name())
+		} else if !os.IsNotExist(err) {
+			t.Errorf("stat %s: %v", target, err)
+		}
+		// And the file being synced must be this package's temporary file in the target directory.
+		if filepath.Dir(f.Name()) != dir {
+			t.Errorf("the sync must be on a temporary file in the target's directory, got %s", f.Name())
+		}
+		if !IsTemp(filepath.Base(f.Name())) {
+			t.Errorf("the synced file %s is not one of this package's temporaries", f.Name())
+		}
+		return f.Sync()
+	}
+	t.Cleanup(func() { syncFile = orig })
+
+	if err := Write(target, []byte(`{"round":"ok"}`), 0o644); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	mu.Lock()
+	n := len(synced)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("exactly one fsync belongs on the temporary file, got %d", n)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"round":"ok"}` {
+		t.Errorf("the target holds %q", got)
+	}
+}
+
+// A failed sync must fail the write and leave the previous contents alone.
+//
+// The whole point of syncing before the rename is that a crash between the two is the only window
+// left; a sync that is attempted and ignored would put the truncated-report window back without
+// changing the code's shape. The rename must therefore not have happened when the sync fails.
+func TestAFailedSyncLeavesTheOldContentsInPlace(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "onboarding-report.json")
+	if err := os.WriteFile(target, []byte("previous"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := syncFile
+	syncFile = func(*os.File) error { return errors.New("EIO") }
+	t.Cleanup(func() { syncFile = orig })
+
+	if err := Write(target, []byte("new"), 0o644); err == nil {
+		t.Fatal("a sync failure must be reported: the caller has to know the write is not durable")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "previous" {
+		t.Errorf("a failed sync must not install the new contents, target holds %q", got)
+	}
+	// And the temporary file must not be left behind.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if IsTemp(e.Name()) {
+			t.Errorf("a failed write left %s behind", e.Name())
+		}
 	}
 }

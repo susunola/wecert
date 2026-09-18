@@ -38,9 +38,6 @@ SERVICES = ("ssl", "dnspod", "clb", "tat")
 # Actions the code calls that must NOT be required of every policy, with the reason. Anything
 # added here needs a reason that says which binary holds the permission instead.
 EXEMPT: dict[str, str] = {
-    # clbverify is an operator-run tool for the one-time manual bind; it is not part of the
-    # daemon's runtime path and can be run with the operator's own credentials.
-    "clb:DescribeListeners": "cmd/clbverify (operator-run) -- verified separately in README.reference.md",
     # tatrun drives Stage C on a CVM; the runtime daemon never calls TAT.
     "tat:RunCommand": "cmd/tatrun (Stage C tooling), not the daemon",
     "tat:DescribeInvocationTasks": "cmd/tatrun (Stage C tooling), not the daemon",
@@ -52,19 +49,46 @@ EXEMPT: dict[str, str] = {
 # `ssl.Something` form and duly demanded permissions for `ssl:NewClient` and
 # `ssl:UploadCertificateResponse`. The alias form (`ssl.DeleteCertificate` as a type name) always
 # accompanies a constructor, so nothing is lost.
-RE_REQUEST = re.compile(r"\b(" + "|".join(SERVICES) + r")\.New([A-Za-z0-9]+)Request\b")
+RE_REQUEST = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.New([A-Za-z0-9]+)Request\b")
+
+# The import path of an SDK service package, e.g.
+#   github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317
+RE_SDK_IMPORT = re.compile(
+    r'(?:^|[\s(])(?:([A-Za-z_][A-Za-z0-9_]*)\s+)?"github\.com/tencentcloud/tencentcloud-sdk-go/'
+    r'tencentcloud/([a-z0-9]+)/[^"]+"', re.M)
 
 
 def source_actions() -> dict[str, set[str]]:
-    """action -> files that build the request, from non-test Go sources."""
+    """action -> files that build the request, from non-test Go sources.
+
+    The package name a file actually uses is resolved from its imports rather than assumed, because
+    one of them is aliased: `internal/onboarding/tencent.go` writes `clbsdk.NewDescribeLoadBalancers
+    Request`. The earlier version of this check matched only the bare service names (ssl, dnspod, clb,
+    tat), so it never saw the two read-only CLB calls wecert-onboard's rule guard makes -- the runtime
+    policy shipped without them, and `clb:DescribeListeners` was even listed as an exemption with the
+    reason "clbverify is operator-run". The round-11 CVM verification attached that policy to a real
+    instance role and the guard failed with UnauthorizedOperation, which is how the miss surfaced.
+    """
     found: dict[str, set[str]] = {}
     for path in sorted(ROOT.rglob("*.go")):
         rel = path.relative_to(ROOT).as_posix()
         if rel.startswith("testenv/") or rel.endswith("_test.go"):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
+
+        # Alias (or package name) -> service, for this file only.
+        aliases: dict[str, str] = {}
+        for m in RE_SDK_IMPORT.finditer(text):
+            service = m.group(2)
+            if service not in SERVICES:
+                continue
+            aliases[m.group(1) or service] = service
+
         for m in RE_REQUEST.finditer(text):
-            found.setdefault(f"{m.group(1)}:{m.group(2)}", set()).add(rel)
+            service = aliases.get(m.group(1))
+            if service is None:
+                continue
+            found.setdefault(f"{service}:{m.group(2)}", set()).add(rel)
     return found
 
 

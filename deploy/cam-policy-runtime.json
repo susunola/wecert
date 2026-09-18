@@ -14,7 +14,20 @@
         "ssl:CreateCertificateBindResourceSyncTask",
         "ssl:DescribeCertificateBindResourceTaskResult"
       ],
-      "resource": ["*"]
+      "resource": [
+        "*"
+      ]
+    },
+    {
+      "sid": "WecertRuntimeCLBGuard",
+      "effect": "allow",
+      "action": [
+        "clb:DescribeLoadBalancers",
+        "clb:DescribeListeners"
+      ],
+      "resource": [
+        "*"
+      ]
     },
     {
       "sid": "WecertRuntimeDNS01",
@@ -26,7 +39,9 @@
         "dnspod:ModifyRecord",
         "dnspod:DeleteRecord"
       ],
-      "resource": ["*"]
+      "resource": [
+        "*"
+      ]
     }
   ]
 }

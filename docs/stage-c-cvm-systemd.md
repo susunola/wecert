@@ -1,12 +1,19 @@
 # Stage C：在真实 CVM 上以 systemd + CVM 角色跑通一次续期
 
-> ## 未跑
+> ## 已跑（2026-09-17 / 09-18）
 >
-> **本文描述的步骤尚未在任何环境执行过。** 不是"上次跑过、这次省略"，而是**一次都没有跑过** ——
-> 写这份 runbook 的机器上没有任何腾讯云凭据，也没有可用的测试域名，所以这里没有一行输出是实测的。
+> **本文的步骤已经在真机上执行过两轮**，不再是"从未跑过"：
 >
-> 文中所有"预期"都标注了来源：能追到源码的写明文件与行内字符串；追不到的写 **expect** 或
-> **跑之前确认**，不做断言。
+> | 轮次 | 报告 | 覆盖到本文的哪一段 |
+> |---|---|---|
+> | 2026-09-17 | [`e2e-run-2026-09-17-credentialed.md`](e2e-run-2026-09-17-credentialed.md) §4.5、§4.9 | §3 构建 + `install.sh` 安装（sha256 与本机产物一致、路径与权限、三个 unit）；§5 systemd 启动、日志与指标；§6 的凭证取证（配置/unit/磁盘上的零密钥匹配）。§4.9 另外跑通了第 1 节第 5 条：首签 → 手工绑定（用 API 完成，对应控制台那一次）→ 守护进程自动续期并换绑 |
+> | 2026-09-18 | [`e2e-run-2026-09-18-credentialed.md`](e2e-run-2026-09-18-credentialed.md) §4.7 | 同一套路径重跑：`install.sh` → systemd → `cvm-role` 下的真实签发与上传，配置里 `SecretId`/`SecretKey`/`loginToken`/`password` 零匹配，元数据服务读回角色名 |
+>
+> 这两轮**没有**覆盖的：§6.5 的"故意指向不存在的角色名"反证、第 1 节最后两条（跨过一次真实续期
+> 窗口的临时凭证过期、多 region / 多 resourceTypes 覆盖）。
+>
+> 本文其余部分仍然是 runbook：每条"预期"都标注了来源 —— 能追到源码的写明文件与行内字符串；
+> 追不到的写 **expect** 或 **跑之前确认**，不做断言。
 >
 > **要跑起来至少需要**：
 >
@@ -58,13 +65,17 @@
 
 **Stage C 不能证明的**（别把它当总验收）：
 
-- **`-dry-run` 绿 ≠ 角色路径可用。** `-dry-run` 在 `main.go` 里的返回点在 `newDeployer()` 与
-  `acme.NewDNSSolver()` **之前**，而这两处才是会取腾讯云凭证的地方；`acme.EnsureAccount()` 只跟 ACME
-  服务端说话。也就是说 `-dry-run` 完全没碰过 CVM 角色（详见第 4 节）。
+- **`-dry-run` 绿 ≠ 角色路径可用。** 第 11 轮之后 `-dry-run` 会真的构建 DNS provider 与 deployer
+  （`cmd/wecert/main.go` 的 `buildCredentialBearingComponents`，所以静态 `secretId`/`secretKey` 会被
+  校验），但 **CVM 角色的凭证获取仍然推迟到首次使用**（`internal/deploy` 的 `LazyTencentCLB` 构造时不
+  解析凭证），而 `acme.EnsureAccount()` 只跟 ACME 服务端说话。也就是说一个指向不存在角色的
+  `-dry-run` 照样退出 0 —— 实测（2026-09-18）：
+  `credentialMode=cvm-role` + `roleName: wecert-role-that-does-not-exist` 在没有任何元数据服务的机器上
+  仍然是 `dry run finished …` / 退出 0。详见第 4 节。
 - **重绑定的时序与原子性**：那是 Stage B 的战场，`UpdateCertificateInstance` 是异步且非原子的
   （实测 30s–2min 内逐条切换，README《The rebind is asynchronous **and not atomic**》）。
 - **SNI 多证书互不干扰**：见 [`docs/sni-multicert.md`](sni-multicert.md) 与 `scripts/e2e-sni.sh`。
-- **临时凭证过期行为**：角色凭证一般 2 小时过期，`fetchCVMRoleCredential` **刻意不缓存**、每次部署重取。
+- **临时凭证过期行为**：`fetchCVMRoleCredential` **刻意不缓存**、每次调用重取。实测（2026-09-18，真实 CVM 角色）：元数据返回的 `ExpiredTime` 是**每次取到时刻 + 12.0 小时**，不是本文原先写的「一般 2 小时」；一次守护进程重启后的新一轮续期（19:47）也重新取了一次（tcpdump 抓到 38 次 metadata GET），说明「不缓存」这一半是对的，而「2 小时」这个数字是错的。
   一次 Stage C 只跨几分钟，证明不了"跨过续期窗口仍正常"。真要证，得让它跑过一个真实续期窗口。
 - **多 region / 多 resourceTypes / 规模**：`tencent.regions` 少写一个 region 就静默不更新，这条只有把
   那个 region 的 CLB 也纳入才谈得上验证。
@@ -373,7 +384,7 @@ sudo -u wecert /usr/local/bin/wecert -config /etc/wecert/config.yaml -dry-run
 | 同上，首次运行 | `level=WARN msg="no account in the state store; registering a new ACME account"` |
 | 同上，每张证书 | `loaded certificate cert=stage-c-test profile=classic domains=1 maxNames=100 renewBefore=720h0m0s deploy=true` |
 | `newProvider` | `desired state comes from the configuration file mode=static certificates=1` |
-| `-dry-run` 分支 | `dry run finished: the config, the ACME account and the desired-state source are all fine mode=static provider=static certificates=1 probing=on (port 443, timeout 10s, max 3 hosts/cert)` |
+| `-dry-run` 分支 | `dry run finished: the config, the ACME account, the desired-state source, the DNS provider and the deployer are all fine; nothing was issued or deployed mode=static provider=static certificates=1 probing=on (port 443, timeout 10s, max 3 hosts/cert)` |
 | 退出码 | `0` |
 
 `provider=static` 来自 `internal/spec/static.go` 的 `Kind()`（返回 `config.ModeStatic`）；
@@ -391,7 +402,7 @@ sudo -u wecert /usr/local/bin/wecert -config /etc/wecert/config.yaml -dry-run
 
 | **没**证明 | 依据 |
 |---|---|
-| **CVM 角色凭证可用** | `-dry-run` 在 `newDeployer()` 与 `acme.NewDNSSolver()` **之前**就 `return nil` 了，这两处才会构造腾讯云客户端 |
+| **CVM 角色凭证可用** | `buildCredentialBearingComponents`（`cmd/wecert/main.go`）会构造 DNS provider 与 deployer，但两者都不在构造时取凭证：`LazyTencentCLB` 把角色凭证的获取推迟到首次 `Deploy`/`Delete`/`Bindings`，`acme.NewDNSSolver` 对 `cvm-role` 也是每次使用时才取。于是角色名写错、或元数据服务不可达，`-dry-run` 仍然退出 0（2026-09-18 实测：不存在的角色名 + 无元数据服务的机器 → `dry run finished` / 退出 0） |
 | 指标端口能绑 | `startMetricsServer` 在 `-dry-run` 返回点**之后** |
 | 快照目录可写 | `dirIsWritable` / `startStateBackups` 同样在后面 |
 | 任何 DNS 或部署行为 | 一行都没执行 |
@@ -744,3 +755,4 @@ curl -s -o /dev/null -w '%{http_code}\n' http://metadata.tencentyun.com/latest/m
 | 日期 | 变更 |
 |---|---|
 | 2026-09-17 | 首版。**未跑**：本机无腾讯云凭据，无法执行；每条"预期"都标注了源码出处 |
+| 2026-09-18 | 顶部横幅按实跑更正：Stage C 已在 2026-09-17（[§4.5、§4.9](e2e-run-2026-09-17-credentialed.md)）与 2026-09-18（[§4.7](e2e-run-2026-09-18-credentialed.md)）两轮真机运行中执行，不再是"未跑"，仍未覆盖的是 §6.5 的反证与跨续期窗口的临时凭证。第 1 节与 §4.2 的 `-dry-run` 说明按第 11 轮修复后的 `cmd/wecert/main.go` 更正（dry-run 现在会构建 DNS provider 与 deployer，但角色凭证仍推迟到首次使用，所以"绿 ≠ 角色可用"的结论不变） |

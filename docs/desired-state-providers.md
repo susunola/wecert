@@ -399,9 +399,15 @@ t3: DNS 恢复           → 又重签                 ✗ 再烧一次
 跑完就退出，两次运行之间的窗口天然就是去抖窗口。
 把它做进进程里只会引入一份额外的状态和一类新的时钟 bug。
 
-**仍然没做：** 外部黑盒探测（拨 443 读 `notAfter`）、
-`multi_cert_info` 的"一张证书不影响另一张"验证、
-DNSPod token 走 `LoadCredential`。
+**仍然没做：** `multi_cert_info` 的"一张证书不影响另一张"验证 —— 本账号的监听器级绑定被完全忽略
+（`extCertIds` 恒空），真实数据没走到"两张证书挂在同一个监听器上"那条路径，见
+[`sni-multicert.md`](sni-multicert.md) 与 [`verification-2026-09-18.md`](verification-2026-09-18.md) §5。
+
+**当时写着"没做"、现在两项已经落地**（2026-09-18 更正）：外部黑盒探测就是 `wecert-probe`
+（拨 443 读回真实服务的证书，`internal/probe` + Prometheus 指标，见 README《`wecert-probe`》）；
+DNSPod token 现在可以写进 `dns.loginTokenFile`，路径会被环境变量展开，因此 systemd 的
+`LoadCredential=dnspod-token:...` 可用（`internal/config/config.go` 的凭证文件读取，示例见
+`config.example.yaml`）。
 
 ---
 

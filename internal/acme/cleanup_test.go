@@ -1510,6 +1510,86 @@ func TestAFailedStateWriteTakesThePresentedRecordBackOut(t *testing.T) {
 	}
 }
 
+// Releasing the LAST lease leaves no leaver to fire the provider's delete-all.
+//
+// This is the round-7 trade (LC-4) made concrete, and it is a real trade rather than a harmless one.
+// The registry's contract is "the delete-EVERY-TXT call fires when the last value leaves": that is
+// what lets one certificate's cleanup defer while another's record is still live at the same
+// _acme-challenge name. releaseStaleLease only drops the value from the registry -- it deliberately
+// does not call the provider, because a provider call outside the per-name mutex is the race the
+// registry exists to prevent.
+//
+// So a release that empties the name (the record the released value owned was already deleted, or
+// never written) leaves the values that an earlier leaver deferred on with nobody left to fire the
+// call for them. Those records stay in DNS until some LATER challenge is presented at the same name
+// and its cleanup is the last leaver -- which is why the trade is still the right one: the release
+// is what keeps the name cleanable at all, and a lease nothing will ever remove blocks the delete-all
+// for the rest of the process, which is strictly worse.
+func TestReleasingTheLastLeaseLeavesNoLeaverToFireTheDeleteAll(t *testing.T) {
+	privateLeaseRegistry(t)
+	t.Setenv("LEGO_DISABLE_CNAME_SUPPORT", "true")
+
+	p := &recordingProvider{}
+	solver := &DNSSolver{
+		newProvider: func(context.Context) (challenge.Provider, error) { return p, nil },
+		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// Present resolves the zone before handing the write to the provider.
+		recursiveNameservers: []string{"192.0.2.53:53"},
+		exchange: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
+			return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{
+				Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}}), nil
+		},
+	}
+	m, _ := newTestManager(t, solver, fakeKeyAuth{})
+	ctx := context.Background()
+
+	// Two certificates share one challenge name -- the shape that makes the registry necessary.
+	recA, err := solver.Present(ctx, "shared.example.com", "tok-a", "keyauth-a")
+	if err != nil {
+		t.Fatalf("Present A: %v", err)
+	}
+	recB, err := solver.Present(ctx, "shared.example.com", "tok-b", "keyauth-b")
+	if err != nil {
+		t.Fatalf("Present B: %v", err)
+	}
+	if recA.FQDN != recB.FQDN || recA.Value == recB.Value {
+		t.Fatalf("the fixture needs one name and two values, got %+v and %+v", recA, recB)
+	}
+
+	// A leaves first: the delete-all is deferred for B's record, which is the guard working.
+	if err := solver.CleanUp(ctx, "shared.example.com", "tok-a", "keyauth-a"); err != nil {
+		t.Fatalf("CleanUp A: %v", err)
+	}
+	if len(p.cleanups) != 0 {
+		t.Fatalf("A's cleanup must defer while B's record is live, got %d provider calls", len(p.cleanups))
+	}
+	if !hasTXTLease(recA.FQDN, recB.Value) {
+		t.Fatal("B is the last leaver and its lease has to still be held")
+	}
+
+	// B's own record is proven gone -- by the reclaim probe, or by a cleanup that already ran. The
+	// value is nobody's, so the lease goes, and the promise that "the last leaver cleans up" is now
+	// attached to a leaver that does not exist.
+	m.releaseStaleLease(recB.FQDN, recB.Value)
+	if hasTXTLease(recB.FQDN, recB.Value) {
+		t.Fatal("no presented row claims the value, so the lease must be released")
+	}
+	if got := len(p.cleanups); got != 0 {
+		t.Fatalf("releasing a lease must not touch the provider, got %d CleanUp calls", got)
+	}
+
+	// The name is now empty of leases, and the deferred delete-all has still never run: A's record
+	// is the stranded one. What eventually collects it is the next cleanup at this name -- which,
+	// with the registry empty, now fires the delete-all that A's first cleanup had to skip.
+	if err := solver.CleanUp(ctx, "shared.example.com", "tok-a", "keyauth-a"); err != nil {
+		t.Fatalf("CleanUp A again: %v", err)
+	}
+	if len(p.cleanups) != 1 {
+		t.Fatalf("with the released lease gone, the next cleanup at the name is the delete-all that "+
+			"collects the stranded record; got %d calls", len(p.cleanups))
+	}
+}
+
 // failAuthorizationWrites makes every UPDATE of an authorization row fail, deterministically.
 //
 // A trigger is the closest thing to a full disk or a corrupt page that a test can arrange: the read

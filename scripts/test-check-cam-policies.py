@@ -29,12 +29,21 @@ def run_in(tree: pathlib.Path) -> subprocess.CompletedProcess:
                           capture_output=True, text=True)
 
 
+# The import line is part of the fixture because the checker resolves the package name a file uses
+# from its imports -- that is what catches an ALIASED one (`clbsdk.NewDescribeLoadBalancersRequest` in
+# internal/onboarding/tencent.go), which the earlier bare-name match could not see: the runtime policy
+# shipped without the two read-only CLB actions wecert-onboard's rule guard needs, and the miss only
+# surfaced when the round-11 CVM verification attached that policy to a real instance role.
+SSL_IMPORT = 'import ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"\n'
+
+
 def fake_tree(tmp: pathlib.Path) -> pathlib.Path:
     tree = tmp / "tree"
     (tree / "internal" / "deploy").mkdir(parents=True)
     (tree / "deploy").mkdir()
     (tree / "internal" / "deploy" / "tencent.go").write_text(
-        "package deploy\n\nfunc f() { _ = ssl.NewDeleteCertificateRequest() }\n")
+        "package deploy\n\n" + SSL_IMPORT +
+        "\nfunc f() { _ = ssl.NewDeleteCertificateRequest() }\n")
     return tree
 
 
@@ -66,18 +75,33 @@ def main() -> int:
         # 3. A new constructor with no policy update: must fail.
         tree = fake_tree(tmp / "added")
         (tree / "internal" / "deploy" / "more.go").write_text(
-            "package deploy\n\nfunc g() { _ = ssl.NewDescribeDeleteCertificatesTaskResultRequest() }\n")
+            "package deploy\n\n" + SSL_IMPORT +
+            "\nfunc g() { _ = ssl.NewDescribeDeleteCertificatesTaskResultRequest() }\n")
         write_policy(tree, ["ssl:DeleteCertificate"])
         proc = run_in(tree)
         if proc.returncode != 1 or "DescribeDeleteCertificatesTaskResult" not in proc.stdout:
             failures.append(f"a newly used API was not reported: rc={proc.returncode} {proc.stdout!r}")
+
+        # 4. An ALIASED SDK import must be seen too (the miss that let the runtime policy ship
+        #    without the CLB guard's two actions).
+        tree = fake_tree(tmp / "aliased")
+        (tree / "internal" / "deploy" / "aliased.go").write_text(
+            "package deploy\n\n" +
+            'import clbsdk "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317"\n' +
+            "\nfunc h() { _ = clbsdk.NewDescribeLoadBalancersRequest() }\n")
+        write_policy(tree, ["ssl:UploadCertificate", "ssl:DeleteCertificate"])
+        proc = run_in(tree)
+        if proc.returncode != 1 or "clb:DescribeLoadBalancers" not in proc.stdout:
+            failures.append(
+                f"an aliased SDK import was not resolved: rc={proc.returncode} {proc.stdout!r}")
 
     if failures:
         print("check-cam-policies self-test FAILED")
         for f in failures:
             print("  -", f)
         return 1
-    print("✓ check-cam-policies.py reports a missing action, passes a complete policy, and notices a new API")
+    print("✓ check-cam-policies.py reports a missing action, passes a complete policy, notices a new "
+          "API, and resolves an aliased SDK import")
     return 0
 
 
