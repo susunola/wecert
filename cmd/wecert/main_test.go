@@ -67,6 +67,12 @@ func TestOnceExitFailsWhenThePassDidNotConverge(t *testing.T) {
 		// certificate stuck in a long backoff sits in, which is exactly what a one-shot run has to
 		// report.
 		{"nothing was attempted and everything was skipped", reconcile.RunReport{Skipped: []string{"a", "b"}}},
+		// Every certificate inside its retry backoff window. This case used to sit in the healthy
+		// list, and the guard that was supposed to cover it could not fire: an ErrBackoff pass
+		// increments Backoff and never appends to Skipped, so `Attempted == 0 && len(Skipped) > 0`
+		// was false and the timer exited 0. It is reachable -- the backoff is capped at 6h and the
+		// timer runs hourly -- and the exit code is the only channel that reports it.
+		{"every certificate is inside its retry backoff window", reconcile.RunReport{Backoff: 2}},
 	}
 	for _, tc := range trouble {
 		if err := onceExit(tc.rep); err == nil {
@@ -79,7 +85,9 @@ func TestOnceExitFailsWhenThePassDidNotConverge(t *testing.T) {
 		rep  reconcile.RunReport
 	}{
 		{"everything succeeded", reconcile.RunReport{Attempted: 2, Succeeded: 2}},
-		{"a certificate is inside its retry window", reconcile.RunReport{Attempted: 0, Backoff: 1}},
+		// Nothing due: no certificate was attempted, none failed, none is parked in a retry window.
+		// This is what an idle interval looks like and it must stay a success.
+		{"nothing is due yet", reconcile.RunReport{}},
 	}
 	for _, tc := range healthy {
 		if err := onceExit(tc.rep); err != nil {

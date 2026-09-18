@@ -65,23 +65,39 @@ func runRevoke(configPath, statePathOverride, certName, reasonName string, assum
 	}
 	defer store.Close()
 
+	log := newLogger("info")
+
+	// Record the decision BEFORE reading the CA directory, with a manager that has no CA core at all.
+	//
+	// This is the documented promise -- "the request is written to the state store FIRST, so a
+	// transient CA failure leaves a durable record and the daemon's next pass retries it" -- and it
+	// was not true: EnsureAccount came first, so a CA directory that was unreachable (or a network
+	// that was down) made the command fail with nothing recorded, no retry, and
+	// wecert_revocation_pending at 0, on the one action an operator takes about a leaked key.
+	if err := acme.NewManager(store, nil, nil, nil, log).RecordRevocation(certName, reason); err != nil {
+		return err
+	}
+
 	// The same account the daemon issues with: revocation is authenticated with the account key
 	// that placed the order, and being a separate invocation must not mean a second copy of it.
 	// EnsureAccount is idempotent -- an account already in the store is loaded, not replaced.
-	log := newLogger("info")
 	core, err := acme.EnsureAccount(cfg, store, acme.NewHTTPClient(60*time.Second))
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nNOT YET REVOKED: %v\n", err)
+		fmt.Fprintf(os.Stderr, "The request IS recorded in %s and will be retried on every pass, so the "+
+			"daemon will revoke it as soon as the CA is reachable. Fix the reason above (or start the "+
+			"daemon) and it will complete on its own.\n", cfg.StatePath)
 		return fmt.Errorf("prepare the ACME account: %w", err)
 	}
 
 	// A manager with no solver and no deployer: revocation needs neither, and passing nil keeps
 	// it obvious that this path cannot issue or deploy anything.
 	m := acme.NewManager(store, acme.NewAPI(core), nil, nil, log)
-	if err := m.RequestRevocation(context.Background(), certName, reason); err != nil {
+	if err := m.AttemptRecordedRevocation(context.Background(), certName); err != nil {
 		fmt.Fprintf(os.Stderr, "\nNOT YET REVOKED: %v\n", err)
-		// "It is recorded and will be retried" is only true when it reached the store. Saying it
-		// unconditionally told an operator acting on a key compromise that the revocation was
-		// queued while wecert_revocation_pending stayed 0 and nothing would ever retry it.
+		// The record was written before EnsureAccount ran, so by this point the request is durable and
+		// the daemon's next pass retries it. (The ErrRevocationNotRecorded branch that used to be here
+		// belongs to the recording step above, which has already returned by now.)
 		if errors.Is(err, acme.ErrRevocationNotRecorded) {
 			fmt.Fprintf(os.Stderr, "Nothing was recorded, so nothing will retry this on its own: fix the "+
 				"reason above and run the command again.\n")

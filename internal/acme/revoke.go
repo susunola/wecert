@@ -49,7 +49,31 @@ func ReasonName(code int) string {
 // revocation is queued when it is not is wrong in the unsafe direction.
 var ErrRevocationNotRecorded = errors.New("the revocation request was not recorded")
 
+// RequestRevocation records the decision and then tries once.
 func (m *Manager) RequestRevocation(ctx context.Context, certName string, reason int) error {
+	if err := m.RecordRevocation(certName, reason); err != nil {
+		return err
+	}
+
+	// Attempt now so the common case completes while the operator is watching, but the error
+	// is returned for information only: the request is durable either way, and the daemon's
+	// next pass retries it.
+	if err := m.processRevocation(ctx, certName); err != nil {
+		return fmt.Errorf("the CA has not accepted the revocation yet; it is recorded and will be "+
+			"retried on every pass: %w", err)
+	}
+	return nil
+}
+
+// RecordRevocation writes the operator's decision to the state store, and touches no network.
+//
+// It is separate from RequestRevocation because the order matters when the CA is unreachable, which
+// is exactly when an operator is most likely to be revoking something: the CLI used to prepare the
+// ACME account BEFORE calling in here, so a CA that was down (or a directory that could not be read)
+// meant the run failed with nothing recorded, no retry, and wecert_revocation_pending at 0 -- while
+// the documentation promises the decision is durable whatever the CA does. A leaked key does not stop
+// being leaked because the CA returned a 503.
+func (m *Manager) RecordRevocation(certName string, reason int) error {
 	st, err := m.store.GetCert(certName)
 	if err != nil {
 		return fmt.Errorf("%w: reading the certificate: %w", ErrRevocationNotRecorded, err)
@@ -71,14 +95,25 @@ func (m *Manager) RequestRevocation(ctx context.Context, certName string, reason
 	if leaf, err := leafCertificate(st.CertPEM); err == nil {
 		identity = certIdentity(leaf)
 		// Asking again after a renewal is a new decision about a different certificate, and the
-		// refresh below silently retargets the request. Say so: the previous certificate is then
-		// only revoked if its own request is still outstanding.
+		// upsert below REPLACES the outstanding request rather than adding to it -- there is one row
+		// per certificate name, and AddRevokeRequest overwrites its identity.
+		//
+		// The warning used to say the previous certificate "is revoked only if its request is still
+		// outstanding", which reads as "it may still be revoked". It will not be: from the statement
+		// below on, the row names the certificate stored now, so every later retry revokes that one
+		// and the identity the operator was worried about is referenced nowhere. On a key compromise
+		// that is the worst possible reading -- the run then logs "CERTIFICATE REVOKED" for the
+		// healthy replacement while the compromised key stays trusted -- so the sentence says the
+		// consequence and what to do about it instead.
 		if prev, perr := m.store.GetRevokeRequest(certName); perr == nil && prev != nil &&
 			prev.CertIdentity != "" && prev.CertIdentity != identity {
-			m.log.Warn("the certificate stored for this name is not the one the outstanding request "+
-				"targets; this new request retargets it at the certificate stored now, and the "+
-				"previous one is revoked only if its request is still outstanding",
-				"cert", certName, "outstanding", prev.CertIdentity, "now", identity)
+			m.log.Warn("an outstanding revocation request for this name targets a DIFFERENT "+
+				"certificate than the one stored now. This request replaces it (one row per name), so "+
+				"the certificate that was targeted before will NOT be revoked by wecert: revoke it in "+
+				"the CA console with the material you still have, or restore that material and revoke "+
+				"it before renewing",
+				"cert", certName, "outstanding", prev.CertIdentity, "now", identity,
+				"wasOutstandingSince", prev.RequestedAt)
 		}
 	} else {
 		// Material that does not parse cannot be identified. Recording the request anyway keeps
@@ -94,15 +129,16 @@ func (m *Manager) RequestRevocation(ctx context.Context, certName string, reason
 	}
 	m.log.Error("revocation requested; the request is recorded and will be retried until the CA accepts it",
 		"cert", certName, "reason", ReasonName(reason))
-
-	// Attempt now so the common case completes while the operator is watching, but the error
-	// is returned for information only: the request is durable either way, and the daemon's
-	// next pass retries it.
-	if err := m.processRevocation(ctx, certName); err != nil {
-		return fmt.Errorf("the CA has not accepted the revocation yet; it is recorded and will be "+
-			"retried on every pass: %w", err)
-	}
 	return nil
+}
+
+// AttemptRecordedRevocation performs one attempt for a request that is already in the store.
+//
+// The CLI needs this because EnsureAccount -- the step that reads the CA directory -- has to happen
+// after the decision is durable (see RecordRevocation), so it builds the manager twice: once with no
+// CA core at all to record, and once with the account to attempt.
+func (m *Manager) AttemptRecordedRevocation(ctx context.Context, certName string) error {
+	return m.processRevocation(ctx, certName)
 }
 
 // RevocationReasonCode validates a reason code.

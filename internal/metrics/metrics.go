@@ -33,7 +33,11 @@ var (
 
 	CertARIWindowStart = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_ari_window_start_timestamp_seconds",
-		Help: "Start of the ARI-suggested renewal window in unix seconds; 0 means not yet obtained.",
+		// Not "0 means not yet obtained": the reconcile loop DELETES this series when the window is
+		// unset (reconcile.go, "an unset ARI window is 'no answer', not 1970"), so a rule written as
+		// `== 0` would match nothing and never fire. Absence is the signal, and absence is what the
+		// Help has to describe.
+		Help: "Start of the ARI-suggested renewal window in unix seconds. The series is ABSENT when no window has been obtained (rather than 0, which would be 1970), so alert on its absence, not on a zero value.",
 	}, []string{"cert"})
 
 	// RevocationPending counts revocation requests the CA has not accepted yet.
@@ -57,18 +61,21 @@ var (
 		Help: "Passes that could not read the outstanding revocation requests. wecert_revocation_pending is stale whenever this is increasing.",
 	})
 
-	// RateLimitRemaining reports how much of a published CA rate limit is left, as a LOWER
+	// RateLimitRemaining reports how much of a published CA rate limit is left, as an UPPER
 	// BOUND.
 	//
 	// The value counts only what this program spent, while "certs per registered domain" and
 	// "certs per exact set of identifiers" are global across all accounts, so the true
-	// remainder can be smaller -- never larger. It is published anyway because the number an
-	// operator needs before a bulk change ("do 40 issuances still fit in this week's 50?") was
-	// previously unavailable from anywhere: Let's Encrypt documents the limits and their token
-	// bucket refill rates but offers no endpoint to query the remainder.
+	// remainder can be smaller -- never larger: it is "at most this much". (This comment and the
+	// Help below said "a lower bound" until round 11; the wording is the same fact read backwards,
+	// and it is the direction that matters, because "at least" invites spending quota that may not
+	// be there. internal/ratelimit/tracker.go carries the full argument.) It is published anyway
+	// because the number an operator needs before a bulk change ("do 40 issuances still fit in this
+	// week's 50?") was previously unavailable from anywhere: Let's Encrypt documents the limits and
+	// their token bucket refill rates but offers no endpoint to query the remainder.
 	RateLimitRemaining = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_ratelimit_remaining_tokens",
-		Help: "Estimated tokens left in a published CA rate limit, counting only this program's own spend (a lower bound; the per-domain limits are global across accounts).",
+		Help: "Estimated tokens left in a published CA rate limit, counting only this program's own spend. An UPPER BOUND: the per-registered-domain and per-exact-set limits are global across accounts, so the real remainder is at most this much. Read wecert_ratelimit_blocked for what the CA itself has refused.",
 	}, []string{"limit", "scope"})
 
 	// RateLimitBlocked reports 1 while the CA has reported a deadline for a limit, which is
@@ -158,12 +165,12 @@ var (
 
 	CertificateProbeNotAfter = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_probe_not_after_timestamp_seconds",
-		Help: "notAfter read back from a real TLS handshake, in unix seconds. Compare against wecert_certificate_not_after_timestamp_seconds to see whether the rebind actually took effect.",
+		Help: "notAfter read back from a real TLS handshake, in unix seconds. The series is ABSENT when the probe could not complete a handshake for this host, or completed only some of its addresses: a missing series means 'no answer for the whole host', not a stale one. To compare it with what was deployed, find the certificate whose SANs cover the host (the config, /hook/desired, or wecert_desired_state_certificates) and read wecert_certificate_not_after_timestamp_seconds{cert=...} -- the two families share no label, so there is no join.",
 	}, []string{"host"})
 
 	CertificateProbeTrusted = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_probe_trusted",
-		Help: "1 when the served chain validates against the system roots. 0 is not necessarily broken (an internal CA is legitimate) but browsers will warn.",
+		Help: "1 when the served chain validates against the system roots. 0 is not necessarily broken (an internal CA is legitimate) but browsers will warn. The series is ABSENT when the probe could not complete a handshake for this host (or completed only some of its addresses), so a missing series is 'no answer' and a present one is a certificate the probe really read.",
 	}, []string{"host"})
 
 	CertificateProbeErrors = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -184,7 +191,9 @@ var (
 
 	CertificateFallbackDropped = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_fallback_dropped_names",
-		Help: "How many names were dropped from the certificate currently served by the failure fallback. The names themselves are in the state store and in the logs.",
+		// "in force", not "currently served", for the same reason as the sibling above: this is set
+		// when the decision is taken, which is before the reduced certificate is issued or deployed.
+		Help: "How many names the failure fallback has dropped for this certificate. The count describes the fallback IN FORCE, which on the first pass (and for as long as the reduced issuance keeps failing) is not yet what is being served: the previous, complete certificate is still live. The names themselves are in the state store and in the logs.",
 	}, []string{"cert"})
 )
 
@@ -221,6 +230,19 @@ func DeleteCertSeries(name string) {
 
 // DeleteProbeSeries removes every per-host probe series for a host that is no longer
 // probed. See DeleteCertSeries for why the reclamation has to be explicit.
+// ClearProbeAnswer drops the two gauges that describe a certificate the probe READ, leaving
+// probe_match and the error counter alone.
+//
+// It exists because "the probe cannot reach this host" is the one verdict for which those two values
+// are not merely unproven but meaningless: keeping the last successful handshake's chain verdict and
+// notAfter exports trusted=1 and a fresh-looking expiry for a host nobody can dial, which is the
+// false green probe_match was already fixed for. DeleteProbeSeries is too blunt here -- it would take
+// the error counter with it, and that counter is the evidence that the probe is the problem.
+func ClearProbeAnswer(host string) {
+	CertificateProbeNotAfter.DeleteLabelValues(host)
+	CertificateProbeTrusted.DeleteLabelValues(host)
+}
+
 func DeleteProbeSeries(host string) {
 	CertificateProbeMatch.DeleteLabelValues(host)
 	CertificateProbeNotAfter.DeleteLabelValues(host)

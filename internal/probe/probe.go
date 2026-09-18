@@ -351,8 +351,58 @@ type Verdict struct {
 	// OK is true when every check passed.
 	OK bool `json:"ok"`
 
-	// Problems is the human-facing list of problems, each standing as its own conclusion.
-	Problems []string `json:"problems,omitempty"`
+	// Problems is the list of problems, each standing as its own conclusion: the text for a human
+	// and the kind for the code that has to word its own message about them.
+	Problems []Problem `json:"problems,omitempty"`
+}
+
+// ProblemKind is the direction a verification problem points in.
+//
+// It exists because the four classes below "point in completely different directions" (see Verify)
+// and the caller that logs the transition needs to know which one it is looking at: a validity-floor
+// failure means the deployed certificate IS being served, and telling the operator that a different
+// certificate is being served sends them to the CLB console for a renewal that has not run yet.
+type ProblemKind string
+
+const (
+	// ProblemNoCertificate: no certificate was captured at all.
+	ProblemNoCertificate ProblemKind = "no_certificate"
+	// ProblemNotCovered: the served certificate does not cover the name that was dialed.
+	ProblemNotCovered ProblemKind = "not_covered"
+	// ProblemNamesMissing: the served certificate is missing names that were deployed.
+	ProblemNamesMissing ProblemKind = "names_missing"
+	// ProblemNamesExtra: the served certificate has names that were not deployed.
+	ProblemNamesExtra ProblemKind = "names_extra"
+	// ProblemNotAfter: the served certificate expires at a different instant than the deployed one.
+	ProblemNotAfter ProblemKind = "not_after"
+	// ProblemMinValidFor: the deployed certificate is served, with less validity left than required.
+	ProblemMinValidFor ProblemKind = "min_valid_for"
+	// ProblemUnreachable: the probe could not answer at all (resolution, dial or handshake), or could
+	// answer for only some of the host's addresses. It is an environment problem, not a certificate
+	// one, and the runner reports it as such.
+	ProblemUnreachable ProblemKind = "unreachable"
+)
+
+// Problem is one verification failure.
+type Problem struct {
+	Kind ProblemKind `json:"kind"`
+	Text string      `json:"text"`
+}
+
+// String makes a Problem usable anywhere a message is.
+func (p Problem) String() string { return p.Text }
+
+// OnlyKind reports whether every problem is of this kind (and there is at least one).
+func (v Verdict) OnlyKind(kind ProblemKind) bool {
+	if len(v.Problems) == 0 {
+		return false
+	}
+	for _, p := range v.Problems {
+		if p.Kind != kind {
+			return false
+		}
+	}
+	return true
 }
 
 // Summary returns a one-line summary for logs and CLI output.
@@ -360,7 +410,20 @@ func (v Verdict) Summary() string {
 	if v.OK {
 		return "ok"
 	}
-	return strings.Join(v.Problems, "; ")
+	texts := make([]string, 0, len(v.Problems))
+	for _, p := range v.Problems {
+		texts = append(texts, p.Text)
+	}
+	return strings.Join(texts, "; ")
+}
+
+// ProblemTexts returns the human-facing texts, for a log attribute.
+func (v Verdict) ProblemTexts() []string {
+	texts := make([]string, 0, len(v.Problems))
+	for _, p := range v.Problems {
+		texts = append(texts, p.Text)
+	}
+	return texts
 }
 
 // Verify compares the probe result against the expectation.
@@ -375,47 +438,47 @@ func (r *Result) Verify(e Expectation) Verdict {
 		now = time.Now()
 	}
 
-	var problems []string
+	var problems []Problem
 
 	// 1. Does this certificate cover the name I dialed?
 	// This is the most fundamental one: if it does not cover it, the checks below are moot.
 	if r.cert == nil {
-		problems = append(problems, "no certificate was captured")
+		problems = append(problems, Problem{Kind: ProblemNoCertificate, Text: "no certificate was captured"})
 	} else if err := r.cert.VerifyHostname(r.Host); err != nil {
-		problems = append(problems, fmt.Sprintf("the served certificate does not cover %s "+
-			"(it covers %s)", r.Host, formatSANs(r.SANs)))
+		problems = append(problems, Problem{Kind: ProblemNotCovered, Text: fmt.Sprintf(
+			"the served certificate does not cover %s (it covers %s)", r.Host, formatSANs(r.SANs))})
 	}
 
 	// 2. Does the coverage match the certificate that was deployed?
 	if len(e.Domains) > 0 && r.cert != nil {
 		missing, extra := diffDomains(e.Domains, r.SANs)
 		if len(missing) > 0 {
-			problems = append(problems, fmt.Sprintf(
-				"the served certificate is missing names that were deployed: %s", strings.Join(missing, ", ")))
+			problems = append(problems, Problem{Kind: ProblemNamesMissing, Text: fmt.Sprintf(
+				"the served certificate is missing names that were deployed: %s", strings.Join(missing, ", "))})
 		}
 		if len(extra) > 0 {
-			problems = append(problems, fmt.Sprintf(
+			problems = append(problems, Problem{Kind: ProblemNamesExtra, Text: fmt.Sprintf(
 				"the served certificate has names that were not deployed: %s "+
 					"(a different certificate is being served, or the deploy wrote something unexpected)",
-				strings.Join(extra, ", ")))
+				strings.Join(extra, ", "))})
 		}
 	}
 
 	// 3. Is this the one I deployed?
 	if !e.NotAfter.IsZero() && !r.NotAfter.Equal(e.NotAfter) {
-		problems = append(problems, fmt.Sprintf(
+		problems = append(problems, Problem{Kind: ProblemNotAfter, Text: fmt.Sprintf(
 			"the served certificate expires at %s but the deployed one expires at %s "+
 				"(the rebind did not take effect, or another certificate is winning SNI)",
-			r.NotAfter.UTC().Format(time.RFC3339), e.NotAfter.UTC().Format(time.RFC3339)))
+			r.NotAfter.UTC().Format(time.RFC3339), e.NotAfter.UTC().Format(time.RFC3339))})
 	}
 
 	// 4. How much time is left?
 	if e.MinValidFor > 0 {
 		left := r.NotAfter.Sub(now)
 		if left < e.MinValidFor {
-			problems = append(problems, fmt.Sprintf(
+			problems = append(problems, Problem{Kind: ProblemMinValidFor, Text: fmt.Sprintf(
 				"the served certificate has %s left, less than the required %s",
-				left.Round(time.Hour), e.MinValidFor))
+				left.Round(time.Hour), e.MinValidFor)})
 		}
 	}
 

@@ -61,7 +61,7 @@ func writeConfig(t *testing.T, dir string) (cfgPath, out string) {
 statePath: ` + filepath.Join(dir, "state.db") + `
 acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  email: ops@example.com
+  email: ops@atomwangnus.com
 dns:
   provider: tencentcloud
 tencent:

@@ -635,12 +635,16 @@ func corruptDatabaseError(path string, cause error) error {
 
 	//lint:ignore ST1005 the second paragraph of a multi-line operator instruction is a sentence;
 	// capitalising it is the point, and the first paragraph still starts lowercase.
+	// "the newest snapshot", not "state.db together with its -wal": snapshots are VACUUM INTO copies
+	// and have no sidecars at all, and wecert -restore installs one as a single command. Pointing at a
+	// file copy plus a -wal sent the reader looking for two files where recovery.md now says "stop the
+	// daemon, run wecert -restore latest".
 	return fmt.Errorf(
 		"the state database %s is corrupt: %v\n"+
-			"       wecert will not start against a database it cannot read. Restore the backup that "+
-			"docs/recovery.md describes (state.db together with its -wal), or move the damaged file "+
-			"aside to start from an empty database -- which registers a new ACME account and re-places "+
-			"orders, so prefer the backup. See docs/recovery.md.",
+			"       wecert will not start against a database it cannot read. Restore the newest snapshot "+
+			"(`wecert -restore latest`, which keeps this file aside), or move the damaged file aside to "+
+			"start from an empty database -- which registers a new ACME account and re-places orders, so "+
+			"prefer the snapshot. See docs/recovery.md.",
 		path, cause)
 }
 
@@ -657,8 +661,8 @@ func verifyDatabaseIntact(db *sql.DB) error {
 		// capitalising it is the point, and the first paragraph still starts lowercase.
 		return fmt.Errorf(
 			"the state database is unreadable: %w\n"+
-				"       wecert will not start against a database it cannot trust. Restore a backup of "+
-				"state.db (and its -wal) if you have one, or move the damaged file aside to start from an "+
+				"       wecert will not start against a database it cannot trust. Restore the newest "+
+				"snapshot (`wecert -restore latest`), or move the damaged file aside to start from an "+
 				"empty one -- losing it means a new ACME account and re-placed orders. See docs/recovery.md.",
 			err)
 	}
@@ -667,9 +671,9 @@ func verifyDatabaseIntact(db *sql.DB) error {
 		// capitalising it is the point, and the first paragraph still starts lowercase.
 		return fmt.Errorf(
 			"the state database failed its consistency check: %s\n"+
-				"       Restore a backup of state.db if you have one, or move the damaged file aside to "+
-				"start from an empty one -- losing it means a new ACME account and re-placed orders. "+
-				"See docs/recovery.md.",
+				"       Restore the newest snapshot (`wecert -restore latest`), or move the damaged file "+
+				"aside to start from an empty one -- losing it means a new ACME account and re-placed "+
+				"orders. See docs/recovery.md.",
 			result)
 	}
 	return nil

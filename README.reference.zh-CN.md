@@ -934,7 +934,11 @@ ssl:DescribeCertificateBindResourceTaskResult
 | `-once` | `false` | 只跑一轮就退出（配合 systemd timer / cron） |
 | `-interval` | `1h` | 守护模式下的收敛间隔 |
 | `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
-| `-dry-run` | `false` | 只校验配置并初始化 ACME 账号，不签发也不部署 |
+| `-dry-run` | `false` | 校验配置、初始化 ACME 账号，并构造 DNS provider 与 deployer（静态凭证有问题在这里就会失败）；不签发也不部署 |
+| `-revoke` | — | 请求 CA 吊销这张证书后退出（先把决定写进状态库，CA 暂时失败时由守护进程重试） |
+| `-revoke-reason` | `unspecified` | `unspecified` \| `keyCompromise` \| `affiliationChanged` \| `superseded` \| `cessationOfOperation` |
+| `-yes` | `false` | 配合 `-revoke`：跳过交互确认（否则要求手输证书名） |
+| `-restore` | — | 恢复状态快照后退出：快照文件、快照目录，或 `latest`（见 **docs/recovery.md**）。守护进程持锁时拒绝执行；被替换掉的数据库保留在 `state.db.replaced-<stamp>` |
 | `-version` | `false` | 打印版本后退出 |
 
 ### `wecert-onboard`（期望状态生成器）
