@@ -170,8 +170,11 @@ func TestEnsureAccountTreatsAnEmptyKeyAsNoAccount(t *testing.T) {
 	}
 }
 
-// A registration response without a Location header carries no kid, so the account can be
-// neither used nor usefully persisted. It must be reported, not written with an empty kid.
+// A registration response without a Location header carries no kid, so the account cannot
+// be used yet. It must be reported, and no kid may be written -- but the account KEY is
+// persisted anyway: it was generated before the registration call precisely so that a
+// failed (or, worse, succeeded-but-unrecorded) registration can be retried with the same
+// key instead of registering a second account.
 func TestEnsureAccountRequiresAKid(t *testing.T) {
 	fake, store, cfg := accountFixture(t)
 	fake.omitAccountLocation.Store(true)
@@ -183,8 +186,12 @@ func TestEnsureAccountRequiresAKid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored != nil {
-		t.Errorf("nothing usable should be persisted, got %+v", stored)
+	if stored == nil || len(stored.PrivateKeyPEM) == 0 {
+		t.Error("the account key must be persisted even when registration fails: it is the " +
+			"identity the retry registers with, and losing it would register a second account")
+	}
+	if stored != nil && stored.KID != "" {
+		t.Errorf("no kid was returned, so none may be stored, got %q", stored.KID)
 	}
 }
 

@@ -458,9 +458,11 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		// fixed for exactly this reason. A bare return left a state store that fails this read
 		// invisible in wecert_certificate_consecutive_failures and retrying at the pass rate.
 		//
-		// st is nil here (the read failed), so the failure is recorded against a fresh row for this
-		// name: PutCert upserts, and the next pass reads the counter back.
-		return m.recordFailure(ctx, &state.CertState{Name: c.Name}, fmt.Errorf(
+		// But NOT the ordinary recordFailure: st is nil here (the read failed), so recordFailure
+		// would persist a synthesised CertState holding only the name, and PutCert's whole-row
+		// upsert would blank the certificate material of the certificate currently in service.
+		// The narrow variant writes only the failure bookkeeping columns.
+		return m.recordFailureUnreadable(ctx, c.Name, fmt.Errorf(
 			"read the certificate state: %w", err))
 	}
 	if st == nil {
@@ -498,9 +500,11 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	}
 	// Skip straight through the backoff window. Once a retry is scheduled, stop knocking
 	// on the CA's door.
-	if until, ok := m.transientBackoffFor(c.Name); ok && m.now().Before(until) {
+	if until, ok := m.transientBackoffFor(c.Name); ok {
 		// A backoff that could not be persisted (see transientBackoff). Checking it first
 		// means a failing state store still costs one window instead of one order per pass.
+		// transientBackoffFor drops expired entries on read, so an ok result is always in
+		// the future.
 		m.log.Warn("inside a backoff window that could not be recorded (the state store was failing); skipping",
 			"cert", c.Name, "nextAttemptAt", until)
 		return state.ErrBackoff
@@ -536,6 +540,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 
 	// Invariant 1: with an unexpired order in progress, keep advancing it, never create a
 	// new one.
+	orderDiscarded := false
 	if o, err := m.store.GetOrder(c.Name); err != nil {
 		// recordFailure, not a bare return: the doc comment above promises that a failed decision
 		// schedules the retry, and a bare return skipped the counter, the backoff and the in-memory
@@ -556,6 +561,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 				// probes and provider deletes each time) and nothing escalates or records why.
 				return m.recordFailure(ctx, st, fmt.Errorf("discard the expired order: %w", err))
 			}
+			orderDiscarded = true
 
 		case !orderMatchesConfig(o, c):
 			// The configured domains changed. This order's identifier set was fixed the
@@ -570,6 +576,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 			if err := m.discardOrder(ctx, c.Name); err != nil {
 				return m.recordFailure(ctx, st, fmt.Errorf("discard the order for the changed domain set: %w", err))
 			}
+			orderDiscarded = true
 
 		default:
 			m.log.Info("resuming the existing order", "cert", c.Name, "order", o.OrderURL, "status", o.Status)
@@ -581,8 +588,15 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	// authorizations that were "written into DNS", they are orphaned now (the order delete
 	// succeeded but the authorization delete failed, or the process was killed). Reclaim
 	// them on the spot rather than leaving them parked on DNSPod forever.
-	if err := m.cleanupOrphanTXT(ctx, c.Name); err != nil {
-		m.log.Warn("failed to reclaim a leftover TXT record", "cert", c.Name, "err", err)
+	//
+	// Skipped when this pass just discarded an order: discardOrder already ran this same
+	// cleanup, and running it again spends a second round of authoritative DNS probes and
+	// provider deletes on the rows it deliberately kept (a record whose fate is unknown is
+	// re-probed every pass until the probe answers).
+	if !orderDiscarded {
+		if err := m.cleanupOrphanTXT(ctx, c.Name); err != nil {
+			m.log.Warn("failed to reclaim a leftover TXT record", "cert", c.Name, "err", err)
+		}
 	}
 
 	// No certificate yet -> first issuance.

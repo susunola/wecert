@@ -37,6 +37,11 @@ var removeSnapshotFile = os.Remove
 // dropped without a test noticing.
 var snapshotCopied = func(string) {}
 
+// repairDirSynced runs after a repaired snapshot's rename has been made durable with a directory
+// fsync. Tests use it to observe that the fsync actually happens: a rename without one is
+// invisible to any assertion made on the directory afterwards.
+var repairDirSynced = func(string) {}
+
 // Snapshot writes a consistent copy of the state database, and prunes older snapshots.
 //
 // Why VACUUM INTO rather than copying the file: the database runs in WAL mode, so the
@@ -78,7 +83,7 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 	// not deleting (an ACL, a chattr'd directory): every interval failed on the Remove, and each
 	// attempt left a 0-byte .snapshot-*.tmp that nothing revisits. Picking a free name needs only
 	// stat, and a crash mid-VACUUM now leaves a file the sweep below recognises.
-	sweepStaleSnapshotTemps(dir)
+	s.sweepStaleSnapshotTemps(dir)
 	s.repairFutureDatedSnapshots(dir)
 	tmpName, err := s.freeTempName(dir)
 	if err != nil {
@@ -148,12 +153,17 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 //
 // VACUUM INTO insists on a path that does not exist, so the name has to be chosen rather than
 // created: CreateTemp's O_EXCL is exactly the guarantee that cannot be used here. The stamp plus a
-// counter is enough -- one process writes snapshots (the store lock makes that true), and a
-// collision is detected by the stat instead of assumed away.
+// counter is enough -- one process writes snapshots for a given store (the store lock makes that
+// true), and a collision is detected by the stat instead of assumed away.
+//
+// The name carries s.base for the same reason the final snapshot name does (see Store.base):
+// nothing refuses a shared backup directory, and an unprefixed name let one deployment's trial
+// names collide with another's in-progress write -- and made sweepStaleSnapshotTemps unable to
+// tell which temp files were its own to remove.
 func (s *Store) freeTempName(dir string) (string, error) {
 	stamp := time.Now().UTC().Format("20060102T150405.000")
 	for n := 0; ; n++ {
-		candidate := filepath.Join(dir, fmt.Sprintf(".snapshot-%s-%d.tmp", stamp, n))
+		candidate := filepath.Join(dir, fmt.Sprintf(".snapshot-%s-%s-%d.tmp", s.base, stamp, n))
 		_, err := os.Stat(candidate)
 		if os.IsNotExist(err) {
 			return candidate, nil
@@ -211,19 +221,36 @@ func (s *Store) repairFutureDatedSnapshots(dir string) {
 		if err != nil || fixed == name {
 			continue
 		}
-		_ = os.Rename(name, fixed)
+		if err := os.Rename(name, fixed); err != nil {
+			continue
+		}
+		// A rename is only durable once the directory itself is synced (the same reasoning as
+		// atomicfile.Install): a power cut here would otherwise resurrect the future-dated name,
+		// undoing the repair. Best-effort like the repair itself -- the snapshot pass that called
+		// this continues either way.
+		_ = atomicfile.SyncDir(dir)
+		repairDirSynced(dir)
 	}
 }
 
-// sweepStaleSnapshotTemps removes leftover temporary snapshots from an interrupted write.
-func sweepStaleSnapshotTemps(dir string) {
+// snapshotTempPrefix is how this store's temporary snapshot names start. A shared backup directory
+// means a prefix match on ".snapshot-" alone would also match another deployment's in-progress
+// write, which this store has no business removing -- the age check exists so a live write is
+// never swept, and widening the match would punch through exactly that guarantee for files this
+// store does not own. Temp files written before the prefix carried the base (".snapshot-<stamp>-")
+// are deliberately left behind: they cannot be attributed to any store, so nobody may delete them.
+func (s *Store) snapshotTempPrefix() string { return ".snapshot-" + s.base + "-" }
+
+// sweepStaleSnapshotTemps removes this store's leftover temporary snapshots from an interrupted
+// write.
+func (s *Store) sweepStaleSnapshotTemps(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if !strings.HasPrefix(name, ".snapshot-") || !strings.HasSuffix(name, ".tmp") {
+		if !strings.HasPrefix(name, s.snapshotTempPrefix()) || !strings.HasSuffix(name, ".tmp") {
 			continue
 		}
 		info, err := e.Info()

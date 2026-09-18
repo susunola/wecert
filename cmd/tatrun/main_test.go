@@ -431,3 +431,39 @@ func TestTheTATTimeoutMessageSurvivesTheContextDeadline(t *testing.T) {
 		t.Errorf("the message must carry the invocation id, got %v", err)
 	}
 }
+
+// A non-positive poll interval must be refused: waitForTask sleeps for interval between polls,
+// and zero or less turns that loop into a hot spin against the TAT API.
+func TestValidateIntervalRejectsANonPositiveInterval(t *testing.T) {
+	for _, bad := range []time.Duration{0, -time.Second} {
+		if err := validateInterval(bad); err == nil {
+			t.Errorf("interval %s must be rejected: it hot-loops the TAT API", bad)
+		}
+	}
+	if err := validateInterval(time.Second); err != nil {
+		t.Errorf("a positive interval must pass, got %v", err)
+	}
+}
+
+// A decodable string is not necessarily an encoded one.
+//
+// A short word in the Base64 alphabet ("DONE" -- exactly what a verification command prints on
+// success) decodes cleanly into bytes that are not text, and printing the mojibake loses the one
+// word the operator was grepping for. A decode that is not plausible text must fall back to the
+// original string, the same way an undecodable one does.
+func TestDecodeRemoteOutputKeepsPlaintextThatMerelyDecodes(t *testing.T) {
+	// "DONE" is valid Base64: it decodes to three non-text bytes. The word must survive.
+	if got := decodeRemoteOutput("DONE"); got != "DONE" {
+		t.Errorf("plaintext that happens to decode must be printed as-is, got %q", got)
+	}
+	// Genuine Base64 of ordinary command output still decodes, including its newlines and tabs.
+	encoded := base64.StdEncoding.EncodeToString([]byte("cert ok\nserial: 01\t\n"))
+	if got := decodeRemoteOutput(encoded); got != "cert ok\nserial: 01\t\n" {
+		t.Errorf("real Base64 output must still decode, got %q", got)
+	}
+	// Base64 of binary garbage is not command output either; print what the server sent.
+	blob := base64.StdEncoding.EncodeToString([]byte{0x00, 0x01, 0x02, 0xff, 0xfe})
+	if got := decodeRemoteOutput(blob); got != blob {
+		t.Errorf("a decode that is not text must fall back to the raw value, got %q", got)
+	}
+}

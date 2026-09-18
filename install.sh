@@ -50,13 +50,27 @@ if ! command -v file >/dev/null 2>&1; then
 	echo "       it must be a linux/amd64 or linux/arm64 ELF." >&2
 	exit 1
 fi
-file -- "${BINARY}"
-if ! file -- "${BINARY}" | grep -q 'ELF 64-bit'; then
+FILE_INFO="$(file -- "${BINARY}")"
+echo "${FILE_INFO}"
+if ! grep -q 'ELF 64-bit' <<<"${FILE_INFO}"; then
 	echo "Error: this is not a Linux ELF binary. The CVM needs a linux/amd64 or linux/arm64 build." >&2
 	exit 1
 fi
+# The ELF check alone passes for either architecture: an arm64 build on an amd64 box installs
+# cleanly and only fails when systemd starts it (203/EXEC), which is the wrong place to learn
+# the build was wrong. file already printed the machine field above -- compare it with the host.
+case "$(uname -m)" in
+	x86_64)        WANT_MACHINE="x86-64" ;;
+	aarch64|arm64) WANT_MACHINE="aarch64" ;;
+	*)             WANT_MACHINE="" ;; # an unusual host arch: the ELF check above is all we have
+esac
+if [[ -n "${WANT_MACHINE}" ]] && ! grep -qi -- "${WANT_MACHINE}" <<<"${FILE_INFO}"; then
+	echo "Error: this machine is $(uname -m) but the binary is not built for it:" >&2
+	echo "       ${FILE_INFO}" >&2
+	exit 1
+fi
 
-# Verify the artifact before installing it as root.
+# Verify an artifact before installing it as root.
 #
 # `make release` writes dist/SHA256SUMS next to the binaries, and nothing ever read
 # it: whatever file was passed in became a root-owned binary that systemd then runs
@@ -67,34 +81,50 @@ fi
 # Absent sums file: warn rather than refuse, because copying the single binary to a
 # CVM is a legitimate workflow. Present but mismatched: refuse, because that is the
 # case this check exists for.
-BINARY_DIR="$(cd "$(dirname "${BINARY}")" && pwd)"
-BINARY_NAME="$(basename "${BINARY}")"
-SUMS="${BINARY_DIR}/SHA256SUMS"
+verify_checksum() {
+	local artifact="$1"
+	local dir name sums expected actual goarch
+	dir="$(cd "$(dirname "${artifact}")" && pwd)"
+	name="$(basename "${artifact}")"
+	sums="${dir}/SHA256SUMS"
 
-if [[ -f "${SUMS}" ]]; then
-	echo "==> Verifying ${BINARY_NAME} against ${SUMS}"
-	expected="$(awk -v f="${BINARY_NAME}" '$2 == f { print $1 }' "${SUMS}")"
+	if [[ ! -f "${sums}" ]]; then
+		echo "Warning: no SHA256SUMS beside ${name}, so the artifact cannot be verified." >&2
+		echo "         It will be installed as root and run with the CAM credentials and the" >&2
+		echo "         private-key database. Prefer installing from a 'make release' output." >&2
+		return 0
+	fi
+
+	echo "==> Verifying ${name} against ${sums}"
+	case "$(uname -m)" in
+		x86_64)  goarch="amd64" ;;
+		aarch64) goarch="arm64" ;;
+		*)       goarch="" ;;
+	esac
+	# The systemd units exec a fixed name (wecert, wecert-onboard), so a release artifact is
+	# commonly renamed before copying: wecert-onboard_linux_amd64 -> wecert-onboard. The checksum
+	# is over the content, so the suffixed entry for this host's architecture verifies the rename.
+	expected="$(awk -v f="${name}" -v g="${name}_linux_${goarch}" \
+		'$2 == f || (g != "" && $2 == g) { print $1 }' "${sums}")"
 	if [[ -z "${expected}" ]]; then
-		echo "Error: ${BINARY_NAME} is not listed in ${SUMS}. Refusing to install an unlisted artifact." >&2
+		echo "Error: ${name} is not listed in ${sums}. Refusing to install an unlisted artifact." >&2
 		exit 1
 	fi
 	if command -v sha256sum >/dev/null 2>&1; then
-		actual="$(sha256sum -- "${BINARY}" | awk '{ print $1 }')"
+		actual="$(sha256sum -- "${artifact}" | awk '{ print $1 }')"
 	else
-		actual="$(shasum -a 256 -- "${BINARY}" | awk '{ print $1 }')"
+		actual="$(shasum -a 256 -- "${artifact}" | awk '{ print $1 }')"
 	fi
 	if [[ "${actual}" != "${expected}" ]]; then
-		echo "Error: checksum mismatch for ${BINARY_NAME}." >&2
+		echo "Error: checksum mismatch for ${name}." >&2
 		echo "  expected ${expected}" >&2
 		echo "  actual   ${actual}" >&2
 		exit 1
 	fi
 	echo "    ok"
-else
-	echo "Warning: no SHA256SUMS beside ${BINARY_NAME}, so the artifact cannot be verified." >&2
-	echo "         It will be installed as root and run with the CAM credentials and the" >&2
-	echo "         private-key database. Prefer installing from a 'make release' output." >&2
-fi
+}
+
+verify_checksum "${BINARY}"
 
 echo "==> Creating system user wecert"
 if ! id -u wecert >/dev/null 2>&1; then
@@ -126,6 +156,9 @@ if [[ ! -f "${ONBOARD_SRC}" ]]; then
 fi
 if [[ -f "${ONBOARD_SRC}" ]]; then
 	echo "==> Installing ${ONBOARD_SRC} to ${INSTALL_PATH%/*}/wecert-onboard"
+	# Same trust decision as the main binary: it is installed root-owned and run by its timer,
+	# so it goes through the same SHA256SUMS verification.
+	verify_checksum "${ONBOARD_SRC}"
 	install -m 0755 -o root -g root -- "${ONBOARD_SRC}" "${INSTALL_PATH%/*}/wecert-onboard"
 else
 	echo "Note: no wecert-onboard next to ${BINARY}; the wecert-onboard.service unit will not" >&2

@@ -99,10 +99,10 @@ func (l *authLimiter) recordFailure(addr string, now time.Time) {
 // accepted on purpose -- locking out a shared IP hard would hand the attacker a
 // way to deny service to everyone behind it.
 //
-// Note this only runs when the address is not currently blocked: the 429 check
-// precedes the token check, so a fully locked-out caller (legit or not) waits
-// out the block. That ordering is deliberate -- the block is on the address,
-// not on the credentials presented.
+// The token is checked BEFORE the lockout (see auth), so a success always reaches this decay:
+// a fully blocked caller presenting the correct token is admitted -- the block only ever
+// applies to requests that failed the token check, which is what keeps a shared-IP attacker
+// from locking out the legitimate caller behind the same TLS terminator.
 //
 // now is taken so the sweep below can run here as well as on failure.
 func (l *authLimiter) recordSuccess(addr string, now time.Time) {

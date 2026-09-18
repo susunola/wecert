@@ -83,6 +83,23 @@ func LoadState(path string) (*State, error) {
 		return nil, fmt.Errorf("the onboarding state file %s is not a regular file (%s); refusing it",
 			path, fi.Mode().Type())
 	}
+	// The same contract spec.LoadDocument enforces on the desired-state document, and for the
+	// same reason: this file is the grace-period clock and the change ledger, so whoever can
+	// rewrite it can turn deletion from conservative into aggressive. Save writes it 0600; a
+	// group- or world-writable mode is refused, and so is a different owner -- the mode bits
+	// say nothing about WHO the writer is (a one-off run as root leaves a file the daemon's
+	// account does not own, and neither does the check above).
+	//
+	// The checks run against the open descriptor (f.Stat above), not a path re-stat, so the
+	// mode and owner validated are the ones on the file actually being read.
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		return nil, fmt.Errorf("the onboarding state file %s is group- or world-writable (%04o); "+
+			"whoever can write it can reset the grace-period clock and the change budget", path, perm)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Uid != uint32(os.Geteuid()) {
+		return nil, fmt.Errorf("the onboarding state file %s is owned by uid %d but this process runs as uid %d; "+
+			"whoever owns the file can rewrite the grace-period clock", path, st.Uid, os.Geteuid())
+	}
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("read onboarding state: %w", err)

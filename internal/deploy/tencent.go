@@ -697,19 +697,26 @@ func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, 
 		req.TaskIds = []*string{common.StringPtr(taskID)}
 		resp, err := client.DescribeDeleteCertificatesTaskResultWithContext(ctx, req)
 		if err != nil {
-			return sdkCallError(ctx, "DescribeDeleteCertificatesTaskResult("+taskID+")", err)
-		}
-
-		status, detail, found, err := deleteTaskStatus(resp, taskID)
-		if err != nil {
-			return err
-		}
-		if found && status != deleteTaskRunning {
-			if status == deleteTaskSuccess {
-				return nil
+			// A failed QUERY is not a failed task: the answer was never read, so giving up
+			// here would abandon a task that may well have succeeded -- and Delete's caller
+			// would keep the reclaim record only by luck of the error path it happened to
+			// hit. Retry within the same deadline, exactly as waitDeployRecord does; the
+			// deadline and the ctx-aware wait below bound the retry, and a caller
+			// cancellation still surfaces through waitBetweenPolls.
+			d.log.Warn("failed to query the delete task's result; retrying shortly",
+				"taskId", taskID, "err", err)
+		} else {
+			status, detail, found, err := deleteTaskStatus(resp, taskID)
+			if err != nil {
+				return err
 			}
-			return fmt.Errorf("DeleteCertificate(%s) failed: task %s reported status %d%s",
-				certID, taskID, status, detail)
+			if found && status != deleteTaskRunning {
+				if status == deleteTaskSuccess {
+					return nil
+				}
+				return fmt.Errorf("DeleteCertificate(%s) failed: task %s reported status %d%s",
+					certID, taskID, status, detail)
+			}
 		}
 
 		if d.now().After(deadline) {

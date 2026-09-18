@@ -73,6 +73,10 @@ func NewTracker(store bucketStore, log *slog.Logger, now func() time.Time) *Trac
 
 // SetNow replaces the tracker's clock, so a caller that simulates time keeps the accounting
 // on the same timeline as its own decisions.
+//
+// It is not synchronised: call it before the tracker is handed to any concurrent use (the
+// manager reconciles one goroutine per certificate). Swapping the clock mid-flight would race
+// with the Spend/Remaining reads of it.
 func (t *Tracker) SetNow(now func() time.Time) {
 	if t == nil || now == nil {
 		return
@@ -184,8 +188,14 @@ func (t *Tracker) NoteDeadline(l Limit, scopeID string, at time.Time, source str
 		return time.Time{}, false
 	}
 	if err := t.store.UpdateRateBucket(l.Name, scopeID, func(rec *BucketRecord) error {
-		rec.ResetAt = at
-		rec.ResetReason = l.Name
+		// The later instant wins, as the Deadline contract states. Concurrent passes can
+		// record their refusals out of order, and an older response reaching the store after
+		// a newer one must not roll the deadline BACK: Remaining and BlockedUntil would then
+		// unblock issuance inside the window the CA most recently named.
+		if at.After(rec.ResetAt) {
+			rec.ResetAt = at
+			rec.ResetReason = l.Name
+		}
 		return nil
 	}); err != nil {
 		t.log.Warn("cannot record the CA-reported rate-limit deadline",

@@ -13,7 +13,9 @@ import (
 // store without that package depending on it.
 //
 // The two structs are field-for-field identical on purpose: this is a boundary translation,
-// not a second model, and if one gains a field the compiler will say so here.
+// not a second model. Named field literals cannot enforce that -- a new field on either side
+// would still compile here and be silently dropped -- so ratelimit_adapter_test.go pins the two
+// field sets with reflect instead.
 type rateBucketAdapter struct{ store *state.Store }
 
 func (a rateBucketAdapter) GetRateBucket(limitName, scopeID string) (*ratelimit.BucketRecord, error) {

@@ -23,7 +23,9 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/susunola/wecert/internal/atomicfile"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/onboarding"
 	"github.com/susunola/wecert/internal/spec"
@@ -105,7 +107,9 @@ Flags:
 	)
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
-		return exitUsage, err
+		// flag.ContinueOnError has already printed the error and the usage to fs.Output();
+		// returning the error here would make main print it a second time.
+		return exitUsage, nil
 	}
 	if *showVer {
 		fmt.Println("wecert-onboard", version)
@@ -218,20 +222,33 @@ Flags:
 	//
 	// -dry-run is exempt: it writes nothing, so it cannot corrupt the state, and it
 	// is exactly what a human runs while the scheduled job is also active.
-	var unlock func() error
+	var lock *state.FileLock
 	if !*dryRun {
-		if unlock, err = state.LockFile(stateFile + ".lock"); err != nil {
+		if lock, err = state.AcquireFileLock(stateFile + ".lock"); err != nil {
 			return exitError, err
 		}
-		defer func() { _ = unlock() }()
+		defer func() { _ = lock.Unlock() }()
 	}
 
 	rep, err := ob.Run(ctx)
 	if err != nil {
+		// A round that fails this early (a corrupt state file, an unreadable previous
+		// document) never reaches Commit, so without this the report file simply goes
+		// stale -- and the report file is what monitoring watches. Publish a minimal
+		// frozen report carrying the failure as its reason, best effort: the exit code
+		// and stderr carry the error either way.
+		writeFailureReport(report, err)
 		return exitError, err
 	}
 
 	if !*dryRun {
+		// flock is bound to the inode, not the name: if the lock file was removed
+		// mid-run (the classic "clear the stale lock" habit), the next cron run locks a
+		// NEW file and both runs last-writer-wins the same state. That cannot be
+		// prevented, only noticed -- so notice it before publishing anything.
+		if err := lock.VerifyHeld(); err != nil {
+			return exitError, err
+		}
 		if err := ob.Commit(rep); err != nil {
 			return exitError, err
 		}
@@ -319,6 +336,36 @@ func printDecisions(w io.Writer, ds []spec.Decision) {
 		for _, d := range included {
 			fmt.Fprintf(w, "  %-45s -> %-20s %s\n", d.Hostname, d.Certificate, d.Reason)
 		}
+	}
+}
+
+// writeFailureReport publishes a minimal frozen report for a round that failed before it
+// could produce one.
+//
+// Commit's contract is "the report exists exactly when the round completed", and this does
+// not break it: the report here says mode "frozen" with the failure as its reason, which is
+// the truth -- nothing moved. What it fixes is the failure's visibility: monitoring watches
+// the report file, and a round that dies on a corrupt state file or an unreadable document
+// otherwise shows up only as the file going stale.
+//
+// Best effort on purpose: the exit code and stderr already carry the error, so a report
+// that cannot be written (the same broken directory usually holds it) is only warned about.
+func writeFailureReport(path string, cause error) {
+	if path == "" {
+		return
+	}
+	rep := onboarding.Report{
+		GeneratedAt:   time.Now(),
+		Generator:     "wecert-onboard/" + version,
+		Mode:          onboarding.ModeFrozen,
+		FreezeReasons: []string{cause.Error()},
+	}
+	data, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := atomicfile.Write(path, append(data, '\n'), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "wecert-onboard: could not write the failure report %s: %v\n", path, err)
 	}
 }
 

@@ -89,7 +89,15 @@ func Install(tmpPath, path string, perm os.FileMode, dir string) error {
 	// chmod(2) follows symlinks, and both callers hand this function a name they created -- but
 	// "a name we created a moment ago" is not a property chmod can check, and the failure mode is
 	// ugly: the mode of an unrelated file changes, and the symlink itself is installed under the
-	// target's name. A regular-file check closes it for the price of one lstat.
+	// target's name. A regular-file check is the price of one lstat.
+	//
+	// Note the check does not CLOSE the window, it narrows it: the Lstat, the Chmod and the Rename
+	// are three separate syscalls, and a local attacker racing them can still swap in a symlink
+	// between the check and the chmod. Closing that for good needs openat2-style RESOLVE_NO_SYMLINKS
+	// semantics, which os does not expose. The residual window is accepted because the temporary
+	// name is either random (Write's CreateTemp) or freshly probed in a directory the caller owns
+	// (internal/state's snapshot temps), so winning the race needs write access to a directory that
+	// already implies the ability to replace the target itself.
 	if fi, err := os.Lstat(tmpPath); err != nil {
 		return fmt.Errorf("install %s: %w", path, err)
 	} else if !fi.Mode().IsRegular() {

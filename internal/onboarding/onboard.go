@@ -225,10 +225,21 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 		return nil, fmt.Errorf("onboarding: unknown keyType %q (want %s/%s)",
 			opts.KeyType, config.KeyTypeECDSAP256, config.KeyTypeRSA2048)
 	}
-	if opts.MaxNames <= 0 {
+	// 0 means "use the default" for each knob below, but a NEGATIVE value is a typo, not
+	// "unset": the config layer rejects the same values (config.Onboarding.normalize), and
+	// silently substituting a default for a value the operator explicitly typed leaves them
+	// believing a guard is tuned when it is not.
+	if opts.MaxNames < 0 {
+		return nil, fmt.Errorf("onboarding: MaxNames must not be negative, got %d (0 means the default of 25)", opts.MaxNames)
+	}
+	if opts.MaxNames == 0 {
 		opts.MaxNames = 25 // Aligned with tlsserver so a future profile switch needs no redesign.
 	}
-	if opts.DropThreshold <= 0 {
+	if opts.DropThreshold < 0 {
+		return nil, fmt.Errorf("onboarding: DropThreshold must not be negative, got %v (0 means the default %.2f)",
+			opts.DropThreshold, DefaultDropThreshold)
+	}
+	if opts.DropThreshold == 0 {
 		opts.DropThreshold = DefaultDropThreshold
 	} else if math.IsNaN(opts.DropThreshold) || opts.DropThreshold >= 1 {
 		// Mirror the config layer's [0,1) check: a CLI -drop-threshold flag reaches
@@ -243,13 +254,25 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 				"(a value of 1 or more can never be exceeded, so the abrupt-change fuse would never fire)",
 			opts.DropThreshold)
 	}
-	if opts.GracePeriod <= 0 {
+	if opts.GracePeriod < 0 {
+		return nil, fmt.Errorf("onboarding: GracePeriod must not be negative, got %s (0 means the default %s)",
+			opts.GracePeriod, DefaultGracePeriod)
+	}
+	if opts.GracePeriod == 0 {
 		opts.GracePeriod = DefaultGracePeriod
 	}
-	if opts.BudgetWindow <= 0 {
+	if opts.BudgetWindow < 0 {
+		return nil, fmt.Errorf("onboarding: BudgetWindow must not be negative, got %s (0 means the default %s)",
+			opts.BudgetWindow, DefaultBudgetWindow)
+	}
+	if opts.BudgetWindow == 0 {
 		opts.BudgetWindow = DefaultBudgetWindow
 	}
-	if opts.Budget <= 0 {
+	if opts.Budget < 0 {
+		return nil, fmt.Errorf("onboarding: Budget must not be negative, got %d (0 means the default %d)",
+			opts.Budget, DefaultBudget)
+	}
+	if opts.Budget == 0 {
 		opts.Budget = DefaultBudget
 	}
 	if opts.Now == nil {
@@ -270,15 +293,19 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 	// Normalize the allowlist to registered domains too, so nobody writes
 	// "www.example.com" expecting it to match all of example.com.
 	if len(opts.Allowlist) > 0 {
+		// Copy first: rewriting the caller's slice in place (and then sorting it) mutated
+		// the config object the caller still holds.
+		allow := make([]string, len(opts.Allowlist))
 		for i, a := range opts.Allowlist {
-			opts.Allowlist[i] = group.RegisteredDomain(strings.ToLower(strings.TrimSpace(a)))
+			allow[i] = group.RegisteredDomain(strings.ToLower(strings.TrimSpace(a)))
 		}
 		// allowed() looks entries up with sort.SearchStrings, so this slice has to
 		// be sorted. Sorting at the call site is not enough: normalising each entry
 		// to its registered domain can reorder it (a.example.com -> example.com),
 		// and an unsorted slice makes the binary search miss entries that really
 		// are on the allowlist -- which silently drops names from certificates.
-		sort.Strings(opts.Allowlist)
+		sort.Strings(allow)
+		opts.Allowlist = allow
 	}
 	return &Onboarder{src: src, opts: opts, log: log}, nil
 }
@@ -341,6 +368,7 @@ func (o *Onboarder) Run(ctx context.Context) (*Report, error) {
 			Generator:   o.opts.Generator,
 			Mode:        ModeWritten,
 		},
+		excludedIdx: map[string]int{},
 	}
 
 	// A corrupt state file must fail outright, never continue as empty state: that
@@ -459,6 +487,14 @@ type run struct {
 
 	// declarations are the successfully parsed declarations, sorted by hostname.
 	declarations []*Declaration
+
+	// excludedIdx maps a hostname to the index of its exclusion in rep.Decisions.
+	//
+	// The report carries one verdict per hostname, which makes reject/unreject "find
+	// the entry for this name" operations. Scanning the slice for each of them made a
+	// round quadratic in the number of names -- reject runs once per filtered name and
+	// include calls unreject for every covered one.
+	excludedIdx map[string]int
 
 	// reasons records why each expanded name is in or out of the final set.
 	reasons map[string]string
@@ -755,11 +791,10 @@ func (r *run) parse(raw []RawDeclaration) {
 // what happened. The opposite transition (a name that ends up included) is unreject's job, and
 // include calls it.
 func (r *run) reject(hostname, reason string) {
-	for _, d := range r.rep.Decisions {
-		if d.Hostname == hostname && !d.Included {
-			return
-		}
+	if _, excluded := r.excludedIdx[hostname]; excluded {
+		return
 	}
+	r.excludedIdx[hostname] = len(r.rep.Decisions)
 	r.rep.Decisions = append(r.rep.Decisions, spec.Decision{
 		Hostname: hostname,
 		Included: false,
@@ -1149,11 +1184,9 @@ func (r *run) carry(name, reason string) {
 // was rejected under its apex name) falls back to a sentence that says what is known: it is
 // declared, it did not pass, and it keeps what it has.
 func (r *run) stillDeclaredReason(name string) string {
-	for _, d := range r.rep.Decisions {
-		if d.Hostname == name && !d.Included {
-			return fmt.Sprintf("%s; the declaration is still there, so the name keeps its coverage "+
-				"(removing coverage means removing the declaration)", d.Reason)
-		}
+	if i, excluded := r.excludedIdx[name]; excluded {
+		return fmt.Sprintf("%s; the declaration is still there, so the name keeps its coverage "+
+			"(removing coverage means removing the declaration)", r.rep.Decisions[i].Reason)
 	}
 	return "declared, but it did not pass a filter this round; keeping its coverage " +
 		"(removing coverage means removing the declaration)"
@@ -1165,14 +1198,18 @@ func (r *run) stillDeclaredReason(name string) string {
 // is "included". Leaving the earlier exclusion in place showed the same name twice with opposite
 // answers, in the artifact a human reads to find out what happened.
 func (r *run) unreject(hostname string) {
-	kept := r.rep.Decisions[:0]
-	for _, d := range r.rep.Decisions {
-		if d.Hostname == hostname && !d.Included {
-			continue
-		}
-		kept = append(kept, d)
+	i, excluded := r.excludedIdx[hostname]
+	if !excluded {
+		return
 	}
-	r.rep.Decisions = kept
+	delete(r.excludedIdx, hostname)
+	r.rep.Decisions = append(r.rep.Decisions[:i], r.rep.Decisions[i+1:]...)
+	// Removing an entry shifts every later one; the index has to shift with it.
+	for h, j := range r.excludedIdx {
+		if j > i {
+			r.excludedIdx[h] = j - 1
+		}
+	}
 }
 
 // referenced reports whether a name is still referenced by some CLB rule.

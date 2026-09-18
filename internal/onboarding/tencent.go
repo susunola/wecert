@@ -30,6 +30,7 @@ const (
 	// paging on would just hammer the API forever, so stop with a clear error.
 	maxRecordsPerZone = 50000
 	maxLoadBalancers  = 5000
+	maxZones          = 10000
 )
 
 // TencentSources assembles the Tencent Cloud sources from configuration.
@@ -178,8 +179,8 @@ func (d *DNSPodDeclarations) listZones(ctx context.Context, client dnspodAPI) ([
 			break
 		}
 		offset += int64(len(list))
-		if offset > 10000 {
-			return nil, fmt.Errorf("more than %d DNS zones; refusing to keep paging", offset)
+		if offset > maxZones {
+			return nil, fmt.Errorf("more than %d DNS zones; refusing to keep paging", maxZones)
 		}
 	}
 	sort.Strings(zones)
@@ -284,15 +285,32 @@ type CLBRules struct {
 }
 
 // NewCLBRules constructs the rule enumerator.
+//
+// An empty region list is refused here rather than left for ListRuleDomains to trip over:
+// the guard's caller treats a read error as weather (the round keeps every name, and with
+// RequireRule on it also stops vetting new ones), so "no regions configured" surfacing only
+// at enumeration time looked exactly like a transient outage -- while RequireRule silently
+// vetted nothing. A misconfigured guard must fail loud at construction, where the mistake
+// is made.
 func NewCLBRules(cfg config.Tencent, regions []string, log *slog.Logger) (*CLBRules, error) {
 	src, err := deploy.NewCredentialSource(cfg)
 	if err != nil {
 		return nil, err
 	}
+	clean := make([]string, 0, len(regions))
+	for _, r := range regions {
+		if r = strings.TrimSpace(r); r != "" {
+			clean = append(clean, r)
+		}
+	}
+	if len(clean) == 0 {
+		return nil, fmt.Errorf("no region is configured (tencent.regions); CLB is regional, " +
+			"so an empty list would silently guard nothing")
+	}
 	if log == nil {
 		log = slog.Default()
 	}
-	return &CLBRules{credential: src, regions: regions, log: log}, nil
+	return &CLBRules{credential: src, regions: clean, log: log}, nil
 }
 
 // errIncompleteRuleList marks a guard reading that came back short of what the API itself said

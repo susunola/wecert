@@ -104,3 +104,38 @@ func TestAFIFOAtTheStatePathIsRefusedNotOpened(t *testing.T) {
 			"target stale")
 	}
 }
+
+// The state file is the grace-period clock and the change ledger, so whoever can rewrite it
+// can turn deletion from conservative into aggressive. spec.LoadDocument refuses a group- or
+// world-writable document for the same reason; the state file now holds the same line.
+func TestLoadStateRefusesAGroupOrWorldWritableFile(t *testing.T) {
+	for _, perm := range []os.FileMode{0o664, 0o646, 0o606} {
+		path := filepath.Join(t.TempDir(), "onboard-state.json")
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, perm); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := LoadState(path)
+		if err == nil {
+			t.Errorf("a %04o state file must be refused: its grace clocks are writable by others", perm)
+			continue
+		}
+		if !strings.Contains(err.Error(), "group- or world-writable") {
+			t.Errorf("the refusal must say what is wrong, got %v", err)
+		}
+	}
+
+	// The control: the mode Save writes must load, so the checks above cannot be satisfied by
+	// refusing every file.
+	path := filepath.Join(t.TempDir(), "onboard-state.json")
+	st := &State{AbsentSince: map[string]time.Time{}}
+	if err := st.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadState(path); err != nil {
+		t.Errorf("a state file written by Save must load, got %v", err)
+	}
+}

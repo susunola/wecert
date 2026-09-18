@@ -314,6 +314,14 @@ func ParseRetryAfterHeader(value string) (time.Time, bool) {
 		if secs <= 0 {
 			return time.Time{}, false
 		}
+		// time.Duration is int64 nanoseconds, so a delay beyond ~292 years overflows the
+		// multiplication and wraps to a NEGATIVE duration -- "retry after 1e13 seconds" would
+		// report a deadline in the past, i.e. no deadline at all, for the one response that
+		// is telling us to wait longest. A miss is reported rather than guessed, same as an
+		// unparseable value.
+		if int64(secs) > math.MaxInt64/int64(time.Second) {
+			return time.Time{}, false
+		}
 		return time.Now().Add(time.Duration(secs) * time.Second).UTC(), true
 	}
 	if t, err := http.ParseTime(v); err == nil && !t.IsZero() {

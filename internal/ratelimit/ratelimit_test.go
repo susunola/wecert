@@ -2,6 +2,8 @@ package ratelimit
 
 import (
 	"math"
+	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -341,5 +343,48 @@ func TestParseRetryAfterAcceptsTheRealMessage(t *testing.T) {
 		if got.Format("2006-01-02 15:04:05 MST") != want {
 			t.Errorf("deadline = %s, want %s", got, want)
 		}
+	}
+}
+
+// The header form is the protocol's own answer and a CA may send it without repeating the
+// instant in the error message, so it must parse on its own.
+func TestParseRetryAfterHeader(t *testing.T) {
+	before := time.Now()
+	at, ok := ParseRetryAfterHeader("120")
+	if !ok {
+		t.Fatal("a delay in seconds must parse")
+	}
+	if d := at.Sub(before); d < 120*time.Second || d > 121*time.Second {
+		t.Errorf("deadline = %s after the call, want ~120s", d)
+	}
+
+	// The HTTP-date form.
+	want := time.Date(2026, 9, 23, 4, 0, 0, 0, time.UTC)
+	at, ok = ParseRetryAfterHeader(want.Format(http.TimeFormat))
+	if !ok || !at.Equal(want) {
+		t.Errorf("an HTTP-date must parse to %s, got %s (ok=%v)", want, at, ok)
+	}
+
+	for _, v := range []string{"", "0", "-5", "soon", "12.5"} {
+		if at, ok := ParseRetryAfterHeader(v); ok {
+			t.Errorf("%q must not parse as a deadline, got %s", v, at)
+		}
+	}
+}
+
+// A delay beyond ~292 years overflows time.Duration (int64 nanoseconds) and wraps to a
+// NEGATIVE duration -- "retry after 10000000000 seconds" would report a deadline in the past,
+// which reads as "not blocked" for the response asking us to wait longest. The value fits an
+// int (so Atoi accepts it), which is exactly why the bound has to be checked separately.
+func TestParseRetryAfterHeaderRejectsAnOverflowingDelay(t *testing.T) {
+	// One above the largest delay that fits a time.Duration.
+	overflow := strconv.FormatInt(math.MaxInt64/int64(time.Second)+1, 10)
+	if at, ok := ParseRetryAfterHeader(overflow); ok {
+		t.Errorf("a delay that overflows time.Duration must be refused, got %s", at)
+	}
+	// The largest representable delay still parses.
+	max := strconv.FormatInt(math.MaxInt64/int64(time.Second), 10)
+	if _, ok := ParseRetryAfterHeader(max); !ok {
+		t.Error("the largest delay that fits a time.Duration must still parse")
 	}
 }

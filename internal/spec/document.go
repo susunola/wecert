@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -65,10 +64,16 @@ type Document struct {
 // It covers only the certificates and deliberately **excludes** GeneratedAt and
 // Revision itself: otherwise it would change on every onboarding run, and "did
 // the desired state actually change?" -- the most basic question -- would be
-// unanswerable. Domains are sorted first so ordering is not misread as change.
+// unanswerable. Certificates are sorted by name and domains are sorted first, so
+// neither kind of ordering is misread as change.
 func Revision(certs []config.Certificate) string {
+	// Hash a name-sorted copy: the same certificate set in a different order is the
+	// same desired state, and the generator's grouping order is not semantic.
+	ordered := append([]config.Certificate(nil), certs...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
+
 	h := sha256.New()
-	for _, c := range certs {
+	for _, c := range ordered {
 		fmt.Fprintf(h, "name=%s\nprofile=%s\nkeyType=%s\nrenewBefore=%s\ndeploy=%t\n",
 			c.Name, c.Profile, c.KeyType, c.RenewBefore, c.Deploy.Enabled)
 
@@ -190,20 +195,15 @@ const maxGeneratedAtSkew = time.Hour
 // state. Acting on that strips the rest of the fleet from every certificate.
 const maxDocumentBytes = 16 << 20
 
-// openDocumentFile opens the document for reading, refusing to follow a symlink.
-//
-// O_NOFOLLOW makes the symlink refusal a property of the open call rather than of a
-// separate Lstat that a concurrent writer can invalidate between the two.
-//
-// O_NONBLOCK is what makes the regular-file check below reachable. open(2) on a FIFO with no
-// writer BLOCKS until one appears, so a FIFO planted at desiredState.path hung the daemon inside
-// newProvider -- before metrics, the webhook and the snapshots start -- and a Type=simple unit
-// never notices. With O_NONBLOCK the open returns immediately, the stat below sees a non-regular
-// file, and the reader refuses it. On a regular file the flag is a no-op.
+// openDocumentFile opens the document for reading, refusing to follow a symlink
+// where the platform supports it. The flags are platform-specific -- see
+// openflags_unix.go / openflags_other.go: O_NOFOLLOW and O_NONBLOCK do not exist
+// everywhere, and platforms without them get a plain read-only open (the mode-bit
+// checks in LoadDocument still apply there).
 func openDocumentFile(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, err := os.OpenFile(path, documentOpenFlags, 0)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EMLINK) {
+		if isSymlinkRefusal(err) {
 			return nil, fmt.Errorf("the desired-state document %s is a symlink; refusing to follow it -- point the config at the real file", path)
 		}
 		return nil, fmt.Errorf("open desired-state document %s: %w", path, err)
@@ -393,9 +393,12 @@ func WriteDocument(path string, doc *Document) error {
 // WriteDocumentUnchecked is WriteDocument without validation.
 //
 // It has exactly one caller: WriteDocument, which validates first and then delegates
-// the write. Nothing writes a document unchecked today -- the onboarding component
-// deliberately goes through spec.WriteDocument even when it freezes, so that a frozen
-// round leaves a *valid* document on disk and the previous revision in place.
+// the write. A frozen onboarding round does NOT come through here: onboarding's Commit
+// writes only the report in that case, so the document on disk stays at the previous
+// revision -- generatedAt is not refreshed, and a freeze that outlasts
+// desiredState.maxStaleness fires the staleness alarm. That is deliberate: a frozen
+// round has no trustworthy conclusion to publish, and refreshing the timestamp would
+// hide exactly the "the generator is stuck" condition the alarm exists to catch.
 //
 // Kept as a separate function so the write path (atomic temp file, fsync, rename) has
 // a single implementation. Do not use it to bypass validation.

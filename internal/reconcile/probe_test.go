@@ -77,7 +77,7 @@ func TestStaleProbeSeriesAreReclaimed(t *testing.T) {
 		prober:      fake,
 	}
 
-	r.reclaimStaleProbeSeries()
+	r.reclaimStaleProbeSeries(nil)
 
 	if !probeMatchSeriesExists(t, "live.example.com") {
 		t.Error("a host probed this round must keep its series")
@@ -97,7 +97,7 @@ func TestStaleProbeSeriesAreReclaimed(t *testing.T) {
 // A prober that cannot enumerate its hosts is skipped rather than panicking.
 func TestReclaimSkipsAProberWithoutHostEnumeration(t *testing.T) {
 	r := &Reconciler{probedHosts: map[string]struct{}{}, prober: &opaqueProber{}}
-	r.reclaimStaleProbeSeries() // must not panic
+	r.reclaimStaleProbeSeries(nil) // must not panic
 }
 
 type fakeProber struct {
@@ -270,7 +270,7 @@ func TestReclaimStaleProbeSeriesKeepsHostsOfAClaimedCertificate(t *testing.T) {
 		t.Fatal("acquiring the claim should succeed on a fresh reconciler")
 	}
 
-	r.reclaimStaleProbeSeries()
+	r.reclaimStaleProbeSeries(r.resolve(context.Background()))
 
 	if !probeMatchSeriesExists(t, host) {
 		t.Error("the series of a host whose certificate is still converging was reclaimed; " +
@@ -281,7 +281,7 @@ func TestReclaimStaleProbeSeriesKeepsHostsOfAClaimedCertificate(t *testing.T) {
 	// the exported series and the runner's transition memory. Reclaiming only the metric
 	// leaks an entry in the runner for every host ever dropped from a SAN set.
 	r.release(certName)
-	r.reclaimStaleProbeSeries()
+	r.reclaimStaleProbeSeries(r.resolve(context.Background()))
 
 	if probeMatchSeriesExists(t, goneHost) {
 		t.Error("a host that is no longer probed must have its exported series reclaimed")
@@ -343,7 +343,7 @@ func TestReclaimingManyStaleHostsResolvesOnce(t *testing.T) {
 		metrics.CertificateProbeMatch.WithLabelValues(h).Set(1)
 	}
 
-	r.reclaimStaleProbeSeries()
+	r.reclaimStaleProbeSeries(r.resolve(context.Background()))
 
 	if got := prov.calls.Load(); got != 1 {
 		t.Errorf("resolved the desired state %d times for %d stale hosts; one resolve per reclaim "+
@@ -493,7 +493,7 @@ func TestAnUnconfirmedDeploymentKeepsItsProbeSeries(t *testing.T) {
 	r.prober = fake
 	r.probedHosts = map[string]struct{}{}
 
-	r.reclaimStaleProbeSeries()
+	r.reclaimStaleProbeSeries(r.resolve(context.Background()))
 
 	if !probeMatchSeriesExists(t, "pending.example.com") {
 		t.Error("a certificate that is merely unconfirmed is still being worked on: its probe series " +
@@ -504,8 +504,87 @@ func TestAnUnconfirmedDeploymentKeepsItsProbeSeries(t *testing.T) {
 	if err := store.PutCert(&state.CertState{Name: "example-com", DeployConfirmed: true}); err != nil {
 		t.Fatal(err)
 	}
-	r.reclaimStaleProbeSeries()
+	r.reclaimStaleProbeSeries(r.resolve(context.Background()))
 	if probeMatchSeriesExists(t, "pending.example.com") {
 		t.Error("a host that is no longer probed for a confirmed deployment must be reclaimed")
+	}
+}
+
+// The stale-series sweep judges each candidate host against the desired state the pass
+// already resolved. Resolving again per host meant a full document read, YAML decode,
+// validation and hash -- plus resolve's metric and log side effects -- for EVERY
+// candidate of EVERY pass.
+func TestStaleProbeSweepUsesThePasssOwnResolution(t *testing.T) {
+	certs := []config.Certificate{{Name: "kept", Domains: []string{"kept.example.com"}}}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	prov := &countingProvider{inner: spec.NewStatic(certs)}
+	cfg := &config.Config{Certificates: certs}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, prov, store, &fakeManager{}, nil, log)
+	r.prober = &fakeProber{hosts: []string{"stale.example.com"}}
+
+	// The stale host's series exists from an earlier round; it is not in the desired
+	// state, so the sweep must reclaim it -- and must not re-resolve to decide that.
+	metrics.CertificateProbeMatch.WithLabelValues("stale.example.com").Set(0)
+
+	r.RunDetailed(context.Background())
+
+	if got := prov.calls.Load(); got != 1 {
+		t.Errorf("a full pass must resolve the desired state exactly once, resolved %d times "+
+			"(each extra resolution is a document read, YAML decode, validation and hash)",
+			got)
+	}
+	if probeMatchSeriesExists(t, "stale.example.com") {
+		t.Error("the stale host's series must be reclaimed")
+	}
+}
+
+// "Nothing to probe" has two causes -- a certificate of pure wildcards, and a probe cap
+// of zero ("off", e.g. probing paused during an investigation) -- and the log used to
+// blame wildcards for both, sending the diagnosis in the wrong direction when probing
+// was paused by configuration.
+func TestProbeCertLogDistinguishesAZeroCapFromAllWildcards(t *testing.T) {
+	newProbingReconciler := func(t *testing.T, maxHosts int, domains ...string) (*Reconciler, *config.Certificate, *recordLogHandler) {
+		t.Helper()
+		store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+
+		const name = "probe-log"
+		if err := store.PutCert(&state.CertState{
+			Name: name, DeployConfirmed: true, NotAfter: time.Now().Add(30 * 24 * time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg := &config.Config{Probe: config.Probe{MaxHostsPerCert: maxHosts}}
+		handler := &recordLogHandler{}
+		r := New(cfg, spec.NewStatic(nil), store, &fakeManager{}, nil, slog.New(handler))
+		r.prober = &fakeProber{}
+		c := &config.Certificate{Name: name, Domains: domains, Deploy: config.Deploy{Enabled: true}}
+		return r, c, handler
+	}
+
+	r, c, handler := newProbingReconciler(t, 0, "a.example.com")
+	r.probeCert(context.Background(), c)
+	if !handler.contains("host cap is 0") {
+		t.Error("a zero cap must say probing is off, not blame the certificate")
+	}
+	if handler.contains("wildcard") {
+		t.Error("a zero cap must not be diagnosed as an all-wildcard certificate")
+	}
+
+	r, c, handler = newProbingReconciler(t, 3, "*.example.com")
+	r.probeCert(context.Background(), c)
+	if !handler.contains("every name in this certificate is a wildcard") {
+		t.Error("an all-wildcard certificate must still be diagnosed as such")
 	}
 }

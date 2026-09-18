@@ -4,6 +4,171 @@
 
 ### Fixed
 
+- **A failed certificate read erased the certificate it failed to read.** `Reconcile` answered
+  a `GetCert` error by building an empty `CertState` — a name and nothing else — and passing it
+  to `recordFailure`, which persists through the full-column `PutCert` upsert. One bad read (a
+  row the scanner cannot decode, a transient I/O error) therefore rewrote the row with empty
+  `cert_pem`, `key_pem`, `not_after`, `deployed_cert_id` and `ari_cert_id`: the only local copy
+  of the private key and the deployment record, destroyed by the same pass that failed to read
+  them. The read-failure path now uses the new `Store.RecordFailure`, a narrow upsert that
+  touches only `consecutive_failures`, `last_error` and `next_attempt_at`.
+- **The wildcard failure-budget claim named the apex, not the wildcard.** Phase 3 of the order
+  flow called `noteIdentifierFailure(a.Identifier)` — the bare domain — while the other three
+  bookkeeping sites and the cooldown reader use `challenge.GetTargetedDomain`, which carries the
+  `*.` prefix. One wrong key, two failures: the claim that serializes concurrent passes on a
+  shared wildcard never matched the cooldown lookup, and the apex entry was never cleared on
+  success, so it blocked a plain `example.com` issuance for the rest of the hour. The claim now
+  names the targeted identifier like everywhere else.
+- **`Trouble()` reported a fully backed-off run as clean.** Backed-off certificates count into
+  `rep.Backoff`, not `Skipped`, so a `-once` run in which every certificate sat inside a backoff
+  window attempted nothing, skipped nothing, and exited 0 — exactly the silent stall the systemd
+  timer's exit code exists to surface, and exactly what the function's own comment promised to
+  catch. Backoff now counts as trouble.
+- **A typo'd webhook trigger key no longer widens into a fleet-wide convergence.**
+  `parseTrigger` decoded into a key set it never validated, so `{"certificate": "foo"}` — the
+  shape a CI template with a renamed variable produces — parsed as "no certificates named",
+  which the handler reads as "all of them", spending issuance quota for the whole fleet.
+  Unknown keys are now rejected with 400, joining the existing guards for empty `cert` and null
+  `certs`.
+- **The onboarding lock is verified held before the state is committed.** flock is bound to the
+  inode: remove the lock file and the next process locks a fresh inode, and two runs walk the
+  load-compute-write critical section together. `wecert-onboard` now acquires the lock through
+  the new `state.AcquireFileLock`, whose handle exposes the `VerifyHeld` check the daemon's
+  store already performs, and calls it before `Commit`.
+- **An ACME account is no longer lost when its registration succeeds but the state write
+  fails.** `EnsureAccount` used to register first and persist second, so a failed `PutAccount`
+  left the account known only to the CA and the next start registered another one, spending the
+  CA's newAccount quota each time. The key is now persisted first with an empty kid and the kid
+  backfilled after registration, so a restart resumes the same account.
+- **A discarded order no longer triggers a second orphan-TXT sweep in the same pass.**
+  `discardOrder` already runs `cleanupOrphanTXT`; `Reconcile` then ran it again at the end of
+  the same pass, repeating a round of authoritative DNS probes the pass had just paid for. The
+  wrap-up sweep is skipped when a discard already did it.
+- **A cancellation during the recursive-resolver probe no longer reads as "TXT propagated".**
+  The probe's fallback branch could reach the success return without ever checking the context,
+  so a cancelled pass walked on toward `AcceptChallenge`. The success path now checks
+  `ctx.Err()` first.
+- **Failure fallback no longer enters through a pruned record.** `applyFallback` read
+  `fallbackActive` before pruning, then pruned the record, then used the stale flag — so the
+  "close enough to expiry" gate at entry was skipped for a certificate nowhere near expiry.
+  Pruning now resets the in-memory flag with the record.
+- **The single-authority exemption counts delegated nameservers, not resolvable ones.** A zone
+  delegating to two NS names where one fails to resolve used to fall under the "one authority
+  is exempt" branch and confirm propagation on a single answer. Unresolvable delegated names
+  now still count toward the delegation, so the exemption only applies to genuinely
+  single-homed zones.
+- **`ratelimit.NoteDeadline` no longer lets an older response move the deadline earlier.** The
+  `Deadline` contract says the later instant wins, but the assignment was unconditional, so a
+  stale refusal processed late (the manager runs one goroutine per certificate) could pull the
+  stored deadline back inside the CA's window. The later instant now wins, as documented.
+- **`ParseRetryAfterHeader` rejects a delay that overflows `time.Duration`.** A Retry-After of
+  more than ~292 years multiplied into a negative duration and produced a deadline in the past —
+  which reads as "not blocked" on precisely the response that asked for the longest wait.
+- **`wecert_ratelimit_remaining_tokens`'s help text said "lower bound" where it meant "upper
+  bound".** The estimate counts only this program's own consumption, so the real remainder is
+  always smaller; reading it as a floor is the dangerous direction when judging whether the
+  week's issuances still fit.
+- **The state store's restrictive-umask windows are now mutually exclusive.** `restrictiveUmask`
+  is process-global state, and two overlapping windows restored in the wrong order left the
+  whole process stuck at 077 — silently, in the code path that exists to keep private keys
+  private. A package-level mutex serializes the windows, and the contract that nothing else may
+  create files inside one is now written down.
+- **`Open` refuses to continue when it cannot stat the file it just opened.** That stat feeds
+  the inode identity `VerifyOnDisk` checks every pass; its failure used to set `openedAs = nil`,
+  which disabled the replaced-database detection forever, with no log. The open now fails with
+  the path named.
+- **Snapshot temp files carry the store's base name.** Two deployments sharing one backup
+  directory could pick the same `.snapshot-<ms>-<n>.tmp` name in the same millisecond, failing
+  one side's `VACUUM INTO`, and the stale-temp sweep collected the other deployment's files.
+  Temp names now match the final names' per-store prefix, and the sweep only touches its own.
+- **Negative safety knobs passed to `wecert-onboard` are rejected instead of silently replaced
+  by defaults.** `New()` mapped every non-positive `MaxNames`, `GracePeriod`, `BudgetWindow`,
+  `Budget` and `DropThreshold` to its default — so `-budget -3` weakened a safety limit while
+  reporting success, the exact "typo silently undone" the config layer refuses for the same
+  knobs. Zero still means "use the default"; negative is an error.
+- **`NewCLBRules` refuses an empty region list at construction.** The failure used to surface
+  only at enumeration time, where it was treated as transient weather — so with `RequireRule`
+  set, guard 1 silently stopped vetoing new names, round after round.
+- **The onboarding state file gets the same trust checks as the desired-state document.**
+  `AbsentSince` in that file is what decides whether a deletion grace period has elapsed, so a
+  group/world-writable state file is one `rsync` away from a silently shortened grace period.
+  `LoadState` now refuses group- or world-writable files and checks the owner, mirroring
+  `spec.LoadDocument`.
+- **Config validation closes the silent-typo gaps.** `dns.ttl: -1` is rejected instead of
+  replaced by the default; `dns.legoProvider` set without `provider: lego` is rejected instead
+  of ignored; `webhook.notifyURL` must parse as an absolute http(s) URL at load time instead of
+  failing on every send; `probe.timeout` has a 1s floor; `metrics.listen`/`webhook.listen` are
+  validated with `net.SplitHostPort`; and `parseDuration` errors now say there is no day unit.
+- **Dual-key certificates are no longer rejected as duplicates.** `NormalizeCertificates` keyed
+  duplicate detection on the domain set alone, so the standard RSA+ECDSA pair — which CLB
+  supports and serves by algorithm negotiation — was refused as "one of them can only waste
+  quota". The key type is now part of the key.
+- **The observe-mode diff compares `renewBefore` by duration, not by spelling.** A static
+  `renewBefore: 720h` against an onboarding document that omits the field reported a permanent
+  diff over two spellings of the same value — and a permanent diff is what the documentation
+  says must be clean before switching to enforce mode. The parsed durations are compared.
+- **`spec.Revision` is order-insensitive across certificates, not just across domains.** The
+  hash walked the certificate slice in input order, so a reordered document — any future
+  producer, or a hand edit — changed the revision without changing anything. Certificates are
+  sorted by name before hashing.
+- **`Reconcile` hardening in the notification and metrics paths.** The success-path
+  `notifier.Renewal` now runs under the same panic guard as the failure path — a panicking
+  notifier previously rewrote a successful pass into a reported failure and notified twice.
+  Publishing `wecert_certificate_not_after` first deletes the certificate's series under any
+  other profile label, so switching profiles no longer strands a frozen series that keeps
+  feeding the expiry alert. `OrphanedCertificates` counts every certificate present in the
+  store but absent from the desired state, including ones whose teardown is deferred while a
+  pass runs.
+- **`reclaimStaleProbeSeries` resolves the desired state once per pass.** It used to re-resolve
+  — file read, YAML decode, validation, hash — once per candidate host, with metric and log side
+  effects each time, on a `context.Background()` shutdown could not cancel.
+- **`waitDeleteTask` tolerates a failed poll the way `waitDeleteRecord` does.** One transient
+  `DescribeDeleteCertificatesTaskResult` error used to fail the whole deletion verdict and
+  postpone it a full cycle; query errors now warn and keep polling within the existing deadline.
+- **`StartNamed` reports the passes it already accepted when shutdown begins mid-walk.** It used
+  to return bare `ErrShuttingDown` and drop the accepted list, so the webhook answered 503 for
+  reconciliations that were in fact running.
+- **CLI flag hygiene.** `-interval` below one minute is rejected in daemon mode (jitter used to
+  floor it at one second — a full reconcile pass per second); `tatrun -interval <= 0` is
+  rejected (it spun `waitForTask` into a hot poll against the TAT API); mutually exclusive
+  combinations (`-revoke` with `-once`/`-dry-run`/`-log-level`, `-once` with `-dry-run`,
+  preflight's `-bindings` with `-prune-certs`) are rejected instead of silently picking a
+  winner; an unknown `-log-level` is an error instead of a silent demotion to info; and
+  `signal.NotifyContext` is registered at the top of `run()` instead of after the first network
+  calls.
+- **`tatrun` no longer garbles plaintext output that happens to be valid base64.** A remote
+  `echo DONE` trims to `DONE`, which *is* legal base64 — and was decoded into three bytes of
+  garbage. Decoded output now has to look like text (valid UTF-8, no control characters) or the
+  original is printed.
+- **`preflight -domain example.com.` (trailing dot) no longer reports the domain missing from
+  DNSPod.** The comparison trims the root dot first.
+- **`install.sh` verifies `wecert-onboard` against `SHA256SUMS` too, and checks the
+  architecture.** The main binary got a checksum verification whose whole point is "whatever
+  file was passed in becomes a root-owned binary" — and the same directory's second binary was
+  installed as root with no check at all. Both are verified now, and the ELF check compares the
+  binary's machine against `uname -m` instead of passing any 64-bit ELF on any architecture.
+- **Smaller corrections:** the webhook `/hook/desired` endpoint reports a store read error as
+  `error` instead of as `issued: false`; `RecordRevokeAttempt` refuses to count attempts against
+  a non-existent request; `PutRateBucket(nil)` is an error like `PutAuthorization(nil)`;
+  repaired snapshots are directory-fsynced; `onboarding.New` no longer sorts the caller's
+  allowlist in place; onboarding decisions index hostnames instead of scanning the list three
+  ways per verdict; the shutdown-drop of a queued pass logs at WARN; and `RunCert` is documented
+  as the synchronous, test-oriented entry point that bypasses drain protection.
+
+### Security
+
+- **A config file carrying inline secrets now warns when it is readable by others.**
+  `state.db`, its snapshots and the desired-state document all enforce permission discipline,
+  but the config file — the one place `secretKey` and `loginToken` are explicitly documented as
+  allowed inline — was read with no check at all. `Load` warns when inline secrets sit in a file
+  wider than 0600.
+- **`wecert` warns when `LEGO_DEBUG_DNS_API_HTTP_CLIENT` is set with the DNSPod provider.**
+  lego's debug dumper redacts headers, and dnspod-go sends the credential in the POST body, so
+  the variable writes the never-expiring DNSPod token into the journal; the hazard was only a
+  comment. The onboarding state file permission/owner checks above are also security-relevant.
+
+### Fixed
+
 - **A deployment could be recorded as complete from an answer it never got.** The bind-resource
   enumeration reported "0 bound resources, finished" when a region's query had failed inside the
   task, and the deploy recovery path reads exactly that zero as "the old certificate is bound

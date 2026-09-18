@@ -124,6 +124,7 @@ func TestOnceExitFailsWhenThePassDidNotConverge(t *testing.T) {
 		// Nothing due: no certificate was attempted, none failed, none is parked in a retry window.
 		// This is what an idle interval looks like and it must stay a success.
 		{"nothing is due yet", reconcile.RunReport{}},
+		{"some certificates are in backoff while another was attempted", reconcile.RunReport{Attempted: 1, Succeeded: 1, Backoff: 1}},
 	}
 	for _, tc := range healthy {
 		if err := onceExit(tc.rep); err != nil {
