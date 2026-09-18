@@ -141,18 +141,19 @@
 
   <h2>未跑的部分<span class="zh">not run, and why</span></h2>
   <p class="lede">这几项属于"需要真实云凭证或真实域名"，本环境没有，所以它们<strong>没有</strong>被算进上面的通过数。每条都给出可直接执行的命令。</p>
+  <div class="note"><b>这一节的后续状态（2026-09-18 更正）。</b>本页是 2026-09-17 那一轮<strong>离线</strong>运行的记录，"未跑"说的是那一轮。此后两轮带凭据的真实运行（<code>docs/e2e-run-2026-09-17-credentialed.md</code>、<code>docs/e2e-run-2026-09-18-credentialed.md</code>）把下面第 1、2 项跑通并通过；第 3 项的探针也已经在一个真实公网端点上执行（<code>docs/verification-2026-09-18.md</code> §2.3：正例 exit 0、反例 exit 2），仍然没跑的是<strong>从 VPC 内探测那台内网 CLB</strong>（同文 §5 C3）。第 4 项在本机仍然做不到，Linux 容器里的替代路径已经在 <code>docs/verification-2026-09-18.md</code> §6.1 跑过。</div>
       <div class="card warn">
         <div class="t"><span class="n">cloud-deploy-and-rebind</span><span class="badge skip">需要凭证</span></div>
         <p class="what">Upload to Tencent Cloud SSL and rebind the CLB listener, then read the binding back from the API.</p>
-        <ul class="ev"><li>needs TENCENTCLOUD_SECRET_ID/KEY with the CAM policy in deploy/, plus a CLB and an HTTPS listener: scripts/run-stage-ab.sh</li></ul>
+        <ul class="ev"><li>needs TENCENTCLOUD_SECRET_ID/KEY with the CAM policy in deploy/, plus a CLB and an HTTPS listener: scripts/run-stage-ab.sh</li><li><b>后记（2026-09-18）：已补跑并通过</b> —— 真实上传 + <code>UpdateCertificateInstance</code> 换绑 + 独立握手复核，见 <code>e2e-run-2026-09-17-credentialed.md</code> §4.3/§4.4/§4.6/§4.9 与 <code>e2e-run-2026-09-18-credentialed.md</code> §4.4。</li></ul>
       </div>      <div class="card warn">
         <div class="t"><span class="n">lets-encrypt-staging-issuance</span><span class="badge skip">需要凭证</span></div>
         <p class="what">The same lifecycle against Let&#x27;s Encrypt staging with a real DNSPod or Tencent Cloud DNS zone.</p>
-        <ul class="ev"><li>needs a real zone plus DNS API credentials and outbound DNS: cp e2e-config.example.yaml e2e-config.yaml &amp;&amp; ./scripts/e2e-test.sh &lt;domain&gt; ./e2e-config.yaml</li></ul>
+        <ul class="ev"><li>needs a real zone plus DNS API credentials and outbound DNS: cp e2e-config.example.yaml e2e-config.yaml &amp;&amp; ./scripts/e2e-test.sh &lt;domain&gt; ./e2e-config.yaml</li><li><b>后记（2026-09-18）：已补跑并通过</b> —— 真实 Let's Encrypt staging + 真实 DNSPod 的完整签发，见 <code>e2e-run-2026-09-17-credentialed.md</code> §3/§4.1 与 <code>e2e-run-2026-09-18-credentialed.md</code> §3/§4.1。</li></ul>
       </div>      <div class="card warn">
         <div class="t"><span class="n">black-box-probe-of-the-live-endpoint</span><span class="badge skip">需要凭证</span></div>
         <p class="what">Dial 443 and compare the certificate served with the one deployed.</p>
-        <ul class="ev"><li>needs a deployed certificate behind a CLB: ./bin/wecert-probe -host &lt;name&gt; -min-valid 168h</li></ul>
+        <ul class="ev"><li>needs a deployed certificate behind a CLB: ./bin/wecert-probe -host &lt;name&gt; -min-valid 168h</li><li><b>后记（2026-09-18）：探针已在真实公网端点上执行</b>（正例 exit 0 / 反例 exit 2 / 覆盖不符 / 部分地址不可达，见 <code>verification-2026-09-18.md</code> §2.3）；仍未跑的是从 VPC 内探测那台内网 CLB（同文 §5 C3）。</li></ul>
       </div>      <div class="card warn">
         <div class="t"><span class="n">binary-against-a-local-ca</span><span class="badge skip">本机无法运行</span></div>
         <p class="what">Run the compiled wecert binary, rather than the Manager in-process, against pebble.</p>

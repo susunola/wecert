@@ -364,6 +364,14 @@ func open(path string, exclusive bool) (*Store, error) {
 // fail (a lost search permission, an unreachable mount) makes the earlier create fail first.
 var statOpenedFile = os.Stat
 
+// openStateDB opens the SQLite handle.
+//
+// It is a variable rather than a direct sql.Open call so a build with `-tags verifycount` can
+// substitute a counting driver.Connector and measure how many statements a pass costs the database
+// (see zz_stmtcount_verifycount.go, and internal/reconcile's orphan-cost instrument). Production
+// builds carry the line below and nothing else.
+var openStateDB = func(dsn string) (*sql.DB, error) { return sql.Open("sqlite", dsn) }
+
 // openFiles creates/opens the database files and runs the schema migration.
 //
 // Everything file-creating in here runs under a restrictive umask (see
@@ -415,7 +423,7 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 	}
 
 	dsn := sqliteDSN(path)
-	db, err := sql.Open("sqlite", dsn)
+	db, err := openStateDB(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open state db: %w", err)
 	}

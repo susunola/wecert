@@ -278,14 +278,23 @@ snapshot() {
 	SNAPSHOT_FILE="${EVIDENCE_DIR}/listener-${label}.json"
 	SNAPSHOT_FILTERED="yes"
 
-	"${CLBVERIFY}" -region "${REGION}" -clb "${CLB}" -listener "${LISTENER}" -raw >"${SNAPSHOT_FILE}"
+	"${CLBVERIFY}" -region "${REGION}" -clb "${CLB}" -listener "${LISTENER}" -raw >"${SNAPSHOT_FILE}.full"
+	# -raw prints the raw DescribeListeners JSON *and then* the human report (added in 6c2057b), so
+	# that file is not JSON on its own. Keeping only the first JSON document is what makes
+	# listener_field (json.load) able to read it at all: against a real CLB the script used to die
+	# with "Extra data: line 121 column 1 (char 3414)" -- the stub table passed only because a stub
+	# printed pure JSON. Found by the round-11 verification pass (U98).
+	keep_first_json "${SNAPSHOT_FILE}.full" "${SNAPSHOT_FILE}"
+	rm -f -- "${SNAPSHOT_FILE}.full"
 
 	if ! listener_field "${SNAPSHOT_FILE}" has-certificate >/dev/null 2>&1; then
 		echo "WARN: the listener-filtered DescribeListeners response carries no Certificate field" >&2
 		echo "      (wecert-clbverify notes this can happen when filtering by ListenerIds)." >&2
 		echo "      Re-reading the whole CLB and selecting ${LISTENER} from it." >&2
 		SNAPSHOT_FILTERED="no"
-		"${CLBVERIFY}" -region "${REGION}" -clb "${CLB}" -raw >"${SNAPSHOT_FILE}"
+		"${CLBVERIFY}" -region "${REGION}" -clb "${CLB}" -raw >"${SNAPSHOT_FILE}.full"
+		keep_first_json "${SNAPSHOT_FILE}.full" "${SNAPSHOT_FILE}"
+		rm -f -- "${SNAPSHOT_FILE}.full"
 	fi
 
 	echo "--- raw evidence (${label}) -> ${SNAPSHOT_FILE}"
@@ -294,6 +303,28 @@ snapshot() {
 show_raw() {
 	cat -- "${SNAPSHOT_FILE}"
 	echo
+}
+
+# keep_first_json <in> <out>
+#
+# Copies the first complete JSON document from <in> into <out>, discarding whatever follows it.
+# wecert-clbverify -raw ends its raw dump with a human-readable report, so a plain json.load on the
+# file fails with "Extra data"; raw_decode stops at the end of the first document instead.
+keep_first_json() {
+	python3 - "$1" "$2" <<'PYEOF'
+import json
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, encoding="utf-8") as fh:
+    text = fh.read()
+try:
+    value, _ = json.JSONDecoder().raw_decode(text.lstrip())
+except ValueError as exc:
+    sys.exit("could not find a JSON document in %s: %s" % (src, exc))
+with open(dst, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PYEOF
 }
 
 # listener_field <file> <mode>

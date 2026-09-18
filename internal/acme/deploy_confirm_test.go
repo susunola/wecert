@@ -1,13 +1,18 @@
 package acme
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite" // the driver the state store uses, for the second connection
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
@@ -387,6 +392,103 @@ func TestReconcileLooksUpBindingsOncePerInterval(t *testing.T) {
 	_ = m.Reconcile(context.Background(), cert)
 	if dep.calls != 2 {
 		t.Errorf("Bindings ran %d times; want a second lookup once the interval elapsed", dep.calls)
+	}
+}
+
+// A reclaim record whose local delete fails must be retried, not wedged.
+//
+// The cloud delete already succeeded, so the certificate is gone from the account; what failed is
+// only the local write that removes the row. The recorded trade (round 4 §3.2, "recorded, not
+// changed") is that this is deliberately *not* treated as an error: the row stays, the pass warns,
+// and the next pass issues the same Delete again. That second delete is idempotent -- Tencent's
+// DeleteCertificate answers success for an id it does not hold -- so the row converges on the next
+// pass instead of being stuck at "delete failed" forever.
+//
+// The write is made to fail at the SQL layer, which is the only place that reproduces "the cloud
+// call worked and the disk write did not": a BEFORE DELETE trigger raises the error SQLite would
+// raise on a full disk or a corrupt page, and the store's own error mapping turns it into the
+// warning ReapRetired logs.
+func TestAReclaimRecordWhoseLocalDeleteFailsIsRetriedTheNextPass(t *testing.T) {
+	// Built here rather than through newConfirmHarness because the fault is injected through a
+	// second connection to the same database file, so the test needs its path.
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	dep := &fakeDeployer{}
+	var logs bytes.Buffer
+	m := newManager(store, nil, &fakeSolver{}, fakeKeyAuth{}, dep,
+		slog.New(slog.NewTextHandler(&logs, nil)))
+	cert := &config.Certificate{
+		Name: "reclaim-test", Domains: []string{"a.example.com"},
+		Profile: config.ProfileClassic, Deploy: config.Deploy{Enabled: true},
+	}
+	if err := store.PutCert(&state.CertState{Name: cert.Name, NotAfter: time.Now().Add(80 * 24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A reclaimed certificate, past the retention window.
+	if err := store.AddRetiredCert("ap-orphan-1", cert.Name, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now()
+	m.SetNow(func() time.Time { return base.Add(2 * m.retention) })
+
+	// The local write fails; the cloud call before it does not.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open the state database a second time: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`CREATE TRIGGER refuse_reclaim_removal BEFORE DELETE ON retired_certificates
+		BEGIN SELECT RAISE(ABORT, 'disk full (injected)'); END`); err != nil {
+		t.Fatalf("install the failing write: %v", err)
+	}
+
+	// Pass one: the delete reaches the cloud, the record cannot be removed.
+	m.ReapRetired(context.Background())
+	if len(dep.deleted) != 1 || dep.deleted[0] != "ap-orphan-1" {
+		t.Fatalf("the reaper must still issue the cloud delete, got %v", dep.deleted)
+	}
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 1 {
+		t.Fatalf("a failed local write must leave the record for the next pass, got %+v", got)
+	}
+	if !strings.Contains(logs.String(), "failed to remove the reclaim record") {
+		t.Errorf("the failed write has to be reported, got:\n%s", logs.String())
+	}
+
+	// Pass two, with the database write still broken: the SAME id is deleted again and the pass
+	// neither errors out nor drops the row.
+	logs.Reset()
+	m.ReapRetired(context.Background())
+	if len(dep.deleted) != 2 || dep.deleted[1] != "ap-orphan-1" {
+		t.Fatalf("the next pass must retry the same certificate id, got %v", dep.deleted)
+	}
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 1 {
+		t.Fatalf("the record must survive a failed removal, got %+v", got)
+	}
+	if !strings.Contains(logs.String(), "failed to remove the reclaim record") {
+		t.Errorf("each pass has to warn while the write keeps failing, got:\n%s", logs.String())
+	}
+
+	// Once the disk recovers the next pass converges: the row goes, and no further delete is
+	// issued for it -- so the retry is bounded by the outage, not permanent.
+	if _, err := db.Exec(`DROP TRIGGER refuse_reclaim_removal`); err != nil {
+		t.Fatal(err)
+	}
+	m.ReapRetired(context.Background())
+	if len(dep.deleted) != 3 {
+		t.Fatalf("the recovering pass still has to delete the record's certificate, got %v", dep.deleted)
+	}
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 0 {
+		t.Fatalf("a successful delete plus a successful write must clear the record, got %+v", got)
+	}
+	m.ReapRetired(context.Background())
+	if len(dep.deleted) != 3 {
+		t.Errorf("a cleared record must not be deleted again, got %v", dep.deleted)
 	}
 }
 

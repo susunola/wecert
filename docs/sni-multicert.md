@@ -1,11 +1,22 @@
 # SNI 多证书：续期一张不能动另一张
 
-> ## 未跑
+> ## 脚本未跑（被测行为已用另一种形态观测到）
 >
-> 本文配套的 [`scripts/e2e-sni.sh`](../scripts/e2e-sni.sh) **尚未在任何真实 listener 上执行过**。
-> 写这份文档的机器上没有腾讯云凭据，`bin/wecert-clbverify` 也没有构建，所以**没有一条断言是实测通过的**。
-> 脚本本身的机器可验部分（参数门禁、凭证拒绝、证据解析、五条断言的成败路径）用桩数据跑过，
-> 见第 4 节；**云端那一段一次都没跑**。
+> 本文配套的 [`scripts/e2e-sni.sh`](../scripts/e2e-sni.sh) **尚未在任何真实 listener 上执行过**：
+> 脚本本身的机器可验部分（参数门禁、凭证拒绝、证据解析、五条断言的成败路径）用桩数据跑过（第 4 节），
+> **云端那一段一次都没跑**，所以脚本里没有一条断言是实测通过的。
+>
+> 但**"续期 A 不动 B"这个行为本身已经在真机上观测到**（2026-09-17 / 09-18），只是形态与本文设想的不同：
+> 本账号**完全忽略监听器级绑定**（`extCertIds` 恒空），证书挂在转发规则的主 `CertId` 上，走的是
+> "一条监听器上两条规则、每条规则一张证书"的路径，而不是 `multi_cert_info` + `ExtCertIds`。证据来自
+> **独立的 TLS 握手机位**：[`e2e-run-2026-09-17-credentialed.md`](e2e-run-2026-09-17-credentialed.md)
+> §4.3（换掉 alpha 的证书后 beta 的 subject/issuer/指纹与基线逐字节一致）与 §4.9（两个独立执行者、
+> 两张证书，同一条监听器互不影响）；换绑本身见
+> [`e2e-run-2026-09-18-credentialed.md`](e2e-run-2026-09-18-credentialed.md) §4.4。
+>
+> 仍然没有验证的是**本文这条断言路径**：监听器级的 `multi_cert_info` 读回表示
+> （`Certificate.CertId` + `ExtCertIds`）、真实 `DescribeListeners` 返回的 JSON 结构、以及
+> `-not-expect` 在真实 listener 上的判定 —— 那需要一个**不忽略监听器级绑定**的账号。
 >
 > 要跑起来需要：一个多证书 SNI listener（两张证书，其中一张由 wecert 管）、一个能改 DNS 的测试域名、
 > 腾讯云 CAM 凭据（`clb:DescribeListeners` 即可），以及一次真实的续期。
@@ -23,8 +34,9 @@
 
 > - [ ] Test the SNI multi-certificate case with `multi_cert_info` ("replacing one doesn't disturb another")
 
-也就是说：**这句话目前是设计意图，不是已验证的事实。** 本文与 `scripts/e2e-sni.sh` 就是把它变成
-一次可复核的观测。
+也就是说：**这句话原先只是设计意图**；2026-09-17/09-18 的真机运行已经在"规则级绑定"这条路径上观测到
+它成立（顶部横幅里那两处证据）。本文与 `scripts/e2e-sni.sh` 仍然有价值：它们要把它变成**监听器级
+`multi_cert_info` / `ExtCertIds`** 这条路径上一次可复核、带断言的观测。
 
 为什么它值得单独验：这件事**错了不会报错**。如果 `UpdateCertificateInstance` 在重绑时把 listener
 的证书集合整体重写，A 换新是成功的、日志是成功的、指标是绿的，而 B 悄悄消失 —— 直到 B 的域名
@@ -185,7 +197,9 @@ make build tools          # 需要 bin/wecert-clbverify
 | 未知参数 / `--wait` 非数字 / A==B | 退出 1 | ✅ |
 
 **没验的**（`未跑` 的真正含义）：真实 `DescribeListeners` 返回的 JSON 结构、`-not-expect` 在真实
-listener 上的判定、以及"续期 A 确实不动 B"这个**被测行为本身**。
+listener 上的判定、以及**监听器级** `multi_cert_info` / `ExtCertIds` 这条表示路径。至于"续期 A 确实
+不动 B"这个被测行为本身，已经在真机上按**规则级绑定**观测到（见顶部横幅与
+[`e2e-run-2026-09-17-credentialed.md`](e2e-run-2026-09-17-credentialed.md) §4.3/§4.9）。
 
 ---
 
@@ -232,3 +246,4 @@ listener 上的判定、以及"续期 A 确实不动 B"这个**被测行为本�
 | 日期 | 变更 |
 |---|---|
 | 2026-09-17 | 首版。**未跑**：本机无腾讯云凭据；脚本的机器可验部分用桩验证（见第 4 节） |
+| 2026-09-18 | 顶部横幅与第 1、4 节按实跑更正：**脚本仍未在任何真实 listener 上执行**（本账号忽略监听器级绑定，`extCertIds` 恒空），但"续期一张不动另一张"已在 2026-09-17 §4.3/§4.9 与 2026-09-18 §4.4 的真机运行中、按**规则级绑定**加独立 TLS 握手观测到；未验的改为监听器级 `multi_cert_info` / `ExtCertIds` 这条表示路径 |

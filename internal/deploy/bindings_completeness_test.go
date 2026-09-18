@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -299,4 +300,103 @@ func TestAHalfPopulatedSyncProgressIsNotAFinishedZero(t *testing.T) {
 	if n, ready := progressBoundCount([]*ssl.UpdateSyncProgress{populatedZero, nil}); ready {
 		t.Errorf("a nil entry leaves the answer incomplete, got (%d, %v)", n, ready)
 	}
+}
+
+// The `complete:true, count:0` answer is reachable, and it means exactly one thing.
+//
+// The round-OCR finding (m4) was that an unpopulated response could read as `complete:true, count:0`
+// -- "the old certificate is bound nowhere", which is what the repair path acts on. The fix refuses
+// every unpopulated shape, and the remaining question was reachability: does the real API shape ever
+// produce that verdict? The answer comes from the SDK's own model definitions, and the JSON tags are
+// the decisive part:
+//
+//	BindResourceResult []*BindResourceResult `json:"BindResourceResult,omitnil,omitempty"`      // ssl/v20191205 models.go:7535
+//	BindResourceRegionResult []*BindResourceRegionResult `json:"...,omitnil,omitempty"`          // models.go:239
+//	TotalCount *uint64 `json:"TotalCount,omitnil,omitempty"`                                     // models.go:228
+//
+// The slice fields carry no `omitempty`, so the server's array survives unmarshalling as a
+// populated slice; TotalCount is a POINTER, so a JSON `0` arrives as a non-nil pointer to 0 while a
+// MISSING key arrives as nil. Those are the two shapes the fixed countBindings separates:
+//
+//   - `{"BindResourceResult":[{"BindResourceRegionResult":[{"Region":"ap-guangzhou","TotalCount":0}]}]}`
+//     -> complete:true, count:0. REACHABLE, and it is a genuine "bound to nothing".
+//   - `{"BindResourceResult":[]}` (or a region without TotalCount) -> complete:false. Also
+//     reachable, and now correctly not an answer.
+//
+// So the branch is reachable only through a populated, answered enumeration -- which is precisely
+// the case where a zero is the server's answer. The dangerous shape the finding described (a zero
+// read out of an answer that was never given) is the one the fix makes unreachable.
+//
+// The fixture goes through encoding/json rather than a struct literal, because that is the claim:
+// these are the SDK's wire shapes, not shapes a test can only build by hand.
+func TestAZeroFromAPopulatedEnumerationIsReachableAndMeansZero(t *testing.T) {
+	t.Run("populated region answering zero", func(t *testing.T) {
+		resp := unmarshalBindResult(t, `{
+			"Response": {
+				"SyncTaskBindResourceResult": [{
+					"TaskId": "task-1",
+					"Status": 1,
+					"BindResourceResult": [{
+						"ResourceType": "clb",
+						"BindResourceRegionResult": [{"Region": "ap-guangzhou", "TotalCount": 0}]
+					}]
+				}]
+			}
+		}`)
+		n, done, err := countBindings(resp, "task-1")
+		if err != nil || !done {
+			t.Fatalf("the enumeration is finished and answered, got done=%v err=%v", done, err)
+		}
+		if !n.complete || n.count != 0 {
+			t.Fatalf("got %+v, want complete:true count:0 -- the server answered \"bound to nothing\" "+
+				"with a populated entry, which is the only shape allowed to mean it", n)
+		}
+	})
+
+	t.Run("empty result list is not that answer", func(t *testing.T) {
+		resp := unmarshalBindResult(t, `{
+			"Response": {
+				"SyncTaskBindResourceResult": [{
+					"TaskId": "task-1", "Status": 1, "BindResourceResult": []
+				}]
+			}
+		}`)
+		if n, done, err := countBindings(resp, "task-1"); err != nil || done {
+			t.Fatalf("an unpopulated result list must stay \"keep waiting\", got done=%v err=%v n=%+v",
+				done, err, n)
+		}
+	})
+
+	t.Run("region without a total is not that answer", func(t *testing.T) {
+		// The region key is absent, so the SDK's *uint64 stays nil: a region that was never counted.
+		resp := unmarshalBindResult(t, `{
+			"Response": {
+				"SyncTaskBindResourceResult": [{
+					"TaskId": "task-1", "Status": 1,
+					"BindResourceResult": [{
+						"ResourceType": "clb",
+						"BindResourceRegionResult": [{"Region": "ap-guangzhou"}]
+					}]
+				}]
+			}
+		}`)
+		n, done, err := countBindings(resp, "task-1")
+		if err != nil || !done {
+			t.Fatalf("the task is finished, got done=%v err=%v", done, err)
+		}
+		if n.complete {
+			t.Errorf("got %+v: a region with no TotalCount key is a missing answer, not the number zero", n)
+		}
+	})
+}
+
+// unmarshalBindResult decodes a raw response body the way the SDK does (common/http/common_response.go
+// uses encoding/json on the raw body), so the fixture is the wire shape rather than a struct literal.
+func unmarshalBindResult(t *testing.T, body string) *ssl.DescribeCertificateBindResourceTaskResultResponse {
+	t.Helper()
+	var resp ssl.DescribeCertificateBindResourceTaskResultResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("decode the fixture: %v", err)
+	}
+	return &resp
 }
