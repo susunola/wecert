@@ -83,7 +83,16 @@ func (s *Store) WithTx(ctx context.Context, fn func(*Tx) error) error {
 func (t *Tx) PutCert(c *CertState) error { return putCertExec(t.tx, c) }
 
 // AddRetiredCert records a certificate for reclamation inside the transaction.
+//
+// The empty-id guard is here as well as on Store.AddRetiredCert, because the two are separate
+// entry points and only one of them had it: a row with no id is one the reaper can never delete
+// (Delete("") fails every round), so it would hold a reclaim slot forever -- and the transaction
+// path is exactly the one the promotion epilogue uses, where a missing id is most likely to slip
+// through. Round 11's verification pass found the asymmetry recorded as an open item since round 10.
 func (t *Tx) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) error {
+	if certID == "" {
+		return fmt.Errorf("refusing to queue an empty certificate id for reclaim under %q", certName)
+	}
 	return addRetiredCertExec(t.tx, certID, certName, certPEM, keyPEM)
 }
 
