@@ -8,7 +8,7 @@
 
 ## 0. 一句话结论
 
-**101 条"未验证"里，69 条本机可验**：这一轮把其中最有分量的一批真跑了 —— 真实 Let's Encrypt **生产**签发与 ARI 驱动的续期、真实 DNSPod 的记录名形态、真实端点的探针三态、Linux 容器里的 `install.sh` 全流程与 145 次 SIGKILL 崩溃安全、完整恢复演练、老二进制读新 schema —— 并且**实测又找出 8 个缺陷**（全部已修、全部有会变红的用例）。剩下 13 条本机做不到、7 条**本质上无法验证**（例如"真实断电"和"90 天自然到期"），逐条写在 §4。
+**101 条"未验证"里，69 条本机可验**：这一轮把其中最有分量的一批真跑了 —— 真实 Let's Encrypt **生产**签发与 ARI 驱动的续期、真实 DNSPod 的记录名形态、真实端点的探针三态、Linux 容器里的 `install.sh` 全流程与 145 次 SIGKILL 崩溃安全、完整恢复演练、老二进制读新 schema —— 并且**实测又找出 10 个缺陷**（全部已修、全部有会变红的用例）。剩下 13 条本机做不到、7 条**本质上无法验证**（例如"真实断电"和"90 天自然到期"），逐条写在 §4。
 
 ---
 
@@ -115,7 +115,7 @@ level=INFO msg="an unpresented row's record was denied, but its challenge is new
 
 ---
 
-## 3. 实测发现的缺陷（8 条，全部已修 + 会变红的用例）
+## 3. 实测发现的缺陷（10 条，全部已修 + 会变红的用例）
 
 | # | 位置 | 缺陷 | 怎么发现的 | 修法 |
 |---|---|---|---|---|
@@ -127,6 +127,8 @@ level=INFO msg="an unpresented row's record was denied, but its challenge is new
 | 6 | `internal/state/state.go` | 创建数据库时 I/O 出错会留下一个 **0 字节**的 `state.db`，下一次健康启动把它当全新库静默迁移 —— "数据库被删/丢了"的警告只在文件**不存在**而锁文件存在时才触发 | 注入 fsync EIO 实测 | 0 字节 + 锁文件存在同样触发那条警告 |
 | 7 | `internal/state/backup.go` | 崩溃留下的快照临时文件要等满 1 小时才被清理，而且 SQLite 在旁边写的 `-journal` 根本不在清理模式里；48 MiB 的库每次崩溃能留下几十 MiB 私钥副本 | 快照写到一半时杀进程实测 | 临时文件名带上本 store 的 base，属于**本 store** 的临时文件（含 `-journal`）在加锁的那一轮快照里立即清理；别家部署的文件仍走 1 小时阈值 |
 | 8 | `cmd/wecert/main.go` | `-once` 的立即快照失败只留一条后台 goroutine 的 ERROR，退出码仍是 0 —— 而 timer 模式的 unit 状态是唯一报警通道，于是"备份路径坏了"这件事永远不报警 | 注入 fsync EIO 实测（pass 收敛、exit 0） | 立即快照的结果送进一次性运行的退出码判断；措辞上把"这一轮没收敛"和"收敛了但没有备份"分开；守护进程仍不因一次快照失败退出（下一轮会重试并记账） |
+| 9 | `cmd/clbverify/main.go` | **本轮自己引入的回归**：第十一轮把这个工具改成自己的 `FlagSet`（为了 64 退出码约定）时改掉了 region/listener/expect/domain/not-expect/raw/wait，**漏了 `-clb`**，它还挂在 `flag.CommandLine` 上从未被解析 —— 于是 `docs/staging-checklist.md` 1.5/4.2 里那条命令必退 64（`flag provided but not defined: -clb`） | 真实账号里按文档验证换绑时发现：换绑本身成功了（规则的 CertId 从 `atcRHVHh` 变成 `atcuQ0dm`，deployRecord 15612、`boundResources=1`），而"用来证明它"的工具根本跑不起来 | 改成 `fs.String`；`-clb` 至少能走到凭据检查（exit 1）而不是用法错误 |
+| 10 | `internal/deploy/tencent.go` | `Delete` 在 `DeleteResult == false` 时直接返回"API 拒绝了删除"、**从不轮询异步任务**。而真实 API 在 `IsCheckResource=true` 时**两种结果都返回 false**：绑定中 → 任务 status 4（"There are unbound cloud resources: clb, that cannot be deleted."），已解绑 → 任务 status 1 且证书真的被删。后果是双向的：**已经删掉的证书被报成"被拒绝"**（`retired_certificates` 行永远清不掉、每轮都再警告一次，staging-checklist §2.2 永不成立），而**status 4 这个"服务端还在引用"的信号从来没被报出来过** | 真实账号实测（旧二进制 + 产品自己的 `ReapRetired` 路径：日志说"the API refused the delete"，而 `DescribeCertificate` 已经 `CertificateNotFound`，行仍在） | `false` 只在**没有任务 ID** 时才算拒绝；有任务就轮询并按下文状态判定（1 成功 / 4 拒绝 / 其它照实报）。用例改成模拟**真实**语义（`false` + status 1 = 成功、`false` + status 4 = 拒绝、`false` 且无任务 = 拒绝）—— 原来 10 个用例全用 `DeleteResult=true`，等于把不存在的 API 写进了假客户端 |
 
 另外顺手修掉两处同批发现的措辞/行为问题：`Tx.AddRetiredCert` 缺空 id 守卫（第 10 轮记为待办，现已与 `Store.AddRetiredCert` 一致，附会变红的用例）；`-restore latest` 在快照目录**不存在**时打的是 `open(2)` 原始错误，而不是"这个库里没有快照"。
 
@@ -149,10 +151,9 @@ level=INFO msg="an unpresented row's record was denied, but its challenge is new
 ### 4.2 本机条件做不到（13 条，各带卡点）
 
 - **Stage C（CVM + systemd + 实例角色）的"首次绑定→自动换绑"重跑**（U6/U79/U82）：需要新建一台带公网 IP 的 CVM（有费用）。09-18 的带凭据报告已经在真机上跑过一遍（TAT 驱动、角色取证、磁盘无凭据）；这一轮没有重复付费。
-- **`IsCheckResource=true` 的真实删除拒绝（状态 4）+ 真实换绑 + SNI 多证书**（U8/U41/U43/U98）：需要一台真实 CLB 与一张绑定中的证书。这一轮交给独立的云上子任务执行（见 §5 的结果），本报告不预判。
+- **SNI 多证书 / `e2e-sni.sh` 全流程**（U43/U98）：这一轮的云上任务建了带 SNI 规则的真实 CLB 并做了真实换绑（§5），但**本账号完全忽略监听器级绑定**（`extCertIds` 恒空），所以"两个证书挂在一个监听器上"的那条路径在这里没有被真实数据走到。
 - **`wecert-preflight -prune-certs` 非交互 stdin 视为 no**（U90）：**故意不跑** —— 共享账号里它一旦行为不符会删掉别人正在服务的证书。要验只能在一次性账号上。
 - **CAM 策略的"最小且充分"在真实账号上生效**（U42）：静态检查（`check-cam-policies.py`，10 个 API 全覆盖）已通过；"用这套策略真的能跑通、且多一个 API 会被拒"需要在子账号上挂策略实测。
-- **`e2e-sni.sh` 的全流程**（U98）：同上，要真实 CLB + SNI 监听。
 - **真机 systemd 启动 unit**（U45 的最后一米）：容器里只做了 `systemd-analyze verify`，没有让 systemd 真正拉起服务。
 - **`run-stage-ab.sh` 全流程**（U101）：需要 terraform apply 出一台 CLB/CVM；脚本的 plan-only 分支与校验逻辑已在静态检查里覆盖。
 - **多注册域 / 第二个 zone**（U49）：账号里只有一个可写 zone（`atomwangnus.com`），跨域配额行为无法实测。
@@ -164,16 +165,29 @@ level=INFO msg="an unpresented row's record was denied, but its challenge is new
 
 ---
 
-## 5. 这一轮尚未收尾的两条（在独立的容器/云任务里执行）
+## 5. 真实 CLB 的结果（U8/U40/U41）
 
-- **真实 DNS-01 的 CA 侧校验 + 自然墙钟续期**：在 Linux 容器里（53 端口可用）重跑 `make e2e` 与 `make test-pebble`，并用 pebble 的短有效期 profile 让守护进程**按真实时间**等到 ARI 窗口打开后自行续期。结果记入本节。
-- **真实 CLB：`IsCheckResource` 拒绝、真实换绑、`wecert-clbverify` 观察**：在真实账号里新建一台内网 CLB、上传并绑定证书、用产品自己的删除路径对比 `IsCheckResource=true/false`，最后按 ID 清理。结果记入本节。
+在真实账号里新建内网 CLB + HTTPS 监听与 SNI 规则、上传并绑定证书、跑真实换绑、并用产品自己的删除路径做对照。三条结论：
 
-*(这两条返回后补齐：通过 / 缺陷 / 卡点。)*
+| 断言 | 结果 | 证据 |
+|---|---|---|
+| **C1 · 云端 `IsCheckResource` 语义** | **云端行为成立、产品消费它的方式不成立（已修，见 §3 第 10 条）** | 绑定中：`DeleteResult=false` + 任务 status **4**（"There are unbound cloud resources: clb, that cannot be deleted."），证书与规则都还在；解绑后同一次调用：任务 status **1**，证书真的消失；绑定中改用 `IsCheckResource=false`：同步 `DeleteResult=true`，证书被删掉而规则仍引用它 —— 这正是 `-prune-certs` 那条"服务端不会保护你"的告警所描述的危险 |
+| **C2 · 真实换绑** | **换绑本身成立；用来验证它的工具坏了（已修，见 §3 第 9 条）** | 强制续期后 LE staging 证书 `atcuQ0dm` 上传成功，`UpdateCertificateInstance(old=atcRHVHh, new=atcuQ0dm)` 返回 deployRecord 15612 / success=1，日志"verified the adopted update task … boundResources=1"，`DescribeListeners` 显示规则 `loc-27xgx4tq` 的 certId 已从 `atcRHVHh` 变为 `atcuQ0dm` |
+| **C3 · 真实端点探针** | **本机不可验证** | CLB 是内网（`vips=[10.99.1.16]`，无公网域名），名字在公网 DNS 上是 NXDOMAIN；本机 VPN 路由又吞掉所有端口（`connect` 成功但 TLS 回 `WRONG_VERSION_NUMBER`）。需要一台 VPC 内的机器（= 公网 CVM 的费用）才能做真实握手。**公网端点的探针三态已在 §2.3 用真实清单验证** |
+
+附带的事实（值得记进文档）：这个账号**完全忽略监听器级别的证书绑定**，SNI 证书落在规则的 primary `CertId` 上，`extCertIds` 始终为空 —— 所以 `docs/staging-checklist.md` 里"SNI 监听器需要 `multi_cert_info`"那段在本账号上不成立（真机行为以账号而定，规则级 CertId 才是唯一入口）。
+
+清理已核对：本轮创建的 5 张证书、2 台 CLB、规则/VPC/子网/安全组全部按 ID 删除，terraform state 为空，DNSPod zone 仍是 11 条记录且 0 条 `r11`/`_acme-challenge`，账号里原有 36 张证书**逐张完好**；`-prune-certs` 从未运行。
 
 ---
 
-## 6. 精度说明
+## 6. 容器里的真实 DNS-01 与自然墙钟续期
+
+*(这一条仍在执行：在 Linux 容器里（本机 53 被占、容器里可用）跑 `make e2e` 与 `make test-pebble`，并用 pebble 的短有效期 profile 让守护进程按真实时间等到 ARI 窗口打开后自行续期。返回后补齐：suites 结果、CA 是否真的读到了我们写下的 TXT、自然续期的墙钟耗时与触发源。)*
+
+---
+
+## 7. 精度说明
 
 - **"验证过"的标准**：本文件里每一条"已证实"都配了可复现的命令与原始输出（长日志在 `/tmp/wv-verify/`、`/tmp/wcert-verify/`、`/tmp/drill/`、`/tmp/verify-*.json`）；凭"读代码觉得对"的一律不算。
 - **注入式验证的边界**：fsync/rename EIO 是**系统调用级注入**，不是真实断电；SIGKILL 是进程级杀灭，不是掉电。两者覆盖了产品代码里所有"持久化调用失败"的分支，但不覆盖文件系统自身的原子性保证。
