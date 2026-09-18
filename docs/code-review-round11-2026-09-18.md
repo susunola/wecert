@@ -130,7 +130,9 @@
 - `bash scripts/test-e2e-wildcard.sh`（5/5）
 - `go test -race -count=1 ./...`：**20/20 包**
 - `make test-tags`（`-tags "pebble lego_dns"` 下的全套 + vet）：绿。第一次尝试失败是环境冲突 —— 某个复审者留在 `/tmp` 的桩 ACME 服务器一直占着 14000 端口（用例报 `bind: address already in use`），确认那是残留进程后结束它，重跑即绿。
-- `make e2e`：**3/3 绿**（真实 DNS-01 生命周期 9 秒、pebble 上的订单协议 6 秒、通配符/apex 共享名 22 秒），HTML 报告 `docs/e2e-run-2026-09-18.html`。
+- `make e2e`：**2/3 通过，第 1 个套件在本机 SKIP**（`limactl` 的 DNS 代理占着 53/tcp，Go 侧写的是 `cannot bind TCP port 53 ... address already in use`）。按 #68 定下的语义，SKIP 就是门禁失败，所以这条命令在本机**退出 1**，HTML 报告里也这么写（`docs/e2e-run-2026-09-18.html`，报告页明确标注"这个套件没跑"）。pebble 上的订单协议（13.8 秒）与通配符/apex 共享名（22 秒）两个套件通过。
+
+  值得记一笔的是**这一轮差点把 SKIP 当成通过**：rebase 之前的分支用的还是旧 `e2e.sh`，它对 SKIP 套件打印 `pass in 9s`；本轮的 #68 修好之后同一条命令才如实报"缺 Go 报告 + 退出 1"。这条修正本身就是上一轮那类缺陷（"跳过的套件被写成通过"）在真实环境里再抓到一次。
 
 提交：本轮 13 个提交都在 `test/e2e-tlsserver-renewal` 上（恢复功能 → 两个视角的修复 → CI 门禁补强 → 规模修复 → 本报告）。**分支基底需要留意**：这一轮开始时该分支的基底早于 `main` 上的 #66/#68，直接推上去会把 #68（"SKIP 的套件算失败"+ 缺 Go 报告不再 traceback）在合并时**回退**；发现后已把本轮 13 个提交 rebase 到当时的 `origin/main` 上，并确认 `docs/stage-c-cvm-systemd.md`、`scripts/e2e-sni.sh`、`scripts/e2e-report.py` 的修复都还在。恢复功能与两轮 review 的修复在同一提交里，因为它们是同一轮的工作。
 
