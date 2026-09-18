@@ -176,6 +176,16 @@ func Restore(dest, source string) (RestoreResult, error) {
 	res.Certificates = stats.certificates
 	res.Account = stats.account
 
+	// The state directory, created the way open() creates it: restoring onto a fresh host -- the
+	// disaster this command exists for -- is exactly when /var/lib/wecert may not exist yet, and
+	// "create temp file: no such file or directory" is not an answer an operator can act on. Before
+	// the lock, because the lock FILE lives in this directory too.
+	if dir := filepath.Dir(realDest); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return res, fmt.Errorf("restore: create the state directory %s: %w", dir, err)
+		}
+	}
+
 	// The lock is the same one the daemon holds, so this is the check that stops a restore from
 	// happening under a running process -- which would leave that process writing to an unlinked
 	// inode (state.VerifyOnDisk reports it, but only after the fact).
