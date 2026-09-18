@@ -36,6 +36,8 @@ The one flow a human is part of, and the one that is hardest to fake.
 |---|---|---|
 | 1.1 | `sudo -u wecert wecert -config … -once` on a fresh state store, **with the daemon stopped** (the state database is locked by a running process, and the refusal is by design) | uploads, prints the uploaded CertId, logs "waiting for a one-time manual bind in the CLB console"; issuance succeeds and `wecert_certificate_deployed` stays **0** |
 | 1.2 | Bind that certificate to a CLB listener in the console (an **SNI** listener needs `multi_cert_info`; the primary `certificate_id` is silently ignored) | — |
+
+> **Verified on a real account (2026-09-18):** that warning is account-dependent. On the account used for the round-11 verification, the listener-level certificate fields are ignored entirely and the SNI certificate lives on the **forwarding rule's primary `CertId`** (`extCertIds` is always empty) — so "bind it in the console" means the rule, not the listener. Check with `wecert-clbverify -region <r> -clb <id> -raw`, which dumps the listener and its rules, before concluding the bind did not take.
 | 1.3 | Wait one reconcile pass, or POST `/hook/reconcile` | logs "confirmed the certificate is bound"; `wecert_certificate_deployed{cert}` becomes **1** |
 | 1.4 | Force the next renewal window (`renewBefore` shorter, or a second staging cert), run a pass | `UpdateCertificateInstance` runs, the listener moves to the new CertId **without** console work |
 | 1.5 | `wecert-clbverify -region $WECERT_REGION -clb <id> -expect <newCertId>` | exit 0; the assertion sees SNI extension certificates too |
