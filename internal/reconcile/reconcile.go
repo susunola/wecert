@@ -396,17 +396,39 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		}
 
 		orphans++
-		r.tearDownOrphan(ctx, name)
+		// Only the first few get their own line (see orphanLogLimit): the count is what an operator
+		// acts on, and 500 of these every pass -- which is what a deployment that dropped a whole
+		// generated document looks like -- buries every other line in the journal, forever, because
+		// the row is deliberately kept.
+		r.tearDownOrphan(ctx, name, orphans > orphanLogLimit)
 	}
 	metrics.OrphanedCertificates.Set(float64(orphans))
+	if orphans > orphanLogLimit {
+		r.log.Error("more certificates are no longer in the desired state than are listed above; they "+
+			"will not be renewed and will expire unless their declarations come back",
+			"orphans", orphans, "listed", orphanLogLimit,
+			"metric", "wecert_orphaned_certificates",
+			"listThem", "sqlite3 <statePath> \"SELECT name FROM certificates ORDER BY name\" and "+
+				"compare against the desired-state document")
+	}
 }
+
+// orphanLogLimit bounds the per-pass orphan lines at Error.
+//
+// Why a bound at all: an orphan is loud on purpose (nothing else will ever mention that a
+// certificate stopped being renewed), but the state is persistent by design -- the row is kept so a
+// re-added name resumes its history -- so the line repeats on every pass. At 500 orphans that is
+// 500 ERROR lines per pass and 12,000 per day from one deployment, which is how a journal stops
+// being read. The first few are listed with their names and expiry; the rest are counted, and the
+// count is exported as wecert_orphaned_certificates.
+const orphanLogLimit = 10
 
 // tearDownOrphan reclaims everything a certificate that left the desired state still holds.
 //
 // The claim on the name is already held by the caller (see publishOrphans); this function
 // releases it on every path, including a panic in the middle of the teardown, so a failure here
 // cannot wedge the name against every later pass.
-func (r *Reconciler) tearDownOrphan(ctx context.Context, name string) {
+func (r *Reconciler) tearDownOrphan(ctx context.Context, name string, counted bool) {
 	defer r.release(name)
 
 	st, stErr := r.store.GetCert(name)
@@ -444,9 +466,15 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string) {
 		attrs = append(attrs, "notAfter", st.NotAfter,
 			"daysLeft", config.DaysUntil(st.NotAfter, time.Now()))
 	}
-	r.log.Error("this certificate is no longer in the desired state, so it will not be renewed "+
-		"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard",
-		attrs...)
+	msg := "this certificate is no longer in the desired state, so it will not be renewed " +
+		"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard"
+	if counted {
+		// Past the limit the line still exists -- at Debug, so `-log-level=debug` or a journal query
+		// can still name every one of them -- but it does not drown the pass summary.
+		r.log.Debug(msg, attrs...)
+		return
+	}
+	r.log.Error(msg, attrs...)
 }
 
 // orphanProbeHosts recovers the dialable names of a dropped certificate from the
