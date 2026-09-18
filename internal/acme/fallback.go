@@ -222,11 +222,13 @@ func entriesOfNotIn(want, have []string) []string {
 //     was established, and the next pass immediately ordered the full set -- the one
 //     containing the identifier that cannot issue. Once per backoff window, forever.
 //
-// So while a degradation record exists and the failing evidence is still fresh, the
-// reduced set stands. The full set gets its next attempt when the failure evidence ages
-// out (an operator fixed the name, or the ledger expired) -- that is the documented
-// self-healing entry point, and it now costs one attempt per failure window instead of
-// one per reconcile pass.
+// So while a degradation record exists, the reduced set stands. The full set gets its next
+// attempt at the RENEWAL WINDOW (see the SAN-drift branch in Reconcile): aged-out evidence
+// stops forcing the reduction, but it does not by itself place an order -- a full-set order
+// every pass against an identifier set already known to be broken is the oscillation this
+// whole mechanism exists to stop, and it would exhaust the 5-per-exact-set quota within the
+// week. The cost of that rule is the other direction: after an operator repairs the name,
+// recovery still waits for the renewal window rather than happening on the next pass.
 func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState, held bool) (kept, dropped []string, reason string) {
 	p := m.fallback
 	if p == nil || !p.EnabledOr(false) {
@@ -257,9 +259,9 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState, he
 		return c.Domains, nil, ""
 	}
 
-	// Only names that are still failing recently count. Stale entries do not -- that is
-	// exactly the self-healing entry point: once the problem is fixed the entries age out
-	// and the next round naturally tries the full set again.
+	// Only names that are still failing recently count. Stale entries do not, so a repaired
+	// name stops being dropped; the full set is then tried again at the renewal window (see
+	// the SAN-drift branch), not on the next pass.
 	minFailures := p.MinIdentifierFailuresOr(defaultFallbackMinIdentFail)
 	cutoff := m.now().Add(-m.fallbackWindow())
 
