@@ -44,15 +44,36 @@ LOG="$ROOT/dist/e2e.log"
 : >"$LOG"
 
 echo "==> 1/3 real DNS-01 lifecycle (pebble + authoritative DNS on :53 + real solver)"
+# A SKIP is not a pass.
+#
+# This suite binds port 53 to be a real authoritative server, so on a machine where something
+# already holds :53 (a local resolver, a VM's DNS proxy) it skips itself -- and `go test` exits 0
+# for a skipped test, so the whole gate reported "pass in 0s" for a suite that never ran. That is
+# the one thing an e2e gate must not do: the suites are the evidence, and "we could not run it" is
+# not evidence. The skip is detected from the output and reported as such; set
+# WECERT_E2E_ALLOW_SKIP=1 to run the rest anyway (the report then says the suite did not run).
 start=$(date +%s)
+skip_from=$(( $(wc -l <"$LOG") + 1 ))
 if WECERT_E2E_REPORT="$GORESULT" "$GO" test -tags "pebble lego_dns" -count=1 -timeout 15m \
 	./internal/acme/ -run TestRealDNS01Lifecycle -v >>"$LOG" 2>&1; then
 	go_status=pass
 else
 	go_status=fail
 fi
+if [[ "$go_status" == pass ]] && tail -n +"$skip_from" "$LOG" | grep -qE '^--- SKIP: TestRealDNS01Lifecycle'; then
+	go_status=skip
+fi
 go_seconds=$(( $(date +%s) - start ))
-echo "    $go_status in ${go_seconds}s (log: $LOG)"
+if [[ "$go_status" == skip ]]; then
+	echo "    SKIPPED in ${go_seconds}s: something already holds port 53, so the suite could not run"
+	echo "    (it needs to bind :53; see the log for the exact message) -- log: $LOG"
+	grep -m1 'cannot bind' "$LOG" | sed 's/^/    /' || true
+	if [[ "${WECERT_E2E_ALLOW_SKIP:-0}" != 1 ]]; then
+		echo "    this is a failed gate, not a pass; set WECERT_E2E_ALLOW_SKIP=1 to run the rest anyway" >&2
+	fi
+else
+	echo "    $go_status in ${go_seconds}s (log: $LOG)"
+fi
 
 echo "==> 2/3 ACME order protocol against pebble"
 start=$(date +%s)
@@ -103,6 +124,15 @@ echo "==> report"
 python3 scripts/e2e-report.py --go-report "$GORESULT" --extras "$EXTRAS" --out "$OUT"
 echo "    $OUT"
 
-if [[ "$go_status" != pass || "$pebble_status" != pass || "$wild_status" != pass ]]; then
+# With the override set, "skipped" is an accepted outcome for the first suite only -- and it is
+# recorded on the page, so a report generated this way cannot be mistaken for a full run.
+if [[ "$go_status" == skip && "${WECERT_E2E_ALLOW_SKIP:-0}" == 1 ]]; then
+	echo "note: the real DNS-01 suite did not run (WECERT_E2E_ALLOW_SKIP=1); the report says so" >&2
+	go_status=skipped
+fi
+if [[ "$go_status" != pass && "$go_status" != skipped ]]; then
+	exit 1
+fi
+if [[ "$pebble_status" != pass || "$wild_status" != pass ]]; then
 	exit 1
 fi
