@@ -186,7 +186,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <span class="badge">默认模式 <b>static</b></span>
     <span class="badge">迁移路径 <b>static → observe → enforce</b></span>
     <span class="badge">当前版本 <b>v0.5.0</b></span>
-    <span class="badge">Go <b>1.26.5</b></span>
+    <span class="badge">Go <b>1.26.6</b></span>
     <span class="badge"><a class="langswitch" href="certificate-lifecycle.en.html" style="color:inherit;text-decoration:none">English</a></span>
   </div>
 </header>
@@ -1063,7 +1063,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <!-- note 5 -->
     <rect class="bx" x="16" y="350" width="212" height="60" rx="8"/>
     <foreignObject x="16" y="350" width="212" height="60">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">5 · 传播检查（quorum）<br/>无可达 NS 否认 且 ≥2 确认</div>
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">5 · 传播检查（quorum）<br/>无可达 NS 否认 且 ≥1 确认<br/>多台权威时要求 ≥2 台</div>
     </foreignObject>
     <path class="edge-dot" d="M228 380 H250"/>
 
@@ -1109,7 +1109,8 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
   <p>
     传播检查用 quorum 而不是"全部权威 NS 可达"：实测里 <code>9</code> 个权威 NS 总有
     <code>1</code> 个不可达（实测 <code>确认 8 / 否认 0 / 不可达 1</code>）。
-    要求全部可达会让验证永远通不过；判据是<strong>没有任何可达的 NS 否认，且至少 2 个确认</strong>。
+    要求全部可达会让验证永远通不过；判据是<strong>没有任何可达的 NS 否认，且至少一台确认</strong>——
+    多台权威的 zone 还要求至少 <code>2</code> 台独立确认，只有一台权威的 zone 一台即可。
   </p>
 </section>
 
@@ -1328,7 +1329,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <tr>
         <td>临近到期且反复签发失败（<code>failureFallback</code> 开启时）</td>
         <td><span class="pill warn">摘掉反复失败的名字先签</span></td>
-        <td>部分可用好过全挂。只摘有逐个授权失败证据的名字；记录老化后自愈</td>
+        <td>部分可用好过全挂。只摘有逐个授权失败证据的名字；记录老化后不再摘它，但全集要等到下一个续期窗口才重试</td>
       </tr>
     </tbody>
   </table>
@@ -1344,12 +1345,13 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <tr><td>New Certs / 注册域</td><td>50 / 7 天 · <strong>跨账号共享</strong></td><td>域名集合频繁变化</td><td>通配符优先 + 25 次/周预算</td></tr>
       <tr><td>New Certs / <strong>精确 identifier 集合</strong></td><td>5 / 7 天 · <strong>无 override</strong></td><td>同一组域名反复重签</td><td>每证书最多一个在途订单</td></tr>
       <tr><td>Authorization Failures / identifier</td><td>5 / 小时</td><td>DNS 没配好还猛重试</td><td>退避 + 转人工</td></tr>
-      <tr><td colspan="4"><strong>ARI 协调的续期：豁免以上全部。</strong> 但豁免的前提是<em>同名续期</em>——订单必须带 <code>replaces</code>，且 identifier 集合不变。</td></tr>
+      <tr><td colspan="4"><strong>ARI 协调的续期：豁免以上全部。</strong> 前提是订单必须带 <code>replaces</code>，且与被替换的证书<em>至少共享一个 identifier</em>——集合不变自然满足，完全不相交才失去豁免。</td></tr>
     </tbody>
   </table>
 
   <div class="callout neutral">
-    <p>这一条推出来的直接结论：<strong>域名集合变一次就是一张全新证书</strong>，拿不到 ARI 豁免。
+    <p>这一条推出来的直接结论：<strong>与旧证书完全不相交的域名集合就是一张全新证书</strong>，拿不到 ARI 豁免，
+    要花掉"每注册域 50 张 / 7 天"的额度（增删域名只要还共享至少一个 identifier，豁免就还在）。
     所以"加一个域名"的成本必须被压到接近零，而唯一能做到这件事的手段就是通配符。
     这也是为什么期望状态生成器宁可把"加子域"解释成"已被通配符覆盖，0 次签发"，
     也不肯为它动 SAN 集合。</p>
@@ -1370,7 +1372,9 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 
       <h3><code>DescribeListeners</code> 不回读证书绑定</h3>
       <p>
-        想确认"到底绑上没绑上"，唯一可靠的办法是看 <code>CertificateDeployInstanceEmpty</code>。
+        可靠的独立信号是 <code>UpdateCertificateInstance</code> 返回里的 <code>UpdateSyncProgress.TotalCount</code>
+        和 <code>CreateCertificateBindResourceSyncTask</code>（后者也是 wecert 每轮用来确认"人工绑上没绑上"的手段）。
+        <code>TotalCount</code> 为 0 意味着证书其实没绑上。
       </p>
 
       <h3>绑定成功 ≠ 已经生效</h3>
@@ -1409,7 +1413,8 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 
       <h3>传播检查不能用"全部权威 NS 可达"</h3>
       <p>
-        实测 9 个 NS 里总有 1 个不可达。判据是 quorum：没有可达的 NS 否认，且至少 2 个确认。
+        实测 9 个 NS 里总有 1 个不可达。判据是 quorum：没有可达的 NS 否认，且至少一台确认；
+        多台权威的 zone 还要求至少 2 台独立确认，只有一台权威的 zone 一台即可。
       </p>
 
       <h3>CLB 健康检查的源地址不在 VPC CIDR 里</h3>
