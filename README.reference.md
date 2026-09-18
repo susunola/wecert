@@ -1180,12 +1180,12 @@ CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` +
 
 ### Test layout
 
-817 test functions across 78 files in 20 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
+831 test functions across 81 files in 20 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
 
 | Package | Files | Tests | What it covers |
 |---|---|---|---|
-| `internal/acme` | 28 | 235 | The issuance state machine |
-| `internal/state` | 10 | 83 | Schema, permissions, backups, transactions |
+| `internal/acme` | 28 | 232 | The issuance state machine |
+| `internal/state` | 11 | 96 | Schema, permissions, snapshots and restore, transactions |
 | `internal/deploy` | 7 | 82 | Upload, bind confirmation, replacement |
 | `internal/onboarding` | 4 | 81 | Document generation and the CLB guard |
 | `internal/config` | 7 | 67 | Validation, domain normalisation, profiles |
@@ -1198,10 +1198,10 @@ CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` +
 | `internal/atomicfile` | 1 | 6 | The temp-file/fsync/rename protocol |
 | `internal/metrics` | 1 | 2 | The registry itself |
 | `internal/tcerr` | 1 | 1 | The DNSPod "no data" classification |
-| `cmd/*` | 6 | 65 | Per-tool argument handling and exit codes |
+| `cmd/*` | 9 | 69 | Per-tool argument handling and exit codes |
 
 Counts drift as tests are added; the command above is the source of truth, and this table was
-regenerated in review round 6 after the numbers here had been stale since the OCR round.
+regenerated in review round 11 (it had been stale since round 6).
 
 ### What the tests pin down
 
