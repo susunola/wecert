@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # VERSION comes from `git describe --tags`, so the checkout needs the tags themselves.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      # A release is exactly the commit CI already gates on, but a tag can point anywhere --
+      # re-run the gate so a tag placed on an untested commit cannot ship.
+      - name: test
+        run: make test
+
+      - name: build artifacts
+        run: make release
+
+      # CHANGELOG.md sections are headed "## 0.4.2 - 2026-09-16" (no v prefix); the release notes
+      # are the section matching the tag. A tag with no changelog section fails here rather than
+      # publishing an empty release.
+      - name: extract release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## " v " - " { found=1; print; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md || { echo "no CHANGELOG.md section for $version"; exit 1; }
+          cat release-notes.md
+
+      - name: publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "wecert $GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            dist/*

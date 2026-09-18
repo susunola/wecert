@@ -71,6 +71,21 @@ change touches issuance, deployment or cleanup, run it.
 The subject says what changed; the body says **why**, and what the tradeoff was. If you removed a
 guard, say what made it unnecessary — otherwise the next reader cannot tell it from a mistake.
 
+## Releasing
+
+Releases are cut by CI, not by hand. Move the `Unreleased` section of `CHANGELOG.md` to a
+`## X.Y.Z - <date>` heading, push, then tag:
+
+```bash
+git tag -a vX.Y.Z -m "wecert vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: it re-runs the test gate, builds with
+`make release` (same artifacts and `SHA256SUMS` as a local build), and publishes the GitHub
+Release with the matching changelog section as the notes. A tag without a matching changelog
+section fails the workflow rather than publishing an empty release.
+
 ## Reporting a vulnerability
 
 Not here — see [SECURITY.md](SECURITY.md).
