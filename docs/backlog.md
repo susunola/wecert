@@ -7,9 +7,9 @@ shape, and the obvious HA fix does not provide HA. Both are written up in
 
 They are ordered by real exposure over effort.
 
-1. **Make the checks into gates**
+1. **Finish making the checks into gates**
 
-   The cheapest item on this list and the one that protects all the others. CI runs `gofmt`, English, `vet`, `govulncheck`, `test -race`, `make build` and `make release` — but not `check-alerts`, `check-scripts`, `make fuzz` or `make test-pebble`, and `main` has **no branch protection** (checked against the API: "Branch not protected"), so nothing requires the run to pass before a merge. The consequence is concrete: the 17 alert rules and the fuzz corpus added most recently are verified only by whoever remembers to run `make check` locally, and `.github/CODEOWNERS` reads as if reviews were required when they are not. A few lines in `ci.yml` plus two repository settings.
+   Mostly done, and what is left is not code. CI now runs `check-alerts` and `check-scripts` next to `gofmt`, English, `vet`, `govulncheck`, `test -race`, `test-tags`, `make build` and `make release`. Still missing: `make fuzz` (bounded wall-clock, so it belongs in a scheduled job) and `make test-pebble` (needs the pebble binary installed), and **`main` still has no branch protection** (checked against the API: "Branch not protected"), so nothing requires the run to pass before a merge. The repository settings are the part that is not mine to change: require the `test` job, and either fill in `.github/CODEOWNERS` or drop it, because as written it reads as if reviews were required when they are not.
 
 2. **Switch on GitHub private vulnerability reporting**
 
