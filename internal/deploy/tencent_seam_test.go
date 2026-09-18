@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"errors"
+	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -1267,5 +1268,47 @@ func TestDeployReportsAPendingFirstBindInsteadOfAFailure(t *testing.T) {
 	if errors.Is(err, ErrNothingBoundYet) {
 		t.Error("an incomplete enumeration reports zero for a certificate that may be bound where the " +
 			"read did not reach: that must not be read as \"nothing is bound\", or a needed switch is skipped")
+	}
+}
+
+// A call cut short by a shutdown must carry the shutdown's sentinel.
+//
+// The SDK builds a fresh *TencentCloudSDKError from the transport error's string and does not wrap
+// it, so `errors.Is(err, context.Canceled)` is false for a cancelled call. Upstream, recordFailure
+// uses exactly that test to decide "a stopped process is not a business failure" -- without the
+// sentinel, a stop signal costs the certificate a failure counter, a backoff and a last_error it
+// must then serve out after the restart.
+func TestACancelledSDKCallCarriesTheContextError(t *testing.T) {
+	// The shape the SDK produces, verbatim from common@v1.3.180's netretry path.
+	sdkErr := tcerrors.NewTencentCloudSDKError("ClientError.NetworkError",
+		"Post \"https://ssl.tencentcloudapi.com\": context canceled", "req-1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := sdkCallError(ctx, "UploadCertificate", sdkErr)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("a cancelled call must unwrap to context.Canceled, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "UploadCertificate") {
+		t.Errorf("the call has to stay identifiable, got %v", err)
+	}
+
+	// A live context means the SDK error is a real failure, and it must keep its own identity so
+	// the caller can classify it (a throttle is retried, a permission error is not).
+	err = sdkCallError(context.Background(), "UploadCertificate", sdkErr)
+	if !errors.Is(err, sdkErr) {
+		t.Errorf("a failure on a live context must keep the SDK error, got %v", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Error("a live context must not manufacture a cancellation")
+	}
+
+	// A deadline that has expired is the same story as a cancellation: the context is the reason.
+	expired, cancelExpired := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelExpired()
+	time.Sleep(time.Millisecond)
+	if err := sdkCallError(expired, "UploadCertificate", sdkErr); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("an expired deadline must unwrap to context.DeadlineExceeded, got %v", err)
 	}
 }

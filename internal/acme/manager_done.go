@@ -27,7 +27,7 @@ func (m *Manager) download(
 	o *state.Order, order legoacme.ExtendedOrder, rd round,
 ) error {
 	if order.Certificate == "" {
-		return m.recordFailure(st, errors.New("the order is valid but has no certificate URL"))
+		return m.recordFailure(ctx, st, errors.New("the order is valid but has no certificate URL"))
 	}
 
 	// Idempotent backstop: the order's certificate is already the live one, which means the
@@ -51,7 +51,7 @@ func (m *Manager) download(
 			// order. That is still a failed pass -- and the one thing it must not do is come back
 			// immediately, because discardOrder is what reclaims TXT records through authoritative
 			// DNS probes.
-			return m.recordFailure(st, fmt.Errorf("discard the already-live order: %w", err))
+			return m.recordFailure(ctx, st, fmt.Errorf("discard the already-live order: %w", err))
 		}
 		return nil
 	}
@@ -60,16 +60,16 @@ func (m *Manager) download(
 	// the format CLB needs.
 	fullchain, _, err := m.core.GetCertificate(order.Certificate, true)
 	if err != nil {
-		return m.recordFailure(st, fmt.Errorf("download certificate: %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("download certificate: %w", err))
 	}
 
 	leaf, err := ParseLeaf(fullchain)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	if err := VerifyCoverage(leaf, c.Domains); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	// A certificate exists at the CA now, so the two certificate budgets are spent -- here, not
@@ -110,19 +110,19 @@ func (m *Manager) download(
 	// live certificate's material is unavailable or unparseable, where "later expiry" is the
 	// only evidence available.
 	if !st.NotAfter.IsZero() && !leaf.NotAfter.After(st.NotAfter) && !certIsNewer(leaf, st) {
-		return m.recordFailure(st, fmt.Errorf(
+		return m.recordFailure(ctx, st, fmt.Errorf(
 			"the new certificate's notAfter (%s) is not later than the current one (%s), and it was not "+
 				"issued after it either, so it is not a replacement; refusing to deploy",
 			leaf.NotAfter, st.NotAfter))
 	}
 	if len(o.KeyPEM) == 0 {
-		return m.recordFailure(st, errors.New("the order has no private key; cannot deploy"))
+		return m.recordFailure(ctx, st, errors.New("the order has no private key; cannot deploy"))
 	}
 	// The last gate of the same triad as coverage and notAfter: a certificate that covers
 	// the right names and lives long enough, but belongs to a different key, would be
 	// deployed over a working one and break every handshake.
 	if err := VerifyKeyMatch(leaf, o.KeyPEM); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	// Deploy. On a first issuance DeployedCertID is empty, so this only uploads and waits
@@ -162,7 +162,7 @@ func (m *Manager) download(
 					// first -- and a bare `return err` also skips the backoff, so it retries at the
 					// pass rate instead. recordFailure keeps both (it schedules the retry and leaves
 					// the failure visible), which is what the sibling call sites already do.
-					return m.recordFailure(st, fmt.Errorf(
+					return m.recordFailure(ctx, st, fmt.Errorf(
 						"the certificate %s was uploaded but recording it for the resume anchor failed: %w",
 						id, err))
 				}
@@ -219,11 +219,11 @@ func (m *Manager) download(
 					if err := m.store.PutOrder(o); err != nil {
 						// As above: the upload happened, so the id is the only record of a cloud object,
 						// and the failure has to cost a backoff rather than a bare retry.
-						return m.recordFailure(st, fmt.Errorf(
+						return m.recordFailure(ctx, st, fmt.Errorf(
 							"the certificate %s was uploaded but recording it for reclaim failed: %w", id, err))
 					}
 				}
-				return m.recordFailure(st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
+				return m.recordFailure(ctx, st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
 			}
 		}
 		deployedID = id
@@ -453,7 +453,7 @@ func (m *Manager) download(
 		// st is deliberately untouched: the promotion did not commit, so neither the in-memory
 		// state nor the failure row this records may claim it did. (It also keeps the operator's
 		// failure count attached to the certificate that is actually still live.)
-		return m.recordFailure(st, fmt.Errorf(
+		return m.recordFailure(ctx, st, fmt.Errorf(
 			"the certificate was issued and deployed, but recording that in state.db failed, so it "+
 				"is unchanged on disk and this pass is reported as failed: %w. The next pass will "+
 				"re-order (which costs an issuance against the per-identifier-set limit); if this "+
@@ -551,11 +551,20 @@ func uniqueRegisteredDomains(domains []string) []string {
 // identifier per hour", hammering retries only makes things worse. Backing off to 6 hours
 // means at most 4 attempts a day, far below the rate-limit threshold, while still
 // guaranteeing that a fixed problem heals itself.
-func (m *Manager) recordFailure(st *state.CertState, err error) error {
+func (m *Manager) recordFailure(ctx context.Context, st *state.CertState, err error) error {
 	// A stopped process / cancelled parent context is not a business failure. Recording it
 	// would lengthen the backoff, so after a restart the same order should have been pushed
 	// on immediately but is instead locked out of the window.
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	//
+	// The question is whether THIS PASS was stopped, not what the error happens to wrap. Testing
+	// errors.Is against context.Canceled/DeadlineExceeded also matched every http.Client timeout,
+	// because net/http wraps its own deadline in *url.Error, whose Unwrap is
+	// context.DeadlineExceeded -- so an ordinary CA-side timeout, the commonest failure there is,
+	// was filed as "pass cancelled": no consecutive_failures, no last_error, no backoff, and on a
+	// first issuance not even a certificate row for the next pass to find. The context is the
+	// authority on why the pass stopped; if it is still alive, the error is a real failure whatever
+	// it unwraps to.
+	if ctx.Err() != nil {
 		m.log.Warn("pass cancelled; not counted as a failure and no backoff applied", "cert", st.Name, "err", err)
 		return err
 	}

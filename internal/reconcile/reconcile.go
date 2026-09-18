@@ -568,6 +568,15 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 		r.retryRevocations(ctx)
 		return rep
 	}
+	// Before anything is written this pass: is the database still the file this process opened, and
+	// does it still hold the cross-process lock? SQLite and flock bind to the inode, so a state
+	// directory removed (or a database restored) under a running daemon is invisible to every
+	// read and write that follows -- the pass keeps converging into a file nothing will read again.
+	for _, problem := range r.store.VerifyOnDisk() {
+		r.log.Error("the state database underneath this process has changed", "problem", problem,
+			"hint", "stop the daemon, restore the directory or the newest snapshot, then start it again")
+	}
+
 	r.publishOrphans(ctx, res)
 
 	// The probe floor and the certificates finally meet here.

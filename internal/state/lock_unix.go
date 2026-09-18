@@ -45,6 +45,35 @@ func acquireLock(path string) (*fileLock, error) {
 	return &fileLock{f: f, path: path}, nil
 }
 
+// VerifyHeld reports whether this process still holds the lock FILE that sits at the path.
+//
+// flock is bound to the inode, so `rm state.db.lock` -- the very "clear the stale lock" habit the
+// comment above uses to justify flock over a PID file -- hands the next process a brand new inode
+// to lock while this one keeps "holding" the old one. Both then run against the same database,
+// which is precisely the duplicate-order path the lock exists to prevent (two orders for one
+// identifier set run into the 5-per-7-days limit). Nothing can prevent the removal; what can be
+// done is to notice it. The caller reports this, and the operator has a process to stop.
+func (l *fileLock) VerifyHeld() error {
+	if l == nil {
+		return nil
+	}
+	held, err := l.f.Stat()
+	if err != nil {
+		return fmt.Errorf("cannot stat the held lock file %s: %w", l.path, err)
+	}
+	onDisk, err := os.Stat(l.path)
+	if err != nil {
+		return fmt.Errorf("the lock file %s that this process holds is gone (%v); another process can "+
+			"now open the same state database, and two writers are one duplicate order away from the "+
+			"exact-identifier-set rate limit", l.path, err)
+	}
+	if !os.SameFile(held, onDisk) {
+		return fmt.Errorf("the lock file %s has been replaced since this process locked it; another "+
+			"process can hold a lock on the new file while this one keeps writing", l.path)
+	}
+	return nil
+}
+
 func (l *fileLock) release() error {
 	if l == nil || l.f == nil {
 		return nil
