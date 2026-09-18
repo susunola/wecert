@@ -112,7 +112,8 @@ done
 ### P6 构建
 
 ```bash
-make build   # 产出 ./bin/wecert 与 ./bin/wecert-onboard
+make tools   # 产出 ./bin/wecert 与 ./bin/wecert-onboard（`make build` 只产出 wecert，
+             #  Part B 之后会直接调用 wecert-onboard，所以这里用 tools）
 ```
 
 ### P7 配置文件
@@ -447,7 +448,7 @@ q "SELECT consecutive_failures, datetime(next_attempt_at,'unixepoch') FROM certi
 | `consecutive_failures` | **0**（`kill -9` 什么都没来得及记） |
 | `next_attempt_at` | 0（同上：没有退避，恢复轮不需要清） |
 | 日志 | `TXT presented` ×2，且**没有** `TXT propagated` |
-| 退出码 | 被杀时是 137。**顺带记住**：`-once` 即使这一轮失败也是 **0**（`RunAll` 刻意丢弃单张证书的错误），所以永远不要用退出码判断单张证书的成败 |
+| 退出码 | 被杀时是 137。**顺带记住**：`-once` 在"这一轮没有收敛"时退出码是 **1**（`onceExit`；"什么都没尝试、全部被跳过"也算没有收敛），只有真正收敛才回 0 —— 这是 systemd timer 用来报警的信号。旧文写的"即使失败也是 0、永远不要看退出码"描述的是 `RunAll` 时代的行为，那个函数已经不存在了 |
 
 **这一条是整个 A4 的核心**：直接看到"一个名字下两条 TXT 并存"，
 而不是靠"签发成功"去反推。
@@ -570,7 +571,7 @@ _acme-challenge.<名字> - check that a DNS record exists for this domain
 （配置去重的是证书名，不是域名）。lego 的 provider `CleanUp` 会删掉**该名字下的所有**
 TXT，所以 A 的清理绝不能把 B 还活着的记录一起删掉。
 
-`RunAll`（`-once` 和定时巡检）是**顺序**执行的，碰不到这个窗口；
+`RunDetailed`（`-once` 和定时巡检）是**顺序**执行的，碰不到这个窗口（`RunAll` 这个名字已经不存在）；
 要真正并发，只能用 webhook 触发（`StartCert` 给每张证书一个 goroutine）。
 而守护进程启动时会立刻跑一轮 —— 所以顺序是"先让初始那轮无事可做，
 再用 SQL 把两张证书同时推进续期窗口，最后触发"。

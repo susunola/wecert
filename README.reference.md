@@ -694,7 +694,7 @@ Poll `/hook/status` for the outcome:
   "time": "2026-09-15T18:00:00Z",
   "certificates": [
     { "name": "a-com", "notAfter": "2026-12-14T16:41:58Z", "daysLeft": 89,
-      "deployed": true, "deployConfirmed": true, "consecutiveFailures": 0 }
+      "uploaded": true, "deployConfirmed": true, "consecutiveFailures": 0 }
   ]
 }
 ```
@@ -878,9 +878,11 @@ answered by asking. wecert answers it two ways, and the difference matters:
 
 - **Locally, from what it spent** (`wecert_ratelimit_remaining_tokens`). Every event that
   consumes quota goes through wecert, and the buckets refill at published rates, so the
-  remainder can be reconstructed exactly — for this program. It is a **lower bound**: the
+  remainder can be reconstructed exactly — for this program. It is an **upper bound**: the
   per-registered-domain and per-exact-set limits are global, and another account spending them
-  is invisible here. Read it as "at least this much is left".
+  is invisible here, so the real remainder can only be smaller. Read it as "at most this much is
+  left" — the direction matters, because "at least" would invite spending quota that may not be
+  there.
 - **From the CA, when it refuses** (`wecert_ratelimit_blocked`). A rate-limited request returns
   a documented message ending in `retry after <instant>`, and when several limits are exceeded
   at once the CA reports the one that resets *furthest* in the future. That instant is
@@ -911,7 +913,7 @@ row per bucket in `rate_buckets`: the bucket model is its own memory, so no even
 | `wecert_certificate_fallback_dropped_names{cert}` | How many names that partial certificate is missing |
 | `wecert_desired_state_age_seconds` | Age of the desired-state document. A growing value means `wecert-onboard` stopped running |
 | `wecert_orphaned_certificates` | Certificates in the state store but absent from the desired state. They will not be renewed |
-| `wecert_ratelimit_remaining_tokens{limit,scope}` | Estimated tokens left in a published CA rate limit. **A lower bound**: it counts only what wecert spent, while *certs per registered domain* and *certs per exact set of identifiers* are global across all accounts |
+| `wecert_ratelimit_remaining_tokens{limit,scope}` | Estimated tokens left in a published CA rate limit. **An upper bound**: it counts only what wecert spent, while *certs per registered domain* and *certs per exact set of identifiers* are global across all accounts, so the true remainder can be smaller |
 | `wecert_ratelimit_blocked{limit,scope}` | `1` while the CA has refused a request against this limit and reported when it will accept one again |
 
 Alert on `not_after`, **not** on "did the renewal job error" — the latter stays silent when the program is quietly broken:
@@ -946,20 +948,26 @@ watching quota behaviour under a deliberately broken name.
 With a **CVM role** (the default), credentials come from instance metadata and never touch disk:
 
 ```
-dnspod:DescribeRecordList / CreateRecord / DeleteRecord   scope: your single acme-auth zone
+dnspod:DescribeRecordList / CreateRecord / DeleteRecord / DescribeDomainList
 ssl:UploadCertificate
 ssl:DescribeCertificates
 ssl:DeleteCertificate
+ssl:DescribeDeleteCertificatesTaskResult
 ssl:UpdateCertificateInstance
 ssl:DescribeHostUpdateRecordDetail
 ssl:CreateCertificateBindResourceSyncTask
 ssl:DescribeCertificateBindResourceTaskResult
 ```
 
-Omitting any of the last three is not a soft failure: without
+Omitting any of these is not a soft failure: without
 `DescribeHostUpdateRecordDetail` every one-click rebind times out after three minutes and
-the certificate is re-uploaded each round, and without the two bind-resource actions the
-`deployed` metric can never turn green.
+the certificate is re-uploaded each round, without the two bind-resource actions the
+`deployed` metric can never turn green, and without
+`DescribeDeleteCertificatesTaskResult` every `IsCheckResource=true` delete is polled
+through an API the role may not call, so `ReapRetired` keeps the certificate on its list
+and logs a warning every round instead of reclaiming it. `deploy/cam-policy-*.json` is the
+authoritative list, and `scripts/check-cam-policies.py` (run by `make check`) fails when a
+policy stops covering an API the code calls.
 
 `deploy/cam-policy-test.json` and `deploy/cam-policy-stage-ab.json` contain ready-made policies.
 
@@ -1214,7 +1222,8 @@ Runs a full issuance against staging with a throwaway state database, refusing t
 
 ## License
 
-No license file is present in this repository. Absent a license, the default is all rights reserved — **add one before distributing or accepting external contributions.**
+MIT — see [LICENSE](LICENSE). (This section used to say no license file was present; the file has
+been in the repository since the first release.)
 ---
 
 <sub>[← Back to the overview](README.md) · [简体中文](README.reference.zh-CN.md)</sub>

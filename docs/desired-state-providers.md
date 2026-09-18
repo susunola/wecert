@@ -37,7 +37,7 @@ wecert 今天已经能做到"域名集合变了 → 立刻重签"（`CoverageDri
 | 域名集合漂移检测 | `acme.CoverageDrift` | 线上证书的 SAN ≠ 配置 → 立即重签 |
 | 事件触发 | `POST /hook/reconcile` | 外部可以按需触发一轮收敛 |
 | 单证书并发闸门 | `reconcile.Reconciler` | 定时器与事件触发不会重复下单 |
-| 收敛循环 | `reconcile.RunAll/RunCert` | 已经能收敛任意的 `[]config.Certificate` |
+| 收敛循环 | `reconcile.RunDetailed/RunCert` | 已经能收敛任意的 `[]config.Certificate`（`RunAll` 在 OCR 那轮删掉了，守护进程与 `-once` 都走 `RunDetailed`） |
 
 **结论：`internal/reconcile` 几乎不用改。** 它已经能收敛任何一份期望状态，
 问题只在于今天这份期望状态来自一个静态 YAML。
