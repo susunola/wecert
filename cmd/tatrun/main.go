@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
@@ -44,6 +46,9 @@ func run() error {
 
 	if *region == "" || *instance == "" || *command == "" {
 		return fmt.Errorf("-region, -instance and -cmd are required")
+	}
+	if err := validateInterval(*interval); err != nil {
+		return err
 	}
 
 	secretID := os.Getenv("TENCENTCLOUD_SECRET_ID")
@@ -193,6 +198,16 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 	}
 }
 
+// validateInterval rejects a non-positive poll interval: waitForTask sleeps for interval
+// between polls, and a value at or below zero turns that loop into a hot spin against the
+// TAT API.
+func validateInterval(interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("-interval must be positive, got %s (it is the sleep between TAT API polls)", interval)
+	}
+	return nil
+}
+
 // buildRunCommand assembles the RunCommand request.
 //
 // Split out because TAT has one non-obvious requirement: Content must be base64 encoded, and
@@ -246,18 +261,36 @@ func deref(s *string) string {
 // An undecodable value is printed as-is rather than dropped: whatever the server sent is still the
 // only evidence there is, and silently printing nothing would be worse than printing something
 // unreadable. The caller is told which happened.
+//
+// Decodable is not the same as "was encoded": a short word in the Base64 alphabet ("DONE") decodes
+// cleanly into bytes that are not text at all. A decode that fails looksLikeText is not the
+// command's output, so the original string is printed instead of the mojibake.
 func decodeRemoteOutput(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw)); err == nil {
+	if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw)); err == nil && looksLikeText(decoded) {
 		return string(decoded)
 	}
 	// Some encoders omit padding; try the unpadded alphabet before giving up.
-	if decoded, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(strings.TrimSpace(raw), "=")); err == nil {
+	if decoded, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(strings.TrimSpace(raw), "=")); err == nil && looksLikeText(decoded) {
 		return string(decoded)
 	}
 	return raw
+}
+
+// looksLikeText reports whether a decoded payload is plausibly what a shell command printed:
+// valid UTF-8 with no control characters other than the usual whitespace.
+func looksLikeText(b []byte) bool {
+	if !utf8.Valid(b) {
+		return false
+	}
+	for _, r := range string(b) {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 // truncationNotice words the warning for a truncated TaskResult, or returns "" when the output is

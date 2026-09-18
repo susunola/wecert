@@ -275,12 +275,16 @@ func TestAuthoritativeNSSkipsAnUnresolvableNameserver(t *testing.T) {
 		return nil, fmt.Errorf("unexpected query %s", msg.Question[0].Name)
 	})
 
-	servers, err := solver.authoritativeNS(context.Background(), "example.com.")
+	servers, delegated, err := solver.authoritativeNS(context.Background(), "example.com.")
 	if err != nil {
 		t.Fatalf("one unresolvable NS must not fail the lookup: %v", err)
 	}
 	if len(servers) != 1 || servers[0].addr != "198.51.100.53:53" {
 		t.Errorf("servers = %v, want only the resolvable one", servers)
+	}
+	if delegated != 2 {
+		t.Errorf("delegated = %d, want 2: a name that did not resolve is still part of the "+
+			"delegation, and the single-authority exemption must be keyed on the delegation", delegated)
 	}
 	if len(servers) == 1 && servers[0].ns == "" {
 		t.Error("each address must carry the NS name it belongs to: the confirmation rule counts " +
@@ -301,7 +305,7 @@ func TestAuthoritativeNSFailsWhenNoneResolve(t *testing.T) {
 		return nil, fmt.Errorf("unexpected")
 	})
 
-	if _, err := solver.authoritativeNS(context.Background(), "example.com."); err == nil {
+	if _, _, err := solver.authoritativeNS(context.Background(), "example.com."); err == nil {
 		t.Fatal("no resolvable NS must be an error")
 	}
 }
@@ -315,7 +319,7 @@ func TestAuthoritativeNSFailsWithoutNSRecords(t *testing.T) {
 		return nil, fmt.Errorf("unexpected")
 	})
 
-	_, err := solver.authoritativeNS(context.Background(), "example.com.")
+	_, _, err := solver.authoritativeNS(context.Background(), "example.com.")
 	if err == nil || !strings.Contains(err.Error(), "example.com.") {
 		t.Errorf("the error must name the zone, got: %v", err)
 	}

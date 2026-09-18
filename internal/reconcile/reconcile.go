@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/metrics"
@@ -369,6 +371,12 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		if want[name] {
 			continue
 		}
+		// The gauge answers "present in the store but not in the desired state", so it
+		// counts every orphan FOUND -- including one whose teardown is deferred below
+		// because its own pass is in flight. Counting only the torn-down ones dropped
+		// the gauge to 0 during exactly the rounds an orphan existed but could not yet
+		// be reclaimed, contradicting the metric's own help text.
+		orphans++
 
 		// A name can be absent from the desired state while a pass for it is still in
 		// flight -- that is exactly what removing a certificate mid-issuance looks like,
@@ -401,7 +409,6 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 			continue
 		}
 
-		orphans++
 		// Only the first few get their own line (see orphanLogLimit): the count is what an operator
 		// acts on, and 500 of these every pass -- which is what a deployment that dropped a whole
 		// generated document looks like -- buries every other line in the journal, forever, because
@@ -588,6 +595,10 @@ func (rep RunReport) Trouble() bool {
 	if rep.Failed > 0 || rep.DesiredStateUnreadable {
 		return true
 	}
+	// Backed-off certificates count too: they never land in Skipped (no pass was in
+	// flight -- the manager deliberately did not run one), so without this a pass in
+	// which every certificate sits inside its retry window reported Attempted == 0 and
+	// nothing else, and a one-shot run exited 0 over a fleet making no progress.
 	return rep.Attempted == 0 && (rep.Backoff > 0 || len(rep.Skipped) > 0)
 }
 
@@ -685,7 +696,7 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 
 	r.manager.ReapRetired(ctx)
 	r.retryRevocations(ctx)
-	r.reclaimStaleProbeSeries()
+	r.reclaimStaleProbeSeries(res)
 	r.publishQuota(res)
 	return rep
 }
@@ -776,7 +787,13 @@ func (r *Reconciler) retryRevocations(ctx context.Context) {
 // every host it checks; this round's set is recorded by probeCert. Only the difference is
 // reclaimed, so a host that simply was not probed this round (an unconfirmed deployment,
 // a failed pass) keeps its series rather than flickering.
-func (r *Reconciler) reclaimStaleProbeSeries() {
+//
+// res is the desired state the caller already resolved. It is a parameter rather than
+// something this function fetches because it runs once per pass but judges one host at
+// a time: resolving inside the per-host check meant a full document read, YAML decode,
+// validation and hash -- plus resolve's metric and log side effects -- for EVERY
+// candidate host of every pass.
+func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 	if r.prober == nil {
 		return
 	}
@@ -790,22 +807,21 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 	r.probedHosts = map[string]struct{}{}
 	r.probeMu.Unlock()
 
-	// Resolve the desired state ONCE for the whole loop, not once per stale host.
+	// Judge each candidate host against the desired state the pass already resolved.
 	//
-	// This used to live in hostIsUnconfirmed, which the loop called per host: every stale host paid
-	// a full resolve -- a file read, a YAML decode, a validation pass and a sha256 of the document.
+	// This used to resolve per host (inside hostIsUnconfirmed): every stale host paid a full
+	// resolve -- a file read, a YAML decode, a validation pass and a sha256 of the document.
 	// The scale work in round 11 measured the result at the default probe cap: 500 certificates, a
 	// pass that reclaims stale hosts took 27.8 s against 0.18 s for the same pass with nothing to
 	// reclaim (155x), and it is exactly O(staleHosts x fleetSize): 0.41/1.48/5.66/22.9 s at
 	// 25/50/100/200 certificates. The hosts are also what a shrinking probe set produces -- removed
 	// certificates or names -- so this is the shape of an ordinary fleet edit, not a corner case.
 	//
-	// hostOwner is nil when there is no desired state to judge from (a partially built reconciler in
-	// tests, or an unreadable document): every stale host is then reclaimed, which is what the old
-	// helper did for the partially built case.
+	// hostOwner is nil when there is no store to judge deployment state from (a partially built
+	// reconciler in tests): every stale host is then reclaimed, which is what the old helper did
+	// for that case.
 	var hostOwner map[string]string
-	if r.store != nil && r.provider != nil {
-		res := r.resolve(context.Background())
+	if r.store != nil {
 		if res == nil {
 			// No desired state: keep the series rather than deleting evidence.
 			return
@@ -879,6 +895,13 @@ func (r *Reconciler) anyPassInFlight() bool {
 // error; one already being processed returns ErrAlreadyRunning. Unlike a whole pass,
 // the certificate's own error is propagated: a caller that asked for one specific
 // certificate needs to hear that it failed, not a bare "accepted".
+//
+// This is the SYNCHRONOUS, test- and tooling-oriented entry point: it runs the pass on
+// the caller's goroutine and deliberately bypasses Drain's bookkeeping -- it neither
+// consults draining nor registers with the background group, so a shutdown will not
+// wait for it and it can even start mid-drain. The webhook therefore uses StartCert /
+// StartNamed, which are drain-safe; a production caller that cannot accept that must
+// not switch to RunCert.
 func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 	res := r.resolve(ctx)
 	if res == nil {
@@ -907,8 +930,10 @@ func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 // the same N+1 the full-trigger path already fixed; the per-name path was left behind.
 //
 // The returned maps mirror what the caller needs to answer with: started, alreadyRunning,
-// unknown. A non-nil error means the desired state could not be read, so nothing started
-// and the buckets are meaningless.
+// unknown. A non-nil error means either the desired state could not be read (nothing
+// started, the buckets are meaningless) or a shutdown began mid-walk -- in the latter
+// case the buckets are the partial answer: every name already in `started` was accepted
+// and is waited for by Drain, so the caller can say exactly which passes exist.
 func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
 	started, alreadyRunning, unknown []string, err error,
 ) {
@@ -943,8 +968,11 @@ func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
 		}
 		if err := r.startCert(ctx, res, found); err != nil {
 			if errors.Is(err, ErrShuttingDown) {
-				// Drain began between the check above and this start.
-				return nil, nil, nil, ErrShuttingDown
+				// Drain began between the check above and this start. The names already in
+				// `started` WERE accepted and Drain will wait for them, so they go back to
+				// the caller along with the error: discarding them would report a pass that
+				// is running as one that was refused.
+				return started, alreadyRunning, unknown, ErrShuttingDown
 			}
 			alreadyRunning = append(alreadyRunning, name)
 			continue
@@ -1028,8 +1056,10 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 			// The process is shutting down while this pass is still parked on a
 			// start slot. The caller was told "accepted", so say plainly that the
 			// pass will never run -- otherwise the 202 is indistinguishable from a
-			// pass that started and failed silently.
-			r.log.Debug("shutdown while waiting for a start slot; the queued pass will not run", "cert", c.Name)
+			// pass that started and failed silently. Warn, not Debug: the caller
+			// holds an acceptance that will never be fulfilled, which is exactly
+			// what an operator auditing a shutdown needs to see.
+			r.log.Warn("shutdown while waiting for a start slot; the queued pass will not run", "cert", c.Name)
 			return
 		}
 
@@ -1236,8 +1266,13 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 	// Notified only when the pass actually attempted something: "every renewal attempt
 	// emits" is the documented meaning of this event, and a backoff skip is the absence of
 	// an attempt.
-	if r.notifier != nil && !errors.Is(err, state.ErrBackoff) {
-		r.notifier.Renewal(ctx, c.Name, err)
+	//
+	// Through notifyPanicSafe on the normal path too, not only in the recover above: the
+	// notifier is a user-supplied path, and a panic raised HERE would be caught by this
+	// function's own recover -- turning a pass that had already succeeded into a reported
+	// failure and firing a second, contradictory notification from the recover block.
+	if !errors.Is(err, state.ErrBackoff) {
+		r.notifyPanicSafe(ctx, c.Name, err)
 	}
 	return err
 }
@@ -1279,9 +1314,17 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 	}
 	hosts := probeHosts(domains, r.cfg.Probe.MaxHostsPerCert)
 	if len(hosts) == 0 {
-		// Every name in this certificate is a wildcard: nothing concrete to dial.
-		r.log.Debug("nothing to probe: every name in this certificate is a wildcard",
-			"cert", c.Name, "domains", domains)
+		if r.cfg.Probe.MaxHostsPerCert <= 0 {
+			// A cap of 0 is "off" (probeHosts' contract, e.g. probing paused during an
+			// investigation) -- blaming wildcards would point the diagnosis at the
+			// certificate when the cause is the setting.
+			r.log.Debug("nothing to probe: the per-certificate host cap is 0, so probing is off",
+				"cert", c.Name, "maxHostsPerCert", r.cfg.Probe.MaxHostsPerCert)
+		} else {
+			// Every name in this certificate is a wildcard: nothing concrete to dial.
+			r.log.Debug("nothing to probe: every name in this certificate is a wildcard",
+				"cert", c.Name, "domains", domains)
+		}
 		return
 	}
 	if err := ctx.Err(); err != nil {
@@ -1390,9 +1433,14 @@ func (r *Reconciler) publish(c *config.Certificate) {
 	if profile == "" {
 		profile = config.ProfileClassic
 	}
-	if st.NotAfter.IsZero() {
-		metrics.CertNotAfter.DeleteLabelValues(c.Name, profile)
-	} else {
+	// Drop every series this certificate has before publishing under the current
+	// profile. The profile is a label, so after a profile change the OLD profile's
+	// series otherwise stays at its last value forever -- nothing ever writes it again,
+	// and the per-profile expiry alert keeps comparing a frozen timestamp. A partial
+	// delete is the same mechanism DeleteCertSeries uses: DeleteLabelValues cannot
+	// express "every profile of this cert".
+	metrics.CertNotAfter.DeletePartialMatch(prometheus.Labels{"cert": c.Name})
+	if !st.NotAfter.IsZero() {
 		metrics.CertNotAfter.WithLabelValues(c.Name, profile).Set(float64(st.NotAfter.Unix()))
 	}
 

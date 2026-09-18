@@ -58,11 +58,11 @@ func TestConfiguredDiscoveryUsesOneResolverViewAndAuthoritativeTXT(t *testing.T)
 	if err != nil || zone != "example.com." {
 		t.Fatalf("findZone = %q, %v", zone, err)
 	}
-	servers, err := solver.authoritativeNS(context.Background(), zone)
+	servers, delegated, err := solver.authoritativeNS(context.Background(), zone)
 	if err != nil || len(servers) != 1 || servers[0].addr != authority {
 		t.Fatalf("authoritativeNS = %v, %v", servers, err)
 	}
-	results := solver.probeRecords(servers, []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}})
+	results := solver.probeRecords(servers, delegated, []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}})
 	if len(results) != 1 || !results[0].ready {
 		t.Fatalf("authoritative TXT should pass, got %+v", results)
 	}
@@ -639,7 +639,7 @@ func TestPropagatedVerdictLogsItsEvidenceIncludingUnreachableAuthorities(t *test
 	now := time.Now()
 	budget := zoneBudget{passStart: now, zoneStart: now, deadline: now.Add(5 * time.Second)}
 
-	if err := solver.waitZone(context.Background(), "example.com.", servers, recs, budget); err != nil {
+	if err := solver.waitZone(context.Background(), "example.com.", servers, 3, recs, budget); err != nil {
 		t.Fatalf("two authorities confirmed and none denied, so this is propagated: %v", err)
 	}
 	out := logs.String()
@@ -702,7 +702,7 @@ func TestRecursiveDenialBlocksAnOtherwiseConfirmedVerdict(t *testing.T) {
 	})
 	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
 
-	err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), recs,
+	err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), 2, recs,
 		recursiveTestBudget(60*time.Millisecond))
 	if err == nil {
 		t.Fatal("every recursive resolver answered NXDOMAIN, which is exactly what the CA would be " +
@@ -724,7 +724,7 @@ func TestRecursiveConfirmationAllowsTheVerdict(t *testing.T) {
 	})
 	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
 
-	if err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), recs,
+	if err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), 2, recs,
 		recursiveTestBudget(2*time.Second)); err != nil {
 		t.Fatalf("both views have the value, so this is propagated: %v", err)
 	}
@@ -739,7 +739,7 @@ func TestUnreachableRecursiveResolversDegradeToAWarning(t *testing.T) {
 	})
 	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
 
-	if err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), recs,
+	if err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), 2, recs,
 		recursiveTestBudget(2*time.Second)); err != nil {
 		t.Fatalf("no recursive resolver was reachable, so the authoritative verdict stands: %v", err)
 	}
@@ -855,7 +855,7 @@ func TestATruncatedAnswerDoesNotShrinkTheAuthoritySet(t *testing.T) {
 		},
 	}
 
-	servers, err := solver.authoritativeNS(context.Background(), "example.com.")
+	servers, _, err := solver.authoritativeNS(context.Background(), "example.com.")
 	if err != nil {
 		t.Fatalf("the second resolver answers in full, so this must succeed: %v", err)
 	}

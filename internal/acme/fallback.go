@@ -38,7 +38,7 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState, rd r
 	// Stop waiting for names that can never come back, before anything else looks at the
 	// record. This runs first, and separately from the metrics block below, so the two
 	// concerns stay independent: what the record should contain, and what the gauges say.
-	m.pruneFallback(c)
+	m.pruneFallback(c, &rd)
 
 	kept, dropped, reason := m.fallbackDomains(c, st, rd.fallbackActive)
 
@@ -119,8 +119,9 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState, rd r
 // teaches whoever reads it to ignore the signal.
 //
 // c is the certificate as configured, before applyFallback reduces it: this is the only point
-// in a pass that holds both the record and the full desired set.
-func (m *Manager) pruneFallback(c *config.Certificate) {
+// in a pass that holds both the record and the full desired set. rd is the pass's round value:
+// clearing the record retires its fallbackActive snapshot, which was read before the prune ran.
+func (m *Manager) pruneFallback(c *config.Certificate, rd *round) {
 	if c == nil {
 		return
 	}
@@ -147,6 +148,11 @@ func (m *Manager) pruneFallback(c *config.Certificate) {
 				"cert", c.Name, "err", err)
 			return
 		}
+		// The record is gone, so the pass-entry snapshot is stale: it was read before this
+		// prune, and fallbackDomains treats a held degradation as licence to skip the expiry
+		// gate. Leaving the stale true behind would drop names from a certificate that is
+		// nowhere near expiry, on the strength of a record that no longer exists.
+		rd.fallbackActive = false
 		m.log.Info("every name dropped by an earlier fallback has left the desired set; clearing the record",
 			"cert", c.Name, "wasDropping", gone)
 		return
@@ -301,11 +307,17 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState, he
 		return c.Domains, nil, ""
 	}
 
+	// left is negative once the certificate has already expired, and "expires in -72h0m0s"
+	// buries the one fact the reader most needs: there is no valid certificate left at all.
+	expiry := fmt.Sprintf("expires in %s", left.Round(time.Hour))
+	if left < 0 {
+		expiry = fmt.Sprintf("expired %s ago", (-left).Round(time.Hour))
+	}
 	return kept, dropped, fmt.Sprintf(
-		"issuance has failed %d times in a row and the certificate expires in %s; "+
+		"issuance has failed %d times in a row and the certificate %s; "+
 			"dropping the names whose authorizations keep failing so the rest stay available "+
 			"(and so this stops consuming the exact-set quota every hour)",
-		st.ConsecutiveFailures, left.Round(time.Hour))
+		st.ConsecutiveFailures, expiry)
 }
 
 func (m *Manager) fallbackWindow() time.Duration {

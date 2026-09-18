@@ -50,6 +50,14 @@ func NewHTTPClient(timeout time.Duration) *http.Client {
 //
 // The account key and the kid both live in SQLite: losing them means a brand-new
 // account, needlessly burning another slice of the per-account quota.
+//
+// The key is persisted BEFORE the account is registered, with an empty kid, and the kid
+// is backfilled once registration answers. The other order -- register first, persist
+// both -- loses the account entirely when the write fails after a successful
+// registration: the CA knows the account, but neither the key nor the kid survives
+// locally, so the next start registers a SECOND account. A restart finding a key with an
+// empty kid re-registers with that same key, and a CA returns the existing account for a
+// key it already knows -- so the interrupted registration is recovered, not duplicated.
 func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Client) (*api.Core, error) {
 	directory := cfg.ACME.Directory
 
@@ -58,11 +66,34 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 		return nil, err
 	}
 
+	var keyPEM []byte
+	var key crypto.Signer
 	if acc != nil && len(acc.PrivateKeyPEM) > 0 {
-		key, err := ParsePrivateKeyPEM(acc.PrivateKeyPEM)
+		key, err = ParsePrivateKeyPEM(acc.PrivateKeyPEM)
 		if err != nil {
 			return nil, fmt.Errorf("parse the stored account key: %w", err)
 		}
+		keyPEM = acc.PrivateKeyPEM
+	} else {
+		// First run, or a legacy row without a key: generate the account private key and
+		// persist it before any network call, so a registration that succeeds while its
+		// record fails can still be recovered by the retry above.
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, fmt.Errorf("generate the account key: %w", err)
+		}
+		key = k
+		keyPEM, err = MarshalPrivateKeyPEM(key)
+		if err != nil {
+			return nil, err
+		}
+		if err := store.PutAccount(&state.Account{Directory: directory, PrivateKeyPEM: keyPEM}); err != nil {
+			return nil, fmt.Errorf("persist the account key before registering: %w", err)
+		}
+	}
+
+	// A row with a kid is complete: load it without registering.
+	if acc != nil && acc.KID != "" {
 		core, err := api.New(httpClient, userAgent(), directory, acc.KID, key)
 		if err != nil {
 			return nil, fmt.Errorf("initialise the ACME client: %w", err)
@@ -70,12 +101,9 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 		return core, nil
 	}
 
-	// First run: generate the account private key and register the account.
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate the account key: %w", err)
-	}
-
+	// The key is on disk but no kid is recorded -- either this is the first registration or
+	// an earlier run was interrupted between the registration and the kid backfill. Both
+	// converge on the same call: registering with the stored key.
 	core, err := api.New(httpClient, userAgent(), directory, "", key)
 	if err != nil {
 		return nil, fmt.Errorf("initialise the ACME client: %w", err)
@@ -92,15 +120,15 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 		return nil, fmt.Errorf("register the ACME account: the server returned no account URL (kid)")
 	}
 
-	keyPEM, err := MarshalPrivateKeyPEM(key)
-	if err != nil {
-		return nil, err
-	}
 	if err := store.PutAccount(&state.Account{
 		Directory:     directory,
 		KID:           reg.Location,
 		PrivateKeyPEM: keyPEM,
 	}); err != nil {
+		// The account exists at the CA now, and its key is on disk with an empty kid: the
+		// next start re-registers with the same key, which the CA answers with this same
+		// account. The registration is recovered, not duplicated -- which is exactly the
+		// failure this two-step write exists for.
 		return nil, err
 	}
 

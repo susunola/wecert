@@ -84,7 +84,7 @@ func (m *Manager) RecordRevocation(certName string, reason int) error {
 			ErrRevocationNotRecorded, certName)
 	}
 
-	if _, err := m.RevocationReasonCode(reason); err != nil {
+	if _, err := RevocationReasonCode(reason); err != nil {
 		return fmt.Errorf("%w: %w", ErrRevocationNotRecorded, err)
 	}
 
@@ -142,7 +142,7 @@ func (m *Manager) AttemptRecordedRevocation(ctx context.Context, certName string
 }
 
 // RevocationReasonCode validates a reason code.
-func (m *Manager) RevocationReasonCode(code int) (int, error) {
+func RevocationReasonCode(code int) (int, error) {
 	for _, c := range RevocationReasons {
 		if c == code {
 			return code, nil
@@ -170,7 +170,7 @@ func (m *Manager) RetryPendingRevocations(ctx context.Context) {
 		if err := m.processRevocation(ctx, r.CertName); err != nil {
 			m.log.Warn("revocation still not accepted by the CA; will retry on the next pass",
 				"cert", r.CertName, "reason", ReasonName(r.Reason),
-				"attempts", r.Attempts+1, "outstanding", time.Since(r.RequestedAt).Round(time.Minute),
+				"attempts", r.Attempts+1, "outstanding", m.now().Sub(r.RequestedAt).Round(time.Minute),
 				"err", err)
 		}
 	}
@@ -340,15 +340,6 @@ func leafCertificate(certPEM []byte) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("stored certificate does not parse: %w", err)
 	}
 	return leaf, nil
-}
-
-// leafDER extracts the first certificate's DER bytes from a PEM bundle.
-func leafDER(certPEM []byte) ([]byte, error) {
-	leaf, err := leafCertificate(certPEM)
-	if err != nil {
-		return nil, err
-	}
-	return leaf.Raw, nil
 }
 
 // certIdentity names a certificate for the revocation bookkeeping.

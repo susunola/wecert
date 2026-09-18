@@ -61,7 +61,8 @@ type Store struct {
 	// opened. VerifyOnDisk compares them later: SQLite keeps writing to an inode that has been
 	// unlinked or replaced, so a `rm -rf` of the state directory (or a snapshot restored under a
 	// running daemon) produces writes that succeed, reads that succeed, and a next start that holds
-	// nothing -- with no error anywhere in between.
+	// nothing -- with no error anywhere in between. openedAs is always set: openFiles refuses to
+	// open a database it cannot stat, precisely so this check can never be silently disabled.
 	path     string
 	openedAs os.FileInfo
 
@@ -356,6 +357,13 @@ func open(path string, exclusive bool) (*Store, error) {
 	return s, nil
 }
 
+// statOpenedFile is os.Stat, as a seam.
+//
+// The file it stats was pre-created by openFiles itself, so "the stat of a file we know exists
+// fails" cannot be provoked from a test any other way: every real arrangement that makes stat
+// fail (a lost search permission, an unreachable mount) makes the earlier create fail first.
+var statOpenedFile = os.Stat
+
 // openFiles creates/opens the database files and runs the schema migration.
 //
 // Everything file-creating in here runs under a restrictive umask (see
@@ -430,9 +438,19 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 	s := &Store{db: db, lock: lock, base: filepath.Base(path), path: path}
 	// The identity of the file at that path right now. os.SameFile against a later stat is what
 	// catches "unlinked" and "replaced by a restore" alike, without needing the driver's own fd.
-	if fi, statErr := os.Stat(path); statErr == nil {
-		s.openedAs = fi
+	//
+	// A failure here refuses the open rather than continuing with openedAs=nil: the file was
+	// pre-created by this very function, so it exists, and a stat that fails anyway means the
+	// filesystem is in a state nothing downstream can reason about. Continuing silently would
+	// disable VerifyOnDisk's identity check for the life of the process -- its "is this still
+	// the same inode" comparison has nothing to compare against -- and that check is the only
+	// tripwire for "the database was unlinked or replaced under a running daemon".
+	fi, statErr := statOpenedFile(path)
+	if statErr != nil {
+		db.Close()
+		return nil, fmt.Errorf("stat the state file %s after opening it: %w", path, statErr)
 	}
+	s.openedAs = fi
 
 	// Verify the file is a usable database before anything writes to it.
 	//
@@ -1325,6 +1343,42 @@ func putCertExec(e execer, c *CertState) error {
 	return nil
 }
 
+// RecordFailure updates only the failure-bookkeeping columns --
+// consecutive_failures, last_error, next_attempt_at -- and never touches the
+// certificate material (cert_pem, key_pem, not_after, deployed_cert_id,
+// ari_cert_id, ...).
+//
+// It exists because the failure path (acme's recordFailure) may be holding a
+// CertState synthesised from a failed read: funnelling that through PutCert's
+// whole-row overwrite upsert would blank the private key and PEM of the
+// certificate currently in service. Failure bookkeeping needs only these three
+// columns, so the write surface is narrowed to them. When no row exists yet it
+// inserts one carrying just these fields; every other column falls to its
+// schema default (each NOT NULL column of certificates has a DEFAULT, and
+// cert_pem/key_pem are nullable), which matches what putCertExec's INSERT
+// branch produces for a fresh row.
+func (s *Store) RecordFailure(name, lastErr string, consecutiveFailures int, nextAttemptAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`
+		INSERT INTO certificates (name, consecutive_failures, next_attempt_at, last_error, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			consecutive_failures = excluded.consecutive_failures,
+			next_attempt_at      = excluded.next_attempt_at,
+			last_error           = excluded.last_error,
+			updated_at           = excluded.updated_at`,
+		// last_error is bounded here for the same reason putCertExec bounds it (see
+		// maxLastErrorBytes): upstream error text is unbounded remote-controlled data,
+		// and the point of persistence is the one place the rule cannot be forgotten.
+		name, consecutiveFailures, toUnix(nextAttemptAt),
+		truncate(lastErr, maxLastErrorBytes), time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("record failure for %s: %w", name, err)
+	}
+	return nil
+}
+
 // ---------- Order ----------
 
 // GetOrder reads the in-flight order; returns (nil, nil) when it does not exist.
@@ -1426,6 +1480,13 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 // refuses a specific write, which is how "the write fails but the read did not" (a full disk, a
 // corrupt page) is reproduced deterministically. The alternative is a fake store, and a fake store
 // would not exercise the real SQL, the real transaction or the real error mapping.
+//
+// Why an exported method compiled into the production binary instead of an export_test.go symbol:
+// its callers live in OTHER packages (internal/acme's fault-injection tests), and Go makes
+// test-only symbols visible only to the package's own tests. A _test.go file here simply cannot
+// reach them, so the seam has to ship. It is one statement against an already-open handle -- the
+// same privilege every other method on this type has -- so the cost of shipping it is a naming
+// convention, not an attack surface.
 func (s *Store) ExecForTest(query string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

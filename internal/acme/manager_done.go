@@ -625,6 +625,43 @@ func (m *Manager) recordFailure(ctx context.Context, st *state.CertState, err er
 	return err
 }
 
+// recordFailureUnreadable records a failed pass for a certificate whose state row could
+// not be read this pass.
+//
+// recordFailure persists through PutCert, a whole-row upsert: handing it a CertState
+// synthesised after a failed GetCert -- one holding only the name -- would blank the
+// certificate material (cert_pem, key_pem, not_after, deployed_cert_id, ari_cert_id) of
+// the certificate currently in service. This variant goes through store.RecordFailure,
+// which narrows the write to the failure bookkeeping columns and never touches the rest
+// of the row.
+//
+// What an unreadable row costs is the counter itself: the consecutive failure count
+// cannot be known without the row, so it restarts at 1 and the backoff is the base
+// window. A store whose reads are failing is exactly the case this path exists for, and
+// the material an exact count would take down with it is worth more than the count.
+func (m *Manager) recordFailureUnreadable(ctx context.Context, name string, err error) error {
+	// Same contract as recordFailure: a stopped pass is not a business failure.
+	if ctx.Err() != nil {
+		m.log.Warn("pass cancelled; not counted as a failure and no backoff applied", "cert", name, "err", err)
+		return err
+	}
+
+	// Shift 0: without the stored row the count is unknown, so the base window applies.
+	nextAttemptAt := m.now().Add(time.Minute)
+
+	if perr := m.store.RecordFailure(name, err.Error(), 1, nextAttemptAt); perr != nil {
+		// The deadline computed above cannot be persisted, so hold it in memory as well --
+		// the same reasoning as recordFailure's PutCert failure branch applies.
+		m.setTransientBackoff(name, nextAttemptAt)
+		return errors.Join(err, perr)
+	}
+
+	m.log.Error("pass failed; a retry has been scheduled (the certificate row could not be read, "+
+		"so only the failure bookkeeping was written and the stored certificate material is untouched)",
+		"cert", name, "err", err, "consecutiveFailures", 1, "nextAttemptAt", nextAttemptAt)
+	return err
+}
+
 // discardOrder discards the current order and **reclaims the TXT records before deleting the
 // authorization rows**.
 //

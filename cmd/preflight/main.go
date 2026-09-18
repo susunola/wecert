@@ -54,6 +54,12 @@ func main() {
 		os.Exit(exitUsage)
 	}
 
+	if modes := selectedModes(*bindings, *pruneCerts, *listCerts, *domain); len(modes) > 1 {
+		fmt.Fprintf(os.Stderr, "these flags select different operations and cannot be combined: %s\n",
+			strings.Join(modes, ", "))
+		os.Exit(1)
+	}
+
 	if *bindings != "" {
 		if err := dumpBindings(*bindings); err != nil {
 			fmt.Fprintf(os.Stderr, "\nFAILED: %v\n", err)
@@ -87,6 +93,27 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("\nOK: all preflight checks passed")
+}
+
+// selectedModes lists the operations the command line asked for. They are mutually exclusive:
+// main() used to take the first match and silently drop the rest, so "-prune-certs -bindings
+// <id>" dumped the bindings and never pruned -- the exact opposite of what the flags said, for
+// the flag pair where getting it wrong deletes certificates.
+func selectedModes(bindings string, pruneCerts, listCerts bool, domain string) []string {
+	var modes []string
+	if bindings != "" {
+		modes = append(modes, "-bindings")
+	}
+	if pruneCerts {
+		modes = append(modes, "-prune-certs")
+	}
+	if listCerts {
+		modes = append(modes, "-list-certs")
+	}
+	if domain != "" {
+		modes = append(modes, "-domain")
+	}
+	return modes
 }
 
 // creds loads and validates the Tencent Cloud credentials.
@@ -251,6 +278,10 @@ var describeDomainList = func(ctx context.Context, client *dnspod.Client, req *d
 //
 // A nil item (with nil error) means the account genuinely does not hold the domain.
 func findDomain(ctx context.Context, client *dnspod.Client, domain string) (*dnspod.DomainListItem, error) {
+	// A trailing dot ("example.com.") is how an absolute DNS name is written, and users paste it
+	// from resolver output; DNSPod stores the name without it, so the exact comparison below
+	// would false-report "not under DNSPod" for a domain that is.
+	domain = strings.TrimSuffix(domain, ".")
 	var offset int64
 	for {
 		req := dnspod.NewDescribeDomainListRequest()

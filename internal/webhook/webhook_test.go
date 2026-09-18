@@ -1258,3 +1258,76 @@ func TestACorrectTokenIsNotLockedOutByFailuresFromTheSameAddress(t *testing.T) {
 		t.Error("the read-only status endpoint must not be locked out either")
 	}
 }
+
+// An unknown JSON key must be refused, not silently dropped.
+//
+// encoding/json ignores unknown fields, so {"certificate": "foo"} -- a misspelt "cert" --
+// decoded into a request with no targets, and no targets is a FULL trigger: the typo burned a
+// whole fleet's issuance quota on Let's Encrypt.
+func TestTriggerRejectsUnknownFields(t *testing.T) {
+	for _, body := range []string{
+		`{"certificate":"a"}`,            // the typo the fix exists for
+		`{"cert":"a","certificate":"b"}`, // a valid key must not excuse an unknown one
+		`{"certs":["a"],"padding":"x"}`,  // a "harmless" extra key is still a misspelt one
+	} {
+		t.Run(body, func(t *testing.T) {
+			rec := &fakeReconciler{names: []string{"a", "b"}}
+			s, _ := newTestServer(t, rec)
+
+			w := do(t, s, http.MethodPost, "/hook/reconcile", body, bearer())
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("%s should return 400, got %d", body, w.Code)
+			}
+			if len(rec.started) != 0 {
+				t.Errorf("%s triggered %v; an unknown key must not widen into a full convergence",
+					body, rec.started)
+			}
+		})
+	}
+
+	// Control: the two accepted keys still work.
+	rec := &fakeReconciler{names: []string{"a", "b"}}
+	s, _ := newTestServer(t, rec)
+	if w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer()); w.Code != http.StatusAccepted {
+		t.Errorf("the documented key must still be accepted, got %d", w.Code)
+	}
+}
+
+// A certificate whose state cannot be read must say so on /hook/desired too, not answer
+// issued=false -- that is the same entry "desired but not issued yet" produces, on the
+// endpoint whose job is to answer whether the desired certificate actually exists.
+func TestDesiredReportsAnUnreadableCertificateState(t *testing.T) {
+	last := &spec.Result{
+		Certificates: []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}},
+	}
+	s := newDesiredServer(t, last)
+
+	// Close the store so the read fails, the way a busy or broken database looks.
+	if err := s.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := do(t, s, http.MethodGet, "/hook/desired", "", bearer())
+	if w.Code != http.StatusOK {
+		t.Fatalf("the endpoint itself worked, so it should answer 200, got %d", w.Code)
+	}
+	var view struct {
+		Certificates []struct {
+			Issued bool   `json:"issued"`
+			Error  string `json:"error"`
+		} `json:"certificates"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(view.Certificates) != 1 {
+		t.Fatalf("certificates = %+v", view.Certificates)
+	}
+	c := view.Certificates[0]
+	if c.Error == "" {
+		t.Errorf("an unreadable state must be reported as an error on the entry, got %+v", c)
+	}
+	if c.Issued {
+		t.Error("a read failure must not be reported as issued")
+	}
+}

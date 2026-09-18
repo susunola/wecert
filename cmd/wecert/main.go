@@ -96,9 +96,18 @@ func run() error {
 		return errUsage
 	}
 
+	// Only an explicitly set flag can contradict another one: -log-level and -interval have
+	// defaults, so "-revoke x -log-level info" sets nothing the operator asked for.
+	explicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
 	if *showVer {
 		fmt.Println("wecert", version)
 		return nil
+	}
+
+	if err := validateFlags(explicit, *once, *dryRun, *interval); err != nil {
+		return err
 	}
 
 	if *restoreFrom != "" {
@@ -111,11 +120,25 @@ func run() error {
 		return runRestore(*configPath, *statePath, *restoreFrom)
 	}
 
+	// Install signal handling before anything touches the network (config load, EnsureAccount,
+	// the revocation path). This used to be registered just before the daemon loop, so a SIGTERM
+	// during the first account setup -- a network call that can hang for a while -- got the
+	// default kill instead of a graceful shutdown.
+	//
+	// The context is process-level on purpose: a webhook-triggered reconcile runs in the
+	// background for minutes, so it must hang off the process context, not a request's.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	if *revokeCert != "" {
 		return runRevoke(*configPath, *statePath, *revokeCert, *revokeWhy, *yesFlag)
 	}
 
-	log := newLogger(*logLevel)
+	level, err := parseLogLevel(*logLevel)
+	if err != nil {
+		return err
+	}
+	log := newLogger(level)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -236,11 +259,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-
-	// Build the process-level context first: a webhook-triggered reconcile runs in the
-	// background for minutes, so it must hang off the process context, not a request's.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	// Note the shape: a nil interface and an interface holding a nil pointer differ, and
 	// stuffing (*webhook.Notifier)(nil) into one defeats the != nil check below.
@@ -874,6 +892,43 @@ func buildCredentialBearingComponents(cfg *config.Config, log *slog.Logger) erro
 	return nil
 }
 
+// minReconcileInterval is the smallest -interval the daemon accepts.
+//
+// jitter maps a non-positive interval to one second, and even an explicit few seconds is a full
+// reconcile per round -- DNS lookups, cloud API reads, a TLS dial per name. An interval that
+// small is a misconfiguration: it hammers the DNS provider and the cloud APIs, so it is rejected
+// at startup rather than silently run.
+const minReconcileInterval = time.Minute
+
+// validateFlags rejects flag combinations that used to be resolved silently, with one flag
+// quietly winning over the other and the operator never told.
+//
+// -revoke exits before the logger, the dry-run branch and the reconcile loop, so -once,
+// -dry-run, -log-level and -interval are dead flags next to it. -once and -dry-run exclude each
+// other: the dry run returns before any pass exists for -once to mean. And the reconcile
+// interval has a floor (see minReconcileInterval), checked only when the loop will actually run.
+func validateFlags(explicit map[string]bool, once, dryRun bool, interval time.Duration) error {
+	if explicit["revoke"] {
+		for _, dead := range []string{"once", "dry-run", "log-level", "interval"} {
+			if explicit[dead] {
+				return fmt.Errorf("-%s has no effect with -revoke (revocation exits before that flag "+
+					"is read); drop it so the command line says what it does", dead)
+			}
+		}
+		return nil
+	}
+	if once && dryRun {
+		return fmt.Errorf("-once and -dry-run cannot be combined: the dry run validates the config and " +
+			"exits before any pass, so there is nothing for -once to run")
+	}
+	if !once && !dryRun && interval < minReconcileInterval {
+		return fmt.Errorf("-interval must be at least %s, got %s: daemon mode runs a full reconcile per "+
+			"interval, and a shorter one hammers the DNS provider and the cloud APIs",
+			minReconcileInterval, interval)
+	}
+	return nil
+}
+
 // certificateCountField is what the banner and the dry-run summary report as `certificates`.
 //
 // In enforce mode len(cfg.Certificates) is 0 by construction -- config.normalize refuses a non-empty
@@ -888,20 +943,27 @@ func certificateCountField(cfg *config.Config) any {
 	return len(cfg.Certificates)
 }
 
-func newLogger(level string) *slog.Logger {
-	var lv slog.Level
+// parseLogLevel turns the -log-level flag into an slog.Level.
+//
+// An unknown value is an error, not a silent fall back to info: the fall back meant a typo like
+// "wran" ran the daemon at a verbosity the operator did not ask for, with no line anywhere
+// saying so.
+func parseLogLevel(level string) (slog.Level, error) {
 	switch strings.ToLower(level) {
 	case "debug":
-		lv = slog.LevelDebug
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
 	case "warn":
-		lv = slog.LevelWarn
+		return slog.LevelWarn, nil
 	case "error":
-		lv = slog.LevelError
-	default:
-		lv = slog.LevelInfo
+		return slog.LevelError, nil
 	}
+	return 0, fmt.Errorf("unknown log level %q (want debug|info|warn|error)", level)
+}
 
+func newLogger(level slog.Level) *slog.Logger {
 	// Without timestamps it reads better under systemd/journald; in a terminal they help.
-	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lv})
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})
 	return slog.New(handler)
 }

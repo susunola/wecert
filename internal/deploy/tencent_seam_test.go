@@ -1312,3 +1312,79 @@ func TestACancelledSDKCallCarriesTheContextError(t *testing.T) {
 		t.Errorf("an expired deadline must unwrap to context.DeadlineExceeded, got %v", err)
 	}
 }
+
+// ── waitDeleteTask ──────────────────────────────────────────────────────────
+
+// A failed QUERY of the delete task is not a failed task -- the answer was never read.
+// waitDeployRecord has always retried these within its deadline; the delete path used
+// to give up on the first one, abandoning a task that may well have succeeded.
+func TestWaitDeleteTaskRetriesQueryErrors(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var calls int
+	fake := &fakeSSLAPI{
+		deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.New("throttled")
+			}
+			return deleteTaskResp("del-task-1", 1, ""), nil
+		},
+	}
+
+	if err := d.waitDeleteTask(context.Background(), fake, "del-task-1", "cert-1"); err != nil {
+		t.Fatalf("a single query error must be retried, got: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want one retry after the query error", calls)
+	}
+}
+
+// Retrying is bounded by the task deadline, not endless: queries that keep failing end
+// in the same "did not finish" timeout a running task gets, which keeps the reclaim
+// record so the next round tries again.
+func TestWaitDeleteTaskTimesOutWhenQueriesKeepFailing(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var calls int
+	fake := &fakeSSLAPI{
+		deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			calls++
+			return nil, errors.New("throttled")
+		},
+	}
+
+	err := d.waitDeleteTask(context.Background(), fake, "del-task-1", "cert-1")
+	if err == nil || !strings.Contains(err.Error(), "did not finish within") {
+		t.Fatalf("err = %v, want the delete-task timeout", err)
+	}
+	if calls < 2 {
+		t.Errorf("calls = %d, want polling to have repeated before timing out", calls)
+	}
+}
+
+// A caller cancellation must still interrupt the wait even when the query errors are
+// what made the loop spin: the retry must not swallow the shutdown signal.
+func TestWaitDeleteTaskStopsOnCancellationDespiteQueryErrors(t *testing.T) {
+	// No stubSleeper here: the stub ignores ctx, and honoring ctx is exactly what is
+	// under test. The cancelled context makes the one real waitBetweenPolls return
+	// immediately.
+	d := newTestDeployer(time.Now)
+
+	fake := &fakeSSLAPI{
+		deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			return nil, errors.New("throttled")
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := d.waitDeleteTask(ctx, fake, "del-task-1", "cert-1")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("a cancelled wait must surface the cancellation, got %v", err)
+	}
+}

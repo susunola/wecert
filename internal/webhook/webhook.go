@@ -364,6 +364,16 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 	if err := json.Unmarshal(body, &keys); err != nil {
 		return req, err
 	}
+	// Refuse keys this request does not define.
+	//
+	// encoding/json silently drops unknown fields, so a misspelt key -- {"certificate": "foo"}
+	// -- decoded into an empty request, and an empty request is a FULL trigger: the typo burned
+	// a whole fleet's issuance quota. The keys map is already decoded, so the check costs nothing.
+	for k := range keys {
+		if k != "cert" && k != "certs" {
+			return req, fmt.Errorf("unknown field %q: the trigger accepts only \"cert\" and \"certs\"", k)
+		}
+	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return req, err
 	}
@@ -512,6 +522,11 @@ type desiredCert struct {
 	Issued   bool     `json:"issued"`
 	NotAfter string   `json:"notAfter,omitempty"`
 	DaysLeft *int     `json:"daysLeft,omitempty"`
+
+	// Error reports that this certificate's state could not be read at all. Without it a read
+	// failure is indistinguishable from "desired but not issued yet" (Issued simply stays
+	// false) -- the same distinction certStatus.Error keeps on /hook/status.
+	Error string `json:"error,omitempty"`
 }
 
 type desiredView struct {
@@ -583,7 +598,11 @@ func (s *Server) handleDesired(dr DesiredReader) http.HandlerFunc {
 			}
 			st, err := s.store.GetCert(c.Name)
 			if err != nil {
+				// Say that the state could not be READ rather than answering issued=false:
+				// that is the same entry "not issued yet" produces, and this endpoint is
+				// where an operator checks whether a desired certificate actually exists.
 				s.log.Warn("failed to read the certificate state", "cert", c.Name, "err", err)
+				dc.Error = err.Error()
 			} else if st != nil && !st.NotAfter.IsZero() {
 				dc.Issued = true
 				dc.NotAfter = st.NotAfter.UTC().Format(time.RFC3339)

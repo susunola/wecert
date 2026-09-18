@@ -792,8 +792,8 @@ func TestStaleSnapshotTempsAreSweptAndFreshOnesKept(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stale := filepath.Join(backups, ".snapshot-20200101T000000.000-0.tmp")
-	fresh := filepath.Join(backups, ".snapshot-29990101T000000.000-0.tmp")
+	stale := filepath.Join(backups, ".snapshot-state.db-20200101T000000.000-0.tmp")
+	fresh := filepath.Join(backups, ".snapshot-state.db-29990101T000000.000-0.tmp")
 	for _, p := range []string{stale, fresh} {
 		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
 			t.Fatal(err)
@@ -813,5 +813,99 @@ func TestStaleSnapshotTempsAreSweptAndFreshOnesKept(t *testing.T) {
 	}
 	if _, err := os.Stat(fresh); err != nil {
 		t.Errorf("a fresh temporary file must be left alone (a write may be in progress): %v", err)
+	}
+}
+
+// The sweep must not touch another store's temporary files, however stale they are.
+//
+// Nothing refuses a shared backup directory, and temp names that carried no store identity made
+// this sweep match every deployment's in-progress or crashed writes: one store's interval pass
+// deleted the other's partial snapshot. Temp names now carry the store's base, like the final
+// snapshot names, and the sweep matches only its own.
+func TestTheSweepLeavesAnotherStoresTempsAlone(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	foreign := filepath.Join(backups, ".snapshot-other.db-20200101T000000.000-0.tmp")
+	// The pre-base naming of an older build is not attributable to anyone either, so nobody may
+	// delete it: the age check exists for OUR crashed writes, not for files we cannot identify.
+	legacy := filepath.Join(backups, ".snapshot-20200101T000000.000-0.tmp")
+	for _, p := range []string{foreign, legacy} {
+		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-3 * time.Hour)
+	for _, p := range []string{foreign, legacy} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := s.Snapshot(backups, 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	for _, p := range []string{foreign, legacy} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s is not this store's temp file and must not be swept: %v", filepath.Base(p), err)
+		}
+	}
+}
+
+// The temporary name must carry the store's identity, like the final snapshot name.
+//
+// Two deployments sharing one backup directory pick trial names under the same prefix otherwise,
+// and a sweep on one side cannot tell its own crashed writes from the other's in-progress ones.
+func TestSnapshotTempNamesCarryTheStoresBase(t *testing.T) {
+	s, _ := snapshotStore(t)
+	dir := t.TempDir()
+
+	name, err := s.freeTempName(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := s.snapshotTempPrefix(); !strings.HasPrefix(filepath.Base(name), want) {
+		t.Errorf("temp name %q does not start with the store-scoped prefix %q: two stores sharing "+
+			"this directory could collide, and the sweep would clean the other deployment's "+
+			"in-progress write", filepath.Base(name), want)
+	}
+}
+
+// A repaired (renamed) future-dated snapshot must be made durable with a directory fsync.
+//
+// rename(2) updates the directory's own block, and without the sync a power cut can resurrect the
+// future-dated name -- silently undoing the repair. The fsync itself leaves no trace a test can
+// stat for, so the hook next to it is what proves the step runs.
+func TestRepairedSnapshotsAreMadeDurable(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	future := filepath.Join(backups, s.snapshotName(time.Now().UTC().Add(48*time.Hour).Format(snapshotStamp)))
+	if err := os.WriteFile(future, []byte("snapshot from a host whose clock was ahead"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	saved := repairDirSynced
+	synced := ""
+	repairDirSynced = func(d string) { synced = d }
+	defer func() { repairDirSynced = saved }()
+
+	if _, err := s.Snapshot(backups, 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if synced != backups {
+		t.Errorf("the repair rename was not followed by a directory fsync of %q (hook saw %q): a "+
+			"power cut here resurrects the future-dated name, and retention never prunes it again",
+			backups, synced)
+	}
+	if _, err := os.Stat(future); !os.IsNotExist(err) {
+		t.Errorf("the future-dated name must be gone after the repair, stat err %v", err)
 	}
 }

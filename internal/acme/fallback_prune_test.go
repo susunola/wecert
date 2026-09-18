@@ -181,3 +181,46 @@ func TestFallbackRecordClearsAfterAFullIssuanceOnceTheRemovedNameIsGone(t *testi
 		t.Errorf("wecert_certificate_fallback_active = %v, want 0 after a full issuance", got)
 	}
 }
+
+// Pruning the last dropped name out of the record must also retire the pass-entry snapshot.
+//
+// rd.fallbackActive is read once at the start of the pass, before the prune runs. A record
+// cleared because every name it was waiting for left the configuration used to leave the
+// snapshot true, and fallbackDomains reads "a degradation is in force" as licence to skip the
+// expiry gate -- so the stale snapshot dropped a name from a certificate nowhere near expiry,
+// on the strength of a record that no longer existed.
+func TestAPrunedFallbackRecordNoLongerSkipsTheExpiryGate(t *testing.T) {
+	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
+	clearGaugeFor(t, cert.Name)
+
+	// The record waits only for a name the configuration no longer carries: the prune clears it.
+	if err := store.PutFallback(&state.Fallback{
+		CertName: cert.Name, Dropped: []string{"gone.example.com"}, Since: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh failure evidence against a still-configured name, and plenty of consecutive
+	// failures: everything the fallback needs except the expiry window.
+	for i := 0; i < 3; i++ {
+		if err := store.RecordIdentifierFailure(cert.Name, "b.example.com", "dns says no", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := &state.CertState{
+		Name:                cert.Name,
+		NotAfter:            now.Add(30 * 24 * time.Hour), // far outside the 7-day window
+		ConsecutiveFailures: 9,
+	}
+
+	got, rd := m.applyFallback(cert, st, round{fallbackActive: true})
+	if len(got.Domains) != 3 {
+		t.Errorf("the record was pruned away, so the expiry gate applies and no name may be "+
+			"dropped this far from expiry, got %v", got.Domains)
+	}
+	if rd.fallbackActive {
+		t.Error("the round must not keep reporting a degradation whose record was just cleared")
+	}
+	if fb, _ := store.GetFallback(cert.Name); fb != nil {
+		t.Errorf("the record itself must be gone, got %+v", fb)
+	}
+}

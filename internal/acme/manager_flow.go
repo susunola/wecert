@@ -208,7 +208,17 @@ func (m *Manager) solveChallenges(
 	// Here we must never do "write one -> validate one -> delete one": for
 	// example.com + *.example.com both authorizations' challenge values land on
 	// _acme-challenge.example.com and have to exist at the same time.
-	var pending []*state.Authorization
+	//
+	// pendingEntry carries the ledger/cooldown name alongside the row: the row's Identifier
+	// is deliberately the bare apex for a wildcard (the apex and its wildcard share one TXT
+	// name, so the row must stay unprefixed), while the identifier-failure budget and the
+	// cooldown are keyed by the name as the operator wrote it -- "*.example.com" for a
+	// wildcard. Phase 3 claims that budget, so it needs the prefixed name too.
+	type pendingEntry struct {
+		row      *state.Authorization
+		targeted string
+	}
+	var pending []pendingEntry
 	// resumed collects the rows this pass did not write itself (Presented was already
 	// true on entry): their records are not re-verified anywhere except by WaitAll
 	// below, and the WaitAll error path needs to know who they are.
@@ -440,7 +450,7 @@ func (m *Manager) solveChallenges(
 			return false, m.recordFailure(ctx, st, fmt.Errorf("persist a presented challenge (%s): %w", a.Identifier, err))
 		}
 		records = append(records, DNSRecord{FQDN: a.TxtName, Value: a.TxtValue})
-		pending = append(pending, a)
+		pending = append(pending, pendingEntry{row: a, targeted: targeted})
 	}
 
 	if invalidErr != nil {
@@ -476,7 +486,8 @@ func (m *Manager) solveChallenges(
 	}
 
 	// Phase 3: only once propagation is confirmed do we tell the CA, one by one, to validate.
-	for _, a := range pending {
+	for _, p := range pending {
+		a := p.row
 		if a.ChallengeSent {
 			continue
 		}
@@ -491,7 +502,12 @@ func (m *Manager) solveChallenges(
 		// sees the first pass's claim whatever order the scheduler picks; a success clears it again
 		// (see awaitAuthorizations), and an order that is merely refused by the CA never claims
 		// anything, which is why this is not done where the order is placed.
-		m.noteIdentifierFailure(a.Identifier)
+		//
+		// Claimed under the targeted name, not the row's Identifier: for a wildcard the row
+		// deliberately holds the bare apex (see the targeted comment above), and claiming the
+		// budget against the apex would cool down the wrong name -- the healthy apex -- while
+		// the wildcard that is actually about to be validated keeps spending.
+		m.noteIdentifierFailure(p.targeted)
 		if err := m.core.AcceptChallenge(a.ChallengeURL); err != nil {
 			return false, m.recordFailure(ctx, st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
 		}
@@ -504,13 +520,19 @@ func (m *Manager) solveChallenges(
 		}
 	}
 
+	// Phases 4 and 5 want the bare rows again.
+	pendingRows := make([]*state.Authorization, len(pending))
+	for i, p := range pending {
+		pendingRows[i] = p.row
+	}
+
 	// Phase 4: poll until everything is valid.
-	if err := m.awaitAuthorizations(ctx, pending); err != nil {
+	if err := m.awaitAuthorizations(ctx, pendingRows); err != nil {
 		return false, m.recordFailure(ctx, st, err)
 	}
 
 	// Phase 5: only after every validation passes do we clean up the TXT records together.
-	m.cleanup(ctx, c.Name, pending)
+	m.cleanup(ctx, c.Name, pendingRows)
 	return true, nil
 }
 

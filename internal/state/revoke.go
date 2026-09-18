@@ -125,6 +125,10 @@ func (s *Store) GetRevokeRequest(certName string) (*RevokeRequest, error) {
 // The error is kept so an operator can see whether they are waiting on a transient condition
 // or on something that will never succeed (a CA that refuses the reason code, say) -- the two
 // call for opposite responses.
+//
+// A name with no outstanding request is an error, not a silent no-op: an UPDATE that matches
+// nothing reports success otherwise, and the caller would believe an attempt was recorded when
+// there is no request to record it against.
 func (s *Store) RecordRevokeAttempt(certName string, attemptErr error, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,12 +140,20 @@ func (s *Store) RecordRevokeAttempt(certName string, attemptErr error, now time.
 		// grows without bound.
 		msg = truncate(attemptErr.Error(), maxLastErrorBytes)
 	}
-	_, err := s.db.Exec(`
+	res, err := s.db.Exec(`
 		UPDATE revoke_requests
 		SET attempts = attempts + 1, last_error = ?, last_attempt_at = ?
 		WHERE cert_name = ?`, msg, toUnix(now), certName)
 	if err != nil {
 		return fmt.Errorf("record revoke attempt for %s: %w", certName, err)
+	}
+	// An UPDATE against a name that has no row matches nothing and reports success: the attempt
+	// would be counted nowhere, which reads as "the request is being tracked" when there is no
+	// request at all.
+	if n, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("record revoke attempt for %s: %w", certName, err)
+	} else if n == 0 {
+		return fmt.Errorf("record revoke attempt for %s: no such revoke request", certName)
 	}
 	return nil
 }

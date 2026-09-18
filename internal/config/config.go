@@ -14,6 +14,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -353,6 +354,14 @@ func (p *Probe) normalize() error {
 	var err error
 	if p.TimeoutDur, err = parseDuration(p.Timeout, 10*time.Second, "probe.timeout"); err != nil {
 		return err
+	}
+	// A floor, like dns.pollingInterval's: cross-AZ handshakes routinely take 3-5 seconds,
+	// so a timeout far below that fails every probe -- and every failed probe raises
+	// probe_errors, which is an alarm that fires without a single real failure.
+	if p.TimeoutDur < time.Second {
+		return fmt.Errorf("probe.timeout is %s, which is below the 1s minimum: cross-AZ handshakes "+
+			"routinely take 3-5 seconds, so a timeout this short fails every probe and turns into "+
+			"false alarms that train people to ignore the real ones", p.TimeoutDur)
 	}
 
 	// minValidFor cannot go through parseDuration: that helper reads "default 0"
@@ -810,6 +819,12 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Captured before resolveSecretFiles fills the empty fields from files and the
+	// environment: the permission warning at the end of Load is about secrets written
+	// IN the file, which is only answerable while the inline values are still
+	// distinguishable from the resolved ones.
+	inlineSecrets := inlineSecretFields(cfg)
+
 	// Resolve file- and environment-backed secrets before validation, so the validation rules see
 	// the credential that will actually be used rather than the field the operator left empty.
 	if err := cfg.resolveSecretFiles(); err != nil {
@@ -818,6 +833,24 @@ func Load(path string) (*Config, error) {
 
 	if err := cfg.normalize(); err != nil {
 		return nil, err
+	}
+
+	// Warnings, not refusals -- the same call state.open makes. Each of these names a
+	// posture the program cannot tell apart from a deliberate choice (a loopback-only
+	// deployment cannot know the operator did not mean 0.0.0.0), so they are stated
+	// plainly and left to the operator. See the helpers below; they are pure so the
+	// wording is testable without capturing stderr.
+	var warns []string
+	warns = append(warns, notifyURLWarnings(cfg.Webhook.NotifyURL)...)
+	warns = append(warns, listenWarnings("metrics.listen", cfg.Metrics.Listen)...)
+	warns = append(warns, listenWarnings("webhook.listen", cfg.Webhook.Listen)...)
+	if len(inlineSecrets) > 0 {
+		if fi, statErr := os.Stat(path); statErr == nil {
+			warns = append(warns, configPermWarnings(path, fi.Mode().Perm(), inlineSecrets)...)
+		}
+	}
+	for _, w := range warns {
+		fmt.Fprintf(os.Stderr, "wecert: WARNING: %s\n", w)
 	}
 	return cfg, nil
 }
@@ -832,6 +865,110 @@ func rejectExtraDocuments(dec *yaml.Decoder, path string) error {
 		return fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return nil
+}
+
+// ── startup warnings ────────────────────────────────────────────────────────────────
+//
+// These are warnings, not refusals -- the same call state.open makes for the state
+// database. Each names a posture this program cannot tell apart from a deliberate
+// choice, so each is stated plainly and left to the operator. The helpers are pure
+// (the file's mode arrives as an argument) so the wording and the decision are
+// testable without capturing stderr, exactly like state.statePathWarnings.
+
+// inlineSecretFields lists the credential fields written directly into the config
+// file. Called before resolveSecretFiles, which would fill the empty fields from
+// files and the environment and make the inline ones indistinguishable.
+func inlineSecretFields(c *Config) []string {
+	var out []string
+	if c.DNS.LoginToken != "" {
+		out = append(out, "dns.loginToken")
+	}
+	if c.Tencent.SecretID != "" {
+		out = append(out, "tencent.secretId")
+	}
+	if c.Tencent.SecretKey != "" {
+		out = append(out, "tencent.secretKey")
+	}
+	if c.Webhook.Token != "" {
+		out = append(out, "webhook.token")
+	}
+	if c.Webhook.NotifySecret != "" {
+		out = append(out, "webhook.notifySecret")
+	}
+	return out
+}
+
+// configPermWarnings warns when a config file that carries inline secrets is readable
+// by anyone but its owner. A warning rather than a refusal: 0644 configs are common
+// in the wild, and refusing would push operators toward deleting the check rather
+// than tightening the mode. The *_file fields and the environment fallbacks exist so
+// the secrets need not be in this file at all.
+func configPermWarnings(path string, perm os.FileMode, inlineSecrets []string) []string {
+	if len(inlineSecrets) == 0 || perm&0o077 == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"the config file %s is readable by group or other (%04o) while carrying inline "+
+			"credentials (%s). A credential in a 0644 file is in every backup and every "+
+			"backup's off-site copy; use the *_file variants or the environment instead, or "+
+			"chmod 0600 the file", path, perm, strings.Join(inlineSecrets, ", "))}
+}
+
+// notifyURLWarnings warns about a plaintext notification URL to another host.
+//
+// Chat/CI webhook endpoints (Slack, Feishu, DingTalk) carry their credential in the
+// URL path itself, so http to a non-loopback host exposes the credential to anyone on
+// the path. Loopback is exempt: nothing leaves the machine.
+func notifyURLWarnings(notifyURL string) []string {
+	if notifyURL == "" {
+		return nil
+	}
+	u, err := url.Parse(notifyURL)
+	if err != nil {
+		// normalize already rejected an unparseable or non-http(s) URL; reaching this
+		// branch would mean the two drifted apart, and silence is the wrong drift.
+		return []string{fmt.Sprintf("webhook.notifyURL %q could not be re-parsed for the plaintext check: %v", notifyURL, err)}
+	}
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return []string{fmt.Sprintf(
+			"webhook.notifyURL %q uses plaintext http to a non-loopback host. Notification "+
+				"endpoints usually carry their credential in the URL path, so anyone on the "+
+				"network path can read it; use https", notifyURL)}
+	}
+	return nil
+}
+
+// listenWarnings warns when a server binds beyond this machine.
+//
+// metrics.listen serves the expiry state of every certificate, and webhook.listen can
+// trigger real issuance (it is token-guarded, but a wider bind widens the brute-force
+// surface). Both default to loopback; binding further is sometimes exactly what is
+// wanted -- Prometheus scraping from another host -- so this is a warning, not a refusal.
+func listenWarnings(field, listen string) []string {
+	if listen == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		// normalize already rejected a malformed address; as above, drift must be loud.
+		return []string{fmt.Sprintf("%s %q could not be re-parsed for the bind-scope check: %v", field, listen, err)}
+	}
+	if isLoopbackHost(host) {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"%s binds %s, which is reachable from beyond this machine (an empty host means every "+
+			"interface). If that is deliberate -- a Prometheus scraper on another host -- ignore "+
+			"this; otherwise 127.0.0.1:<port> keeps it local", field, listen)}
+}
+
+// isLoopbackHost reports whether host names only this machine.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (c *Config) normalize() error {
@@ -870,6 +1007,16 @@ func (c *Config) normalize() error {
 	default:
 		return fmt.Errorf("dns.provider must be %q, %q or %q, got %q",
 			DNSProviderDNSPod, DNSProviderTencentCloud, DNSProviderLego, c.DNS.Provider)
+	}
+	// legoProvider is read only when provider is "lego". Leaving it set next to a native
+	// provider means the operator believes challenges go through, say, Cloudflare while they
+	// actually go through dnspod -- rejected loudly rather than silently ignored, for the same
+	// reason desiredState.path under mode=static is rejected above.
+	if c.DNS.Provider != DNSProviderLego && c.DNS.LegoProvider != "" {
+		return fmt.Errorf("dns.legoProvider is set but dns.provider is %q: the field is only read "+
+			"when dns.provider=%q, so it would be silently ignored -- remove it, or switch "+
+			"dns.provider to %q if lego's registry is what you meant",
+			c.DNS.Provider, DNSProviderLego, DNSProviderLego)
 	}
 	if c.DNS.Provider == DNSProviderDNSPod && c.DNS.LoginToken == "" {
 		return fmt.Errorf("dns.provider=dnspod requires dns.loginToken, dns.loginTokenFile or " +
@@ -914,11 +1061,16 @@ func (c *Config) normalize() error {
 			"the interval is the sleep between rounds inside that budget, so an interval at or above "+
 			"it means the propagation wait probes once and gives up", c.DNS.Polling, c.DNS.Propagation)
 	}
-	if c.DNS.TTL <= 0 {
+	if c.DNS.TTL == 0 {
 		// The default is 600, not 60: on DNSPod's free tier the TTL floor is 600, and
 		// 60 is rejected by the API with LimitExceeded.RecordTtlLimit. Paid tiers may
 		// go lower, but the default must hold on every tier.
 		c.DNS.TTL = 600
+	}
+	// A negative TTL is a typo, not "unset" -- the same rule failureFallback.* applies:
+	// silently replacing it with the default would throw away the number the operator wrote.
+	if c.DNS.TTL < 0 {
+		return fmt.Errorf("dns.ttl must not be negative, got %d (0 means \"use the default\")", c.DNS.TTL)
 	}
 	if len(c.DNS.RecursiveNameservers) > 0 {
 		resolvers, err := normalizeRecursiveNameservers(c.DNS.RecursiveNameservers)
@@ -930,6 +1082,12 @@ func (c *Config) normalize() error {
 
 	if c.Metrics.Listen == "" {
 		c.Metrics.Listen = "127.0.0.1:9800"
+	}
+	// A malformed listen address used to surface only when the metrics server tried to bind --
+	// after the ACME account had been touched. /metrics is this system's only expiry alerting
+	// channel, so a typo there must be a load-time error.
+	if _, _, err := net.SplitHostPort(c.Metrics.Listen); err != nil {
+		return fmt.Errorf("metrics.listen must be a host:port address, got %q: %w", c.Metrics.Listen, err)
 	}
 
 	if err := c.Webhook.normalize(); err != nil {
@@ -1049,6 +1207,21 @@ func CheckProbeFloor(minValid time.Duration, certs []Certificate) error {
 }
 
 func (w *Webhook) normalize() error {
+	// Checked before the listen-address branch below: NotifyURL is independent of the
+	// trigger endpoint and may be used alone, so it is validated on every path that
+	// carries it.
+	if w.NotifyURL != "" {
+		u, err := url.Parse(w.NotifyURL)
+		if err != nil {
+			return fmt.Errorf("webhook.notifyURL: %w", err)
+		}
+		// A URL without a host or with another scheme would be POSTed to by the notifier
+		// and fail there, one renewal at a time, with the cause far from the config line.
+		if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("webhook.notifyURL must be an http or https URL with a host, got %q", w.NotifyURL)
+		}
+	}
+
 	// Checked before the listen-address branch below: NotifySecret is about the
 	// outbound event target, which is independent of the trigger endpoint.
 	if w.NotifySecret != "" {
@@ -1075,6 +1248,12 @@ func (w *Webhook) normalize() error {
 			return nil
 		}
 		return nil
+	}
+
+	// Same rule as metrics.listen: a malformed address must fail at load time, not at the
+	// first bind.
+	if _, _, err := net.SplitHostPort(w.Listen); err != nil {
+		return fmt.Errorf("webhook.listen must be a host:port address, got %q: %w", w.Listen, err)
 	}
 
 	if w.Token == "" {
@@ -1296,26 +1475,34 @@ func NormalizeCertificates(certs []Certificate) error {
 			return err
 		}
 
-		// Reject two certificates that ask for the same identifier set under different
-		// names.
+		// Reject two certificates that ask for the same identifier set AND the same key
+		// type under different names.
 		//
 		// Both count against the same "5 certificates per exact set of identifiers /
 		// 7 days" bucket and both spend "Certificates per Registered Domain", and they
-		// cover the same names, so the second one buys nothing while halving the number
-		// of attempts left for the first. This is exactly the cheap local rejection the
-		// domain validation above exists for.
+		// cover the same names with the same key algorithm, so the second one buys
+		// nothing while halving the number of attempts left for the first. This is
+		// exactly the cheap local rejection the domain validation above exists for.
+		//
+		// The key type is part of the dedupe key because the same names with a DIFFERENT
+		// algorithm are a legitimate dual-certificate setup (an RSA certificate beside an
+		// ECDSA one, so clients without ECDSA still get served): those are distinct
+		// certificates with distinct keys, not duplicates.
 		//
 		// The desired-state path additionally requires a certificate name to be derived
 		// from its registered domain (spec.checkNameStability); that rule lives there
 		// because it needs the grouping package, which imports this one. The overlap
-		// check needs nothing beyond DomainKey, so it protects both entry points -- which
-		// is what the "same entry point, same strictness" claim requires.
-		key := certs[i].DomainKey()
+		// check needs nothing beyond DomainKey and the key type, so it protects both
+		// entry points -- which is what the "same entry point, same strictness" claim
+		// requires.
+		key := certs[i].DomainKey() + "|" + certs[i].KeyType
 		if prev, dup := byDomainSet[key]; dup {
 			return fmt.Errorf(
-				"certificates %q and %q ask for the same identifier set (%s): they would share the "+
-					"5-per-exact-set/7-days quota and cover the same names, so one of them can only waste it",
-				prev, certs[i].Name, key)
+				"certificates %q and %q ask for the same identifier set (%s) with the same keyType: "+
+					"they would share the 5-per-exact-set/7-days quota and cover the same names, so one of "+
+					"them can only waste it (an RSA+ECDSA pair over the same names is fine -- that is "+
+					"exactly what the keyType in this check is for)",
+				prev, certs[i].Name, certs[i].DomainKey())
 		}
 		byDomainSet[key] = certs[i].Name
 	}
@@ -1406,7 +1593,7 @@ func parseDuration(s string, def time.Duration, field string) (time.Duration, er
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
-		return 0, fmt.Errorf("%s: %w", field, err)
+		return 0, fmt.Errorf("%s: %w (note: there is no day unit; use hours, e.g. 720h for 30 days)", field, err)
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("%s must be positive, got %s", field, s)

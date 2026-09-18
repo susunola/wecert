@@ -511,14 +511,34 @@ func TestListRuleDomainsCollectsListenerDomainsIncludingWildcards(t *testing.T) 
 	}
 }
 
-// An empty region list would guard nothing while looking configured, so it is an error.
-func TestListRuleDomainsRefusesAnEmptyRegionList(t *testing.T) {
-	_, err := newRules(t, nil).ListRuleDomains(context.Background())
-	if err == nil {
-		t.Fatal("no configured region must be an error: an empty guard looks configured")
+// An empty region list would guard nothing while looking configured, so the constructor
+// refuses it: surfacing only at enumeration time looked exactly like a transient guard
+// outage (the round keeps every name and, with RequireRule on, vets no new one either),
+// which let a misconfiguration degrade RequireRule silently for every round.
+func TestNewCLBRulesRefusesAnEmptyRegionList(t *testing.T) {
+	cred := config.Tencent{CredentialMode: config.CredentialStatic, SecretID: "id", SecretKey: "key"}
+
+	for _, regions := range [][]string{nil, {}, {"", "  "}} {
+		_, err := NewCLBRules(cred, regions, testLogger())
+		if err == nil {
+			t.Errorf("NewCLBRules(regions=%v) must fail: an empty guard looks configured", regions)
+			continue
+		}
+		if !strings.Contains(err.Error(), "regions") {
+			t.Errorf("the error must name the setting, got: %v", err)
+		}
 	}
-	if !strings.Contains(err.Error(), "regions") {
-		t.Errorf("the error must name the setting, got: %v", err)
+
+	// A hand-built CLBRules (skipping the constructor) must still refuse at read time:
+	// the runtime check is the second line, not the only one.
+	r := &CLBRules{credential: nil, log: testLogger()}
+	if _, err := r.ListRuleDomains(context.Background()); err == nil {
+		t.Error("ListRuleDomains on a region-less CLBRules must still fail")
+	}
+
+	// And a configured region still constructs fine.
+	if _, err := NewCLBRules(cred, []string{"ap-guangzhou"}, testLogger()); err != nil {
+		t.Errorf("a configured region must construct: %v", err)
 	}
 }
 
@@ -656,7 +676,7 @@ func TestEnumerationRejectsANilResultInsteadOfPanicking(t *testing.T) {
 	t.Run("load balancers", func(t *testing.T) {
 		fake := &fakeCLB{nilResponse: true}
 		stubCLB(t, fake)
-		if _, err := newRules(t, nil).ListRuleDomains(context.Background()); err == nil {
+		if _, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background()); err == nil {
 			t.Error("a response with no result must be an error, not an empty rule set")
 		}
 	})

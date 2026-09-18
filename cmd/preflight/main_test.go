@@ -400,3 +400,32 @@ func TestAnUnreadableCertificateCountIsNotZero(t *testing.T) {
 		t.Errorf("a readable answer must be returned as-is, got (%d, %v)", got, err)
 	}
 }
+
+// The mode flags are mutually exclusive, and combining them used to be resolved silently: the
+// first branch won, so "-prune-certs -bindings <id>" dumped the bindings and never pruned -- the
+// exact opposite of what the flags said, for the pair where a wrong guess deletes certificates.
+func TestSelectedModesReportsEverySelectedMode(t *testing.T) {
+	if got := selectedModes("", false, false, "example.com"); len(got) != 1 || got[0] != "-domain" {
+		t.Errorf("a plain domain check selects only -domain, got %v", got)
+	}
+	if got := selectedModes("cert-1", true, false, ""); len(got) != 2 {
+		t.Errorf("-bindings with -prune-certs must report both so main can refuse, got %v", got)
+	}
+	if got := selectedModes("", false, false, ""); len(got) != 0 {
+		t.Errorf("no flags means the usage error, got %v", got)
+	}
+}
+
+// A trailing dot is how an absolute DNS name is written, and users paste it from resolver
+// output. DNSPod stores the name without it, so the exact comparison used to false-report
+// "not under DNSPod" for a domain that is.
+func TestFindDomainAcceptsATrailingDot(t *testing.T) {
+	stubDescribeDomainList(t, func(offset int64) *dnspod.DescribeDomainListResponse {
+		return domainPage(1, "example.com")
+	})
+
+	found, err := findDomain(context.Background(), nil, "example.com.")
+	if err != nil || found == nil {
+		t.Fatalf("found=%v err=%v, want the trailing-dot form of a held domain to match", found, err)
+	}
+}

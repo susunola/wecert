@@ -120,11 +120,6 @@ func (s *Store) UpdateRateBucket(limitName, scopeID string, fn func(*RateBucket)
 	return nil
 }
 
-// PutRateBucket writes one bucket.
-//
-// The reset fields are only overwritten when the new value is non-zero, so recording a spend
-// cannot erase a CA-reported deadline that is still in force -- the two facts have different
-// lifetimes and the deadline is the stronger one.
 // ListRateBucketScopes returns the scope IDs this store has a bucket row for, sorted.
 //
 // It exists for the per-identifier quota series. Those are the one unbounded family: the caller
@@ -159,9 +154,17 @@ func (s *Store) ListRateBucketScopes(limitName string) ([]string, error) {
 	return out, nil
 }
 
+// PutRateBucket writes one bucket.
+//
+// The reset fields are only overwritten when the new value is non-zero, so recording a spend
+// cannot erase a CA-reported deadline that is still in force -- the two facts have different
+// lifetimes and the deadline is the stronger one.
+//
+// A nil bucket is an error, matching PutAuthorization: silently accepting it made a caller's
+// bug (a record that was never built) indistinguishable from a write that landed.
 func (s *Store) PutRateBucket(b *RateBucket) error {
 	if b == nil {
-		return nil
+		return fmt.Errorf("nil rate bucket")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

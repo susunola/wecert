@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -65,7 +66,7 @@ func runRevoke(configPath, statePathOverride, certName, reasonName string, assum
 	}
 	defer store.Close()
 
-	log := newLogger("info")
+	log := newLogger(slog.LevelInfo)
 
 	// Record the decision BEFORE reading the CA directory, with a manager that has no CA core at all.
 	//

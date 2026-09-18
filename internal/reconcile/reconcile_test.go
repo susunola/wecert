@@ -1160,8 +1160,9 @@ func TestOrphanCleanupIsWired(t *testing.T) {
 // recordLogHandler captures log messages so a test can assert a specific line
 // went out.
 type recordLogHandler struct {
-	mu   sync.Mutex
-	msgs []string
+	mu     sync.Mutex
+	msgs   []string
+	levels []slog.Level
 }
 
 func (h *recordLogHandler) Enabled(context.Context, slog.Level) bool { return true }
@@ -1170,6 +1171,7 @@ func (h *recordLogHandler) Handle(_ context.Context, r slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.msgs = append(h.msgs, r.Message)
+	h.levels = append(h.levels, r.Level)
 	return nil
 }
 
@@ -1181,6 +1183,20 @@ func (h *recordLogHandler) contains(sub string) bool {
 	defer h.mu.Unlock()
 	for _, m := range h.msgs {
 		if strings.Contains(m, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsAtLevel answers "was this said, and was it said loudly enough": a message
+// an operator must not miss has to be logged at a level that survives the default
+// verbosity, so the level is part of the assertion.
+func (h *recordLogHandler) containsAtLevel(sub string, lvl slog.Level) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, m := range h.msgs {
+		if h.levels[i] == lvl && strings.Contains(m, sub) {
 			return true
 		}
 	}
@@ -1236,9 +1252,11 @@ func TestParkedStartLogsAtShutdown(t *testing.T) {
 	cancel()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for !handler.contains("shutdown while waiting for a start slot") {
+	for !handler.containsAtLevel("shutdown while waiting for a start slot", slog.LevelWarn) {
 		if time.Now().After(deadline) {
-			t.Fatal("the parked pass must log that it will not run")
+			t.Fatal("the parked pass must log at Warn that it will not run: the caller was told " +
+				"\"accepted\", so a trace buried at Debug leaves the 202 indistinguishable from a " +
+				"pass that started and failed silently")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1375,6 +1393,12 @@ func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 	if cleaned := mgr.orphanCleaned(); len(cleaned) != 0 {
 		t.Errorf("the orphan teardown ran for a certificate with a pass in flight (%v); "+
 			"that deletes the TXT records and order the running pass is waiting on", cleaned)
+	}
+	// Deferred is not invisible: the certificate IS in the store and NOT in the desired
+	// state, so the gauge must count it even while its teardown waits -- otherwise the
+	// one signal for "this will expire unrenewed" reads 0 during exactly that window.
+	if got := testutil.ToFloat64(metrics.OrphanedCertificates); got != 1 {
+		t.Errorf("an orphan whose teardown is deferred must still be counted, got %v", got)
 	}
 
 	// Once the pass releases, the next round must reap it -- skipping must not mean losing.
@@ -2080,5 +2104,242 @@ func TestQuotaPublishingCoversEveryManagedScope(t *testing.T) {
 	}
 	if n := len(got["exact-identifier-set"]); n != 2 {
 		t.Errorf("one identifier set per certificate, got %d: %v", n, got["exact-identifier-set"])
+	}
+}
+
+// A one-shot run reads Trouble() as its exit code, so "nothing ran and nothing is
+// running" must not read as clean. A certificate inside its retry backoff lands in
+// Backoff -- not in Skipped (no pass was in flight; the manager deliberately did not
+// run one) -- so a pass in which every certificate sat inside its window used to
+// report Attempted == 0 with empty Skipped and exit 0 over a fleet making no progress.
+func TestTroubleTreatsAFullyBackedOffPassAsTrouble(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rep  RunReport
+		want bool
+	}{
+		{"clean pass", RunReport{Attempted: 2, Succeeded: 2}, false},
+		{"nothing managed", RunReport{}, false},
+		{"failures", RunReport{Attempted: 1, Failed: 1}, true},
+		{"unreadable desired state", RunReport{DesiredStateUnreadable: true}, true},
+		{"all skipped", RunReport{Skipped: []string{"a"}}, true},
+		{"all backed off", RunReport{Backoff: 2}, true},
+		{"backoff beside real attempts is not trouble", RunReport{Attempted: 1, Succeeded: 1, Backoff: 3}, false},
+	} {
+		if got := tc.rep.Trouble(); got != tc.want {
+			t.Errorf("%s: Trouble() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// The integration that produces the shape: the only certificate is inside its
+	// retry window, so the pass backs off instead of attempting.
+	mgr := &fakeManager{failWith: map[string]error{"stuck": state.ErrBackoff}}
+	r, _ := newTestReconciler(t, []string{"stuck"}, mgr)
+
+	rep := r.RunDetailed(context.Background())
+	if rep.Attempted != 0 || rep.Backoff != 1 {
+		t.Fatalf("a backed-off pass must report Attempted=0 Backoff=1, got %+v", rep)
+	}
+	if !rep.Trouble() {
+		t.Error("a pass in which the only certificate is backing off must read as trouble -- " +
+			"a one-shot run exits 0 on !Trouble, over a fleet making no progress")
+	}
+}
+
+// panicNotifier panics on every call, to prove the notification path cannot take a
+// finished pass down with it.
+type panicNotifier struct{ calls atomic.Int64 }
+
+func (p *panicNotifier) Renewal(context.Context, string, error) {
+	p.calls.Add(1)
+	panic("the notification POST exploded")
+}
+
+// A notifier that panics on the NORMAL path used to escape into reconcileOne's own
+// recover: a pass that had already succeeded was rewritten to a reported failure and
+// the recover block then fired a second, contradictory notification.
+func TestAPanickingNotifierDoesNotRewriteASuccessfulPass(t *testing.T) {
+	const name = "notify-panics"
+	mgr := &fakeManager{}
+	notifier := &panicNotifier{}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler := &recordLogHandler{}
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier, slog.New(handler))
+
+	before := reconcileCounts(t, name)
+
+	if err := r.RunCert(context.Background(), name); err != nil {
+		t.Errorf("the pass succeeded; the notifier's panic must not rewrite that, got %v", err)
+	}
+	if got := notifier.calls.Load(); got != 1 {
+		t.Errorf("the notifier must be called exactly once -- a second call would be the "+
+			"recover block contradicting the first, got %d", got)
+	}
+	if !handler.contains("renewal notification itself panicked") {
+		t.Error("the swallowed panic must be logged with its stack, not vanish")
+	}
+	after := reconcileCounts(t, name)
+	if after["ok"] != before["ok"]+1 {
+		t.Errorf("the pass must count as ok exactly once, went from %v to %v", before["ok"], after["ok"])
+	}
+	if after["error"] != before["error"] {
+		t.Errorf("a notifier panic must not count as a pass error, went from %v to %v",
+			before["error"], after["error"])
+	}
+}
+
+// hasNotAfterSeries reports whether the not_after gauge exports this exact
+// cert+profile combination (ToFloat64 cannot answer this: reading a deleted child
+// recreates it).
+func hasNotAfterSeries(t *testing.T, cert, profile string) bool {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != "wecert_certificate_not_after_timestamp_seconds" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["cert"] == cert && labels["profile"] == profile {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// A certificate whose profile changed between passes must not keep the old profile's
+// not_after series: nothing ever writes it again, so it freezes at its last value and
+// the per-profile expiry alert keeps comparing a stale timestamp.
+func TestPublishDropsTheSeriesOfAPreviousProfile(t *testing.T) {
+	const name = "profile-switch-cert"
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	prov := &mutableProvider{}
+	prov.set(config.Certificate{Name: name})
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
+	r := New(cfg, prov, store, &fakeManager{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	notAfter := time.Now().Add(90 * 24 * time.Hour).Truncate(time.Second)
+	if err := store.PutCert(&state.CertState{Name: name, NotAfter: notAfter}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.publish(&config.Certificate{Name: name}) // no profile -> classic
+	if !hasNotAfterSeries(t, name, config.ProfileClassic) {
+		t.Fatal("setup: the classic profile series should be exported")
+	}
+
+	// The document switches the certificate to the shortlived profile.
+	r.publish(&config.Certificate{Name: name, Profile: config.ProfileShortLived})
+
+	if hasNotAfterSeries(t, name, config.ProfileClassic) {
+		t.Error("the previous profile's series must be dropped, or it freezes at its last " +
+			"value and the per-profile expiry alert compares a stale timestamp forever")
+	}
+	if !hasNotAfterSeries(t, name, config.ProfileShortLived) {
+		t.Error("the current profile's series must be published")
+	}
+	if v, ok := gaugeValue(t, "wecert_certificate_not_after_timestamp_seconds", name); !ok || int64(v) != notAfter.Unix() {
+		t.Errorf("the remaining series must carry the real expiry, got %v (present=%v)", v, ok)
+	}
+}
+
+// signalOnResolveProvider closes ch on its first Desired call, so a test can observe
+// that the caller passed the entry checks and is about to walk the names.
+type signalOnResolveProvider struct {
+	inner spec.Provider
+	once  sync.Once
+	ch    chan struct{}
+}
+
+func (p *signalOnResolveProvider) Desired(ctx context.Context) ([]config.Certificate, error) {
+	p.once.Do(func() { close(p.ch) })
+	return p.inner.Desired(ctx)
+}
+
+// When Drain begins mid-walk, StartNamed must still hand back the names it already
+// accepted: those passes were registered and Drain waits for them, so reporting them as
+// refused would tell the caller to give up on passes that are in fact running.
+func TestStartNamedReturnsTheAcceptedPrefixWhenShutdownBeginsMidWalk(t *testing.T) {
+	certs := []config.Certificate{{Name: "a"}, {Name: "b"}}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mgr := &fakeManager{}
+	prov := &signalOnResolveProvider{inner: spec.NewStatic(certs), ch: make(chan struct{})}
+	cfg := &config.Config{Certificates: certs}
+	r := New(cfg, prov, store, mgr, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	type outcome struct {
+		started, running, unknown []string
+		err                       error
+	}
+	out := make(chan outcome, 1)
+
+	// Holding the claim mutex parks the walk inside the first startCert: after the
+	// pass was registered with the drain group, before its goroutine launches.
+	r.mu.Lock()
+	go func() {
+		started, running, unknown, err := r.StartNamed(context.Background(), []string{"a", "b"})
+		out <- outcome{started, running, unknown, err}
+	}()
+
+	<-prov.ch                          // the walk has resolved and is heading into the first start
+	time.Sleep(100 * time.Millisecond) // let it reach the parked claim
+
+	drained := make(chan error, 1)
+	go func() { drained <- r.Drain(context.Background()) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !r.drainingNow() {
+		if time.Now().After(deadline) {
+			r.mu.Unlock()
+			t.Fatal("Drain never began")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Draining is set, so the second name can no longer be admitted; release the walk.
+	r.mu.Unlock()
+
+	got := <-out
+	if !errors.Is(got.err, ErrShuttingDown) {
+		t.Fatalf("want ErrShuttingDown, got %v", got.err)
+	}
+	if len(got.started) != 1 || got.started[0] != "a" {
+		t.Errorf("the accepted prefix must come back with the error, got started=%v", got.started)
+	}
+	if len(got.running) != 0 || len(got.unknown) != 0 {
+		t.Errorf("no other bucket may be filled, got running=%v unknown=%v", got.running, got.unknown)
+	}
+
+	// "a" was reported accepted, so its pass must really run and Drain must wait for it.
+	if err := <-drained; err != nil {
+		t.Errorf("Drain must wait for the accepted pass and then return clean, got %v", err)
+	}
+	if calls := mgr.reconciled(); len(calls) != 1 || calls[0] != "a" {
+		t.Errorf("the accepted pass must have run (Drain waited for it), reconciled=%v", calls)
 	}
 }

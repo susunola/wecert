@@ -228,3 +228,43 @@ func TestConcurrentSpendsOnOneBucketAllCount(t *testing.T) {
 			spenders, rec.Tokens, want, int(want-rec.Tokens))
 	}
 }
+
+// The later instant wins, whichever order the refusals arrive in.
+//
+// The manager reconciles one goroutine per certificate, so two passes can record deadlines
+// for the same bucket and the older error response can reach the store second. Overwriting
+// unconditionally rolled the recorded deadline BACK to the earlier instant, and Remaining and
+// BlockedUntil then unblocked issuance inside the window the CA had most recently named.
+func TestTrackerKeepsTheLaterDeadline(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	earlier := now.Add(time.Hour)
+	later := now.Add(3 * time.Hour)
+
+	// Out of order: the older refusal is recorded last and must not win.
+	store := newFakeStore()
+	tr := testTracker(t, store, now)
+	if _, ok := tr.NoteDeadline(NewOrdersPerAccount, "", later, "newer response"); !ok {
+		t.Fatal("the first deadline must be recorded")
+	}
+	if _, ok := tr.NoteDeadline(NewOrdersPerAccount, "", earlier, "older response"); !ok {
+		t.Fatal("a deadline must be reported even when it does not win")
+	}
+	got, _, blocked := tr.BlockedUntil(NewOrdersPerAccount, "")
+	if !blocked || !got.Equal(later) {
+		t.Errorf("an out-of-order older refusal moved the deadline back to %s, want %s", got, later)
+	}
+
+	// In order: the later refusal still lands on top.
+	store = newFakeStore()
+	tr = testTracker(t, store, now)
+	if _, ok := tr.NoteDeadline(NewOrdersPerAccount, "", earlier, "older response"); !ok {
+		t.Fatal("the first deadline must be recorded")
+	}
+	if _, ok := tr.NoteDeadline(NewOrdersPerAccount, "", later, "newer response"); !ok {
+		t.Fatal("the later deadline must be recorded")
+	}
+	got, _, blocked = tr.BlockedUntil(NewOrdersPerAccount, "")
+	if !blocked || !got.Equal(later) {
+		t.Errorf("the later deadline must win, got %s want %s", got, later)
+	}
+}

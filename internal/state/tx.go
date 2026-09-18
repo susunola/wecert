@@ -40,9 +40,10 @@ type Tx struct {
 
 // WithTx runs fn inside a single transaction.
 //
-// fn's error rolls the transaction back and is returned unchanged, and so does a panic from fn --
-// which matters more than it looks, because a panic in the middle of the epilogue is exactly the
-// partial state this exists to prevent.
+// fn's error rolls the transaction back and is returned unchanged. A panic from fn also rolls the
+// transaction back, and then PROPAGATES -- WithTx does not recover it, so it reaches the caller as
+// a panic, not as an error. That rollback-on-the-way-out matters more than it looks, because a
+// panic in the middle of the epilogue is exactly the partial state this exists to prevent.
 //
 // Reads made through the store (not through Tx) inside fn DO NOT WORK AT ALL: every store method
 // takes s.mu, WithTx holds it for the whole transaction, and the mutex is not reentrant -- so such a

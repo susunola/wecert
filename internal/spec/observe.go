@@ -193,7 +193,12 @@ func diffCert(cur, want *config.Certificate) *CertificateChange {
 	// differs there produced two different revisions and an EMPTY diff -- and an empty diff is the
 	// documented gate for switching to enforce ("stay at 0 before switching"). The operator would
 	// have promoted a change that moves how far ahead renewals start.
-	if cur.RenewBefore != want.RenewBefore {
+	//
+	// The comparison uses the parsed duration, not the raw string: both sides came through
+	// config.NormalizeCertificates, which fills RenewBeforeDur, and a string comparison misread
+	// "720h" written on one side and the empty default on the other as a change -- a semantic
+	// false positive against the gate above.
+	if cur.RenewBeforeDur != want.RenewBeforeDur {
 		ch.Changed = append(ch.Changed, "renewBefore")
 	}
 

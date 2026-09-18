@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +66,12 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		// zone in the account) into stdout, which under systemd means the journal.
 		//
 		// Keep it out of the unit and out of any drop-in; debug DNS locally instead.
+		if os.Getenv("LEGO_DEBUG_DNS_API_HTTP_CLIENT") != "" {
+			log.Warn("LEGO_DEBUG_DNS_API_HTTP_CLIENT is set: lego's debug dump of the dnspod " +
+				"provider logs request BODIES, and the never-expiring login_token travels in the " +
+				"POST body, which no redaction rule matches -- unset it anywhere but a local " +
+				"debugging session")
+		}
 		p, err := dnspod.NewDNSProviderConfig(dnspodConfig(dnsCfg))
 		if err != nil {
 			return nil, fmt.Errorf("initialise the dnspod provider: %w", err)
@@ -112,6 +119,11 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 	if err != nil {
 		return nil, err
 	}
+	// Applying the option to a throwaway Challenge works by side effect, and only because of how
+	// lego implements it: in lego v4.35.2 (challenge/dns01/nameserver.go -- the package-level
+	// `recursiveNameservers` variable at line 27, the option at line 65) AddRecursiveNameservers
+	// ignores its *Challenge argument and assigns that package-level variable, which every later
+	// lego DNS lookup then uses. Re-check both spots when the lego dependency is bumped.
 	if err := dns01.AddRecursiveNameservers(resolvers)(&dns01.Challenge{}); err != nil {
 		return nil, fmt.Errorf("configure lego recursive nameservers: %w", err)
 	}
@@ -268,11 +280,11 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 				"(zone %s was not reached; %s was spent on the zones before it)",
 				s.timeout, zone, waitStart.Sub(start).Round(time.Second))
 		}
-		servers, err := s.authoritativeNS(ctx, zone)
+		servers, delegated, err := s.authoritativeNS(ctx, zone)
 		if err != nil {
 			return err
 		}
-		if err := s.waitZone(ctx, zone, servers, recs, zoneBudget{
+		if err := s.waitZone(ctx, zone, servers, delegated, recs, zoneBudget{
 			passStart: start, zoneStart: waitStart, deadline: deadline,
 		}); err != nil {
 			return err
@@ -302,7 +314,7 @@ type recordProbe struct {
 // up to 3 seconds each -- one round then runs far past the 5-second polling interval.
 // Propagation waiting would degrade into "advance a little every 5 seconds", and a
 // 5-minute budget would not survive even a few rounds.
-func probeRecordsWithExchange(servers []nsServer, recs []DNSRecord, exchange func(*dns.Msg, string) (*dns.Msg, error)) []recordProbe {
+func probeRecordsWithExchange(servers []nsServer, delegated int, recs []DNSRecord, exchange func(*dns.Msg, string) (*dns.Msg, error)) []recordProbe {
 	out := make([]recordProbe, len(recs))
 	if len(recs) == 0 {
 		return out
@@ -323,7 +335,7 @@ func probeRecordsWithExchange(servers []nsServer, recs []DNSRecord, exchange fun
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			ready, summary := probeReadyWithExchange(servers, r.FQDN, r.Value, exchange)
+			ready, summary := probeReadyWithDelegation(servers, delegated, r.FQDN, r.Value, exchange)
 			// Each goroutine writes only its own index; no overlap, so no lock is needed.
 			out[i] = recordProbe{record: r, ready: ready, summary: summary}
 		}(i, r)
@@ -334,7 +346,7 @@ func probeRecordsWithExchange(servers []nsServer, recs []DNSRecord, exchange fun
 }
 
 func probeRecords(servers []nsServer, recs []DNSRecord) []recordProbe {
-	return probeRecordsWithExchange(servers, recs, func(msg *dns.Msg, server string) (*dns.Msg, error) {
+	return probeRecordsWithExchange(servers, delegatedCount(servers), recs, func(msg *dns.Msg, server string) (*dns.Msg, error) {
 		client := &dns.Client{Timeout: 3 * time.Second}
 		resp, _, err := client.Exchange(msg, server)
 		return resp, err
@@ -355,11 +367,13 @@ type zoneBudget struct {
 }
 
 // waitZone polls one zone until its records are confirmed, within the shared deadline.
+// delegated is the number of NS names in the zone's delegation (see authoritativeNS): servers
+// holds only the names that resolved, and the propagation rule needs the full count.
 func (s *DNSSolver) waitZone(
-	ctx context.Context, zone string, servers []nsServer, recs []DNSRecord, b zoneBudget,
+	ctx context.Context, zone string, servers []nsServer, delegated int, recs []DNSRecord, b zoneBudget,
 ) error {
 	for {
-		results := s.probeRecords(servers, recs)
+		results := s.probeRecords(servers, delegated, recs)
 
 		// Summarise only the records that are **not ready yet**.
 		//
@@ -400,6 +414,14 @@ func (s *DNSSolver) waitZone(
 			for _, res := range results {
 				readiness = append(readiness, fmt.Sprintf("%s = %s (%s)",
 					res.record.FQDN, res.record.Value, res.summary))
+			}
+			// A cancellation that landed during the recursive probe must not read as
+			// "propagated". recursiveReady degrades "no resolver answered" to a warning (a host
+			// without public DNS egress must still be able to issue), and a cancelled context
+			// makes every resolver unreachable -- so a shutdown would otherwise walk out of here
+			// with a success verdict nobody verified.
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 			s.log.Info("TXT propagated",
 				"zone", zone, "nameservers", len(servers), "records", len(recs),
@@ -537,6 +559,28 @@ func probeTXTWithExchange(servers []nsServer, fqdn, want string, exchange func(*
 // A single-authority zone has to be able to pass: requiring 2 confirmations would leave
 // such a zone waiting for propagation forever.
 func probeReadyWithExchange(servers []nsServer, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) (bool, string) {
+	return probeReadyWithDelegation(servers, delegatedCount(servers), fqdn, want, exchange)
+}
+
+// delegatedCount counts the distinct NS names in a server list. Callers that never went through
+// authoritativeNS (tests, mostly) have no delegation count of their own, and for them the list
+// IS the delegation: every name in it resolved.
+func delegatedCount(servers []nsServer) int {
+	names := make(map[string]bool, len(servers))
+	for _, s := range servers {
+		names[s.ns] = true
+	}
+	return len(names)
+}
+
+// probeReadyWithDelegation is probeReadyWithExchange with the delegation count made explicit.
+//
+// delegated is the number of NS names the zone delegates to, INCLUDING the names this host
+// could not resolve to an address: authoritativeNS skips an unresolvable name with a warning,
+// and keying the single-authority exemption on the names that resolved would let a two-NS zone
+// with one broken A record pass on a single confirmation -- while the unresolvable server may
+// be exactly the one the CA reaches and be told the record does not exist.
+func probeReadyWithDelegation(servers []nsServer, delegated int, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) (bool, string) {
 	results := probeTXTWithExchange(servers, fqdn, want, exchange)
 
 	var confirmed, missing, nonAuthoritative, unreachable int
@@ -565,8 +609,16 @@ func probeReadyWithExchange(servers []nsServer, fqdn, want string, exchange func
 		}
 	}
 
+	// The delegation is the authority count, not the subset of it that resolved. delegated can
+	// only ever be the larger one; the max keeps a hand-built server list (delegated inferred
+	// from it) from ever shrinking the count below what the probes actually saw.
+	authorityCount := delegated
+	if len(authorities) > authorityCount {
+		authorityCount = len(authorities)
+	}
+
 	summary := fmt.Sprintf("confirmed %d/%d server(s) / denied %d / non-authoritative %d / unreachable %d (of %d addresses)",
-		len(confirmingNS), len(authorities), missing, nonAuthoritative, unreachable, len(results))
+		len(confirmingNS), authorityCount, missing, nonAuthoritative, unreachable, len(results))
 
 	// Any reachable server that answers "no such value" -> not propagated yet. Checked per
 	// address on purpose: one address of one authority denying the value is enough to hold the
@@ -581,7 +633,7 @@ func probeReadyWithExchange(servers []nsServer, fqdn, want string, exchange func
 	// With more than one authority, require two of them to confirm, so "only one server was
 	// reachable" cannot slip through. A zone with a single authority is exempt, whoever many
 	// addresses that authority has.
-	if len(authorities) >= 2 && len(confirmingNS) < 2 {
+	if authorityCount >= 2 && len(confirmingNS) < 2 {
 		return false, summary
 	}
 	return true, summary
@@ -889,7 +941,7 @@ func (s *DNSSolver) LookupTXT(ctx context.Context, domain, keyAuth string) (DNSR
 	if err != nil {
 		return rec, false, fmt.Errorf("find the zone of %s: %w", rec.FQDN, err)
 	}
-	servers, err := s.authoritativeNS(ctx, zone)
+	servers, _, err := s.authoritativeNS(ctx, zone)
 	if err != nil {
 		return rec, false, fmt.Errorf("list the authoritative nameservers of %s: %w", zone, err)
 	}
@@ -978,13 +1030,20 @@ type nsServer struct {
 }
 
 // authoritativeNS resolves the public NS delegation through the configured recursive resolver set.
-func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]nsServer, error) {
+//
+// The second return value is the number of NS names in the delegation, INCLUDING the names that
+// did not resolve to an address. Skipping an unresolvable name (with the warning below) is right
+// for the probe list, but the propagation rule's single-authority exemption must be keyed on the
+// delegation itself: a zone that delegates to two nameservers and resolves only one is not a
+// single-authority zone, and the server this host cannot resolve may be exactly the one the CA
+// reaches.
+func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]nsServer, int, error) {
 	msg := new(dns.Msg)
 	msg.SetQuestion(zone, dns.TypeNS)
 	msg.RecursionDesired = true
 	resp, err := s.queryRecursive(ctx, msg)
 	if err != nil {
-		return nil, fmt.Errorf("lookup NS for %s: %w", zone, err)
+		return nil, 0, fmt.Errorf("lookup NS for %s: %w", zone, err)
 	}
 	var names []string
 	for _, rr := range resp.Answer {
@@ -993,7 +1052,7 @@ func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]nsServe
 		}
 	}
 	if len(names) == 0 {
-		return nil, fmt.Errorf("%s has no NS records", zone)
+		return nil, 0, fmt.Errorf("%s has no NS records", zone)
 	}
 
 	var servers []nsServer
@@ -1013,13 +1072,13 @@ func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]nsServe
 		}
 	}
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("none of %s's nameservers resolve to an address", zone)
+		return nil, 0, fmt.Errorf("none of %s's nameservers resolve to an address", zone)
 	}
-	return servers, nil
+	return servers, len(names), nil
 }
 
-func (s *DNSSolver) probeRecords(servers []nsServer, recs []DNSRecord) []recordProbe {
-	return probeRecordsWithExchange(servers, recs, s.authoritativeExchange())
+func (s *DNSSolver) probeRecords(servers []nsServer, delegated int, recs []DNSRecord) []recordProbe {
+	return probeRecordsWithExchange(servers, delegated, recs, s.authoritativeExchange())
 }
 
 func (s *DNSSolver) queryRecursive(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {

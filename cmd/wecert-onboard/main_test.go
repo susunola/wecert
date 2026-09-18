@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/susunola/wecert/internal/onboarding"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -93,11 +96,11 @@ func TestRunFailsFastWhenTheStateIsLocked(t *testing.T) {
 	cfgPath, out := writeConfig(t, t.TempDir())
 
 	// Simulate the previous run still holding the state file's lock.
-	unlock, err := state.LockFile(out + ".state.json.lock")
+	lock, err := state.AcquireFileLock(out + ".state.json.lock")
 	if err != nil {
 		t.Fatalf("taking the lock failed: %v", err)
 	}
-	defer func() { _ = unlock() }()
+	defer func() { _ = lock.Unlock() }()
 
 	withArgs(t, "-config", cfgPath)
 	code, err := run()
@@ -115,11 +118,11 @@ func TestRunFailsFastWhenTheStateIsLocked(t *testing.T) {
 func TestRunProceedsAfterTheLockIsReleased(t *testing.T) {
 	cfgPath, out := writeConfig(t, t.TempDir())
 
-	unlock, err := state.LockFile(out + ".state.json.lock")
+	lock, err := state.AcquireFileLock(out + ".state.json.lock")
 	if err != nil {
 		t.Fatalf("taking the lock failed: %v", err)
 	}
-	if err := unlock(); err != nil {
+	if err := lock.Unlock(); err != nil {
 		t.Fatalf("releasing the lock failed: %v", err)
 	}
 
@@ -127,5 +130,74 @@ func TestRunProceedsAfterTheLockIsReleased(t *testing.T) {
 	_, err = run()
 	if errors.Is(err, state.ErrLocked) {
 		t.Fatalf("a released lock must not block the run, got %v", err)
+	}
+}
+
+// A bad flag is already reported by the flag package itself (ContinueOnError prints the
+// error and the usage); run must not hand the same error back to main for a second print.
+func TestFlagErrorIsReportedOnce(t *testing.T) {
+	withArgs(t, "-no-such-flag")
+	code, err := run()
+	if err != nil {
+		t.Errorf("the flag package already printed the error; run must not return it again, got %v", err)
+	}
+	if code != exitUsage {
+		t.Errorf("a command-line mistake is a usage error, got exit code %d", code)
+	}
+}
+
+// A negative policy value passed explicitly is a typo, not "unset": the config layer rejects
+// the same values, and silently substituting the default would leave the operator believing
+// the guard was tuned when it was not. New is the chokepoint that sees both paths.
+func TestExplicitNegativePolicyFlagIsRejected(t *testing.T) {
+	cfgPath, _ := writeConfig(t, t.TempDir())
+
+	withArgs(t, "-config", cfgPath, "-budget=-1")
+	code, err := run()
+	if err == nil {
+		t.Fatal("an explicitly negative budget must fail, not fall back to the default")
+	}
+	if !strings.Contains(err.Error(), "Budget") {
+		t.Errorf("the error must name the knob, got %v", err)
+	}
+	if code != exitError {
+		t.Errorf("a rejected policy value is a plain error, got exit code %d", code)
+	}
+}
+
+// A round that fails before producing a report (here: a corrupt state file) must still
+// publish one: monitoring watches the report file, and "no new report" only ever shows up
+// as staleness. The report says frozen and carries the failure as its reason.
+func TestRunFailureStillWritesAReport(t *testing.T) {
+	cfgPath, out := writeConfig(t, t.TempDir())
+
+	// A state file that cannot be parsed must fail the round outright -- LoadState refuses
+	// to read it as empty state.
+	if err := os.WriteFile(out+".state.json", []byte(`{"absentSince": {`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	withArgs(t, "-config", cfgPath)
+	code, err := run()
+	if err == nil {
+		t.Fatal("a corrupt state file must fail the run")
+	}
+	if code != exitError {
+		t.Errorf("a failed round is a plain error, got exit code %d", code)
+	}
+
+	data, err := os.ReadFile(out + ".report.json")
+	if err != nil {
+		t.Fatalf("a failed round must still leave a report for monitoring: %v", err)
+	}
+	var rep onboarding.Report
+	if err := json.Unmarshal(data, &rep); err != nil {
+		t.Fatalf("the failure report must parse: %v", err)
+	}
+	if rep.Mode != onboarding.ModeFrozen {
+		t.Errorf("the failure report must say frozen (nothing moved), got mode %q", rep.Mode)
+	}
+	if len(rep.FreezeReasons) == 0 {
+		t.Error("the failure report must carry the cause as its freeze reason")
 	}
 }
