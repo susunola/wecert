@@ -106,7 +106,13 @@ func resolveSnapshot(cfg *config.Config, arg string) (string, error) {
 func newestSnapshot(dir, statePath string) (string, error) {
 	snaps, err := state.SnapshotsIn(dir, statePath)
 	if err != nil {
-		return "", fmt.Errorf("restore: list the snapshots in %s: %w", dir, err)
+		// A directory that does not exist is the same answer as one with no snapshots, and the
+		// operator needs the sentence below rather than an open(2) error: `-restore latest` on a host
+		// where stateBackup never ran is an ordinary situation during a recovery. Verified in the
+		// round-11 restore drill, which printed "open /tmp/drill/snapshots: no such file or directory".
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("restore: list the snapshots in %s: %w", dir, err)
+		}
 	}
 	if len(snaps) == 0 {
 		return "", fmt.Errorf("restore: there are no snapshots of %s in %s (the directory "+
