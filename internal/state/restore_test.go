@@ -401,6 +401,35 @@ func TestLoadRestoreNoticeDistinguishesAbsentFromUnreadable(t *testing.T) {
 	}
 }
 
+// Restoring onto a fresh host is the disaster case, and there the state directory may not exist yet.
+func TestRestoreCreatesTheStateDirectory(t *testing.T) {
+	h := newRestoreHarness(t)
+
+	fresh := filepath.Join(h.dir, "fresh-host", "lib", "wecert", "state.db")
+	res, err := Restore(fresh, h.snapshot)
+	if err != nil {
+		t.Fatalf("Restore onto a missing directory: %v", err)
+	}
+	if res.Replaced != "" {
+		t.Errorf("there was nothing to replace, got %s", res.Replaced)
+	}
+	store, err := Open(fresh)
+	if err != nil {
+		t.Fatalf("Open the restored database: %v", err)
+	}
+	defer store.Close()
+	names, err := store.ListCertNames()
+	if err != nil {
+		t.Fatalf("ListCertNames: %v", err)
+	}
+	if len(names) != 1 || names[0] != "old-cert" {
+		t.Errorf("the restored database should hold the snapshot's certificate, got %v", names)
+	}
+	if fi, err := os.Stat(filepath.Dir(fresh)); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("the created state directory should be 0700 (mode %v, err %v)", fi.Mode().Perm(), err)
+	}
+}
+
 // A symlinked state path is a supported arrangement, and the restore has to work through it: the
 // alternative is reporting success while putting the bytes where the daemon will never read them.
 func TestRestoreFollowsASymlinkedStatePath(t *testing.T) {
