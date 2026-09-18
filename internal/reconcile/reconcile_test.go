@@ -1329,6 +1329,50 @@ func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
 	}
 }
 
+// A pass in which every certificate is inside its backoff window must be reported as trouble.
+//
+// This is the classification Trouble() depends on, and the reason the guard it used to have could
+// never fire: an ErrBackoff pass increments Backoff and does NOT append to Skipped, so a one-shot run
+// exited 0 with a green journal for a certificate parked for up to six hours. Asserting it here as
+// well as on Trouble() itself keeps the two halves -- what the pass records, and what the exit code
+// reads -- from drifting apart again.
+func TestAPassInBackoffIsRecordedAsTrouble(t *testing.T) {
+	names := []string{"backing-off-one", "backing-off-two"}
+
+	mgr := &fakeManager{failWith: map[string]error{
+		names[0]: state.ErrBackoff,
+		names[1]: state.ErrBackoff,
+	}}
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	certs := make([]config.Certificate, 0, len(names))
+	for _, n := range names {
+		certs = append(certs, config.Certificate{Name: n})
+	}
+	cfg := &config.Config{Certificates: certs}
+	r := New(cfg, spec.NewStatic(certs), store, mgr, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rep := r.RunDetailed(context.Background())
+	if rep.Backoff != len(names) {
+		t.Errorf("Backoff = %d, want %d: this is the count the exit code reads", rep.Backoff, len(names))
+	}
+	if len(rep.Skipped) != 0 {
+		t.Errorf("a backoff skip is not an in-flight skip; Skipped = %v", rep.Skipped)
+	}
+	if rep.Attempted != 0 {
+		t.Errorf("nothing was attempted, got %d", rep.Attempted)
+	}
+	if !rep.Trouble() {
+		t.Error("a pass that attempted nothing because every certificate is in its retry window is " +
+			"not a healthy pass: the timer would exit 0 while nothing is being renewed")
+	}
+}
+
 // reconcileCounts reads the three result counters for one certificate.
 func reconcileCounts(t *testing.T, name string) map[string]float64 {
 	t.Helper()
