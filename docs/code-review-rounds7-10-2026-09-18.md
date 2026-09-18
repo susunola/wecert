@@ -1,4 +1,4 @@
-# 第七至十轮代码复审（2026-09-18）
+# 第七至十轮代码复审（2026-09-18，共 4 轮）
 
 > 承接 [`docs/code-review-round4-2026-09-18.md`](code-review-round4-2026-09-18.md)（第 1–5 小轮，42 条）与 [`docs/code-review-round6-2026-09-18.md`](code-review-round6-2026-09-18.md)（第 6 轮，16 条）。第 6 轮之后先把它**故意没做**的 9 项做完（提交 `0497d14`），再按四个**互不相同的视角**继续复审：故障注入、协议一致性、性质/模糊测试、以及对自己修复的对抗性攻击。
 
@@ -109,3 +109,91 @@
 ### 2.5 复审者另外跑过的性质测试（「这些面查过了」，但不是证明）
 
 声明解析器（60s / 416 万次执行，含 `hostnameFromRecord == Hostname` 与幂等性）、`parse()` 的「每个名字一个结论 + 与记录次序无关」（77s）、`validateDomain`（42s / 630 万次 + 归一化不动点）、`CertName` 单射与分组稳定性、`LoadDocument`（77s：加载即校验、写读往返、十亿笑声/深层嵌套/重复键/非 UTF-8 全部拒绝、16.77MB 合法文档 1.2s 读完）、限额桶序列（62+46+45+45s，最多 2900 万次，含「时钟回拨不发币」与冻结时钟的守恒）、`tcerr`（2×30s）、probe 判定（不变性/单调性）、状态库 120 组随机操作序列（每步断言不变量 + 重开后 9 张表逐字节一致）+ 62s fuzz、reconciler 决策属性（153s：不 due 不下单、失败必排重试、收缩必有 fallback 记录、不超 profile 上限）。
+
+---
+
+## 3. 第 9 轮：运维面 + 文档（2 个复审者）
+
+**方法**：一个复审者只走**运维真正会碰的东西**（systemd unit、install.sh、cloud-init、告警规则、runbook、CLI 契约），并要求能跑的就跑（`systemd-analyze verify`/`security`、容器里真跑 unit、真跑 install.sh、`bash -n`/`shellcheck`）；一个只做**文档 vs 行为**，范围是第 6 轮之后改动的约 40 处行为（第 6 轮审计过的那 36 处不再重复）。
+
+### 3.1 已修（HIGH：定时器模式下指标告警根本不可能响）
+
+`wecert-once.timer` 模式下 `/metrics` 只在**一次 pass 的时长内**存在（`cmd/wecert/main.go:252` 起，`:261-274` 就返回），而 17 条规则里 13 条带 `for:`（5 分钟到 24 小时）——**它们永远不可能满足 `for`**，另外 4 条也只有恰好在那段时间里被抓到才算数。而 README 把 `/metrics` 说成两种模式通用的告警路径，定时器的退出码只覆盖「这一轮没收敛」：`probe_match==0`、未决吊销、限额封禁、孤儿证书、文档冻结全都看不见。
+
+**修法**：README 明确写出这个限制（「指标只在守护进程活着的时候存在；要让那 17 条规则有意义就得跑守护进程，或者定时器 + push gateway」）。
+
+### 3.2 已修（medium：告警规则本身不可能完成它的工作）
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| 1 | 三条到期规则是按 profile 写的，而指标只有 `cert` 一个标签 —— 一张 shortlived（160 小时）证书在它**整个生命周期**里都会触发 22.5 天与 11.25 天两条告警 | 指标加 `profile` 标签（发布处按证书 profile，空值回落 classic），三条规则各自选择自己的 profile；顺带修掉 `DeleteCertSeries` —— 它用单值删除，在新标签下会 panic（`DeleteLabelValues` 的值个数必须等于标签个数），而「证书移除后序列被回收」这条既有用例正好抓住了它 |
+| 2 | `increase(probe_errors_total[1h]) > 3` **不可能达到**：每个主机每次 pass 只加 1，pass 每小时一次 —— 于是「这是环境问题不是证书问题」的告警永远不响，响的是一条 CRITICAL 的「服务的不是部署的那张证书」，正好是这两个指标存在的意义所在 | 窗口改为 6 小时 |
+| 3 | `remaining < 5` 恰好等于两条限额的容量（exact-set 5/7 天、identifier 5/小时），于是每次签发之后大约一天半里这条 warning 一直是亮的 | 阈值改为 1 token |
+| 4 | `HasNotReconciledRecently` 没有 `> 0` 守卫：`last_reconcile` 是普通 gauge、从 0 开始，于是**每次进程启动半小时后**就会告警「两小时没有完成过一轮」 | 加 `> 0` 守卫 |
+
+### 3.3 已修（install.sh 与 runbook）
+
+- **只装了 `wecert`**，而随仓库分发的 onboarding 定时器执行的是 `wecert-onboard` —— 每个 tick 都是 203/EXEC（对期望状态文档来说是静默失效）。现在从 wecert 同目录安装它，找不到就明确说明哪个 unit 起不来。
+- **镜像里没有 `file(1)` 时**：`set -e` 下脚本以 127 退出，而且下一行把「工具缺失」误报成「不是 Linux ELF」。现在先检查命令是否存在并说清楚。
+- **找不到 unit 文件时**：先打印 error，然后照样打印「Installation complete」并以 0 退出。现在以非 0 退出。
+- **`WECERT_STATE_DIR` 与 unit 沙箱不兼容**（`StateDirectory=wecert` + `ProtectSystem=strict`，没有 `ReadWritePaths`）：现在会明确警告「需要给 unit 加 ReadWritePaths」。
+- `wecert-onboard -h` 退出码从 1 改为 **64**（与 probe/preflight 一致；1 在这个仓库的文档里是「程序跑了但失败」）。
+- `docs/staging-checklist.md` 第 1.1 步（`-once`）与本清单「守护进程在跑」的前提冲突（状态库有锁，会被拒绝），并补上 `sudo -u wecert`。
+- `docs/desired-state.md` 的 reload unit 用 `${WEBHOOK_TOKEN}` 却没有任何 `Environment=`：systemd 把未定义变量展开成空串 → 401，而 `curl -sf` 让这个 unit 看起来只是「没触发」。现在给出 `EnvironmentFile` 的正确写法。
+- `README.md` 的 `-dry-run` 说法收敛为事实：它在构造 DNS provider 与 deployer **之前**就返回，所以不会验证 DNSPod token 或 CAM 凭据。
+- 新行为补文档：探测的 32 地址上限、（第 7 轮加的）状态文件符号链接/可写目录警告。
+
+### 3.4 已修（HIGH：文档把 ARI 豁免规则说错了，而这是「通配符优先」的论据）
+
+四份 README 与生命周期页面都写「ARI 豁免要求 identifier 集合**不变**」。Let's Encrypt 的实际规则是「与被替换证书**至少共享一个标识符**」（`at least one identifier matching the certificate it intends to replace`）；代码从 `b88b910` 起就是按真实规则做的（SAN drift 分支照发 `replaces`），它自己的注释还引用了官方措辞，而 `TestDriftReissueWithAnOverlappingSetKeepsTheExemption` 一直在钉这个行为。**文档说的比代码严**，代价是运维会以为「加一个域名必然花掉 50/7 天额度」。已按真实规则改正 5 处文档 + 1 处日志措辞。
+
+其余已修文档：中文 README 对（第 6 轮只改了英文）的 `statePath` 默认值、限额外负担方向、Roadmap 五项、CAM 权限两项、状态表；英文参考文档里 `identifier_failures` 写了不存在的列（`first_seen`/`last_seen`，是第 6 轮自己引入的）；10 处 grep 仍在找第 8 轮改名的 `replaces=true`（其中一处是**否定断言**，改名后它会空转通过）；`recovery.md` 没有第 7 轮新加的「WAL 被删」警告所指向的内容；测试清单与 `make check` 描述过期。
+
+---
+
+## 4. 第 10 轮：对抗自己 + 新眼睛（2 个复审者）
+
+**方法**：一个只攻击第 7/8 轮与第 6 轮收尾的**修复本身**（要求对每处修复给出反例或「我试过，它顶住了」的证据）；一个**全新视角**看从没被指派过的面（`internal/metrics`、`tcerr`、`group`、`spec` 的冷路径、测试辅助函数），并**重测早先的驳回**——驳回是「这不是缺陷」的断言，最弱的那几条用真实复现再打一遍。
+
+### 4.1 已修
+
+| 严重度 | 位置 | 缺陷 | 修法 |
+|---|---|---|---|
+| medium | `internal/acme/manager_renew.go` | **第 8 轮的回归**：拒绝 scope 的提取只认 `already issued for %q`，于是 Boulder 的 failed-authorization 措辞落到「证书的第一个域名」上。第 8 轮让这个截止时间**开始生效**之后，它就变成双向的可用性 bug：含被暂停名字的那张证书不被拦，而恰好共享第一个域名的**无关证书**被拦 | 改为取消息里**第一个被引号括起来的名字**（两条 Boulder 措辞都满足），并加用例把三种形状钉住（点名 b、点名注册域名、什么都没点名时的回落） |
+| medium | `internal/reconcile/reconcile.go` | **panic 容器不是容器**：deferred 处理器自己在里面调 `notifier.Renewal`，从这条路径再 panic 就没有任何 handler 了；实测 panic 逃逸、`Reconcile` 少跑一张证书，而在 webhook 路径上那是裸 goroutine，会**杀掉进程**。同一次运行还让同一个 pass 同时计入 `ok` 与 `error` | 通知走自己的 recover（`notifyPanicSafe`）；计数只在 switch 没跑过时才补记（`accounted` 标志） |
+| low | `internal/reconcile/reconcile.go` | 部署**只是未确认**时也会回收该主机的探测序列（`probeCert` 对未确认部署故意早退），于是每个续期周期序列都会闪烁一次；如果换绑最终失败，`probe_match==0` 那条文档化告警赖以触发的序列已经没了 —— 对它要抓的失败保持沉默 | 证书仍在期望状态、只是 `DeployConfirmed=false` 时保留序列（拿不到期望状态时也保留；只有「确实不再被探测」才回收）。用例 `TestAnUnconfirmedDeploymentKeepsItsProbeSeries` |
+| low | `internal/state/tx.go` | 文档说「fn 内通过 store 读取会看到事务前状态」——**假的**：那会永久阻塞在不可重入的 `s.mu` 上（ctx 也救不了），随后连 `Close` 都冻住。两个生产调用方都干净，所以今天不可达，但这句话会骗到下一个维护者 | 注释改为陈述真实行为（会死锁，必须通过 `Tx` 读） |
+
+### 4.2 复审者重测后确认「仍然成立」的驳回（这些面的可信度因此提高）
+
+preflight 的 `confirm`（空/出错的 stdin 都算 no，且闸门在删除循环之前）、`solveChallenges` 的 16 个错误返回全部走 `recordFailure`、probe 期望语义与两个调用方一致、`replaces` 空值不会上线（lego 的 `omitempty` + 目录门控）、`probe` 的 `NotAfter` 秒级精度往返无损、`pruneSnapshots` 的 protect、`HasRecoverableState`、token 先于锁定、7 处 `sdkCallError`、`onboarding.New` 的校验、`PublishQuota` 的新签名、`make test-tags`、`make release` 里的 lego_dns、`atomicfile.SyncDir`。
+
+### 4.3 驳回与已知取舍（本轮）
+
+| 复审说法 | 处理 |
+|---|---|
+| IP/PSL 校验会不会拒掉合法名字（私有后缀、punycode、通配符、`ca.test`） | **驳回**：仓库里所有 fixture 与脚本用的名字都通过；单标签名字被拒，但 `dns.go` 的 SOA 走查本来就会拒掉「托管区正好停在公共后缀」的情况，是闭环。唯一遗留是措辞（消息说「no certificate authority」，对私有 CA 不准确） |
+| `AddRetiredCert("")` 的守卫只在 store 上、`Tx.AddRetiredCert` 没有 | **接受为遗留**：两个入口都应带守卫，记入待办 |
+| `orphaned_certificates` 是单向 gauge（行按设计保留） | **记入文档**：指标 Help 与 README 说明「行会被保留、这个 gauge 不是瞬时状态」 |
+| 探测部分地址失败时 `probe_match=0` 且 `probe_errors` 增加（行为有意，契约写反） | **修文档**：metric Help 与 README 说明「0 也可能是环境问题，配合 probe_errors 看」 |
+| `WithTx` 内读 store 会死锁（上一轮记为「仅措辞」） | **上一轮的驳回被削弱**：可达性那半仍然成立（无调用方），但注释已按真实行为改写（见 4.1） |
+
+---
+
+## 5. 四轮合计与门禁
+
+| 轮次 | 视角 | 复审者返回 | 核实后已修 |
+|---|---|---|---|
+| 第 7 轮 | 故障注入（磁盘 / 数据库与崩溃 / 时间·网络·上下文） | 20 条（10+4+6） | **13**（1 medium×6、low×7），驳回 1（`deployRecordGrace` 的墙钟算术，有反证） |
+| 第 8 轮 | 协议一致性 / 配额经济学 / 性质与模糊测试 | 22 条（8+9+5） | **15**（high×1、medium×6、low×8），驳回 1、记为缺口/限制 4 |
+| 第 9 轮 | 运维面 / 文档 vs 行为 | 51 条（15+36） | **约 30**（high×5、medium×8，其余为低价值但会导致误操作的陈旧描述） |
+| 第 10 轮 | 对抗自己 + 新眼睛 + 重测驳回 | 6 条 | **4**（medium×2、low×2），并把上一轮的一条驳回降级为「真实行为比文档更糟」 |
+
+四轮的门禁每一项都跑过并绿：`gofmt -l .`、`go vet ./...`、`go vet -tags "pebble lego_dns" ./...`、`staticcheck ./...`、`python3 scripts/check-english.py`（188 个源文件）、`python3 scripts/check-alerts.py`（17 条规则引用的序列都存在）、`python3 scripts/check-cam-policies.py`（10 个 API 都被三份策略覆盖）、`go test -race ./...` **20/20 包**、`make check`（含 `test-tags`）、`make test-pebble`（2/2）、`make e2e`（3/3）。提交：`a607998`、`3a0fabd`、`0f7acf5`、`c0a2156`（前一个 `0497d14` 是第 6 轮遗留项收尾），每个都已推送且 CI success。
+
+## 6. 精度说明（这四轮的可信度边界）
+
+- **驳回也要有证据**：这一轮序列里共有 30 余条「不是缺陷」的结论被写下来（含反证），并且第 10 轮专门派人**重测**其中推理最弱的几条——重测改变了一条（`WithTx` 的注释：可达性那半成立，但真实失败是死锁而不是「读到旧值」）。
+- **抓到的最值钱的东西是「修复自己的回归」**：第 8 轮的截止时间消费让一条早已存在的 scope 提取缺陷开始咬人（第 10 轮抓到）；第 8 轮给指标加标签又暴露了 `DeleteCertSeries` 的单值删除（既有用例抓到）。两处都说明：**修复会把沉睡的缺陷激活**，所以每一轮都要回头打自己。
+- **仍然未验证**（与前面各轮合并，不再重复列举）：真机生产 LE、自然到期续期、云端对 `IsCheckResource` 的真实执行、真实断电/掉页、CA 是否真的会在同一 authz URL 上换挑战、DNSPod 是否真的返回非规范记录名、`-tags lego_dns` 的 CI 门禁（token 推不了 workflow，已用 `make release` 与 `make test-tags` 覆盖）、`docs/certificate-lifecycle*.html` 里的若干陈旧陈述（那两张页面由 `make diagrams` 从中文源生成，本轮没有重新生成）。
+- **两处刻意留给后续**：第五个 CA 限额（连续授权失败导致标识符暂停）没有建模；降级集合的「证据过期后自动重试完整集合」还没有实现（第 9 轮只把 WARN 文案的评估记录下来）。两者都写在 §2.4 与 §4.3 里。
