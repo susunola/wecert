@@ -198,6 +198,12 @@ func (m *Manager) solveChallenges(
 		return false, m.recordFailure(ctx, st, err)
 	}
 
+	// As in the polling loop: a pass that sees several invalid authorizations books ALL of them.
+	// The ledger is what the degraded-set decision reads, so learning about one of two broken names
+	// leaves the certificate re-ordering a set that still contains a name the CA rejects.
+	var invalid []string
+	var invalidErr error
+
 	// Phase 1: write every TXT that is still awaiting validation, all in one go.
 	// Here we must never do "write one -> validate one -> delete one": for
 	// example.com + *.example.com both authorizations' challenge values land on
@@ -256,8 +262,14 @@ func (m *Manager) solveChallenges(
 					"cert", c.Name, "identifier", targeted, "err", rerr)
 			}
 
-			return false, m.recordFailure(ctx, st, fmt.Errorf(
-				"the authorization for identifier %s is invalid: %s", targeted, authzError(cur)))
+			// Booked, not returned: the ledger is what the degraded-set decision reads, so a pass
+			// that sees two invalid identifiers has to record both. See the loop tail.
+			invalid = append(invalid, targeted)
+			if invalidErr == nil {
+				invalidErr = fmt.Errorf(
+					"the authorization for identifier %s is invalid: %s", targeted, authzError(cur))
+			}
+			continue
 
 		case "deactivated", "expired", "revoked":
 			// RFC 8555 section 7.1.6: these statuses are closed. The authorization can never
@@ -431,6 +443,15 @@ func (m *Manager) solveChallenges(
 		pending = append(pending, a)
 	}
 
+	if invalidErr != nil {
+		if len(invalid) > 1 {
+			m.log.Warn("several identifiers were already invalid at the start of this pass; all of "+
+				"them are in the failure ledger, which is what the degraded-set decision reads",
+				"cert", c.Name, "identifiers", strings.Join(invalid, ","))
+		}
+		return false, m.recordFailure(ctx, st, invalidErr)
+	}
+
 	if len(pending) == 0 {
 		// Every authorization is already valid (for example we crashed after it went valid but
 		// before cleanup). Still try to clear any leftover TXT, so DNSPod's record quota does
@@ -459,6 +480,18 @@ func (m *Manager) solveChallenges(
 		if a.ChallengeSent {
 			continue
 		}
+		// The identifier's failure budget is claimed BEFORE the CA is asked to validate.
+		//
+		// This is the point of no return for spending it: once the challenge is accepted, a failure
+		// costs one of the five authorizations per identifier per hour, and the budget belongs to
+		// the IDENTIFIER -- several certificates for the same name share it. The decision used to be
+		// check-then-act, and the webhook fan-out admits up to eight passes at once, so eight
+		// certificates sharing a name all read "not cooling" and all failed inside one window,
+		// leaving the bucket at -3 against a capacity of five. Claiming here means the second pass
+		// sees the first pass's claim whatever order the scheduler picks; a success clears it again
+		// (see awaitAuthorizations), and an order that is merely refused by the CA never claims
+		// anything, which is why this is not done where the order is placed.
+		m.noteIdentifierFailure(a.Identifier)
 		if err := m.core.AcceptChallenge(a.ChallengeURL); err != nil {
 			return false, m.recordFailure(ctx, st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
 		}
@@ -544,6 +577,15 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 		}
 
 		stillPending := pending[:0]
+		// Every invalid authorization this poll sees is booked, not just the first.
+		//
+		// Returning on the first one left the failure ledger knowing about one name of however many
+		// the CA rejected: measured with a certificate whose [a,b,c] had a AND b invalid, the ledger
+		// recorded a three times, the degraded round ordered [b,c] -- still containing the invalid b --
+		// and the certificate could never degrade far enough to issue at all. The ledger is what the
+		// fallback decides from, so a name the CA calls invalid has to be in it after this pass.
+		var invalid []string
+		var invalidErr error
 		for i, a := range pending {
 			cur := current[i]
 
@@ -577,13 +619,27 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 				if rerr := m.store.RecordIdentifierFailure(a.CertName, targeted, authzError(cur), m.now()); rerr != nil {
 					m.log.Warn("failed to record the identifier failure", "cert", a.CertName, "identifier", targeted, "err", rerr)
 				}
-				return fmt.Errorf("validation failed for identifier %s: %s", targeted, authzError(cur))
+				invalid = append(invalid, targeted)
+				if invalidErr == nil {
+					invalidErr = fmt.Errorf("validation failed for identifier %s: %s", targeted, authzError(cur))
+				}
+				continue
 			default:
 				stillPending = append(stillPending, a)
 			}
 		}
 		pending = stillPending
 
+		if invalidErr != nil {
+			// Reported once, after every invalid authorization in this poll has been booked. The
+			// message names the first one; the ledger now holds all of them.
+			if len(invalid) > 1 {
+				m.log.Warn("several identifiers failed validation in this poll; all of them are in the "+
+					"failure ledger, which is what the degraded-set decision reads",
+					"identifiers", strings.Join(invalid, ","))
+			}
+			return invalidErr
+		}
 		if len(pending) == 0 {
 			return nil
 		}

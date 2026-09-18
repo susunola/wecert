@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"log/slog"
+	"math"
 	"time"
 )
 
@@ -87,6 +88,18 @@ func (t *Tracker) Spend(l Limit, scopeID string, cost float64) {
 	if t == nil || t.store == nil {
 		return
 	}
+	// A non-finite amount never reaches the arithmetic.
+	//
+	// Spend sanitises a negative cost (an over-spend, which is the realistic mistake) but not NaN
+	// or +Inf, and one such value leaves Tokens non-finite for the rest of the bucket's life:
+	// every comparison against NaN is false, so Remaining reports NaN forever and the debt clamp
+	// never fires. No caller computes a cost today -- all four pass the literal 1 -- which is
+	// exactly why the guard belongs here rather than in a comment.
+	if math.IsNaN(cost) || math.IsInf(cost, 0) {
+		t.log.Warn("refusing a rate-limit spend with a non-finite cost; the bucket would be "+
+			"unreadable for the rest of its life", "limit", l.Name, "scope", scopeID, "cost", cost)
+		return
+	}
 	now := t.now()
 	// One operation, not Get then Put: a concurrent pass spending on the same bucket would
 	// otherwise read the same token count and overwrite this spend, and the estimate is what keeps
@@ -110,9 +123,11 @@ func (t *Tracker) Spend(l Limit, scopeID string, cost float64) {
 
 // Remaining reports how many tokens a limit has left, or (0, false) when it cannot be read.
 //
-// The estimate is a LOWER BOUND: it counts only what this program spent, while
-// "certs per registered domain" and "certs per exact set" are global across accounts. A value
-// here is therefore "at least this much", never more.
+// The estimate is an UPPER BOUND on what is left: it counts only what this program spent, while
+// "certs per registered domain" and "certs per exact set" are global across accounts, so another
+// account's spend makes the true remainder smaller, never larger. A value here is therefore "at
+// most this much". (The wording used to say "at least", which is the same fact read backwards --
+// and the direction matters, because "at least" invites spending quota that may not be there.)
 func (t *Tracker) Remaining(l Limit, scopeID string) (float64, bool) {
 	if t == nil || t.store == nil {
 		return 0, false
@@ -151,11 +166,21 @@ func (t *Tracker) BlockedUntil(l Limit, scopeID string) (time.Time, string, bool
 // second is the one to act on because it accounts for every other spend the local estimate
 // cannot see.
 func (t *Tracker) NoteRetryAfter(l Limit, scopeID, errMsg string) (time.Time, bool) {
-	if t == nil || t.store == nil {
-		return time.Time{}, false
-	}
 	at, ok := ParseRetryAfter(errMsg)
 	if !ok {
+		return time.Time{}, false
+	}
+	return t.NoteDeadline(l, scopeID, at, "retry after")
+}
+
+// NoteDeadline records an authoritative deadline that was read from somewhere other than the
+// error's prose -- in practice the 429 Retry-After HEADER, which lego exposes on its typed error.
+//
+// The field is the protocol's own answer and the prose is commentary, so a CA may send the header
+// alone. Parsing only the message meant such a refusal recorded no deadline at all: the metric
+// stayed optimistic and the pass retried inside the window the CA had just named.
+func (t *Tracker) NoteDeadline(l Limit, scopeID string, at time.Time, source string) (time.Time, bool) {
+	if t == nil || t.store == nil || at.IsZero() {
 		return time.Time{}, false
 	}
 	if err := t.store.UpdateRateBucket(l.Name, scopeID, func(rec *BucketRecord) error {
@@ -164,11 +189,11 @@ func (t *Tracker) NoteRetryAfter(l Limit, scopeID, errMsg string) (time.Time, bo
 		return nil
 	}); err != nil {
 		t.log.Warn("cannot record the CA-reported rate-limit deadline",
-			"limit", l.Name, "scope", scopeID, "until", at, "err", err)
+			"limit", l.Name, "scope", scopeID, "until", at, "source", source, "err", err)
 		return time.Time{}, false
 	}
 	t.log.Error("the CA refused a request against a documented rate limit; no request against "+
 		"this limit will succeed before the reported instant",
-		"limit", l.Name, "scope", scopeID, "until", at)
+		"limit", l.Name, "scope", scopeID, "until", at, "source", source)
 	return at, true
 }

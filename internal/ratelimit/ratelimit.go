@@ -16,17 +16,23 @@
 //     stored as an override (see Deadline).
 //  2. Local accounting. Limits are token buckets: capacity N refilling at a published rate.
 //     Knowing what we spent and when is enough to compute what is left, because the refill is
-//     deterministic. This is a LOWER BOUND: other accounts sharing a domain, and any operator
-//     activity outside this program, consume from the same bucket and are invisible here.
+//     deterministic. This is an UPPER BOUND on what is left: other accounts sharing a domain, and
+//     any operator activity outside this program, consume from the same bucket and are invisible
+//     here, so the real remainder can only be smaller.
 //
-// The lower bound is the honest framing and the useful one: it answers "can I safely do this
-// now", and the estimate can only be wrong in the direction that makes the operator more
-// careful. The package name says estimate, not quota.
+// The bound direction is stated because it is the whole safety argument, and this comment used to
+// state it backwards ("a lower bound ... at least this much is left"). "At most this much is left"
+// answers "can I safely do this now" with the wrong answer if it is read as "at least"; the alert
+// file and the metric table in README.reference.md both have it right. The package name says
+// estimate, not quota.
 package ratelimit
 
 import (
 	"fmt"
 	"math"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -288,6 +294,30 @@ func ParseRetryAfter(msg string) (time.Time, bool) {
 			}
 			return t.UTC(), true
 		}
+	}
+	return time.Time{}, false
+}
+
+// ParseRetryAfterHeader parses an HTTP Retry-After header value.
+//
+// RFC 9110 section 10.2.3 allows two forms: a delay in seconds, or an HTTP-date. It is a different
+// syntax from the free text Boulder puts in the error MESSAGE (see ParseRetryAfter), and it is the
+// authoritative field: a CA may send the header without repeating the instant in the message, and
+// lego exposes it on its typed error. Reading only the message meant such a refusal recorded no
+// deadline at all, so the pass retried inside the window the CA had just named.
+func ParseRetryAfterHeader(value string) (time.Time, bool) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return time.Time{}, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return time.Time{}, false
+		}
+		return time.Now().Add(time.Duration(secs) * time.Second).UTC(), true
+	}
+	if t, err := http.ParseTime(v); err == nil && !t.IsZero() {
+		return t.UTC(), true
 	}
 	return time.Time{}, false
 }

@@ -993,3 +993,37 @@ probe:
 		t.Errorf("an unset floor must stay accepted, got %v", err)
 	}
 }
+
+// An IP literal and a bare public suffix must be rejected where they are written.
+//
+// Neither can be issued, and neither fails cleanly on its own. lego promotes an IP literal to an
+// RFC 8738 "ip" identifier, the CA then offers only tls-alpn-01 and http-01 for it, and the DNS-01
+// selector finds no challenge -- so the WHOLE certificate (every SAN on it) stops issuing every
+// pass with an error about a challenge type rather than about the line in the document that caused
+// it. A bare TLD or public suffix has nothing above it to validate against, and a single label is
+// the "internal name" the CA/B baseline requirements forbid a public CA to sign.
+func TestIdentifiersThatCannotBeIssuedAreRejected(t *testing.T) {
+	cases := []struct {
+		domain string
+		why    string
+	}{
+		{"203.0.113.10", "IPv4 literal"},
+		{"*.198.51.100.7", "IPv4 literal behind a wildcard"},
+		{"com", "bare TLD"},
+		{"co.uk", "public suffix"},
+		{"localhost", "single label"},
+	}
+	for _, tc := range cases {
+		if err := ValidateDomain(tc.domain); err == nil {
+			t.Errorf("%s (%s) must be rejected when the document is written, not discovered when the "+
+				"whole certificate fails to issue", tc.domain, tc.why)
+		}
+	}
+
+	// The ordinary shapes must keep working, including a wildcard and a delegated subzone.
+	for _, ok := range []string{"example.com", "*.example.com", "a.b.example.co.uk", "xn--bcher-kva.example"} {
+		if err := ValidateDomain(ok); err != nil {
+			t.Errorf("%q is a normal identifier and must be accepted, got %v", ok, err)
+		}
+	}
+}
