@@ -120,7 +120,7 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 		return "", fmt.Errorf("snapshot %s is missing after rename: %w", final, err)
 	}
 
-	if err := s.pruneSnapshots(dir, keep); err != nil {
+	if err := s.pruneSnapshots(dir, keep, final); err != nil {
 		// The snapshot itself succeeded; failing to prune is worth reporting but must not
 		// be reported as a failed snapshot.
 		return final, fmt.Errorf("snapshot written to %s, but pruning old snapshots failed: %w", final, err)
@@ -214,8 +214,17 @@ func (s *Store) listSnapshots(dir string) ([]string, error) {
 	return out, nil
 }
 
-// pruneSnapshots keeps the newest `keep` snapshots and removes the rest.
-func (s *Store) pruneSnapshots(dir string, keep int) error {
+// pruneSnapshots keeps the newest `keep` snapshots and removes the rest, never removing protect
+// (the snapshot this call just wrote).
+//
+// Names are wall-clock stamps, so name order and content order agree only while the clock moves
+// forwards. After a backward step -- an NTP correction, a VM resumed from a snapshot, a backup
+// directory restored from a host whose clock was ahead -- the file just written has the newest
+// CONTENT and the OLDEST name, and "delete from the front" removed exactly that file: the caller
+// logged a fresh snapshot at a path that no longer existed and the recovery point silently stopped
+// advancing. Protecting the name and taking one extra victim from the rest keeps retention at
+// `keep` while guaranteeing the newest content survives.
+func (s *Store) pruneSnapshots(dir string, keep int, protect string) error {
 	names, err := s.listSnapshots(dir)
 	if err != nil {
 		return err
@@ -223,7 +232,18 @@ func (s *Store) pruneSnapshots(dir string, keep int) error {
 	if len(names) <= keep {
 		return nil
 	}
-	for _, name := range names[:len(names)-keep] {
+	// names is oldest-first, so filling the victim set in order preserves "oldest goes first".
+	victims := make([]string, 0, len(names)-keep)
+	for _, name := range names {
+		if len(victims) == len(names)-keep {
+			break
+		}
+		if name == protect {
+			continue
+		}
+		victims = append(victims, name)
+	}
+	for _, name := range victims {
 		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove old snapshot %s: %w", name, err)
 		}
@@ -234,4 +254,30 @@ func (s *Store) pruneSnapshots(dir string, keep int) error {
 // Snapshots lists the snapshots this store would prune, oldest first. For diagnostics.
 func (s *Store) Snapshots(dir string) ([]string, error) {
 	return s.listSnapshots(dir)
+}
+
+// HasRecoverableState reports whether this database holds anything a snapshot could recover.
+//
+// The question is not idle when retention is in play. A snapshot of a freshly created database is
+// not a recovery point, but retention counts it as one: after the documented state.db loss -- the
+// case snapshots exist for -- every restart wrote one of these and evicted a real backup, so three
+// restarts with keep=3 destroyed all three genuine snapshots and the operator's last good copy was
+// gone before anyone looked. The answer is "is there an account key, a certificate, an order, a
+// revocation decision or retired material in here"; rate buckets and identifier-failure counters
+// are deliberately not counted, because losing them costs rate-limit knowledge, not a certificate.
+func (s *Store) HasRecoverableState() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, table := range []string{"accounts", "certificates", "orders", "revoke_requests", "retired_certificates"} {
+		var exists int
+		err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ` + table + `)`).Scan(&exists)
+		if err != nil {
+			return false, fmt.Errorf("check %s for recoverable state: %w", table, err)
+		}
+		if exists == 1 {
+			return true, nil
+		}
+	}
+	return false, nil
 }

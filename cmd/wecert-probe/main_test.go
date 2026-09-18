@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -305,5 +306,40 @@ func captureStdout(t *testing.T) func() string {
 		data, _ := io.ReadAll(r)
 		_ = r.Close()
 		return string(data)
+	}
+}
+
+// -json is one object per line, not one indented object per attempt.
+//
+// The documented contract (README.md, README.zh-cn.md, docs/test-cases.md TC-PROBE-20/21/21b) is
+// NDJSON: one attempt, one line, so a line-oriented consumer -- `... | while read -r line; do jq .
+// <<<"$line"; done`, a CI step, a log processor -- can read the stream. The encoder indented, so a
+// single attempt spanned about thirty lines and no line was a JSON object on its own: the docs
+// described the intent and the code did something else.
+func TestJSONOutputIsOneObjectPerLine(t *testing.T) {
+	attempts := func(context.Context, string, probe.Options) ([]probe.Attempt, error) {
+		return []probe.Attempt{
+			{Address: "192.0.2.1", Result: &probe.Result{Host: "example.com", NotAfter: time.Now().Add(24 * time.Hour)}},
+			{Address: "192.0.2.2", Result: &probe.Result{Host: "example.com", NotAfter: time.Now().Add(24 * time.Hour)}},
+		}, nil
+	}
+
+	out := captureStdout(t)
+	checkOne(context.Background(), "example.com", probe.Options{},
+		probe.Expectation{Domains: []string{"example.com"}}, 0, true, attempts)
+	printed := out()
+
+	lines := strings.Split(strings.TrimRight(printed, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("two addresses must produce two lines, got %d:\n%s", len(lines), printed)
+	}
+	for i, line := range lines {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			t.Fatalf("line %d is not a JSON object on its own (%v): %q", i+1, err, line)
+		}
+		if obj["address"] == nil {
+			t.Errorf("line %d does not name the address it judged: %v", i+1, obj)
+		}
 	}
 }

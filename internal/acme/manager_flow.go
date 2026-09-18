@@ -408,6 +408,23 @@ func (m *Manager) solveChallenges(
 		}
 
 		if err := m.store.PutAuthorization(a); err != nil {
+			// The record is in DNS and the state write that would have named it failed, so nothing
+			// on disk points at it any more: the row still carries the token of the earlier attempt
+			// (that is exactly what the revisit path holds back until the write succeeds), and
+			// recovery derives the value it probes for from the token. Left alone, the record stays
+			// in DNS for the rest of the certificate's life -- a stale TXT at the challenge name that
+			// no row, no lease and no log line mentions. Take it back out instead.
+			if a.Presented {
+				if cleaned, cerr := m.removeAuthzTXT(ctx, a); cerr != nil || !cleaned {
+					m.log.Warn("the presented TXT could not be reclaimed after the state write failed, "+
+						"so it is in DNS under the name recorded in the row's txt_name",
+						"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName, "err", cerr)
+				} else {
+					m.log.Warn("the state write failed after the TXT was presented, so the record was "+
+						"taken back out rather than left unnamed in DNS",
+						"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName)
+				}
+			}
 			return false, m.recordFailure(st, fmt.Errorf("persist a presented challenge (%s): %w", a.Identifier, err))
 		}
 		records = append(records, DNSRecord{FQDN: a.TxtName, Value: a.TxtValue})

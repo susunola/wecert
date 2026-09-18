@@ -204,7 +204,8 @@ func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
 	if st.ARICheckedAt.IsZero() {
 		return true
 	}
-	// One effective interval: the shorter of our own floor and the server's Retry-After.
+	// One effective interval: the server's Retry-After when it gives one, our own floor otherwise
+	// (both clamped to the RFC's reasonableness bounds below).
 	//
 	// The two used to be checked in sequence with the fixed six-hour floor first, which made a
 	// SHORTER Retry-After impossible to honour -- the floor had already returned false, so the

@@ -54,3 +54,45 @@ func TestANotifyRedirectIsNotADelivery(t *testing.T) {
 		t.Errorf("the log must say the target redirected, got %s", logs.String())
 	}
 }
+
+// A notification target must not be logged verbatim: the URL is the credential.
+//
+// Chat and CI webhooks put the secret in the path (Slack/Feishu/DingTalk) or in a signed query, and
+// the journal is routinely shipped somewhere with a wider audience than the daemon's owner. A
+// delivery failure logs the target on every attempt, so an unredacted URL here is a credential in
+// the log forever -- and the transport error embeds it a second time.
+func TestANotificationTargetIsNotLoggedVerbatim(t *testing.T) {
+	const secret = "T000/B000/SUPERSECRETVALUE"
+	var logs bytes.Buffer
+
+	// Nothing listens on this port, so the delivery fails at dial time and the failure path logs.
+	n := NewNotifier("http://127.0.0.1:1/hook/"+secret, "", slog.New(slog.NewTextHandler(&logs, nil)))
+	n.Renewal(context.Background(), "cert-a", nil)
+	n.Drain(context.Background())
+
+	got := logs.String()
+	if strings.Contains(got, "SUPERSECRETVALUE") {
+		t.Errorf("the notification URL's secret reached the log:\n%s", got)
+	}
+	if !strings.Contains(got, "127.0.0.1:1") {
+		t.Errorf("the operator still has to learn WHICH target failed, got:\n%s", got)
+	}
+}
+
+// The redactor keeps the host, withholds path and query, and never prints an unparseable URL.
+func TestRedactNotifyURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://hooks.slack.com/services/T00/B00/SECRET", "https://hooks.slack.com/...(path withheld)"},
+		{"https://example.com/hook?token=SECRET", "https://example.com/...(path withheld)?..."},
+		{"https://example.com", "https://example.com"},
+		{"https://example.com/", "https://example.com"},
+		{"", "(no notification URL)"},
+		{"://not a url", "(notification URL withheld)"},
+		{"not-a-url", "(notification URL withheld)"},
+	}
+	for _, tc := range cases {
+		if got := RedactNotifyURL(tc.in); got != tc.want {
+			t.Errorf("RedactNotifyURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

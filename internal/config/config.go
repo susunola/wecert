@@ -944,21 +944,42 @@ func (c *Config) normalize() error {
 	// with a diagnosis that blames the rebind or SNI. The file already rejects the analogous
 	// "renewBefore >= validity" for the same reason: cheap to check, and the failure it prevents
 	// looks like something else entirely.
-	if c.Probe.MinValidDur > 0 {
-		for i := range c.Certificates {
-			cert := &c.Certificates[i]
-			validity, ok := profileValidity[cert.Profile]
-			if !ok {
-				continue
-			}
-			if c.Probe.MinValidDur >= validity {
-				return fmt.Errorf(
-					"probe.minValidFor %s is not shorter than certificate %q's %s profile validity %s, "+
-						"so every probe of it would fail while the certificate is still perfectly valid "+
-						"(wecert_certificate_probe_match stays 0 and the alert blames the rebind); "+
-						"use less than %s",
-					c.Probe.MinValidDur, cert.Name, cert.Profile, validity, validity)
-			}
+	//
+	// In enforce mode this loop sees an empty list -- the document is the only source of
+	// certificates there -- so the same check runs again where the document is resolved, which is
+	// the only place the two can meet. See CheckProbeFloor.
+	return CheckProbeFloor(c.Probe.MinValidDur, c.Certificates)
+}
+
+// CheckProbeFloor rejects a probe.minValidFor that no profile in use can satisfy.
+//
+// probe.Verify fails every probe whose remaining validity is below this floor, and the runner turns
+// that into wecert_certificate_probe_match = 0 -- so an unsatisfiable floor pins the metric at zero
+// forever and fires the critical "not serving the deployed certificate" alert with a diagnosis that
+// blames the rebind or SNI.
+//
+// It is exported because the certificates are not always in the config file: in enforce mode
+// c.Certificates must be empty, so the only place the floor and the certificates can meet is where
+// the document is resolved. Config.normalize calls it for the static and observe modes; the
+// reconciler calls it on every resolved pass and reports the mismatch, because a document may
+// change between passes and failing the pass there would stop renewals over a probe setting.
+func CheckProbeFloor(minValid time.Duration, certs []Certificate) error {
+	if minValid <= 0 {
+		return nil
+	}
+	for i := range certs {
+		cert := &certs[i]
+		validity, ok := profileValidity[cert.Profile]
+		if !ok {
+			continue
+		}
+		if minValid >= validity {
+			return fmt.Errorf(
+				"probe.minValidFor %s is not shorter than certificate %q's %s profile validity %s, "+
+					"so every probe of it would fail while the certificate is still perfectly valid "+
+					"(wecert_certificate_probe_match stays 0 and the alert blames the rebind); "+
+					"use less than %s",
+				minValid, cert.Name, cert.Profile, validity, validity)
 		}
 	}
 	return nil

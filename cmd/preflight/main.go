@@ -246,6 +246,14 @@ func findDomain(ctx context.Context, client *dnspod.Client, domain string) (*dns
 
 		resp, err := describeDomainList(ctx, client, req)
 		if err != nil {
+			// "No data for this domain" is not a permission problem: it is the answer this
+			// function is documented to give as nil, nil ("the domain is not under DNSPod in this
+			// account"). Classifying only the record-level code left the filtered-empty shape
+			// pointing the operator at a permission that was fine.
+			if tcerr.IsNoDataOfDomain(err) {
+				// nil, nil is this function's documented answer for "not in this account".
+				return nil, nil
+			}
 			return nil, fmt.Errorf("DescribeDomainList failed (check the dnspod:DescribeDomainList permission): %w", err)
 		}
 		if resp.Response == nil {
