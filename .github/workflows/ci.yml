@@ -63,7 +63,13 @@ jobs:
       # failures that are silent by construction, and both are checked by a Python script that
       # nothing in CI ran -- so a renamed metric or a policy that no longer covers an API call
       # reached main with a green build. Both are stdlib-only and take under a second.
-      - name: alert rules and CAM policies
+      #
+      # `check-scripts` also pulls in `check-cli`, which holds the documentation to the binaries:
+      # the README's own `wecert-clbverify -clb ...` exited 64 for a whole round because the flag
+      # was registered on flag.CommandLine instead of the tool's FlagSet, and no gate spelled the
+      # documented command. It builds the binaries itself (`make build tools`) when they are
+      # missing or older than the sources.
+      - name: alert rules, CAM policies, shell + CLI surface
         run: |
           make check-alerts
           make check-scripts
@@ -75,3 +81,195 @@ jobs:
       # a CVM, so do not wait until release day to find out they do not build.
       - name: cross build
         run: make release
+
+  # `install.sh` is the documented way onto a CVM, and no machine ran it: the round-11
+  # verification found it aborting on every `make release` + install with "SUMS: unbound
+  # variable" -- a merge left a reference to a local that verify_checksum had replaced, and
+  # under `set -u` the script died before the units were installed. The quick start's own
+  # command produced a half-installed machine, and green CI had no opinion about it.
+  #
+  # This job runs that command as root on the documented platform against real `make release`
+  # artifacts, so the two failures that path can have -- an abort, and a silent wrong result --
+  # are both visible. No containers: the runner is the target.
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The artifacts the quick start names, including wecert-onboard_linux_amd64 -- the
+      # release layout is what install.sh's same-directory lookup and its SHA256SUMS check
+      # are written against.
+      - name: release artifacts
+        run: make release
+
+      - name: install.sh smoke test (as root)
+        run: |
+          set -euo pipefail
+
+          # Every assertion reports; the step fails at the end if any of them did not hold,
+          # so one run says everything that is wrong rather than only the first thing.
+          fail=0
+          note() { echo "  ok   $*"; }
+          problem() { echo "::error::$*"; fail=1; }
+          expect_eq() { # <what> <want> <got>
+            if [ "$3" = "$2" ]; then note "$1 = $2"; else problem "$1: want '$2', got '$3'"; fi
+          }
+          expect_path() { # <what> <test flag> <path> -- as root: /etc/wecert is 0750 root:wecert
+            if sudo test "$2" "$3"; then note "$1: $3"; else problem "$1: $3 (test $2 failed)"; fi
+          }
+
+          log="$(mktemp)"; log2="$(mktemp)"
+
+          set +e
+          sudo ./install.sh ./dist/wecert_linux_amd64 >"${log}" 2>&1
+          rc=$?
+          set -e
+          echo "== install.sh exit code: ${rc} (log follows)"
+          tail -n 30 "${log}"
+          expect_eq "install.sh exit code" 0 "${rc}"
+
+          expect_path "the wecert binary is installed and executable" -x /usr/local/bin/wecert
+          expect_path "the wecert-onboard binary is installed and executable" -x /usr/local/bin/wecert-onboard
+          expect_path "the config exists" -e /etc/wecert/config.yaml
+          expect_eq "config mode" 640 "$(sudo stat -c '%a' /etc/wecert/config.yaml)"
+          expect_path "the state directory exists" -d /var/lib/wecert
+          expect_eq "state directory mode" 700 "$(sudo stat -c '%a' /var/lib/wecert)"
+          for unit in wecert.service wecert-once.service wecert-once.timer; do
+            expect_path "the ${unit} unit is installed" -e "/etc/systemd/system/${unit}"
+          done
+
+          # The completion banner is where the operator gets the next command; a run that
+          # installs everything and prints nothing usable is the silent half of the same bug.
+          if grep -qF -- 'sudo -u wecert /usr/local/bin/wecert -config /etc/wecert/config.yaml -dry-run' "${log}"; then
+            note "the run prints the validation command"
+          else
+            problem "the run does not print the validation command (step 2 of the completion banner)"
+          fi
+
+          # Second run over an existing installation: a config an operator has edited must
+          # survive, which is the one thing a re-run must not get wrong.
+          echo "# sentinel-line for the install.sh smoke test" | sudo tee -a /etc/wecert/config.yaml >/dev/null
+          set +e
+          sudo ./install.sh ./dist/wecert_linux_amd64 >"${log2}" 2>&1
+          rc2=$?
+          set -e
+          echo "== second install.sh exit code: ${rc2} (log follows)"
+          tail -n 30 "${log2}"
+          expect_eq "second run exit code" 0 "${rc2}"
+          if sudo grep -q 'sentinel-line for the install.sh smoke test' /etc/wecert/config.yaml; then
+            note "the second run did not overwrite the config"
+          else
+            problem "the second run overwrote the config (the sentinel line is gone)"
+          fi
+
+          # The trap that caught the round-11 defect: with `set -u`, a reference to a variable
+          # that no longer exists aborts the script. Both runs above must be free of it -- and
+          # both already had to exit 0, which is the other half.
+          if grep -q 'unbound variable' "${log}" "${log2}"; then
+            problem "install.sh printed 'unbound variable' (the variable typo that killed every install)"
+          else
+            note "neither run printed 'unbound variable'"
+          fi
+
+          exit "${fail}"
+
+  # The real-DNS end-to-end run and the full ACME protocol suite, behind their own job name so
+  # branch protection can require them.
+  #
+  # Both steps assert on what the output says, not only on the exit code: `make test-pebble`
+  # skips itself when the pebble binary is absent, and scripts/e2e.sh already treats a skipped
+  # first suite as a failure (round 11) -- but a gate that can pass by skipping is the thing
+  # this job exists to remove, so the skip is also searched for by name.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The integration test finds pebble's own TLS certificates in the module cache and the
+      # binary through $PATH or ~/go/bin, so both are made explicit.
+      - name: install pebble
+        run: |
+          go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+          echo "GOPATH=$(go env GOPATH)" >> "$GITHUB_ENV"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          test -x "$(go env GOPATH)/bin/pebble"
+          echo "pebble installed at $(go env GOPATH)/bin/pebble"
+
+      - name: pebble integration (must not skip)
+        run: |
+          set -o pipefail
+          make test-pebble 2>&1 | tee /tmp/test-pebble.log
+          echo "--- pebble suite result ---"
+          grep -E '^(=== RUN|--- PASS|--- SKIP|--- FAIL|ok|FAIL|PASS)' /tmp/test-pebble.log || true
+          grep -q 'PASS' /tmp/test-pebble.log || { echo "::error::make test-pebble produced no PASS"; exit 1; }
+          if grep -qiE -- '--- skip|skipping|not installed|not in the module cache' /tmp/test-pebble.log; then
+            echo "::error::make test-pebble skipped instead of running the real ACME lifecycle"
+            exit 1
+          fi
+
+      # The first suite binds 0.0.0.0:53 to be a real authoritative server, and a runner image
+      # commonly has systemd-resolved holding 127.0.0.53:53 -- the wildcard bind then fails and
+      # the suite skips itself, which this job treats as a failure (scripts/e2e.sh does too).
+      # Freeing 53 is safe here: the runner is a disposable VM, nothing in the suites resolves a
+      # public name (pebble and the authority are both on 127.0.0.1), and a public resolver is
+      # written back so anything after this step still has DNS.
+      - name: free port 53
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee /etc/resolv.conf >/dev/null
+          echo "--- still listening on port 53 (nothing is what the next step needs) ---"
+          sudo ss -lunpt 2>/dev/null | grep -E ':53\b' || echo "nothing is listening on port 53"
+
+      # The first suite binds 53/udp+tcp to be a real authoritative server, which a runner's
+      # unprivileged user cannot do, so the whole run goes through sudo with the Go environment
+      # (and HOME, where the module cache with pebble's test certificates lives) passed along.
+      # scripts/e2e.sh exits non-zero by itself when a suite skips or fails.
+      - name: e2e (all three suites)
+        run: |
+          set -o pipefail
+          sudo env "PATH=$PATH" "HOME=$HOME" "GOPATH=$(go env GOPATH)" "GOCACHE=$(go env GOCACHE)" \
+            make e2e 2>&1 | tee /tmp/e2e.log
+          echo "--- suite lines ---"
+          grep -E '^(==> [123]/3|    (pass|fail|SKIPPED))' /tmp/e2e.log || true
+          passes="$(grep -c '^    pass in ' /tmp/e2e.log || true)"
+          echo "passing suites: ${passes}/3"
+          if [ "${passes}" -ne 3 ]; then
+            echo "::error::expected all three suites to pass, saw ${passes}"
+            exit 1
+          fi
+          if grep -q 'SKIPPED in' /tmp/e2e.log; then
+            echo "::error::a suite skipped; a skip is a failure here (set WECERT_E2E_ALLOW_SKIP only to investigate)"
+            exit 1
+          fi
+
+  # Bounded fuzzing on every push, short enough to be a gate rather than a scheduled chore.
+  # The targets are the rate-limit arithmetic, where the divide-by-zero that motivated them was
+  # found by a fuzz run rather than by a reviewer.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # `make fuzz` stops at the first target that fails, and `set -o pipefail` is what keeps `tee`
+      # from turning that failure into a green step.
+      - name: fuzz (FUZZTIME=15s per target)
+        run: |
+          set -o pipefail
+          FUZZTIME=15s make fuzz 2>&1 | tee /tmp/fuzz.log

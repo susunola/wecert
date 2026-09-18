@@ -40,15 +40,19 @@ upgrade step: update the relevant file under `docs/` in the same PR.
 
 ```bash
 make build          # bin/wecert and the tools
-make check          # gofmt, vet, English, race tests, the e2e self-test, the alert rules
+make check          # gofmt, vet, English, race tests, the shell self-tests, the CLI surface, the alert rules
 make test-pebble    # a real ACME lifecycle against a local CA (needs the pebble binary)
 make fuzz           # property and fuzz targets, bounded per target (FUZZTIME=30s default)
 ```
 
-`make check` is a **superset** of what CI runs. CI currently does `gofmt`, `check-english.py`,
-`go vet`, `govulncheck`, `go test -race`, `make build` and `make release` — it does **not** run
-`check-scripts`, `check-alerts`, `make fuzz` or `make test-pebble`, so those four are on you before
-you push. Adding them to `.github/workflows/ci.yml` is open work, not a decision.
+`make check` covers everything CI's `test` job runs except `govulncheck` and `make release`
+(cross-compilation) — CI does `gofmt`, `check-english.py`, `go vet`, `govulncheck`,
+`go test -race`, `make test-tags`, `make check-alerts`, `make check-scripts`, `make build` and
+`make release`. Three CI jobs cover what a local `make check` cannot: `install` (the documented
+`make release` + `sudo ./install.sh` path, as root), `e2e` (pebble, `make test-pebble` and
+`make e2e`, which binds port 53) and `fuzz` (`FUZZTIME=15s make fuzz`). Run `make test-pebble`
+and `make fuzz` locally when your change touches issuance or the rate limiter; the other two need
+Linux and root.
 
 `make fuzz` arrives with the fuzz-target change (PR #55). On a base that predates it, run a target
 directly: `go test ./internal/ratelimit/ -run XXX -fuzz FuzzParseRetryAfter -fuzztime 30s`.
