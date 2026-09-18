@@ -794,7 +794,8 @@ func TestStaleSnapshotTempsAreSweptAndFreshOnesKept(t *testing.T) {
 
 	stale := filepath.Join(backups, ".snapshot-state.db-20200101T000000.000-0.tmp")
 	fresh := filepath.Join(backups, ".snapshot-state.db-29990101T000000.000-0.tmp")
-	for _, p := range []string{stale, fresh} {
+	journal := stale + "-journal"
+	for _, p := range []string{stale, fresh, journal} {
 		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -808,11 +809,57 @@ func TestStaleSnapshotTempsAreSweptAndFreshOnesKept(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Errorf("a stale temporary snapshot must be swept, stat err %v", err)
+	// Both of THIS store's temps go, whatever their age -- and with no age threshold.
+	//
+	// An earlier version of this test kept the fresh one because "a write may be in progress". That
+	// cannot be true here: the sweep runs inside Snapshot, which holds the store mutex (so no second
+	// snapshot of this database can be in flight in this process) and the cross-process lock on this
+	// state path (so no other process can be writing one either). Leaving the fresh file alone was
+	// therefore not caution, it was junk: the round-11 crash-fault verification killed the daemon
+	// mid-copy and found the partial temp AND its `-journal` still sitting in the state directory
+	// after the next start had already taken a clean snapshot.
+	for _, p := range []string{stale, fresh} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("this store's own leftover temp must be swept, %s: stat err %v", filepath.Base(p), err)
+		}
 	}
-	if _, err := os.Stat(fresh); err != nil {
-		t.Errorf("a fresh temporary file must be left alone (a write may be in progress): %v", err)
+	// The journal SQLite writes beside a VACUUM INTO target is part of the same leftover, and it
+	// never matched the old ".tmp" suffix test.
+	if _, err := os.Stat(journal); !os.IsNotExist(err) {
+		t.Errorf("the temp's -journal must be swept with it, stat err %v", err)
+	}
+}
+
+// A temp file this store cannot attribute -- no base in the name, i.e. one written by a deployment
+// sharing the directory -- is left alone regardless of age: deleting another store's in-flight
+// snapshot is the failure the prefix exists to prevent.
+func TestForeignSnapshotTempsAreNeverSwept(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	foreign := filepath.Join(backups, ".snapshot-other.db-20200101T000000.000-0.tmp")
+	legacy := filepath.Join(backups, ".snapshot-20200101T000000.000-0.tmp")
+	for _, p := range []string{foreign, legacy} {
+		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-3 * time.Hour)
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := s.Snapshot(backups, 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	for _, p := range []string{foreign, legacy} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s belongs to another deployment (or predates the base-name prefix) and must be left alone: %v",
+				filepath.Base(p), err)
+		}
 	}
 }
 

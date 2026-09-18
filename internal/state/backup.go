@@ -92,9 +92,12 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 
 	defer func() {
 		// Every failure path must clean up, or a broken snapshot accumulates on disk
-		// looking like a usable backup.
-		if _, statErr := os.Stat(tmpName); statErr == nil {
-			_ = os.Remove(tmpName)
+		// looking like a usable backup. The `-journal` goes with it: SQLite creates it beside the
+		// VACUUM INTO target and leaves it behind if the process dies mid-copy.
+		for _, name := range []string{tmpName, tmpName + "-journal"} {
+			if _, statErr := os.Stat(name); statErr == nil {
+				_ = os.Remove(name)
+			}
 		}
 	}()
 
@@ -243,18 +246,29 @@ func (s *Store) snapshotTempPrefix() string { return ".snapshot-" + s.base + "-"
 
 // sweepStaleSnapshotTemps removes this store's leftover temporary snapshots from an interrupted
 // write.
+//
+// No age threshold for this store's own files: the only caller is Snapshot, which runs under the
+// cross-process lock on this state path, so nothing else can be writing a snapshot of this database
+// and every `.snapshot-<base>-*` file is a leftover. The threshold exists for files whose owner
+// cannot be established (see snapshotTempPrefix), and those are not matched here at all.
+//
+// The journal SQLite creates beside a VACUUM INTO target goes with the temp file. The round-11
+// crash-fault verification killed the daemon with 8-15 MiB of a 48 MiB copy written and found BOTH
+// files stranded (".snapshot-...-0.tmp" and ".snapshot-...-0.tmp-journal"); the old suffix test only
+// matched ".tmp", so tens of MiB of private-key database sat in the state directory until the hour
+// expired -- and the journal never matched at all.
 func (s *Store) sweepStaleSnapshotTemps(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
+	own := s.snapshotTempPrefix()
 	for _, e := range entries {
 		name := e.Name()
-		if !strings.HasPrefix(name, s.snapshotTempPrefix()) || !strings.HasSuffix(name, ".tmp") {
+		if !strings.HasPrefix(name, own) {
 			continue
 		}
-		info, err := e.Info()
-		if err != nil || time.Since(info.ModTime()) < snapshotTempMaxAge {
+		if !strings.HasSuffix(name, ".tmp") && !strings.HasSuffix(name, ".tmp-journal") {
 			continue
 		}
 		_ = os.Remove(filepath.Join(dir, name))
