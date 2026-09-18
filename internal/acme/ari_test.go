@@ -1,11 +1,21 @@
 package acme
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-acme/lego/v4/acme/api"
 )
 
 // Determinism in RenewalTime is a hard requirement: if every call re-rolled the dice,
@@ -141,5 +151,85 @@ func TestVerifyCoverage(t *testing.T) {
 	}
 	if err := VerifyCoverage(leaf, []string{"example.com", "other.com"}); err == nil {
 		t.Error("a missing other.com must be an error")
+	}
+}
+
+// The CA's Retry-After for a PROCESSING ORDER cannot reach wecert at all.
+//
+// The recorded limitation (rounds 7-10, section 2.4) says order/authorization polling ignores the
+// CA's Retry-After because lego's ExtendedOrder does not expose it. This pins that against lego
+// v4.35.2 with a real api.Core talking to a test server that DOES send the header:
+//
+//   - lego's OrderService.Get (acme/api/order.go:105) throws the *http.Response away --
+//     `_, err := o.core.postAsGet(orderURL, &order)` -- so the header is unreachable even though
+//     the response carrying it was in lego's hands;
+//   - ExtendedOrder (acme/commons.go:132) is `Order` plus `Location`, and `Order` has no
+//     Retry-After field (the only struct that carries one is ExtendedChallenge, filled in for
+//     challenge URLs).
+//
+// wecert is therefore left with one fixed interval for order/authorization polling
+// (pollInterval = 3s), which is what the claim records. This is the confirmed blocker, not a bug
+// to fix here: honouring a processing order's Retry-After needs a lego change, or a hand-rolled
+// poller that reads the header instead of lego's api.Core.
+//
+// One Retry-After DOES reach wecert: lego attaches the header to its typed RateLimitedError
+// (acme/errors.go:88, sender.go:157), and wecert books that deadline in noteNewOrderRefusal. That
+// is a REFUSED order, not a processing one.
+func TestLegoDropsTheRetryAfterHeaderOnOrderPolling(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var srv *httptest.Server
+	// TLS, because lego refuses a plaintext directory ("HTTPS is required").
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dir":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"newNonce":   srv.URL + "/nonce",
+				"newAccount": srv.URL + "/acct",
+				"newOrder":   srv.URL + "/order",
+			})
+		case "/nonce":
+			// Every POST needs a fresh nonce; lego's nonce manager fetches them here.
+			w.Header().Set("Replay-Nonce", "nonce-1")
+			w.WriteHeader(http.StatusOK)
+		case "/order/1":
+			// The CA telling the client how long to wait before asking again -- exactly the header
+			// that RFC 8555 section 7.4 attaches to a processing order.
+			w.Header().Set("Retry-After", "7")
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"status":"processing"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	core, err := api.New(srv.Client(), "wecert-test", srv.URL+"/dir", "", key)
+	if err != nil {
+		t.Fatalf("build a lego api.Core against the test directory: %v", err)
+	}
+	order, err := core.Orders.Get(srv.URL + "/order/1")
+	if err != nil {
+		t.Fatalf("Orders.Get: %v", err)
+	}
+	if order.Status != "processing" {
+		t.Fatalf("fixture: got status %q", order.Status)
+	}
+
+	// ExtendedOrder carries no Retry-After -- neither as a field nor as a method -- so nothing
+	// downstream of this call can honour the 7 seconds the CA asked for.
+	if strings.Contains(fmt.Sprintf("%#v", order), "7") {
+		t.Errorf("ExtendedOrder unexpectedly carries the Retry-After value: %#v", order)
+	}
+	if _, ok := any(order).(interface{ GetRetryAfter() time.Duration }); ok {
+		t.Error("ExtendedOrder grew a Retry-After accessor: wecert could act on a processing order's " +
+			"Retry-After now, and the recorded limitation is stale")
+	}
+	if pollInterval != 3*time.Second {
+		t.Errorf("pollInterval = %s; the recorded fallback is one fixed 3s interval", pollInterval)
 	}
 }

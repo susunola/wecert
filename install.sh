@@ -155,31 +155,12 @@ if [[ ! -f "${ONBOARD_SRC}" ]]; then
 	fi
 fi
 if [[ -f "${ONBOARD_SRC}" ]]; then
-	# The same verification the main binary got. It was missing here, and the omission matters more
-	# than it looks: this file is also installed as root, also 0755, and it is what wecert-onboard.timer
-	# execs -- while `make release` writes a checksum for it into the very SHA256SUMS that was being
-	# read a few lines above for wecert alone. A sums file that lists it and disagrees is refused.
-	if [[ -f "${SUMS}" ]]; then
-		onboard_name="$(basename "${ONBOARD_SRC}")"
-		onboard_expected="$(awk -v f="${onboard_name}" '$2 == f { print $1 }' "${SUMS}")"
-		if [[ -n "${onboard_expected}" ]]; then
-			echo "==> Verifying ${onboard_name} against ${SUMS}"
-			if command -v sha256sum >/dev/null 2>&1; then
-				onboard_actual="$(sha256sum -- "${ONBOARD_SRC}" | awk '{ print $1 }')"
-			else
-				onboard_actual="$(shasum -a 256 -- "${ONBOARD_SRC}" | awk '{ print $1 }')"
-			fi
-			if [[ "${onboard_actual}" != "${onboard_expected}" ]]; then
-				echo "Error: checksum mismatch for ${onboard_name}." >&2
-				echo "  expected ${onboard_expected}" >&2
-				echo "  actual   ${onboard_actual}" >&2
-				exit 1
-			fi
-			echo "    ok"
-		else
-			echo "Warning: ${onboard_name} is not listed in ${SUMS}; installing it unverified." >&2
-		fi
-	fi
+	# The same trust decision as the main binary: this file is also installed root-owned and 0755, and
+	# it is what wecert-onboard.timer execs, so it goes through the same SHA256SUMS verification.
+	# (A separate, hand-rolled copy of this check used to sit here and referenced ${SUMS} -- a variable
+	# that stopped existing when the check above became verify_checksum(), so with `set -u` every
+	# install from a `make release` layout died at "SUMS: unbound variable" before installing anything
+	# else. Found by the round-11 CVM verification; the helper below is the one implementation.)
 	echo "==> Installing ${ONBOARD_SRC} to ${INSTALL_PATH%/*}/wecert-onboard"
 	# Same trust decision as the main binary: it is installed root-owned and run by its timer,
 	# so it goes through the same SHA256SUMS verification.

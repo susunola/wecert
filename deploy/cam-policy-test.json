@@ -12,9 +12,13 @@
         "ssl:UpdateCertificateInstance",
         "ssl:DescribeHostUpdateRecordDetail",
         "ssl:CreateCertificateBindResourceSyncTask",
-        "ssl:DescribeCertificateBindResourceTaskResult"
+        "ssl:DescribeCertificateBindResourceTaskResult",
+        "clb:DescribeLoadBalancers",
+        "clb:DescribeListeners"
       ],
-      "resource": ["*"]
+      "resource": [
+        "*"
+      ]
     },
     {
       "sid": "wecertTestDns",
@@ -26,7 +30,9 @@
         "dnspod:ModifyRecord",
         "dnspod:DeleteRecord"
       ],
-      "resource": ["*"]
+      "resource": [
+        "*"
+      ]
     }
   ]
 }

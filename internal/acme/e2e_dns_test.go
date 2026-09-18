@@ -1310,6 +1310,15 @@ func TestRealDNS01Lifecycle(t *testing.T) {
 	// ── the run's own evidence, for the report ──────────────────────────────────────
 	live, peak := dnsSrv.snapshot()
 	rep.PeakTXT = peak
+	// NotRun describes THIS offline run, and every entry below was true of it. Three of
+	// them have since been executed for real, on a credentialed Tencent Cloud account:
+	// cloud-deploy-and-rebind and lets-encrypt-staging-issuance passed in
+	// docs/e2e-run-2026-09-17-credentialed.md (§3, §4.1, §4.3, §4.6, §4.9) and again in
+	// docs/e2e-run-2026-09-18-credentialed.md (§3, §4.1, §4.4); the live-endpoint probe ran
+	// against a real public endpoint in docs/verification-2026-09-18.md §2.3, while probing
+	// the internal CLB from inside the VPC is still unrun (same file, §5 C3). Keep the
+	// entries as they are -- they are what an offline run on this host can and cannot do --
+	// but do not read them as "wecert has never done this".
 	rep.NotRun = []e2eCase{
 		{Name: "cloud-deploy-and-rebind", What: "Upload to Tencent Cloud SSL and rebind the CLB listener, then read the binding back from the API.", Verdict: "needs-credentials",
 			Evidence: []string{"needs TENCENTCLOUD_SECRET_ID/KEY with the CAM policy in deploy/, plus a CLB and an HTTPS listener: scripts/run-stage-ab.sh"}},

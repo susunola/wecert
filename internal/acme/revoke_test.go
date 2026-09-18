@@ -919,3 +919,86 @@ func TestARefusalIsBookedAgainstTheLimitItNames(t *testing.T) {
 		})
 	}
 }
+
+// The "cannot revoke" branch: neither the live certificate nor an archived copy is the one asked
+// about.
+//
+// This is the end state of a request that outlived retention. The archive only holds what has not
+// been reclaimed yet (ReapRetired deletes rows and their material with them), so "the certificate
+// this request targets is gone" is reachable without any mistake at all: the request was recorded,
+// retention passed, and the copy that would have answered it is no longer on disk.
+//
+// Three things have to hold, and the round-4 review recorded this branch as covered only by unit
+// tests (real-machine run never provoked it):
+//
+//  1. it must not degrade into revoking the certificate stored NOW -- that is a healthy certificate
+//     serving traffic, and revoking it while the compromised one stays trusted is the worst possible
+//     outcome for this action;
+//  2. the refusal has to say what is left to do ("it has to be revoked at the CA"), not just fail;
+//  3. the request has to STAY outstanding -- the operator's decision is still outstanding business,
+//     and wecert_revocation_pending staying >= 1 is what keeps the alert up until somebody acts.
+func TestRevocationWithNeitherLiveNorArchivedMaterialIsRefusedAndKept(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	// The live certificate is the replacement: a different serial, so a different identity.
+	live := certPEMWithSerial(t, 2002, "example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, NotAfter: fixed.Add(90 * 24 * time.Hour), CertPEM: live,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The request is about the OLD certificate, and the archive holds a retired row whose material
+	// is a THIRD certificate (or none at all) -- retention reclaimed the one that was asked about.
+	old := certPEMWithSerial(t, 1001, "example.com")
+	if err := store.AddRevokeRequest(cert.Name, RevocationReasons["keyCompromise"],
+		leafIdentity(t, old), fixed.Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddRetiredCert("cloud-other", cert.Name, certPEMWithSerial(t, 3003, "example.com"), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	err := m.AttemptRecordedRevocation(context.Background(), cert.Name)
+	if err == nil {
+		t.Fatal("there is no material for the certificate asked about, so this cannot report success")
+	}
+	if len(fake.revoked) != 0 {
+		t.Fatalf("the live certificate must never be sent in place of the archived one, got %d revoke calls",
+			len(fake.revoked))
+	}
+	for _, want := range []string{"no archived copy of it is held", "revoked at the CA"} {
+		if !contains(err.Error(), want) {
+			t.Errorf("the refusal has to say %q, got %q", want, err.Error())
+		}
+	}
+
+	// The request survives, with the refusal recorded against it: this is what keeps
+	// wecert_revocation_pending non-zero and its alert firing until a human acts.
+	req, gerr := store.GetRevokeRequest(cert.Name)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if req == nil {
+		t.Fatal("the operator's decision must stay outstanding: nothing else records it")
+	}
+	if req.Attempts < 1 {
+		t.Errorf("the failed attempt must be counted, got %d", req.Attempts)
+	}
+	if !contains(req.LastError, "no archived copy of it is held") {
+		t.Errorf("the persisted last_error must carry the refusal, got %q", req.LastError)
+	}
+	if n, perr := m.PendingRevocations(); perr != nil || n != 1 {
+		t.Errorf("wecert_revocation_pending must stay at 1, got (%d, %v)", n, perr)
+	}
+
+	// And the next pass does the same thing rather than converging on a wrong answer.
+	if err := m.AttemptRecordedRevocation(context.Background(), cert.Name); err == nil {
+		t.Error("a second attempt must fail the same way: nothing about the material has changed")
+	}
+	if len(fake.revoked) != 0 {
+		t.Errorf("no attempt may ever fall back to the live certificate, got %d calls", len(fake.revoked))
+	}
+}
