@@ -1,8 +1,11 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -334,6 +337,8 @@ func TestARenewalWithNothingBoundYetConvergesAsAFirstBind(t *testing.T) {
 
 	dep := &stagedDeployer{uploadID: "cloud-new", rebindErr: deploy.ErrNothingBoundYet}
 	m.deployer = dep
+	var logs bytes.Buffer
+	m.log = slog.New(slog.NewTextHandler(&logs, nil))
 
 	seedIssuedCertificate(t, store, cert, "cloud-old")
 	fake.certNotAfter = time.Now().Add(90 * 24 * time.Hour)
@@ -342,6 +347,22 @@ func TestARenewalWithNothingBoundYetConvergesAsAFirstBind(t *testing.T) {
 
 	if err := m.Reconcile(context.Background(), cert); err != nil {
 		t.Fatalf("nothing is bound, so there was no switch to fail: %v", err)
+	}
+
+	// The operator hint is the only thing that tells a human what to do about this state, and the
+	// wording is load-bearing rather than cosmetic: it used to say "bind either certificate once in
+	// the CLB console", while the very same round retires the predecessor onto the reclaim list --
+	// so following it by binding the OLD certificate leaves the row wecert tracks unbound, the next
+	// pass reports "nothing bound yet" again, uploads a THIRD certificate and burns another issuance.
+	// The hint therefore has to name this upload (and the field that carries its id).
+	if !strings.Contains(logs.String(), "bind this certificate (the certId above") ||
+		!strings.Contains(logs.String(), `certId=cloud-new`) {
+		t.Errorf("the hint must name the certificate this upload created, with the field that "+
+			"carries its id, so the instruction is followable; got:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "either certificate") {
+		t.Error("the hint must not offer a choice of certificate: binding the predecessor leaves the " +
+			"tracked row unbound and costs another issuance next round")
 	}
 
 	st, err := store.GetCert(cert.Name)

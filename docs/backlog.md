@@ -28,8 +28,10 @@ They are ordered by real exposure over effort.
 4b. **Make the orphan teardown proportional to what needs cleaning**
 
    Certificates that left the desired state keep their row by design, and every pass tears each one
-   down again: the round-11 scale work measured 2,999 orphans at 2,999 `CleanupOrphan` calls,
-   2,999 journal lines and 15,051 SQL statements **per pass**, identical on every pass. The journal
+   down again: measured with a counting driver (round-11 verification pass) at 2,999 orphans, that is
+   6.000 SQL statements per orphan **per pass** -- 5.000 in `CleanupOrphan` plus one `GetCert` -- i.e.
+   **17,994 statements per pass**, identical on every pass. (The earlier figure here, 15,051, was an
+   undercount from the same order of magnitude.) The journal
    half is fixed (ten lines plus a counted summary). The SQL half needs a durable "already cleaned"
    mark — a column on `certificates`, cleared when the name comes back — because the row itself is
    what says there is anything to clean, and an in-memory set would just be another map that grows
@@ -57,7 +59,7 @@ They are ordered by real exposure over effort.
 
 10. **Finish the go.sum story for `-tags lego_dns`**
 
-   Any of lego's ~198 providers can now be selected by name, but the hundreds of third-party SDKs they pull in were deliberately kept out of the default `go.sum`. The cost is that a first tagged build needs `go mod tidy`. What is missing is a controlled check: build at least one provider, prove it can issue, and record the dependency and binary-size cost so the tradeoff is documented rather than assumed.
+   Any of lego's ~198 providers can now be selected by name. The dependency cost is already paid: `make build-lego-dns` leaves `go.mod`/`go.sum` untouched (verified 2026-09-18 -- every provider SDK is in the module graph), and the tagged real-DNS-01 e2e passes 7/7 against pebble with `legoProvider: httpreq`, so a third-party provider can be selected, built and issue. What is still missing is narrower: no *credentialed* third-party provider (one that needs a real API token) has been exercised, and the binary-size number (64.3 MB tagged vs 23.5 MB default) is not written down where the tradeoff is decided.
 
 ## The rest
 

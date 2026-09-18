@@ -47,9 +47,9 @@
 | 完整自动续期闭环（真实 LE staging） | 推窗到现在的续期 + 换绑 | **通过** | 续期成功、`success=1`、旧证书进回收、规则级握手确认新证书在服务（4.8） |
 | Stage C 首签 → 手工绑定 → 自动续期/换绑（用到脚手架） | 真机 systemd + `cvm-role` | **通过** | 上传 `asJfCWAP` → 绑规则 → 守护进程续期到 `asK2pula`，指标确认部署，同一监听器上另一张证书未受影响（4.9） |
 | Stage C 安装 + systemd + 角色 | `install.sh` on Ubuntu 22.04 CVM + `systemctl enable --now wecert` | **通过** | `install.sh` 装出 `/usr/local/bin/wecert`（sha256 与本机交叉编译产物逐字节一致）、`/etc/wecert/config.yaml 0640 root:wecert`、`/var/lib/wecert 0700 wecert:wecert`；unit `active`；`credentialMode=cvm-role` 下完成一轮真实签发并上传（见 4.5） |
-| apex + `*.apex` 单证书（真实 LE） | — | **未跑** | 本轮未执行 |
-| `profile: tlsserver`（45 天）真实续期 | — | **未跑** | 真实 LE 侧未跑；profile 选择仅由离线 pebble e2e 覆盖 |
-| 共享 apex + wildcard TXT 名（真实 DNSPod） | — | **未跑** | 本轮未执行 |
+| apex + `*.apex` 单证书（真实 LE） | — | **通过** | 见 4.7：两个值在 8 个权威地址上同时在线、`records=2`、订单收尾无失败（本节原先误写为"未跑"，与 4.7/第 6 节矛盾，2026-09-18 更正） |
+| `profile: tlsserver`（45 天）真实续期 | — | **通过（窗口是推出来的）** | 见 4.8：45 天已核实，续期由状态库把窗口推到当下触发（本节原先误写为"未跑"，2026-09-18 更正） |
+| 共享 apex + wildcard TXT 名（真实 DNSPod） | — | **通过** | 见 4.7（本节原先误写为"未跑"，2026-09-18 更正） |
 
 ---
 

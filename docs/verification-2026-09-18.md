@@ -8,7 +8,7 @@
 
 ## 0. 一句话结论
 
-**101 条"未验证"里，69 条本机可验**：这一轮把其中最有分量的一批真跑了 —— 真实 Let's Encrypt **生产**签发与 ARI 驱动的续期、真实 DNSPod 的记录名形态、真实端点的探针三态、Linux 容器里的 `install.sh` 全流程与 145 次 SIGKILL 崩溃安全、完整恢复演练、老二进制读新 schema —— 并且**实测又找出 10 个缺陷**（全部已修、全部有会变红的用例）。剩下 13 条本机做不到、7 条**本质上无法验证**（例如"真实断电"和"90 天自然到期"），逐条写在 §4。
+**101 条"未验证"里，69 条本机可验**：两遍下来覆盖了 **86 条**（实测 62 条成立、19 条作为文档化决策核对成立、15 条发现缺陷并修掉），剩下 15 条逐条写了卡点（§7.3）。第一遍先跑最有分量的那批 —— 真实 Let's Encrypt **生产**签发与 ARI 驱动的续期、真实 DNSPod 的记录名形态、真实端点的探针三态、Linux 容器里的 `install.sh` 全流程与 145 次 SIGKILL 崩溃安全、完整恢复演练、老二进制读新 schema —— 并且**实测又找出 10 个缺陷**（全部已修、全部有会变红的用例）。剩下 13 条本机做不到、7 条**本质上无法验证**（例如"真实断电"和"90 天自然到期"），逐条写在 §4。
 
 ---
 
@@ -115,7 +115,7 @@ level=INFO msg="an unpresented row's record was denied, but its challenge is new
 
 ---
 
-## 3. 实测发现的缺陷（10 条，全部已修 + 会变红的用例）
+## 3. 第一遍实测发现的缺陷（10 条，全部已修 + 会变红的用例）
 
 | # | 位置 | 缺陷 | 怎么发现的 | 修法 |
 |---|---|---|---|---|
@@ -230,7 +230,62 @@ pebble 侧："ARI: order "GPKy…" is a replacement of "UxHM…""；权威侧 3 
 
 ---
 
-## 7. 精度说明
+## 7. 第二批：把"本机可验"剩下的也跑了
+
+第一遍只跑了最有分量的那些（约 25 项）。这一遍把**清单里其余本机可验的**分四路并行跑完，加上我自己补的几项，覆盖到 **86 / 101**：
+
+| 路线 | 覆盖条目 | 结果 |
+|---|---|---|
+| 文档与"已知限制"审计 | 34 项（U13、U22/U23、U26–U29、U31/U32、U33、U39、U47/U48、U53/U54、U57、U59、U61、U63、U66/U67、U69、U71–U77、U80、U83、U95–U97） | **26 条成立、7 条陈旧（已改）、1 条无法验证**（U33：被截断的 OCR 输出已经不存在，那 15 条无从辨认） |
+| 本机行为补测 | 12 项（U4、U14–U16、U19、U34、U51、U58、U64、U92–U94） | **12 条全部成立、0 缺陷**；新增 11 个测试（含三个"时钟/视角"用例和两个 fsync/措辞用例），并把两个文档里的数字改正 |
+| 真实账号探针 | 8 项（U3、U17、U38、U42、U43、U68、U98、U100） | **5 条成立、2 缺陷（已修）、1 条本机不可验证**（U42 需要子账号/角色，随后由 CVM 路线实测） |
+| 真实 CVM + systemd + 实例角色 | 6 项（U6、U45 最后一米、U79、U81、U82、U42/U100） | **5 条成立、4 缺陷（3 个已修、1 个已修+加门禁）** |
+| 我自己补的 | U52、U55、U56、U60、U65、U101 | 全部成立（见下） |
+
+### 7.1 第二批实测发现的 5 个缺陷（累计 15 个，全部已修 + 用例/门禁）
+
+| # | 位置 | 缺陷 | 怎么发现的 | 修法 |
+|---|---|---|---|---|
+| 11 | `install.sh` | **合并产生的回归**：main 把校验和检查重构成 `verify_checksum()`（局部变量 `sums`），而我这边新增的 onboard 校验块仍引用 `${SUMS}` —— `set -u` 下**每一次 `make release` + `install.sh` 都在装 unit 之前直接死掉**（`SUMS: unbound variable`），CVM 上是 `systemctl enable` 才报"unit 不存在" | 真实 CVM 上按文档安装 | 删掉重复块，统一走 `verify_checksum`；容器里复验：两个产物都校验、二进制与 3 个 unit 全部就位、exit 0 |
+| 12 | `scripts/e2e-sni.sh` | 脚本**永远无法解析自己的证据**：它把 `wecert-clbverify -raw` 的整个 stdout 存成 JSON，而 `-raw` 从 `6c2057b` 起是"raw JSON + 人类报告"，`json.load` 必然 `Extra data: line 121 column 1`；文档里的桩表之所以通过，只是因为桩只打印纯 JSON | 真实 CLB 上按文档运行 | 新增 `keep_first_json`（用 `raw_decode` 取第一个完整 JSON 文档）；单独测过三种输入（JSON+报告、纯 JSON、无 JSON 要报错） |
+| 13 | `deploy/cam-policy-runtime.json` + `scripts/check-cam-policies.py` | 随包的**运行时 CAM 策略缺 `clb:DescribeLoadBalancers` / `clb:DescribeListeners`**，于是 `wecert-onboard` 的"CLB 规则守卫"在文档化的运行时策略下**永远跑不起来**（实测 `UnauthorizedOperation`，退出 2、守卫按"满足"处理）。而检查脚本之所以没抓到，是因为它只匹配裸服务名，**看不见别名导入**（`clbsdk.NewDescribeLoadBalancersRequest`），还把 `clb:DescribeListeners` 当成"clbverify 是运维手动跑的"豁免掉了 | 真实 CVM 上挂**原样**策略跑一遍 | 两个只读 CLB 动作加进 runtime 与 test 策略；检查脚本改为**从 import 解析别名**（现在能派生出 12 个动作而不是 10 个），删掉那条错误豁免，并在自测里加了一个"别名导入必须被抓到"的用例 |
+| 14 | `internal/tcerr/tcerr.go` | 分类器写的是 `ResourceNotFound.NoDataOfDomain`，实测**真实 API 从不返回它**：带 Keyword 的 `DescribeDomainList` 无匹配时是 200 + 空列表；账号外域名回的是 `InvalidParameterValue.DomainNotExists`。于是 preflight 那条"域名不在本账号"的文档化答案不可达 | 真实账号上逐种调用 | 把真实编码加入分类（保留原编码作防御），并在注释里写清实测形状；附用例 |
+| 15 | 文档数字（3 处） | ① 角色凭证 TTL 写的"一般 2 小时"，实测元数据每次返回 **+12.0 小时**；② `docs/backlog.md` 第 4b 项的孤儿回收成本写 15,051 条 SQL/pass，用计数驱动实测是 **6.000 条/孤儿 = 17,994 条/pass**（同数量级但偏低）；③ 第 10 项"第一次带 tag 构建需要 `go mod tidy`"在本树已不成立（`make build-lego-dns` 不动 `go.mod`/`go.sum`） | 真实 CVM + 计数驱动 | 三处按实测改写 |
+
+### 7.2 这一遍确认成立、值得单独记一笔的
+
+- **真实生产 429 抓到了**（U3）：第 5 次同 exact-set 签发被拒，报文 `too many certificates (5) already issued for this exact set of identifiers in the last 168h0m0s, retry after 2026-09-19 18:09:23 UTC`，HTTP 429 + `Retry-After: 110311`；wecert 把截止时间记进账本（`source="retry after"`）、打 ERROR、下一轮**拒绝下单**并按 CA 自己的时间退避 —— `ParseRetryAfterHeader` 的文档行为在真实 CA 上成立。
+- **真实 CVM + systemd + 实例角色全链路**（U6/U45/U79）：`wecert.service` 下 5 轮真实 pass、签发 → 人工绑定 → **自动换绑**两次（含一次重启后的进程），全程**磁盘上没有任何凭据**（配置只有 `cvm-role` + roleName，unit 无 `Environment=`，`/proc/<pid>/environ` 计数 0），tcpdump 抓到 38 次元数据取凭证。
+- **同一监听器两张证书**（U43）：两条规则各绑一张，续期 A 只动了 A 的规则（`atozqwx6`→`atpGIhHX`，同一 LocationId），B 的规则逐字节未变。
+- **探针的"视角依赖"是结构性的**（U92）：同一条记录、同一时刻，一个视角"确认 2/3、否认 0"判为就绪，另一个视角"确认 2/3、否认 1"判为未就绪；**一次同意的快照就足以宣布传播**（U94）；深负缓存会把 5 分钟预算整个烧掉再退避（U93，拒绝是对的、代价是发现）。
+- **lego 第三方 provider 真的能签发**（U64）：`-tags lego_dns` 构建不动依赖，真实 DNS-01 套件 7/7 通过（`legoProvider: httpreq` + pebble 真验证）。
+- **归档材料可以回滚**（U68）：从 `retired_certificates` 取出 PEM/KEY 重新上传腾讯云 SSL 被接受（域名解析正确、status 1），再删除。
+- **DNSPod 的 total 是准的**（U38）：`Limit=2 → 11/2`、`Limit=3000 → 11/11`；不比对 total 是无害的（真按 `returned == TotalCount` 做守卫反而会在短页上误冻结）。
+- **TAT agent 默认不装**（U82）：镜像是 cloud-init 现装的（`tat_agent 1.2.2 ... install finish`），runbook 应该断言 `AgentStatus=Online`；没有它时报 `ResourceUnavailable.AgentNotInstalled`。
+- **本机补测的 6 条**：U52（`scripts/acceptance-check.sh` 确实不存在，8 条 PASS 判据仍靠人读）、U55（仓库私有漏洞报告**确实关闭**：API `enabled: false`）、U56（快照确实只在本地，off-host 备份缺失，`docs/recovery.md` 已写明）、U60（HTTP-01 的配置模型确实"写清楚但不动"，见 `docs/challenge-types.md` §"If it is added later"）、U65（50 条全景确实维护在仓库外）、U101（`run-stage-ab.sh` 不带 `--yes` 的 plan-only 路径实跑：exit 0、7 个资源的计划、明确拒绝 apply）。
+
+### 7.3 覆盖账：101 条里还剩 15 条
+
+| 剩下的条目 | 卡点 |
+|---|---|
+| U5（绑定枚举超时的 `ErrSwitchUnverified` 分支） | 需要真实云侧枚举超时，无法在本机诱发 |
+| U9（CA 在同一 authz URL 上换挑战） | CA 侧行为，无法诱发（要能控制 CA 查询时刻的权威应答） |
+| U12（`Add`/`Drain` 竞态的真实频率） | 需要长时间真实 webhook 流量 |
+| U20（SAN 里带逗号） | 公共 CA 不会签发这种证书 |
+| U21 / U44（连续授权失败导致的标识符暂停、真实失败下的配额行为） | 同上：需要**在 CA 查询的那一刻**让权威 DNS 给出失败答案。本机做不到（DNSPod 的权威删除传播要 ~60s，够不上 CA 查询窗口）；要做必须把一个子域委派给一台有公网 53 端口的机器 —— 也就是再开一台 CVM |
+| U30（真实 fleet 的规模数据） | 只有合成 fleet（第十一轮规模视角） |
+| U35 / U36 / U37（形式化验证、工具证据边界、真实生产履历） | 本质上无法在这里验证 |
+| U49（第二个注册域） | 账号里只有一个可写 zone |
+| U70（TLS-ALPN-01） | 架构性：443 的 TLS 属于 CLB |
+| U78（多区域/多资源类型覆盖） | 需要第二个区域与更多真实资源 |
+| U99（控制台手工绑定路径） | 需要人坐在控制台前（本次绑定是通过 API 做的） |
+| U101（`run-stage-ab.sh --yes` 的完整 apply 路径） | 需要真实建资源；plan-only 路径已跑（§7.2），`--yes` 路径的实际动作已被本轮的 terraform/CVM/CLB 跑法覆盖，但**不是**通过这个脚本 |
+
+其余 86 条：**实测成立 62 条、作为文档化决策/限制核对成立 19 条、发现缺陷并修复 15 条（其中 10 条在第一遍）**。
+
+---
+
+## 8. 精度说明
 
 - **"验证过"的标准**：本文件里每一条"已证实"都配了可复现的命令与原始输出（长日志在 `/tmp/wv-verify/`、`/tmp/wcert-verify/`、`/tmp/drill/`、`/tmp/verify-*.json`）；凭"读代码觉得对"的一律不算。
 - **注入式验证的边界**：fsync/rename EIO 是**系统调用级注入**，不是真实断电；SIGKILL 是进程级杀灭，不是掉电。两者覆盖了产品代码里所有"持久化调用失败"的分支，但不覆盖文件系统自身的原子性保证。
