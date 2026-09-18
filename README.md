@@ -221,7 +221,9 @@ start the timer that keeps the desired state fresh.
 
 ## Day-2 operations
 
-**Where state lives.** `statePath`, default `/var/lib/wecert/state.db` (0600, directory 0700). It
+**Where state lives.** `statePath`, e.g. `/var/lib/wecert/state.db` (0600, directory 0700). It is
+**required** — there is no built-in default, and the config refuses to load without it, so that a
+typo can never silently start a second, empty state next to the real one. It
 holds the ACME account key, every certificate private key, in-flight order URLs and the ARI
 certID — and losing an order URL costs an issuance against the 5-per-7-days limit. So it is also
 snapshotted automatically: `stateBackup` is on by default, a consistent `VACUUM INTO` every 24h with
@@ -250,6 +252,11 @@ curl -X POST http://127.0.0.1:9801/hook/reconcile \
 > the `Authorization` header if that suits your caller better.
 
 It answers `202 Accepted` and converges in the background; poll `GET /hook/status` for the outcome.
+Anything else is a refusal, and each one means something different: `401` the token is missing or
+wrong, `429` this address spent its failed-authentication budget (the correct token still gets
+through), `400` the request body is malformed or names nothing (`{"cert":""}`), `413` the body is
+over 64 KiB, and `503` nothing was started because the desired state could not be read or the
+process is shutting down — only then is retrying the right move.
 The timer and an event trigger can land on the same certificate at the same moment, so the slot is
 reserved **synchronously** and the second caller is told `skipped` rather than placing a duplicate
 order — which would run straight into the 5-per-7-days limit for that identifier set. The token is

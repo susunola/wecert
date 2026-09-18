@@ -673,7 +673,7 @@ X-Wecert-Token: <token>
   "time": "2026-09-15T18:00:00Z",
   "certificates": [
     { "name": "a-com", "notAfter": "2026-12-14T16:41:58Z", "daysLeft": 89,
-      "deployed": true, "deployConfirmed": true, "consecutiveFailures": 0 }
+      "uploaded": true, "deployConfirmed": true, "consecutiveFailures": 0 }
   ]
 }
 ```
@@ -955,7 +955,7 @@ ssl:DescribeCertificateBindResourceTaskResult
 ./bin/wecert-onboard -config /etc/wecert/config.yaml            # 落盘
 ```
 
-### `wecert-preflight`（只读）
+### `wecert-preflight`（默认只读；`-prune-certs` 会删）
 
 | 参数 | 说明 |
 |---|---|
@@ -1265,8 +1265,8 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
 
 ## License
 
-本仓库没有 LICENSE 文件。在没有许可证的情况下默认是"保留所有权利" ——
-**对外分发或接受外部贡献之前应当先补一个。**
+MIT —— 见 [LICENSE](LICENSE)。（这一节此前写的是"本仓库没有 LICENSE 文件"，但该文件从第一个
+版本起就在仓库里。）
 ---
 
 <sub>[← 返回简介](README.zh-CN.md) · [English reference](README.reference.md)</sub>

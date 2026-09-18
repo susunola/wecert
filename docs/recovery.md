@@ -21,8 +21,12 @@ Enabled by default (`stateBackup`, see `config.example.yaml`). Every `interval` 
 writes a consistent copy beside `state.db`, keeping the newest `keep` (7) named:
 
 ```
-/var/lib/wecert/state.backup-20060102T150405Z.db
+/var/lib/wecert/state.db.backup-20060102T150405.123Z.db
 ```
+
+The name is `<state.db's file name>.backup-<UTC stamp, milliseconds>.db`, so the glob for this
+deployment is `state.db.backup-*.db`. (This section used to print `state.backup-<stamp>.db`, which
+matches nothing the code writes: the rsync below silently copied zero files and exited 0.)
 
 They are **not** plain file copies. The database runs in WAL mode, so the bytes on disk are
 `state.db` plus a `-wal` holding everything since the last checkpoint — copying `state.db`
@@ -37,7 +41,7 @@ protect: a lost disk, a dropped directory or a bad `rm` takes both. Copy them so
 
 ```sh
 # Anywhere off the host. The files are small (a few hundred KB).
-rsync -a /var/lib/wecert/state.backup-*.db backup-host:/srv/wecert/
+rsync -a /var/lib/wecert/state.db.backup-*.db backup-host:/srv/wecert/
 ```
 
 If `stateBackup.enabled: false`, wecert logs a warning at startup saying so.
@@ -58,7 +62,7 @@ rm -f /var/lib/wecert/state.db-wal /var/lib/wecert/state.db-shm
 
 # 3. Install the snapshot as the live database. A snapshot has no sidecars, so nothing else
 #    has to be copied.
-cp /var/lib/wecert/state.backup-<newest>.db /var/lib/wecert/state.db
+cp /var/lib/wecert/state.db.backup-<newest>.db /var/lib/wecert/state.db
 chown wecert:wecert /var/lib/wecert/state.db
 chmod 0600 /var/lib/wecert/state.db
 
@@ -87,7 +91,7 @@ journalctl -u wecert -f
 Try the next one. `PRAGMA quick_check` on each before installing:
 
 ```sh
-for f in /var/lib/wecert/state.backup-*.db; do
+for f in /var/lib/wecert/state.db.backup-*.db; do
   printf '%s: ' "$f"; sqlite3 "$f" 'PRAGMA quick_check;' 2>&1 | head -1
 done
 ```
