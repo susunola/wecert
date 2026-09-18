@@ -6,10 +6,12 @@ keys that terminate TLS for a production domain. Reports are welcome and taken s
 
 ## Reporting a vulnerability
 
-**Do not open a public issue describing the vulnerability.** GitHub's private reporting
-(**Security → Report a vulnerability**) is the intended channel, but it is currently **turned off**
-in this repository's settings — verified against the API, which reports `"enabled": false`. Until
-that changes, use one of these:
+**Do not open a public issue describing the vulnerability.** Use GitHub's private reporting:
+**Security → Report a vulnerability** (repository settings → private vulnerability reporting, enabled
+2026-09-18; the API reports `"enabled": true`). A report opened there is visible only to the
+maintainer until an advisory is published.
+
+If that form is unavailable to you, the fallbacks are:
 
 - Open a public issue that says **only** that you have a security report and would like a private
   channel. Do not include details, versions, or reproduction steps in it. A maintainer will open a

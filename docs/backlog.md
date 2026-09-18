@@ -7,13 +7,13 @@ shape, and the obvious HA fix does not provide HA. Both are written up in
 
 They are ordered by real exposure over effort.
 
-1. **Finish making the checks into gates**
+1. **Done: the checks are gates** (closed 2026-09-18)
 
-   Mostly done, and what is left is not code. CI now runs `check-alerts` and `check-scripts` next to `gofmt`, English, `vet`, `govulncheck`, `test -race`, `test-tags`, `make build` and `make release`. Still missing: `make fuzz` (bounded wall-clock, so it belongs in a scheduled job) and `make test-pebble` (needs the pebble binary installed), and **`main` still has no branch protection** (checked against the API: "Branch not protected"), so nothing requires the run to pass before a merge. The repository settings are the part that is not mine to change: require the `test` job, and either fill in `.github/CODEOWNERS` or drop it, because as written it reads as if reviews were required when they are not.
+   CI runs `gofmt`, English, `vet`, `govulncheck`, `test -race`, `test-tags`, `check-alerts`, `check-scripts`, `build`, `release`, plus the gates added the same day: an `install.sh` smoke test on a real Linux runner, `scripts/check-cli-surface.py` (every flag the README documents must exist in that binary), the `e2e-sni.sh` self-test, `make test-pebble` with pebble installed, `make e2e` with the real DNS-01 suite binding 53 as root, `make fuzz`. **`main` is protected**: the `test` check is required (verified against the API; `enforce_admins: false` and no review requirement, so a maintainer can still push in an emergency). What is still not machine-checked: `.github/CODEOWNERS` reads as if reviews were required when they are not — either fill it in or drop it.
 
-2. **Switch on GitHub private vulnerability reporting**
+2. **Done: private vulnerability reporting is on** (closed 2026-09-18)
 
-   `SECURITY.md` documents a fallback — an empty public issue asking for a private channel — because the real channel is **off** in this repository (the API reports `"enabled": false`). One setting, and it removes an awkward step from the only path a reporter has.
+   Enabled in the repository settings; `SECURITY.md` now leads with the private form and keeps the fallbacks for anyone who cannot see it.
 
 3. **Finish off-host snapshots (option A in docs/availability.md)**
 
