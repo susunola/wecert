@@ -254,18 +254,18 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 			"that other certificates for this name also depend on",
 			"cert", c.Name, "identifier", name, "cooldownUntil", until,
 			"remaining", until.Sub(m.now()).Round(time.Minute))
-		return m.recordFailure(st, fmt.Errorf(
+		return m.recordFailure(ctx, st, fmt.Errorf(
 			"identifier %s is in its authorization-failure cooldown until %s; not placing an order",
 			name, until.UTC().Format(time.RFC3339)))
 	}
 
 	key, err := GenerateKey(c.KeyType)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 	keyPEM, err := MarshalPrivateKeyPEM(key)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	order, err := m.core.NewOrder(c.Domains, &api.OrderOptions{
@@ -329,10 +329,10 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		}
 	}
 	if err != nil {
-		return m.recordFailure(st, fmt.Errorf("create order: %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("create order: %w", err))
 	}
 	if order.Location == "" {
-		return m.recordFailure(st, errors.New("create order: the server returned no order URL"))
+		return m.recordFailure(ctx, st, errors.New("create order: the server returned no order URL"))
 	}
 
 	expiresAt, expErr := parseOrderExpires(order.Expires, m.now())
@@ -370,7 +370,7 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		// The order URL is logged because it is the only remaining handle on the order that
 		// now exists at the CA and nowhere else -- an operator reading the log can still
 		// recover it by hand.
-		return m.recordFailure(st, fmt.Errorf(
+		return m.recordFailure(ctx, st, fmt.Errorf(
 			"record the new order (the CA has it as %s, and it is not in the state store, so the next "+
 				"attempt will create another one): %w", order.Location, err))
 	}

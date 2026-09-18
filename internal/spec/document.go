@@ -194,8 +194,14 @@ const maxDocumentBytes = 16 << 20
 //
 // O_NOFOLLOW makes the symlink refusal a property of the open call rather than of a
 // separate Lstat that a concurrent writer can invalidate between the two.
+//
+// O_NONBLOCK is what makes the regular-file check below reachable. open(2) on a FIFO with no
+// writer BLOCKS until one appears, so a FIFO planted at desiredState.path hung the daemon inside
+// newProvider -- before metrics, the webhook and the snapshots start -- and a Type=simple unit
+// never notices. With O_NONBLOCK the open returns immediately, the stat below sees a non-regular
+// file, and the reader refuses it. On a regular file the flag is a no-op.
 func openDocumentFile(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EMLINK) {
 			return nil, fmt.Errorf("the desired-state document %s is a symlink; refusing to follow it -- point the config at the real file", path)

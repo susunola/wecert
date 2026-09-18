@@ -205,6 +205,23 @@ func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM
 }
 
 // Upload stores the certificate and returns its durable Tencent Cloud identity.
+// sdkCallError classifies a failed Tencent Cloud SDK call.
+//
+// The SDK does not wrap the transport error it saw: common@v1.3.180's netretry layer builds a fresh
+// *TencentCloudSDKError from the string, so a call cut short by a shutdown arrives upstream as
+// `ClientError.NetworkError ... Post ...: context canceled` -- an error that neither unwraps to
+// context.Canceled nor looks like one. The caller's rule is explicit ("a stopped process is not a
+// business failure": the certificate would get a failure counter and a backoff for a stop signal,
+// and after the restart the pass it should have pushed on at once is locked out of the window), and
+// it can only apply if the error carries the sentinel. The context is the authority on why the call
+// stopped, so it is consulted first.
+func sdkCallError(ctx context.Context, what string, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("%s: %w", what, cerr)
+	}
+	return fmt.Errorf("%s: %w", what, err)
+}
+
 func (d *TencentCLB) Upload(ctx context.Context, certName string, certPEM, keyPEM []byte) (string, error) {
 	client, err := d.client(ctx)
 	if err != nil {
@@ -330,7 +347,7 @@ func (d *TencentCLB) upload(ctx context.Context, client sslAPI, certName string,
 
 	resp, err := client.UploadCertificateWithContext(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("UploadCertificate: %w", err)
+		return "", sdkCallError(ctx, "UploadCertificate", err)
 	}
 	if resp.Response == nil {
 		return "", errors.New("UploadCertificate returned an empty response")
@@ -377,7 +394,7 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 	for {
 		resp, err := client.UpdateCertificateInstanceWithContext(ctx, req)
 		if err != nil {
-			return fmt.Errorf("UpdateCertificateInstance: %w", err)
+			return sdkCallError(ctx, "UpdateCertificateInstance", err)
 		}
 		if resp.Response != nil && resp.Response.DeployRecordId != nil && *resp.Response.DeployRecordId > 0 {
 			recordID = *resp.Response.DeployRecordId
@@ -575,7 +592,7 @@ func (d *TencentCLB) describeDeployRecord(ctx context.Context, client sslAPI, re
 	req.DeployRecordId = common.StringPtr(strconv.FormatUint(recordID, 10))
 	resp, err := client.DescribeHostUpdateRecordDetailWithContext(ctx, req)
 	if err != nil {
-		return 0, 0, 0, 0, false, err
+		return 0, 0, 0, 0, false, sdkCallError(ctx, fmt.Sprintf("DescribeHostUpdateRecordDetail(%d)", recordID), err)
 	}
 	if resp.Response == nil {
 		return 0, 0, 0, 0, false, errors.New("DescribeHostUpdateRecordDetail returned an empty response")
@@ -627,7 +644,7 @@ func (d *TencentCLB) Delete(ctx context.Context, certID string) error {
 
 	resp, err := client.DeleteCertificateWithContext(ctx, req)
 	if err != nil {
-		return fmt.Errorf("DeleteCertificate(%s): %w", certID, err)
+		return sdkCallError(ctx, "DeleteCertificate("+certID+")", err)
 	}
 	if resp.Response == nil {
 		return fmt.Errorf("DeleteCertificate(%s): the API returned an empty response", certID)
@@ -680,7 +697,7 @@ func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, 
 		req.TaskIds = []*string{common.StringPtr(taskID)}
 		resp, err := client.DescribeDeleteCertificatesTaskResultWithContext(ctx, req)
 		if err != nil {
-			return fmt.Errorf("DescribeDeleteCertificatesTaskResult(%s): %w", taskID, err)
+			return sdkCallError(ctx, "DescribeDeleteCertificatesTaskResult("+taskID+")", err)
 		}
 
 		status, detail, found, err := deleteTaskStatus(resp, taskID)
@@ -927,7 +944,7 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 
 	createResp, err := client.CreateCertificateBindResourceSyncTaskWithContext(ctx, createReq)
 	if err != nil {
-		return bindingCount{}, fmt.Errorf("CreateCertificateBindResourceSyncTask: %w", err)
+		return bindingCount{}, sdkCallError(ctx, "CreateCertificateBindResourceSyncTask", err)
 	}
 	// No task ids is not the answer "bound nowhere": it is the absence of an answer, and an older
 	// API version or a throttled call both look like this.
@@ -959,7 +976,7 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 
 		queryResp, err := client.DescribeCertificateBindResourceTaskResultWithContext(ctx, queryReq)
 		if err != nil {
-			return bindingCount{}, fmt.Errorf("DescribeCertificateBindResourceTaskResult: %w", err)
+			return bindingCount{}, sdkCallError(ctx, "DescribeCertificateBindResourceTaskResult", err)
 		}
 
 		n, done, err := countBindings(queryResp, taskID)

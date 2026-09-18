@@ -407,6 +407,17 @@ func (s *DNSSolver) waitZone(
 			return nil
 		}
 
+		// The context is checked BEFORE the budget.
+		//
+		// With the budget first, a cancellation that landed during the final probe round was
+		// reported as a propagation timeout -- and upstream a timeout is a business failure:
+		// solveChallenges calls markResumedUnpresented and recordFailure books a
+		// consecutive_failures increment and a backoff for what was actually a shutdown. Both of
+		// those rules ("a stop signal is not a failure", "a cancelled wait says nothing about DNS")
+		// depend on the cancellation being visible here.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if !time.Now().Before(b.deadline) {
 			return fmt.Errorf(
 				"TXT propagation not confirmed: this zone waited %s, entering it %s into the %s "+

@@ -473,7 +473,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		// schedules the retry, and a bare return skipped the counter, the backoff and the in-memory
 		// transient backoff -- so a state store that fails this read was invisible in
 		// wecert_certificate_consecutive_failures and retried at the pass rate.
-		return m.recordFailure(st, fmt.Errorf("read the order in progress: %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("read the order in progress: %w", err))
 	} else if o != nil {
 		switch {
 		// A zero ExpiresAt means the server gave no expiry: keep advancing and let the CA
@@ -486,7 +486,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 				// manager_flow.go does: returning the bare error skips the backoff entirely, so the
 				// next pass retries at the pass rate (re-running cleanupOrphanTXT's authoritative DNS
 				// probes and provider deletes each time) and nothing escalates or records why.
-				return m.recordFailure(st, fmt.Errorf("discard the expired order: %w", err))
+				return m.recordFailure(ctx, st, fmt.Errorf("discard the expired order: %w", err))
 			}
 
 		case !orderMatchesConfig(o, c):
@@ -500,7 +500,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 				"orderIdentifiers", o.Identifiers,
 				"configIdentifiers", c.DomainKey())
 			if err := m.discardOrder(ctx, c.Name); err != nil {
-				return m.recordFailure(st, fmt.Errorf("discard the order for the changed domain set: %w", err))
+				return m.recordFailure(ctx, st, fmt.Errorf("discard the order for the changed domain set: %w", err))
 			}
 
 		default:
@@ -630,7 +630,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		// exists to avoid, and recordFailure's unpersisted backoff is what breaks it. A cancelled
 		// pass is filtered inside recordFailure, so a shutdown still does not lock the certificate
 		// out of the next window.
-		return m.recordFailure(st, ariErr)
+		return m.recordFailure(ctx, st, ariErr)
 	}
 	if ariErr != nil {
 		m.log.Warn("ARI lookup failed; falling back to a time-based threshold", "cert", c.Name, "err", ariErr)
@@ -669,8 +669,17 @@ func (m *Manager) bindingCheckDue(certName string) bool {
 	m.bindingMu.Lock()
 	defer m.bindingMu.Unlock()
 
-	if last, ok := m.bindingChecked[certName]; ok && now.Sub(last) < m.bindingCheckEvery {
-		return false
+	if last, ok := m.bindingChecked[certName]; ok {
+		// A stored instant in the future means the clock moved BACKWARDS, not that a check just
+		// happened. now.Sub(last) is then negative, and every "less than the interval" test treats
+		// a negative duration as "recently checked": measured over three passes spanning 48 hours of
+		// wall time after a backward step, ZERO binding lookups ran, DeployConfirmed stayed false,
+		// and because probeCert returns early for a certificate that is not confirmed deployed the
+		// network probe never ran either -- the certificate was simply unverified until the clock
+		// caught up. A future instant is due now.
+		if !last.After(now) && now.Sub(last) < m.bindingCheckEvery {
+			return false
+		}
 	}
 	m.bindingChecked[certName] = now
 	return true

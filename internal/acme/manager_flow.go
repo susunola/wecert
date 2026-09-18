@@ -51,12 +51,12 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 			if derr := m.discardOrder(ctx, c.Name); derr != nil {
 				// Discarding failed too, so the order row survives; still report the failure so
 				// the backoff applies, and the next round tries again.
-				return m.recordFailure(st, errors.Join(fmt.Errorf("get order: %w", err), derr))
+				return m.recordFailure(ctx, st, errors.Join(fmt.Errorf("get order: %w", err), derr))
 			}
-			return m.recordFailure(st, fmt.Errorf(
+			return m.recordFailure(ctx, st, fmt.Errorf(
 				"get order: %w (the order was discarded; the next attempt places a new one)", err))
 		}
-		return m.recordFailure(st, fmt.Errorf("get order: %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("get order: %w", err))
 	}
 	// It answered, so the URL is alive: forget any earlier failures.
 	m.clearOrderFetchFailures(o.OrderURL)
@@ -65,7 +65,7 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 	// Discarding it would defeat the point of making it return one, and Go does not
 	// warn about a dropped return value.
 	if err := m.persistOrder(o, order); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	switch order.Status {
@@ -83,7 +83,7 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		if derr := m.discardOrder(ctx, c.Name); derr != nil {
 			err = errors.Join(err, derr)
 		}
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 
 	case "ready":
 		return m.finalize(ctx, c, st, o, order, rd)
@@ -97,10 +97,10 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		// on track. Just wait for the outcome and download.
 		final, err := m.awaitOrderStatus(ctx, o.OrderURL, "valid", orderWaitTimeout)
 		if err != nil {
-			return m.recordFailure(st, err)
+			return m.recordFailure(ctx, st, err)
 		}
 		if err := m.persistOrder(o, final); err != nil {
-			return m.recordFailure(st, err)
+			return m.recordFailure(ctx, st, err)
 		}
 		return m.download(ctx, c, st, o, final, rd)
 	}
@@ -118,10 +118,10 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 	// Every authorization is valid; wait for the order to turn ready, then finalize.
 	ready, err := m.awaitOrderStatus(ctx, o.OrderURL, "ready", orderWaitTimeout)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 	if err := m.persistOrder(o, ready); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 	if ready.Status == "valid" {
 		return m.download(ctx, c, st, o, ready, rd)
@@ -190,12 +190,12 @@ func (m *Manager) solveChallenges(
 ) (bool, error) {
 	authzs, err := m.loadAuthorizations(c.Name, order.Authorizations)
 	if err != nil {
-		return false, m.recordFailure(st, err)
+		return false, m.recordFailure(ctx, st, err)
 	}
 
 	current, err := m.fetchAuthzs(ctx, authzs)
 	if err != nil {
-		return false, m.recordFailure(st, err)
+		return false, m.recordFailure(ctx, st, err)
 	}
 
 	// Phase 1: write every TXT that is still awaiting validation, all in one go.
@@ -227,7 +227,7 @@ func (m *Manager) solveChallenges(
 		switch cur.Status {
 		case "valid":
 			if err := m.store.PutAuthorization(a); err != nil {
-				return false, m.recordFailure(st, fmt.Errorf("persist a validated authorization (%s): %w", a.Identifier, err))
+				return false, m.recordFailure(ctx, st, fmt.Errorf("persist a validated authorization (%s): %w", a.Identifier, err))
 			}
 			continue
 		case "invalid":
@@ -256,7 +256,7 @@ func (m *Manager) solveChallenges(
 					"cert", c.Name, "identifier", targeted, "err", rerr)
 			}
 
-			return false, m.recordFailure(st, fmt.Errorf(
+			return false, m.recordFailure(ctx, st, fmt.Errorf(
 				"the authorization for identifier %s is invalid: %s", targeted, authzError(cur)))
 
 		case "deactivated", "expired", "revoked":
@@ -279,11 +279,11 @@ func (m *Manager) solveChallenges(
 				"so the next pass places a fresh one",
 				"cert", c.Name, "identifier", targeted, "status", cur.Status, "authz", a.AuthzURL)
 			if derr := m.discardOrder(ctx, c.Name); derr != nil {
-				return false, m.recordFailure(st, fmt.Errorf(
+				return false, m.recordFailure(ctx, st, fmt.Errorf(
 					"the authorization for %s is %s and discarding the order failed: %w",
 					targeted, cur.Status, derr))
 			}
-			return false, m.recordFailure(st, fmt.Errorf(
+			return false, m.recordFailure(ctx, st, fmt.Errorf(
 				"the authorization for identifier %s is %s, which cannot be satisfied; a fresh order "+
 					"will be placed on the next pass", targeted, cur.Status))
 		}
@@ -291,11 +291,11 @@ func (m *Manager) solveChallenges(
 		if !a.Presented {
 			chlg, err := pickDNS01(cur)
 			if err != nil {
-				return false, m.recordFailure(st, err)
+				return false, m.recordFailure(ctx, st, err)
 			}
 			keyAuth, err := m.keyAuth.GetKeyAuthorization(chlg.Token)
 			if err != nil {
-				return false, m.recordFailure(st, fmt.Errorf("compute the key authorization: %w", err))
+				return false, m.recordFailure(ctx, st, fmt.Errorf("compute the key authorization: %w", err))
 			}
 
 			// The row must describe the challenge this pass is actually solving. The token
@@ -345,7 +345,7 @@ func (m *Manager) solveChallenges(
 				a.ChallengeURL = chlg.URL
 				a.ChallengeToken = chlg.Token
 				if err := m.store.PutAuthorization(a); err != nil {
-					return false, m.recordFailure(st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
+					return false, m.recordFailure(ctx, st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
 				}
 			} else {
 				// The row already names the record an earlier attempt wrote, so only the refreshed
@@ -355,7 +355,7 @@ func (m *Manager) solveChallenges(
 				// the old record stays in DNS with nothing naming it. See
 				// TestAFailedWriteOnTheRevisitPathKeepsTheTokenThatNamesTheRecord.
 				if err := m.store.PutAuthorization(a); err != nil {
-					return false, m.recordFailure(st, fmt.Errorf("persist the age of a new challenge (%s): %w", a.Identifier, err))
+					return false, m.recordFailure(ctx, st, fmt.Errorf("persist the age of a new challenge (%s): %w", a.Identifier, err))
 				}
 				a.ChallengeURL = chlg.URL
 				a.ChallengeToken = chlg.Token
@@ -391,7 +391,7 @@ func (m *Manager) solveChallenges(
 				// so that is minutes right there).
 				rec, err := m.dns.Present(ctx, a.Identifier, chlg.Token, keyAuth)
 				if err != nil {
-					return false, m.recordFailure(st, fmt.Errorf("present TXT (%s): %w", a.Identifier, err))
+					return false, m.recordFailure(ctx, st, fmt.Errorf("present TXT (%s): %w", a.Identifier, err))
 				}
 
 				a.TxtName = rec.FQDN
@@ -425,7 +425,7 @@ func (m *Manager) solveChallenges(
 						"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName)
 				}
 			}
-			return false, m.recordFailure(st, fmt.Errorf("persist a presented challenge (%s): %w", a.Identifier, err))
+			return false, m.recordFailure(ctx, st, fmt.Errorf("persist a presented challenge (%s): %w", a.Identifier, err))
 		}
 		records = append(records, DNSRecord{FQDN: a.TxtName, Value: a.TxtValue})
 		pending = append(pending, a)
@@ -451,7 +451,7 @@ func (m *Manager) solveChallenges(
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			m.markResumedUnpresented(c.Name, resumed)
 		}
-		return false, m.recordFailure(st, fmt.Errorf("wait for TXT propagation: %w", err))
+		return false, m.recordFailure(ctx, st, fmt.Errorf("wait for TXT propagation: %w", err))
 	}
 
 	// Phase 3: only once propagation is confirmed do we tell the CA, one by one, to validate.
@@ -460,20 +460,20 @@ func (m *Manager) solveChallenges(
 			continue
 		}
 		if err := m.core.AcceptChallenge(a.ChallengeURL); err != nil {
-			return false, m.recordFailure(st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
+			return false, m.recordFailure(ctx, st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
 		}
 		a.ChallengeSent = true
 		if err := m.store.PutAuthorization(a); err != nil {
 			// The challenge WAS accepted; only the record of it failed. Counting the pass as a
 			// failure is still right: without the row, the next pass cannot tell that this
 			// challenge is already in flight, and the pass has not finished its job.
-			return false, m.recordFailure(st, fmt.Errorf("persist that a challenge was accepted (%s): %w", a.Identifier, err))
+			return false, m.recordFailure(ctx, st, fmt.Errorf("persist that a challenge was accepted (%s): %w", a.Identifier, err))
 		}
 	}
 
 	// Phase 4: poll until everything is valid.
 	if err := m.awaitAuthorizations(ctx, pending); err != nil {
-		return false, m.recordFailure(st, err)
+		return false, m.recordFailure(ctx, st, err)
 	}
 
 	// Phase 5: only after every validation passes do we clean up the TXT records together.
@@ -911,15 +911,15 @@ func (m *Manager) finalize(
 ) error {
 	key, err := ParsePrivateKeyPEM(o.KeyPEM)
 	if err != nil {
-		return m.recordFailure(st, fmt.Errorf("load the order's private key: %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("load the order's private key: %w", err))
 	}
 	csr, err := CreateCSRDER(key, c.Domains)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	if o.FinalizeURL == "" {
-		return m.recordFailure(st, errors.New("the order has no finalize URL; cannot submit the CSR"))
+		return m.recordFailure(ctx, st, errors.New("the order has no finalize URL; cannot submit the CSR"))
 	}
 
 	// RFC 8555 section 7.4: the CSR must be POSTed to the order's finalize URL.
@@ -928,15 +928,15 @@ func (m *Manager) finalize(
 	// whatever URL you hand it. Passing the order URL makes LE treat it as POST-as-GET and
 	// fail with "POST-as-GET requests must have an empty payload".
 	if _, err := m.core.UpdateOrderForCSR(o.FinalizeURL, csr); err != nil {
-		return m.recordFailure(st, fmt.Errorf("submit CSR (finalize): %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("submit CSR (finalize): %w", err))
 	}
 
 	final, err := m.awaitOrderStatus(ctx, o.OrderURL, "valid", orderWaitTimeout)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 	if err := m.persistOrder(o, final); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 	return m.download(ctx, c, st, o, final, rd)
 }

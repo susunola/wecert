@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1296,5 +1297,65 @@ func TestAFailedDeployBookkeepingSchedulesARetry(t *testing.T) {
 	}
 	if dep.uploads == 0 {
 		t.Error("this test needs the upload to have happened, or it is not testing the bookkeeping")
+	}
+}
+
+// A timeout from inside a call is a business failure; only a stopped pass is not.
+//
+// The old filter was `errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)`,
+// and net/http wraps its own request deadline in *url.Error, whose Unwrap is
+// context.DeadlineExceeded. So the commonest CA-side failure there is -- a request that timed out --
+// was filed as "pass cancelled": no consecutive_failures, no last_error, no backoff, and on a first
+// issuance not even a certificate row for the next pass to find. The rule the code states is about
+// the PASS being stopped, so the pass context is what decides.
+func TestAnInnerTimeoutIsRecordedAsAFailure(t *testing.T) {
+	store, m, _, cert := newAPITestHarness(t, []string{"example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+
+	st := &state.CertState{Name: cert.Name, NotAfter: fixed.Add(30 * 24 * time.Hour)}
+	if err := store.PutCert(st); err != nil {
+		t.Fatal(err)
+	}
+
+	// The shape an http.Client timeout produces: a *url.Error wrapping the context error.
+	inner := &url.Error{Op: "Post", URL: "https://acme-v02.api.letsencrypt.org/order",
+		Err: context.DeadlineExceeded}
+	if !errors.Is(inner, context.DeadlineExceeded) {
+		t.Fatal("the fixture must wrap the sentinel, or this test proves nothing")
+	}
+
+	if err := m.recordFailure(context.Background(), st, inner); err == nil {
+		t.Fatal("the failure has to be reported")
+	}
+	after, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ConsecutiveFailures == 0 {
+		t.Error("a request that timed out is a failure: without the counter the fallback trigger and " +
+			"the pre-expiry degradation never see it")
+	}
+	if after.NextAttemptAt.IsZero() {
+		t.Error("a timed-out request must schedule a retry; retrying at the pass rate hammers the CA " +
+			"and burns the per-identifier failure budget")
+	}
+	if after.LastError == "" {
+		t.Error("the operator has to be able to read what happened")
+	}
+
+	// The same error on a stopped pass is still not a failure.
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel()
+	before := after.ConsecutiveFailures
+	if err := m.recordFailure(stopped, after, inner); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a stopped pass reports the error unchanged, got %v", err)
+	}
+	again, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ConsecutiveFailures != before {
+		t.Errorf("a stop signal must not count as a failure: %d -> %d", before, again.ConsecutiveFailures)
 	}
 }
