@@ -594,3 +594,82 @@ func TestAnUnanswerableCollisionProbeIsReported(t *testing.T) {
 			"same way", got)
 	}
 }
+
+// A backward clock step must not make retention delete the snapshot it just wrote.
+//
+// Snapshot names are wall-clock stamps and pruning deletes from the front of a lexicographic sort,
+// which is "oldest first" only while the clock moves forwards. After an NTP correction, a VM resumed
+// from a snapshot, or a backup directory restored from a host whose clock was ahead, the file just
+// written carries the newest CONTENT and the oldest NAME -- so the old code deleted exactly that
+// file, logged a fresh snapshot at a path that no longer existed, and left the recovery point stuck
+// on an older copy without saying so.
+func TestPruningKeepsTheSnapshotItJustWroteWhenTheClockWentBackwards(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// A snapshot from "before" the clock stepped backwards: its name sorts after anything this
+	// process will write now.
+	future := filepath.Join(backups, s.snapshotName(time.Now().UTC().Add(time.Hour).Format(snapshotStamp)))
+	if err := os.WriteFile(future, []byte("older content, later name"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	path, err := s.Snapshot(backups, 1)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the snapshot this call just wrote was deleted by its own pruning: %v", err)
+	}
+	if _, err := os.Stat(future); !os.IsNotExist(err) {
+		t.Errorf("retention still has to hold at keep=1, so the other snapshot must be the victim, "+
+			"got stat err %v", err)
+	}
+	left, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 {
+		t.Errorf("keep=1 must leave one snapshot, got %d: %v", len(left), left)
+	}
+}
+
+// An empty database is not worth snapshotting, and the daemon must not treat it as one.
+//
+// This is what the daemon gates on before writing a snapshot. Without it, after the documented
+// state.db loss every restart wrote a snapshot of the empty replacement and retention evicted a
+// genuine backup -- three restarts with keep=3 destroyed all three.
+func TestHasRecoverableStateTracksWhatASnapshotCouldRecover(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if has, err := s.HasRecoverableState(); err != nil || has {
+		t.Fatalf("a freshly created database holds nothing to recover: has=%v err=%v", has, err)
+	}
+
+	// Rate buckets and failure counters are not recovery material: losing them costs
+	// rate-limit knowledge, not a certificate.
+	if err := s.PutRateBucket(&RateBucket{
+		LimitName: "new-orders", ScopeID: "acct", Tokens: 1, ObservedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("PutRateBucket: %v", err)
+	}
+	if has, err := s.HasRecoverableState(); err != nil || has {
+		t.Errorf("rate-limit bookkeeping is not a recovery point: has=%v err=%v", has, err)
+	}
+
+	if err := s.PutCert(&CertState{Name: "example-com", KeyPEM: []byte("PRIVATE KEY")}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	if has, err := s.HasRecoverableState(); err != nil || !has {
+		t.Errorf("a stored certificate is exactly what a snapshot exists for: has=%v err=%v", has, err)
+	}
+}

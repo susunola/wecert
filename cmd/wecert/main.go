@@ -183,7 +183,10 @@ func run() error {
 	var notifier reconcile.Notifier
 	if n := webhook.NewNotifier(cfg.Webhook.NotifyURL, cfg.Webhook.NotifySecret, log); n != nil {
 		notifier = n
-		log.Info("renewal results will be pushed out", "url", cfg.Webhook.NotifyURL,
+		// The target is logged redacted: a chat/CI notification URL carries its secret in the path
+		// (Slack, Feishu, DingTalk) or in the query, and the journal has a wider audience than the
+		// daemon's owner. See webhook.RedactNotifyURL.
+		log.Info("renewal results will be pushed out", "target", webhook.RedactNotifyURL(cfg.Webhook.NotifyURL),
 			"signed", cfg.Webhook.NotifySecret != "")
 	}
 
@@ -507,20 +510,7 @@ func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Conf
 		dir = filepath.Dir(cfg.StatePath)
 	}
 
-	snapshot := func() {
-		path, err := store.Snapshot(dir, cfg.StateBackup.Keep)
-		if err != nil {
-			// A partial failure still writes the file; say which, so a successful
-			// snapshot with a failed prune is not read as "no backup exists".
-			log.Error("state database snapshot failed", "dir", dir, "err", err)
-			if path != "" {
-				log.Info("a snapshot was written despite the error", "path", path)
-			}
-			return
-		}
-		log.Info("state database snapshotted", "path", path,
-			"interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
-	}
+	snapshot := func() { takeSnapshot(store, dir, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log) }
 
 	go func() {
 		// One immediately: waiting a whole interval means a fresh deployment has no
@@ -541,6 +531,41 @@ func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Conf
 
 	log.Info("periodic state database snapshots are on",
 		"dir", dir, "interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
+}
+
+// takeSnapshot writes one snapshot, unless the database holds nothing a snapshot could recover.
+//
+// The second half is the point. A copy of a freshly created database is not a recovery point, but
+// retention counts it as one -- and the case snapshots exist for is exactly the case that produces
+// an empty database: after state.db is lost, every restart wrote a snapshot of the empty
+// replacement and evicted a genuine backup, so three restarts with keep=3 destroyed all three real
+// snapshots before anyone looked at the directory. Rate buckets and failure counters do not count
+// as recoverable state: losing them costs rate-limit knowledge, not a certificate.
+func takeSnapshot(store *state.Store, dir string, keep int, interval time.Duration, log *slog.Logger) {
+	has, err := store.HasRecoverableState()
+	if err != nil {
+		log.Error("cannot tell whether the state database holds anything worth snapshotting", "err", err)
+		return
+	}
+	if !has {
+		log.Warn("skipping this snapshot: the state database holds no account, certificate, order "+
+			"or revocation request yet, so a copy of it is not a recovery point -- and retention "+
+			"would count it as one and evict a snapshot that is",
+			"dir", dir, "keep", keep)
+		return
+	}
+
+	path, err := store.Snapshot(dir, keep)
+	if err != nil {
+		// A partial failure still writes the file; say which, so a successful snapshot with a
+		// failed prune is not read as "no backup exists".
+		log.Error("state database snapshot failed", "dir", dir, "err", err)
+		if path != "" {
+			log.Info("a snapshot was written despite the error", "path", path)
+		}
+		return
+	}
+	log.Info("state database snapshotted", "path", path, "interval", interval, "keep", keep)
 }
 
 func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) error {

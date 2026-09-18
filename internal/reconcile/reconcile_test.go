@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -1828,5 +1829,44 @@ func TestStartingAPassDoesNotRaceWithDrain(t *testing.T) {
 		if err := r.Drain(context.Background()); err != nil {
 			t.Fatalf("iteration %d: Drain after the race reported %v", i, err)
 		}
+	}
+}
+
+// A probe floor the desired state cannot satisfy must be reported, not silently ignored.
+//
+// In enforce mode config.normalize sees an empty certificate list -- the document is the only source
+// of certificates -- so its probe.minValidFor check never runs. The floor then fails every probe of
+// a shortlived certificate, which pins wecert_certificate_probe_match at 0 and fires the critical
+// "not serving the deployed certificate" alert with a diagnosis that blames the rebind or SNI. The
+// pass must say what the real cause is. It must not refuse to renew: the document may change between
+// passes, and a monitoring misconfiguration is not a reason to stop issuing.
+func TestAProbeFloorTheDocumentCannotSatisfyIsReported(t *testing.T) {
+	mgr := &fakeManager{}
+	provider := &mutableProvider{}
+	provider.set(config.Certificate{
+		Name: "short", Profile: config.ProfileShortLived, Domains: []string{"short.example.com"},
+	})
+
+	var logs bytes.Buffer
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{}
+	cfg.Probe.MinValidDur = 168 * time.Hour
+	r := New(cfg, provider, store, mgr, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	// A certificate with no stored state is attempted, which is what makes this a pass rather
+	// than an empty sweep; the manager is a fake, so nothing else is needed.
+	r.RunDetailed(context.Background())
+
+	if got := logs.String(); !strings.Contains(got, "probe's minimum remaining validity") ||
+		!strings.Contains(got, "short") {
+		t.Errorf("the pass must report the unsatisfiable probe floor and name the certificate, got:\n%s", got)
+	}
+	if len(mgr.calls) == 0 {
+		t.Error("a probe-setting mismatch must not stop the certificate from being renewed")
 	}
 }

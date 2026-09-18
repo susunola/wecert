@@ -209,8 +209,21 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 	if opts.Profile == "" {
 		opts.Profile = config.ProfileClassic
 	}
+	if !config.ValidProfile(opts.Profile) {
+		// A CLI -profile/-keytype flag lands in Options directly, bypassing the validation the
+		// config file and the declaration parser both apply. A typo then produced a round that
+		// reported mode="written" with a certificate count while Commit failed and nothing reached
+		// the document -- the same "written but nothing on disk" shape the config path already
+		// refuses.
+		return nil, fmt.Errorf("onboarding: unknown profile %q (want %s/%s/%s)",
+			opts.Profile, config.ProfileClassic, config.ProfileTLSServer, config.ProfileShortLived)
+	}
 	if opts.KeyType == "" {
 		opts.KeyType = config.KeyTypeECDSAP256
+	}
+	if !config.ValidKeyType(opts.KeyType) {
+		return nil, fmt.Errorf("onboarding: unknown keyType %q (want %s/%s)",
+			opts.KeyType, config.KeyTypeECDSAP256, config.KeyTypeRSA2048)
 	}
 	if opts.MaxNames <= 0 {
 		opts.MaxNames = 25 // Aligned with tlsserver so a future profile switch needs no redesign.

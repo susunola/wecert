@@ -5,12 +5,15 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/reconcile"
+	"github.com/susunola/wecert/internal/state"
 	"sync/atomic"
 	"time"
 )
@@ -159,5 +162,51 @@ func TestTheDaemonKeepsRunningAfterAPassThatDidNotConverge(t *testing.T) {
 			t.Errorf("the per-pass summary must carry %q so a pass that converged nothing is visible, got:\n%s",
 				want, out)
 		}
+	}
+}
+
+// A restart on an empty database must not evict the snapshots that still hold the real state.
+//
+// This is the shape of the documented disaster: state.db is lost, the daemon starts with a fresh
+// one, and the periodic snapshot runs immediately (by design -- waiting a whole interval would
+// leave a fresh deployment with no recoverable state). Retention counted that empty copy as a peer,
+// so three restarts with keep=3 removed all three genuine snapshots, and the operator's last good
+// copy was gone before anyone noticed the loss.
+func TestAnEmptyDatabaseIsNotSnapshotted(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	backups := filepath.Join(dir, "backups")
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+
+	takeSnapshot(store, backups, 3, time.Hour, log)
+
+	if _, err := os.Stat(backups); !os.IsNotExist(err) {
+		t.Errorf("no snapshot may be written for a database with nothing to recover, backup dir stat err %v", err)
+	}
+	if !strings.Contains(logs.String(), "skipping this snapshot") {
+		t.Errorf("the skip has to be visible, got:\n%s", logs.String())
+	}
+
+	// With one certificate the same call must write, so the guard is about content, not about
+	// disabling snapshots.
+	if err := store.PutCert(&state.CertState{Name: "example-com", KeyPEM: []byte("PRIVATE KEY")}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	logs.Reset()
+	takeSnapshot(store, backups, 3, time.Hour, log)
+
+	snaps, err := store.Snapshots(backups)
+	if err != nil {
+		t.Fatalf("Snapshots: %v", err)
+	}
+	if len(snaps) != 1 {
+		t.Errorf("a database with a certificate in it must be snapshotted, got %d: %v (%s)",
+			len(snaps), snaps, logs.String())
 	}
 }

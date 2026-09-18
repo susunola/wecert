@@ -319,9 +319,15 @@ func printHuman(res *probe.Result, v probe.Verdict, now time.Time) {
 	fmt.Println()
 }
 
+// emitJSON writes one JSON object per line.
+//
+// It used to indent, which made each object span ~30 lines: the documented contract (README.md,
+// README.zh-cn.md, docs/test-cases.md TC-PROBE-20/21/21b) is NDJSON -- one attempt per line, so
+// `... | while read -r line; do jq . <<<"$line"; done` works -- and the docs were right about the
+// intent while the code was not. A multi-address host or a -wait retry therefore produced a
+// stream that no line-oriented consumer could read.
 func emitJSON(v any) {
 	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
 }
 

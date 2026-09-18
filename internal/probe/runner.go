@@ -68,6 +68,13 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 	if err != nil {
 		metrics.CertificateProbeErrors.WithLabelValues(host).Inc()
 
+		// The verdict is not OK, so "the served certificate is the deployed one" must stop claiming
+		// it is. This branch used to leave probe_match at its previous value: a host that resolved
+		// and matched last round, then lost its DNS, kept a stale 1 for as long as the resolution
+		// failed -- and the documented alert on probe_match == 0 could not fire for the one host
+		// whose name no longer resolves. The two sibling branches below already say this.
+		metrics.CertificateProbeMatch.WithLabelValues(host).Set(0)
+
 		// Unreachable and wrong-certificate must be reported separately: being unable to dial
 		// out from the machine running wecert is an environment problem, not a certificate
 		// problem. Merging them into one conclusion sends people down the wrong path -- and

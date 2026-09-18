@@ -569,6 +569,21 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 	}
 	r.publishOrphans(ctx, res)
 
+	// The probe floor and the certificates finally meet here.
+	//
+	// In enforce mode the config's certificate list is empty by construction, so config.normalize's
+	// check never sees the profiles the document actually uses: a floor longer than a shortlived
+	// profile's validity then fails every probe of that certificate, pins
+	// wecert_certificate_probe_match at 0 and fires the critical "not serving the deployed
+	// certificate" alert with a diagnosis that blames the rebind. Reported rather than fatal: the
+	// document is allowed to change between passes, and refusing to renew over a probe setting
+	// would turn a monitoring misconfiguration into an outage.
+	if err := config.CheckProbeFloor(r.cfg.Probe.MinValidDur, res.Certificates); err != nil {
+		r.log.Error("the probe's minimum remaining validity cannot be satisfied by this desired "+
+			"state, so probes of the certificate it names will fail while it is still valid",
+			"err", err)
+	}
+
 	for i := range res.Certificates {
 		c := &res.Certificates[i]
 
@@ -1150,7 +1165,17 @@ func probeHosts(domains []string, max int) []string {
 // publish mirrors the current state store into Prometheus.
 func (r *Reconciler) publish(c *config.Certificate) {
 	st, err := r.store.GetCert(c.Name)
-	if err != nil || st == nil {
+	if err != nil {
+		// Say so. Everything below this line either sets or deletes series, so a silent return
+		// leaves wecert_certificate_not_after_timestamp_seconds -- the series this project
+		// documents as THE expiry signal -- reporting the previous pass's value while
+		// wecert_last_reconcile keeps advancing, i.e. a stale number that looks freshly written.
+		// There is no dedicated staleness counter for this read; the journal is the signal.
+		r.log.Warn("cannot read this certificate's state, so its metric series keep their previous "+
+			"values (including the expiry timestamp the alerts watch)", "cert", c.Name, "err", err)
+		return
+	}
+	if st == nil {
 		return
 	}
 
