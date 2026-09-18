@@ -830,10 +830,11 @@ func TestStaleSnapshotTempsAreSweptAndFreshOnesKept(t *testing.T) {
 	}
 }
 
-// A temp file this store cannot attribute -- no base in the name, i.e. one written by a deployment
-// sharing the directory -- is left alone regardless of age: deleting another store's in-flight
-// snapshot is the failure the prefix exists to prevent.
-func TestForeignSnapshotTempsAreNeverSwept(t *testing.T) {
+// A temp file this store cannot attribute is left alone while it could be live, and swept once it
+// cannot be: no base in the name means another deployment sharing the directory (deleting its
+// in-flight snapshot is the failure the prefix exists to prevent) or a file from before the prefix
+// carried the base, and the hour is far longer than any snapshot takes.
+func TestForeignSnapshotTempsAreSweptOnlyWhenOld(t *testing.T) {
 	s, dir := snapshotStore(t)
 	backups := filepath.Join(dir, "backups")
 	if err := os.MkdirAll(backups, 0o700); err != nil {
@@ -856,10 +857,22 @@ func TestForeignSnapshotTempsAreNeverSwept(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	for _, p := range []string{foreign, legacy} {
-		if _, err := os.Stat(p); err != nil {
-			t.Errorf("%s belongs to another deployment (or predates the base-name prefix) and must be left alone: %v",
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s is stale by an hour and belongs to no live writer; it must be swept, stat err %v",
 				filepath.Base(p), err)
 		}
+	}
+
+	// A FRESH foreign temp is left alone: another deployment may be writing it right now.
+	freshForeign := filepath.Join(backups, ".snapshot-other.db-29990101T000000.000-0.tmp")
+	if err := os.WriteFile(freshForeign, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Snapshot(backups, 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if _, err := os.Stat(freshForeign); err != nil {
+		t.Errorf("a fresh temp that may belong to another deployment's live write must be left alone: %v", err)
 	}
 }
 
@@ -876,11 +889,12 @@ func TestTheSweepLeavesAnotherStoresTempsAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A temp file whose owner cannot be established: another deployment sharing the directory, or a
+	// file from before the name carried the base.
 	foreign := filepath.Join(backups, ".snapshot-other.db-20200101T000000.000-0.tmp")
-	// The pre-base naming of an older build is not attributable to anyone either, so nobody may
-	// delete it: the age check exists for OUR crashed writes, not for files we cannot identify.
 	legacy := filepath.Join(backups, ".snapshot-20200101T000000.000-0.tmp")
-	for _, p := range []string{foreign, legacy} {
+	freshForeign := filepath.Join(backups, ".snapshot-other.db-29990101T000000.000-0.tmp")
+	for _, p := range []string{foreign, legacy, freshForeign} {
 		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -896,9 +910,23 @@ func TestTheSweepLeavesAnotherStoresTempsAlone(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
+	// The FRESH one may be another deployment's live write, so it is never touched -- that is the
+	// property the prefix exists for, and it is what this test guard against.
+	if _, err := os.Stat(freshForeign); err != nil {
+		t.Errorf("a fresh temp that may belong to another deployment's live write must be left alone: %v", err)
+	}
+
+	// The three-hour-old ones are swept. This used to say "nobody may delete them", and the reasoning
+	// was that the age check exists for OUR crashed writes -- but then nothing ever removes them: a
+	// pre-base leftover holds a partial copy of a private-key database for the rest of the host's
+	// life, and there is no process left that could still be writing it (an hour is far longer than
+	// any snapshot takes, which is what the threshold meant in the first place, before the crash-fault
+	// verification showed that for OUR OWN files the lock is the stronger proof and the age rule was
+	// only leaving the partial copy behind for an hour).
 	for _, p := range []string{foreign, legacy} {
-		if _, err := os.Stat(p); err != nil {
-			t.Errorf("%s is not this store's temp file and must not be swept: %v", filepath.Base(p), err)
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s is unattributable but hours old, so no live writer can hold it and it must be swept: %v",
+				filepath.Base(p), err)
 		}
 	}
 }

@@ -244,19 +244,25 @@ func (s *Store) repairFutureDatedSnapshots(dir string) {
 // are deliberately left behind: they cannot be attributed to any store, so nobody may delete them.
 func (s *Store) snapshotTempPrefix() string { return ".snapshot-" + s.base + "-" }
 
-// sweepStaleSnapshotTemps removes this store's leftover temporary snapshots from an interrupted
-// write.
+// sweepStaleSnapshotTemps removes leftover temporary snapshots from an interrupted write.
 //
-// No age threshold for this store's own files: the only caller is Snapshot, which runs under the
-// cross-process lock on this state path, so nothing else can be writing a snapshot of this database
-// and every `.snapshot-<base>-*` file is a leftover. The threshold exists for files whose owner
-// cannot be established (see snapshotTempPrefix), and those are not matched here at all.
+// Two rules, and the difference is ownership:
 //
-// The journal SQLite creates beside a VACUUM INTO target goes with the temp file. The round-11
-// crash-fault verification killed the daemon with 8-15 MiB of a 48 MiB copy written and found BOTH
-// files stranded (".snapshot-...-0.tmp" and ".snapshot-...-0.tmp-journal"); the old suffix test only
-// matched ".tmp", so tens of MiB of private-key database sat in the state directory until the hour
-// expired -- and the journal never matched at all.
+//   - THIS store's files (`.snapshot-<base>-*`) go at any age. The only caller is Snapshot, which
+//     holds the store mutex (so no second snapshot of this database can be in flight in this
+//     process) and the cross-process lock on this state path (so no other process can be writing one
+//     either): every one of them is a leftover, and an age threshold only leaves a partial copy of
+//     the private-key database lying around for an hour. The round-11 crash-fault verification killed
+//     the daemon with 8-15 MiB of a 48 MiB copy written and found the temp still there after the next
+//     start had taken a clean snapshot.
+//   - Anything else matching `.snapshot-*` keeps the age threshold: it belongs to another deployment
+//     sharing this directory (see snapshotTempPrefix) or predates the base-name prefix, so its owner
+//     cannot be established -- and an hour is far longer than any snapshot takes, which is what makes
+//     the age a safe proxy for "nobody is writing this".
+//
+// The journal SQLite creates beside a VACUUM INTO target goes with the temp file: the verification
+// found both stranded (".snapshot-...-0.tmp" and ".snapshot-...-0.tmp-journal"), and the old suffix
+// test only matched ".tmp", so the journal was never swept at all.
 func (s *Store) sweepStaleSnapshotTemps(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -265,11 +271,16 @@ func (s *Store) sweepStaleSnapshotTemps(dir string) {
 	own := s.snapshotTempPrefix()
 	for _, e := range entries {
 		name := e.Name()
-		if !strings.HasPrefix(name, own) {
+		if !strings.HasPrefix(name, ".snapshot-") {
 			continue
 		}
 		if !strings.HasSuffix(name, ".tmp") && !strings.HasSuffix(name, ".tmp-journal") {
 			continue
+		}
+		if !strings.HasPrefix(name, own) {
+			if info, err := e.Info(); err != nil || time.Since(info.ModTime()) < snapshotTempMaxAge {
+				continue
+			}
 		}
 		_ = os.Remove(filepath.Join(dir, name))
 	}
