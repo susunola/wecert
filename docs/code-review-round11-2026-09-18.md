@@ -129,9 +129,10 @@
 - `python3 scripts/test-check-cam-policies.py` 与 `scripts/check-cam-policies.py`
 - `bash scripts/test-e2e-wildcard.sh`（5/5）
 - `go test -race -count=1 ./...`：**20/20 包**
-- `make test-tags`（`-tags "pebble lego_dns"` 下的全套 + vet）：**本机暂时跑不了** —— 视角 B 的复审者同时在本机占用 pebble 的 14000 端口，用例报 `bind: address already in use`（这是环境冲突，不是代码问题）。等它退出后重跑，结果记在本节末尾。
+- `make test-tags`（`-tags "pebble lego_dns"` 下的全套 + vet）：绿。第一次尝试失败是环境冲突 —— 某个复审者留在 `/tmp` 的桩 ACME 服务器一直占着 14000 端口（用例报 `bind: address already in use`），确认那是残留进程后结束它，重跑即绿。
+- `make e2e`：**3/3 绿**（真实 DNS-01 生命周期 9 秒、pebble 上的订单协议 6 秒、通配符/apex 共享名 22 秒），HTML 报告 `docs/e2e-run-2026-09-18.html`。
 
-提交：`606c886`（恢复功能 + 两个视角的修复），随后是 CI 门禁补强（`check-alerts`、`check-scripts` 进 `ci.yml`，见 `docs/backlog.md` 第 1 项）。恢复功能与两轮 review 的修复在同一提交里，因为它们是同一轮的工作。
+提交：本轮 13 个提交都在 `test/e2e-tlsserver-renewal` 上（恢复功能 → 两个视角的修复 → CI 门禁补强 → 规模修复 → 本报告）。**分支基底需要留意**：这一轮开始时该分支的基底早于 `main` 上的 #66/#68，直接推上去会把 #68（"SKIP 的套件算失败"+ 缺 Go 报告不再 traceback）在合并时**回退**；发现后已把本轮 13 个提交 rebase 到当时的 `origin/main` 上，并确认 `docs/stage-c-cvm-systemd.md`、`scripts/e2e-sni.sh`、`scripts/e2e-report.py` 的修复都还在。恢复功能与两轮 review 的修复在同一提交里，因为它们是同一轮的工作。
 
 ---
 
