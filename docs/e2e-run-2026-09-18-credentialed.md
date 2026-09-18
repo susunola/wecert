@@ -90,6 +90,8 @@ time=00:33:17 level=INFO msg="TXT propagated" nameservers=9 records=2
 
 09-17 → 11-01 是 45 天，`profile: tlsserver` 在真实 LE staging 上生效；续期订单带 `replaces=true`（ARI 豁免的前提）。
 
+> 注（第 7–10 轮复审后）：这一行的字段名已从 `replaces` 改为 `replacesRequested`，因为它记录的是**本程序请求了什么**，而不是线上真正发出去了什么（lego 在目录不声明 renewalInfo 时会丢掉这个字段）。上面引用的日志是当时那个构建的输出，保留原样。
+
 ### 4.4 一键换绑：两条真实规则 + 机内握手
 
 ```

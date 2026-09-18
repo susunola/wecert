@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"github.com/susunola/wecert/internal/config"
 	"math/big"
 	"testing"
 	"time"
@@ -778,12 +779,9 @@ func TestARateLimitRefusalFromTheRetryStillSetsTheDeadline(t *testing.T) {
 // -- the limit with NO override path, and the one whose alert is `< 5` -- kept reading optimistic:
 // the estimate was wrong in the direction that leads to an order the CA will reject.
 func TestARefusalIsBookedAgainstTheLimitItNames(t *testing.T) {
-	store, m, fake, cert := newAPITestHarness(t, []string{"b.other.com"})
 	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
-	m.SetNow(func() time.Time { return fixed })
-	// Two registered domains, the one the CA names second, so a "first registered domain" guess
-	// cannot pass by accident.
-	cert.Domains = []string{"b.other.com", "a.example.com"}
+	// The scope of the exact-set refusal, for the cases that have to know it before a harness exists.
+	domainKey := (&config.Certificate{Domains: []string{"b.other.com", "a.example.com"}}).DomainKey()
 
 	cases := []struct {
 		name     string
@@ -798,7 +796,7 @@ func TestARefusalIsBookedAgainstTheLimitItNames(t *testing.T) {
 				"already issued for this exact set of identifiers, retry after 2026-09-16 15:00:00 UTC: see " +
 				"https://letsencrypt.org/docs/rate-limits/#certificates-per-exact-set-of-identifiers",
 			limit: ratelimit.CertsPerExactIdentifierSet,
-			scope: cert.DomainKey(),
+			scope: domainKey,
 			// The account-wide order budget is untouched by this refusal and must not be marked.
 			unmarked: ratelimit.NewOrdersPerAccount,
 		},
@@ -829,11 +827,16 @@ func TestARefusalIsBookedAgainstTheLimitItNames(t *testing.T) {
 	want := time.Date(2026, 9, 16, 15, 0, 0, 0, time.UTC)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Re-seed the row: the previous case left a retry deadline behind, and a pass inside a
-			// backoff window never reaches the order at all.
-			// NotAfter inside the renewal window (renewBefore is 30 days for classic) and no ARI,
-			// so the pass places an order; and a fresh row, so the previous case's retry deadline
-			// does not send this pass into its backoff window.
+			// A harness per case: a recorded deadline is deliberately sticky (PutRateBucket keeps
+			// an existing reset_at when the incoming one is zero), so a shared store would leave the
+			// previous case's refusal gating this one -- which is exactly what the code should do,
+			// and exactly what a shared fixture cannot express.
+			store, m, fake, cert := newAPITestHarness(t, []string{"b.other.com"})
+			m.SetNow(func() time.Time { return fixed })
+			// Two registered domains, the one the CA names second, so a "first registered domain"
+			// guess cannot pass by accident.
+			cert.Domains = []string{"b.other.com", "a.example.com"}
+
 			expiry := fixed.Add(10 * 24 * time.Hour)
 			if err := store.PutCert(&state.CertState{
 				Name:     cert.Name,
@@ -862,15 +865,6 @@ func TestARefusalIsBookedAgainstTheLimitItNames(t *testing.T) {
 			}
 			if _, _, other := m.quota.BlockedUntil(tc.unmarked, ""); other {
 				t.Errorf("%s was marked blocked by a refusal that does not name it", tc.unmarked.Name)
-			}
-
-			// Clear the bucket so the next case starts clean.
-			if err := store.UpdateRateBucket(tc.limit.Name, tc.scope, func(rec *state.RateBucket) error {
-				rec.ResetAt = time.Time{}
-				rec.ResetReason = ""
-				return nil
-			}); err != nil {
-				t.Fatal(err)
 			}
 		})
 	}
