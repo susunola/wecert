@@ -129,6 +129,8 @@
 - `python3 scripts/test-check-cam-policies.py` 与 `scripts/check-cam-policies.py`
 - `bash scripts/test-e2e-wildcard.sh`（5/5）
 - `go test -race -count=1 ./...`：**20/20 包**
+- `make test-pebble`：绿（含 `TestRealDNS01Lifecycle` 之外的 pebble 全套；本机 `TestPebbleFullIssuance` 4.6 秒）。
+- `make test-repeat`（`-race -shuffle=on -count=3`）：绿（顺序无关与可重复性）。
 - `make test-tags`（`-tags "pebble lego_dns"` 下的全套 + vet）：绿。第一次尝试失败是环境冲突 —— 某个复审者留在 `/tmp` 的桩 ACME 服务器一直占着 14000 端口（用例报 `bind: address already in use`），确认那是残留进程后结束它，重跑即绿。
 - `make e2e`：**2/3 通过，第 1 个套件在本机 SKIP**（`limactl` 的 DNS 代理占着 53/tcp，Go 侧写的是 `cannot bind TCP port 53 ... address already in use`）。按 #68 定下的语义，SKIP 就是门禁失败，所以这条命令在本机**退出 1**，HTML 报告里也这么写（`docs/e2e-run-2026-09-18.html`，报告页明确标注"这个套件没跑"）。pebble 上的订单协议（13.8 秒）与通配符/apex 共享名（22 秒）两个套件通过。
 
