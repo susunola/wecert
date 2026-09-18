@@ -392,19 +392,6 @@ type Problem struct {
 // String makes a Problem usable anywhere a message is.
 func (p Problem) String() string { return p.Text }
 
-// OnlyKind reports whether every problem is of this kind (and there is at least one).
-func (v Verdict) OnlyKind(kind ProblemKind) bool {
-	if len(v.Problems) == 0 {
-		return false
-	}
-	for _, p := range v.Problems {
-		if p.Kind != kind {
-			return false
-		}
-	}
-	return true
-}
-
 // Summary returns a one-line summary for logs and CLI output.
 func (v Verdict) Summary() string {
 	if v.OK {
@@ -415,15 +402,6 @@ func (v Verdict) Summary() string {
 		texts = append(texts, p.Text)
 	}
 	return strings.Join(texts, "; ")
-}
-
-// ProblemTexts returns the human-facing texts, for a log attribute.
-func (v Verdict) ProblemTexts() []string {
-	texts := make([]string, 0, len(v.Problems))
-	for _, p := range v.Problems {
-		texts = append(texts, p.Text)
-	}
-	return texts
 }
 
 // Verify compares the probe result against the expectation.
