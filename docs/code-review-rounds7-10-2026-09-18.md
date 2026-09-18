@@ -195,5 +195,5 @@ preflight 的 `confirm`（空/出错的 stdin 都算 no，且闸门在删除循�
 
 - **驳回也要有证据**：这一轮序列里共有 30 余条「不是缺陷」的结论被写下来（含反证），并且第 10 轮专门派人**重测**其中推理最弱的几条——重测改变了一条（`WithTx` 的注释：可达性那半成立，但真实失败是死锁而不是「读到旧值」）。
 - **抓到的最值钱的东西是「修复自己的回归」**：第 8 轮的截止时间消费让一条早已存在的 scope 提取缺陷开始咬人（第 10 轮抓到）；第 8 轮给指标加标签又暴露了 `DeleteCertSeries` 的单值删除（既有用例抓到）。两处都说明：**修复会把沉睡的缺陷激活**，所以每一轮都要回头打自己。
-- **仍然未验证**（与前面各轮合并，不再重复列举）：真机生产 LE、自然到期续期、云端对 `IsCheckResource` 的真实执行、真实断电/掉页、CA 是否真的会在同一 authz URL 上换挑战、DNSPod 是否真的返回非规范记录名、`-tags lego_dns` 的 CI 门禁（token 推不了 workflow，已用 `make release` 与 `make test-tags` 覆盖）、`docs/certificate-lifecycle*.html` 里的若干陈旧陈述（那两张页面由 `make diagrams` 从中文源生成，本轮没有重新生成）。
+- **仍然未验证**（与前面各轮合并，不再重复列举）：真机生产 LE、自然到期续期、云端对 `IsCheckResource` 的真实执行、真实断电/掉页、CA 是否真的会在同一 authz URL 上换挑战、DNSPod 是否真的返回非规范记录名（`-tags lego_dns` 的 CI 门禁已在拿到带 `workflow` scope 的凭据后补上：`b7b914d` 把 `make test-tags` 加进了 `ci.yml`）、`docs/certificate-lifecycle*.html` 里的若干陈旧陈述（那两张页面由 `make diagrams` 从中文源生成，本轮没有重新生成）。
 - **两处刻意留给后续**：第五个 CA 限额（连续授权失败导致标识符暂停）没有建模；降级集合的「证据过期后自动重试完整集合」还没有实现（第 9 轮只把 WARN 文案的评估记录下来）。两者都写在 §2.4 与 §4.3 里。
