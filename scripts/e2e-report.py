@@ -16,6 +16,7 @@ Usage: e2e-report.py --go-report FILE --extras FILE --out FILE
 import argparse
 import html
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -69,7 +70,20 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    rep = json.loads(Path(args.go_report).read_text())
+    # A missing Go report is a legitimate state, not a crash.
+    #
+    # The first suite writes this file, and it SKIPS itself when it cannot bind port 53 (a local
+    # resolver or a VM's DNS proxy already holds it). Crashing with a traceback there loses the
+    # report for the suites that DID run, and buries the real message -- that this suite did not
+    # run -- under a Python stack. Fall back to an empty result and say so on the page.
+    try:
+        rep = json.loads(Path(args.go_report).read_text())
+    except FileNotFoundError:
+        print(f"warning: {args.go_report} is missing (the real-DNS suite did not write it, which "
+              f"usually means it skipped); the report will say so", file=sys.stderr)
+        rep = {"cases": [], "not_run": [{"name": "TestRealDNS01Lifecycle",
+                                         "why": "the suite did not run: it writes this file only when it "
+                                                "actually starts, and it skips when port 53 is taken"}]}
     extras = json.loads(Path(args.extras).read_text())
 
     cases = rep.get("cases", [])
