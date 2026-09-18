@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	legoacme "github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/acme/api"
 
 	"github.com/susunola/wecert/internal/config"
@@ -31,7 +32,13 @@ func (m *Manager) renewalDecision(
 
 	now := m.now()
 
-	if st.ARICertID != "" && m.ariCheckDue(st, now) {
+	// RFC 9773 section 4.3: "clients MUST NOT send requests for certificates that have expired".
+	// An expired certificate has nothing to renew and the CA's answer cannot change the decision --
+	// and a certificate that expired long ago (a fleet member that has been failing for months)
+	// would otherwise be polled for as long as it stays in the desired state.
+	expired := !st.NotAfter.IsZero() && !now.Before(st.NotAfter)
+
+	if st.ARICertID != "" && !expired && m.ariCheckDue(st, now) {
 		info, retryAfter, err := FetchRenewalInfo(m.core, st.ARICertID)
 		switch {
 		case err == nil:
@@ -62,6 +69,12 @@ func (m *Manager) renewalDecision(
 			// FetchRenewalInfo has already parsed it for us, covering even non-200 responses.
 			st.ARICheckedAt = now
 			st.ARIRetryAfter = retryAfter
+			if errors.Is(err, ErrRenewalInfoLongTerm) {
+				// A long-term answer: the CA does not know this certificate, so a short Retry-After
+				// would have us asking again in a minute for the rest of the deployment's life.
+				// The floor applies.
+				st.ARIRetryAfter = 0
+			}
 			if perr := m.store.PutCert(st); perr != nil {
 				return time.Time{}, "", perr
 			}
@@ -71,6 +84,14 @@ func (m *Manager) renewalDecision(
 
 	if !st.ARIWindowStart.IsZero() && st.ARIWindowEnd.After(st.ARIWindowStart) {
 		return RenewalTime(c.Name, st.ARIWindowStart, st.ARIWindowEnd), st.ARICertID, ariErr
+	}
+	// RFC 9773 section 4.2 makes the window a half-open interval, so end == start is malformed: it
+	// describes no instant at all. The fallback below handles it (the schedule comes from NotAfter),
+	// but silently -- and a CA that keeps sending one is worth seeing in the journal.
+	if !st.ARIWindowStart.IsZero() && st.ARIWindowEnd.Equal(st.ARIWindowStart) {
+		m.log.Warn("the CA returned an empty ARI window (start == end), which RFC 9773 section 4.2 "+
+			"does not allow; falling back to the deterministic schedule for this renewal",
+			"cert", c.Name, "start", st.ARIWindowStart)
 	}
 
 	// Fallback: no ARI, but the identifier set still stays identical, so at least we keep the
@@ -94,9 +115,12 @@ func (m *Manager) spendNewOrder() {
 // use is the same rule the spend path applies (see download): the exact identifier set, and each
 // registered domain the order covers.
 //
-// NoteRetryAfter only answers for errors that actually carry a Retry-After, so a refusal of any
-// other kind is left to the caller's own failure accounting.
-func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) {
+// NoteRetryAfter only answers for errors that actually carry a Retry-After (in the message or, via
+// lego's typed error, in the header), so a refusal of any other kind is left to the caller's own
+// failure accounting. The answer is also "should this pass retry right now": a refusal that named a
+// deadline must not be followed by the immediate replaces-less retry, which would spend a second
+// request inside the window the CA just named.
+func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) bool {
 	named := refusedLimits(err.Error())
 	if len(named) == 0 {
 		// A rate-limited refusal that names no specific limit is most likely the account-wide
@@ -104,10 +128,25 @@ func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) {
 		named = []ratelimit.Limit{ratelimit.NewOrdersPerAccount}
 	}
 
+	// lego exposes the 429's Retry-After HEADER on its typed error, and only the free text used to be
+	// parsed. A CA may send the header without repeating the instant in the message -- the field is
+	// the protocol's own answer, the prose is commentary -- and then no deadline was recorded at all,
+	// so the pass came straight back inside the window the CA had just named.
+	headerAt, headerOK := time.Time{}, false
+	var rle *legoacme.RateLimitedError
+	if errors.As(err, &rle) && rle.RetryAfter != "" {
+		headerAt, headerOK = ratelimit.ParseRetryAfterHeader(rle.RetryAfter)
+	}
+
 	blocked := false
 	for _, l := range named {
 		scope := newOrderRefusalScope(l, c, err.Error())
 		at, ok := m.quota.NoteRetryAfter(l, scope, err.Error())
+		if !ok && headerOK {
+			// The message had no parsable instant; the header did.
+			m.quota.NoteDeadline(l, scope, headerAt, "retry-after header")
+			at, ok = headerAt, true
+		}
 		if !ok {
 			continue
 		}
@@ -116,9 +155,44 @@ func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) {
 			"against that limit must wait for the reported instant",
 			"cert", c.Name, "limit", l.Name, "scope", scope, "until", at)
 	}
-	if !blocked {
-		return
+	return blocked
+}
+
+// blockedByRecordedDeadline reports whether the CA has told us not to come back yet.
+//
+// The account-wide new-order limit gates everything, so it is checked first; the per-scope limits
+// (the exact identifier set, each registered domain, each identifier) gate only the certificate in
+// front of us. Returns the instant, the limit name, the scope and whether anything blocked.
+func (m *Manager) blockedByRecordedDeadline(c *config.Certificate) (time.Time, string, string, bool) {
+	type check struct {
+		limit ratelimit.Limit
+		scope string
 	}
+	checks := []check{{limit: ratelimit.NewOrdersPerAccount}}
+	checks = append(checks, check{limit: ratelimit.CertsPerExactIdentifierSet, scope: c.DomainKey()})
+	for _, d := range uniqueRegisteredDomains(c.Domains) {
+		checks = append(checks, check{limit: ratelimit.CertsPerRegisteredDomain, scope: d})
+	}
+	for _, d := range c.Domains {
+		checks = append(checks, check{limit: ratelimit.AuthzFailuresPerIdentifier, scope: strings.ToLower(d)})
+	}
+	for _, ch := range checks {
+		if ch.scope == "" && ch.limit.Scope != "account" {
+			continue
+		}
+		if at, _, blocked := m.quota.BlockedUntil(ch.limit, ch.scope); blocked {
+			return at, ch.limit.Name, ch.scope, true
+		}
+	}
+	return time.Time{}, "", "", false
+}
+
+// scopeLabel renders a scope for a log or error message.
+func scopeLabel(scope string) string {
+	if scope == "" {
+		return ""
+	}
+	return " for " + scope
 }
 
 // newOrderRefusalScope is the bucket a refused limit is recorded against, matching the scope the
@@ -139,6 +213,18 @@ func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate, msg string) 
 		}
 		if doms := uniqueRegisteredDomains(c.Domains); len(doms) > 0 {
 			return doms[0]
+		}
+	case ratelimit.AuthzFailuresPerIdentifier.Name:
+		// The identifier budget is per NAME, and Boulder names the one it counted
+		// (`too many failed authorizations (5) for "bad.example.com"`). Preferring the name in the
+		// message over the certificate's first domain matters for the same reason it does above: a
+		// certificate with several names would otherwise have the deadline recorded against one that
+		// is fine.
+		if named := quotedIssuedDomain(msg); named != "" {
+			return named
+		}
+		if len(c.Domains) > 0 {
+			return strings.ToLower(c.Domains[0])
 		}
 	}
 	return ""
@@ -188,6 +274,17 @@ func refusedLimits(msg string) []ratelimit.Limit {
 	}
 	if !exactSet && strings.Contains(lower, "already issued for") {
 		out = append(out, ratelimit.CertsPerRegisteredDomain)
+	}
+	// The fourth limit Boulder checks at new-order time is the per-domain failed-authorization
+	// budget, and its wording names the domain:
+	//
+	//	too many failed authorizations (5) for %q in the last %s, retry after %s
+	//
+	// Booking it against new-orders (the fallback for anything unrecognised) pointed the operator at
+	// the whole account while the paused identifier's own series still read "5 of 5 left", because
+	// the deadline landed on a bucket that has nothing to do with the refusal.
+	if strings.Contains(lower, "failed authorizations") {
+		out = append(out, ratelimit.AuthzFailuresPerIdentifier)
 	}
 	if strings.Contains(lower, "new orders") || strings.Contains(lower, "new-orders") {
 		out = append(out, ratelimit.NewOrdersPerAccount)
@@ -248,7 +345,7 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 	// Checked here, at the point an order would be created, so resuming an order that is
 	// already in flight is unaffected -- that costs no new order and is how a pass that was
 	// interrupted mid-validation finishes.
-	if name, until, cooling := m.coolingDown(c.Domains); cooling {
+	if name, until, cooling := m.coolingDown(c.Name, c.Domains); cooling {
 		m.log.Warn("an identifier's authorizations failed recently, so no new order is placed until its "+
 			"failure budget refills; retrying inside the window cannot succeed and spends the budget "+
 			"that other certificates for this name also depend on",
@@ -257,6 +354,27 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		return m.recordFailure(ctx, st, fmt.Errorf(
 			"identifier %s is in its authorization-failure cooldown until %s; not placing an order",
 			name, until.UTC().Format(time.RFC3339)))
+	}
+
+	// The CA's own deadline wins over our backoff.
+	//
+	// Nothing used to consult a recorded refusal before ordering: the bucket was written, published
+	// as a metric and otherwise ignored, so a "retry after 3h" was followed by new-order attempts at
+	// our own 1m..6h backoff -- eight of them inside one three-hour window in a measured run. Every
+	// one of those is a request the CA has already said cannot succeed, and on the identifier limits
+	// they also count against the budget the whole account shares.
+	//
+	// The account-wide limit stops the pass outright; a per-scope one stops only the certificates it
+	// names, because refusing every order because one domain is paused would stall the fleet.
+	if until, limit, scope, blocked := m.blockedByRecordedDeadline(c); blocked {
+		m.log.Warn("the CA has refused this limit recently and named when it will listen again; no "+
+			"order is placed before then, because the refusal is the CA's own answer and retrying "+
+			"inside the window cannot change it",
+			"cert", c.Name, "limit", limit, "scope", scope, "until", until,
+			"remaining", until.Sub(m.now()).Round(time.Minute))
+		return m.recordFailure(ctx, st, fmt.Errorf(
+			"limit %s%s is blocked until %s according to the CA's own Retry-After; not placing an order",
+			limit, scopeLabel(scope), until.UTC().Format(time.RFC3339)))
 	}
 
 	key, err := GenerateKey(c.KeyType)
@@ -279,6 +397,7 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 	// made the published lower bound optimistic by one -- in the flow that spends orders in
 	// bursts -- and a rate-limit refusal from the retry was dropped on the floor instead of
 	// becoming the deadline that gates every other certificate.
+	refusedDeadline := false
 	if err == nil {
 		// An order was created, so it counts -- whether or not this pass goes on to finish.
 		// The CA's own documentation is explicit that the resource is consumed at new-order
@@ -286,10 +405,15 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		m.spendNewOrder()
 	} else {
 		// Worth reading even though a retry follows: a rate-limited account is not a `replaces`
-		// problem, and the instant it names governs every certificate on this account.
-		m.noteNewOrderRefusal(c, err)
+		// problem, and the instant it names governs every certificate on this account. A true
+		// answer also means "do not retry now".
+		refusedDeadline = m.noteNewOrderRefusal(c, err)
 	}
-	if err != nil && replaces != "" {
+	if err != nil && replaces != "" && !refusedDeadline {
+		// ... except when the CA has told us not to come back yet: a rate-limit refusal is not a
+		// `replaces` problem, and retrying immediately spends a second request inside the window the
+		// CA just named, where it cannot succeed (the limit applies to placing the order, replaces
+		// or not). This retry exists for the opposite case, a refusal about the replacement itself.
 		// A `replaces` that the CA will not honour must never be a dead end, so retry once
 		// without it. Losing the rate-limit exemption is a far smaller cost than not renewing
 		// at all -- and a renewal that never happens is the worst failure this system has.
@@ -375,8 +499,15 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 				"attempt will create another one): %w", order.Location, err))
 	}
 
+	// "replaces" here is what this program ASKED for, not proof of what went on the wire.
+	//
+	// lego drops the field when the directory does not advertise renewalInfo, so a journal line
+	// reading replaces=true next to an order that carried nothing is not a contradiction -- but it
+	// was written as if it were a statement about the request that reached the CA, which is the one
+	// thing an operator would use it to check. The wire itself is visible in lego's payloads (and
+	// in the CA's own accounting); this line now says which of the two it is.
 	m.log.Info("ACME order created",
 		"cert", c.Name, "status", order.Status, "expiresAt", expiresAt,
-		"names", len(c.Domains), "profile", order.Profile, "replaces", replaces != "")
+		"names", len(c.Domains), "profile", order.Profile, "replacesRequested", replaces != "")
 	return m.advance(ctx, c, st, o, rd)
 }

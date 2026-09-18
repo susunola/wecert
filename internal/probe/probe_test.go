@@ -601,3 +601,25 @@ func TestTooManyAddressesIsRefusedRatherThanSampled(t *testing.T) {
 		t.Errorf("the cap itself must be allowed, got %v", err)
 	}
 }
+
+// A misspelled -expect-san must not be reported as both missing and extra.
+//
+// normalizeSet trimmed the spaces BEFORE stripping the dot, so it was not idempotent: a name written
+// "www.example.com.." kept one dot after the first pass and lost it on the second. Verify compares
+// two normalized sets, so the same name landed in both "missing names that were deployed" and "has
+// names that were not deployed" -- one typo, a self-contradictory verdict and exit code 2.
+func TestExpectSANNormalisationIsIdempotent(t *testing.T) {
+	for _, spelling := range []string{"www.example.com", "WWW.Example.com ", "www.example.com.", "www.example.com..", " www.example.com ."} {
+		first := normalizeSet([]string{spelling})
+		for name := range first {
+			second := normalizeSet([]string{name})
+			if len(second) != 1 || !second[name] {
+				t.Errorf("normalizeSet is not idempotent for %q: first pass %q, second pass %v",
+					spelling, name, second)
+			}
+			if name != "www.example.com" {
+				t.Errorf("%q normalised to %q, want www.example.com", spelling, name)
+			}
+		}
+	}
+}

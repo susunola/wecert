@@ -247,22 +247,54 @@ func (m *Manager) clearOrderFetchFailures(orderURL string) {
 const identifierCooldownFor = time.Hour
 
 // coolingDown returns the identifier among these names that is inside its cooldown, if any.
-func (m *Manager) coolingDown(domains []string) (string, time.Time, bool) {
+func (m *Manager) coolingDown(certName string, domains []string) (string, time.Time, bool) {
 	now := m.now()
 	m.identifierMu.Lock()
 	defer m.identifierMu.Unlock()
 	for _, d := range domains {
 		until, ok := m.identifierCooldown[d]
-		if !ok {
-			continue
-		}
-		if !now.Before(until) {
-			delete(m.identifierCooldown, d)
+		if !ok || !now.Before(until) {
+			if ok {
+				delete(m.identifierCooldown, d)
+			}
+			// The cooldown map is per-process, and the budget it protects is persisted. A restart
+			// used to re-arm nothing: the same process held the second attempt back, but a restart
+			// three minutes after the first failure let it through -- and with several certificates
+			// sharing the identifier, one restart per round spends the whole 5-per-hour budget.
+			// The ledger the fallback already relies on records when each name last failed, so it is
+			// the authority here too.
+			if seeded, ok := m.persistedCooldown(certName, d, now); ok {
+				m.identifierCooldown[d] = seeded
+				return d, seeded, true
+			}
 			continue
 		}
 		return d, until, true
 	}
 	return "", time.Time{}, false
+}
+
+// persistedCooldown reports the cooldown left for an identifier according to the stored ledger.
+func (m *Manager) persistedCooldown(certName, identifier string, now time.Time) (time.Time, bool) {
+	if identifier == "" || m.store == nil {
+		return time.Time{}, false
+	}
+	rows, err := m.store.ListIdentifierFailures(certName)
+	if err != nil {
+		// Unreadable evidence is not evidence of health: leave the decision to the in-memory map
+		// rather than inventing a cooldown, and the next pass retries the read.
+		return time.Time{}, false
+	}
+	for _, r := range rows {
+		if r.Identifier != identifier || r.LastFailedAt.IsZero() {
+			continue
+		}
+		until := r.LastFailedAt.Add(identifierCooldownFor)
+		if now.Before(until) {
+			return until, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // noteIdentifierFailure starts (or extends) the cooldown for a name whose authorization failed.

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"golang.org/x/net/publicsuffix"
 	"io"
 	"math"
 	"net"
@@ -1265,6 +1266,30 @@ func validateDomain(d string) error {
 	}
 	if strings.ContainsAny(d, " \t\r\n/") {
 		return fmt.Errorf("domain %q contains whitespace or a slash", d)
+	}
+
+	// An IP literal cannot be validated with DNS-01, and it does not fail on its own: lego promotes
+	// a literal to an RFC 8738 "ip" identifier, the CA then offers only tls-alpn-01 and http-01 for
+	// it, and pickDNS01 finds no dns-01 challenge -- so the WHOLE certificate stops issuing, every
+	// pass, with an error that names the challenge type rather than the domain that caused it.
+	// Rejecting it here turns "this certificate never works" into "this line of the document is
+	// wrong". (IPv6 literals are not even expressible as a hostname label, and a wildcard over an
+	// address is nonsense, so the base name is what is checked.)
+	if net.ParseIP(strings.TrimPrefix(d, "*.")) != nil {
+		return fmt.Errorf("domain %q is an IP address: Let's Encrypt issues certificates for DNS "+
+			"names, and this program validates with DNS-01, which an address identifier cannot "+
+			"answer -- use a name that resolves to it instead", d)
+	}
+	// A single label, or a public suffix ("co.uk"), cannot be issued either: the CA needs a name
+	// under a registrable domain it can validate, and an identifier with nothing above it is
+	// exactly the "internal name" the CA/Browser Forum baseline requirements forbid a public CA to
+	// sign. The PSL is consulted here rather than through internal/group because group imports this
+	// package (it validates through ValidateDomain), so the dependency only runs one way.
+	if base := strings.TrimPrefix(d, "*."); base != "" {
+		if suffix, _ := publicsuffix.PublicSuffix(base); suffix == base {
+			return fmt.Errorf("domain %q IS a public suffix (or has no suffix above it at all), so no "+
+				"certificate authority can validate it; use a name under it, e.g. www.%s", d, base)
+		}
 	}
 
 	// Check label by label. Empty labels (a..example.com), over-long labels and

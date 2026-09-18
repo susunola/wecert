@@ -1472,6 +1472,9 @@ func (s *Store) ListPresentedAuthorizations() ([]*Authorization, error) {
 
 // PutAuthorization writes a single authorization.
 func (s *Store) PutAuthorization(a *Authorization) error {
+	if a == nil {
+		return fmt.Errorf("nil authorization")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`
@@ -1552,6 +1555,12 @@ type RetiredCert struct {
 // certificate wecert never held a copy of). The row is still useful then: the reaper must
 // delete it from the cloud either way.
 func (s *Store) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) error {
+	if certID == "" {
+		// A row with no id is one the reaper can never delete: Delete("") fails every round and the
+		// slot is held forever, which is the opposite of what a reclaim list is for. The only
+		// caller that could produce it guards against an empty id itself; this is the second line.
+		return fmt.Errorf("refusing to queue an empty certificate id for reclaim under %q", certName)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return addRetiredCertExec(s.db, certID, certName, certPEM, keyPEM)

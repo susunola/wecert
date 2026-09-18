@@ -457,9 +457,28 @@ func diffDomains(want, got []string) (missing, extra []string) {
 func normalizeSet(in []string) map[string]bool {
 	out := make(map[string]bool, len(in))
 	for _, d := range in {
-		out[strings.TrimSuffix(strings.ToLower(strings.TrimSpace(d)), ".")] = true
+		out[normalizeName(d)] = true
 	}
 	return out
+}
+
+// normalizeName canonicalises one name the same way however many times it is called.
+//
+// Trimming the spaces BEFORE stripping the dot is not idempotent: "www.example.com.." keeps one dot
+// after the first pass and loses it on the second, and "www.example.com ." only loses the space on
+// the second. The CLI splits -expect-san straight into the expectation, so either spelling made
+// Verify report the same name as both "missing names that were deployed" and "has names that were
+// not deployed" -- a self-contradictory verdict for one typo, with exit code 2. Loop until the
+// string stops changing instead.
+func normalizeName(d string) string {
+	prev := d
+	for {
+		next := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(prev)), ".")
+		if next == prev {
+			return next
+		}
+		prev = next
+	}
 }
 
 // DaysLeft returns the days remaining, rounded up -- "0 days left" is a meaningless thing

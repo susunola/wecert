@@ -446,3 +446,30 @@ func TestCloseWaitsForAnInFlightTransaction(t *testing.T) {
 		t.Fatalf("Close after the transaction: %v", err)
 	}
 }
+
+// A reclaim row with no certificate id must be refused.
+//
+// The reaper's only handle is the id: Delete("") fails every round, so the row is never removed and
+// the slot is held forever -- the opposite of what a reclaim list is for. The one caller that could
+// produce it checks first; this is the second line, and it is cheap because a wrong row here leaks a
+// cloud certificate rather than an HTTP request.
+func TestARetiredRowWithNoCertificateIdIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.AddRetiredCert("", "example-com", nil, nil); err == nil {
+		t.Error("queueing an empty certificate id for reclaim must be refused: the reaper can never " +
+			"delete it and the row is held forever")
+	}
+	rows, err := s.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("nothing may be queued by a refused call, got %+v", rows)
+	}
+}
