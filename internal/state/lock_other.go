@@ -33,3 +33,6 @@ func acquireLock(path string) (*fileLock, error) {
 }
 
 func (l *fileLock) release() error { return nil }
+
+// VerifyHeld is a no-op where there is no cross-process lock to verify (see the build tag above).
+func (l *fileLock) VerifyHeld() error { return nil }

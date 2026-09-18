@@ -243,3 +243,37 @@ func TestAFailedOrderReadSchedulesTheRetry(t *testing.T) {
 		t.Error("the failure must schedule a retry, otherwise the next pass repeats it immediately")
 	}
 }
+
+// A backward clock step must not silence the binding check.
+//
+// `now.Sub(last) < interval` treats a NEGATIVE duration as "checked recently", so after the clock
+// moved backwards every later pass skipped the binding lookup: DeployConfirmed stayed false, and
+// because probeCert returns early for a certificate that is not confirmed deployed, the network
+// probe never ran either. The certificate was unverified until the wall clock caught up with the
+// stored instant. A future instant means the clock moved, not that a check just happened.
+func TestABackwardClockStepDoesNotSilenceTheBindingCheck(t *testing.T) {
+	store, m, _, cert := newAPITestHarness(t, []string{"example.com"})
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return now })
+
+	if !m.bindingCheckDue(cert.Name) {
+		t.Fatal("the first check is always due")
+	}
+	if m.bindingCheckDue(cert.Name) {
+		t.Fatal("a second check in the same instant is not")
+	}
+
+	// The clock steps back an hour: the stored instant is now in the future.
+	now = now.Add(-time.Hour)
+	if !m.bindingCheckDue(cert.Name) {
+		t.Error("a stored instant in the future must be treated as due: the alternative is that no " +
+			"binding lookup runs until the clock catches up, so DeployConfirmed stays false and the " +
+			"network probe never runs for this certificate")
+	}
+
+	// And the ordinary interval still applies after that.
+	if m.bindingCheckDue(cert.Name) {
+		t.Error("the check must not run on every pass")
+	}
+	_ = store
+}

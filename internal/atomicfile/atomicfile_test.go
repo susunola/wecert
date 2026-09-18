@@ -98,3 +98,60 @@ func TestInstallMovesAndSetsPerm(t *testing.T) {
 		t.Errorf("contents = %q", body)
 	}
 }
+
+// Write must refuse a symlinked target rather than silently replacing the link.
+//
+// rename(2) replaces the NAME: the link is destroyed and the file it pointed at stays frozen at its
+// old contents. The desired-state reader refuses a symlinked document, so a writer that quietly
+// undid that rule would leave the operator with a link gone, a stale target, and no error.
+func TestWriteRefusesASymlinkedTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.yaml")
+	if err := os.WriteFile(target, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "desired-state.yaml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Write(link, []byte("new\n"), 0o644)
+	if err == nil {
+		t.Fatal("writing over a symlink must be refused")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("the refusal must say what it saw, got %v", err)
+	}
+	if fi, lerr := os.Lstat(link); lerr != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("the link must still be there; the write must not have replaced it")
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != "old\n" {
+		t.Errorf("the target must be untouched, got %q", got)
+	}
+}
+
+// Install must refuse a temporary path that is not a regular file, because chmod(2) follows links.
+func TestInstallRefusesANonRegularTemporaryFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "elsewhere")
+	if err := os.WriteFile(target, []byte("unrelated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(dir, ".atomic-link.tmp")
+	if err := os.Symlink(target, tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Install(tmp, filepath.Join(dir, "final"), 0o600, dir); err == nil {
+		t.Fatal("a symlinked temporary path must be refused: chmod follows the link and would change " +
+			"the mode of an unrelated file before installing the link under the target's name")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Errorf("the unrelated file's mode changed to %04o", info.Mode().Perm())
+	}
+}

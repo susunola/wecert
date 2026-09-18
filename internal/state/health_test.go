@@ -309,3 +309,52 @@ func TestStatePathHazardsAreWarnedAboutNotRefused(t *testing.T) {
 			"user unlinking it, got %v", warnings)
 	}
 }
+
+// VerifyOnDisk reports a database that is no longer the file at its path, and a lock that was taken
+// away underneath the process.
+//
+// SQLite writes to the inode it opened and flock is bound to the inode it locked, so both failures
+// are invisible from inside the process: reads answer, writes succeed, and the next start comes up
+// with nothing. The removal cannot be prevented; it can be noticed.
+func TestVerifyOnDiskNoticesADeletedOrReplacedDatabaseAndALostLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if problems := s.VerifyOnDisk(); len(problems) != 0 {
+		t.Fatalf("a healthy store has nothing to report, got %v", problems)
+	}
+
+	// The lock file disappears: flock keeps working on the unlinked inode, so the next process can
+	// take a lock on a fresh file and both write.
+	if err := os.Remove(path + ".lock"); err != nil {
+		t.Fatal(err)
+	}
+	problems := s.VerifyOnDisk()
+	if len(problems) == 0 {
+		t.Fatal("a lock file that has been removed must be reported: another process can now hold " +
+			"the lock this one believes it owns")
+	}
+	if !strings.Contains(strings.Join(problems, " "), "lock") {
+		t.Errorf("the report must name the lock, got %v", problems)
+	}
+
+	// The database itself disappears. It has to be re-created first for the lock check to be the
+	// only one complaining, then removed outright.
+	if err := os.WriteFile(path+".lock", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	problems = s.VerifyOnDisk()
+	joined := strings.Join(problems, " ")
+	if !strings.Contains(joined, "no longer at that path") {
+		t.Errorf("a state database removed from under a running store must be reported: every later "+
+			"write goes to an unlinked file and the next start finds nothing. Got %v", problems)
+	}
+}

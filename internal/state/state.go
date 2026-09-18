@@ -57,6 +57,14 @@ type Store struct {
 	// discipline.
 	mu sync.Mutex
 
+	// path is where this store's database lives, and openedAs is the identity of the file that was
+	// opened. VerifyOnDisk compares them later: SQLite keeps writing to an inode that has been
+	// unlinked or replaced, so a `rm -rf` of the state directory (or a snapshot restored under a
+	// running daemon) produces writes that succeed, reads that succeed, and a next start that holds
+	// nothing -- with no error anywhere in between.
+	path     string
+	openedAs os.FileInfo
+
 	// lock is the cross-process exclusive lock.
 	//
 	// The "at most one in-flight order per certificate" invariant used to hold only
@@ -415,7 +423,12 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 			realPath, path, realPath)
 	}
 
-	s := &Store{db: db, lock: lock, base: filepath.Base(path)}
+	s := &Store{db: db, lock: lock, base: filepath.Base(path), path: path}
+	// The identity of the file at that path right now. os.SameFile against a later stat is what
+	// catches "unlinked" and "replaced by a restore" alike, without needing the driver's own fd.
+	if fi, statErr := os.Stat(path); statErr == nil {
+		s.openedAs = fi
+	}
 
 	// Verify the file is a usable database before anything writes to it.
 	//
@@ -479,7 +492,7 @@ func statePathWarnings(path, dir string) []string {
 	var out []string
 
 	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		target := ""
+		target := "(target does not exist)"
 		if resolved, rerr := filepath.EvalSymlinks(path); rerr == nil {
 			target = resolved
 		}
@@ -502,6 +515,46 @@ func statePathWarnings(path, dir string) []string {
 		}
 	}
 	return out
+}
+
+// VerifyOnDisk reports whether the database this store is writing to is still the file at the path
+// it was opened from, and whether the cross-process lock is still the one this process holds.
+//
+// Both checks exist because SQLite (and flock) bind to the INODE, not to the name. `rm -rf` of the
+// state directory while the daemon runs leaves every later write succeeding against an unlinked
+// file: reads answer, no error is raised, and the next start comes up with no certificates at all
+// -- the "someone deleted state.db" warning does not fire either, because that needs the lock file,
+// which the same rm took with it. Restoring a snapshot under a running daemon has the same shape
+// from the other side. Neither can be prevented from inside the process; both can be reported.
+//
+// It returns the problems, in the operator's words. An empty slice means "still the same file".
+func (s *Store) VerifyOnDisk() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var problems []string
+	if s.path != "" && s.openedAs != nil {
+		fi, err := os.Stat(s.path)
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf(
+				"the state database %s is no longer at that path (%v), but this process is still "+
+					"writing to the file it opened -- SQLite writes to an unlinked inode happily. Every "+
+					"write since then is invisible to the next start, which will find no account and no "+
+					"certificates. Restore the directory or the newest snapshot and restart",
+				s.path, err))
+		case !os.SameFile(s.openedAs, fi):
+			problems = append(problems, fmt.Sprintf(
+				"the state database %s has been replaced since this process opened it (a restore, or "+
+					"a second deployment on the same path); this process is still writing to the old "+
+					"file, so the two are now different databases and this process's writes are lost",
+				s.path))
+		}
+	}
+	if err := s.lock.VerifyHeld(); err != nil {
+		problems = append(problems, err.Error())
+	}
+	return problems
 }
 
 // missingDatabaseWarning words the "there was a database here and now there is not" case.

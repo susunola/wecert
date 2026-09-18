@@ -673,3 +673,145 @@ func TestHasRecoverableStateTracksWhatASnapshotCouldRecover(t *testing.T) {
 		t.Errorf("a stored certificate is exactly what a snapshot exists for: has=%v err=%v", has, err)
 	}
 }
+
+// A snapshot named in the future must not hold a retention slot forever.
+//
+// Names are wall-clock stamps and retention keeps the newest, so one forward clock excursion writes
+// a file that sorts after every honest stamp and is therefore never pruned again: with keep=3 the
+// deployment kept only two genuine recovery points and deleted the oldest fresh one every round.
+// The file's contents are fine, so it is renamed to when it was actually written.
+func TestAFutureDatedSnapshotIsAgedRatherThanKeptForever(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two honest snapshots and one from "the future".
+	for _, d := range []time.Duration{-2 * time.Hour, -time.Hour} {
+		if _, err := s.Snapshot(backups, 10); err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		_ = d
+	}
+	future := filepath.Join(backups, s.snapshotName(time.Now().UTC().Add(48*time.Hour).Format(snapshotStamp)))
+	if err := os.WriteFile(future, []byte("snapshot from a host whose clock was ahead"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Snapshot(backups, 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	left, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 3 {
+		t.Fatalf("keep=3 must leave three snapshots, got %d: %v", len(left), left)
+	}
+	for _, name := range left {
+		stamp, ok := s.snapshotStampOf(filepath.Base(name))
+		if !ok {
+			t.Fatalf("unexpected file in the snapshot list: %s", name)
+		}
+		at, err := time.Parse(snapshotStamp, stamp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if at.After(time.Now().Add(time.Minute)) {
+			t.Errorf("a future-dated name survived: %s. It sorts after every honest stamp, so "+
+				"retention can never pick it and one recovery point is lost for good", filepath.Base(name))
+		}
+	}
+}
+
+// One undeletable snapshot must not stop pruning the rest.
+//
+// Returning on the first os.Remove failure meant a single immutable snapshot (chattr +i, an ACL, a
+// read-only attribute -- ransomware hardening an operator may well have applied) stalled pruning for
+// the life of the directory: the backup directory grew by one file per interval while every round
+// reported the same error against the same oldest name.
+func TestPruningAttemptsEveryVictim(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	for i := 0; i < 4; i++ {
+		if _, err := s.Snapshot(backups, 10); err != nil {
+			t.Fatalf("Snapshot %d: %v", i, err)
+		}
+	}
+
+	// The oldest snapshot cannot be removed; the next two must still go.
+	saved := removeSnapshotFile
+	t.Cleanup(func() { removeSnapshotFile = saved })
+	blocked := ""
+	removeSnapshotFile = func(name string) error {
+		if blocked == "" {
+			blocked = name
+			return os.ErrPermission
+		}
+		return os.Remove(name)
+	}
+
+	if _, err := s.Snapshot(backups, 2); err == nil {
+		t.Error("the failure has to be reported: the operator needs to know a snapshot could not be " +
+			"removed and the directory will grow")
+	}
+	removeSnapshotFile = saved
+
+	left, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 3 {
+		t.Errorf("keep=2 with one undeletable snapshot must leave 3 files (the two newest plus the "+
+			"one that cannot go), got %d: %v", len(left), left)
+	}
+	if blocked == "" {
+		t.Fatal("the fixture never blocked a removal, so this test proves nothing")
+	}
+	found := false
+	for _, name := range left {
+		if name == blocked {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the undeletable snapshot must still be there, got %v", left)
+	}
+}
+
+// A stale temporary snapshot is swept; a fresh one is left alone.
+//
+// A crash between VACUUM INTO and the rename leaves a partial copy under a `.snapshot-*.tmp` name
+// that nothing else revisits. The sweep is age-based so it can never delete a write in progress.
+func TestStaleSnapshotTempsAreSweptAndFreshOnesKept(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := filepath.Join(backups, ".snapshot-20200101T000000.000-0.tmp")
+	fresh := filepath.Join(backups, ".snapshot-29990101T000000.000-0.tmp")
+	for _, p := range []string{stale, fresh} {
+		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-3 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Snapshot(backups, 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("a stale temporary snapshot must be swept, stat err %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("a fresh temporary file must be left alone (a write may be in progress): %v", err)
+	}
+}
