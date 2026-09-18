@@ -64,6 +64,8 @@ level=INFO msg="an unpresented row's record was denied, but its challenge is new
 第 4 轮（窗口之后）：无任何 WARN，authorizations 行数 0，三个权威上均查不到该 TXT
 ```
 
+**这次生产运行的真实成本（如实记账）**：为了验证，生产目录上注册了 1 个新的 ACME 账号（LE 限额：每 IP 每 3 小时 10 个），签发了 1 张新证书（`round11-prod.atomwangnus.com`，属于全新的 exact-set，占 5/7 天里的 1 张），并用一次 ARI 豁免的续期换掉了它（`replaces=true`，按 LE 的规则不计入 exact-set 额度）。这些都在本账号的常规额度内，且全部发生在测试域名下。
+
 ### 2.2 真实 DNSPod 的记录名形态（U10）
 
 18 条记录、逐条按 RecordId 删除，最终 `wecert-verify-r11` 匹配 0 条（zone 里只剩预先存在的 `_dmarc`）。字节级观测：
@@ -176,4 +178,5 @@ level=INFO msg="an unpresented row's record was denied, but its challenge is new
 - **"验证过"的标准**：本文件里每一条"已证实"都配了可复现的命令与原始输出（长日志在 `/tmp/wv-verify/`、`/tmp/wcert-verify/`、`/tmp/drill/`、`/tmp/verify-*.json`）；凭"读代码觉得对"的一律不算。
 - **注入式验证的边界**：fsync/rename EIO 是**系统调用级注入**，不是真实断电；SIGKILL 是进程级杀灭，不是掉电。两者覆盖了产品代码里所有"持久化调用失败"的分支，但不覆盖文件系统自身的原子性保证。
 - **这一轮改动了产品代码**（8 条缺陷 + 2 处措辞），全部走完整门禁：`gofmt`、`go vet`（两套 tag）、`staticcheck`、`check-english`、`check-alerts`、`check-cam-policies`、`go test -race`（20/20 包）。
+- **顺带补跑的门禁**：`make fuzz`（4 个目标 × 20 秒）也跑了一遍 —— 其中 `FuzzParseRetryAfter` 单个目标 20 秒内执行 **833 万次**、无新失败、语料仍 26 条；这条门禁 CI 里没有，属于"谁推谁跑"的那一类。
 - **仍然没有验证的"人对人的东西"**：`docs/staging-checklist.md` 的第 1 节（控制台里手工绑定）与第 3 节（CAM 策略在真实子账号上的最小性）需要一个人坐在控制台前，这一轮没有替代方案。
