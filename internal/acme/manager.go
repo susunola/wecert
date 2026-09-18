@@ -618,8 +618,10 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 			m.log.Warn("the live certificate is the degraded name set and a fallback is in force; "+
 				"holding it until the renewal window instead of re-ordering the broken full set",
 				"cert", c.Name, "detail", detail,
-				"note", "the full set is retried once the identifier failure evidence ages out, "+
-					"or when an operator fixes the failing name")
+				"note", "the degraded set stands until the renewal window, where the full set is tried "+
+					"again; the aged-out failure evidence only stops forcing the reduction, it does not "+
+					"order anything on its own (an hourly full-set order against a known-bad identifier "+
+					"set is what the fallback exists to prevent)")
 		} else {
 			m.log.Warn("the live certificate's SANs no longer match the config; reissuing now",
 				"cert", c.Name, "detail", detail,

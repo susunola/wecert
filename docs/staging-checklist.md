@@ -90,7 +90,7 @@ Deliberately break DNS for one name, and watch wecert not burn the account.
 |---|---|---|
 | 5.1 | Remove the challenge record's zone delegation for one SAN | the authorization fails, and the failure is booked against **that identifier** (`identifier_failures` has one row) |
 | 5.2 | Leave it failing, with `failureFallback` **off**, for a day | orders stop being placed for the window, and the backoff caps at 6h — count the orders in the log and compare against "5 per exact set per 7 days" |
-| 5.3 | Repeat with `failureFallback` **on**, near expiry | exactly one degraded issuance, then the full set is retried only after the failure evidence ages out — **not** on every pass (the review's P1-3) |
+| 5.3 | Repeat with `failureFallback` **on**, near expiry | exactly one degraded issuance, then the full set is retried at the **renewal window** — not on every pass, and not merely when the failure evidence ages out (the evidence expiring stops the reduction being forced; the renewal window is what orders; the review's P1-3) |
 | 5.4 | Restore the delegation | the next round succeeds with the full set, and the ledger is cleared |
 
 ## 6. Crash recovery, for real
