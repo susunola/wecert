@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -124,6 +125,40 @@ func (s *Store) UpdateRateBucket(limitName, scopeID string, fn func(*RateBucket)
 // The reset fields are only overwritten when the new value is non-zero, so recording a spend
 // cannot erase a CA-reported deadline that is still in force -- the two facts have different
 // lifetimes and the deadline is the stronger one.
+// ListRateBucketScopes returns the scope IDs this store has a bucket row for, sorted.
+//
+// It exists for the per-identifier quota series. Those are the one unbounded family: the caller
+// derives them from the desired state, so a deployment with 500 certificates of 20 names each asked
+// for 10,000 series (and 10,000 bucket reads) every pass -- measured at 17,052 series and a 1.6 MB
+// scrape in the round-11 scale work. An identifier nobody has ever attempted has nothing to report:
+// its budget is untouched, so the only value the series could carry is the limit's capacity. What
+// the operator needs is the identifiers this program has actually spent against -- the ones that can
+// be exhausted -- and those are exactly the rows here.
+func (s *Store) ListRateBucketScopes(limitName string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(`SELECT scope_id FROM rate_buckets WHERE limit_name = ?`, limitName)
+	if err != nil {
+		return nil, fmt.Errorf("list rate buckets for %s: %w", limitName, err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var scope string
+		if err := rows.Scan(&scope); err != nil {
+			return nil, fmt.Errorf("scan rate bucket scope: %w", err)
+		}
+		out = append(out, scope)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read rate bucket scopes: %w", err)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 func (s *Store) PutRateBucket(b *RateBucket) error {
 	if b == nil {
 		return nil

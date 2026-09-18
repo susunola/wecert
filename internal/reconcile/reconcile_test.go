@@ -731,6 +731,59 @@ func TestStartAllResolvesTheDesiredStateOnce(t *testing.T) {
 	}
 }
 
+// A full trigger must publish the quota gauges once, not once per certificate.
+//
+// publishQuota costs two store reads per scope, and the scope map is derived from the desired state
+// (one entry per registered domain, per identifier set and, before round 11, per identifier). Calling
+// it from each certificate's pass made the trigger quadratic in the fleet: the round-11 scale work
+// measured 500 certificates of 20 names at 11,001,500 SQL statements and 84.4 s, against 23,003
+// statements and 0.234 s for the same fleet's scheduled pass. The last pass of a batch publishes for
+// the whole batch, so the numbers still include every spend the batch made.
+func TestAFullTriggerPublishesQuotaOnce(t *testing.T) {
+	const n = 12
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{}
+	for i := 0; i < n; i++ {
+		cfg.Certificates = append(cfg.Certificates, config.Certificate{
+			Name:    fmt.Sprintf("c-%02d", i),
+			Domains: []string{fmt.Sprintf("c-%02d.example.com", i)},
+		})
+	}
+
+	done := make(chan struct{}, n)
+	mgr := &fakeManager{onReconcile: func(string) { done <- struct{}{} }}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, log)
+
+	if _, _, err := r.StartAll(context.Background()); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		<-done
+	}
+
+	// The publish happens in a deferred call in the last pass's goroutine, after onReconcile fires
+	// for every certificate, so wait for the claims to be released as well.
+	for i := 0; i < 500; i++ {
+		if r.quotaPasses.Load() == 0 && !r.anyPassInFlight() {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	published := mgr.publishedQuota()
+	if len(published) != 1 {
+		t.Errorf("published the quota gauges %d times for one full trigger of %d certificates; "+
+			"once per trigger is what keeps it linear in the fleet", len(published), n)
+	}
+}
+
 // A full trigger used to start one goroutine per certificate, so a large state
 // fired that many concurrent ACME orders, DNS writes and cloud calls from a single
 // HTTP request. The timer path walks the same certificates strictly one at a time.

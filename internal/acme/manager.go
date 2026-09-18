@@ -302,9 +302,37 @@ func (m *Manager) noteIdentifierFailure(identifier string) {
 	if identifier == "" {
 		return
 	}
+	now := m.now()
 	m.identifierMu.Lock()
 	defer m.identifierMu.Unlock()
-	m.identifierCooldown[identifier] = m.now().Add(identifierCooldownFor)
+	m.identifierCooldown[identifier] = now.Add(identifierCooldownFor)
+	pruneExpired(m.identifierCooldown, now, cooldownMapLimit)
+}
+
+// cooldownMapLimit is when the two time-keyed maps are swept for expired entries.
+//
+// Both are keyed by a name that can leave the deployment -- an identifier, a certificate -- and
+// entries were only ever deleted when the SAME name came up again: coolingDown deletes an expired
+// identifier it is asked about, and nothing ever deletes a binding check. A deployment that churns
+// names therefore grew both maps forever (the round-11 scale work measured 50 -> 600 entries over 600
+// churned names, and certificate names churn by design). The sweep runs on the write path, which is
+// the only place where growth happens, and the limit is high enough that it is one pass over a small
+// map at most once per batch of failures.
+const cooldownMapLimit = 512
+
+// pruneExpired drops entries whose instant is not in the future.
+//
+// The caller holds the map's mutex. Callers whose values are timestamps rather than deadlines (the
+// binding-check map) delete separately, because "expired" means something different there.
+func pruneExpired(m map[string]time.Time, now time.Time, limit int) {
+	if len(m) < limit {
+		return
+	}
+	for k, at := range m {
+		if !now.Before(at) {
+			delete(m, k)
+		}
+	}
 }
 
 // clearIdentifierCooldown forgets a name that validated successfully, so the next failure
@@ -725,6 +753,17 @@ func (m *Manager) bindingCheckDue(certName string) bool {
 		}
 	}
 	m.bindingChecked[certName] = now
+
+	// Sweep the entries of certificates that are long gone (see cooldownMapLimit). "Expired" here is
+	// the check interval: past it the entry would be re-read as due anyway, so dropping it changes
+	// nothing except the memory.
+	if len(m.bindingChecked) >= cooldownMapLimit {
+		for name, at := range m.bindingChecked {
+			if now.Sub(at) >= m.bindingCheckEvery {
+				delete(m.bindingChecked, name)
+			}
+		}
+	}
 	return true
 }
 
