@@ -983,6 +983,87 @@ func TestDeleteWaitsForTheAsyncTask(t *testing.T) {
 	}
 }
 
+// DeleteResult=false is what the live API returns whenever IsCheckResource is on -- for a refusal
+// AND for a deletion that succeeds -- so it must NOT short-circuit the task poll.
+//
+// The round-11 verification pass found this against the real account: a bound certificate gave
+// DeleteResult=false with task status 4, and the same call after unbinding gave DeleteResult=false
+// with task status 1 and the certificate was really gone. Every test in this file used
+// DeleteResult=true, so the fake encoded an API that does not exist, and the product reported "the
+// API refused the delete" for a certificate it had already deleted -- keeping the
+// retired_certificates row and warning again on every pass.
+func TestDeleteWithFalseResultStillPollsTheTask(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	var polls int
+	fake := &fakeSSLAPI{
+		deleteFn: func(context.Context, *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error) {
+			return deleteResp(false, "del-task-1"), nil
+		},
+		deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			polls++
+			return deleteTaskResp("del-task-1", 1, ""), nil
+		},
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	if err := d.Delete(context.Background(), "cert-1"); err != nil {
+		t.Fatalf("DeleteResult=false with a successful task is a DELETED certificate, not a refusal: %v", err)
+	}
+	if polls == 0 {
+		t.Error("the task must be polled: with IsCheckResource on, DeleteResult=false is not the answer")
+	}
+}
+
+// The same flag with task status 4 is the real refusal, and it names the status.
+func TestDeleteWithFalseResultAndStatusFourIsTheRefusal(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	fake := &fakeSSLAPI{
+		deleteFn: func(context.Context, *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error) {
+			return deleteResp(false, "del-task-1"), nil
+		},
+		deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			return deleteTaskResp("del-task-1", 4, "There are unbound cloud resources: clb, that cannot be deleted."), nil
+		},
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	err := d.Delete(context.Background(), "cert-1")
+	if err == nil {
+		t.Fatal("status 4 must be reported as a refusal so the reclaim row is kept and retried")
+	}
+	if !strings.Contains(err.Error(), "status 4") {
+		t.Errorf("the error should name status 4, got %v", err)
+	}
+}
+
+// With no task ID the flag IS the whole answer, and false means refused.
+func TestDeleteWithFalseResultAndNoTaskIsARefusal(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	fake := &fakeSSLAPI{
+		deleteFn: func(context.Context, *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error) {
+			return deleteResp(false, ""), nil
+		},
+		deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			t.Error("there is no task to poll")
+			return nil, nil
+		},
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	if err := d.Delete(context.Background(), "cert-1"); err == nil {
+		t.Error("a synchronous DeleteResult=false is a refusal")
+	}
+}
+
 // Status 4 is the server refusing because a resource still references the certificate.
 // That must surface as an error so ReapRetired keeps its reclaim record and retries.
 func TestDeleteReportsAResourceStillBound(t *testing.T) {

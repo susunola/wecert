@@ -658,7 +658,20 @@ func (d *TencentCLB) Delete(ctx context.Context, certID string) error {
 	// certificate would leak in the cloud account forever -- and the exact case the
 	// resource check exists for (a live certificate still bound to a listener) is
 	// reported asynchronously as status 4, which would never be seen.
-	if resp.Response.DeleteResult != nil && !*resp.Response.DeleteResult {
+	// DeleteResult=false is NOT the refusal. The live API returns false whenever IsCheckResource is
+	// on -- for the refusal AND for a deletion that is about to succeed -- and only the async task
+	// says which happened. Verified against the real API in the round-11 verification pass: a bound
+	// certificate gave DeleteResult=false with task status 4 ("There are unbound cloud resources:
+	// clb, that cannot be deleted"), the same call after unbinding gave DeleteResult=false with task
+	// status 1 and the certificate was really gone.
+	//
+	// Returning here on false was the defect that verification found: the reaper reported "the API
+	// refused the delete" for a certificate that had already been deleted, kept its
+	// retired_certificates row forever, and warned again on every pass -- while status 4, the case the
+	// resource check exists for, was never reported at all.
+	if (resp.Response.DeleteResult != nil && !*resp.Response.DeleteResult) &&
+		(resp.Response.TaskId == nil || *resp.Response.TaskId == "") {
+		// No task to ask: the flag is the whole answer, and it says the delete was refused.
 		return fmt.Errorf("DeleteCertificate(%s): the API refused the delete", certID)
 	}
 	if resp.Response.TaskId == nil || *resp.Response.TaskId == "" {

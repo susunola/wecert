@@ -125,7 +125,8 @@ LABELS = {
     "3 · 发现两个 identifier": "3 · two identifiers turn out to",
     "指向同一个记录名": "share one record name",
     "5 · 传播检查（quorum）": "5 · propagation check (quorum)",
-    "无可达 NS 否认 且 ≥2 确认": "no reachable NS denies it, and ≥2 confirm",
+    "无可达 NS 否认 且 ≥1 确认": "no NS denial, ≥1 confirms",
+    "多台权威时要求 ≥2 台": "multi-NS zones: ≥2 confirm",
     "证书有效区间": "certificate validity",
     "ARI 建议窗口": "ARI suggested window",
     "renewBefore 兜底窗口（仅当 ARI 不可用）": "renewBefore fallback (only when ARI is unavailable)",
@@ -185,8 +186,8 @@ PROSE: dict[str, str] = {
         'From “somebody added a line to a DNS zone” to “deleted from the cloud”',
     '这套系统唯一的核心纪律是：wecert 永远不推断。 某个东西负责推断意图，并把结论写成一份可 diff 的文件；wecert 只读那份文件做收敛。 下面七张图从要解决的问题一路下钻到单个订单的状态机。':
         'The one rule everything else follows: <strong>wecert never infers.</strong>\n    Something else works out what should exist and writes it down; wecert only reads that document and converges.\n    The seven diagrams below go from the problem it solves down to the state machine of a single order.',
-    '默认模式 static 迁移路径 static → observe → enforce 当前版本 v0.5.0 Go 1.26.5':
-        '<span class="badge">default mode <b>static</b></span>\n    <span class="badge">migration <b>static → observe → enforce</b></span>\n    <span class="badge">version <b>v0.5.0</b></span>\n    <span class="badge">Go <b>1.26.5</b></span>',
+    '默认模式 static 迁移路径 static → observe → enforce 当前版本 v0.4.2 + 未发布改动 Go 1.26.6':
+        '<span class="badge">default mode <b>static</b></span>\n    <span class="badge">migration <b>static → observe → enforce</b></span>\n    <span class="badge">version <b>v0.4.2 + unreleased changes</b></span>\n    <span class="badge">Go <b>1.26.6</b></span>',
     '图 ①系统全景：谁拥有什么，谁只读什么':
         '<span class="num">diagram ①</span>System map — who owns what, who only reads',
     '从左到右是权限的传递：意图（人写）→ 推断（可丢弃）→ 契约（机器写）→ 执行（必须稳）→ 外部。 每一层的失败模式都不一样，这正是它们被拆开的原因。':
@@ -211,8 +212,8 @@ PROSE: dict[str, str] = {
         '<span class="num">diagram ⑤</span>DNS-01 — a wildcard and its apex share one TXT name',
     '这是最容易写错、后果最隐蔽的一段。example.com 和 *.example.com 的挑战记录都叫 _acme-challenge.example.com——同一个名字、两个值。':
         'This is the easiest part to get wrong and the hardest to notice. <code>example.com</code> and <code>*.example.com</code> both put their challenge at <code>_acme-challenge.example.com</code> — one name, two values.',
-    '传播检查用 quorum 而不是"全部权威 NS 可达"：实测里 9 个权威 NS 总有 1 个不可达（实测 确认 8 / 否认 0 / 不可达 1）。 要求全部可达会让验证永远通不过；判据是没有任何可达的 NS 否认，且至少 2 个确认。':
-        'Propagation checking uses a quorum rather than “every authoritative nameserver reachable”: in practice one of nine is routinely unreachable (measured: 8 confirm, 0 deny, 1 unreachable). Demanding all of them would never pass. The criterion is <strong>no reachable nameserver denies it, and at least two confirm</strong>.',
+    '传播检查用 quorum 而不是"全部权威 NS 可达"：实测里 9 个权威 NS 总有 1 个不可达（实测 确认 8 / 否认 0 / 不可达 1）。 要求全部可达会让验证永远通不过；判据是没有任何可达的 NS 否认，且至少一台确认—— 多台权威的 zone 还要求至少 2 台独立确认，只有一台权威的 zone 一台即可。':
+        'Propagation checking uses a quorum rather than “every authoritative nameserver reachable”: in practice one of nine is routinely unreachable (measured: 8 confirm, 0 deny, 1 unreachable). Demanding all of them would never pass. The criterion is <strong>no reachable nameserver denies it, and at least one confirms</strong> — with multiple authorities at least <code>2</code> must confirm independently, and a zone with a single authority passes on one.',
     '图 ⑥一张证书的一生（以 classic / 90 天为例）':
         '<span class="num">diagram ⑥</span>The life of one certificate (classic, 90 days)',
     '时间轴按 classic profile 的 90 天画。真正决定续期时刻的是 ARI 的 suggestedWindow；下面的 renewBefore 只是 ARI 拿不到时的兜底。':
@@ -331,8 +332,8 @@ PROSE: dict[str, str] = {
         'Near expiry and issuance keeps failing (<code>failureFallback</code> on)',
     '摘掉反复失败的名字先签':
         '<span class="pill warn">drop the names that keep failing</span> and sign the rest',
-    '部分可用好过全挂。只摘有逐个授权失败证据的名字；记录老化后自愈':
-        'Partial availability beats total failure. Only names with evidence of individual failure are dropped, and it heals itself',
+    '部分可用好过全挂。只摘有逐个授权失败证据的名字；记录老化后不再摘它，但全集要等到下一个续期窗口才重试':
+        'Partial availability beats total failure. Only names with evidence of individual failure are dropped; once that record ages out the name is no longer dropped, but the full set is only retried at the next renewal window',
     '表 C限速算术：为什么"通配符优先"不是优化项':
         '<span class="num">table C</span>The rate-limit arithmetic — why wildcard-first is not an optimisation',
     '额度':
@@ -373,14 +374,14 @@ PROSE: dict[str, str] = {
         'Backoff, then hand over to a human',
     'Let\'s Encrypt 速率限制（与本系统相关的部分）':
         "Let's Encrypt rate limits (the ones this system runs into)",
-    'ARI 协调的续期：豁免以上全部。 但豁免的前提是同名续期——订单必须带 replaces，且 identifier 集合不变。':
-        '<strong>ARI-coordinated renewals: exempt from all of the above.</strong>\n      The exemption requires a same-name renewal — the order must carry <code>replaces</code> and the identifier set must be unchanged.',
+    'ARI 协调的续期：豁免以上全部。 前提是订单必须带 replaces，且与被替换的证书至少共享一个 identifier——集合不变自然满足，完全不相交才失去豁免。':
+        '<strong>ARI-coordinated renewals: exempt from all of the above.</strong>\n      The order must carry <code>replaces</code> and share <em>at least one identifier</em> with the certificate it replaces — an unchanged set trivially qualifies; only a wholly disjoint set loses the exemption.',
     '表 D实测踩过的坑':
         '<span class="num">table D</span>Field notes and pitfalls',
     '都是这套东西真跑起来之后才暴露的，按"如果不知道会浪费你多久"排序。':
         'All found by actually running this, ordered by how much time they would waste you.',
-    '打印 / 存为 PDF 最后更新 2026-09-16 · 对应 v0.5.0':
-        '<button class="print" type="button" onclick="window.print()">Print / save as PDF</button><br/>\n      <span style="font-size:12px">last updated 2026-09-16 · for v0.5.0</span>',
+    '打印 / 存为 PDF 最后更新 2026-09-18 · 对应 v0.4.2 + 未发布改动':
+        '<button class="print" type="button" onclick="window.print()">Print / save as PDF</button><br/>\n      <span style="font-size:12px">last updated 2026-09-18 · for v0.4.2 + unreleased changes</span>',
     '设计动机见 docs/desired-state-providers.md，操作手册见 docs/desired-state.md。 图 ① 的边语义：实线 = 同步，虚线 = 异步，点线 = 可选/兜底，粗线 = 关键路径。':
         'Design rationale in <code>docs/desired-state-providers.md</code>, operator guide in <code>docs/desired-state.md</code>.\n    Edge semantics in diagram ①: solid = synchronous, dashed = asynchronous, dotted = optional/fallback, thick = critical path.',
     'wecert · 证书生命周期架构图':
@@ -391,8 +392,8 @@ PROSE: dict[str, str] = {
         'default mode <b>static</b>',
     '迁移路径 static → observe → enforce':
         'migration <b>static → observe → enforce</b>',
-    '当前版本 v0.5.0':
-        'version <b>v0.5.0</b>',
+    '当前版本 v0.4.2 + 未发布改动':
+        'version <b>v0.4.2 + unreleased changes</b>',
     '① 系统全景':
         '① System map',
     '② 意图 → 契约':
@@ -535,16 +536,16 @@ PROSE: dict[str, str] = {
         'Situation',
     '限制':
         'Limit',
-    '这一条推出来的直接结论：域名集合变一次就是一张全新证书，拿不到 ARI 豁免。 所以"加一个域名"的成本必须被压到接近零，而唯一能做到这件事的手段就是通配符。 这也是为什么期望状态生成器宁可把"加子域"解释成"已被通配符覆盖，0 次签发"， 也不肯为它动 SAN 集合。':
-        'That last row is what makes wildcard-first more than an optimisation: <strong>changing the name set makes the issuance a brand-new certificate</strong>, which forfeits the ARI exemption. The cost of “add one domain” therefore has to be driven to nearly zero, and a wildcard is the only way to do that. It is also why the desired-state generator prefers to report “covered by the declared wildcard, 0 issuances” over touching the SAN set.',
+    '这一条推出来的直接结论：与旧证书完全不相交的域名集合就是一张全新证书，拿不到 ARI 豁免， 要花掉"每注册域 50 张 / 7 天"的额度（增删域名只要还共享至少一个 identifier，豁免就还在）。 所以"加一个域名"的成本必须被压到接近零，而唯一能做到这件事的手段就是通配符。 这也是为什么期望状态生成器宁可把"加子域"解释成"已被通配符覆盖，0 次签发"， 也不肯为它动 SAN 集合。':
+        'That last row is what makes wildcard-first more than an optimisation: <strong>a domain set wholly disjoint from the old certificate is a brand-new certificate</strong>, which forfeits the ARI exemption and spends “Certificates per Registered Domain (50 / 7 days)” instead (adding or removing a domain keeps the exemption as long as at least one identifier is shared). The cost of “add one domain” therefore has to be driven to nearly zero, and a wildcard is the only way to do that. It is also why the desired-state generator prefers to report “covered by the declared wildcard, 0 issuances” over touching the SAN set.',
     'CLB 开了 SNI 就静默忽略主证书字段':
         'Enabling SNI on a CLB silently ignores the primary certificate field',
     '必须写 multi_cert_info。而且只有 CertificateDeployInstanceEmpty 这个错误码才会暴露它——否则你看到的是一切正常。':
         'You must write <code>multi_cert_info</code>. And only the <code>CertificateDeployInstanceEmpty</code> error code exposes it — otherwise everything looks fine.',
     'DescribeListeners 不回读证书绑定':
         '<code>DescribeListeners</code> does not read certificate bindings back',
-    '想确认"到底绑上没绑上"，唯一可靠的办法是看 CertificateDeployInstanceEmpty。':
-        'The only reliable way to confirm whether it is actually bound is to look at <code>CertificateDeployInstanceEmpty</code>.',
+    '可靠的独立信号是 UpdateCertificateInstance 返回里的 UpdateSyncProgress.TotalCount 和 CreateCertificateBindResourceSyncTask（后者也是 wecert 每轮用来确认"人工绑上没绑上"的手段）。 TotalCount 为 0 意味着证书其实没绑上。':
+        'The reliable independent signals are <code>UpdateSyncProgress.TotalCount</code> in the <code>UpdateCertificateInstance</code> response and <code>CreateCertificateBindResourceSyncTask</code> — the latter is also what wecert uses on every pass to confirm a hand-bound certificate. A <code>TotalCount</code> of 0 means the certificate was never actually bound.',
     '绑定成功 ≠ 已经生效':
         'Uploading is not binding',
     '重绑定是异步的，实测约 15 秒，而且不是原子的。 deploy_confirmed 要等确认换完才置位，否则首次上传就会让 deployed 指标报绿，到期告警以为一切正常。':
@@ -567,16 +568,16 @@ PROSE: dict[str, str] = {
         'Writing 60 is rejected with <code>LimitExceeded.RecordTtlLimit</code>, so 600 is the default.',
     '传播检查不能用"全部权威 NS 可达"':
         'Propagation checking cannot require “every authoritative NS reachable”',
-    '实测 9 个 NS 里总有 1 个不可达。判据是 quorum：没有可达的 NS 否认，且至少 2 个确认。':
-        'In practice one of nine nameservers is always unreachable. The criterion is a quorum: no reachable nameserver denies it, and at least two confirm.',
+    '实测 9 个 NS 里总有 1 个不可达。判据是 quorum：没有可达的 NS 否认，且至少一台确认； 多台权威的 zone 还要求至少 2 台独立确认，只有一台权威的 zone 一台即可。':
+        'In practice one of nine nameservers is always unreachable. The criterion is a quorum: no reachable nameserver denies it, and at least one confirms; with multiple authorities at least 2 must confirm independently, and a zone with a single authority passes on one.',
     'CLB 健康检查的源地址不在 VPC CIDR 里':
         'CLB health-check source addresses are not in the VPC CIDR',
     '表象是 504，但 TLS 握手其实正常——非常容易误判成证书问题。放宽安全组即可。':
         'It shows up as a 504 while the TLS handshake is actually fine — very easy to misdiagnose as a certificate problem. Widening the security group fixes it.',
     '打印 / 存为 PDF':
         'Print / save as PDF',
-    '最后更新 2026-09-16 · 对应 v0.5.0':
-        'last updated 2026-09-16 · for v0.5.0',
+    '最后更新 2026-09-18 · 对应 v0.4.2 + 未发布改动':
+        'last updated 2026-09-18 · for v0.4.2 + unreleased changes',
     'wecert · 证书生命周期架构图 源码 github.com/susunola/wecert':
         '<strong>wecert</strong> · certificate lifecycle<br/>\n      source <code>github.com/susunola/wecert</code>',
     '图 ⓪':

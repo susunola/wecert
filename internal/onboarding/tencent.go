@@ -261,13 +261,30 @@ func (d *DNSPodDeclarations) listTXTRecords(ctx context.Context, client dnspodAP
 	return out, nil
 }
 
-// joinRecordName joins the relative record name DNSPod returns into a full name.
+// joinRecordName joins the record name DNSPod returns into a full name.
 //
-// DNSPod's Name is the subdomain relative to the zone, and "@" means the zone itself.
+// DNSPod's Name is normally the subdomain relative to the zone, and "@" means the zone itself --
+// but the API does NOT enforce that: a SubDomain written as a full host ("_wecert.x.example.com")
+// is accepted and returned verbatim (verified against the live API in the round-11 verification
+// pass, which is why this is no longer a plain concatenation). Appending the zone to a name that
+// already carries it produced "x.example.com.example.com", and ParseDeclaration accepted that as a
+// hostname: the desired state then contained a name that does not exist under the zone, whose order
+// can only fail validation -- spending one authorization-failure credit per attempt on it.
 func joinRecordName(name, zone string) string {
 	name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
 	if name == "" || name == "@" {
 		return zone
+	}
+	// Already absolute for this zone: return it as it is rather than doubling the zone.
+	//
+	// The comparison runs on the trimmed, lower-cased copies so a case or dot difference in the
+	// returned name still de-duplicates, while the ZONE itself is still passed through untouched
+	// (the property the tests below pin: normalising it here would hide a caller that stopped
+	// passing a normalised zone).
+	trimmedZone := strings.TrimSuffix(strings.TrimSpace(zone), ".")
+	if lower := strings.ToLower(trimmedZone); lower != "" &&
+		(name == lower || strings.HasSuffix(name, "."+lower)) {
+		return name
 	}
 	return name + "." + zone
 }

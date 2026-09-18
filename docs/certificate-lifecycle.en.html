@@ -185,8 +185,8 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
   <div class="badges">
     <span class="badge">default mode <b>static</b></span>
     <span class="badge">migration <b>static → observe → enforce</b></span>
-    <span class="badge">version <b>v0.5.0</b></span>
-    <span class="badge">Go <b>1.26.5</b></span>
+    <span class="badge">version <b>v0.4.2 + unreleased changes</b></span>
+    <span class="badge">Go <b>1.26.6</b></span>
     <span class="badge"><a class="langswitch" href="certificate-lifecycle.html" style="color:inherit;text-decoration:none">中文</a></span>
   </div>
 </header>
@@ -933,7 +933,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
     <!-- note 5 -->
     <rect class="bx" x="16" y="350" width="212" height="60" rx="8"/>
     <foreignObject x="16" y="350" width="212" height="60">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">5 · propagation check (quorum)<br/>no reachable NS denies it, and ≥2 confirm</div>
+      <div xmlns="http://www.w3.org/1999/xhtml" class="fo" style="font-size:11.5px">5 · propagation check (quorum)<br/>no NS denial, ≥1 confirms<br/>multi-NS zones: ≥2 confirm</div>
     </foreignObject>
     <path class="edge-dot" d="M228 380 H250"/>
 
@@ -972,7 +972,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
 
   <h3>Why it has to be “write all → verify all → clean up together”</h3>
   <p>Handling identifiers one at a time — write, verify, clean, next — means the value written for <code>*.example.com</code> gets removed or overwritten before <code>example.com</code> is reached. DNSPod allows several TXT records under one name, but the <strong>cleanup has to happen together</strong>, or a challenge that already verified becomes invalid again.</p>
-  <p>Propagation checking uses a quorum rather than “every authoritative nameserver reachable”: in practice one of nine is routinely unreachable (measured: 8 confirm, 0 deny, 1 unreachable). Demanding all of them would never pass. The criterion is <strong>no reachable nameserver denies it, and at least two confirm</strong>.</p>
+  <p>Propagation checking uses a quorum rather than “every authoritative nameserver reachable”: in practice one of nine is routinely unreachable (measured: 8 confirm, 0 deny, 1 unreachable). Demanding all of them would never pass. The criterion is <strong>no reachable nameserver denies it, and at least one confirms</strong> — with multiple authorities at least <code>2</code> must confirm independently, and a zone with a single authority passes on one.</p>
 </section>
 
 <!-- ══════════════════════════════════════════════════════════ ⑥ -->
@@ -1178,7 +1178,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <tr>
         <td>Near expiry and issuance keeps failing (<code>failureFallback</code> on)</td>
         <td><span class="pill warn">drop the names that keep failing</span> and sign the rest</td>
-        <td>Partial availability beats total failure. Only names with evidence of individual failure are dropped, and it heals itself</td>
+        <td>Partial availability beats total failure. Only names with evidence of individual failure are dropped; once that record ages out the name is no longer dropped, but the full set is only retried at the next renewal window</td>
       </tr>
     </tbody>
   </table>
@@ -1195,12 +1195,12 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <tr><td>New Certs / <strong>exact identifier set</strong></td><td>5 / 7 days · <strong>no override</strong></td><td>Reissuing the same name set repeatedly</td><td>At most one in-flight order per certificate</td></tr>
       <tr><td>Authorization Failures / identifier</td><td>5 / hour</td><td>Retrying a name whose DNS is not configured</td><td>Backoff, then hand over to a human</td></tr>
       <tr><td colspan="4"><strong>ARI-coordinated renewals: exempt from all of the above.</strong>
-      The exemption requires a same-name renewal — the order must carry <code>replaces</code> and the identifier set must be unchanged.</td></tr>
+      The order must carry <code>replaces</code> and share <em>at least one identifier</em> with the certificate it replaces — an unchanged set trivially qualifies; only a wholly disjoint set loses the exemption.</td></tr>
     </tbody>
   </table>
 
   <div class="callout neutral">
-    <p>That last row is what makes wildcard-first more than an optimisation: <strong>changing the name set makes the issuance a brand-new certificate</strong>, which forfeits the ARI exemption. The cost of “add one domain” therefore has to be driven to nearly zero, and a wildcard is the only way to do that. It is also why the desired-state generator prefers to report “covered by the declared wildcard, 0 issuances” over touching the SAN set.</p>
+    <p>That last row is what makes wildcard-first more than an optimisation: <strong>a domain set wholly disjoint from the old certificate is a brand-new certificate</strong>, which forfeits the ARI exemption and spends “Certificates per Registered Domain (50 / 7 days)” instead (adding or removing a domain keeps the exemption as long as at least one identifier is shared). The cost of “add one domain” therefore has to be driven to nearly zero, and a wildcard is the only way to do that. It is also why the desired-state generator prefers to report “covered by the declared wildcard, 0 issuances” over touching the SAN set.</p>
   </div>
 </section>
 
@@ -1214,7 +1214,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <p>You must write <code>multi_cert_info</code>. And only the <code>CertificateDeployInstanceEmpty</code> error code exposes it — otherwise everything looks fine.</p>
 
       <h3><code>DescribeListeners</code> does not read certificate bindings back</h3>
-      <p>The only reliable way to confirm whether it is actually bound is to look at <code>CertificateDeployInstanceEmpty</code>.</p>
+      <p>The reliable independent signals are <code>UpdateSyncProgress.TotalCount</code> in the <code>UpdateCertificateInstance</code> response and <code>CreateCertificateBindResourceSyncTask</code> — the latter is also what wecert uses on every pass to confirm a hand-bound certificate. A <code>TotalCount</code> of 0 means the certificate was never actually bound.</p>
 
       <h3>Uploading is not binding</h3>
       <p>The rebind is asynchronous — measured at about 15 seconds — and <strong>not atomic</strong>. <code>deploy_confirmed</code> is only set once the switch is confirmed; otherwise the first upload would turn the <code>deployed</code> gauge green and the expiry alarm would think everything is fine.</p>
@@ -1234,7 +1234,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       <p>Writing 60 is rejected with <code>LimitExceeded.RecordTtlLimit</code>, so 600 is the default.</p>
 
       <h3>Propagation checking cannot require “every authoritative NS reachable”</h3>
-      <p>In practice one of nine nameservers is always unreachable. The criterion is a quorum: no reachable nameserver denies it, and at least two confirm.</p>
+      <p>In practice one of nine nameservers is always unreachable. The criterion is a quorum: no reachable nameserver denies it, and at least one confirms; with multiple authorities at least 2 must confirm independently, and a zone with a single authority passes on one.</p>
 
       <h3>CLB health-check source addresses are not in the VPC CIDR</h3>
       <p>It shows up as a 504 while the TLS handshake is actually fine — very easy to misdiagnose as a certificate problem. Widening the security group fixes it.</p>
@@ -1248,7 +1248,7 @@ button.print:focus-visible{outline:2px solid var(--local);outline-offset:2px}
       source <code>github.com/susunola/wecert</code></div>
     <div style="text-align:right">
       <button class="print" type="button" onclick="window.print()">Print / save as PDF</button><br/>
-      <span style="font-size:12px">last updated 2026-09-16 · for v0.5.0</span>
+      <span style="font-size:12px">last updated 2026-09-18 · for v0.4.2 + unreleased changes</span>
     </div>
   </div>
   <p style="margin-top:14px;font-size:12.5px;max-width:82ch">Design rationale in <code>docs/desired-state-providers.md</code>, operator guide in <code>docs/desired-state.md</code>.

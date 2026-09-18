@@ -63,6 +63,10 @@ func main() {
 const (
 	// exitUsage: the command line itself is wrong (see main).
 	exitUsage = 64
+
+	// snapshotWait bounds how long a one-shot run waits for the immediate snapshot before judging it
+	// (see snapshotHealth.wait).
+	snapshotWait = 60 * time.Second
 )
 
 // errUsage marks a command-line error, so main can pick the exit code without re-printing what the
@@ -334,9 +338,10 @@ func run() error {
 	// into the running branch: the loop started, took a snapshot every interval, failed, and
 	// logged an ERROR each time -- while the branch written to say exactly that was unreachable,
 	// because its guard was the same condition the first branch had already consumed.
+	var snapshots *snapshotHealth
 	switch planStateBackups(cfg.StateBackup.Enabled, dirIsWritable(backupDir)) {
 	case backupsRun:
-		startStateBackups(ctx, store, cfg, log)
+		snapshots = startStateBackups(ctx, store, cfg, log)
 	case backupsEnabledButUnwritable:
 		log.Error("periodic state database snapshots are ENABLED but the directory is not writable, "+
 			"so none will be taken", "dir", backupDir)
@@ -382,6 +387,16 @@ func run() error {
 		// it and the notifications have to be waited for before the deferred store.Close() runs.
 		drainBackground(reconciler, log)
 		drainNotifier(notifier, log)
+		if err := snapshots.wait(snapshotWait); err != nil {
+			// The pass's own report comes first when there is one: "it converged but there is no
+			// backup" and "it did not converge" are different answers, and onceExit already knows how
+			// to word the second.
+			if passErr := onceExit(rep); passErr != nil {
+				return errors.Join(passErr, fmt.Errorf("and the state snapshot failed: %w", err))
+			}
+			return fmt.Errorf("the pass converged, but the state database could not be snapshotted, so "+
+				"there is no recovery point for it: %w", err)
+		}
 		return onceExit(rep)
 	}
 
@@ -618,18 +633,24 @@ func jitter(d time.Duration) time.Duration {
 // posture, not a reason to stop renewing certificates. It is logged at ERROR so it shows
 // up in the same place every other operational problem does, and it is reported through
 // the same metric channel as everything else.
-func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Config, log *slog.Logger) {
+func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Config, log *slog.Logger) *snapshotHealth {
 	dir := cfg.StateBackup.Dir
 	if dir == "" {
 		dir = filepath.Dir(cfg.StatePath)
 	}
 
-	snapshot := func() { takeSnapshot(store, dir, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log) }
+	snapshot := func() error {
+		return takeSnapshot(store, dir, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log)
+	}
 
+	// first records the outcome of the immediate snapshot: the one-shot run reads it to decide its
+	// exit code (see snapshotHealth).
+	first := make(chan error, 1)
+	health := &snapshotHealth{first: first}
 	go func() {
 		// One immediately: waiting a whole interval means a fresh deployment has no
 		// recoverable state for its first day, which is exactly when orders are in flight.
-		snapshot()
+		first <- snapshot()
 
 		ticker := time.NewTicker(cfg.StateBackup.IntervalDur)
 		defer ticker.Stop()
@@ -638,13 +659,48 @@ func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Conf
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				snapshot()
+				_ = snapshot()
 			}
 		}
 	}()
 
 	log.Info("periodic state database snapshots are on",
 		"dir", dir, "interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
+	return health
+}
+
+// snapshotHealth carries the immediate snapshot's outcome to the one-shot exit code.
+//
+// Why the exit code has to know: `wecert-once.timer` runs `-once` hourly, and its unit status is the
+// ONLY channel a timer-mode deployment has (round 9: /metrics does not live long enough for any rule
+// with a `for:`). A snapshot that cannot be written leaves the recovery posture broken -- no
+// recoverable copy of the account key or of any in-flight order URL -- and that used to be an ERROR
+// line inside a background goroutine, so a pass that converged still exited 0 and the unit stayed
+// green. The round-11 Linux verification reproduced it with an injected fsync EIO: "state database
+// snapshot failed", exit 0.
+//
+// It lives in this file rather than in internal/state because the decision is the CLI's: the daemon
+// must NOT exit over a failed snapshot (it retries on the next interval and says so in the journal),
+// while a one-shot run that leaves no backup behind is a failure the timer should report.
+type snapshotHealth struct {
+	first chan error
+}
+
+// wait returns the immediate snapshot's error, or nil when it succeeded, was skipped because the
+// database holds nothing to recover, or has not reported yet within the grace period.
+func (h *snapshotHealth) wait(timeout time.Duration) error {
+	if h == nil {
+		return nil
+	}
+	select {
+	case err := <-h.first:
+		return err
+	case <-time.After(timeout):
+		// Still writing: a snapshot of a large database takes seconds, and the pass it overlapped has
+		// already finished. Reporting a timeout as a snapshot failure would be a false alarm on a
+		// slow disk, so the run stays green and the daemon logs the real outcome.
+		return nil
+	}
 }
 
 // takeSnapshot writes one snapshot, unless the database holds nothing a snapshot could recover.
@@ -655,18 +711,19 @@ func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Conf
 // replacement and evicted a genuine backup, so three restarts with keep=3 destroyed all three real
 // snapshots before anyone looked at the directory. Rate buckets and failure counters do not count
 // as recoverable state: losing them costs rate-limit knowledge, not a certificate.
-func takeSnapshot(store *state.Store, dir string, keep int, interval time.Duration, log *slog.Logger) {
+func takeSnapshot(store *state.Store, dir string, keep int, interval time.Duration, log *slog.Logger) error {
 	has, err := store.HasRecoverableState()
 	if err != nil {
 		log.Error("cannot tell whether the state database holds anything worth snapshotting", "err", err)
-		return
+		return err
 	}
 	if !has {
+		// Not a failure: a copy of a database with nothing to recover is not a recovery point.
 		log.Warn("skipping this snapshot: the state database holds no account, certificate, order "+
 			"or revocation request yet, so a copy of it is not a recovery point -- and retention "+
 			"would count it as one and evict a snapshot that is",
 			"dir", dir, "keep", keep)
-		return
+		return nil
 	}
 
 	path, err := store.Snapshot(dir, keep)
@@ -677,9 +734,10 @@ func takeSnapshot(store *state.Store, dir string, keep int, interval time.Durati
 		if path != "" {
 			log.Info("a snapshot was written despite the error", "path", path)
 		}
-		return
+		return err
 	}
 	log.Info("state database snapshotted", "path", path, "interval", interval, "keep", keep)
+	return nil
 }
 
 func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) error {

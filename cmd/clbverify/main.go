@@ -45,7 +45,7 @@ func run() error {
 	fs := flag.NewFlagSet("clbverify", flag.ContinueOnError)
 	var (
 		region     = fs.String("region", "", "region, e.g. ap-guangzhou")
-		lbID       = flag.String("clb", "", "CLB instance ID")
+		lbID       = fs.String("clb", "", "CLB instance ID")
 		listenerID = fs.String("listener", "", "listener ID; when omitted, the first listener on that CLB is used")
 		expect     = fs.String("expect", "", "certificate ID that must be in the asserted set; when set the assertion must hold")
 		domain     = fs.String("domain", "", "assert on the certificate the forwarding rule for this domain serves (SNI); when omitted every certificate on the listener and its rules is asserted")

@@ -155,6 +155,31 @@ if [[ ! -f "${ONBOARD_SRC}" ]]; then
 	fi
 fi
 if [[ -f "${ONBOARD_SRC}" ]]; then
+	# The same verification the main binary got. It was missing here, and the omission matters more
+	# than it looks: this file is also installed as root, also 0755, and it is what wecert-onboard.timer
+	# execs -- while `make release` writes a checksum for it into the very SHA256SUMS that was being
+	# read a few lines above for wecert alone. A sums file that lists it and disagrees is refused.
+	if [[ -f "${SUMS}" ]]; then
+		onboard_name="$(basename "${ONBOARD_SRC}")"
+		onboard_expected="$(awk -v f="${onboard_name}" '$2 == f { print $1 }' "${SUMS}")"
+		if [[ -n "${onboard_expected}" ]]; then
+			echo "==> Verifying ${onboard_name} against ${SUMS}"
+			if command -v sha256sum >/dev/null 2>&1; then
+				onboard_actual="$(sha256sum -- "${ONBOARD_SRC}" | awk '{ print $1 }')"
+			else
+				onboard_actual="$(shasum -a 256 -- "${ONBOARD_SRC}" | awk '{ print $1 }')"
+			fi
+			if [[ "${onboard_actual}" != "${onboard_expected}" ]]; then
+				echo "Error: checksum mismatch for ${onboard_name}." >&2
+				echo "  expected ${onboard_expected}" >&2
+				echo "  actual   ${onboard_actual}" >&2
+				exit 1
+			fi
+			echo "    ok"
+		else
+			echo "Warning: ${onboard_name} is not listed in ${SUMS}; installing it unverified." >&2
+		fi
+	fi
 	echo "==> Installing ${ONBOARD_SRC} to ${INSTALL_PATH%/*}/wecert-onboard"
 	# Same trust decision as the main binary: it is installed root-owned and run by its timer,
 	# so it goes through the same SHA256SUMS verification.
@@ -213,8 +238,25 @@ if [[ "${units_installed}" -eq 0 ]]; then
 	echo "       install the unit by hand before enabling anything." >&2
 	UNITS_MISSING=1
 fi
-systemctl daemon-reload
+# systemd may be absent (a container, WSL, a rescue image) or present without being PID 1, and
+# `systemctl daemon-reload` then fails -- which, under `set -e`, aborted the script AFTER everything
+# was installed but BEFORE the completion block, so the operator never saw the validation command and
+# read the run as a failed installation. Verified in the round-11 Linux pass: "System has not been
+# booted with systemd as init system (PID 1)" -> exit 1, and with no systemctl at all -> exit 127.
+if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+	systemctl daemon-reload || echo "Warning: 'systemctl daemon-reload' failed; run it by hand before enabling the units." >&2
+else
+	echo "Note: systemd is not running here (no /run/systemd/system), so the units were installed but"
+	echo "      not reloaded. On the machine that will run them: sudo systemctl daemon-reload"
+fi
 
+# The success banner is skipped when the units are missing: everything above it says so, and printing
+# "Installation complete ... 3) Start the service: systemctl enable --now wecert" after that error is
+# how an operator ends up enabling a unit that does not exist. The non-zero exit is at the very end,
+# after the state-directory warning (which is still worth reading in that case).
+if [[ "${UNITS_MISSING:-0}" -eq 1 ]]; then
+	echo "==> The binary and config are installed, but the systemd units are NOT. Nothing was started." >&2
+else
 cat <<EOF
 
 ==> Installation complete
@@ -247,6 +289,7 @@ Note: the first issuance only uploads the certificate to Tencent Cloud and print
 the CertId. You have to bind it once by hand in the CLB console; every renewal
 after that is fully automatic.
 EOF
+fi
 
 if [[ "${STATE_DIR}" != "${UNITS_STATE_DIR}" ]]; then
 	echo "Warning: statePath is under ${STATE_DIR}, but the shipped units only grant write access to" >&2

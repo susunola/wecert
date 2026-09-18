@@ -16,6 +16,35 @@ import (
 // the old one and discards the order in one unit, and a half-applied version of that is not
 // repairable by a later pass -- promote-without-retire leaks a cloud certificate that nothing will
 // ever delete, retire-without-promote marks the certificate that is still serving for deletion.
+// The transaction entry point must refuse an empty certificate id too.
+//
+// Store.AddRetiredCert has had this guard since the round-8 review; Tx.AddRetiredCert did not, and it
+// is the path the promotion epilogue uses. A row with no id is one the reaper can never delete --
+// Delete("") fails every round -- so it holds a reclaim slot forever, which is the opposite of what a
+// reclaim list is for. Recorded as an open item in round 10, verified and closed in round 11.
+func TestTxRefusesToQueueAnEmptyCertificateIDForReclaim(t *testing.T) {
+	store := openTestStore(t)
+
+	err := store.WithTx(context.Background(), func(tx *Tx) error {
+		return tx.AddRetiredCert("", "example-com", []byte("CERT"), []byte("KEY"))
+	})
+	if err == nil {
+		t.Fatal("the transaction must refuse an empty certificate id")
+	}
+	if !strings.Contains(err.Error(), "empty certificate id") {
+		t.Errorf("the error should name the problem, got: %v", err)
+	}
+
+	// Nothing was written, so the reaper has nothing undeletable to trip over.
+	var n int
+	if err := store.db.QueryRow(`SELECT count(*) FROM retired_certificates`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("a refused row must not be written, got %d", n)
+	}
+}
+
 func TestWithTxRollsBackEverythingOnError(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
