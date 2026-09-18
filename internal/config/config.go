@@ -581,6 +581,71 @@ func (d *DesiredState) normalize(hasCertificates bool) error {
 	return nil
 }
 
+// reservedContactDomains and reservedContactTLDs are the names a CA refuses as a contact address.
+//
+// Let's Encrypt answers 400 invalidContact ("contact email has forbidden domain") for these, and it
+// does so at ACCOUNT REGISTRATION -- before a single certificate is issued. The shipped example config
+// used ops@example.com, so the documented quick start failed at the documented `-dry-run` step with a
+// CA-side error that names neither the file nor the line, and the operator had to work out that the
+// address in the example was the problem. Catching it here turns that into a local, specific error.
+//
+// The lists are the documented reserved names (RFC 2606 / RFC 6761): the "example" domains and the
+// special-use TLDs. Nothing else is guessed at -- a typo in a real domain is not this check's
+// business, and the CA will refuse what it refuses.
+var reservedContactDomains = map[string]bool{
+	"example.com": true,
+	"example.net": true,
+	"example.org": true,
+	"example.edu": true,
+}
+
+var reservedContactTLDs = map[string]bool{
+	"example":   true,
+	"invalid":   true,
+	"test":      true,
+	"localhost": true,
+}
+
+// validateContactEmail refuses an address a CA will not accept, before it reaches the CA.
+func validateContactEmail(email string) error {
+	at := strings.LastIndex(email, "@")
+	if at <= 0 || at == len(email)-1 {
+		return fmt.Errorf("acme.email %q is not a usable contact address: it must look like "+
+			"user@domain, and it should be a mailbox you can read -- it is where a CA sends expiry "+
+			"and revocation notices", email)
+	}
+	domain := strings.ToLower(strings.TrimSuffix(email[at+1:], "."))
+
+	// The domain and every parent of it: mail to anything under a reserved domain goes nowhere, so
+	// `ops@sub.example.net` is the same mistake as `ops@example.net` and a CA refuses it the same way.
+	for suffix := domain; suffix != ""; {
+		if reservedContactDomains[suffix] {
+			return fmt.Errorf("acme.email is %q, and %s is a reserved documentation domain: Let's "+
+				"Encrypt refuses it as a contact address (\"contact email has forbidden domain\") when "+
+				"it registers the account, so nothing is issued at all. Set acme.email to a mailbox you "+
+				"control", email, suffix)
+		}
+		dot := strings.IndexByte(suffix, '.')
+		if dot < 0 {
+			// A single label ("localhost", or a bare name): the whole thing is the last label, so the
+			// special-use check below has to see it too.
+			if reservedContactTLDs[suffix] {
+				return fmt.Errorf("acme.email is %q, and %q is a reserved special-use name: a CA refuses "+
+					"it as a contact address, so nothing is issued at all. Set acme.email to a mailbox "+
+					"you control", email, suffix)
+			}
+			break
+		}
+		suffix = suffix[dot+1:]
+		if reservedContactTLDs[suffix] {
+			return fmt.Errorf("acme.email is %q, and .%s is a reserved special-use TLD: a CA refuses it "+
+				"as a contact address, so nothing is issued at all. Set acme.email to a mailbox you "+
+				"control", email, suffix)
+		}
+	}
+	return nil
+}
+
 // ACME is the ACME account and directory configuration.
 type ACME struct {
 	Directory string `yaml:"directory"`
@@ -778,6 +843,9 @@ func (c *Config) normalize() error {
 	}
 	if c.ACME.Email == "" {
 		return fmt.Errorf("acme.email is required")
+	}
+	if err := validateContactEmail(c.ACME.Email); err != nil {
+		return err
 	}
 
 	// The DNS provider must be chosen explicitly. Defaulting to dnspod suggests

@@ -111,7 +111,19 @@ install -m 0755 -o root -g root -- "${BINARY}" "${INSTALL_PATH}"
 # directory -- installing only wecert left `wecert-onboard.service` failing with 203/EXEC every
 # tick, which is a silent no-op for the desired-state document. Install it from the same directory
 # as the wecert binary when it is there (a release tarball has both).
+# Two naming conventions reach this line, and both have to work:
+#   - a hand-built ./bin/wecert-onboard (and the plain name in a tarball someone assembled);
+#   - `make release`, which writes <cmd>_<os>_<arch> -- so the documented
+#     `install.sh ./dist/wecert_linux_amd64` looks for wecert-onboard_linux_amd64. It used to find
+#     nothing, print "the wecert-onboard.service unit will not start", and exit 0, which made the
+#     documented quick start produce a machine whose onboarding timer can never run.
 ONBOARD_SRC="$(dirname -- "${BINARY}")/wecert-onboard"
+if [[ ! -f "${ONBOARD_SRC}" ]]; then
+	BINARY_SUFFIX="${BINARY##*wecert}"   # "" for ./bin/wecert, "_linux_amd64" for a release artifact
+	if [[ -f "$(dirname -- "${BINARY}")/wecert-onboard${BINARY_SUFFIX}" ]]; then
+		ONBOARD_SRC="$(dirname -- "${BINARY}")/wecert-onboard${BINARY_SUFFIX}"
+	fi
+fi
 if [[ -f "${ONBOARD_SRC}" ]]; then
 	echo "==> Installing ${ONBOARD_SRC} to ${INSTALL_PATH%/*}/wecert-onboard"
 	install -m 0755 -o root -g root -- "${ONBOARD_SRC}" "${INSTALL_PATH%/*}/wecert-onboard"

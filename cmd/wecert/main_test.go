@@ -52,8 +52,44 @@ func TestEnforceDefersUnusedStaticCredentials(t *testing.T) {
 	}
 }
 
-// A one-shot run that did not converge must fail.
+// -dry-run must build what reads credentials, or its "all fine" is a claim it never checked.
 //
+// The flag documents itself as the pre-install check ("a green dry run means the credentials are
+// usable"), install.sh runs it as its last step, and it used to return several statements before the
+// DNS provider and the deployer were built -- the two places static credentials are validated. A
+// config with credentialMode=static and no credentials therefore exited 0, and failed on the first
+// real pass instead.
+func TestTheDryRunBuildsWhatReadsCredentials(t *testing.T) {
+	cfg := &config.Config{
+		Certificates: []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}},
+	}
+	cfg.DNS.Provider = config.DNSProviderDNSPod
+	cfg.DNS.LoginToken = "12345,abcdef"
+	cfg.Tencent.CredentialMode = config.CredentialStatic
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// No static credentials anywhere: this is the misconfiguration that used to pass.
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "")
+	t.Setenv("TENCENTCLOUD_SECRET_KEY", "")
+	err := buildCredentialBearingComponents(cfg, log)
+	if err == nil {
+		t.Fatal("a dry run must not report success when the credentials it claims to have checked are missing")
+	}
+	if !strings.Contains(err.Error(), "credentials") {
+		t.Errorf("the error should name the credentials, got: %v", err)
+	}
+
+	// With them present, the same call must succeed: this is not a check that always fails.
+	cfg.Tencent.SecretID = "id"
+	cfg.Tencent.SecretKey = "key"
+	cfg.Tencent.Regions = []string{"ap-guangzhou"}
+	if err := buildCredentialBearingComponents(cfg, log); err != nil {
+		t.Errorf("a complete static configuration must build: %v", err)
+	}
+}
+
+// A one-shot run that did not converge must fail.
+
 // wecert-once.service runs this with -once, and "exited 0 with every certificate failing" is the
 // failure this report exists to prevent: the timer reports success while the fleet goes unmanaged.
 func TestOnceExitFailsWhenThePassDidNotConverge(t *testing.T) {
@@ -67,6 +103,12 @@ func TestOnceExitFailsWhenThePassDidNotConverge(t *testing.T) {
 		// certificate stuck in a long backoff sits in, which is exactly what a one-shot run has to
 		// report.
 		{"nothing was attempted and everything was skipped", reconcile.RunReport{Skipped: []string{"a", "b"}}},
+		// Every certificate inside its retry backoff window. This case used to sit in the healthy
+		// list, and the guard that was supposed to cover it could not fire: an ErrBackoff pass
+		// increments Backoff and never appends to Skipped, so `Attempted == 0 && len(Skipped) > 0`
+		// was false and the timer exited 0. It is reachable -- the backoff is capped at 6h and the
+		// timer runs hourly -- and the exit code is the only channel that reports it.
+		{"every certificate is inside its retry backoff window", reconcile.RunReport{Backoff: 2}},
 	}
 	for _, tc := range trouble {
 		if err := onceExit(tc.rep); err == nil {
@@ -79,7 +121,9 @@ func TestOnceExitFailsWhenThePassDidNotConverge(t *testing.T) {
 		rep  reconcile.RunReport
 	}{
 		{"everything succeeded", reconcile.RunReport{Attempted: 2, Succeeded: 2}},
-		{"a certificate is inside its retry window", reconcile.RunReport{Attempted: 0, Backoff: 1}},
+		// Nothing due: no certificate was attempted, none failed, none is parked in a retry window.
+		// This is what an idle interval looks like and it must stay a success.
+		{"nothing is due yet", reconcile.RunReport{}},
 	}
 	for _, tc := range healthy {
 		if err := onceExit(tc.rep); err != nil {

@@ -287,7 +287,13 @@ func (m *Manager) download(
 			m.log.Warn("deploy is disabled for this certificate: the cloud certificate it was previously bound to is now unmanaged, "+
 				"and is left in place because it may still be serving traffic",
 				"cert", c.Name, "certId", oldDeployedID,
-				"hint", "if it is no longer needed, delete it from the Tencent Cloud console or with wecert-preflight prune")
+				// The hint named "wecert-preflight prune", which is not an invocation this program has:
+				// cmd/preflight is flag-only, so that command prints its usage and exits 1 -- and the
+				// operator who guesses the real flag (-prune-certs) gets a bulk delete whose own warning
+				// names exactly the certificate this message went out of its way to preserve.
+				"hint", "if it is no longer needed, delete it from the Tencent Cloud console (unbind it there "+
+					"first), or deliberately with `wecert-preflight -prune-certs`, which deletes EVERY "+
+					"certificate wecert uploaded -- read its warning and its list before confirming")
 		}
 		deployedID = ""
 		// Applied to the staged copy below, not to st: the flag belongs to the promotion, and the

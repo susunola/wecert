@@ -7,21 +7,33 @@ shape, and the obvious HA fix does not provide HA. Both are written up in
 
 They are ordered by real exposure over effort.
 
-1. **Make the checks into gates**
+1. **Finish making the checks into gates**
 
-   The cheapest item on this list and the one that protects all the others. CI runs `gofmt`, English, `vet`, `govulncheck`, `test -race`, `make build` and `make release` — but not `check-alerts`, `check-scripts`, `make fuzz` or `make test-pebble`, and `main` has **no branch protection** (checked against the API: "Branch not protected"), so nothing requires the run to pass before a merge. The consequence is concrete: the 17 alert rules and the fuzz corpus added most recently are verified only by whoever remembers to run `make check` locally, and `.github/CODEOWNERS` reads as if reviews were required when they are not. A few lines in `ci.yml` plus two repository settings.
+   Mostly done, and what is left is not code. CI now runs `check-alerts` and `check-scripts` next to `gofmt`, English, `vet`, `govulncheck`, `test -race`, `test-tags`, `make build` and `make release`. Still missing: `make fuzz` (bounded wall-clock, so it belongs in a scheduled job) and `make test-pebble` (needs the pebble binary installed), and **`main` still has no branch protection** (checked against the API: "Branch not protected"), so nothing requires the run to pass before a merge. The repository settings are the part that is not mine to change: require the `test` job, and either fill in `.github/CODEOWNERS` or drop it, because as written it reads as if reviews were required when they are not.
 
 2. **Switch on GitHub private vulnerability reporting**
 
    `SECURITY.md` documents a fallback — an empty public issue asking for a private channel — because the real channel is **off** in this repository (the API reports `"enabled": false`). One setting, and it removes an awkward step from the only path a reporter has.
 
-3. **Finish off-host snapshots and one-command restore (option A in docs/availability.md)**
+3. **Finish off-host snapshots (option A in docs/availability.md)**
 
-   The real availability exposure. Process death is already covered by `Restart=on-failure` plus resumable orders, and host loss is bounded by `state.db` living on local disk — so a second wecert process on the same host shares its fate and duplicates what systemd already does. The snapshot machinery (`VACUUM INTO`, retention, the documented restore procedure) already exists; what is missing is getting the file off the host automatically and making restore one command instead of a sequence. Needs a decision that is not mine to make: where the snapshots go, and what RTO is being bought.
+   The real availability exposure. Process death is already covered by `Restart=on-failure` plus resumable orders, and host loss is bounded by `state.db` living on local disk — so a second wecert process on the same host shares its fate and duplicates what systemd already does. The snapshot machinery (`VACUUM INTO`, retention) already exists, and **restore is now one command**: `wecert -restore latest` keeps the database it replaced, moves the `-wal`/`-shm` with it, verifies the snapshot before touching anything, and records the rate-limit caveat for the next start. What is still missing is getting the file off the host automatically. Needs a decision that is not mine to make: where the snapshots go, and what RTO is being bought.
 
-4. **Guard against restoring a stale snapshot**
+4. **Notice a state database that was restored without `wecert -restore`**
 
-   A real, unhandled operational risk. An operator restores a snapshot from several days ago, so `NextAttemptAt`, the ARI window and the rate-limit buckets all move backwards; wecert then believes it has spent nothing and tries to issue — while the exact-set limit is a 7-day window with no override. Startup should notice that the store is far older than the wall clock and refuse, or degrade to read-only.
+   Half done, and the remaining half is the awkward one. `wecert -restore` writes `state.db.restored`, and the next start warns for seven days that the rate-limit ledger stops at the snapshot (`state.RestoreCaveatWindow`); what is still invisible is the hand path — `cp snapshot state.db`, which is what docs/recovery.md documented for years. Nothing inside the file records that it was swapped in, so `NextAttemptAt`, the ARI window and the rate-limit buckets can all move backwards in silence.
+
+   The tempting signal is "the file's mtime is much newer than the newest row in it", and it is a false-positive generator: SQLite checkpoints the WAL at open and at close, so a daemon that wrote once and then idled for a week has exactly that signature after an ordinary restart. Ruling that out needs something the file does not carry today — a heartbeat row, or a start/stop ledger — and a warning that also fires on legitimate restarts teaches the reader to ignore the one that matters. Worth doing only once that design is settled; until then the answer is "restore through the command, which records it".
+
+4b. **Make the orphan teardown proportional to what needs cleaning**
+
+   Certificates that left the desired state keep their row by design, and every pass tears each one
+   down again: the round-11 scale work measured 2,999 orphans at 2,999 `CleanupOrphan` calls,
+   2,999 journal lines and 15,051 SQL statements **per pass**, identical on every pass. The journal
+   half is fixed (ten lines plus a counted summary). The SQL half needs a durable "already cleaned"
+   mark — a column on `certificates`, cleared when the name comes back — because the row itself is
+   what says there is anything to clean, and an in-memory set would just be another map that grows
+   with churn.
 
 5. **Sign the release artifacts**
 

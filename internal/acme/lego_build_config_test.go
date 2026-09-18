@@ -25,7 +25,7 @@ func TestLegoProviderSupportMatchesTheBuildTag(t *testing.T) {
 statePath: /tmp/wecert-test.db
 acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  email: ops@example.com
+  email: ops@atomwangnus.com
 tencent:
   credentialMode: static
   secretId: id

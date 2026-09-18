@@ -35,7 +35,7 @@ cat > staging.yaml <<'YAML'
 statePath: /tmp/wecert-selftest.db
 acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  email: selftest@example.com
+  email: selftest@atomwangnus.com
 dns:
   provider: dnspod
   loginToken: token

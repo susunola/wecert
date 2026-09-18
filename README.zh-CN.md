@@ -96,13 +96,18 @@ export TENCENTCLOUD_SECRET_KEY="<secret-key>"
 
 ```yaml
 acme:
-  email: ops@example.com                 # 默认 staging；全绿之后切到生产
+  email: ops@example.com                 # ⚠️ 必须换成你能收信的邮箱，见下
 dns:
   provider: tencentcloud                 # 或者 dnspod + loginToken
 certificates:
   - name: example-com
     domains: [example.com, "*.example.com"]
 ```
+
+这段里有两行是**故意留的占位符**：`acme.email` 必须换成你自己能收信的邮箱 —— Let's Encrypt
+在注册账号时会拒绝保留文档域名（`example.com` 之类，报 `contact email has forbidden domain`），
+而 wecert 现在会在本地就用同样的理由拒绝它，所以忘了改会在 `-dry-run` 这一步就停下来，
+而不是装到一半才失败。`acme.directory` 默认指向 staging：整条链路验证通过后再切生产。
 
 然后在 CVM 上安装 —— 在代码检出目录里执行，用对应那台机器的二进制：
 
@@ -119,7 +124,10 @@ sudo vi /etc/wecert/config.yaml
 sudo -u wecert /usr/local/bin/wecert -config /etc/wecert/config.yaml -dry-run
 ```
 
-`-dry-run` 会加载配置、打开或创建状态库、注册 ACME 账号，然后退出，**不签发也不部署任何东西**。dry-run 通过，意味着配置、凭证与状态目录都是可用的。
+`-dry-run` 会加载配置、打开或创建状态库、注册 ACME 账号、构造 DNS provider 与 deployer，然后退出，
+**不签发也不部署任何东西**。dry-run 通过意味着：配置能解析、状态目录可用、CA 账号可达、凭证存在且格式正确
+（`credentialMode: static` 是"文件或环境变量里有"；CVM 角色则是第一次使用时才去取，所以**这一步不会调用任何云 API**）。
+要确认凭证真的能用（SSL 权限、DNSPod 归属、NS 委派），跑 `wecert-preflight -domain <你的域名>`。
 
 ### 4. 启动
 
@@ -162,7 +170,7 @@ staging 端到端全绿之后，把 `acme.directory` 指向 `https://acme-v02.ap
 
 ## 日常运维
 
-**状态放在哪里。** `statePath`（**必填，没有默认值**），例如 `/var/lib/wecert/state.db`（0600，所在目录 0700）。它装着 ACME 账号密钥、每一张证书的私钥、在飞订单的 order URL，以及 ARI certID —— 而丢掉一个 order URL 就要拿一次签发去补，直接算在 5 / 7 天这条限额上。所以它也会被自动快照：`stateBackup` 默认开启，每 24 小时做一次一致的 `VACUUM INTO`，保留 7 份。每种丢失的代价、以及怎么恢复一份快照：[docs/recovery.md](docs/recovery.md)。
+**状态放在哪里。** `statePath`（**必填，没有默认值**），例如 `/var/lib/wecert/state.db`（0600，所在目录 0700）。它装着 ACME 账号密钥、每一张证书的私钥、在飞订单的 order URL，以及 ARI certID —— 而丢掉一个 order URL 就要拿一次签发去补，直接算在 5 / 7 天这条限额上。所以它也会被自动快照：`stateBackup` 默认开启，每 24 小时做一次一致的 `VACUUM INTO`，保留 7 份。恢复用一条命令 `wecert -restore latest`（也可以给快照文件或快照目录），代价与步骤见 [docs/recovery.md](docs/recovery.md)。
 
 **健康与告警。** `/metrics` 默认监听 `127.0.0.1:9800`，并附一份[可直接加载的规则文件](deploy/prometheus/wecert-alerts.yml)：17 条告警，覆盖按 profile 的到期、收敛与完整性 —— CA 还没接受的吊销、两小时没跑完的一轮、正在服务的不是部署的那张证书。该监听端口不做任何鉴权，所以请让它留在 localhost 或私有网卡上。
 
@@ -323,7 +331,7 @@ CA/Browser Forum 已排期 **2027-03-15 起 ≤100 天、2029-03-15 起 ≤47 �
 | `-once` | `false` | 只跑一轮就退出（配合 systemd timer / cron） |
 | `-interval` | `1h` | 守护模式下的收敛间隔 |
 | `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
-| `-dry-run` | `false` | 只校验配置并初始化 ACME 账号，不签发也不部署 |
+| `-dry-run` | `false` | 校验配置、初始化 ACME 账号，并构造 DNS provider 与 deployer；不签发也不部署 |
 | `-revoke` | — | 要吊销的证书名，执行后退出（见[吊销](#日常运维)） |
 | `-revoke-reason` | `unspecified` | RFC 5280 原因码：`unspecified` \| `keyCompromise` \| `affiliationChanged` \| `superseded` \| `cessationOfOperation` |
 | `-yes` | `false` | 与 `-revoke` 配合：跳过交互式确认 |
@@ -387,6 +395,10 @@ CA/Browser Forum 已排期 **2027-03-15 起 ≤100 天、2029-03-15 起 ≤47 �
 | `-json` | `false` | 每次尝试输出一个 JSON 对象（NDJSON：`-wait` 下的重试、或解析到多个地址的主机，都各占一行） |
 
 退出码：`0` 与预期一致 · `1` 探测根本没跑成 · `2` 探测跑成了，但服务的是错的证书。
+
+`-json` 下 `verdict.problems` 是对象数组（`{"kind": "...", "text": "..."}`），每个独立问题一条 ——
+因为排查方向不同：`min_valid_for` 表示服务的就是部署的那张证书、只是剩余有效期不够（续期还没跑），
+而 `not_after` 或 `names_extra` 才表示服务的是另一张证书。
 
 ```bash
 ./bin/wecert-probe -host www.example.com -min-valid 168h

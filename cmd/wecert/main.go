@@ -46,30 +46,69 @@ func main() {
 	acme.SetUserAgentVersion(version)
 
 	if err := run(); err != nil {
+		// exitUsage is the conventional "the command line itself is wrong" code, the same one
+		// wecert-onboard and wecert-probe use -- and it matters here because the alternative was
+		// flag.ExitOnError's 2, which this repository documents as wecert-onboard's "deliberately
+		// frozen, a human should look" code. A typo in wecert-once.service's ExecStart is not a
+		// freeze, and a monitoring rule keyed on 2 must not read it as one. The flag package has
+		// already printed the offending flag and the usage to stderr.
+		if errors.Is(err, errUsage) {
+			os.Exit(exitUsage)
+		}
 		slog.Error("wecert exited with an error", "err", err)
 		os.Exit(1)
 	}
 }
 
+const (
+	// exitUsage: the command line itself is wrong (see main).
+	exitUsage = 64
+)
+
+// errUsage marks a command-line error, so main can pick the exit code without re-printing what the
+// flag package already printed.
+var errUsage = errors.New("invalid command line")
+
 func run() error {
+	// A ContinueOnError FlagSet rather than the package-level one, because that one exits 2 on a
+	// typo (see main).
+	fs := flag.NewFlagSet("wecert", flag.ContinueOnError)
 	var (
-		configPath = flag.String("config", "config.yaml", "path to the configuration file")
-		statePath  = flag.String("state", "", "override statePath from the config (handy for tests or running multiple instances)")
-		once       = flag.Bool("once", false, "run one pass and exit (for a systemd timer / cron)")
-		interval   = flag.Duration("interval", time.Hour, "reconcile interval in daemon mode")
-		logLevel   = flag.String("log-level", "info", "log level: debug|info|warn|error")
-		dryRun     = flag.Bool("dry-run", false, "validate the config and initialise the account only; issue and deploy nothing")
-		showVer    = flag.Bool("version", false, "print the version and exit")
-		revokeCert = flag.String("revoke", "", "ask the CA to revoke this certificate and exit (see also -yes)")
-		revokeWhy  = flag.String("revoke-reason", "unspecified",
+		configPath  = fs.String("config", "config.yaml", "path to the configuration file")
+		statePath   = fs.String("state", "", "override statePath from the config (handy for tests or running multiple instances)")
+		once        = fs.Bool("once", false, "run one pass and exit (for a systemd timer / cron)")
+		interval    = fs.Duration("interval", time.Hour, "reconcile interval in daemon mode")
+		logLevel    = fs.String("log-level", "info", "log level: debug|info|warn|error")
+		dryRun      = fs.Bool("dry-run", false, "validate the config, initialise the account and build the DNS provider and deployer; issue and deploy nothing")
+		showVer     = fs.Bool("version", false, "print the version and exit")
+		revokeCert  = fs.String("revoke", "", "ask the CA to revoke this certificate and exit (see also -yes)")
+		restoreFrom = fs.String("restore", "",
+			"restore a state snapshot and exit: a snapshot file, a directory of snapshots, or \"latest\"")
+		revokeWhy = fs.String("revoke-reason", "unspecified",
 			"revocation reason: unspecified|keyCompromise|affiliationChanged|superseded|cessationOfOperation")
-		yesFlag = flag.Bool("yes", false, "with -revoke: skip the interactive confirmation")
+		yesFlag = fs.Bool("yes", false, "with -revoke: skip the interactive confirmation")
 	)
-	flag.Parse()
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			// -h: the usage has been printed, and asking for help is not an error.
+			return nil
+		}
+		return errUsage
+	}
 
 	if *showVer {
 		fmt.Println("wecert", version)
 		return nil
+	}
+
+	if *restoreFrom != "" {
+		// A mode flag next to -restore is a mistake worth refusing rather than ordering: every one of
+		// the others does something to a state database, and "restore, and then also reconcile once"
+		// is not a thing an operator can have meant.
+		if *once || *dryRun || *revokeCert != "" {
+			return errRestoreConflict
+		}
+		return runRestore(*configPath, *statePath, *restoreFrom)
 	}
 
 	if *revokeCert != "" {
@@ -115,6 +154,11 @@ func run() error {
 	}
 	logStartup(log, cfg, firstRun)
 
+	// If this database came from a snapshot, say what that costs before the first pass runs: the
+	// rate-limit ledger in it stops at the snapshot, and the refusal that follows days later looks
+	// like an ordinary quota problem. See logRestoreNotice.
+	logRestoreNotice(log, cfg.StatePath, time.Now())
+
 	// The desired-state source is constructed before anything touches the network.
 	//
 	// In enforce mode an unreadable document must blow up at **startup**, not at the
@@ -154,10 +198,30 @@ func run() error {
 			probeState = fmt.Sprintf("on (port %d, timeout %s, max %d hosts/cert)",
 				cfg.Probe.Port, cfg.Probe.TimeoutDur, cfg.Probe.MaxHostsPerCert)
 		}
-		log.Info("dry run finished: the config, the ACME account and the desired-state source are all fine",
+
+		// Build the two components that READ CREDENTIALS even though nothing is issued or deployed.
+		//
+		// This is what makes the line below true, and it used to be false in the direction that
+		// costs the most: internal/config deliberately leaves the validation of static Tencent
+		// credentials to deploy.NewCredentialSource, so a config with credentialMode=static and no
+		// secretId/secretKey sailed through `-dry-run` with "all fine" and exit 0 -- and then failed
+		// on the first real pass, after a production ACME account had been registered and a whole
+		// interval had gone by. The dry run documented in README.md is the step an operator runs
+		// BEFORE installing the units; "the credentials are usable" is exactly the question it is
+		// asked, and install.sh runs it as its verification step.
+		//
+		// It costs no API call: the DNS provider and the CLB client are constructed, credentials are
+		// read and validated from config or environment, and for the CVM instance role the fetch
+		// stays deferred to first use.
+		if err := buildCredentialBearingComponents(cfg, log); err != nil {
+			return fmt.Errorf("dry run: %w", err)
+		}
+
+		log.Info("dry run finished: the config, the ACME account, the desired-state source, the DNS "+
+			"provider and the deployer are all fine; nothing was issued or deployed",
 			"mode", cfg.DesiredState.Mode,
 			"provider", spec.KindOf(provider),
-			"certificates", len(cfg.Certificates),
+			"certificates", certificateCountField(cfg),
 			"probing", probeState)
 		return nil
 	}
@@ -219,6 +283,21 @@ func run() error {
 	// rather than returning an empty list -- which reads as "the desired state is empty".
 	reconciler.Prime(ctx)
 
+	// In enforce mode the certificate list lives in the document, so this is the first and only
+	// point in the boot sequence that can state the fleet size. "wecert starting ... certificates=0"
+	// over a document that lists ten certificates reads as a document problem and is the number an
+	// operator checks first.
+	if cfg.DesiredState.Mode == config.ModeEnforce {
+		names := reconciler.CertNames()
+		log.Info("the desired-state document declares the certificates to manage",
+			"certificates", len(names), "path", cfg.DesiredState.Path,
+			"provider", spec.KindOf(provider))
+		if len(names) == 0 {
+			log.Warn("the desired-state document declares no certificates: nothing will be renewed " +
+				"while that is true")
+		}
+	}
+
 	// Periodic consistent snapshots of state.db. Started here so a snapshot exists before
 	// the first renewal window can lose an order: the file holds the ACME account key and
 	// every in-flight order URL, and losing an order URL means re-placing it into the
@@ -244,8 +323,22 @@ func run() error {
 		log.Error("periodic state database snapshots are ENABLED but the directory is not writable, "+
 			"so none will be taken", "dir", backupDir)
 	default:
-		log.Warn("periodic state database snapshots are DISABLED: losing state.db means a new ACME " +
-			"account and re-placed orders, and nothing here will be able to restore it")
+		// Two different situations reach this arm, and they have different fixes: the operator wrote
+		// stateBackup.enabled: false, or the setting is unset (the documented default) and the
+		// directory cannot be written. The message used to assert the first in both cases and carry
+		// no attributes at all, so the operator grepped the config for a line that was not there and
+		// could not see which directory to fix -- while the sibling arm above prints dir=.
+		if cfg.StateBackup.Enabled != nil {
+			log.Warn("periodic state database snapshots are DISABLED in the config " +
+				"(stateBackup.enabled: false): losing state.db means a new ACME account and re-placed " +
+				"orders, and nothing here will be able to restore it")
+		} else {
+			log.Warn("periodic state database snapshots are OFF because this directory is not "+
+				"writable (stateBackup.enabled is unset, and snapshots default to on where they can "+
+				"be taken): losing state.db means a new ACME account and re-placed orders, and "+
+				"nothing here will be able to restore it",
+				"dir", backupDir, "hint", "point stateBackup.dir at a writable path, or make this one writable")
+		}
 	}
 
 	// Metrics server. Bind the port synchronously first and exit on failure -- see below.
@@ -363,9 +456,12 @@ func onceExit(rep reconcile.RunReport) error {
 	if !rep.Trouble() {
 		return nil
 	}
+	// backoff is in the message because it is the reason a pass can attempt nothing without skipping
+	// anything: "attempted=0 ... skipped=0" used to be the whole explanation for a run that exited
+	// non-zero because every certificate was parked in its retry window.
 	return fmt.Errorf("the pass did not converge: attempted=%d succeeded=%d failed=%d skipped=%d "+
-		"desiredStateUnreadable=%t", rep.Attempted, rep.Succeeded, rep.Failed, len(rep.Skipped),
-		rep.DesiredStateUnreadable)
+		"backoff=%d desiredStateUnreadable=%t", rep.Attempted, rep.Succeeded, rep.Failed,
+		len(rep.Skipped), rep.Backoff, rep.DesiredStateUnreadable)
 }
 
 // drainNotifier waits briefly for accepted notifications to be delivered.
@@ -721,13 +817,14 @@ func logStartup(log *slog.Logger, cfg *config.Config, firstRun bool) {
 		"directory", cfg.ACME.Directory,
 		"production", production,
 		"statePath", cfg.StatePath,
-		"certificates", len(cfg.Certificates))
+		"mode", cfg.DesiredState.Mode,
+		"certificates", certificateCountField(cfg))
 
 	if firstRun {
 		log.Warn("no account in the state store; registering a new ACME account")
 		if production {
-			log.Warn("WARNING: pointed at the Let's Encrypt production environment." +
-				"run the whole flow against https://acme-staging-v02.api.letsencrypt.org/directory first," +
+			log.Warn("WARNING: pointed at the Let's Encrypt production environment. " +
+				"Run the whole flow against https://acme-staging-v02.api.letsencrypt.org/directory first, " +
 				"otherwise failed retries burn real production quota")
 		}
 	}
@@ -750,6 +847,45 @@ func logStartup(log *slog.Logger, cfg *config.Config, firstRun bool) {
 			}
 		}
 	}
+}
+
+// buildCredentialBearingComponents constructs the parts of the program that read credentials,
+// without issuing or deploying anything.
+//
+// It exists so -dry-run can make its own summary true: internal/config deliberately leaves the
+// validation of static Tencent credentials to deploy.NewCredentialSource, so a config with
+// credentialMode=static and no secretId/secretKey passed the documented pre-install check and exited
+// 0 with "all fine" -- failing on the first real pass instead, after a production ACME account had
+// been registered and an interval had gone by.
+//
+// Note the middle call: in enforce mode newDeployer returns the LAZY CLB client on purpose (the
+// document decides what is deployed), so without asking for the credential source directly, a
+// deployment using DNSPod tokens for DNS would still not have its CAM credentials checked here.
+func buildCredentialBearingComponents(cfg *config.Config, log *slog.Logger) error {
+	if _, err := acme.NewDNSSolver(cfg.DNS, cfg.Tencent, log); err != nil {
+		return fmt.Errorf("the DNS provider would not build: %w", err)
+	}
+	if _, err := deploy.NewCredentialSource(cfg.Tencent); err != nil {
+		return fmt.Errorf("the Tencent Cloud credentials would not build: %w", err)
+	}
+	if _, err := newDeployer(cfg, log); err != nil {
+		return fmt.Errorf("the deployer would not build: %w", err)
+	}
+	return nil
+}
+
+// certificateCountField is what the banner and the dry-run summary report as `certificates`.
+//
+// In enforce mode len(cfg.Certificates) is 0 by construction -- config.normalize refuses a non-empty
+// list there, because the document is the single source of truth -- so printing the number said
+// "nothing is managed" about a document that may list ten certificates, and it is the first field an
+// operator reads. The real count is logged once the document has been resolved (see the Prime call
+// in run), which is the only point where it exists.
+func certificateCountField(cfg *config.Config) any {
+	if cfg.DesiredState.Mode == config.ModeEnforce {
+		return "from the desired-state document (counted below)"
+	}
+	return len(cfg.Certificates)
 }
 
 func newLogger(level string) *slog.Logger {

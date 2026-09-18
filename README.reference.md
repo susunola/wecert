@@ -214,7 +214,10 @@ sudo chmod 640 /etc/wecert/config.yaml
 sudo -u wecert ./bin/wecert -config /etc/wecert/config.yaml -dry-run
 ```
 
-`-dry-run` validates the config and initialises the ACME account, but signs and deploys nothing.
+`-dry-run` validates the config, initialises the ACME account, and builds the DNS provider and the
+deployer -- so a missing or malformed static credential fails here rather than on the first real pass
+-- but it signs and deploys nothing, and it makes no cloud API call: a CVM role's credentials are
+fetched on first use, so "the credentials work" is `wecert-preflight`'s job, not this flag's.
 
 ### 5. Start the service
 
@@ -317,7 +320,7 @@ The ACME order state machine is in [Order state machine](#4-order-state-machine)
 
 ### State schema
 
-A single SQLite file. Losing it means re-ordering, which collides with the rate limits — so it is the one thing to back up. wecert snapshots it on an interval by default (`stateBackup`, using `VACUUM INTO` so the copy is consistent despite WAL) and keeps the newest `keep` of them beside it; snapshots are not off-host backup, and **docs/recovery.md** is the restore procedure.
+A single SQLite file. Losing it means re-ordering, which collides with the rate limits — so it is the one thing to back up. wecert snapshots it on an interval by default (`stateBackup`, using `VACUUM INTO` so the copy is consistent despite WAL) and keeps the newest `keep` of them beside it; snapshots are not off-host backup. Restoring one is `wecert -restore latest` (a file, a directory, or `latest`); **docs/recovery.md** is the procedure and the caveat that comes with it.
 
 ```
 accounts                      -- one ACME account per directory URL
@@ -518,7 +521,7 @@ The CA/Browser Forum has scheduled **≤100 days from 2027-03-15 and ≤47 days 
 | `desired-state.yaml` | wecert-onboard | wecert | **Safe** — wecert freezes on the previous revision and alarms |
 | `onboard-state.json` | wecert-onboard | wecert-onboard | **Matters** — the grace period resets, so deletion becomes aggressive |
 | `desired-state.report.json` | wecert-onboard | a human | **Harmless** — troubleshooting only |
-| `state.db` | wecert | wecert | **Disaster** — order URLs, ARI certIDs and CertIds all gone, so orders are re-placed into the exact-set limit. Snapshotted automatically (`stateBackup`); restore with **docs/recovery.md** |
+| `state.db` | wecert | wecert | **Disaster** — order URLs, ARI certIDs and CertIds all gone, so orders are re-placed into the exact-set limit. Snapshotted automatically (`stateBackup`); restore with `wecert -restore latest` (see **docs/recovery.md**) |
 | The ACME account key | wecert | wecert | **Disaster** — accounts are a limited resource (10 per IP per 3 hours) |
 
 ### Failure semantics
@@ -836,7 +839,7 @@ When a certificate is close to expiry and issuance keeps failing, drop the names
 
 **It only ever drops names that failed individually.** With no per-identifier evidence it does nothing — dropping names at random would sacrifice the healthy ones too, which is worse than not falling back at all. It also requires a live certificate: without one there is no "keep what you have" argument, only "sign for less".
 
-**It heals itself.** A dropped name is never attempted again, so it can never earn its way back through a success. Instead the failure record ages out after `failureWindow`, the name stops being dropped, and the next pass retries the full set. Fix the DNS and recovery takes at most one window — no extra retry state, no manual step.
+**It heals itself, at the renewal window.** A dropped name is never attempted again, so it can never earn its way back through a success. Instead the failure record ages out after `failureWindow`, and the name stops being dropped — after which the **renewal window** retries the full set (the same SAN-drift branch that converges a config change). Recovery is therefore bounded by the certificate's own renewal time, not by the failure window: repairing the DNS on a 90-day certificate still waits for `notAfter - renewBefore` before the full set is attempted again. That delay is deliberate — a full-set order on every pass is exactly the oscillation the fallback exists to stop, and it would exhaust the 5-per-exact-set quota within the week — but it is worth knowing before you wait for a repair to show up. `wecert_certificate_fallback_active` stays 1 until a full certificate is issued, and the report/`cert_fallback` row names the dropped names for the whole time.
 
 `wecert_certificate_fallback_active{cert}` and `wecert_certificate_fallback_dropped_names{cert}` are what you alert on. A fallback that stays active is an unresolved problem, not a steady state.
 
@@ -1023,7 +1026,11 @@ is still bound (status 4) keeps the certificate on the reclaim list for the next
 | `-once` | `false` | Run one pass and exit (for systemd timer / cron) |
 | `-interval` | `1h` | Reconcile interval in daemon mode |
 | `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
-| `-dry-run` | `false` | Validate config and initialise the ACME account; sign and deploy nothing |
+| `-dry-run` | `false` | Validate config, initialise the ACME account, and build the DNS provider and deployer (so a bad static credential fails here); sign and deploy nothing |
+| `-revoke` | — | Ask the CA to revoke this certificate and exit (writes the decision to state first, so a transient CA failure is retried by the daemon) |
+| `-revoke-reason` | `unspecified` | `unspecified` \| `keyCompromise` \| `affiliationChanged` \| `superseded` \| `cessationOfOperation` |
+| `-yes` | `false` | With `-revoke`: skip the interactive confirmation (you must otherwise type the certificate name) |
+| `-restore` | — | Restore a state snapshot and exit: a snapshot file, a directory of snapshots, or `latest` (see **docs/recovery.md**). Refuses while the daemon holds the lock; keeps the database it replaces at `state.db.replaced-<stamp>` |
 | `-version` | `false` | Print version and exit |
 
 ### `wecert-preflight` (diagnostic; `-prune-certs` deletes)
@@ -1169,16 +1176,16 @@ make test-pebble  # a real ACME lifecycle against a local CA (needs the pebble b
 make cover      # coverage
 ```
 
-CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. `make check` additionally runs `test-tags` (the same tests under `-tags "pebble lego_dns"`, which is the only gate for two tag-selected production files), `check-scripts` (the shell self-test and the CAM policy drift check) and `check-alerts`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI does **not** run `check-scripts`, `check-alerts`, `make fuzz` or `make test-pebble` yet — those are on whoever pushes.
+CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. `make check` additionally runs `test-tags` (the same tests under `-tags "pebble lego_dns"`, which is the only gate for two tag-selected production files), `check-scripts` (the shell self-test and the CAM policy drift check) and `check-alerts`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI runs `check-alerts` and `check-scripts` too (they are stdlib-only and take under a second). It does **not** run `make fuzz` or `make test-pebble` yet — those are on whoever pushes, and on the scheduled release run.
 
 ### Test layout
 
-817 test functions across 78 files in 20 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
+831 test functions across 81 files in 20 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
 
 | Package | Files | Tests | What it covers |
 |---|---|---|---|
-| `internal/acme` | 28 | 235 | The issuance state machine |
-| `internal/state` | 10 | 83 | Schema, permissions, backups, transactions |
+| `internal/acme` | 28 | 232 | The issuance state machine |
+| `internal/state` | 11 | 96 | Schema, permissions, snapshots and restore, transactions |
 | `internal/deploy` | 7 | 82 | Upload, bind confirmation, replacement |
 | `internal/onboarding` | 4 | 81 | Document generation and the CLB guard |
 | `internal/config` | 7 | 67 | Validation, domain normalisation, profiles |
@@ -1191,10 +1198,10 @@ CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` +
 | `internal/atomicfile` | 1 | 6 | The temp-file/fsync/rename protocol |
 | `internal/metrics` | 1 | 2 | The registry itself |
 | `internal/tcerr` | 1 | 1 | The DNSPod "no data" classification |
-| `cmd/*` | 6 | 65 | Per-tool argument handling and exit codes |
+| `cmd/*` | 9 | 69 | Per-tool argument handling and exit codes |
 
 Counts drift as tests are added; the command above is the source of truth, and this table was
-regenerated in review round 6 after the numbers here had been stale since the OCR round.
+regenerated in review round 11 (it had been stale since round 6).
 
 ### What the tests pin down
 

@@ -8,6 +8,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/susunola/wecert/internal/metrics"
+	"github.com/susunola/wecert/internal/ratelimit"
 )
 
 // quotaSeries returns every currently-exported {limit,scope} pair of the remaining-tokens gauge.
@@ -158,7 +159,9 @@ func TestEveryScopeInAFamilyIsPublished(t *testing.T) {
 	m.PublishQuota(map[string][]string{
 		"registered-domain":    {"a.example.com", "b.example.com", "c.example.com"},
 		"exact-identifier-set": {"set-a", "set-b"},
-		"identifier":           {"a.example.com", "b.example.com", "c.example.com"},
+		// The identifier family comes from the store (see PublishQuota), so these are ignored --
+		// TestIdentifierQuotaSeriesCoverOnlyWhatWasSpent is where that contract lives.
+		"identifier": {"a.example.com", "b.example.com", "c.example.com"},
 	})
 
 	series := quotaSeries(t)
@@ -172,5 +175,42 @@ func TestEveryScopeInAFamilyIsPublished(t *testing.T) {
 	// The account-wide limit has no caller-supplied scope and must still be reported once.
 	if !hasScope(series, "") {
 		t.Errorf("the account-wide limit must still be published, got %v", series)
+	}
+}
+
+// The per-identifier family is published for the identifiers that have been SPENT against, not for
+// every SAN in the desired state.
+//
+// It is the only unbounded family -- "every name of every certificate" grows with the fleet -- while
+// the buckets that can be exhausted grow with what has been attempted. Publishing one series per name
+// cost the round-11 scale work 11,001 series of 17,052, a 1.67 MB scrape and 22,002 SQL statements in
+// an ordinary scheduled pass at 500 certificates of 20 names. A name nobody has validated has a full
+// budget, so the only number its series could carry is the limit's capacity.
+func TestIdentifierQuotaSeriesCoverOnlyWhatWasSpent(t *testing.T) {
+	metrics.RateLimitRemaining.Reset()
+
+	_, m, _, _ := newAPITestHarness(t, []string{"unspent.example.com"})
+	m.quota.Spend(ratelimit.AuthzFailuresPerIdentifier, "spent.example.com", 1)
+
+	m.PublishQuota(map[string][]string{
+		"registered-domain":    {"example.com"},
+		"exact-identifier-set": {"set-a"},
+		"identifier":           {"unspent.example.com", "spent.example.com"},
+	})
+
+	series := quotaSeries(t)
+	if !hasScope(series, "spent.example.com") {
+		t.Errorf("an identifier this program has spent against must be published: it is the one whose "+
+			"budget can be exhausted. Exported: %v", series)
+	}
+	if hasScope(series, "unspent.example.com") {
+		t.Errorf("an identifier with no spend must not be published; its budget is full and the series "+
+			"is pure cardinality. Exported: %v", series)
+	}
+
+	// The other families still follow the desired state, so the alert keeps a series per domain and
+	// per identifier set.
+	if !hasScope(series, "example.com") || !hasScope(series, "set-a") {
+		t.Errorf("the bounded families must keep publishing every scope they are given, got %v", series)
 	}
 }

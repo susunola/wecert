@@ -506,7 +506,7 @@ CA/Browser Forum 已经排定 **≤100 天从 2027-03-15 起、≤47 天从 2029
 | 某组超过 25 个 SAN | 保留该组上一版 | 丢掉整组会让 wecert 看到一张证书凭空消失 |
 | 单条声明写错 | 只排除该条，报告里留 reason | 一个手误不该让所有证书停止更新 |
 | 某张证书签发失败 | 不影响其它证书 | 一张配错域名的证书拖住全部续期，是自动化里最危险的耦合 |
-| 临近到期且反复签发失败（`failureFallback` 开启时） | 摘掉反复失败的名字先签 | 部分可用好过全挂；只摘有逐个失败证据的名字，且会自愈 |
+| 临近到期且反复签发失败（`failureFallback` 开启时） | 摘掉反复失败的名字先签 | 部分可用好过全挂；只摘有逐个失败证据的名字；恢复（重试全集）发生在下一个续期窗口 |
 
 ### 限速算术
 
@@ -775,7 +775,7 @@ HMAC 要对**收到的原始字节**计算，不要拿重新序列化出来的 J
 
 **只摘"确实单独失败过"的名字。** 没有逐个 identifier 的证据时它什么都不做 —— 随机摘会把本来好的名字也一起牺牲掉，那比不降级更糟。它也不适用于"还没有生效证书"的情况：那时没有"保住现有的"这个立论，只有"少签几个"。
 
-**它会自愈。** 被摘掉的名字永远不会再被尝试，所以它不可能靠自己挣回一次成功。走的是另一条路：失败记录在 `failureWindow` 之后老化，那个名字就不再被摘掉，下一轮自然会去重试全集。DNS 修好之后最多等一个窗口就恢复 —— 不需要额外的重试状态，也不需要人工介入。
+**它会自愈，但要等到续期窗口。** 被摘掉的名字永远不会再被尝试，所以它不可能靠自己挣回一次成功。走的是另一条路：失败记录在 `failureWindow` 之后老化，那个名字就不再被摘掉；此后**续期窗口**会重试全集（与「配置变化收敛」走同一个 SAN 漂移分支）。所以恢复的上界是证书自己的续期时间，不是 `failureWindow`：在 90 天的证书上修好 DNS，仍要等到 `notAfter - renewBefore` 才会重试全集。这个延迟是刻意的 —— 每轮都下全集的单正是 fallback 要制止的振荡，一周内就会耗尽「同一标识符集合 5 张」的额度 —— 但在等待修复生效之前值得知道它。在全集证书签发成功之前，`wecert_certificate_fallback_active` 一直是 1，被摘掉的名字也一直写在 `cert_fallback` 行与报告里。
 
 要盯着的是 `wecert_certificate_fallback_active{cert}` 和 `wecert_certificate_fallback_dropped_names{cert}`。降级长期为 1 说明有个未解决的问题，而不是一个稳态。
 
@@ -934,7 +934,11 @@ ssl:DescribeCertificateBindResourceTaskResult
 | `-once` | `false` | 只跑一轮就退出（配合 systemd timer / cron） |
 | `-interval` | `1h` | 守护模式下的收敛间隔 |
 | `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
-| `-dry-run` | `false` | 只校验配置并初始化 ACME 账号，不签发也不部署 |
+| `-dry-run` | `false` | 校验配置、初始化 ACME 账号，并构造 DNS provider 与 deployer（静态凭证有问题在这里就会失败）；不签发也不部署 |
+| `-revoke` | — | 请求 CA 吊销这张证书后退出（先把决定写进状态库，CA 暂时失败时由守护进程重试） |
+| `-revoke-reason` | `unspecified` | `unspecified` \| `keyCompromise` \| `affiliationChanged` \| `superseded` \| `cessationOfOperation` |
+| `-yes` | `false` | 配合 `-revoke`：跳过交互确认（否则要求手输证书名） |
+| `-restore` | — | 恢复状态快照后退出：快照文件、快照目录，或 `latest`（见 **docs/recovery.md**）。守护进程持锁时拒绝执行；被替换掉的数据库保留在 `state.db.replaced-<stamp>` |
 | `-version` | `false` | 打印版本后退出 |
 
 ### `wecert-onboard`（期望状态生成器）

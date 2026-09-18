@@ -10,16 +10,66 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
-	"github.com/susunola/wecert/internal/config"
+	"io"
+	"log/slog"
 	"math/big"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 
 	legoacme "github.com/go-acme/lego/v4/acme"
 )
+
+// The operator's decision must reach the store even when the CA cannot be reached at all.
+//
+// The CLI prepared the ACME account (which reads the CA directory) BEFORE recording the request, so a
+// CA that was down meant `wecert -revoke` failed with nothing recorded: no retry, no
+// wecert_revocation_pending, and the documented promise -- "written to the state store FIRST, so a
+// transient CA failure leaves a durable record" -- quietly false on the one action an operator takes
+// about a leaked key. RecordRevocation talks to the store and nothing else, which is what this pins:
+// a manager whose CA core is nil still records.
+func TestRevocationIsRecordedWithoutAnyCAccess(t *testing.T) {
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if err := store.PutCert(&state.CertState{
+		Name: "example-com", NotAfter: fixed.Add(30 * 24 * time.Hour),
+		CertPEM: selfSignedCertPEM(t, fixed.Add(30*24*time.Hour), "example.com"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// nil core: no ACME account, no directory, no network.
+	m := newManager(store, nil, nil, nil, deploy.Noop{}, log)
+	m.SetNow(func() time.Time { return fixed })
+
+	if err := m.RecordRevocation("example-com", RevocationReasons["keyCompromise"]); err != nil {
+		t.Fatalf("recording must not need the CA: %v", err)
+	}
+	req, err := store.GetRevokeRequest("example-com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req == nil {
+		t.Fatal("the decision was not recorded, so nothing will retry it")
+	}
+	if req.Reason != RevocationReasons["keyCompromise"] {
+		t.Errorf("reason = %d, want keyCompromise", req.Reason)
+	}
+	if req.CertIdentity == "" {
+		t.Error("the identity of the certificate being revoked must be recorded with the request")
+	}
+}
 
 // A revocation the CA does not accept must survive as a durable request.
 //

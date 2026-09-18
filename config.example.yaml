@@ -40,6 +40,14 @@ acme:
   #    production directory:
   #      https://acme-v02.api.letsencrypt.org/directory
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
+
+  # ⚠️ Replace this with a mailbox you can read. It is where the CA sends expiry and
+  #    revocation notices, and Let's Encrypt REFUSES the reserved documentation domains
+  #    (example.com, example.net, example.org, ...) when it registers the account: the
+  #    error is `contact email has forbidden domain`, and nothing is issued at all.
+  #
+  #    wecert rejects those names locally too, with that reason, so an unedited file fails
+  #    at once instead of at the CA -- install.sh's final step is exactly this -dry-run.
   email: ops@example.com
 
 dns:

@@ -90,7 +90,7 @@ Deliberately break DNS for one name, and watch wecert not burn the account.
 |---|---|---|
 | 5.1 | Remove the challenge record's zone delegation for one SAN | the authorization fails, and the failure is booked against **that identifier** (`identifier_failures` has one row) |
 | 5.2 | Leave it failing, with `failureFallback` **off**, for a day | orders stop being placed for the window, and the backoff caps at 6h — count the orders in the log and compare against "5 per exact set per 7 days" |
-| 5.3 | Repeat with `failureFallback` **on**, near expiry | exactly one degraded issuance, then the full set is retried only after the failure evidence ages out — **not** on every pass (the review's P1-3) |
+| 5.3 | Repeat with `failureFallback` **on**, near expiry | exactly one degraded issuance, then the full set is retried at the **renewal window** — not on every pass, and not merely when the failure evidence ages out (the evidence expiring stops the reduction being forced; the renewal window is what orders; the review's P1-3) |
 | 5.4 | Restore the delegation | the next round succeeds with the full set, and the ledger is cleared |
 
 ## 6. Crash recovery, for real
@@ -104,7 +104,26 @@ The unit tests cover the logic; this covers the process.
 | 6.3 | `kill -9` between finalize and download | the next pass resumes the same order (same `order_url`) and issues |
 | 6.4 | `sqlite3 state.db 'PRAGMA quick_check;'` after each | `ok` |
 
-## 7. Sign-off
+## 7. Restoring a snapshot, including the caveat
+
+The operator journey whose failure mode is silent: the restore itself succeeds, and the *next*
+issuance is refused by the CA because the snapshot's rate-limit ledger stopped when it was written.
+Needs a deployment that has issued something, so run it after §1.
+
+| # | Do | Expect |
+|---|---|---|
+| 7.1 | With the daemon stopped, `wecert -restore latest` | prints the snapshot it chose, the date of its data, the account/certificate count, and the `caveatUntil` date; the database it replaced is kept at `state.db.replaced-<stamp>` |
+| 7.2 | `ls -l state.db*` | `state.db` (0600), `state.db.restored`, the `.replaced-<stamp>` file, and **no** `-wal`/`-shm` beside the restored database |
+| 7.3 | Start the daemon | a WARN naming `restoredAt`, `dataFrom` and `caveatUntil`; the first pass adopts the restored state (the in-flight order is advanced, not re-placed) |
+| 7.4 | Run `wecert -restore latest` **while the daemon is up** | refused, naming the lock file and telling you to stop the process; nothing is moved |
+| 7.5 | Point `-restore` at a file that is not a snapshot (`/etc/hostname`) and at a directory with no snapshots | both refused, in the operator's words; the live database is untouched |
+| 7.6 | Go back: stop the daemon, `mv state.db.replaced-<stamp> state.db` | the newer state is back (delete `state.db.restored` with it, or the warning outlives the restore it describes) |
+
+**Failure worth recognising:** if the start after a restore logs "no account in the state store;
+registering a new ACME account", the snapshot came from a deployment pointed at a different ACME
+directory — and that registration is one of the 10 per IP per 3 hours.
+
+## 8. Sign-off
 
 Record, in the release notes or the PR:
 

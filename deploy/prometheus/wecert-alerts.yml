@@ -95,11 +95,17 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.host }} is not serving the deployed certificate"
+          summary: "{{ $labels.host }} is not serving the certificate wecert deployed"
           description: >-
-            Either the rebind did not take effect or another certificate is winning SNI. Check
-            wecert_certificate_probe_not_after_timestamp_seconds against
-            wecert_certificate_not_after_timestamp_seconds for the same host.
+            Either the rebind did not take effect, another certificate is winning SNI, or the
+            certificate that is deployed is below probe.minValidFor (in which case it IS the
+            deployed one and the log line says so). The journal carries the per-address reason:
+            wecert_certificate_probe_match == 0 with wecert_certificate_probe_errors_total flat
+            means every address answered. To compare expiries by hand, find the certificate whose
+            SANs cover {{ $labels.host }} (the config, the desired-state document, or
+            wecert_desired_state_certificates) and read
+            wecert_certificate_not_after_timestamp_seconds{cert="..."} -- the probe family is
+            labelled by host and the desired-state family by cert, so there is no join.
 
       # The probe could not run. This is an environment problem, not a certificate problem, and
       # keeping the two apart is why they are separate metrics.

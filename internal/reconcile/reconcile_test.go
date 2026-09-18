@@ -614,6 +614,66 @@ func TestOrphanedCertificatesAreReported(t *testing.T) {
 	}
 }
 
+// A deployment with hundreds of orphans must not write hundreds of ERROR lines per pass.
+//
+// The orphan state is persistent by design (the row is kept so a re-added name resumes its history),
+// so the per-orphan line repeated on every pass: measured at 500 orphans that is 500 ERROR lines per
+// pass and 12,000 per day from one deployment, which is how a journal stops being read. The first few
+// keep their own line; the rest are counted, and every one of them is still reachable at Debug.
+func TestHundredsOfOrphansDoNotFloodTheJournal(t *testing.T) {
+	const orphans = orphanLogLimit + 5
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: "kept"}}}
+	for i := 0; i < orphans; i++ {
+		if err := store.PutCert(&state.CertState{
+			Name:     fmt.Sprintf("forgotten-%03d", i),
+			NotAfter: time.Now().Add(10 * 24 * time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var logs bytes.Buffer
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, &fakeManager{}, nil,
+		slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	r.RunDetailed(context.Background())
+
+	if got := testutil.ToFloat64(metrics.OrphanedCertificates); got != orphans {
+		t.Errorf("OrphanedCertificates = %v, want %d -- the count is what tells the operator the scale",
+			got, orphans)
+	}
+
+	// At Error: the first orphanLogLimit lines plus one summary. Everything else is Debug.
+	var errorLines, detailLines, summaries int
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		switch {
+		// The summary first: its wording contains the per-orphan sentence as well.
+		case strings.Contains(line, "more certificates are no longer"):
+			summaries++
+		case strings.Contains(line, "level=ERROR") && strings.Contains(line, "no longer in the desired state"):
+			errorLines++
+		case strings.Contains(line, "level=DEBUG") && strings.Contains(line, "no longer in the desired state"):
+			detailLines++
+		}
+	}
+	if errorLines != orphanLogLimit {
+		t.Errorf("ERROR orphan lines = %d, want %d (the bound)", errorLines, orphanLogLimit)
+	}
+	if summaries != 1 {
+		t.Errorf("expected exactly one summary line, got %d", summaries)
+	}
+	if detailLines != orphans-orphanLogLimit {
+		t.Errorf("the orphans past the bound must still be nameable at Debug: got %d, want %d",
+			detailLines, orphans-orphanLogLimit)
+	}
+}
+
 // ── a full trigger must resolve once and stay bounded ──────────────────────
 
 // countingProvider counts Desired calls.
@@ -668,6 +728,59 @@ func TestStartAllResolvesTheDesiredStateOnce(t *testing.T) {
 	}
 	if got := len(mgr.reconciled()); got != n {
 		t.Errorf("every certificate must still be reconciled, got %d of %d", got, n)
+	}
+}
+
+// A full trigger must publish the quota gauges once, not once per certificate.
+//
+// publishQuota costs two store reads per scope, and the scope map is derived from the desired state
+// (one entry per registered domain, per identifier set and, before round 11, per identifier). Calling
+// it from each certificate's pass made the trigger quadratic in the fleet: the round-11 scale work
+// measured 500 certificates of 20 names at 11,001,500 SQL statements and 84.4 s, against 23,003
+// statements and 0.234 s for the same fleet's scheduled pass. The last pass of a batch publishes for
+// the whole batch, so the numbers still include every spend the batch made.
+func TestAFullTriggerPublishesQuotaOnce(t *testing.T) {
+	const n = 12
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{}
+	for i := 0; i < n; i++ {
+		cfg.Certificates = append(cfg.Certificates, config.Certificate{
+			Name:    fmt.Sprintf("c-%02d", i),
+			Domains: []string{fmt.Sprintf("c-%02d.example.com", i)},
+		})
+	}
+
+	done := make(chan struct{}, n)
+	mgr := &fakeManager{onReconcile: func(string) { done <- struct{}{} }}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, log)
+
+	if _, _, err := r.StartAll(context.Background()); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		<-done
+	}
+
+	// The publish happens in a deferred call in the last pass's goroutine, after onReconcile fires
+	// for every certificate, so wait for the claims to be released as well.
+	for i := 0; i < 500; i++ {
+		if r.quotaPasses.Load() == 0 && !r.anyPassInFlight() {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	published := mgr.publishedQuota()
+	if len(published) != 1 {
+		t.Errorf("published the quota gauges %d times for one full trigger of %d certificates; "+
+			"once per trigger is what keeps it linear in the fleet", len(published), n)
 	}
 }
 
@@ -1326,6 +1439,50 @@ func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
 	if after["error"] != before["error"] {
 		t.Errorf("a backoff skip is not a failure; error count went from %v to %v",
 			before["error"], after["error"])
+	}
+}
+
+// A pass in which every certificate is inside its backoff window must be reported as trouble.
+//
+// This is the classification Trouble() depends on, and the reason the guard it used to have could
+// never fire: an ErrBackoff pass increments Backoff and does NOT append to Skipped, so a one-shot run
+// exited 0 with a green journal for a certificate parked for up to six hours. Asserting it here as
+// well as on Trouble() itself keeps the two halves -- what the pass records, and what the exit code
+// reads -- from drifting apart again.
+func TestAPassInBackoffIsRecordedAsTrouble(t *testing.T) {
+	names := []string{"backing-off-one", "backing-off-two"}
+
+	mgr := &fakeManager{failWith: map[string]error{
+		names[0]: state.ErrBackoff,
+		names[1]: state.ErrBackoff,
+	}}
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	certs := make([]config.Certificate, 0, len(names))
+	for _, n := range names {
+		certs = append(certs, config.Certificate{Name: n})
+	}
+	cfg := &config.Config{Certificates: certs}
+	r := New(cfg, spec.NewStatic(certs), store, mgr, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rep := r.RunDetailed(context.Background())
+	if rep.Backoff != len(names) {
+		t.Errorf("Backoff = %d, want %d: this is the count the exit code reads", rep.Backoff, len(names))
+	}
+	if len(rep.Skipped) != 0 {
+		t.Errorf("a backoff skip is not an in-flight skip; Skipped = %v", rep.Skipped)
+	}
+	if rep.Attempted != 0 {
+		t.Errorf("nothing was attempted, got %d", rep.Attempted)
+	}
+	if !rep.Trouble() {
+		t.Error("a pass that attempted nothing because every certificate is in its retry window is " +
+			"not a healthy pass: the timer would exit 0 while nothing is being renewed")
 	}
 }
 

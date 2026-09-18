@@ -129,6 +129,12 @@ type Reconciler struct {
 	// starts, so a pass still queued for a start slot is counted too.
 	bg sync.WaitGroup
 
+	// quotaPasses counts the webhook-triggered passes that are still running, so the quota gauges are
+	// republished once when the last of them finishes rather than once per certificate. See startCert:
+	// publishing is proportional to the scopes in the desired state, so per-certificate publication
+	// made a full trigger quadratic in the fleet (11 million SQL statements at 500 certificates).
+	quotaPasses atomic.Int64
+
 	// bgMu serializes a pass's registration against Drain's transition to draining.
 	//
 	// sync.WaitGroup requires that a positive Add which starts from zero does not run concurrently
@@ -396,17 +402,39 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		}
 
 		orphans++
-		r.tearDownOrphan(ctx, name)
+		// Only the first few get their own line (see orphanLogLimit): the count is what an operator
+		// acts on, and 500 of these every pass -- which is what a deployment that dropped a whole
+		// generated document looks like -- buries every other line in the journal, forever, because
+		// the row is deliberately kept.
+		r.tearDownOrphan(ctx, name, orphans > orphanLogLimit)
 	}
 	metrics.OrphanedCertificates.Set(float64(orphans))
+	if orphans > orphanLogLimit {
+		r.log.Error("more certificates are no longer in the desired state than are listed above; they "+
+			"will not be renewed and will expire unless their declarations come back",
+			"orphans", orphans, "listed", orphanLogLimit,
+			"metric", "wecert_orphaned_certificates",
+			"listThem", "sqlite3 <statePath> \"SELECT name FROM certificates ORDER BY name\" and "+
+				"compare against the desired-state document")
+	}
 }
+
+// orphanLogLimit bounds the per-pass orphan lines at Error.
+//
+// Why a bound at all: an orphan is loud on purpose (nothing else will ever mention that a
+// certificate stopped being renewed), but the state is persistent by design -- the row is kept so a
+// re-added name resumes its history -- so the line repeats on every pass. At 500 orphans that is
+// 500 ERROR lines per pass and 12,000 per day from one deployment, which is how a journal stops
+// being read. The first few are listed with their names and expiry; the rest are counted, and the
+// count is exported as wecert_orphaned_certificates.
+const orphanLogLimit = 10
 
 // tearDownOrphan reclaims everything a certificate that left the desired state still holds.
 //
 // The claim on the name is already held by the caller (see publishOrphans); this function
 // releases it on every path, including a panic in the middle of the teardown, so a failure here
 // cannot wedge the name against every later pass.
-func (r *Reconciler) tearDownOrphan(ctx context.Context, name string) {
+func (r *Reconciler) tearDownOrphan(ctx context.Context, name string, counted bool) {
 	defer r.release(name)
 
 	st, stErr := r.store.GetCert(name)
@@ -444,9 +472,15 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string) {
 		attrs = append(attrs, "notAfter", st.NotAfter,
 			"daysLeft", config.DaysUntil(st.NotAfter, time.Now()))
 	}
-	r.log.Error("this certificate is no longer in the desired state, so it will not be renewed "+
-		"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard",
-		attrs...)
+	msg := "this certificate is no longer in the desired state, so it will not be renewed " +
+		"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard"
+	if counted {
+		// Past the limit the line still exists -- at Debug, so `-log-level=debug` or a journal query
+		// can still name every one of them -- but it does not drown the pass summary.
+		r.log.Debug(msg, attrs...)
+		return
+	}
+	r.log.Error(msg, attrs...)
 }
 
 // orphanProbeHosts recovers the dialable names of a dropped certificate from the
@@ -457,7 +491,18 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string) {
 // was never issued was also never probed (probing requires a confirmed deploy),
 // so there is nothing to reclaim then.
 func (r *Reconciler) orphanProbeHosts(st *state.CertState) []string {
-	return probeHosts(r.issuedSANs(st), r.cfg.Probe.MaxHostsPerCert)
+	hosts := probeHosts(r.issuedSANs(st), r.cfg.Probe.MaxHostsPerCert)
+	if len(hosts) == 0 && st != nil && len(st.CertPEM) > 0 {
+		// An orphan has no configured names to fall back to, so an unreadable certificate means the
+		// per-host probe series cannot be reclaimed here. Say that, because the consequence is a
+		// series frozen at its last value -- and if probe_match was 0 for one of those hosts, the
+		// documented alert on it fires forever for a host nobody manages.
+		r.log.Warn("cannot read the names out of the stored certificate of a certificate that left "+
+			"the desired state, so its per-host probe series cannot be reclaimed automatically; "+
+			"delete them by hand if one of them is frozen at 0",
+			"cert", st.Name)
+	}
+	return hosts
 }
 
 // issuedSANs returns the names of the certificate actually stored for this certificate, or
@@ -485,8 +530,11 @@ func (r *Reconciler) issuedSANs(st *state.CertState) []string {
 	}
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		r.log.Warn("cannot parse the stored certificate; falling back to the configured names",
-			"cert", st.Name, "err", err)
+		// No warning here. The message used to live in this function and claim it was "falling back
+		// to the configured names" -- which is what probeCert does with a nil answer, but this
+		// function has no configured names and its other caller (orphanProbeHosts) has none at all:
+		// a certificate that left the desired state still has its SANs nowhere else, so the honest
+		// statement is "the names are unknown", and each caller now says what that costs it.
 		return nil
 	}
 	return leaf.DNSNames
@@ -524,16 +572,23 @@ type RunReport struct {
 
 // Trouble reports whether this pass should be treated as a failure by a one-shot run.
 //
-// A plain "Failed > 0" is not enough on its own. A certificate whose retries are all inside
-// a backoff window produces Backoff > 0 and Failed == 0, so a run that attempted nothing
-// and skipped everything would look clean -- which is exactly the state a certificate stuck
-// in a long backoff sits in, and exactly what a caller running once per interval needs to
-// hear about.
+// A plain "Failed > 0" is not enough on its own. A certificate whose retries are all inside a backoff
+// window produces Backoff > 0 and Failed == 0, so a run that attempted nothing would look clean --
+// which is exactly the state a certificate stuck in a long backoff sits in, and exactly what a caller
+// running once per interval needs to hear about.
+//
+// Backoff and Skipped are both "attempted nothing", and they are the whole guard: the version of this
+// function that checked only Skipped could never fire for the case its own comment was about, because
+// an ErrBackoff pass increments Backoff and never appends to Skipped (see RunDetailed). The gap is
+// reachable in practice, not theoretical: the backoff is 1m<<n capped at 6h, so after about seven
+// consecutive failures it exceeds an hourly timer's interval, and from then on the unit exits 0 with
+// a green journal while the certificate is not being renewed. README.md and
+// docs/lifecycle-acceptance.md both document the exit code as the timer's only alert channel.
 func (rep RunReport) Trouble() bool {
 	if rep.Failed > 0 || rep.DesiredStateUnreadable {
 		return true
 	}
-	return rep.Attempted == 0 && len(rep.Skipped) > 0
+	return rep.Attempted == 0 && (rep.Backoff > 0 || len(rep.Skipped) > 0)
 }
 
 // RunDetailed runs one pass over every certificate and reports what happened.
@@ -735,6 +790,40 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 	r.probedHosts = map[string]struct{}{}
 	r.probeMu.Unlock()
 
+	// Resolve the desired state ONCE for the whole loop, not once per stale host.
+	//
+	// This used to live in hostIsUnconfirmed, which the loop called per host: every stale host paid
+	// a full resolve -- a file read, a YAML decode, a validation pass and a sha256 of the document.
+	// The scale work in round 11 measured the result at the default probe cap: 500 certificates, a
+	// pass that reclaims stale hosts took 27.8 s against 0.18 s for the same pass with nothing to
+	// reclaim (155x), and it is exactly O(staleHosts x fleetSize): 0.41/1.48/5.66/22.9 s at
+	// 25/50/100/200 certificates. The hosts are also what a shrinking probe set produces -- removed
+	// certificates or names -- so this is the shape of an ordinary fleet edit, not a corner case.
+	//
+	// hostOwner is nil when there is no desired state to judge from (a partially built reconciler in
+	// tests, or an unreadable document): every stale host is then reclaimed, which is what the old
+	// helper did for the partially built case.
+	var hostOwner map[string]string
+	if r.store != nil && r.provider != nil {
+		res := r.resolve(context.Background())
+		if res == nil {
+			// No desired state: keep the series rather than deleting evidence.
+			return
+		}
+		hostOwner = make(map[string]string, len(res.Certificates))
+		for i := range res.Certificates {
+			c := &res.Certificates[i]
+			for _, d := range probeHosts(c.Domains, len(c.Domains)) {
+				// First certificate wins, matching the old helper's "return on the first match"
+				// order: a host covered by two certificates must be judged by the one the document
+				// lists first, not by whichever happened to be written last into the map.
+				if _, seen := hostOwner[d]; !seen {
+					hostOwner[d] = c.Name
+				}
+			}
+		}
+	}
+
 	for _, h := range all.ProbedHosts() {
 		if _, live := current[h]; live {
 			continue
@@ -763,8 +852,11 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 		// gone, so the documented alert stayed silent for the failure it exists to catch.
 		//
 		// A host whose certificate has left the desired state entirely is reclaimed as before.
-		if r.hostIsUnconfirmed(h) {
-			continue
+		if name, inDesiredState := hostOwner[h]; inDesiredState {
+			st, err := r.store.GetCert(name)
+			if err != nil || st == nil || !st.DeployConfirmed {
+				continue
+			}
 		}
 		metrics.DeleteProbeSeries(h)
 		// The runner's transition memory has to go with the series. Its own comment says
@@ -774,35 +866,6 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 		// design.
 		r.prober.Forget(h)
 	}
-}
-
-// hostIsUnconfirmed reports whether h belongs to a certificate that is still in the desired state
-// but not confirmed deployed, i.e. a host the probe deliberately skips rather than one that left.
-func (r *Reconciler) hostIsUnconfirmed(h string) bool {
-	if r.store == nil || r.provider == nil {
-		// A reconciler without a store or a provider has no desired state to judge from; that is a
-		// partially built one (tests), and the caller's own fallback applies.
-		return false
-	}
-	res := r.resolve(context.Background())
-	if res == nil {
-		// No desired state to judge from: keep the series rather than deleting evidence.
-		return true
-	}
-	for i := range res.Certificates {
-		c := &res.Certificates[i]
-		for _, d := range probeHosts(c.Domains, len(c.Domains)) {
-			if d != h {
-				continue
-			}
-			st, err := r.store.GetCert(c.Name)
-			if err != nil || st == nil {
-				return true
-			}
-			return !st.DeployConfirmed
-		}
-	}
-	return false
 }
 
 // anyPassInFlight reports whether any certificate currently holds a convergence claim.
@@ -919,12 +982,41 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		r.bg.Done()
 		return ErrAlreadyRunning
 	}
+	// Count this pass towards one quota publication for the whole trigger (see quotaPasses).
+	r.quotaPasses.Add(1)
 
 	// res is heap-allocated and not reused during this pass, so referring to its
 	// elements is safe.
 	go func() {
 		defer r.bg.Done()
 		defer r.release(c.Name)
+		// Publish the rate-limit gauges when a webhook-triggered pass finishes, ONCE PER TRIGGER.
+		//
+		// These gauges exist on this path at all because RunDetailed publishes them at the end of a
+		// scheduled round and the webhook had no equivalent: a pass started by a POST spends quota
+		// and records the CA's Retry-After just the same, so a deadline shorter than the polling
+		// interval (an hour by default) was never shown as blocked -- exactly the window it
+		// describes, and WecertRateLimitBlocked could not fire for it. Publishing on this path is
+		// also what puts the spend in the number.
+		//
+		// publishQuota's cost is proportional to the scopes the desired state produces, so calling it
+		// per certificate made a full trigger quadratic in the fleet: the round-11 scale work measured
+		// 11,001,500 SQL statements and 84.4 s for 500 certificates of 20 names, against 23,003
+		// statements and 0.234 s for the same fleet's scheduled pass -- minutes of the single SQLite
+		// connection and one core, with every other database user queued behind it.
+		//
+		// The last pass of a batch publishes for the whole batch, so the gauges still carry every
+		// spend the batch made, and a single StartCert still publishes for itself.
+		//
+		// Deferred rather than inlined at the end: the slot-wait below can also return early on
+		// shutdown, and a counter incremented on one path and not decremented on another would stick
+		// above zero and stop the gauges being republished for the rest of the process's life.
+		// Deferred functions run last-in-first-out, so this runs before the claim is released.
+		defer func() {
+			if r.quotaPasses.Add(-1) == 0 {
+				r.publishQuota(res)
+			}
+		}()
 
 		// Queue for a start slot instead of running immediately. Nothing is dropped:
 		// the caller has already been told "accepted", and the pass starts as soon as
@@ -942,17 +1034,6 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		}
 
 		r.reconcileOne(ctx, c)
-
-		// Publish the rate-limit gauges when a webhook-triggered pass finishes.
-		//
-		// RunDetailed publishes them at the end of a scheduled round, and this path used to have
-		// no equivalent: a pass started from the webhook spends quota and records the CA's
-		// Retry-After just the same, but nothing republished either gauge. A deadline shorter than
-		// the polling interval (an hour by default) was therefore never shown as blocked at all,
-		// which is exactly the window it describes -- the critical WecertRateLimitBlocked alert
-		// could not fire for it. Publishing here also means the spend is in the number, which it
-		// would not be if this only ran before the pass started.
-		r.publishQuota(res)
 	}()
 	return nil
 }
@@ -1135,7 +1216,12 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 		// result="ok" hid a certificate stuck in backoff behind a healthy-looking counter,
 		// and an error every interval would train people to ignore the channel.
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "skipped").Inc()
-		r.log.Debug("pass skipped: still inside the retry backoff window", "cert", c.Name)
+		// Info, not Debug: this is the only line that explains a pass which attempted nothing, and a
+		// one-shot run now exits non-zero for exactly this state (see Trouble). At Debug the timer's
+		// journal said "the pass did not converge: attempted=0 ..." with no certificate, no reason
+		// and no next attempt in it.
+		r.log.Info("pass skipped: still inside the retry backoff window an earlier failure scheduled",
+			"cert", c.Name)
 	case err != nil:
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
 		// manager already logged and scheduled backoff; this is just a summary.
@@ -1185,6 +1271,10 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 	// reported every host as a mismatch. See issuedSANs.
 	domains := r.issuedSANs(st)
 	if len(domains) == 0 {
+		r.log.Warn("cannot read the names out of the stored certificate, so probing falls back to the "+
+			"configured names (a certificate that was issued for a fallback subset would be probed "+
+			"under the full set, which can report a mismatch that is not real)",
+			"cert", c.Name)
 		domains = c.Domains
 	}
 	hosts := probeHosts(domains, r.cfg.Probe.MaxHostsPerCert)

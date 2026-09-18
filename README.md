@@ -124,13 +124,19 @@ The minimum you have to edit:
 
 ```yaml
 acme:
-  email: ops@example.com                 # staging by default; switch to production when green
+  email: ops@example.com                 # ⚠️ MUST be a mailbox you control -- see below
 dns:
   provider: tencentcloud                 # or dnspod + loginToken
 certificates:
   - name: example-com
     domains: [example.com, "*.example.com"]
 ```
+
+Two lines in that snippet are placeholders on purpose. `acme.email` must be a mailbox you
+control: Let's Encrypt refuses the reserved documentation domains (`example.com` and friends) when
+it registers the account, and wecert rejects them locally with that reason, so an unedited file
+fails at `-dry-run` rather than halfway through an installation. `acme.directory` points at staging
+on purpose — switch it to production only once the whole flow is green.
 
 Then install on the CVM — run this from the checkout, with the binary for that machine:
 
@@ -150,9 +156,13 @@ sudo vi /etc/wecert/config.yaml
 sudo -u wecert /usr/local/bin/wecert -config /etc/wecert/config.yaml -dry-run
 ```
 
-`-dry-run` loads the config, opens or creates the state database, registers the ACME account, and
-exits **without signing or deploying anything**. A green dry run means the config, the credentials
-and the state directory are all usable.
+`-dry-run` loads the config, opens or creates the state database, registers the ACME account, builds
+the DNS provider and the deployer, and exits **without signing or deploying anything**. A green dry
+run means the config parsed, the state directory is usable, the CA account is reachable, and the
+credentials are present and well-formed — for `credentialMode: static` that means they are in the
+file or the environment; for a CVM role the fetch is deferred to first use, so **nothing here calls
+the cloud API**. To check that the credentials actually work (SSL access, DNSPod ownership, NS
+delegation), run `wecert-preflight -domain <your-domain>`.
 
 ### 4. Run it
 
@@ -388,7 +398,7 @@ If domains get added by other people or other systems, `wecert-onboard` takes th
 
 The payoff is the quota arithmetic above. With `*.example.com` declared, adding `foo.example.com` costs **zero** issuances, against 50 re-issuances for a 50-subdomain import without a wildcard.
 
-Deletion is deliberately an order of magnitude more conservative than addition, and the whole thing can run in a read-only `observe` mode first. Start at [Desired state](docs/desired-state.md).
+Deletion is deliberately an order of magnitude more conservative than addition, and the whole thing can run in a read-only `observe` mode first. Start at [Desired state](docs/desired-state.md) — that document is written in Chinese; the English summary of the model (modes, the fuse, the budget, the grace period) is in [README.reference.md § Declaring domains dynamically](README.reference.md#declaring-domains-dynamically).
 
 ## Documentation
 
@@ -441,7 +451,7 @@ is not backported to an older tag. Known gaps and what is planned are in the
 | `-once` | `false` | Run one pass and exit (systemd timer / cron) |
 | `-interval` | `1h` | Reconcile interval in daemon mode |
 | `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
-| `-dry-run` | `false` | Validate config and initialise the ACME account; sign and deploy nothing |
+| `-dry-run` | `false` | Validate config, initialise the ACME account, and build the DNS provider and deployer; sign and deploy nothing |
 | `-revoke` | — | Name of the certificate to revoke, then exit (see [Revoking](#day-2-operations)) |
 | `-revoke-reason` | `unspecified` | RFC 5280 reason: `unspecified` \| `keyCompromise` \| `affiliationChanged` \| `superseded` \| `cessationOfOperation` |
 | `-yes` | `false` | With `-revoke`: skip the interactive confirmation |
@@ -506,6 +516,11 @@ Dials a real TLS connection and reports the certificate the far end actually ser
 | `-json` | `false` | Print each attempt as one JSON object (NDJSON, so a retry under `-wait`, or a host that resolves to several addresses, produces one line per attempt) |
 
 Exit codes: `0` served as expected · `1` could not complete a probe · `2` probed successfully but the certificate served was not the expected one.
+
+Under `-json`, `verdict.problems` is a list of objects — `{"kind": "...", "text": "..."}` — one per
+independent problem, because they point in different directions: `min_valid_for` means the deployed
+certificate **is** being served but has too little validity left (renewal has not run), while
+`not_after` or `names_extra` mean a different certificate is being served.
 
 ```bash
 ./bin/wecert-probe -host www.example.com -min-valid 168h
