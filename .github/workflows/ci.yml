@@ -130,7 +130,7 @@ jobs:
           rc=$?
           set -e
           echo "== install.sh exit code: ${rc} (log follows)"
-          tail -n 30 "${log}"
+          cat "${log}"
           expect_eq "install.sh exit code" 0 "${rc}"
 
           expect_path "the wecert binary is installed and executable" -x /usr/local/bin/wecert
@@ -159,7 +159,7 @@ jobs:
           rc2=$?
           set -e
           echo "== second install.sh exit code: ${rc2} (log follows)"
-          tail -n 30 "${log2}"
+          cat "${log2}"
           expect_eq "second run exit code" 0 "${rc2}"
           if sudo grep -q 'sentinel-line for the install.sh smoke test' /etc/wecert/config.yaml; then
             note "the second run did not overwrite the config"
