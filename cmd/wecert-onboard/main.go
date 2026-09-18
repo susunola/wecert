@@ -47,7 +47,12 @@ func main() {
 // Exit codes. The freeze case uses 2 rather than 1 so monitoring can tell "this round
 // deliberately froze" (a human should look) from "the program itself crashed" (a bug to fix).
 const (
-	exitOK     = 0
+	exitOK = 0
+	// exitUsage is the conventional "the command line itself is wrong" code, and it is what
+	// wecert-probe and wecert-preflight already use. A missing -config or a bad flag used to exit 1,
+	// which every document in this repository defines as "the program ran and failed" -- so a typo
+	// in a systemd ExecStart looked exactly like a failed round.
+	exitUsage  = 64
 	exitError  = 1
 	exitFrozen = 2
 )
@@ -100,7 +105,7 @@ Flags:
 	)
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
-		return exitError, err
+		return exitUsage, err
 	}
 	if *showVer {
 		fmt.Println("wecert-onboard", version)
@@ -108,7 +113,7 @@ Flags:
 	}
 	if *configPath == "" {
 		fs.Usage()
-		return exitError, errors.New("-config is required")
+		return exitUsage, errors.New("-config is required")
 	}
 
 	// Only flags **explicitly given** override the config. Use fs.Visit, not zero-value

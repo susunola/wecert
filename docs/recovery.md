@@ -15,6 +15,13 @@ the file as the system's only source of truth.
 
 ---
 
+> **先读这条**：`wecert` 启动时如果发现 `state.db-shm` 在、而 `state.db-wal` 不在，会打印一条警告
+> 并把你指到这里。那个组合意味着 **WAL 被人删掉了**（清理脚本匹配 `*-wal`、手工清理、或者更糟），
+> 而 WAL 里装着上次 checkpoint 以来已提交的全部事务——**in-flight 订单 URL 就在里面**。丢了它，
+> 下一轮会重新下单，再花一次「同一标识符集合每 7 天 5 张」的额度。
+> 这时不要继续跑：先按下文「2. 从快照恢复」把最新快照装回去（快照是 `VACUUM INTO` 的完整副本，
+> 不依赖任何 sidecar），再启动。
+
 ## 1. Snapshots
 
 Enabled by default (`stateBackup`, see `config.example.yaml`). Every `interval` (24h) wecert

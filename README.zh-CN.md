@@ -162,7 +162,7 @@ staging 端到端全绿之后，把 `acme.directory` 指向 `https://acme-v02.ap
 
 ## 日常运维
 
-**状态放在哪里。** `statePath`，默认 `/var/lib/wecert/state.db`（0600，所在目录 0700）。它装着 ACME 账号密钥、每一张证书的私钥、在飞订单的 order URL，以及 ARI certID —— 而丢掉一个 order URL 就要拿一次签发去补，直接算在 5 / 7 天这条限额上。所以它也会被自动快照：`stateBackup` 默认开启，每 24 小时做一次一致的 `VACUUM INTO`，保留 7 份。每种丢失的代价、以及怎么恢复一份快照：[docs/recovery.md](docs/recovery.md)。
+**状态放在哪里。** `statePath`（**必填，没有默认值**），例如 `/var/lib/wecert/state.db`（0600，所在目录 0700）。它装着 ACME 账号密钥、每一张证书的私钥、在飞订单的 order URL，以及 ARI certID —— 而丢掉一个 order URL 就要拿一次签发去补，直接算在 5 / 7 天这条限额上。所以它也会被自动快照：`stateBackup` 默认开启，每 24 小时做一次一致的 `VACUUM INTO`，保留 7 份。每种丢失的代价、以及怎么恢复一份快照：[docs/recovery.md](docs/recovery.md)。
 
 **健康与告警。** `/metrics` 默认监听 `127.0.0.1:9800`，并附一份[可直接加载的规则文件](deploy/prometheus/wecert-alerts.yml)：17 条告警，覆盖按 profile 的到期、收敛与完整性 —— CA 还没接受的吊销、两小时没跑完的一轮、正在服务的不是部署的那张证书。该监听端口不做任何鉴权，所以请让它留在 localhost 或私有网卡上。
 
@@ -252,7 +252,7 @@ lego 高层的 `certificate.Obtain` 是刻意不用的：它在内部自己调 `
 
 时间轴按 `classic` 的 90 天证书画。真正决定续期时刻的是 ARI 的 `suggestedWindow`；`renewBefore` 只是 ARI 不可用时的兜底。
 
-ARI 协调的续期**豁免 Let's Encrypt 的全部速率限制** —— 但前提是 identifier 集合不变。这正是通配符优先不只是一项优化的原因，也是"加一个域名"的成本必须被压到接近零的原因。
+ARI 协调的续期在被替换证书**至少共享一个标识符**时**豁免 Let's Encrypt 的全部速率限制**（官方措辞是 "at least one identifier matching the certificate it intends to replace"）。集合不变自然满足，在一张既有证书上加名字也满足 —— 这正是通配符优先不只是一项优化的原因；而**完全不相交**的集合（把名字整体搬到另一张证书上）才要花 `Certificates per Registered Domain`。
 
 这些图背后的三张表 —— 数据所有权、失败语义、限速算术 —— 在[证书生命周期](README.reference.zh-CN.md#证书生命周期)，同样七张图也在那里。另有一份可交互页面：[docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)，图之间有可点的跳转，还有一个打印 / 存 PDF 的按钮。
 

@@ -238,6 +238,13 @@ authentication, so keep it on localhost or a private interface.
 If the metrics port cannot be bound, wecert exits rather than logging and continuing: `/metrics` is
 the only expiry-alerting path, and a silently dead endpoint means certificates expire unnoticed.
 
+> **The metrics exist only while the daemon does.** In `wecert-once.timer` mode the exporter lives
+> for the length of one pass, so a scrape has to land inside it and every rule with a `for:` (5
+> minutes and up) can never fire — including the expiry warnings. The timer's exit status still
+> reports "this pass did not converge", and the log lines are all there, but **metric-based
+> alerting requires the daemon** (or `wecert-once` plus a push gateway). Choose the daemon if you
+> want the rules in that file to mean anything.
+
 **Convergence on demand.** Configure `webhook` and CI can trigger convergence right after a domain
 is added, instead of waiting for the next tick:
 
@@ -357,7 +364,7 @@ The second point is the constraint everything else is built around — wildcard-
 
 The axis is drawn for a `classic` 90-day certificate. What actually decides when renewal happens is ARI's `suggestedWindow`; `renewBefore` is only the fallback for when ARI is unavailable.
 
-ARI-coordinated renewals are **exempt from every Let's Encrypt rate limit** — but only if the identifier set is unchanged. That is what makes wildcard-first more than an optimisation, and why adding a domain has to be driven to nearly zero cost.
+ARI-coordinated renewals are **exempt from every Let's Encrypt rate limit** when the order shares at least one identifier with the certificate it replaces (Let's Encrypt's own wording: "at least one identifier matching the certificate it intends to replace"). An unchanged set trivially qualifies, and so does adding a name to an existing certificate — which is what makes wildcard-first more than an optimisation, while a wholly disjoint set (moving one name from certificate A to certificate B) is the case that loses the exemption and spends Certificates per Registered Domain.
 
 The tables behind these diagrams — data ownership, failure semantics and the rate-limit arithmetic — are in [The certificate lifecycle](README.reference.md#the-certificate-lifecycle), alongside the same seven figures. There is also a single interactive page at [docs/certificate-lifecycle.en.html](docs/certificate-lifecycle.en.html), with links between the figures and a print/PDF button.
 
@@ -373,7 +380,7 @@ The tables behind these diagrams — data ownership, failure semantics and the r
 
 The CA/Browser Forum has scheduled **≤100 days from 2027-03-15 and ≤47 days from 2029-03-15**, so "90-day certificates plus a manual fallback" stops being an option within two years. Keeping each certificate to **25 domains or fewer** aligns with `tlsserver` and bounds the blast radius — domains in one certificate succeed, fail and expire together.
 
-> Adding or removing a domain makes that issuance a new certificate, so it counts against **Certificates per Registered Domain (50 / 7 days)** instead of enjoying the ARI exemption.
+> Adding or removing a domain keeps the ARI exemption as long as at least one identifier is shared with the certificate being replaced (see the rule above). It is the **wholly disjoint** set — every name moving to a different certificate — that counts against **Certificates per Registered Domain (50 / 7 days)** instead.
 
 ## When domains are declared elsewhere
 

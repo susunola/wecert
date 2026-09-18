@@ -148,6 +148,12 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		// the deployed one" is unproven. Leaving probe_match at its previous value
 		// would keep reporting a stale 1 while the verdict is non-OK -- exactly the
 		// false green this metric exists to rule out.
+		//
+		// The consequence to know when reading a dashboard: on a dual-stack host whose AAAA is
+		// unreachable, the addresses that DID answer served exactly the deployed certificate, and
+		// this still exports 0 with a probe error. That is deliberate (an unverified address is not
+		// a verified one) but it means "probe_match == 0" alone does not say WHICH failure it is:
+		// read wecert_certificate_probe_errors_total next to it, and the per-address log lines.
 		metrics.CertificateProbeMatch.WithLabelValues(host).Set(0)
 		msg := "some resolved addresses could not be probed: " + strings.Join(attemptErrs, " | ")
 		r.transition(host, stateUnreachable,

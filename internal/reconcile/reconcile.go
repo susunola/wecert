@@ -752,6 +752,20 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 		if r.anyPassInFlight() {
 			continue
 		}
+		// And a certificate that is merely UNCONFIRMED is still being worked on.
+		//
+		// probeCert returns early for a certificate whose deployment is not confirmed (the honest
+		// thing: there is no "deployed certificate" to compare against), so a host disappears from
+		// this round's probe set during exactly the window a renewal is mid-rebind -- which can last
+		// until the next binding check, up to six hours. Deleting there made probe_match,
+		// probe_not_after and probe_trusted flicker once per renewal, and for a rebind that then
+		// FAILED it was worse than flicker: the series a `probe_match == 0` alert would fire on were
+		// gone, so the documented alert stayed silent for the failure it exists to catch.
+		//
+		// A host whose certificate has left the desired state entirely is reclaimed as before.
+		if r.hostIsUnconfirmed(h) {
+			continue
+		}
 		metrics.DeleteProbeSeries(h)
 		// The runner's transition memory has to go with the series. Its own comment says
 		// both are needed -- otherwise a host that leaves a SAN set leaks an entry there and
@@ -760,6 +774,35 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 		// design.
 		r.prober.Forget(h)
 	}
+}
+
+// hostIsUnconfirmed reports whether h belongs to a certificate that is still in the desired state
+// but not confirmed deployed, i.e. a host the probe deliberately skips rather than one that left.
+func (r *Reconciler) hostIsUnconfirmed(h string) bool {
+	if r.store == nil || r.provider == nil {
+		// A reconciler without a store or a provider has no desired state to judge from; that is a
+		// partially built one (tests), and the caller's own fallback applies.
+		return false
+	}
+	res := r.resolve(context.Background())
+	if res == nil {
+		// No desired state to judge from: keep the series rather than deleting evidence.
+		return true
+	}
+	for i := range res.Certificates {
+		c := &res.Certificates[i]
+		for _, d := range probeHosts(c.Domains, len(c.Domains)) {
+			if d != h {
+				continue
+			}
+			st, err := r.store.GetCert(c.Name)
+			if err != nil || st == nil {
+				return true
+			}
+			return !st.DeployConfirmed
+		}
+	}
+	return false
 }
 
 // anyPassInFlight reports whether any certificate currently holds a convergence claim.
@@ -1019,6 +1062,24 @@ func (r *Reconciler) Drain(ctx context.Context) error {
 	}
 }
 
+// notifyPanicSafe delivers one renewal notification without letting a panic out.
+//
+// It exists for the one call site that runs while a panic is already being handled: anything raised
+// there is unrecoverable, and on the webhook path it reaches a bare goroutine and kills the
+// process. A notification is worth having; it is not worth the daemon.
+func (r *Reconciler) notifyPanicSafe(ctx context.Context, certName string, err error) {
+	if r.notifier == nil {
+		return
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			r.log.Error("the renewal notification itself panicked; the pass result is unaffected",
+				"cert", certName, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+		}
+	}()
+	r.notifier.Renewal(ctx, certName, err)
+}
+
 // reconcileOne processes one certificate and mirrors the result into metrics
 // and notifications. The pass's error is returned for callers that need it
 // (RunCert); a whole pass and startCert deliberately discard it -- one failing
@@ -1032,12 +1093,19 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 	// from renewing, which is the same "one failure blocks everything" coupling this
 	// package exists to avoid. Recovering here turns it into an ordinary failed pass:
 	// counted, logged with a stack, and retried on the usual backoff.
+	// accounted is set once the switch below has run, so a later panic does not double-count the
+	// pass: the counter the switch picked is the pass's answer.
+	var accounted bool
 	defer func() {
 		if p := recover(); p != nil {
 			metrics.ReconcilePanics.WithLabelValues(c.Name).Inc()
-			// The panic skipped the accounting below, so record the failed pass here --
-			// otherwise reconcile_total under-reports exactly the passes that went worst.
-			metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
+			// The panic skipped the accounting below, so record the failed pass here -- but only if
+			// the switch really did not run. A panic raised AFTER it (in publish, probeCert or the
+			// notification) used to increment "error" on top of the "ok" the pass had already
+			// earned, so one pass counted as both.
+			if !accounted {
+				metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
+			}
 			r.log.Error("recovered from a panic: this certificate's pass was aborted, "+
 				"the other certificates are unaffected; this is a bug, please report it",
 				"cert", c.Name, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
@@ -1047,13 +1115,18 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 			// while the stack unwinds -- and a panic is the failure an operator most needs to
 			// hear about, not the one that goes quiet. Same contract as any other failure: the
 			// pass attempted something and it did not succeed.
-			if r.notifier != nil {
-				r.notifier.Renewal(ctx, c.Name, err)
-			}
+			//
+			// In its OWN recover, because this runs while a panic is being handled: a second panic
+			// raised here (the notifier is a user-supplied path -- an HTTP POST, a template, a
+			// channel send) has no handler left, and on the webhook path that goroutine is
+			// `go func(){ r.reconcileOne(...) }()`, so it takes the process down. Measured before
+			// this: a panic in the notification path escaped and killed the pass loop.
+			r.notifyPanicSafe(ctx, c.Name, err)
 		}
 	}()
 
 	err = r.manager.Reconcile(ctx, c)
+	accounted = true
 	switch {
 	case errors.Is(err, state.ErrBackoff):
 		// The manager deliberately did not run this pass: the certificate is inside the
@@ -1219,10 +1292,18 @@ func (r *Reconciler) publish(c *config.Certificate) {
 	// expiry has no answer, so it is absent from the comparison instead of being compared
 	// as 1970. "Never issued" remains visible — `wecert_certificate_deployed` is 0 and
 	// `wecert_certificate_consecutive_failures` carries the retry count.
+	// The profile label is never empty: the alert rules select on it, and an empty value would
+	// silently match none of them -- a certificate whose profile fell through (a document written
+	// before the field existed, a certificate built by hand) would then have an expiry series no
+	// rule looks at.
+	profile := c.Profile
+	if profile == "" {
+		profile = config.ProfileClassic
+	}
 	if st.NotAfter.IsZero() {
-		metrics.CertNotAfter.DeleteLabelValues(c.Name)
+		metrics.CertNotAfter.DeleteLabelValues(c.Name, profile)
 	} else {
-		metrics.CertNotAfter.WithLabelValues(c.Name).Set(float64(st.NotAfter.Unix()))
+		metrics.CertNotAfter.WithLabelValues(c.Name, profile).Set(float64(st.NotAfter.Unix()))
 	}
 
 	// Only a confirmed swap to the new certificate counts as "deployed": the first
