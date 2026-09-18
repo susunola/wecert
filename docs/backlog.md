@@ -25,6 +25,16 @@ They are ordered by real exposure over effort.
 
    The tempting signal is "the file's mtime is much newer than the newest row in it", and it is a false-positive generator: SQLite checkpoints the WAL at open and at close, so a daemon that wrote once and then idled for a week has exactly that signature after an ordinary restart. Ruling that out needs something the file does not carry today — a heartbeat row, or a start/stop ledger — and a warning that also fires on legitimate restarts teaches the reader to ignore the one that matters. Worth doing only once that design is settled; until then the answer is "restore through the command, which records it".
 
+4b. **Make the orphan teardown proportional to what needs cleaning**
+
+   Certificates that left the desired state keep their row by design, and every pass tears each one
+   down again: the round-11 scale work measured 2,999 orphans at 2,999 `CleanupOrphan` calls,
+   2,999 journal lines and 15,051 SQL statements **per pass**, identical on every pass. The journal
+   half is fixed (ten lines plus a counted summary). The SQL half needs a durable "already cleaned"
+   mark — a column on `certificates`, cleared when the name comes back — because the row itself is
+   what says there is anything to clean, and an in-memory set would just be another map that grows
+   with churn.
+
 5. **Sign the release artifacts**
 
    `make repro-check` proves the binaries can be rebuilt bit-for-bit from the commit, which makes "this artifact came from that source" *checkable* — but only by someone who does the rebuilding. Nothing signs the release itself, so a download is still trusted on the strength of the transport. `gh attestation` or cosign turns reproducibility into verifiable provenance.
