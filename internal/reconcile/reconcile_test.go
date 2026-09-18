@@ -48,7 +48,7 @@ type fakeManager struct {
 	reaped int
 
 	// quotaScopes records every PublishQuota call.
-	quotaScopes []map[string]string
+	quotaScopes []map[string][]string
 
 	// pendingRevocations drives PendingRevocations, and revocationRetries counts the
 	// retry calls, so a test can assert the gate is honoured. pendingRevocationsErr makes the
@@ -119,17 +119,17 @@ func (f *fakeManager) RetryPendingRevocations(context.Context) {
 	f.revocationRetries++
 }
 
-func (f *fakeManager) PublishQuota(scopes map[string]string) {
+func (f *fakeManager) PublishQuota(scopes map[string][]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.quotaScopes = append(f.quotaScopes, scopes)
 }
 
 // publishedQuota returns the scopes of every PublishQuota call so far.
-func (f *fakeManager) publishedQuota() []map[string]string {
+func (f *fakeManager) publishedQuota() []map[string][]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]map[string]string(nil), f.quotaScopes...)
+	return append([]map[string][]string(nil), f.quotaScopes...)
 }
 
 func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
@@ -1868,5 +1868,60 @@ func TestAProbeFloorTheDocumentCannotSatisfyIsReported(t *testing.T) {
 	}
 	if len(mgr.calls) == 0 {
 		t.Error("a probe-setting mismatch must not stop the certificate from being renewed")
+	}
+}
+
+// The gauges must cover every managed scope, not one representative per limit family.
+//
+// Publishing only the first certificate's first domain left the per-domain families with a single
+// series: the alert that compares against them could not fire for any other domain, and for a fleet
+// laid out one certificate per domain that is every domain but one. Each family gets every scope
+// the resolved desired state actually spends against, deduplicated (a wildcard and its apex share a
+// registered domain; a multi-name certificate appears once).
+func TestQuotaPublishingCoversEveryManagedScope(t *testing.T) {
+	mgr := &fakeManager{}
+	r, _ := newTestReconciler(t, []string{"a-example-com", "b-example-com"}, mgr)
+
+	// newTestReconciler builds certificates with no domains, so give them real ones through the
+	// provider the pass resolves.
+	spec := spec.NewStatic([]config.Certificate{
+		{Name: "a-example-com", Domains: []string{"a.example.com", "*.a.example.com"}},
+		{Name: "b-example-com", Domains: []string{"b.example.com", "other.test"}},
+	})
+	r = New(r.cfg, spec, r.store, mgr, nil, r.log)
+
+	r.RunDetailed(context.Background())
+
+	published := mgr.publishedQuota()
+	if len(published) == 0 {
+		t.Fatal("a pass must publish the rate-limit gauges")
+	}
+	got := published[len(published)-1]
+
+	inList := func(list []string, want string) bool {
+		for _, got := range list {
+			if got == want {
+				return true
+			}
+		}
+		return false
+	}
+	for _, want := range []string{"a.example.com", "b.example.com", "other.test"} {
+		if !inList(got["identifier"], want) {
+			t.Errorf("identifier scope %q is missing from %v; its series does not exist, so the "+
+				"exhaustion alert cannot fire for it", want, got["identifier"])
+		}
+	}
+	for _, want := range []string{"example.com", "other.test"} {
+		if !inList(got["registered-domain"], want) {
+			t.Errorf("registered-domain scope %q is missing from %v", want, got["registered-domain"])
+		}
+	}
+	if n := len(got["registered-domain"]); n != 2 {
+		t.Errorf("the registered domains are deduplicated (a wildcard shares its apex's), got %d: %v",
+			n, got["registered-domain"])
+	}
+	if n := len(got["exact-identifier-set"]); n != 2 {
+		t.Errorf("one identifier set per certificate, got %d: %v", n, got["exact-identifier-set"])
 	}
 }

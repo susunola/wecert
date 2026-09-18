@@ -1,7 +1,6 @@
 package ratelimit
 
 import (
-	"fmt"
 	"log/slog"
 	"time"
 )
@@ -172,36 +171,4 @@ func (t *Tracker) NoteRetryAfter(l Limit, scopeID, errMsg string) (time.Time, bo
 		"this limit will succeed before the reported instant",
 		"limit", l.Name, "scope", scopeID, "until", at)
 	return at, true
-}
-
-// Summarize renders every spendable limit's state for a log line or a status endpoint.
-//
-// scope is the account-wide scope id (empty) plus whatever per-scope buckets the caller wants
-// reported; a limit whose bucket has never been touched reports full, which is the honest
-// answer for "this program has never spent it".
-func (t *Tracker) Summarize(scopes map[string]string) []string {
-	if t == nil || t.store == nil {
-		return nil
-	}
-	var out []string
-	for _, l := range Spendable() {
-		scopeID := ""
-		if l.Scope != "account" {
-			scopeID = scopes[l.Scope]
-			if scopeID == "" {
-				continue
-			}
-		}
-		if at, reason, blocked := t.BlockedUntil(l, scopeID); blocked {
-			out = append(out, fmt.Sprintf("%s: blocked until %s (%s)",
-				l.Name, at.UTC().Format(time.RFC3339), reason))
-			continue
-		}
-		left, ok := t.Remaining(l, scopeID)
-		if !ok {
-			continue
-		}
-		out = append(out, Describe(l, left))
-	}
-	return out
 }

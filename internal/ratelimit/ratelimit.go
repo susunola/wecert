@@ -50,14 +50,6 @@ type Limit struct {
 	Source string
 }
 
-// RefillPerSecond is the bucket's refill rate.
-func (l Limit) RefillPerSecond() float64 {
-	if l.Refill <= 0 {
-		return 0
-	}
-	return 1 / l.Refill.Seconds()
-}
-
 // String renders the limit for a log line.
 func (l Limit) String() string {
 	return fmt.Sprintf("%s (%s): %g per %s", l.Name, l.Scope, l.Capacity, l.Refill)
@@ -322,29 +314,4 @@ func trimTrailing(s string) string {
 		break
 	}
 	return s[:end]
-}
-
-// WorstCaseBlockedBy reports the latest deadline among those still in the future, which is
-// what a caller should wait for. Multiple limits can be exceeded at once, and the CA reports
-// the furthest-resetting one; when several deadlines have been collected individually, the
-// same rule applies.
-func WorstCaseBlockedBy(deadlines []Deadline, now time.Time) (Deadline, bool) {
-	var worst Deadline
-	found := false
-	for _, d := range deadlines {
-		if d.At.IsZero() || !now.Before(d.At) {
-			continue
-		}
-		if !found || d.At.After(worst.At) {
-			worst, found = d, true
-		}
-	}
-	return worst, found
-}
-
-// Describe renders a remaining-token count for an operator, clamping display at zero so a
-// negative bucket does not read as a negative allowance.
-func Describe(l Limit, remaining float64) string {
-	return fmt.Sprintf("%s: %.0f of %.0f left (1 back every %s)",
-		l.Name, math.Max(0, remaining), l.Capacity, l.Refill)
 }

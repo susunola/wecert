@@ -16,6 +16,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/susunola/wecert/internal/atomicfile"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/group"
 )
@@ -398,44 +399,12 @@ func WriteDocumentUnchecked(path string, doc *Document) error {
 		return fmt.Errorf("encode desired-state document: %w", err)
 	}
 
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".desired-state-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp file in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	// Every failure path must remove the temp file, or the directory slowly fills
-	// with junk.
-	defer func() {
-		if tmpName != "" {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.WriteString(DocumentHeader); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write document header: %w", err)
-	}
-	if _, err := tmp.Write(body); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write document body: %w", err)
-	}
-	// fsync before rename: otherwise a power loss can leave behind a renamed,
-	// zero-byte document whose contents never reached disk.
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("sync document: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close document: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return fmt.Errorf("chmod document: %w", err)
-	}
-
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("replace %s: %w", path, err)
-	}
-	tmpName = "" // Already renamed away; do not delete.
-	return nil
+	// 0644: the document is read by the enforcement half of the deployment and by humans, and it
+	// holds no secrets -- but it does decide which names are served, which is why the reader
+	// refuses a group- or world-writable one and why the shared writer installs it by rename.
+	//
+	// The protocol (temp file in the same directory, fsync, permissions before the rename, rename,
+	// sync the directory) lives in internal/atomicfile: this writer, the onboarding report and the
+	// onboarding state file each grew their own copy and they had already drifted.
+	return atomicfile.Write(path, append([]byte(DocumentHeader), body...), 0o644)
 }

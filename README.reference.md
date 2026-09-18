@@ -361,13 +361,44 @@ authorizations                -- one row per identifier, keyed by authz URL
 ├── challenge_url/token  TEXT
 ├── txt_name, txt_value  TEXT      -- the only handle for cleaning up the record
 ├── presented            INTEGER   -- written to DNS (propagation not guaranteed)
-└── challenge_sent       INTEGER   -- CA notified to verify
+├── challenge_sent       INTEGER   -- CA notified to verify
+└── challenge_prepared_at INTEGER  -- when this challenge was chosen; a denial from the
+                                   -- authoritative servers is only evidence once the write
+                                   -- would have had time to appear
 
 retired_certificates          -- uploaded certificates awaiting reaping
 ├── cert_id    TEXT PK
 ├── cert_name  TEXT
-└── retired_at INTEGER
+├── retired_at INTEGER
+├── cert_pem / key_pem BLOB        -- the archived copy, so a revocation can still be signed
+                                   -- after the cloud copy is gone (NULL for a certificate we
+                                   -- uploaded but never held material for)
+
+cert_fallback                 -- the degraded name set currently in service, if any
+├── cert_name  TEXT PK
+└── ...                            -- the dropped names and the reason, for the report
+
+identifier_failures           -- per-identifier failure ledger ("who has been broken lately")
+├── cert_name, identifier PK
+└── failures, first_seen, last_seen
+
+revoke_requests               -- durable operator decisions (a leaked key stays leaked)
+├── cert_name  TEXT PK
+├── reason                 TEXT
+├── cert_identity          TEXT   -- which certificate the request named, so a later renewal
+│                                  -- cannot be revoked by mistake
+├── requested_at, attempts INTEGER
+└── last_error             TEXT
+
+rate_buckets                  -- reconstructed CA rate-limit accounting
+├── limit_name, scope_id PK
+├── tokens, observed_at    INTEGER
+└── reset_at, reset_reason TEXT    -- the CA's own Retry-After, when it refused a request
 ```
+
+All nine tables are listed above; the schema itself is the `CREATE TABLE` block in
+`internal/state/state.go`, and `schemaColumns` there is what the migration verifier compares against
+— a column missing from that list is a column the next migration would try to add twice.
 
 Migrations run on `Open` and add missing columns in place (`PRAGMA table_info` + `ALTER TABLE`). **Upgrades never require rebuilding the database.** The file, its `-wal` and its `-shm` are all created `0600`, because they contain the ACME account key and every certificate's private key.
 
@@ -1138,20 +1169,27 @@ CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` +
 
 ### Test layout
 
-633 test functions across 60 files in 18 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
+787 test functions across 76 files in 19 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
 
-| Package | Files | What it covers |
-|---|---|---|
-| `internal/acme` | 20 | The issuance state machine |
-| `internal/config` | 5 | Validation, domain normalisation, profiles |
-| `internal/deploy` | 6 | Upload, bind confirmation, replacement |
-| `internal/state` | 7 | Schema, permissions, backups |
-| `internal/onboarding` | 4 | Document generation and the CLB guard |
-| `internal/reconcile` | 2 | Whether to order at all, and metric publication |
-| `internal/webhook` | 2 | Trigger parsing, token enforcement |
-| `internal/ratelimit` | 4 | Token arithmetic, including the fuzz targets |
-| `internal/spec`, `internal/probe`, `internal/group`, `internal/metrics` | 1 each | Source selection, the black-box probe, grouping, the registry |
-| `cmd/*` | 6 | Per-tool argument handling and exit codes |
+| Package | Files | Tests | What it covers |
+|---|---|---|---|
+| `internal/acme` | 27 | 226 | The issuance state machine |
+| `internal/deploy` | 7 | 81 | Upload, bind confirmation, replacement |
+| `internal/onboarding` | 4 | 80 | Document generation and the CLB guard |
+| `internal/state` | 10 | 76 | Schema, permissions, backups, the lease-held lock |
+| `internal/config` | 7 | 66 | Validation, domain normalisation, profiles |
+| `internal/webhook` | 3 | 61 | Trigger parsing, token enforcement, notifications |
+| `internal/reconcile` | 2 | 54 | Whether to order at all, metric publication, shutdown |
+| `internal/spec` | 2 | 25 | Source selection, document read/write |
+| `internal/ratelimit` | 4 | 20 | Token arithmetic, including the fuzz targets |
+| `internal/probe` | 1 | 18 | The black-box probe and every-resolved-address logic |
+| `internal/group` | 1 | 14 | Grouping and the PSL registered domain |
+| `internal/metrics` | 1 | 2 | The registry itself |
+| `internal/tcerr` | 1 | 1 | The DNSPod "no data" classification |
+| `cmd/*` | 6 | 65 | Per-tool argument handling and exit codes |
+
+Counts drift as tests are added; the command above is the source of truth, and this table was
+regenerated in review round 6 after the numbers here had been stale since the OCR round.
 
 ### What the tests pin down
 
@@ -1214,11 +1252,19 @@ Runs a full issuance against staging with a throwaway state database, refusing t
 
 **Outstanding:**
 
-- [ ] Read the DNSPod token from a file or systemd `LoadCredential`, so it isn't plaintext in `config.yaml`
-- [ ] Switch to `profile: tlsserver` (45 days) and run a complete renewal cycle fully automatically
-- [ ] Test the SNI multi-certificate case with `multi_cert_info` ("replacing one doesn't disturb another")
-- [ ] Stage C: CVM + systemd + CVM role credential path (`testenv/` is ready, `create_cvm=true`)
-- [ ] `state.Store` has no transaction support, so the `download()` epilogue (promote the new certificate → retire the old → discard the order) commits in separate statements. A partial failure leaves an orphaned cloud certificate or a false failure alarm.
+All five items this list used to carry are done and were verified against the real account (see
+[docs/e2e-run-2026-09-17-credentialed.md](docs/e2e-run-2026-09-17-credentialed.md) and
+[docs/e2e-run-2026-09-18-credentialed.md](docs/e2e-run-2026-09-18-credentialed.md)): the DNSPod token
+is read from a file (and from a systemd `LoadCredential` on the CVM), `profile: tlsserver` completed
+a full renewal cycle, the SNI multi-certificate case was exercised with `multi_cert_info`, Stage C
+ran on a CVM with systemd and the CVM role, and `state.Store` gained `WithTx` -- the `download()`
+epilogue now commits in one transaction.
+
+What is still open is not a feature but a verification gap, and it is recorded rather than hidden:
+see the "未跑 / 未验证" section of each e2e report and §7 of
+[docs/code-review-round4-2026-09-18.md](docs/code-review-round4-2026-09-18.md) -- natural (real-time)
+renewal, production Let's Encrypt, the CVM rebind re-run, the SNI-off path, and the cloud's real
+enforcement of `IsCheckResource` on delete.
 
 ## License
 

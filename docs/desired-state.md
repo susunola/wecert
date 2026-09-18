@@ -317,7 +317,7 @@ curl -s -H "X-Wecert-Token: $TOKEN" localhost:9801/hook/desired \
   | jq '.decisions[] | select(.hostname=="api.example.com")'
 ```
 
-`decisions[].reason` 是给人看的一句话，常见的几种：
+`decisions[].reason` 是给人看的一句话。注意它的来源：enforce 模式下这个端点返回的是**文档里记下的**决定（上一次 `wecert-onboard` 那一轮的判断），不是刚刚重新评估的结果 —— 想知道"现在"为什么没进去，先跑一次 `wecert-onboard -dry-run` 再读它，或者直接看那一轮的报告。常见的几种：
 
 | Reason | 含义 | 怎么办 |
 |---|---|---|

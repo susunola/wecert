@@ -247,3 +247,65 @@ func TestMissingDatabaseBesideALockFileStillWarns(t *testing.T) {
 		t.Errorf("a lock file with no database must warn; stderr was:\n%s", out)
 	}
 }
+
+// A symlinked state path and a shared-writable state directory are warned about, not refused.
+//
+// Both are legitimate arrangements -- state.db on another volume, a staging symlink, an operator's
+// own directory that happens to be 0775 -- and refusing them would break working deployments. Both
+// also let a local user redirect or replace what this process writes, so the operator is told
+// plainly and left to judge. The database is still created through the symlink: that is the
+// behaviour being kept on purpose.
+func TestStatePathHazardsAreWarnedAboutNotRefused(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "data", "state.db")
+
+	warnings := statePathWarnings(real, filepath.Dir(real))
+	if len(warnings) != 0 {
+		t.Errorf("a private directory and a missing file have nothing to warn about, got %v", warnings)
+	}
+
+	// A symlink: warned about, and open() still works through it.
+	if err := os.MkdirAll(filepath.Dir(real), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(real, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "state.db")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	warnings = statePathWarnings(link, dir)
+	if len(warnings) == 0 {
+		t.Fatal("a symlinked state path must be reported: this process writes through it, so whoever " +
+			"can write the target's directory chooses where the account key goes")
+	}
+	if !strings.Contains(warnings[0], "symlink") {
+		t.Errorf("the warning has to say what it saw, got %q", warnings[0])
+	}
+	s, err := Open(link)
+	if err != nil {
+		t.Fatalf("a symlinked state path must still open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	// A group/world-writable directory: warned about.
+	shared := filepath.Join(dir, "shared")
+	if err := os.MkdirAll(shared, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	warnings = statePathWarnings(filepath.Join(shared, "state.db"), shared)
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "world-writable") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a 0777 state directory must be reported: 0600 on state.db does not stop another "+
+			"user unlinking it, got %v", warnings)
+	}
+}

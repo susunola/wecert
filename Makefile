@@ -32,7 +32,7 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # started inside cmd/wecert (see startWebhookServer), so it ships with the first entry.
 CMDS := wecert wecert-onboard
 
-.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-repeat e2e vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
+.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-tags test-repeat e2e vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
@@ -102,6 +102,14 @@ release:
 			printf '%s\n' "ok"; \
 		done; \
 	done
+	@# The tagged build is compiled here on purpose: `make release` is the one build step CI runs, and
+	@# without this line a broken lego_dns registry would only be discovered on the machine that
+	@# builds that variant. Only linux/amd64 -- the platform that variants ship on -- so the release
+	@# does not pay for the full provider registry three times.
+	@printf 'building %-34s' "dist/wecert_linux_amd64 (lego_dns)"; \
+		CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -tags lego_dns \
+			-ldflags "-s -w -X main.version=$(VERSION)" -o dist/wecert_linux_amd64-lego-dns ./cmd/wecert || exit 1; \
+		printf '%s\n' "ok"
 	@cd dist && (command -v sha256sum >/dev/null 2>&1 && sha256sum wecert* || shasum -a 256 wecert*) > SHA256SUMS
 	@echo && echo "=== artifacts ===" && ls -lh dist/ && echo && cat dist/SHA256SUMS
 
@@ -164,6 +172,17 @@ check-english:
 
 test:
 	$(GO) test ./...
+
+# The build-tagged code needs its own gate.
+#
+# Two production files are selected by a build tag (`lego_registry_tags.go` /
+# `lego_registry_notags.go`, plus the lego registry itself behind `lego_dns`), and each has a paired
+# test file that only runs under that tag. Neither `go test ./...` nor CI's `go test -race ./...`
+# ever compiles them, so a change that breaks the tagged registry -- or a test that only makes sense
+# there -- passes every other gate. This target is what `make check` runs for that.
+test-tags:
+	$(GO) test -race -tags "pebble lego_dns" ./...
+	$(GO) vet -tags "pebble lego_dns" ./...
 
 # -race is necessary: on certificates with many SANs, DNS probing and
 # authorization polling run concurrently, and a data race shows up as "some
@@ -250,7 +269,7 @@ fuzz:
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzLimitWithDegenerateRefill -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzParseRetryAfter -fuzztime $(FUZZTIME)
 
-check: check-english fmt-check vet test-race check-scripts check-alerts
+check: check-english fmt-check vet test-race test-tags check-scripts check-alerts
 
 clean:
 	rm -rf bin dist coverage.out
