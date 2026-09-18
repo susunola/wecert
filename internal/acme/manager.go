@@ -393,7 +393,15 @@ func newManager(
 func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	st, err := m.store.GetCert(c.Name)
 	if err != nil {
-		return err
+		// recordFailure, not a bare return: the doc comment above promises that a failed decision
+		// schedules the retry, and the sibling reads of the order row and the fallback record were
+		// fixed for exactly this reason. A bare return left a state store that fails this read
+		// invisible in wecert_certificate_consecutive_failures and retrying at the pass rate.
+		//
+		// st is nil here (the read failed), so the failure is recorded against a fresh row for this
+		// name: PutCert upserts, and the next pass reads the counter back.
+		return m.recordFailure(ctx, &state.CertState{Name: c.Name}, fmt.Errorf(
+			"read the certificate state: %w", err))
 	}
 	if st == nil {
 		st = &state.CertState{Name: c.Name}

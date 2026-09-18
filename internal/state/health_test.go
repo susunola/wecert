@@ -1,10 +1,12 @@
 package state
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A corrupt state file must be reported as corrupt, with somewhere to go next.
@@ -356,5 +358,91 @@ func TestVerifyOnDiskNoticesADeletedOrReplacedDatabaseAndALostLock(t *testing.T)
 	if !strings.Contains(joined, "no longer at that path") {
 		t.Errorf("a state database removed from under a running store must be reported: every later "+
 			"write goes to an unlinked file and the next start finds nothing. Got %v", problems)
+	}
+}
+
+// A missing -wal beside a present -shm is reported, because it means commits were lost.
+//
+// SQLite keeps committed transactions in state.db-wal until a checkpoint folds them in, and a clean
+// close removes both sidecars. A -shm with no -wal is therefore the signature of a wal that was
+// removed (a cleanup script, an operator, a hostile rm): the database opens without complaint and
+// holds fewer rows than the last pass wrote -- the in-flight order URL among them, which is the row
+// whose loss costs a fresh order against the exact-identifier-set limit.
+func TestAMissingWriteAheadLogIsReported(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+
+	if walMissing(path) {
+		t.Fatal("nothing exists yet, so there is nothing to report")
+	}
+	if err := os.WriteFile(path+"-shm", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !walMissing(path) {
+		t.Error("a shared-memory file with no write-ahead log must be reported")
+	}
+	if warning := missingWALWarning(path); !strings.Contains(warning, "state.db-wal") ||
+		!strings.Contains(warning, "recovery.md") {
+		t.Errorf("the warning must name the file and point at the recovery procedure, got %q", warning)
+	}
+
+	// Both sidecars present is the normal running state; neither present is a clean close.
+	if err := os.WriteFile(path+"-wal", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if walMissing(path) {
+		t.Error("a -wal beside its -shm is normal")
+	}
+	if err := os.Remove(path + "-wal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path + "-shm"); err != nil {
+		t.Fatal(err)
+	}
+	if walMissing(path) {
+		t.Error("no sidecars at all is a clean close, not a missing wal")
+	}
+}
+
+// Close must not return while a transaction is still committing.
+//
+// Every statement goes through the store mutex and WithTx holds it for the whole transaction, so a
+// Close that skipped the lock let an in-flight promotion commit after Close returned -- and after
+// the flock was released, so a second process could already be writing to the same database.
+func TestCloseWaitsForAnInFlightTransaction(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	txDone := make(chan error, 1)
+	go func() {
+		txDone <- s.WithTx(context.Background(), func(tx *Tx) error {
+			close(entered)
+			<-release
+			return tx.PutCert(&CertState{Name: "inside-the-transaction"})
+		})
+	}()
+	<-entered
+
+	closed := make(chan error, 1)
+	go func() { closed <- s.Close() }()
+
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) while a transaction was still running; its commit then lands "+
+			"after the store is closed and after the lock is released", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-txDone; err != nil {
+		t.Fatalf("the transaction must complete: %v", err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatalf("Close after the transaction: %v", err)
 	}
 }
