@@ -1176,7 +1176,7 @@ make test-pebble  # a real ACME lifecycle against a local CA (needs the pebble b
 make cover      # coverage
 ```
 
-CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. `make check` additionally runs `test-tags` (the same tests under `-tags "pebble lego_dns"`, which is the only gate for two tag-selected production files), `check-scripts` (the shell self-test and the CAM policy drift check) and `check-alerts`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI does **not** run `check-scripts`, `check-alerts`, `make fuzz` or `make test-pebble` yet — those are on whoever pushes.
+CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. `make check` additionally runs `test-tags` (the same tests under `-tags "pebble lego_dns"`, which is the only gate for two tag-selected production files), `check-scripts` (the shell self-test and the CAM policy drift check) and `check-alerts`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI runs `check-alerts` and `check-scripts` too (they are stdlib-only and take under a second). It does **not** run `make fuzz` or `make test-pebble` yet — those are on whoever pushes, and on the scheduled release run.
 
 ### Test layout
 
