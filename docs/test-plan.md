@@ -186,15 +186,25 @@ awk -v t="$total" 'BEGIN{ if (t+0 < 60.0) { print "coverage regressed: "t"% < 60
 
 ```
 make check   = check-english fmt-check vet test-race test-tags
-               check-scripts check-alerts                     （7 项，Makefile:272）
-CI 实际跑     = gofmt + check-english + vet + govulncheck
+               check-scripts（含 check-cli）check-alerts      （7 项目标，ci.yml 未覆盖的见下）
+CI test 作业  = gofmt + check-english + vet + govulncheck
                + test -race + test-tags + check-alerts
-               + check-scripts + build + cross build           （9 步，ci.yml）
+               + check-scripts + build + cross build           （9 步）
+CI 另外三个作业 = install（make release + sudo ./install.sh 冒烟）
+               + e2e（pebble + make test-pebble + make e2e，需要 53 端口）
+               + fuzz（FUZZTIME=15s make fuzz）                  （3 个作业）
 ```
 
-`govulncheck`、`make build`、`make release`（交叉编译）**只在 CI 跑**（`make check` 里没有对应目标）。
+`govulncheck`、`make build`、`make release`（交叉编译）**只在 CI 跑**（`make check` 里没有对应目标），
+新增的 `install` / `e2e` / `fuzz` 三个作业同理：它们需要 root、53 端口或有界墙钟，本地门禁不适合背。
 CI 的 `gofmt` / English 两步是内联命令，等价于 `make fmt-check` / `make check-english`；其余每一步都能在
 `make check` 里找到。所以本地全绿不等于 CI 会绿 —— 这正是历史上"改完提交才发现构建不过"的成因。
+
+2026-09-18 补记：`check-cli`（文档里写的每个 flag 必须在二进制的 `-h` 里）与 `scripts/test-e2e-sni.sh`
+已接进 `make check-scripts`，`install` / `e2e` / `fuzz` 三个作业已接进 `ci.yml` —— 缺陷 1（install.sh
+的变量拼写让每次安装中止）、缺陷 2（`wecert-clbverify -clb` 在错 FlagSet 上）、缺陷 3（`-raw` 的 JSON
+后面跟着人类报告，`json.load` 报 Extra data）现在各有一条机器门禁。P0-4 本身**未关闭**：上面列出的
+CI-only 项仍在。
 
 **怎么补**：让 `make check` 成为 CI 的超集（至少加 `build` 与 `release`；`govulncheck` 可选，因为它要联网拉漏洞库）。
 
@@ -399,8 +409,8 @@ spec / 熔断      ██████░░░░░░░░░░░░░░ 
 ## 附：命令速查
 
 ```bash
-# L0–L2：本地门禁（注意：目前仍少于 CI，见 P0-4）
-make check             # check-english + fmt-check + vet + test-race + test-tags + check-scripts + check-alerts
+# L0–L2：本地门禁（注意：仍少于 CI，见 P0-4）
+make check             # check-english + fmt-check + vet + test-race + test-tags + check-scripts（含 check-cli）+ check-alerts
 make test              # 单元测试
 make test-race         # 带竞态检测（多 SAN 时 DNS 探测与授权轮询并发）
 make cover             # 覆盖率
@@ -429,11 +439,14 @@ make build tools
 # 其它门禁
 make check-english     # 源码里不许有中文（.md 除外）
 make diagrams-check    # 图表是否过期/溢出
-make check-scripts     # shell 脚本的自测（目前只覆盖 e2e-wildcard）
+make check-scripts     # shell 自测（e2e-wildcard、e2e-sni 的解析助手）+ CLI 表面 + CAM 策略
+make check-cli         # README/checklist 里写的每个 flag 都在对应二进制的 -h 里
 ```
 
-> `scripts/e2e-sni.sh` 目前**不在** `make check-scripts` 里：它的断言需要真实 listener，
-> 本机没有凭据时按设计直接失败。用哪个 shell 门禁覆盖它待定（`shellcheck scripts/e2e-sni.sh` 是干净的）。
+> `scripts/e2e-sni.sh` 本身仍**不在** `make check-scripts` 里：它的断言需要真实 listener，
+> 本机没有凭据时按设计直接失败。进 `make check` 的是它的解析助手
+> （`keep_first_json` / `listener_field`）：`scripts/test-e2e-sni.sh` 直接 source 目标脚本，
+> 用「JSON + 人类报告」「纯 JSON」「完全无 JSON」三种 dump 驱动它们，无网络、无凭据。
 
 ---
 
@@ -444,3 +457,4 @@ make check-scripts     # shell 脚本的自测（目前只覆盖 e2e-wildcard）
 | 2026-09-16 | 首版。基线 `c6d6a51` / v0.4.2：总覆盖率 61.0%，384 个用例，识别出 4 个 P0 缺口 |
 | 2026-09-17 | 第 2 节新增两条 L4 行：Stage C（真机 + systemd + CVM 角色）与 SNI 多证书，均**未跑**、人工 / 需要账号；配套 `docs/stage-c-cvm-systemd.md`、`docs/sni-multicert.md`、`scripts/e2e-sni.sh` |
 | 2026-09-18 | P0-4 与附录的命令清单按当前 Makefile / ci.yml 重算：`make check` 已从 4 项长到 7 项（`test-tags`、`check-scripts`、`check-alerts` 已接入），CI 现在是 9 步；结论不变 —— `govulncheck`、`build`、`release` 仍只在 CI 跑。P0-3（CI 无覆盖率下限）复核后仍成立。第 2 节的 **Stage C 两行**从"未跑"更正为"已跑"（2026-09-17 §4.5/§4.9、2026-09-18 §4.7）；3.3 节 A 类接缝补注已覆盖的部分 |
+| 2026-09-18 | 第二轮：`check-cli` 与 `scripts/test-e2e-sni.sh` 接入 `make check-scripts`；`ci.yml` 新增 `install`（`make release` + `sudo ./install.sh` 冒烟，root）、`e2e`（pebble + `make test-pebble` + `make e2e`，断言不 skip）、`fuzz`（`FUZZTIME=15s`）三个作业。P0-4 重算后仍未关闭（`govulncheck`/`build`/`release` 及上述三个作业仍只在 CI）；P0-3 未动，仍成立 |

@@ -966,6 +966,8 @@ Alert on `not_after`, **not** on "did the renewal job error" — the latter stay
 
 **The rest of the rules ship with the repository.** `deploy/prometheus/wecert-alerts.yml` is a ready-to-load Prometheus rule file — 17 rules in three groups (`wecert.expiry`, `wecert.convergence`, `wecert.integrity`) — with a comment above each threshold saying where the number came from. Point `rule_files:` at it and adjust the expiry windows to taste: the two expressions above are the ones whose window is a business decision, while what ships is the set that is wrong at any window — a revocation the CA has not accepted, a pass that has not finished in two hours, a certificate serving that is not the one deployed.
 
+> **Timer mode reads a different signal.** 13 of the 17 rules carry a `for:` and watch a series the daemon exports continuously; under `wecert-once.timer` `/metrics` exists only for the seconds a pass takes, so they cannot fire and the **unit status is the only channel**. The rule file's header carries a ready-to-use `node_systemd_unit_state{name="wecert-once.service",state="failed"}` alert for exactly that, and says which signals work in either mode (the webhook and the exit code).
+
 **The black-box probe is built in.** Every pass, wecert dials 443 for each deployed certificate's first few names and reads back the certificate that is actually served — that is the `probe` section above. It catches "the program thinks it succeeded but nothing took effect", which is the most insidious failure, and trusting only your own state database cannot see it. If wecert runs somewhere that cannot reach the VIP, either disable `probe.enabled` or run `wecert-probe` on a schedule from a machine that can; leaving it on from a machine that cannot is harmless but useless, and shows up as `probe_errors` climbing while `probe_match` stays put.
 
 > `wecert_certificate_deployed` reflects `deploy_confirmed`, not "has this ever been uploaded". Uploading is not binding: on first issuance somebody still has to bind it in the CLB console, and until then it reads 0. Without that distinction the gauge turns green while the certificate is not actually serving.
@@ -1164,7 +1166,7 @@ The file holds the ACME account key and every certificate's private key. The sys
 ## Development
 
 ```bash
-make check      # the full gate: gofmt + vet + English + test -race + e2e self-test + alert rules
+make check      # the full gate: gofmt + vet + English + test -race + test-tags + shell self-tests + alert rules
 make test       # unit tests
 make test-race  # with the race detector (DNS probing and authz polling are concurrent)
 make fmt-check  # check only, no writes
@@ -1176,7 +1178,7 @@ make test-pebble  # a real ACME lifecycle against a local CA (needs the pebble b
 make cover      # coverage
 ```
 
-CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. `make check` additionally runs `test-tags` (the same tests under `-tags "pebble lego_dns"`, which is the only gate for two tag-selected production files), `check-scripts` (the shell self-test and the CAM policy drift check) and `check-alerts`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI runs `check-alerts` and `check-scripts` too (they are stdlib-only and take under a second). It does **not** run `make fuzz` or `make test-pebble` yet — those are on whoever pushes, and on the scheduled release run.
+CI (`.github/workflows/ci.yml`) has four jobs. `test` runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make test-tags` + `make check-alerts` + `make check-scripts` + `make build` + `make release`; `check-scripts` pulls in `check-cli`, which requires every flag the READMEs and `docs/staging-checklist.md` document to appear in that binary's own `-h`. `install` runs `make release` and then the documented `sudo ./install.sh ./dist/wecert_linux_amd64` as root, asserting the installed files, their modes, and that a second run keeps an edited config. `e2e` installs pebble, runs `make test-pebble` and fails when it skipped, then runs `make e2e` (the first suite binds 53/udp+tcp, so it runs under sudo) and requires all three suites to report `pass`. `fuzz` runs `FUZZTIME=15s make fuzz`. `make check` is the `test` job minus `govulncheck`, `make build` and `make release`: it pulls in `test-tags` (the same tests under `-tags "pebble lego_dns"`, the only gate for two tag-selected production files), `check-scripts` (the shell self-tests, the CLI surface and the CAM policy drift check) and `check-alerts` — so a local green is a green for that job except for those three steps, while the `install`, `e2e` and `fuzz` jobs need root, port 53 or a bounded wall-clock budget and have no local equivalent. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it.
 
 ### Test layout
 

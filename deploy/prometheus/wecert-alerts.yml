@@ -16,6 +16,32 @@
 # shortlived (160h). A fixed window was tried and rejected: 21 days is most of a shortlived
 # certificate's life, so that profile alerted from issuance onwards and trained people to ignore it.
 
+# ── Which of these rules can fire in timer mode ────────────────────────────────────────────────
+#
+# 13 of the rules below carry a `for:` and read a series the daemon exports continuously. In the
+# documented alternative deployment -- `wecert-once.timer`, one process per hour -- /metrics only
+# exists for the seconds the pass takes, so those rules can never observe a sustained condition, and
+# the timer's unit status is the only channel that reports a bad pass. That is not a defect in the
+# rules; it is a property of the mode, and it has to be said out loud because the failure it hides is
+# "the timer is green and nothing is being renewed".
+#
+# In timer mode, alert on the unit instead (node_exporter's systemd collector):
+#
+#   - alert: WecertTimerUnitFailed
+#     expr: node_systemd_unit_state{name="wecert-once.service",state="failed"} == 1
+#     for: 5m
+#     labels: {severity: critical}
+#     annotations:
+#       summary: "the last wecert-once run did not converge"
+#       description: >-
+#         Check `journalctl -u wecert-once` and `systemctl status wecert-once`. A pass that converged
+#         nothing (including one where every certificate was inside its retry backoff) exits non-zero
+#         by design, so a failed unit is the timer-mode equivalent of WecertHasNotReconciledRecently.
+#
+# The rules that DO work in either mode are the ones whose state wecert pushes out of band: the
+# webhook notification (result, cert, error) and the exit code -- which is why the renewal-result
+# webhook is worth configuring even when the daemon is not used.
+
 groups:
   - name: wecert.expiry
     rules:

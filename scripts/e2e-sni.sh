@@ -66,6 +66,155 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # produced the evidence it is asserting on.
 CLBVERIFY="${WECERT_CLBVERIFY:-${ROOT}/bin/wecert-clbverify}"
 
+# ── evidence helpers ────────────────────────────────────────────────────────
+#
+# Defined before the operator procedure below, and before the argument parsing
+# starts, so that scripts/test-e2e-sni.sh can source this file for them. The
+# parsing helpers are the part of this script that reads the -raw dump, and they
+# were wrong once in a way no run could reveal from the outside (json.load over a
+# dump that ends with a human report); the self-test is what keeps them pinned.
+
+SNAPSHOT_FILE=""
+# SNAPSHOT_FILTERED records whether the dump came from a listener-filtered query.
+# wecert-clbverify's own note says a filtered query can return entries without the
+# Certificate field, and its assertions read Listeners[0] -- so when the filter
+# comes back empty of certificates we fall back to the unfiltered query for the
+# raw evidence, and skip the assertion-shaped calls that would then be looking at
+# the wrong listener.
+SNAPSHOT_FILTERED=""
+
+snapshot() {
+	local label="$1"
+	SNAPSHOT_FILE="${EVIDENCE_DIR}/listener-${label}.json"
+	SNAPSHOT_FILTERED="yes"
+
+	"${CLBVERIFY}" -region "${REGION}" -clb "${CLB}" -listener "${LISTENER}" -raw >"${SNAPSHOT_FILE}.full"
+	# -raw prints the raw DescribeListeners JSON *and then* the human report (added in 6c2057b), so
+	# that file is not JSON on its own. Keeping only the first JSON document is what makes
+	# listener_field (json.load) able to read it at all: against a real CLB the script used to die
+	# with "Extra data: line 121 column 1 (char 3414)" -- the stub table passed only because a stub
+	# printed pure JSON. Found by the round-11 verification pass (U98).
+	keep_first_json "${SNAPSHOT_FILE}.full" "${SNAPSHOT_FILE}"
+	rm -f -- "${SNAPSHOT_FILE}.full"
+
+	if ! listener_field "${SNAPSHOT_FILE}" has-certificate >/dev/null 2>&1; then
+		echo "WARN: the listener-filtered DescribeListeners response carries no Certificate field" >&2
+		echo "      (wecert-clbverify notes this can happen when filtering by ListenerIds)." >&2
+		echo "      Re-reading the whole CLB and selecting ${LISTENER} from it." >&2
+		SNAPSHOT_FILTERED="no"
+		"${CLBVERIFY}" -region "${REGION}" -clb "${CLB}" -raw >"${SNAPSHOT_FILE}.full"
+		keep_first_json "${SNAPSHOT_FILE}.full" "${SNAPSHOT_FILE}"
+		rm -f -- "${SNAPSHOT_FILE}.full"
+	fi
+
+	echo "--- raw evidence (${label}) -> ${SNAPSHOT_FILE}"
+}
+
+show_raw() {
+	cat -- "${SNAPSHOT_FILE}"
+	echo
+}
+
+# keep_first_json <in> <out>
+#
+# Copies the first complete JSON document from <in> into <out>, discarding whatever follows it.
+# wecert-clbverify -raw ends its raw dump with a human-readable report, so a plain json.load on the
+# file fails with "Extra data"; raw_decode stops at the end of the first document instead.
+keep_first_json() {
+	python3 - "$1" "$2" <<'PYEOF'
+import json
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, encoding="utf-8") as fh:
+    text = fh.read()
+try:
+    value, _ = json.JSONDecoder().raw_decode(text.lstrip())
+except ValueError as exc:
+    sys.exit("could not find a JSON document in %s: %s" % (src, exc))
+with open(dst, "w", encoding="utf-8") as fh:
+    json.dump(value, fh)
+PYEOF
+}
+
+# listener_field <file> <mode>
+#   modes: primary | ext | bound | has-certificate | sni-switch
+# Reads the -raw DescribeListeners dump. Selects the listener by ListenerId when
+# the dump contains it, otherwise the first listener that carries a Certificate.
+listener_field() {
+	python3 - "$1" "$2" "$LISTENER" <<'PY'
+import json
+import sys
+
+path, mode, want = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    with open(path, encoding="utf-8") as fh:
+        body = json.load(fh)
+except (OSError, ValueError) as exc:
+    sys.exit("could not parse the raw dump %s: %s" % (path, exc))
+
+listeners = body.get("Listeners") or []
+chosen = None
+for l in listeners:
+    if want and l.get("ListenerId") == want:
+        chosen = l
+        break
+if chosen is None:
+    for l in listeners:
+        if l.get("Certificate"):
+            chosen = l
+            break
+if chosen is None:
+    sys.exit("no listener in %s carries a Certificate field; if this was a "
+             "listener-filtered query, cross-check with an unfiltered -raw run" % path)
+
+cert = chosen.get("Certificate") or {}
+primary = cert.get("CertId") or ""
+ext = [c for c in (cert.get("ExtCertIds") or []) if c]
+
+if mode == "has-certificate":
+    # Exit non-zero when the selected listener carries nothing: the caller uses the
+    # exit status to decide whether to fall back to an unfiltered query.
+    if primary or ext:
+        sys.stdout.write("yes\n")
+        sys.exit(0)
+    sys.exit("the selected listener (%s) carries no Certificate field" % (chosen.get("ListenerId") or "?"))
+elif mode == "primary":
+    out = [primary] if primary else []
+elif mode == "ext":
+    out = ext
+elif mode == "bound":
+    out = ([primary] if primary else []) + ext
+elif mode == "sni-switch":
+    out = [str(chosen.get("SniSwitch", ""))]
+else:
+    sys.exit("unknown mode %r" % mode)
+
+sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+PY
+}
+
+primary_of() { listener_field "$1" primary; }
+ext_of() { listener_field "$1" ext; }
+bound_of() { listener_field "$1" bound; }
+
+# bound_certs_are <id> <file> -- is the id among the listener's certificates?
+bound_certs_are() {
+	local id="$1" file="$2" bound
+	bound="$(bound_of "${file}")"
+	[[ -n "${bound}" ]] || return 1
+	printf '%s\n' "${bound}" | grep -qxF -- "${id}"
+}
+
+# Sourced for those helpers by scripts/test-e2e-sni.sh: everything below is the
+# operator procedure, which must not run there -- it parses its own argv, requires
+# cloud credentials and talks to the API. `return` is valid precisely when the file
+# was sourced, which is what the guard detects.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+	return 0
+fi
+
 usage() {
 	cat >&2 <<'EOF'
 Usage: ./scripts/e2e-sni.sh <region> <clb-id> <listener-id> <cert-id-A> <cert-id-B> [--yes] [--wait <seconds>]
@@ -261,141 +410,6 @@ fi
 
 EVIDENCE_DIR="${EVIDENCE_DIR:-${ROOT}/dist/sni-$(date +%Y%m%dT%H%M%S)-$$}"
 mkdir -p "${EVIDENCE_DIR}"
-
-# ── evidence helpers ────────────────────────────────────────────────────────
-
-SNAPSHOT_FILE=""
-# SNAPSHOT_FILTERED records whether the dump came from a listener-filtered query.
-# wecert-clbverify's own note says a filtered query can return entries without the
-# Certificate field, and its assertions read Listeners[0] -- so when the filter
-# comes back empty of certificates we fall back to the unfiltered query for the
-# raw evidence, and skip the assertion-shaped calls that would then be looking at
-# the wrong listener.
-SNAPSHOT_FILTERED=""
-
-snapshot() {
-	local label="$1"
-	SNAPSHOT_FILE="${EVIDENCE_DIR}/listener-${label}.json"
-	SNAPSHOT_FILTERED="yes"
-
-	"${CLBVERIFY}" -region "${REGION}" -clb "${CLB}" -listener "${LISTENER}" -raw >"${SNAPSHOT_FILE}.full"
-	# -raw prints the raw DescribeListeners JSON *and then* the human report (added in 6c2057b), so
-	# that file is not JSON on its own. Keeping only the first JSON document is what makes
-	# listener_field (json.load) able to read it at all: against a real CLB the script used to die
-	# with "Extra data: line 121 column 1 (char 3414)" -- the stub table passed only because a stub
-	# printed pure JSON. Found by the round-11 verification pass (U98).
-	keep_first_json "${SNAPSHOT_FILE}.full" "${SNAPSHOT_FILE}"
-	rm -f -- "${SNAPSHOT_FILE}.full"
-
-	if ! listener_field "${SNAPSHOT_FILE}" has-certificate >/dev/null 2>&1; then
-		echo "WARN: the listener-filtered DescribeListeners response carries no Certificate field" >&2
-		echo "      (wecert-clbverify notes this can happen when filtering by ListenerIds)." >&2
-		echo "      Re-reading the whole CLB and selecting ${LISTENER} from it." >&2
-		SNAPSHOT_FILTERED="no"
-		"${CLBVERIFY}" -region "${REGION}" -clb "${CLB}" -raw >"${SNAPSHOT_FILE}.full"
-		keep_first_json "${SNAPSHOT_FILE}.full" "${SNAPSHOT_FILE}"
-		rm -f -- "${SNAPSHOT_FILE}.full"
-	fi
-
-	echo "--- raw evidence (${label}) -> ${SNAPSHOT_FILE}"
-}
-
-show_raw() {
-	cat -- "${SNAPSHOT_FILE}"
-	echo
-}
-
-# keep_first_json <in> <out>
-#
-# Copies the first complete JSON document from <in> into <out>, discarding whatever follows it.
-# wecert-clbverify -raw ends its raw dump with a human-readable report, so a plain json.load on the
-# file fails with "Extra data"; raw_decode stops at the end of the first document instead.
-keep_first_json() {
-	python3 - "$1" "$2" <<'PYEOF'
-import json
-import sys
-
-src, dst = sys.argv[1], sys.argv[2]
-with open(src, encoding="utf-8") as fh:
-    text = fh.read()
-try:
-    value, _ = json.JSONDecoder().raw_decode(text.lstrip())
-except ValueError as exc:
-    sys.exit("could not find a JSON document in %s: %s" % (src, exc))
-with open(dst, "w", encoding="utf-8") as fh:
-    json.dump(value, fh)
-PYEOF
-}
-
-# listener_field <file> <mode>
-#   modes: primary | ext | bound | has-certificate | sni-switch
-# Reads the -raw DescribeListeners dump. Selects the listener by ListenerId when
-# the dump contains it, otherwise the first listener that carries a Certificate.
-listener_field() {
-	python3 - "$1" "$2" "$LISTENER" <<'PY'
-import json
-import sys
-
-path, mode, want = sys.argv[1], sys.argv[2], sys.argv[3]
-
-try:
-    with open(path, encoding="utf-8") as fh:
-        body = json.load(fh)
-except (OSError, ValueError) as exc:
-    sys.exit("could not parse the raw dump %s: %s" % (path, exc))
-
-listeners = body.get("Listeners") or []
-chosen = None
-for l in listeners:
-    if want and l.get("ListenerId") == want:
-        chosen = l
-        break
-if chosen is None:
-    for l in listeners:
-        if l.get("Certificate"):
-            chosen = l
-            break
-if chosen is None:
-    sys.exit("no listener in %s carries a Certificate field; if this was a "
-             "listener-filtered query, cross-check with an unfiltered -raw run" % path)
-
-cert = chosen.get("Certificate") or {}
-primary = cert.get("CertId") or ""
-ext = [c for c in (cert.get("ExtCertIds") or []) if c]
-
-if mode == "has-certificate":
-    # Exit non-zero when the selected listener carries nothing: the caller uses the
-    # exit status to decide whether to fall back to an unfiltered query.
-    if primary or ext:
-        sys.stdout.write("yes\n")
-        sys.exit(0)
-    sys.exit("the selected listener (%s) carries no Certificate field" % (chosen.get("ListenerId") or "?"))
-elif mode == "primary":
-    out = [primary] if primary else []
-elif mode == "ext":
-    out = ext
-elif mode == "bound":
-    out = ([primary] if primary else []) + ext
-elif mode == "sni-switch":
-    out = [str(chosen.get("SniSwitch", ""))]
-else:
-    sys.exit("unknown mode %r" % mode)
-
-sys.stdout.write("\n".join(out) + ("\n" if out else ""))
-PY
-}
-
-primary_of() { listener_field "$1" primary; }
-ext_of() { listener_field "$1" ext; }
-bound_of() { listener_field "$1" bound; }
-
-# bound_certs_are <id> <file> -- is the id among the listener's certificates?
-bound_certs_are() {
-	local id="$1" file="$2" bound
-	bound="$(bound_of "${file}")"
-	[[ -n "${bound}" ]] || return 1
-	printf '%s\n' "${bound}" | grep -qxF -- "${id}"
-}
 
 # clbverify_assert <args...> -- run the tool's own assertion path, so the verdict
 # is not only this script's parsing. Skipped when the dump had to fall back to the

@@ -32,7 +32,7 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # started inside cmd/wecert (see startWebhookServer), so it ships with the first entry.
 CMDS := wecert wecert-onboard
 
-.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-tags test-repeat e2e vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
+.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-tags test-repeat e2e vet cover clean fmt validate-cloudinit check-english check-scripts check-cli check-alerts fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
@@ -219,11 +219,23 @@ fmt-check:
 # The full pre-commit gate.
 # The shell scripts are part of the delivery surface (install.sh, the systemd units, the
 # e2e runners) and nothing else tests them. e2e-wildcard.sh in particular cannot be
-# exercised without real DNS, so its assertions are driven by a canned resolver here.
-check-scripts:
+# exercised without real DNS, so its assertions are driven by a canned resolver here;
+# e2e-sni.sh needs a real CLB, so the helpers that read its -raw evidence are driven
+# against dumps of the shape the tool really prints.
+check-scripts: check-cli
 	@bash scripts/test-e2e-wildcard.sh
+	@bash scripts/test-e2e-sni.sh
 	@python3 scripts/test-check-cam-policies.py
 	@python3 scripts/check-cam-policies.py
+
+# The documented command line is part of the delivery surface too, and nothing connected it to
+# the binaries. `wecert-clbverify -clb ...` was unusable for a whole round -- the flag was
+# registered on flag.CommandLine instead of the tool's own FlagSet, so the README's own example
+# exited 64 -- and the same blind spot covers a flag renamed under cmd/ while the docs keep the
+# old name. This runs in `check` because it takes under a second once the binaries exist; it
+# builds them itself (`make build tools`) when they are missing or older than the sources.
+check-cli:
+	python3 scripts/check-cli-surface.py
 
 # The shipped Prometheus rules are the only thing watching several failures that are silent by
 # construction, so a rule that cannot fire is worse than no rule: the operator believes they are
