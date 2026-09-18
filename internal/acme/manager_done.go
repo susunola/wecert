@@ -158,10 +158,28 @@ func (m *Manager) download(
 				o.DeploymentCertID = id
 				if err := m.store.PutOrder(o); err != nil {
 					// The certificate is uploaded; only recording its id failed. That id is the resume
-					// anchor, so losing it means the next pass uploads a SECOND copy and leaks the
-					// first -- and a bare `return err` also skips the backoff, so it retries at the
-					// pass rate instead. recordFailure keeps both (it schedules the retry and leaves
-					// the failure visible), which is what the sibling call sites already do.
+					// anchor, so losing it means the next pass uploads a SECOND copy -- and a bare
+					// `return err` also skips the backoff, so it retries at the pass rate instead.
+					// recordFailure keeps both (it schedules the retry and leaves the failure
+					// visible), which is what the sibling call sites already do.
+					//
+					// What recordFailure does NOT do is give the uploaded copy a row. Without the
+					// anchor the order cannot name it, and the promotion below never runs, so the id
+					// lives only in this log line: not in certificates, not in retired_certificates,
+					// therefore invisible to ReapRetired and billed against the account's uploaded
+					// certificate quota forever. The reclaim list is the only place left, and it is
+					// the right one -- this copy was never bound to anything (the deploy that would
+					// have switched to it never ran), and Delete asks the cloud to refuse if anything
+					// does reference it.
+					if rerr := m.store.AddRetiredCert(id, c.Name, nil, nil); rerr != nil {
+						m.log.Error("the uploaded certificate could not be recorded anywhere, so it "+
+							"will never be reclaimed and counts against the account's uploaded "+
+							"certificate quota", "cert", c.Name, "certId", id, "err", rerr)
+					} else {
+						m.log.Warn("the uploaded certificate could not be recorded as the resume anchor; "+
+							"it has been put on the reclaim list instead, and the next pass will upload "+
+							"a second copy", "cert", c.Name, "certId", id)
+					}
 					return m.recordFailure(ctx, st, fmt.Errorf(
 						"the certificate %s was uploaded but recording it for the resume anchor failed: %w",
 						id, err))

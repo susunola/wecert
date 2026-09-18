@@ -379,6 +379,10 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 	}
 	_ = f.Close()
 
+	if walMissing(path) {
+		fmt.Fprintf(os.Stderr, "wecert: WARNING: %s\n", missingWALWarning(path))
+	}
+
 	if !existedBefore && lockExisted {
 		// See missingDatabaseWarning: a lock file with no database is what "someone deleted
 		// state.db" looks like. Warn rather than refuse -- a first run after restoring a
@@ -484,6 +488,15 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 	return s, nil
 }
 
+// walMissing reports the "-shm present, -wal absent" signature.
+func walMissing(path string) bool {
+	if _, err := os.Stat(path + "-shm"); err != nil {
+		return false
+	}
+	_, err := os.Stat(path + "-wal")
+	return os.IsNotExist(err)
+}
+
 // statePathWarnings words the two local-filesystem hazards around the state database.
 //
 // Split out so the wording and the decision are testable without capturing stderr from open(),
@@ -555,6 +568,22 @@ func (s *Store) VerifyOnDisk() []string {
 		problems = append(problems, err.Error())
 	}
 	return problems
+}
+
+// missingWALWarning words the "-shm without -wal" signature.
+//
+// SQLite's WAL mode keeps committed transactions in state.db-wal until a checkpoint folds them into
+// the database, and a clean close removes both sidecars. A -shm file with no -wal is therefore the
+// signature of a wal that was deleted (a cleanup script matching -*wal, an operator "cleaning up",
+// a hostile rm) or of a checkpoint that never completed: everything committed since the last
+// checkpoint is GONE, and the database opens fine, reports no error, and holds fewer rows than the
+// last pass wrote. The row that matters most is the in-flight order URL -- losing it means the next
+// pass places a new order and spends the exact-identifier-set budget again.
+func missingWALWarning(path string) string {
+	return fmt.Sprintf("the write-ahead log %s-wal is missing while its shared-memory file "+
+		"%s-shm remains. Everything committed since the last checkpoint was in that file and is now "+
+		"gone (in-flight order URLs included), so check whether something removes state.db-wal, and "+
+		"compare this database against the newest snapshot in docs/recovery.md", path, path)
 }
 
 // missingDatabaseWarning words the "there was a database here and now there is not" case.
@@ -734,6 +763,17 @@ func databaseFilePath(db *sql.DB, configured string) (actual string, diverged bo
 
 // Close closes the state database and releases the cross-process lock.
 func (s *Store) Close() error {
+	// Wait for an in-flight operation before closing.
+	//
+	// Every statement goes through s.mu (WithTx holds it for the whole transaction), so closing
+	// without it let a transaction that was already running COMMIT after Close returned -- and after
+	// the flock was released, so a second process could be writing at the same time. The direction
+	// was favourable for the data (the promotion landed), but the shutdown warning in cmd/wecert
+	// describes the opposite mechanism, and "the store is closed" has to mean no writer is still
+	// inside it.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	err := s.db.Close()
 	if relErr := s.lock.release(); err == nil {
 		err = relErr
@@ -1374,6 +1414,19 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// ExecForTest runs one statement against the open database.
+//
+// For tests that need to inject a fault the public API cannot express -- most often a trigger that
+// refuses a specific write, which is how "the write fails but the read did not" (a full disk, a
+// corrupt page) is reproduced deterministically. The alternative is a fake store, and a fake store
+// would not exercise the real SQL, the real transaction or the real error mapping.
+func (s *Store) ExecForTest(query string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(query)
+	return err
 }
 
 // ListAuthorizationsForTest is ListAuthorizations, exposed for tests in other packages that need to

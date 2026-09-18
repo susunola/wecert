@@ -277,3 +277,26 @@ func TestABackwardClockStepDoesNotSilenceTheBindingCheck(t *testing.T) {
 	}
 	_ = store
 }
+
+// A state store that cannot even be read must schedule the retry too.
+//
+// Reconcile's own doc comment promises that a returned error means "the failure is already persisted
+// and the next attempt is already scheduled", and this read returned bare. The same class was fixed
+// for the order row and the fallback record; this call site was missed. The store is broken here, so
+// the failure counter cannot be written either -- what must survive is the in-memory transient
+// backoff, which is what keeps the pass rate from becoming the retry rate while the store is down.
+func TestAnUnreadableCertificateStateSchedulesTheRetry(t *testing.T) {
+	store, m, _, cert, dbPath := newDBFaultHarness(t)
+
+	dropTable(t, dbPath, "certificates")
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("a pass that cannot read its own state must be reported as failed")
+	}
+	if _, ok := m.transientBackoffFor(cert.Name); !ok {
+		t.Error("the failure has to schedule a retry in memory: with the store broken the row cannot " +
+			"carry next_attempt_at, so without this the next pass comes straight back and the pass " +
+			"rate becomes the retry rate")
+	}
+	_ = store
+}
