@@ -517,6 +517,11 @@ Dials a real TLS connection and reports the certificate the far end actually ser
 
 Exit codes: `0` served as expected · `1` could not complete a probe · `2` probed successfully but the certificate served was not the expected one.
 
+Under `-json`, `verdict.problems` is a list of objects — `{"kind": "...", "text": "..."}` — one per
+independent problem, because they point in different directions: `min_valid_for` means the deployed
+certificate **is** being served but has too little validity left (renewal has not run), while
+`not_after` or `names_extra` mean a different certificate is being served.
+
 ```bash
 ./bin/wecert-probe -host www.example.com -min-valid 168h
 ./bin/wecert-probe -host www.example.com -wait 90s        # just rebound
