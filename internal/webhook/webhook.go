@@ -142,6 +142,23 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		// in the default deployment, so RemoteAddr is the honest source.
 		addr := clientIP(r)
 
+		// The token is checked FIRST, and the lockout only ever applies to requests that failed
+		// it. Checking the lockout first meant an unauthenticated caller spent the budget of the
+		// address it shares with the legitimate one -- and the README's own deployment puts a TLS
+		// terminator in front of this listener, which collapses every client onto one address. A
+		// correct token then answered 429 for a renewable 15 minutes, on every hook route
+		// including the read-only /hook/status. Brute force is bounded exactly as before: a wrong
+		// token is counted, and after authMaxFailures the address is refused before the comparison.
+		if s.tokenMatches(r) {
+			// A good token is evidence this address also carries the legitimate
+			// caller, so the accumulated failures are decayed -- not wiped, or one
+			// interleaved success would forgive a shared-IP attacker indefinitely
+			// (see recordSuccess).
+			s.limiter.recordSuccess(addr, s.now())
+			next(w, r)
+			return
+		}
+
 		if ok, retryAfter := s.limiter.allowed(addr, s.now()); !ok {
 			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
 			writeJSON(w, http.StatusTooManyRequests,
@@ -149,21 +166,11 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if !s.tokenMatches(r) {
-			s.limiter.recordFailure(addr, s.now())
-			s.log.Warn("webhook authentication failed",
-				"remote", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
-			writeJSON(w, http.StatusUnauthorized,
-				map[string]string{"error": "missing or invalid token"})
-			return
-		}
-
-		// A good token is evidence this address also carries the legitimate
-		// caller, so the accumulated failures are decayed -- not wiped, or one
-		// interleaved success would forgive a shared-IP attacker indefinitely
-		// (see recordSuccess).
-		s.limiter.recordSuccess(addr, s.now())
-		next(w, r)
+		s.limiter.recordFailure(addr, s.now())
+		s.log.Warn("webhook authentication failed",
+			"remote", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
+		writeJSON(w, http.StatusUnauthorized,
+			map[string]string{"error": "missing or invalid token"})
 	}
 }
 

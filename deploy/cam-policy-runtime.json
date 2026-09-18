@@ -8,6 +8,7 @@
         "ssl:UploadCertificate",
         "ssl:DescribeCertificates",
         "ssl:DeleteCertificate",
+        "ssl:DescribeDeleteCertificatesTaskResult",
         "ssl:UpdateCertificateInstance",
         "ssl:DescribeHostUpdateRecordDetail",
         "ssl:CreateCertificateBindResourceSyncTask",

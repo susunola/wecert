@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"crypto/x509"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -1113,7 +1114,9 @@ func TestTheChallengeIsPersistedBeforeTheDNSWrite(t *testing.T) {
 	old := now.Add(-30 * time.Minute)
 	provider := &recordingProvider{}
 	solver.newProvider = func(context.Context) (challenge.Provider, error) { return provider, nil }
+	hookRan := false
 	provider.onPresent = func() {
+		hookRan = true
 		// What is on disk at the moment the DNS write starts.
 		stored, err := store.ListAuthorizationsForTest("c")
 		if err != nil {
@@ -1148,6 +1151,93 @@ func TestTheChallengeIsPersistedBeforeTheDNSWrite(t *testing.T) {
 		Location: "https://ca.test/order/1",
 	}
 	_, _ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
+
+	// Every assertion above runs inside the hook, so a fixture that never reaches the DNS write
+	// would make this test pass without checking anything. The test-quality review caught exactly
+	// that: replacing the pass's Present call with a local value kept it green.
+	if !hookRan {
+		t.Fatal("the fixture never reached the DNS write, so nothing above was asserted")
+	}
+}
+
+// A first visit must persist the challenge before the DNS write too.
+//
+// This is the ordering the round-5 comment calls load-bearing: a pass that dies between the write
+// and the end-of-loop persist leaves a record in DNS that only the row's token can locate, and on a
+// first visit there is no earlier row to inherit a token from -- so if the row is not written
+// first, the record is unfindable from the moment it exists. Deleting the firstVisit persist left
+// the whole package green before this test existed.
+func TestTheFirstVisitChallengeIsPersistedBeforeTheDNSWrite(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	solver, _, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			resp := dnsReply(msg)
+			resp.Rcode = dns.RcodeNameError
+			resp.Authoritative = true
+			return resp, nil
+		})
+	solver.timeout = time.Millisecond
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{authzByURL: map[string]legoacme.Authorization{
+		"https://ca.test/authz/1": {
+			Status:     "pending",
+			Identifier: legoacme.Identifier{Value: "example.com"},
+			Challenges: []legoacme.Challenge{{
+				Type: "dns-01", URL: "https://ca.test/chall/1", Token: "tok-1",
+			}},
+		},
+	}}
+	m := newManager(store, fake, solver, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return now })
+
+	hookRan := false
+	solver.newProvider = func(context.Context) (challenge.Provider, error) {
+		return &recordingProvider{onPresent: func() {
+			hookRan = true
+			stored, err := store.ListAuthorizationsForTest("c")
+			if err != nil {
+				t.Errorf("reading the row from inside Present: %v", err)
+				return
+			}
+			if len(stored) != 1 {
+				t.Errorf("the challenge has to be on disk before the record it describes: found %d rows",
+					len(stored))
+				return
+			}
+			if stored[0].ChallengeToken != "tok-1" {
+				t.Errorf("the row must name the challenge being written, got token %q",
+					stored[0].ChallengeToken)
+			}
+			if stored[0].Presented {
+				t.Error("nothing has been confirmed presented at the moment of the write")
+			}
+			if !stored[0].ChallengePreparedAt.Equal(now) {
+				t.Errorf("the challenge's age must be on disk with it, got %s want %s",
+					stored[0].ChallengePreparedAt, now)
+			}
+		}}, nil
+	}
+
+	// Nothing in the store: this is a first visit, so there is no earlier token to inherit.
+	cert := &config.Certificate{Name: "c", Domains: []string{"example.com"}}
+	order := legoacme.ExtendedOrder{
+		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
+		Location: "https://ca.test/order/1",
+	}
+	_, _ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
+
+	if !hookRan {
+		t.Fatal("the fixture never reached the DNS write, so nothing above was asserted")
+	}
 }
 
 // refusingProvider refuses every write, so a pass stops between selecting the challenge and the
@@ -1274,5 +1364,116 @@ func TestAFailedWriteOnTheRevisitPathKeepsTheTokenThatNamesTheRecord(t *testing.
 	}
 	if len(after) != 0 {
 		t.Errorf("once the record is reclaimed the row is finished, %d left", len(after))
+	}
+}
+
+// A state write that fails after the TXT was presented must not leave the record unnamed in DNS.
+//
+// The revisit path deliberately keeps the previous attempt's token on disk until the new record
+// exists, so when the write that would name the new record fails, the row names the OLD value and
+// nothing points at the new one: recovery probes the old value, is authoritatively denied, drops
+// the row, and the new record stays in DNS with no row, no lease and no log line mentioning it. The
+// pass now removes what it just wrote before reporting the failure.
+//
+// The write is made to fail deterministically with a SQLite trigger, which is the same shape as a
+// full disk or a corrupt page: the read that loaded the row succeeded, the write does not.
+func TestAFailedStateWriteTakesThePresentedRecordBackOut(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	oldValue := dns01.GetChallengeInfo("example.com", "keyauth(tok-1)").Value
+	newValue := dns01.GetChallengeInfo("example.com", "keyauth(tok-2)").Value
+
+	// The authority denies the new value (so the pass writes) and afterwards serves whatever was
+	// written, so the cleanup probe finds it.
+	var written []string
+	solver, rec, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			if len(written) == 0 {
+				resp := dnsReply(msg)
+				resp.Rcode = dns.RcodeNameError
+				resp.Authoritative = true
+				return resp, nil
+			}
+			return authTXT(msg, written...), nil
+		})
+	provider := &recordingProvider{}
+	provider.onPresent = func() {}
+	solver.newProvider = func(context.Context) (challenge.Provider, error) { return provider, nil }
+	solver.timeout = time.Millisecond
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	store, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// One presented record per Present call, so the harness's authority can serve it back.
+	provider.onPresent = func() {
+		written = append(written, newValue)
+	}
+
+	fake := &fakeAPI{authzByURL: map[string]legoacme.Authorization{
+		"https://ca.test/authz/1": {
+			Status:     "pending",
+			Identifier: legoacme.Identifier{Value: "example.com"},
+			Challenges: []legoacme.Challenge{{
+				Type: "dns-01", URL: "https://ca.test/chall/2", Token: "tok-2",
+			}},
+		},
+	}}
+	m := newManager(store, fake, solver, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return now })
+
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "https://ca.test/authz/1", Identifier: "example.com",
+		ChallengeToken: "tok-1", TxtName: rec.FQDN, TxtValue: oldValue,
+		Presented: false, ChallengePreparedAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// From here on, every UPDATE of an authorization row is refused: the pass's write fails.
+	failAuthorizationWrites(t, dbPath)
+
+	cert := &config.Certificate{Name: "c", Domains: []string{"example.com"}}
+	order := legoacme.ExtendedOrder{
+		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
+		Location: "https://ca.test/order/1",
+	}
+	if _, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order); err == nil {
+		t.Fatal("the state write is refused, so the pass must fail")
+	}
+
+	if len(provider.presents) == 0 {
+		t.Fatal("the fixture must reach the DNS write, or this test proves nothing")
+	}
+	if len(provider.cleanups) != 1 {
+		t.Errorf("the record written by this pass must be taken back out (%d cleanups, expects one "+
+			"delete-all at %s): nothing else on disk or in the lease registry names it",
+			len(provider.cleanups), rec.FQDN)
+	}
+}
+
+// failAuthorizationWrites makes every UPDATE of an authorization row fail, deterministically.
+//
+// A trigger is the closest thing to a full disk or a corrupt page that a test can arrange: the read
+// that loaded the row succeeds, the write is refused by the database itself.
+func failAuthorizationWrites(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open a second connection: %v", err)
+	}
+	defer db.Close()
+	// Only the write that records a PRESENTED challenge fails: the earlier write of the
+	// challenge age has to succeed, or the pass stops before it ever writes to DNS.
+	if _, err := db.Exec(`CREATE TRIGGER r6_no_authorization_writes BEFORE UPDATE ON authorizations
+		WHEN NEW.presented = 1
+		BEGIN SELECT RAISE(ABORT, 'disk full'); END`); err != nil {
+		t.Fatalf("create the fault trigger: %v", err)
 	}
 }

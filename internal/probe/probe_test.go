@@ -531,3 +531,40 @@ func TestForgetDropsTheRememberedState(t *testing.T) {
 		t.Errorf("Forget should drop the remembered state, still have %q", got)
 	}
 }
+
+// A host that stops resolving must not keep a stale probe_match of 1 either.
+//
+// The resolve failure takes a different branch from "some addresses could not be dialled", and that
+// branch used to leave the series alone: a host that matched last round and then lost its DNS kept
+// reporting probe_match=1 while its verdict was unreachable, so the documented alert on
+// probe_match == 0 -- the one signal that says "traffic is being served by something else" -- could
+// never fire for the host that had actually stopped resolving.
+func TestResolveFailureMarksProbeMatchZero(t *testing.T) {
+	const host = "no-longer-resolves.example"
+	cert := makeCert(t, []string{host},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+	good := resultFromCert(t, cert, host)
+	expectation := Expectation{Domains: []string{host}, NotAfter: good.NotAfter}
+
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{{Address: "192.0.2.10:443", Result: good}}, nil
+	}
+	if v := r.Check(context.Background(), host, expectation); !v.OK {
+		t.Fatalf("the priming round should pass, got: %s", v.Summary())
+	}
+	if got := testutil.ToFloat64(metrics.CertificateProbeMatch.WithLabelValues(host)); got != 1 {
+		t.Fatalf("probe_match should be 1 after a clean round, got %v", got)
+	}
+
+	// The name no longer resolves: probeAll fails before any address is tried.
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return nil, &net.DNSError{Name: host, Err: "no such host", IsNotFound: true}
+	}
+	if v := r.Check(context.Background(), host, expectation); v.OK {
+		t.Fatal("a name that does not resolve must not pass")
+	}
+	if got := testutil.ToFloat64(metrics.CertificateProbeMatch.WithLabelValues(host)); got != 0 {
+		t.Errorf("probe_match must drop to 0 when the name cannot be resolved, got %v (stale 1)", got)
+	}
+}
