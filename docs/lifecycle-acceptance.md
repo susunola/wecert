@@ -112,7 +112,8 @@ done
 ### P6 构建
 
 ```bash
-make build   # 产出 ./bin/wecert 与 ./bin/wecert-onboard
+make tools   # 产出 ./bin/wecert 与 ./bin/wecert-onboard（`make build` 只产出 wecert，
+             #  Part B 之后会直接调用 wecert-onboard，所以这里用 tools）
 ```
 
 ### P7 配置文件
@@ -183,7 +184,7 @@ certificates:
 | A4b | 整组换域名 | 与旧证书零重叠也必须能签发 | 签发成功、**不带** `replaces` |
 | A5 | 中断续跑 | 半途失败后复用同一订单 | 恢复时 `order_url` 不变、无新订单 |
 | A6 | 并发双证书 | 同名 TXT 不互删 | 两张证书都签发成功（这正是被修复的缺陷类） |
-| A7 | 续期·ARI | 走 ARI 窗口 + `replaces` | `starting renewal`、`replaces=true`、window 归零 |
+| A7 | 续期·ARI | 走 ARI 窗口 + `replaces` | `starting renewal`、`replacesRequested=true`、window 归零 |
 | A8 | 续期·回退 | ARI 不可用时按时间阈值 | `replaces=false`、仍成功 |
 | A9 | 孤儿回收 | 未持久化的记录被找回 | `reclaiming it before deleting the row`、TXT 与行都被清掉 |
 | B0 | 声明→契约 | `_wecert` 记录生成文档 | 证书名=`example-com`、SAN=声明集合、revision 稳定 |
@@ -334,7 +335,7 @@ txt "_acme-challenge.sub.$APEX"
 - `not_after` 比 A0 的晚；`orders`=0；`_acme-challenge.sub.$APEX` 为空
 
 **判据**：以上全部成立。额外记录（**不作为判据**）：`ACME order created` 可能出现
-`replaces=true` —— 代码把 ARI certID 一并带上；若 CA 不接受 `replaces`，
+`replacesRequested=true` —— 代码把 ARI certID 一并带上；若 CA 不接受 `replaces`，
 lego 会自动去掉并重试一次，最终签发成功仍算通过。
 
 **失败说明**：没有漂移告警却重签了，说明判断落在续期窗口上（那不是这条设计）；
@@ -447,7 +448,7 @@ q "SELECT consecutive_failures, datetime(next_attempt_at,'unixepoch') FROM certi
 | `consecutive_failures` | **0**（`kill -9` 什么都没来得及记） |
 | `next_attempt_at` | 0（同上：没有退避，恢复轮不需要清） |
 | 日志 | `TXT presented` ×2，且**没有** `TXT propagated` |
-| 退出码 | 被杀时是 137。**顺带记住**：`-once` 即使这一轮失败也是 **0**（`RunAll` 刻意丢弃单张证书的错误），所以永远不要用退出码判断单张证书的成败 |
+| 退出码 | 被杀时是 137。**顺带记住**：`-once` 在"这一轮没有收敛"时退出码是 **1**（`onceExit`；"什么都没尝试、全部被跳过"也算没有收敛），只有真正收敛才回 0 —— 这是 systemd timer 用来报警的信号。旧文写的"即使失败也是 0、永远不要看退出码"描述的是 `RunAll` 时代的行为，那个函数已经不存在了 |
 
 **这一条是整个 A4 的核心**：直接看到"一个名字下两条 TXT 并存"，
 而不是靠"签发成功"去反推。
@@ -507,7 +508,7 @@ identifiers in this order do not match any identifiers in the certificate being 
 | 检查 | 期望 |
 |---|---|
 | 结果 | **签发成功**（这是本阶段唯一真正重要的一条） |
-| 日志 | `ACME order created` 存在，且其中 **没有** `replaces=true` |
+| 日志 | `ACME order created` 存在，且其中 **没有** `replacesRequested=true` |
 | 日志 | **没有** `Could not validate ARI 'replaces' field` |
 | 日志 | 没有 `the CA refused the ARI replaces field; retrying the order without it`（走的是"一开始就不发"，不是"发了被拒再重试") |
 | 新 SAN | `{moving.$APEX}` |
@@ -570,7 +571,7 @@ _acme-challenge.<名字> - check that a DNS record exists for this domain
 （配置去重的是证书名，不是域名）。lego 的 provider `CleanUp` 会删掉**该名字下的所有**
 TXT，所以 A 的清理绝不能把 B 还活着的记录一起删掉。
 
-`RunAll`（`-once` 和定时巡检）是**顺序**执行的，碰不到这个窗口；
+`RunDetailed`（`-once` 和定时巡检）是**顺序**执行的，碰不到这个窗口（`RunAll` 这个名字已经不存在）；
 要真正并发，只能用 webhook 触发（`StartCert` 给每张证书一个 goroutine）。
 而守护进程启动时会立刻跑一轮 —— 所以顺序是"先让初始那轮无事可做，
 再用 SQL 把两张证书同时推进续期窗口，最后触发"。
@@ -680,7 +681,7 @@ OLD_ARI="$(q "SELECT ari_cert_id FROM certificates WHERE name='lifecycle';")"
 **期望**
 
 - `starting renewal`，该行 `ariReplaces=true`
-- `ACME order created` 一行里 `replaces=true`
+- `ACME order created` 一行里 `replacesRequested=true`
 - 新叶证书的 SAN 与配置一致，`not_after` 前移
 - 成功后 `ari_window_start` / `ari_window_end` 被**归零**（下一轮重新拉取），
   且 `ari_cert_id` 变成**新证书**的
@@ -696,7 +697,7 @@ q "SELECT ari_window_start, ari_window_end, ari_checked_at, ari_cert_id FROM cer
 | 检查 | 期望 |
 |---|---|
 | `starting renewal` 行 | 存在，且 `ariReplaces=true` |
-| `ACME order created` 行 | 存在，且 `replaces=true` |
+| `ACME order created` 行 | 存在，且 `replacesRequested=true` |
 | `replaces` 是否真被 CA 接受 | 签发成功即证明（staging 会校验 `replaces` 指向的证书） |
 | `ari_cert_id` | 与 `OLD_ARI` **不同**（新证书的 AKI/serial） |
 | `ari_window_start` / `_end` | 0 / 0 |
@@ -1268,7 +1269,7 @@ staging 签发的证书**不需要**吊销，也不占生产配额。若 `deploy
 3. A4：中断态下同一个 `txt_name` 有 2 行授权、`dig` 返回 2 条 TXT
 4. A5：恢复时 `resuming the existing order`，且没有第二张订单
 5. A6：并发两张共享挑战名的证书都签发成功
-6. A7：`ACME order created` 里 `replaces=true`
+6. A7：`ACME order created` 里 `replacesRequested=true`
 7. A9：`reclaiming it before deleting the row` 出现，且授权行清空
 8. A4b：换到零重叠的域名集合仍能签发（不带 `replaces`）
 

@@ -11,7 +11,13 @@ PREFLIGHT := bin/wecert-preflight
 CLBVERIFY := bin/wecert-clbverify
 TATRUN := bin/wecert-tatrun
 PROBE := bin/wecert-probe
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1.0)
+# The version string is embedded with -ldflags, so it must not be able to leave the shell word it
+# sits in. A git tag name is attacker-influenced data -- tags arrive with a clone -- and git refnames
+# may contain `"`, `;`, `>` and `$`: a tag named `v1";id>/tmp/PWNED;#'` made `make build` exit 0
+# while running the injected command, and `make release` is what install.sh installs as root.
+# sanitise-version keeps [A-Za-z0-9._+-] and replaces everything else with '-'.
+SANITISE_VERSION = $(shell printf '%s' '$(1)' | tr -c 'A-Za-z0-9._+-' '-' | sed 's/-*$$//')
+VERSION ?= $(call SANITISE_VERSION,$(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1.0))
 
 # Diagrams: the Chinese version is the hand-written source, the English version is
 # a build artifact.
@@ -22,11 +28,11 @@ ENHTML  := docs/certificate-lifecycle.en.html
 # linux/amd64; ARM instances use linux/arm64; darwin/arm64 is for local debugging.
 PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 
-# Commands shipped with the product. The webhook-triggered half is not in here
-# yet; keep this list in sync when it lands.
+# Commands shipped with the product. The webhook-trigger endpoint is not a separate binary: it is
+# started inside cmd/wecert (see startWebhookServer), so it ships with the first entry.
 CMDS := wecert wecert-onboard
 
-.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-repeat vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
+.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-tags test-repeat e2e vet cover clean fmt validate-cloudinit check-english check-scripts check-alerts fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
@@ -96,6 +102,14 @@ release:
 			printf '%s\n' "ok"; \
 		done; \
 	done
+	@# The tagged build is compiled here on purpose: `make release` is the one build step CI runs, and
+	@# without this line a broken lego_dns registry would only be discovered on the machine that
+	@# builds that variant. Only linux/amd64 -- the platform that variants ship on -- so the release
+	@# does not pay for the full provider registry three times.
+	@printf 'building %-34s' "dist/wecert_linux_amd64 (lego_dns)"; \
+		CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -tags lego_dns \
+			-ldflags "-s -w -X main.version=$(VERSION)" -o dist/wecert_linux_amd64-lego-dns ./cmd/wecert || exit 1; \
+		printf '%s\n' "ok"
 	@cd dist && (command -v sha256sum >/dev/null 2>&1 && sha256sum wecert* || shasum -a 256 wecert*) > SHA256SUMS
 	@echo && echo "=== artifacts ===" && ls -lh dist/ && echo && cat dist/SHA256SUMS
 
@@ -159,6 +173,17 @@ check-english:
 test:
 	$(GO) test ./...
 
+# The build-tagged code needs its own gate.
+#
+# Two production files are selected by a build tag (`lego_registry_tags.go` /
+# `lego_registry_notags.go`, plus the lego registry itself behind `lego_dns`), and each has a paired
+# test file that only runs under that tag. Neither `go test ./...` nor CI's `go test -race ./...`
+# ever compiles them, so a change that breaks the tagged registry -- or a test that only makes sense
+# there -- passes every other gate. This target is what `make check` runs for that.
+test-tags:
+	$(GO) test -race -tags "pebble lego_dns" ./...
+	$(GO) vet -tags "pebble lego_dns" ./...
+
 # -race is necessary: on certificates with many SANs, DNS probing and
 # authorization polling run concurrently, and a data race shows up as "some
 # domain's validation fails intermittently for no apparent reason" — the kind of
@@ -197,6 +222,8 @@ fmt-check:
 # exercised without real DNS, so its assertions are driven by a canned resolver here.
 check-scripts:
 	@bash scripts/test-e2e-wildcard.sh
+	@python3 scripts/test-check-cam-policies.py
+	@python3 scripts/check-cam-policies.py
 
 # The shipped Prometheus rules are the only thing watching several failures that are silent by
 # construction, so a rule that cannot fire is worse than no rule: the operator believes they are
@@ -217,6 +244,18 @@ check-alerts:
 test-pebble:
 	$(GO) test -tags pebble -count=1 -timeout 5m ./internal/acme/ -run TestPebble -v
 
+# The end-to-end run and its HTML report: three suites (the real DNS-01 lifecycle, the ACME order
+# protocol, the wildcard/apex shared-name logic) plus a report that states what is real and what
+# needed credentials this environment does not have. Needs the same pebble binary as test-pebble.
+#
+# Port 53 is required by the first suite: a DNS delegation carries no port, so wecert's propagation
+# probe and the CA's validator both need the authority there. On Linux that means
+# CAP_NET_BIND_SERVICE (docker run --cap-add=NET_BIND_SERVICE ...); the suite skips with that
+# instruction rather than pretending to have run.
+E2E_OUT ?= docs/e2e-run-$(shell date +%Y-%m-%d).html
+e2e:
+	@bash scripts/e2e.sh --out $(E2E_OUT)
+
 # Property and fuzz testing. Separate from `check` because each target runs for a bounded
 # wall-clock budget rather than to completion, so it belongs in a scheduled job as well as a
 # pre-merge run.
@@ -230,7 +269,7 @@ fuzz:
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzLimitWithDegenerateRefill -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzParseRetryAfter -fuzztime $(FUZZTIME)
 
-check: check-english fmt-check vet test-race check-scripts check-alerts
+check: check-english fmt-check vet test-race test-tags check-scripts check-alerts
 
 clean:
 	rm -rf bin dist coverage.out

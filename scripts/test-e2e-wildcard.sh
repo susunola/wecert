@@ -127,7 +127,7 @@ run() {
 	local out rc peak
 	export MOCK_MODE="${mode}" MOCK_AFTER="${after}" MOCK_DONE="${WORK}/.done"
 	export DIG="${WORK}/fake-dig" BIN="${WORK}/fake-wecert"
-	export SAMPLE_SECONDS=5 SAMPLE_INTERVAL=1
+	export SAMPLE_SECONDS=5 SAMPLE_INTERVAL=1 SETTLE_SECONDS=0 SETTLE_INTERVAL=1
 	# The stub lives 2s; sampling covers 5s, so the during-issuance view is observed and the
 	# post-issuance view is not mistaken for it.
 	export ISSUE_SECONDS=2
@@ -135,7 +135,7 @@ run() {
 	out="$(bash "${TARGET}" example.com "${WORK}/staging.yaml" 2>&1)"
 	rc=$?
 	set -e
-	unset MOCK_MODE MOCK_AFTER MOCK_DONE DIG BIN SAMPLE_SECONDS SAMPLE_INTERVAL ISSUE_SECONDS
+	unset MOCK_MODE MOCK_AFTER MOCK_DONE DIG BIN SAMPLE_SECONDS SAMPLE_INTERVAL ISSUE_SECONDS SETTLE_SECONDS SETTLE_INTERVAL
 
 	peak="$(printf '%s' "${out}" | grep -oE 'peak distinct TXT values observed at [^ ]+: [0-9]+' | sed 's/.*: //' || true)"
 	peak="${peak:-0}"

@@ -361,13 +361,47 @@ authorizations                -- one row per identifier, keyed by authz URL
 ├── challenge_url/token  TEXT
 ├── txt_name, txt_value  TEXT      -- the only handle for cleaning up the record
 ├── presented            INTEGER   -- written to DNS (propagation not guaranteed)
-└── challenge_sent       INTEGER   -- CA notified to verify
+├── challenge_sent       INTEGER   -- CA notified to verify
+└── challenge_prepared_at INTEGER  -- when this challenge was chosen; a denial from the
+                                   -- authoritative servers is only evidence once the write
+                                   -- would have had time to appear
 
 retired_certificates          -- uploaded certificates awaiting reaping
 ├── cert_id    TEXT PK
 ├── cert_name  TEXT
-└── retired_at INTEGER
+├── retired_at INTEGER
+├── cert_pem / key_pem BLOB        -- the archived copy, so a revocation can still be signed
+                                   -- after the cloud copy is gone (NULL for a certificate we
+                                   -- uploaded but never held material for)
+
+cert_fallback                 -- the degraded name set currently in service, if any
+├── cert_name  TEXT PK
+└── ...                            -- the dropped names and the reason, for the report
+
+identifier_failures           -- per-identifier failure ledger ("who has been broken lately")
+├── cert_name, identifier PK
+├── failures               INTEGER -- consecutive-ish count, pruned once the name is healthy
+├── last_error             TEXT    -- the CA's own words for the last failure
+└── last_failed_at         INTEGER -- when it happened; the identifier cooldown is seeded from
+                                   -- this after a restart
+
+revoke_requests               -- durable operator decisions (a leaked key stays leaked)
+├── cert_name  TEXT PK
+├── reason                 TEXT
+├── cert_identity          TEXT   -- which certificate the request named, so a later renewal
+│                                  -- cannot be revoked by mistake
+├── requested_at, attempts INTEGER
+└── last_error             TEXT
+
+rate_buckets                  -- reconstructed CA rate-limit accounting
+├── limit_name, scope_id PK
+├── tokens, observed_at    INTEGER
+└── reset_at, reset_reason TEXT    -- the CA's own Retry-After, when it refused a request
 ```
+
+All nine tables are listed above; the schema itself is the `CREATE TABLE` block in
+`internal/state/state.go`, and `schemaColumns` there is what the migration verifier compares against
+— a column missing from that list is a column the next migration would try to add twice.
 
 Migrations run on `Open` and add missing columns in place (`PRAGMA table_info` + `ALTER TABLE`). **Upgrades never require rebuilding the database.** The file, its `-wal` and its `-shm` are all created `0600`, because they contain the ACME account key and every certificate's private key.
 
@@ -514,7 +548,7 @@ Every kind of "cannot read it" has a defined reaction. **None of them treats "un
 | New Certs / registered domain | 50 / 7 days, **shared across accounts** | Frequent changes to the name set | Wildcard-first plus a 25-changes-per-week budget |
 | New Certs / **exact identifier set** | 5 / 7 days, **no override** | Reissuing the same name set repeatedly | At most one in-flight order per certificate |
 | Authorization failures / identifier | 5 / hour | Retrying a name whose DNS is not configured | Backoff, then hand over to a human |
-| **ARI-coordinated renewals** | **exempt from all of the above** | — | The order must carry `replaces` and the identifier set must be unchanged |
+| **ARI-coordinated renewals** | **exempt from all of the above** | — | The order must carry `replaces` and share at least one identifier with the certificate being replaced (an unchanged set qualifies; a wholly disjoint set does not) |
 
 That last row is what makes wildcard-first more than an optimisation: **changing the name set makes the issuance a brand-new certificate**, which forfeits the ARI exemption. The cost of "add one domain" therefore has to be driven to nearly zero, and a wildcard is the only way to do that. It is also why the desired-state generator prefers to report "covered by the declared wildcard, 0 issuances" over touching the SAN set.
 
@@ -532,7 +566,7 @@ A certificate may carry many SANs, and that set changes. Three things exist spec
 
 > ### ⚠️ Changing domains has a quota cost
 >
-> ARI's renewal exemption requires a *same-identifier* renewal. As soon as you add or remove a domain, that issuance becomes a new certificate and counts against **Certificates per Registered Domain (50 / 7 days, shared across accounts)**.
+> ARI's renewal exemption needs the order to share **at least one identifier** with the certificate it replaces (Let's Encrypt's wording). Adding a domain to an existing certificate keeps that overlap and keeps the exemption; a **wholly disjoint** set -- every name moving elsewhere -- is what counts against **Certificates per Registered Domain (50 / 7 days, shared across accounts)**.
 >
 > If you churn identifiers frequently, watch that ceiling. Splitting unrelated services across different registered domains keeps them from competing for the same budget. This is logged as a warning on the drift path.
 
@@ -612,6 +646,7 @@ The two providers use completely different credentials. Don't mix them up.
 |---|---|---|---|
 | `provider` | no | `dnspod` | `dnspod` uses DNSPod's own API token (dnsapi.cn). `tencentcloud` uses Tencent Cloud CAM credentials (dnspod.tencentcloudapi.com) — recommended, because it shares credentials with deployment and supports `SessionToken` for instance roles. |
 | `loginToken` | when `provider: dnspod` | — | DNSPod's own API token, shaped `12345,abcdef…`. **Not** a Tencent Cloud SecretId/SecretKey. |
+| `loginTokenFile` | alternative to `loginToken` | — | Reads the token from a file instead, so it never appears in `config.yaml` — and therefore not in its backups, its diffs, or anyone's scrollback. The path is **environment-expanded**, which is what makes systemd's `LoadCredential` work: `LoadCredential=dnspod-token:/etc/wecert/dnspod.token` exposes the file at `$CREDENTIALS_DIRECTORY/dnspod-token`, and the config says `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token`. `DNSPOD_LOGIN_TOKEN` in the environment is also accepted when neither is set. Setting both `loginToken` and `loginTokenFile` is refused rather than guessed at. |
 | `ttl` | no | `600` | TTL for the `_acme-challenge` TXT record. **600 is the floor on DNSPod's free tier** — configuring 60 is rejected with `LimitExceeded.RecordTtlLimit`. Paid tiers can go lower to speed up propagation and cleanup. |
 | `propagationTimeout` | no | `5m` | Upper bound on waiting for all authoritative nameservers to see the record |
 | `pollingInterval` | no | `5s` | Interval between propagation probes |
@@ -633,6 +668,7 @@ This is fully supported: `GetChallengeInfo` follows the CNAME and reports the re
 |---|---|---|---|
 | `credentialMode` | no | `cvm-role` | `cvm-role` takes temporary credentials from instance metadata (nothing on disk). `static` uses `secretId`/`secretKey` below, or the `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` environment variables (local debugging only). |
 | `secretId` / `secretKey` | when `static` | — | CAM key pair. Prefer the environment variables so the config file can be committed and backed up freely. |
+| `secretIdFile` / `secretKeyFile` | alternative to the pair above | — | File variants, environment-expanded and mutually exclusive with the inline values, exactly like `loginTokenFile`. Unnecessary with `credentialMode: cvm-role`, where no static key exists at all. |
 | `roleName` | when `cvm-role` | — | The role bound to the CVM instance |
 | `resourceTypes` | no | `[clb]` | Resource types for `UpdateCertificateInstance`. `clb` is the common one; `cdn`, `waf`, `tke` and `apigateway` are also supported. |
 | `regions` | yes | — | **CLB is a regional resource. List every region that has a CLB.** A missing region is silently not updated and the certificate there expires. |
@@ -692,7 +728,7 @@ Poll `/hook/status` for the outcome:
   "time": "2026-09-15T18:00:00Z",
   "certificates": [
     { "name": "a-com", "notAfter": "2026-12-14T16:41:58Z", "daysLeft": 89,
-      "deployed": true, "deployConfirmed": true, "consecutiveFailures": 0 }
+      "uploaded": true, "deployConfirmed": true, "consecutiveFailures": 0 }
   ]
 }
 ```
@@ -778,7 +814,8 @@ Wildcards are skipped — `*.example.com` has no address of its own to dial. A c
 Two metrics keep the failure modes apart:
 
 - `wecert_certificate_probe_errors_total{host}` — the probe could not run at all (resolve, dial or handshake failed). This is an environment problem, not a certificate problem.
-- `wecert_certificate_probe_match{host}` — the probe completed and compares what was served against what was deployed. `0` means a rebind did not take effect, or another certificate is winning SNI.
+- A name that resolves to more than **32 addresses** is refused rather than sampled (`probe: … more than the 32 this program will dial`): every resolved address has to be checked, so "here are the first 32" would be a claim the probe cannot support. The verdict for that host is an error, and `probe_match` is 0 while it lasts.
+- `wecert_certificate_probe_match{host}` — the probe completed and compares what was served against what was deployed. `0` means a rebind did not take effect, another certificate is winning SNI, **or** at least one of the host's resolved addresses could not be reached (an unverified address is not a verified one). Read `wecert_certificate_probe_errors_total` with it: errors climbing means the environment, not the certificate.
 
 > **The comparison is against what was deployed, not "some valid certificate".** `wecert_certificate_probe_not_after_timestamp_seconds` (read over the network) sitting next to `wecert_certificate_not_after_timestamp_seconds` (read from the state store) is what makes "the rebind silently did nothing" visible.
 
@@ -876,9 +913,11 @@ answered by asking. wecert answers it two ways, and the difference matters:
 
 - **Locally, from what it spent** (`wecert_ratelimit_remaining_tokens`). Every event that
   consumes quota goes through wecert, and the buckets refill at published rates, so the
-  remainder can be reconstructed exactly — for this program. It is a **lower bound**: the
+  remainder can be reconstructed exactly — for this program. It is an **upper bound**: the
   per-registered-domain and per-exact-set limits are global, and another account spending them
-  is invisible here. Read it as "at least this much is left".
+  is invisible here, so the real remainder can only be smaller. Read it as "at most this much is
+  left" — the direction matters, because "at least" would invite spending quota that may not be
+  there.
 - **From the CA, when it refuses** (`wecert_ratelimit_blocked`). A rate-limited request returns
   a documented message ending in `retry after <instant>`, and when several limits are exceeded
   at once the CA reports the one that resets *furthest* in the future. That instant is
@@ -902,14 +941,14 @@ row per bucket in `rate_buckets`: the bucket model is its own memory, so no even
 | `wecert_last_reconcile_timestamp_seconds` | When the last **full pass finished**. Stamped on completion, never on start, so a hung pass goes stale exactly like a dead process; `0` means none has finished since startup. This is how "the daemon is up and converging nothing" becomes visible — the counter above stops moving both when nothing is due and when the loop is wedged |
 | `wecert_revocation_pending` | Revocation requests recorded but not yet accepted by the CA. **Non-zero is an outstanding security action**, not a background task: the row exists because someone decided a certificate must stop being trusted |
 | `wecert_revocation_query_errors_total` | Passes that could not read the outstanding revocation requests. `wecert_revocation_pending` holds its last value when that read fails rather than reporting a false `0`, so this counter is what distinguishes "the queue is empty" from "we have been unable to look" |
-| `wecert_certificate_probe_match{host}` | 1 when the certificate served is the one deployed; 0 when a rebind did not take effect or another certificate is winning SNI |
+| `wecert_certificate_probe_match{host}` | 1 when the certificate served is the one deployed; 0 when a rebind did not take effect, another certificate is winning SNI, or some resolved addresses could not be checked (see `wecert_certificate_probe_errors_total`) |
 | `wecert_certificate_probe_not_after_timestamp_seconds{host}` | `notAfter` read back over the network — compare against the state-store value |
 | `wecert_certificate_probe_errors_total{host}` | The probe could not run at all. An environment problem, not a certificate problem |
 | `wecert_certificate_fallback_active{cert}` | 1 while a partial certificate is being served because some names keep failing |
 | `wecert_certificate_fallback_dropped_names{cert}` | How many names that partial certificate is missing |
 | `wecert_desired_state_age_seconds` | Age of the desired-state document. A growing value means `wecert-onboard` stopped running |
 | `wecert_orphaned_certificates` | Certificates in the state store but absent from the desired state. They will not be renewed |
-| `wecert_ratelimit_remaining_tokens{limit,scope}` | Estimated tokens left in a published CA rate limit. **A lower bound**: it counts only what wecert spent, while *certs per registered domain* and *certs per exact set of identifiers* are global across all accounts |
+| `wecert_ratelimit_remaining_tokens{limit,scope}` | Estimated tokens left in a published CA rate limit. **An upper bound**: it counts only what wecert spent, while *certs per registered domain* and *certs per exact set of identifiers* are global across all accounts, so the true remainder can be smaller |
 | `wecert_ratelimit_blocked{limit,scope}` | `1` while the CA has refused a request against this limit and reported when it will accept one again |
 
 Alert on `not_after`, **not** on "did the renewal job error" — the latter stays silent when the program is quietly broken:
@@ -944,20 +983,26 @@ watching quota behaviour under a deliberately broken name.
 With a **CVM role** (the default), credentials come from instance metadata and never touch disk:
 
 ```
-dnspod:DescribeRecordList / CreateRecord / DeleteRecord   scope: your single acme-auth zone
+dnspod:DescribeRecordList / CreateRecord / DeleteRecord / DescribeDomainList
 ssl:UploadCertificate
 ssl:DescribeCertificates
 ssl:DeleteCertificate
+ssl:DescribeDeleteCertificatesTaskResult
 ssl:UpdateCertificateInstance
 ssl:DescribeHostUpdateRecordDetail
 ssl:CreateCertificateBindResourceSyncTask
 ssl:DescribeCertificateBindResourceTaskResult
 ```
 
-Omitting any of the last three is not a soft failure: without
+Omitting any of these is not a soft failure: without
 `DescribeHostUpdateRecordDetail` every one-click rebind times out after three minutes and
-the certificate is re-uploaded each round, and without the two bind-resource actions the
-`deployed` metric can never turn green.
+the certificate is re-uploaded each round, without the two bind-resource actions the
+`deployed` metric can never turn green, and without
+`DescribeDeleteCertificatesTaskResult` every `IsCheckResource=true` delete is polled
+through an API the role may not call, so `ReapRetired` keeps the certificate on its list
+and logs a warning every round instead of reclaiming it. `deploy/cam-policy-*.json` is the
+authoritative list, and `scripts/check-cam-policies.py` (run by `make check`) fails when a
+policy stops covering an API the code calls.
 
 `deploy/cam-policy-test.json` and `deploy/cam-policy-stage-ab.json` contain ready-made policies.
 
@@ -1124,24 +1169,32 @@ make test-pebble  # a real ACME lifecycle against a local CA (needs the pebble b
 make cover      # coverage
 ```
 
-CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI does **not** run `check-scripts`, `check-alerts`, `make fuzz` or `make test-pebble` yet — those are on whoever pushes.
+CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. `make check` additionally runs `test-tags` (the same tests under `-tags "pebble lego_dns"`, which is the only gate for two tag-selected production files), `check-scripts` (the shell self-test and the CAM policy drift check) and `check-alerts`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI does **not** run `check-scripts`, `check-alerts`, `make fuzz` or `make test-pebble` yet — those are on whoever pushes.
 
 ### Test layout
 
-633 test functions across 60 files in 18 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
+817 test functions across 78 files in 20 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
 
-| Package | Files | What it covers |
-|---|---|---|
-| `internal/acme` | 20 | The issuance state machine |
-| `internal/config` | 5 | Validation, domain normalisation, profiles |
-| `internal/deploy` | 6 | Upload, bind confirmation, replacement |
-| `internal/state` | 7 | Schema, permissions, backups |
-| `internal/onboarding` | 4 | Document generation and the CLB guard |
-| `internal/reconcile` | 2 | Whether to order at all, and metric publication |
-| `internal/webhook` | 2 | Trigger parsing, token enforcement |
-| `internal/ratelimit` | 4 | Token arithmetic, including the fuzz targets |
-| `internal/spec`, `internal/probe`, `internal/group`, `internal/metrics` | 1 each | Source selection, the black-box probe, grouping, the registry |
-| `cmd/*` | 6 | Per-tool argument handling and exit codes |
+| Package | Files | Tests | What it covers |
+|---|---|---|---|
+| `internal/acme` | 28 | 235 | The issuance state machine |
+| `internal/state` | 10 | 83 | Schema, permissions, backups, transactions |
+| `internal/deploy` | 7 | 82 | Upload, bind confirmation, replacement |
+| `internal/onboarding` | 4 | 81 | Document generation and the CLB guard |
+| `internal/config` | 7 | 67 | Validation, domain normalisation, profiles |
+| `internal/webhook` | 3 | 61 | Trigger parsing, token enforcement, notifications |
+| `internal/reconcile` | 2 | 55 | Whether to order at all, metric publication, shutdown |
+| `internal/spec` | 2 | 26 | Source selection, document read/write |
+| `internal/ratelimit` | 4 | 20 | Token arithmetic, including the fuzz targets |
+| `internal/probe` | 1 | 19 | The black-box probe and every-resolved-address logic |
+| `internal/group` | 1 | 14 | Grouping and the PSL registered domain |
+| `internal/atomicfile` | 1 | 6 | The temp-file/fsync/rename protocol |
+| `internal/metrics` | 1 | 2 | The registry itself |
+| `internal/tcerr` | 1 | 1 | The DNSPod "no data" classification |
+| `cmd/*` | 6 | 65 | Per-tool argument handling and exit codes |
+
+Counts drift as tests are added; the command above is the source of truth, and this table was
+regenerated in review round 6 after the numbers here had been stale since the OCR round.
 
 ### What the tests pin down
 
@@ -1204,15 +1257,24 @@ Runs a full issuance against staging with a throwaway state database, refusing t
 
 **Outstanding:**
 
-- [ ] Read the DNSPod token from a file or systemd `LoadCredential`, so it isn't plaintext in `config.yaml`
-- [ ] Switch to `profile: tlsserver` (45 days) and run a complete renewal cycle fully automatically
-- [ ] Test the SNI multi-certificate case with `multi_cert_info` ("replacing one doesn't disturb another")
-- [ ] Stage C: CVM + systemd + CVM role credential path (`testenv/` is ready, `create_cvm=true`)
-- [ ] `state.Store` has no transaction support, so the `download()` epilogue (promote the new certificate → retire the old → discard the order) commits in separate statements. A partial failure leaves an orphaned cloud certificate or a false failure alarm.
+All five items this list used to carry are done and were verified against the real account (see
+[docs/e2e-run-2026-09-17-credentialed.md](docs/e2e-run-2026-09-17-credentialed.md) and
+[docs/e2e-run-2026-09-18-credentialed.md](docs/e2e-run-2026-09-18-credentialed.md)): the DNSPod token
+is read from a file (and from a systemd `LoadCredential` on the CVM), `profile: tlsserver` completed
+a full renewal cycle, the SNI multi-certificate case was exercised with `multi_cert_info`, Stage C
+ran on a CVM with systemd and the CVM role, and `state.Store` gained `WithTx` -- the `download()`
+epilogue now commits in one transaction.
+
+What is still open is not a feature but a verification gap, and it is recorded rather than hidden:
+see the "未跑 / 未验证" section of each e2e report and §7 of
+[docs/code-review-round4-2026-09-18.md](docs/code-review-round4-2026-09-18.md) -- natural (real-time)
+renewal, production Let's Encrypt, the CVM rebind re-run, the SNI-off path, and the cloud's real
+enforcement of `IsCheckResource` on delete.
 
 ## License
 
-No license file is present in this repository. Absent a license, the default is all rights reserved — **add one before distributing or accepting external contributions.**
+MIT — see [LICENSE](LICENSE). (This section used to say no license file was present; the file has
+been in the repository since the first release.)
 ---
 
 <sub>[← Back to the overview](README.md) · [简体中文](README.reference.zh-CN.md)</sub>

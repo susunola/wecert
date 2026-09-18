@@ -51,10 +51,10 @@ func TestQuotaSeriesFollowTheDesiredState(t *testing.T) {
 	metrics.RateLimitRemaining.Reset()
 
 	_, m, _, _ := newAPITestHarness(t, []string{"old-example.com"})
-	m.PublishQuota(map[string]string{
-		"registered-domain":    "old-example.com",
-		"exact-identifier-set": "old-example.com",
-		"identifier":           "old-example.com",
+	m.PublishQuota(map[string][]string{
+		"registered-domain":    {"old-example.com"},
+		"exact-identifier-set": {"old-example.com"},
+		"identifier":           {"old-example.com"},
 	})
 
 	before := quotaSeries(t)
@@ -66,10 +66,10 @@ func TestQuotaSeriesFollowTheDesiredState(t *testing.T) {
 	}
 
 	// The domain is renamed. The old scope is no longer in the desired state.
-	m.PublishQuota(map[string]string{
-		"registered-domain":    "new-example.com",
-		"exact-identifier-set": "new-example.com",
-		"identifier":           "new-example.com",
+	m.PublishQuota(map[string][]string{
+		"registered-domain":    {"new-example.com"},
+		"exact-identifier-set": {"new-example.com"},
+		"identifier":           {"new-example.com"},
 	})
 
 	after := quotaSeries(t)
@@ -85,6 +85,52 @@ func TestQuotaSeriesFollowTheDesiredState(t *testing.T) {
 	}
 }
 
+// A quota that could not be read must not be published as zero.
+//
+// `Remaining` reports (0, false) when the stored bucket cannot be read, and the report used to
+// drop that `false` on the floor: the gauge was set to 0 -- the strongest claim the metric can
+// make, "no quota left" -- on the strength of a failed read. `WecertRateLimitNearlyExhausted`
+// fires below 5, so a single failed read blanked the estimate for every limit at once and raised
+// a page for a fleet that had spent nothing. The next successful pass cleared it, which is what
+// makes it hard to diagnose from the alert alone.
+func TestUnreadableQuotaIsNotPublishedAsZero(t *testing.T) {
+	metrics.RateLimitRemaining.Reset()
+
+	store, m, _, _ := newAPITestHarness(t, []string{"example.com"})
+	scopes := map[string][]string{
+		"registered-domain":    {"example.com"},
+		"exact-identifier-set": {"example.com"},
+		"identifier":           {"example.com"},
+	}
+
+	m.PublishQuota(scopes)
+	if before := quotaSeries(t); len(before) == 0 {
+		t.Fatal("a readable bucket must be published, otherwise this test proves nothing")
+	}
+
+	// Now every read fails, as it does when the database is busy or gone.
+	if err := store.Close(); err != nil {
+		t.Fatalf("closing the state store: %v", err)
+	}
+
+	reports := m.QuotaStatus(scopes)
+	if len(reports) == 0 {
+		t.Fatal("the report must cover the spendable limits")
+	}
+	for _, rep := range reports {
+		if !rep.Unreadable {
+			t.Errorf("limit %s scope %q could not be read, yet the report offers %v remaining; "+
+				"a failed read must not produce a number", rep.Limit, rep.Scope, rep.Remaining)
+		}
+	}
+
+	m.PublishQuota(scopes)
+	for _, s := range quotaSeries(t) {
+		t.Errorf("series %q was published from a failed read; a scrape cannot tell that zero from "+
+			"a genuine exhaustion", s)
+	}
+}
+
 func hasScope(series []string, scope string) bool {
 	for _, s := range series {
 		if hasSuffixScope(s, scope) {
@@ -96,4 +142,35 @@ func hasScope(series []string, scope string) bool {
 
 func hasSuffixScope(s, scope string) bool {
 	return len(s) > len(scope) && s[len(s)-len(scope):] == scope
+}
+
+// Every scope in a family is published, not just one.
+//
+// The publisher used to take one scope per family, and its only caller passed "the first
+// certificate's first domain". For the normal one-certificate-per-domain layout that meant
+// wecert_ratelimit_remaining_tokens had no series at all for the second domain onwards, so
+// WecertRateLimitNearlyExhausted had nothing to compare and stayed silent for every domain but one
+// -- an absent series is indistinguishable from a healthy one to anyone reading a dashboard.
+func TestEveryScopeInAFamilyIsPublished(t *testing.T) {
+	metrics.RateLimitRemaining.Reset()
+
+	_, m, _, _ := newAPITestHarness(t, []string{"a.example.com"})
+	m.PublishQuota(map[string][]string{
+		"registered-domain":    {"a.example.com", "b.example.com", "c.example.com"},
+		"exact-identifier-set": {"set-a", "set-b"},
+		"identifier":           {"a.example.com", "b.example.com", "c.example.com"},
+	})
+
+	series := quotaSeries(t)
+	for _, scope := range []string{"a.example.com", "b.example.com", "c.example.com", "set-a", "set-b"} {
+		if !hasScope(series, scope) {
+			t.Errorf("scope %q has no series; the alert compares against a series that does not "+
+				"exist, which reads as nothing to see. Exported: %v", scope, series)
+		}
+	}
+
+	// The account-wide limit has no caller-supplied scope and must still be reported once.
+	if !hasScope(series, "") {
+		t.Errorf("the account-wide limit must still be published, got %v", series)
+	}
 }

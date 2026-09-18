@@ -166,9 +166,27 @@ func prepareProbe(ctx context.Context, host string, opts Options) (string, []str
 	if len(ips) == 0 {
 		return "", nil, opts, fmt.Errorf("probe: %s resolved to no address", host)
 	}
+	// Refuse rather than sample a name with an implausible number of addresses.
+	//
+	// Every resolved address has to be checked (that is the whole point of ProbeAll: a rebind can
+	// take effect on some backends and not others), so the honest answer to "there are more
+	// addresses than this cap" is "this name cannot be verified", not "here are the first 32". The
+	// cost of not capping is bounded but real: len(ips) dials of up to Timeout each, inside the
+	// certificate's own pass claim, so one name with a thousand A records delays every other
+	// certificate. 32 is far above any real deployment -- a name spread over more than a handful of
+	// addresses is either a misconfiguration or a name whose owner is not trying to serve it.
+	if err := capCheck(host, len(ips)); err != nil {
+		return "", nil, opts, err
+	}
 	sort.Strings(ips)
 	return host, ips, opts, nil
 }
+
+// maxProbeAddresses caps how many addresses one host may resolve to before the probe refuses it.
+//
+// See prepareProbe: the cap exists so that a single name cannot spend an unbounded amount of a
+// pass's time, and it fails closed because a sample would be a claim the probe cannot support.
+const maxProbeAddresses = 32
 
 // probeIPConcurrency caps how many of one host's addresses are dialled at once.
 //
@@ -439,9 +457,28 @@ func diffDomains(want, got []string) (missing, extra []string) {
 func normalizeSet(in []string) map[string]bool {
 	out := make(map[string]bool, len(in))
 	for _, d := range in {
-		out[strings.TrimSuffix(strings.ToLower(strings.TrimSpace(d)), ".")] = true
+		out[normalizeName(d)] = true
 	}
 	return out
+}
+
+// normalizeName canonicalises one name the same way however many times it is called.
+//
+// Trimming the spaces BEFORE stripping the dot is not idempotent: "www.example.com.." keeps one dot
+// after the first pass and loses it on the second, and "www.example.com ." only loses the space on
+// the second. The CLI splits -expect-san straight into the expectation, so either spelling made
+// Verify report the same name as both "missing names that were deployed" and "has names that were
+// not deployed" -- a self-contradictory verdict for one typo, with exit code 2. Loop until the
+// string stops changing instead.
+func normalizeName(d string) string {
+	prev := d
+	for {
+		next := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(prev)), ".")
+		if next == prev {
+			return next
+		}
+		prev = next
+	}
 }
 
 // DaysLeft returns the days remaining, rounded up -- "0 days left" is a meaningless thing
@@ -455,4 +492,18 @@ func (r *Result) DaysLeft(now time.Time) int {
 		return 0
 	}
 	return int((left + 24*time.Hour - 1) / (24 * time.Hour))
+}
+
+// capCheck refuses an address list longer than maxProbeAddresses.
+//
+// Separated from prepareProbe so the boundary is testable without a DNS server that returns 33
+// addresses: the decision is the whole behaviour.
+func capCheck(host string, n int) error {
+	if n <= maxProbeAddresses {
+		return nil
+	}
+	return fmt.Errorf(
+		"probe: %s resolves to %d addresses, more than the %d this program will dial; every "+
+			"resolved address has to be checked, so the name is reported as unverified rather "+
+			"than sampled", host, n, maxProbeAddresses)
 }

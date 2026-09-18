@@ -1,17 +1,35 @@
 package ratelimit
 
 import (
-	"fmt"
 	"log/slog"
+	"math"
 	"time"
 )
 
 // bucketStore is the persistence the tracker needs. Defined here at the consumer so the
 // tracker can be tested without a real database, and so ratelimit does not depend on the
 // state package (which imports nothing of this one, keeping the layering one-way).
-type bucketStore interface {
+// bucketReader is what reading a limit needs.
+type bucketReader interface {
 	GetRateBucket(limitName, scopeID string) (*BucketRecord, error)
-	PutRateBucket(*BucketRecord) error
+}
+
+// bucketWriter is what changing a limit needs.
+//
+// UpdateRateBucket applies fn to the stored bucket as ONE operation. A read-modify-write through
+// Get then Put loses concurrent updates -- the manager runs one goroutine per certificate and they
+// all spend on the same account-scoped bucket -- which is why there is no Put here: a caller that
+// wants to change a bucket has no business writing a value it read earlier.
+//
+// fn runs under the store's lock and must not call back into the store.
+type bucketWriter interface {
+	UpdateRateBucket(limitName, scopeID string, fn func(*BucketRecord) error) error
+}
+
+// bucketStore is what the tracker needs: it both reads buckets and changes them.
+type bucketStore interface {
+	bucketReader
+	bucketWriter
 }
 
 // BucketRecord mirrors state.RateBucket.
@@ -70,25 +88,34 @@ func (t *Tracker) Spend(l Limit, scopeID string, cost float64) {
 	if t == nil || t.store == nil {
 		return
 	}
-	now := t.now()
-	rec, err := t.store.GetRateBucket(l.Name, scopeID)
-	if err != nil {
-		t.log.Warn("cannot read the rate-limit bucket; the local quota estimate will drift",
-			"limit", l.Name, "scope", scopeID, "err", err)
+	// A non-finite amount never reaches the arithmetic.
+	//
+	// Spend sanitises a negative cost (an over-spend, which is the realistic mistake) but not NaN
+	// or +Inf, and one such value leaves Tokens non-finite for the rest of the bucket's life:
+	// every comparison against NaN is false, so Remaining reports NaN forever and the debt clamp
+	// never fires. No caller computes a cost today -- all four pass the literal 1 -- which is
+	// exactly why the guard belongs here rather than in a comment.
+	if math.IsNaN(cost) || math.IsInf(cost, 0) {
+		t.log.Warn("refusing a rate-limit spend with a non-finite cost; the bucket would be "+
+			"unreadable for the rest of its life", "limit", l.Name, "scope", scopeID, "cost", cost)
 		return
 	}
-	snap := Snapshot{Tokens: rec.Tokens, At: rec.ObservedAt}
-	next := Spend(snap, l, cost, now)
-
-	// The deadline travels with the estimate. The real store also guards this with a
-	// COALESCE, but relying on that would make the tracker's behaviour depend on which
-	// implementation is behind the interface -- and a spend that silently dropped a
-	// CA-reported deadline would unblock issuance the CA has already refused.
-	if err := t.store.PutRateBucket(&BucketRecord{
-		LimitName: l.Name, ScopeID: scopeID,
-		Tokens: next.Tokens, ObservedAt: next.At,
-		ResetAt: rec.ResetAt, ResetReason: rec.ResetReason,
-	}); err != nil {
+	now := t.now()
+	// One operation, not Get then Put: a concurrent pass spending on the same bucket would
+	// otherwise read the same token count and overwrite this spend, and the estimate is what keeps
+	// the fleet under the CA's limits.
+	err := t.store.UpdateRateBucket(l.Name, scopeID, func(rec *BucketRecord) error {
+		snap := Snapshot{Tokens: rec.Tokens, At: rec.ObservedAt}
+		next := Spend(snap, l, cost, now)
+		// The deadline travels with the estimate. The real store also guards this with a
+		// COALESCE, but relying on that would make the tracker's behaviour depend on which
+		// implementation is behind the interface -- and a spend that silently dropped a
+		// CA-reported deadline would unblock issuance the CA has already refused.
+		rec.Tokens = next.Tokens
+		rec.ObservedAt = next.At
+		return nil
+	})
+	if err != nil {
 		t.log.Warn("cannot record the rate-limit spend; the local quota estimate will drift",
 			"limit", l.Name, "scope", scopeID, "err", err)
 	}
@@ -96,9 +123,11 @@ func (t *Tracker) Spend(l Limit, scopeID string, cost float64) {
 
 // Remaining reports how many tokens a limit has left, or (0, false) when it cannot be read.
 //
-// The estimate is a LOWER BOUND: it counts only what this program spent, while
-// "certs per registered domain" and "certs per exact set" are global across accounts. A value
-// here is therefore "at least this much", never more.
+// The estimate is an UPPER BOUND on what is left: it counts only what this program spent, while
+// "certs per registered domain" and "certs per exact set" are global across accounts, so another
+// account's spend makes the true remainder smaller, never larger. A value here is therefore "at
+// most this much". (The wording used to say "at least", which is the same fact read backwards --
+// and the direction matters, because "at least" invites spending quota that may not be there.)
 func (t *Tracker) Remaining(l Limit, scopeID string) (float64, bool) {
 	if t == nil || t.store == nil {
 		return 0, false
@@ -137,58 +166,34 @@ func (t *Tracker) BlockedUntil(l Limit, scopeID string) (time.Time, string, bool
 // second is the one to act on because it accounts for every other spend the local estimate
 // cannot see.
 func (t *Tracker) NoteRetryAfter(l Limit, scopeID, errMsg string) (time.Time, bool) {
-	if t == nil || t.store == nil {
-		return time.Time{}, false
-	}
 	at, ok := ParseRetryAfter(errMsg)
 	if !ok {
 		return time.Time{}, false
 	}
-	rec, err := t.store.GetRateBucket(l.Name, scopeID)
-	if err != nil {
+	return t.NoteDeadline(l, scopeID, at, "retry after")
+}
+
+// NoteDeadline records an authoritative deadline that was read from somewhere other than the
+// error's prose -- in practice the 429 Retry-After HEADER, which lego exposes on its typed error.
+//
+// The field is the protocol's own answer and the prose is commentary, so a CA may send the header
+// alone. Parsing only the message meant such a refusal recorded no deadline at all: the metric
+// stayed optimistic and the pass retried inside the window the CA had just named.
+func (t *Tracker) NoteDeadline(l Limit, scopeID string, at time.Time, source string) (time.Time, bool) {
+	if t == nil || t.store == nil || at.IsZero() {
 		return time.Time{}, false
 	}
-	rec.ResetAt = at
-	rec.ResetReason = l.Name
-	if err := t.store.PutRateBucket(rec); err != nil {
+	if err := t.store.UpdateRateBucket(l.Name, scopeID, func(rec *BucketRecord) error {
+		rec.ResetAt = at
+		rec.ResetReason = l.Name
+		return nil
+	}); err != nil {
 		t.log.Warn("cannot record the CA-reported rate-limit deadline",
-			"limit", l.Name, "scope", scopeID, "until", at, "err", err)
+			"limit", l.Name, "scope", scopeID, "until", at, "source", source, "err", err)
 		return time.Time{}, false
 	}
 	t.log.Error("the CA refused a request against a documented rate limit; no request against "+
 		"this limit will succeed before the reported instant",
-		"limit", l.Name, "scope", scopeID, "until", at)
+		"limit", l.Name, "scope", scopeID, "until", at, "source", source)
 	return at, true
-}
-
-// Summarize renders every spendable limit's state for a log line or a status endpoint.
-//
-// scope is the account-wide scope id (empty) plus whatever per-scope buckets the caller wants
-// reported; a limit whose bucket has never been touched reports full, which is the honest
-// answer for "this program has never spent it".
-func (t *Tracker) Summarize(scopes map[string]string) []string {
-	if t == nil || t.store == nil {
-		return nil
-	}
-	var out []string
-	for _, l := range Spendable() {
-		scopeID := ""
-		if l.Scope != "account" {
-			scopeID = scopes[l.Scope]
-			if scopeID == "" {
-				continue
-			}
-		}
-		if at, reason, blocked := t.BlockedUntil(l, scopeID); blocked {
-			out = append(out, fmt.Sprintf("%s: blocked until %s (%s)",
-				l.Name, at.UTC().Format(time.RFC3339), reason))
-			continue
-		}
-		left, ok := t.Remaining(l, scopeID)
-		if !ok {
-			continue
-		}
-		out = append(out, Describe(l, left))
-	}
-	return out
 }

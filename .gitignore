@@ -39,3 +39,11 @@ __pycache__/
 /clbverify
 /tatrun
 /preflight
+
+# A Go build cache pointed inside the repository (GOCACHE=.gocache) is generated, not source:
+# 1,963 files and ~146 MB were committed by an `git add -A` before this line existed.
+.gocache/
+gomodcache/
+gopath/
+# Terraform plan files written by testenv runs with a name other than the ignored `tfplan`.
+tfplan-*

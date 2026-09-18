@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"golang.org/x/net/publicsuffix"
 	"io"
 	"math"
 	"net"
@@ -70,10 +71,6 @@ const (
 // A variable rather than a constant because the acme package owns the build tag that decides it,
 // and config must not import acme's dependency graph merely to ask.
 var acmeSupportsLegoProviders = false
-
-// SetLegoProviderSupport is called by the acme package at init, so config validation can tell an
-// operator to rebuild with -tags lego_dns instead of failing later when the solver is built.
-func SetLegoProviderSupport(available bool) { acmeSupportsLegoProviders = available }
 
 // profileMaxNames is the maximum identifier count each profile allows.
 // classic allows 100, but the newer tlsserver / shortlived only 25 — reject
@@ -603,6 +600,12 @@ type DNS struct {
 	// not a Tencent Cloud CAM SecretId/SecretKey.
 	LoginToken string `yaml:"loginToken"`
 
+	// LoginTokenFile reads the token from a file instead: a 0600 file, a systemd credential, or
+	// anything else that keeps it out of config.yaml. Environment-expanded, so
+	// ${CREDENTIALS_DIRECTORY}/dnspod-token works under LoadCredential. Mutually exclusive with
+	// loginToken.
+	LoginTokenFile string `yaml:"loginTokenFile,omitempty"`
+
 	// TTL is the value used when writing the _acme-challenge TXT record.
 	//
 	// The default is 600, not 60: on DNSPod's free tier the TTL floor is 600, and
@@ -625,12 +628,17 @@ type DNS struct {
 
 // Tencent is the Tencent Cloud credential and deployment target configuration.
 type Tencent struct {
-	CredentialMode string   `yaml:"credentialMode"`
-	SecretID       string   `yaml:"secretId"`
-	SecretKey      string   `yaml:"secretKey"`
-	RoleName       string   `yaml:"roleName"`
-	ResourceTypes  []string `yaml:"resourceTypes"`
-	Regions        []string `yaml:"regions"`
+	CredentialMode string `yaml:"credentialMode"`
+	SecretID       string `yaml:"secretId"`
+	SecretKey      string `yaml:"secretKey"`
+	// SecretIDFile / SecretKeyFile are the file variants of the two above, for the same reason as
+	// LoginTokenFile. With credentialMode=cvm-role they are unnecessary: the role is read from the
+	// instance metadata service and no static key exists at all.
+	SecretIDFile  string   `yaml:"secretIdFile,omitempty"`
+	SecretKeyFile string   `yaml:"secretKeyFile,omitempty"`
+	RoleName      string   `yaml:"roleName"`
+	ResourceTypes []string `yaml:"resourceTypes"`
+	Regions       []string `yaml:"regions"`
 }
 
 // Metrics is the Prometheus exposition configuration.
@@ -698,14 +706,21 @@ type Deploy struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
-// MaxNames returns the maximum domain count allowed by this certificate's
-// profile.
-func (c *Certificate) MaxNames() int {
-	if n, ok := profileMaxNames[c.Profile]; ok {
+// ProfileMaxNames returns the identifier cap a profile allows, or 0 for an unknown profile.
+//
+// Exported because onboarding has to cap a group by the profile the group will actually be issued
+// with, not by a configured default: splitting by the default alone let a tlsserver group exceed
+// 25 identifiers, and the document was then rejected at write time on every round.
+func ProfileMaxNames(profile string) int {
+	if n, ok := profileMaxNames[profile]; ok {
 		return n
 	}
 	return 0
 }
+
+// MaxNames returns the maximum domain count allowed by this certificate's
+// profile.
+func (c *Certificate) MaxNames() int { return ProfileMaxNames(c.Profile) }
 
 // Load reads and validates the configuration file.
 func Load(path string) (*Config, error) {
@@ -727,6 +742,12 @@ func Load(path string) (*Config, error) {
 	// template edit produces. Silently ignoring half the file is exactly the "why isn't my
 	// certificate being issued" failure this loader exists to prevent.
 	if err := rejectExtraDocuments(dec, path); err != nil {
+		return nil, err
+	}
+
+	// Resolve file- and environment-backed secrets before validation, so the validation rules see
+	// the credential that will actually be used rather than the field the operator left empty.
+	if err := cfg.resolveSecretFiles(); err != nil {
 		return nil, err
 	}
 
@@ -783,7 +804,8 @@ func (c *Config) normalize() error {
 			DNSProviderDNSPod, DNSProviderTencentCloud, DNSProviderLego, c.DNS.Provider)
 	}
 	if c.DNS.Provider == DNSProviderDNSPod && c.DNS.LoginToken == "" {
-		return fmt.Errorf("dns.provider=dnspod requires dns.loginToken " +
+		return fmt.Errorf("dns.provider=dnspod requires dns.loginToken, dns.loginTokenFile or " +
+			"$" + EnvDNSPodLoginToken + " " +
 			"(a DNSPod API token, not a Tencent Cloud SecretId/SecretKey;" +
 			"to use Tencent Cloud CAM credentials instead, set dns.provider=tencentcloud)")
 	}
@@ -905,7 +927,57 @@ func (c *Config) normalize() error {
 			c.DesiredState.Mode, ModeEnforce)
 	}
 
-	return NormalizeCertificates(c.Certificates)
+	if err := NormalizeCertificates(c.Certificates); err != nil {
+		return err
+	}
+
+	// probe.minValidFor must be satisfiable by the shortest profile in use.
+	//
+	// probe.Verify fails every probe whose remaining validity is below this floor, and the runner
+	// turns that into wecert_certificate_probe_match = 0 -- so an unsatisfiable floor pins the
+	// metric at zero forever and fires the critical "not serving the deployed certificate" alert
+	// with a diagnosis that blames the rebind or SNI. The file already rejects the analogous
+	// "renewBefore >= validity" for the same reason: cheap to check, and the failure it prevents
+	// looks like something else entirely.
+	//
+	// In enforce mode this loop sees an empty list -- the document is the only source of
+	// certificates there -- so the same check runs again where the document is resolved, which is
+	// the only place the two can meet. See CheckProbeFloor.
+	return CheckProbeFloor(c.Probe.MinValidDur, c.Certificates)
+}
+
+// CheckProbeFloor rejects a probe.minValidFor that no profile in use can satisfy.
+//
+// probe.Verify fails every probe whose remaining validity is below this floor, and the runner turns
+// that into wecert_certificate_probe_match = 0 -- so an unsatisfiable floor pins the metric at zero
+// forever and fires the critical "not serving the deployed certificate" alert with a diagnosis that
+// blames the rebind or SNI.
+//
+// It is exported because the certificates are not always in the config file: in enforce mode
+// c.Certificates must be empty, so the only place the floor and the certificates can meet is where
+// the document is resolved. Config.normalize calls it for the static and observe modes; the
+// reconciler calls it on every resolved pass and reports the mismatch, because a document may
+// change between passes and failing the pass there would stop renewals over a probe setting.
+func CheckProbeFloor(minValid time.Duration, certs []Certificate) error {
+	if minValid <= 0 {
+		return nil
+	}
+	for i := range certs {
+		cert := &certs[i]
+		validity, ok := profileValidity[cert.Profile]
+		if !ok {
+			continue
+		}
+		if minValid >= validity {
+			return fmt.Errorf(
+				"probe.minValidFor %s is not shorter than certificate %q's %s profile validity %s, "+
+					"so every probe of it would fail while the certificate is still perfectly valid "+
+					"(wecert_certificate_probe_match stays 0 and the alert blames the rebind); "+
+					"use less than %s",
+				minValid, cert.Name, cert.Profile, validity, validity)
+		}
+	}
+	return nil
 }
 
 func (w *Webhook) normalize() error {
@@ -949,6 +1021,28 @@ func (w *Webhook) normalize() error {
 	return nil
 }
 
+// ValidProfile reports whether name is a certificate profile this build knows.
+//
+// Exported so the callers that produce a profile BEFORE a Certificate exists -- the declaration
+// parser in internal/onboarding, which reads "profile=tlsserver" out of a TXT record -- can reject
+// a bad value where it is written, instead of letting it reach NormalizeCertificates at document
+// write time. That path made one typo in one TXT record fail Commit for EVERY certificate, every
+// round, until a human edited DNS.
+func ValidProfile(name string) bool {
+	_, ok := profileMaxNames[name]
+	return ok
+}
+
+// ValidKeyType reports whether kt is a key type this build can generate.
+func ValidKeyType(kt string) bool {
+	switch kt {
+	case KeyTypeECDSAP256, KeyTypeECDSAP384, KeyTypeRSA2048, KeyTypeRSA4096:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Certificate) normalize(seen map[string]bool) error {
 	if c.Name == "" {
 		return fmt.Errorf("certificates[].name is required")
@@ -970,9 +1064,7 @@ func (c *Certificate) normalize(seen map[string]bool) error {
 	if c.KeyType == "" {
 		c.KeyType = KeyTypeECDSAP256
 	}
-	switch c.KeyType {
-	case KeyTypeECDSAP256, KeyTypeECDSAP384, KeyTypeRSA2048, KeyTypeRSA4096:
-	default:
+	if !ValidKeyType(c.KeyType) {
 		return fmt.Errorf("certificate %q: unknown keyType %q", c.Name, c.KeyType)
 	}
 
@@ -1176,6 +1268,30 @@ func validateDomain(d string) error {
 		return fmt.Errorf("domain %q contains whitespace or a slash", d)
 	}
 
+	// An IP literal cannot be validated with DNS-01, and it does not fail on its own: lego promotes
+	// a literal to an RFC 8738 "ip" identifier, the CA then offers only tls-alpn-01 and http-01 for
+	// it, and pickDNS01 finds no dns-01 challenge -- so the WHOLE certificate stops issuing, every
+	// pass, with an error that names the challenge type rather than the domain that caused it.
+	// Rejecting it here turns "this certificate never works" into "this line of the document is
+	// wrong". (IPv6 literals are not even expressible as a hostname label, and a wildcard over an
+	// address is nonsense, so the base name is what is checked.)
+	if net.ParseIP(strings.TrimPrefix(d, "*.")) != nil {
+		return fmt.Errorf("domain %q is an IP address: Let's Encrypt issues certificates for DNS "+
+			"names, and this program validates with DNS-01, which an address identifier cannot "+
+			"answer -- use a name that resolves to it instead", d)
+	}
+	// A single label, or a public suffix ("co.uk"), cannot be issued either: the CA needs a name
+	// under a registrable domain it can validate, and an identifier with nothing above it is
+	// exactly the "internal name" the CA/Browser Forum baseline requirements forbid a public CA to
+	// sign. The PSL is consulted here rather than through internal/group because group imports this
+	// package (it validates through ValidateDomain), so the dependency only runs one way.
+	if base := strings.TrimPrefix(d, "*."); base != "" {
+		if suffix, _ := publicsuffix.PublicSuffix(base); suffix == base {
+			return fmt.Errorf("domain %q IS a public suffix (or has no suffix above it at all), so no "+
+				"certificate authority can validate it; use a name under it, e.g. www.%s", d, base)
+		}
+	}
+
 	// Check label by label. Empty labels (a..example.com), over-long labels and
 	// illegal characters are all rejected by the CA.
 	for _, label := range strings.Split(d, ".") {
@@ -1321,3 +1437,85 @@ func DaysUntil(notAfter, now time.Time) int {
 	}
 	return int((left + 24*time.Hour - 1) / (24 * time.Hour))
 }
+
+// ── secrets from files ──────────────────────────────────────────────────────────────
+//
+// A credential in config.yaml is a credential in every backup, every paste into a chat window and
+// every `cat` while debugging. These three fields let an operator keep them out of the file
+// entirely, which is the difference between "rotate the token" and "rotate the token and also
+// rewrite every copy of the config that ever existed".
+//
+// The shape follows systemd's LoadCredential, which is what the shipped unit can use:
+//
+//	# deploy/systemd/wecert.service.d/credentials.conf
+//	[Service]
+//	LoadCredential=dnspod-token:/etc/wecert/dnspod.token
+//
+// systemd then exposes the file at $CREDENTIALS_DIRECTORY/dnspod-token, and the config says
+// `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token`. That is why the path is
+// environment-expanded: CREDENTIALS_DIRECTORY only exists once systemd has started the unit, so a
+// literal path cannot express it.
+
+// resolveSecretFiles fills in the *_file variants, and the environment fallbacks.
+//
+// Called from Load, before validation, so a typo'd path is reported while the operator is looking
+// at it rather than after an order has been placed and a challenge has failed -- a rate-limited
+// failure is much more expensive than a config error.
+//
+// Every configured path is read, even one the chosen provider does not use. A config that names a
+// file which is not there is wrong whether or not today's provider reads it, and failing now is
+// cheaper than failing on the day the provider changes.
+func (c *Config) resolveSecretFiles() error {
+	resolve := func(field, value, file string, envs []string, target *string) error {
+		if value != "" && file != "" {
+			return fmt.Errorf("%s and its file variant are both set; keep one of them so it is "+
+				"unambiguous which one is in use", field)
+		}
+		if value != "" {
+			return nil
+		}
+		if file != "" {
+			// Environment-expanded so ${CREDENTIALS_DIRECTORY} works: systemd sets it only after
+			// the unit starts, so the path cannot be written literally in the file.
+			path := os.ExpandEnv(file)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return fmt.Errorf("read %s from %s: %w (the path is environment-expanded, so "+
+					"${CREDENTIALS_DIRECTORY} is only set when systemd runs this)", field, path, err)
+			}
+			secret := strings.TrimSpace(string(raw))
+			if secret == "" {
+				return fmt.Errorf("%s file %s is empty; a blank credential would be sent to the "+
+					"provider as an empty string and rejected there, far from the cause", field, path)
+			}
+			*target = secret
+			return nil
+		}
+		for _, env := range envs {
+			if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+				*target = v
+				return nil
+			}
+		}
+		return nil
+	}
+
+	if err := resolve("dns.loginToken", c.DNS.LoginToken, c.DNS.LoginTokenFile,
+		[]string{EnvDNSPodLoginToken}, &c.DNS.LoginToken); err != nil {
+		return err
+	}
+	if err := resolve("tencent.secretId", c.Tencent.SecretID, c.Tencent.SecretIDFile,
+		[]string{"TENCENTCLOUD_SECRET_ID"}, &c.Tencent.SecretID); err != nil {
+		return err
+	}
+	if err := resolve("tencent.secretKey", c.Tencent.SecretKey, c.Tencent.SecretKeyFile,
+		[]string{"TENCENTCLOUD_SECRET_KEY"}, &c.Tencent.SecretKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+// EnvDNSPodLoginToken is the environment variable read when neither dns.loginToken nor
+// dns.loginTokenFile is set. It exists so a container or a systemd EnvironmentFile can supply the
+// token without touching the config at all.
+const EnvDNSPodLoginToken = "DNSPOD_LOGIN_TOKEN"

@@ -314,6 +314,12 @@ ACME 订单状态机见[订单状态机](#4-订单状态机)。
 
 只有一个 SQLite 文件。丢了它就会重新下单，从而撞上速率限制 —— 所以这是唯一需要备份的东西。
 
+> 完整表清单（9 张，含每列含义）在 [README.reference.md](README.reference.md#state-schema) 的同一节；
+> 下面只列四张最常被查询的表，避免第三份会过期的拷贝。最新的两列是
+> `authorizations.challenge_prepared_at`（挑战被选中的时刻，用来判断权威否认是否可信）与
+> `revoke_requests.cert_identity`（吊销请求点名的是哪张证书），
+> `retired_certificates` 另外保留归档的 `cert_pem`/`key_pem`（回滚与吊销都要用）。
+
 ```
 accounts                      -- 每个 directory URL 一个 ACME 账号
 ├── directory       TEXT PK   -- 例如 https://acme-v02.api.letsencrypt.org/directory
@@ -510,7 +516,7 @@ CA/Browser Forum 已经排定 **≤100 天从 2027-03-15 起、≤47 天从 2029
 | New Certs / 注册域 | 50 / 7 天 · **跨账号共享** | 域名集合频繁变化 | 通配符优先 + 25 次/周预算 |
 | New Certs / **精确 identifier 集合** | 5 / 7 天 · **无 override** | 同一组域名反复重签 | 每证书最多一个在途订单 |
 | Authorization Failures / identifier | 5 / 小时 | DNS 没配好还猛重试 | 退避 + 转人工 |
-| **ARI 协调的续期** | **豁免以上全部** | — | 订单必须带 `replaces`，且 identifier 集合不变 |
+| **ARI 协调的续期** | **豁免以上全部** | — | 订单必须带 `replaces`，且与被替换的证书**至少共享一个标识符**（集合不变自然满足；完全不相交则不满足） |
 
 最后一行才是通配符优先不只是优化的原因：**域名集合一变，这次签发就是一张全新证书**，拿不到 ARI 豁免。所以"加一个域名"的成本必须被压到接近零，而通配符是唯一能做到这件事的手段。这也是为什么期望状态生成器宁可报"已被声明的通配符覆盖，0 次签发"，也不肯去动 SAN 集合。
 
@@ -535,9 +541,10 @@ CA/Browser Forum 已经排定 **≤100 天从 2027-03-15 起、≤47 天从 2029
 
 > ### ⚠️ 改域名是有配额代价的
 >
-> ARI 的续期豁免要求"同名续期"（identifier 集合不变）。一旦增删域名，
-> 这次签发就变成了一张新证书，要走
-> **Certificates per Registered Domain（50 / 7 天，跨账号共享）**。
+> ARI 的续期豁免要求订单与被替换的证书**至少共享一个标识符**（Let's Encrypt 官方措辞）。
+> 在一张既有证书上增删域名仍然满足它；真正要走
+> **Certificates per Registered Domain（50 / 7 天，跨账号共享）** 的是**完全不相交**的集合
+> —— 所有名字都搬到另一张证书上去。
 >
 > 如果你频繁改 identifier，请留意这条上限。把不相关的业务拆到不同注册域下，
 > 可以避免它们互相挤占同一份预算。这条路径上程序会打一条 warning 日志。
@@ -591,6 +598,7 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 |---|---|---|---|
 | `provider` | 否 | `dnspod` | `dnspod` 用 DNSPod 自有 API Token（调 dnsapi.cn）。`tencentcloud` 用腾讯云 CAM 凭证（调 dnspod.tencentcloudapi.com）—— 推荐，因为能和证书部署共用一套凭证，且支持实例角色的 `SessionToken`。 |
 | `loginToken` | 当 `provider: dnspod` | — | DNSPod 自有 API Token，形如 `12345,abcdef…`。**不是**腾讯云 SecretId/SecretKey。 |
+| `loginTokenFile` | 替代 `loginToken` | — | 改成从文件读取 Token，于是它不会出现在 `config.yaml` 里 —— 也就不会出现在它的备份、diff 和任何人的终端回滚里。路径会做**环境变量展开**，这正是 systemd `LoadCredential` 能用的原因：`LoadCredential=dnspod-token:/etc/wecert/dnspod.token` 把文件放到 `$CREDENTIALS_DIRECTORY/dnspod-token`，配置里写 `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token` 即可。两者都没设时也接受环境变量 `DNSPOD_LOGIN_TOKEN`。同时设置 `loginToken` 与 `loginTokenFile` 会被拒绝，而不是替你猜一个。 |
 | `ttl` | 否 | `600` | `_acme-challenge` TXT 记录的 TTL。**600 是 DNSPod 免费套餐的下限** —— 配 60 会被 `LimitExceeded.RecordTtlLimit` 拒绝。付费套餐可以调低以加快传播与清理。 |
 | `propagationTimeout` | 否 | `5m` | 等待全部权威 NS 可见该记录的上限 |
 | `pollingInterval` | 否 | `5s` | 传播探测的间隔 |
@@ -612,6 +620,7 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 |---|---|---|---|
 | `credentialMode` | 否 | `cvm-role` | `cvm-role` 从实例元数据取临时凭证（密钥不落盘）。`static` 用下面的 `secretId`/`secretKey`，或环境变量 `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY`（仅建议本地调试）。 |
 | `secretId` / `secretKey` | 当 `static` | — | CAM 密钥对。优先用环境变量，这样配置文件可以放心提交、放心备份。 |
+| `secretIdFile` / `secretKeyFile` | 替代上面两个 | — | 文件形式，同样做环境变量展开，并与内联值互斥。用 `credentialMode: cvm-role` 时不需要它们：根本没有静态密钥。 |
 | `roleName` | 当 `cvm-role` | — | CVM 实例绑定的角色名 |
 | `resourceTypes` | 否 | `[clb]` | `UpdateCertificateInstance` 的资源类型。`clb` 最常用，`cdn`、`waf`、`tke`、`apigateway` 也支持。 |
 | `regions` | 是 | — | **CLB 是分地域资源，必须列出所有有 CLB 的地域。** 漏掉的地域会静默不更新，那边的证书会过期。 |
@@ -671,7 +680,7 @@ X-Wecert-Token: <token>
   "time": "2026-09-15T18:00:00Z",
   "certificates": [
     { "name": "a-com", "notAfter": "2026-12-14T16:41:58Z", "daysLeft": 89,
-      "deployed": true, "deployConfirmed": true, "consecutiveFailures": 0 }
+      "uploaded": true, "deployConfirmed": true, "consecutiveFailures": 0 }
   ]
 }
 ```
@@ -856,7 +865,7 @@ timer 里的 `Unit=` 不是装饰：不写这行时 systemd 会解析成同名�
 | `wecert_certificate_fallback_dropped_names{cert}` | 那张证书少了几个名字 |
 | `wecert_desired_state_age_seconds` | 期望状态文档的年龄。持续增长说明 `wecert-onboard` 没在跑 |
 | `wecert_orphaned_certificates` | 状态库里有、期望状态里没有的证书。它们不会再被续期 |
-| `wecert_ratelimit_remaining_tokens{limit,scope}` | CA 已公布限额的估算剩余额度。**这是下界**：只统计 wecert 自己花掉的，而"每个注册域名的证书数"和"每组完全相同标识符的证书数"是全账号共享的 |
+| `wecert_ratelimit_remaining_tokens{limit,scope}` | CA 已公布限额的估算剩余额度。**这是上界**：只统计 wecert 自己花掉的，而"每个注册域名的证书数"和"每组完全相同标识符的证书数"是全账号共享的，所以真实剩余只会更少 |
 | `wecert_ratelimit_blocked{limit,scope}` | `1` = CA 已针对该限额拒绝过请求，并告知何时会重新接受 |
 
 到期告警应该基于 `not_after` 做，而**不要**基于"续期任务有没有报错" —— 后者会在程序静默失效时保持沉默：
@@ -890,11 +899,16 @@ dnspod:DescribeRecordList / CreateRecord / DeleteRecord   scope: 你那一个 ac
 ssl:UploadCertificate
 ssl:DescribeCertificates
 ssl:DeleteCertificate
+ssl:DescribeDeleteCertificatesTaskResult
 ssl:UpdateCertificateInstance
 ssl:DescribeHostUpdateRecordDetail
 ssl:CreateCertificateBindResourceSyncTask
 ssl:DescribeCertificateBindResourceTaskResult
 ```
+
+（`dnspod:DescribeDomainList` 也在策略里：`wecert-onboard` 与 `wecert-preflight` 需要它列举账号下的域名。
+需要跑 `wecert-clbverify`（一次性人工绑定时用）的话，那个工具另需 `clb:DescribeListeners` —— 它不在
+运行时策略里，因为守护进程从不调用 CLB API。）
 
 后三个不是可选项：缺 `DescribeHostUpdateRecordDetail` 会让每次一键替换都在 3 分钟后超时、
 每轮重新上传证书；缺两个绑定查询动作则 `deployed` 指标永远不会变绿。
@@ -953,7 +967,7 @@ ssl:DescribeCertificateBindResourceTaskResult
 ./bin/wecert-onboard -config /etc/wecert/config.yaml            # 落盘
 ```
 
-### `wecert-preflight`（只读）
+### `wecert-preflight`（默认只读；`-prune-certs` 会删）
 
 | 参数 | 说明 |
 |---|---|
@@ -1224,47 +1238,13 @@ cp e2e-config.example.yaml e2e-config.yaml     # 填上你的 token 与测试域
   - 从 CLB API 独立取证确认生效（异步任务约 15s）
   - 验证了核心假设：**腾讯云自己找绑定资源，wecert 不需要维护监听器清单**
 
-**待办：**
+**待办：** 英文版这一节已改为记录「五项全部已交付并验证」以及真正剩下的**未验证**清单（见 [README.reference.md](README.reference.md) 的同一节与各 e2e 报告的「未跑 / 未验证」）。这里不再维护第二份会过期的列表。
 
-- [ ] DNSPod token 支持从文件 / systemd `LoadCredential` 读取，避免 config.yaml 里放明文
-- [ ] 切 `profile: tlsserver`（45 天）并验证 ARI 全自动跑满一个完整续期周期
-- [ ] 用 `multi_cert_info` 测 SNI 多证书场景（"换一张不误伤另一张"）
-- [ ] 阶段 C：CVM + systemd + CVM 角色凭证路径（`testenv/` 里已备好，`create_cvm=true`）
-- [ ] `state.Store` 缺少事务能力，`download()` 收尾的
-      "提升新证书 → 记录退役证书 → 丢弃订单" 三步是各自独立提交的；
-      中间失败会留下孤儿云证书或一次假故障告警
-
-**已完成：**
-
-- [x] **期望状态来源：域名新增即签发，而不只是过期续签。** 落在 `internal/spec`
-      （契约与 Provider）、`internal/group`（通配符优先分组）、`internal/onboarding`
-      （声明解析 + 五条安全不变量）、`cmd/wecert-onboard`，
-      迁移路径 `static → observe → enforce`。设计取舍见
-      [docs/desired-state-providers.md](docs/desired-state-providers.md)，
-      操作手册见 [docs/desired-state.md](docs/desired-state.md)，
-      全景图见 [docs/certificate-lifecycle.html](docs/certificate-lifecycle.html)。
-- [x] **外部黑盒探测（拨 443 校验实际生效的 `notAfter`）。** 落在 `internal/probe` +
-      `cmd/wecert-probe`：每一轮自动拨已部署证书的头几个名字，比对"实际在服务的"和
-      "我以为部署的"。云 API 说绑定成功、和浏览器真的能拿到这张证书，是两件事 ——
-      换绑是异步的，SNI 上也可能有另一张证书在赢，这两件事控制面都看不出来。
-      见 `probe` 配置节。
-- [x] **给 `state.db` 加跨进程排他锁（`flock`）。** 在 `state.Open` 里对
-- [x] **把 `Manager` 对 `*api.Core` 的依赖抽成窄接口。** `internal/acme/api.go`
-- [x] **签发失败降级：到期前拆分子集。** `failureFallback` 只摘掉逐个授权
-      反复失败的名字，只在到期窗口内生效，而且剩下的名字不够就拒绝降级。
-      默认关闭、以 ERROR 打日志、失败记录老化后自愈。见上面的 `failureFallback` 一节。
-      定义了 Manager 真正需要的七个操作，`NewAPI(core)` 是 lego 的适配器。
-      收益不在于多一层间接，而在于订单状态机终于可以按**调用顺序和参数**断言，
-      不必起 HTTP 服务器。三条以前很难验的不变量现在有了测试：
-      order URL 在联系 CA 之前落盘、续期订单带 `replaces`、
-      CSR 是 DER 且提交到 finalize URL。
-      `<statePath>.lock` 取排他锁，第二个进程启动即失败，而不是并发下单。
-      内核管理，崩溃自动释放，不存在陈旧 PID 文件。见上面的 systemd 部署一节。
 
 ## License
 
-本仓库没有 LICENSE 文件。在没有许可证的情况下默认是"保留所有权利" ——
-**对外分发或接受外部贡献之前应当先补一个。**
+MIT —— 见 [LICENSE](LICENSE)。（这一节此前写的是"本仓库没有 LICENSE 文件"，但该文件从第一个
+版本起就在仓库里。）
 ---
 
 <sub>[← 返回简介](README.zh-CN.md) · [English reference](README.reference.md)</sub>

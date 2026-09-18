@@ -47,6 +47,18 @@ jobs:
       - name: test
         run: go test -race ./...
 
+      # The tag-selected half of the build needs its own gate.
+      #
+      # Two production files are chosen by a build tag -- internal/acme/provider_tags.go (lego's
+      # ~198-provider DNS registry) and internal/config/lego_registry_tags.go -- and each has a
+      # paired test file that only compiles under it. `go test ./...` never builds any of them, so a
+      # change that broke the tagged registry, or a test that only makes sense there, passed every
+      # other gate on this workflow. `make test-tags` is the same suite with
+      # -tags "pebble lego_dns" (pebble's own tests skip themselves when pebble is not installed),
+      # and `make release` below already compiles the tagged binary for linux/amd64.
+      - name: test (build tags)
+        run: make test-tags
+
       - name: build
         run: make build
 

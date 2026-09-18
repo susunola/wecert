@@ -32,6 +32,13 @@ import (
 const maxLastErrorBytes = 512
 
 // Store is the state store layered on top of SQLite.
+// execer is the subset of *sql.DB and *sql.Tx the write helpers below use, so one body of SQL can
+// run either on its own or inside a caller's transaction (see tx.go). Without it, every
+// transactional variant would be a copy of the statement, and the copy is what drifts.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
 type Store struct {
 	db *sql.DB
 
@@ -49,6 +56,14 @@ type Store struct {
 	// silently -- a guarantee that belongs with the data rather than with one caller's
 	// discipline.
 	mu sync.Mutex
+
+	// path is where this store's database lives, and openedAs is the identity of the file that was
+	// opened. VerifyOnDisk compares them later: SQLite keeps writing to an inode that has been
+	// unlinked or replaced, so a `rm -rf` of the state directory (or a snapshot restored under a
+	// running daemon) produces writes that succeed, reads that succeed, and a next start that holds
+	// nothing -- with no error anywhere in between.
+	path     string
+	openedAs os.FileInfo
 
 	// lock is the cross-process exclusive lock.
 	//
@@ -188,6 +203,11 @@ type Authorization struct {
 	Presented bool
 	// ChallengeSent means the CA has been POSTed to go and validate.
 	ChallengeSent bool
+
+	// ChallengePreparedAt is when the challenge currently in this row was chosen. Zero means the
+	// row predates the column (or was written by a path that does not pick a challenge), and the
+	// reader treats it as "age unknown" rather than as "just now".
+	ChallengePreparedAt time.Time
 }
 
 // Account is an ACME account.
@@ -231,6 +251,33 @@ func Open(path string) (*Store, error) { return open(path, true) }
 // than changing it.
 func OpenUnlocked(path string) (*Store, error) { return open(path, false) }
 
+// OpenForTool opens the store for a one-shot command: `-dry-run`, `-revoke`, the diagnostic tools.
+//
+// It asks for the exclusive lock first and falls back to the unlocked path only when another
+// process holds it. That order matters, and getting it wrong broke a documented flow: always
+// opening unlocked made `wecert -dry-run` fail on a fresh installation, because a brand-new state
+// directory needs a schema and the unlocked path refuses to create one. The quick start is
+// "install, edit the config, dry-run" -- and the whole point of the dry run is to check the config
+// before the daemon is ever started.
+//
+// With this order:
+//
+//   - no daemon running (a fresh install, or validation before the first start): the tool takes the
+//     lock, migrates if the schema is behind, and works -- the migration is serialised, so the race
+//     the unlocked path exists to avoid cannot happen;
+//   - a daemon running: the lock is refused, the tool reads without one, and it does NOT migrate --
+//     which is correct, because the running daemon migrated at startup and holds the truth.
+func OpenForTool(path string) (*Store, error) {
+	s, err := Open(path)
+	if err == nil {
+		return s, nil
+	}
+	if !errors.Is(err, ErrLocked) {
+		return nil, err
+	}
+	return OpenUnlocked(path)
+}
+
 // LockFile takes the cross-process exclusive lock described in Store.lock on an
 // arbitrary file and returns the function that releases it.
 //
@@ -250,10 +297,26 @@ func LockFile(path string) (unlock func() error, err error) {
 }
 
 func open(path string, exclusive bool) (*Store, error) {
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create state dir %s: %w", dir, err)
 		}
+	}
+
+	// Both of these are warnings, not refusals, and the difference is deliberate.
+	//
+	// A symlinked statePath is a legitimate, common arrangement -- state.db on a different volume,
+	// or a staging symlink during a migration -- and refusing it would break a working deployment
+	// to prevent a hazard that needs a hostile local user. The hazard is real, though: the file is
+	// opened through the link (no O_NOFOLLOW), so whoever can write the target's directory can have
+	// this process create the schema and the ACME account key inside a file of their choosing. A
+	// shared-writable state directory has the same shape for a different reason: 0600 on state.db
+	// stops another user from READING it, not from unlinking it and creating their own in its place.
+	// Both are stated plainly and left to the operator, because this program cannot tell "my
+	// operator symlinked it on purpose" from "someone is redirecting my writes".
+	for _, w := range statePathWarnings(path, dir) {
+		fmt.Fprintf(os.Stderr, "wecert: WARNING: %s\n", w)
 	}
 
 	// Sample both facts BEFORE the lock is taken, not after.
@@ -316,6 +379,10 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 	}
 	_ = f.Close()
 
+	if walMissing(path) {
+		fmt.Fprintf(os.Stderr, "wecert: WARNING: %s\n", missingWALWarning(path))
+	}
+
 	if !existedBefore && lockExisted {
 		// See missingDatabaseWarning: a lock file with no database is what "someone deleted
 		// state.db" looks like. Warn rather than refuse -- a first run after restoring a
@@ -360,7 +427,12 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 			realPath, path, realPath)
 	}
 
-	s := &Store{db: db, lock: lock, base: filepath.Base(path)}
+	s := &Store{db: db, lock: lock, base: filepath.Base(path), path: path}
+	// The identity of the file at that path right now. os.SameFile against a later stat is what
+	// catches "unlinked" and "replaced by a restore" alike, without needing the driver's own fd.
+	if fi, statErr := os.Stat(path); statErr == nil {
+		s.openedAs = fi
+	}
 
 	// Verify the file is a usable database before anything writes to it.
 	//
@@ -388,13 +460,14 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 		//lint:ignore ST1005 the second paragraph of a multi-line operator instruction is a
 		// sentence; capitalising it is the point, and the first paragraph still starts lowercase.
 		return nil, fmt.Errorf(
-			"the state database %s needs a schema update (%s), and this command opens it without "+
-				"the cross-process lock:\n"+
-				"       migrating from here could race the daemon's own migration -- two processes "+
-				"passing the same 'does this column exist?' check is how a database ends up with an "+
-				"opaque 'duplicate column name' error and a half-applied schema.\n"+
-				"       Run the daemon once (it migrates on startup), or stop it and re-run this "+
-				"command. See docs/recovery.md.",
+			"the state database %s needs a schema update (%s), and another process is holding the "+
+				"lock on it:\n"+
+				"       this command asked for the exclusive lock first and could not get it, so it "+
+				"fell back to reading without one -- and an unlocked open must not migrate, because "+
+				"two processes passing the same 'does this column exist?' check is how a database "+
+				"ends up with an opaque 'duplicate column name' error and a half-applied schema.\n"+
+				"       Stop that process, run `wecert -once` (which takes the lock and migrates), "+
+				"then start it again. See docs/recovery.md.",
 			path, strings.Join(pending, ", "))
 	}
 
@@ -413,6 +486,104 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 		}
 	}
 	return s, nil
+}
+
+// walMissing reports the "-shm present, -wal absent" signature.
+func walMissing(path string) bool {
+	if _, err := os.Stat(path + "-shm"); err != nil {
+		return false
+	}
+	_, err := os.Stat(path + "-wal")
+	return os.IsNotExist(err)
+}
+
+// statePathWarnings words the two local-filesystem hazards around the state database.
+//
+// Split out so the wording and the decision are testable without capturing stderr from open(),
+// exactly like missingDatabaseWarning. Empty means "nothing to say".
+func statePathWarnings(path, dir string) []string {
+	var out []string
+
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		target := "(target does not exist)"
+		if resolved, rerr := filepath.EvalSymlinks(path); rerr == nil {
+			target = resolved
+		}
+		out = append(out, fmt.Sprintf(
+			"the state database %s is a symlink (to %s). That is allowed, but this process writes "+
+				"through it: anyone who can write the target's directory can have wecert create the "+
+				"schema and the ACME account key in a file they choose. If the symlink is not yours, "+
+				"point statePath at the real file", path, target))
+	}
+
+	if dir != "" && dir != "." {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+				out = append(out, fmt.Sprintf(
+					"the state directory %s is group- or world-writable (%04o). state.db itself is "+
+						"0600, which stops another user reading it, but not unlinking it and putting "+
+						"their own file in its place. 0700 is what the shipped systemd unit sets "+
+						"(StateDirectoryMode)", dir, perm))
+			}
+		}
+	}
+	return out
+}
+
+// VerifyOnDisk reports whether the database this store is writing to is still the file at the path
+// it was opened from, and whether the cross-process lock is still the one this process holds.
+//
+// Both checks exist because SQLite (and flock) bind to the INODE, not to the name. `rm -rf` of the
+// state directory while the daemon runs leaves every later write succeeding against an unlinked
+// file: reads answer, no error is raised, and the next start comes up with no certificates at all
+// -- the "someone deleted state.db" warning does not fire either, because that needs the lock file,
+// which the same rm took with it. Restoring a snapshot under a running daemon has the same shape
+// from the other side. Neither can be prevented from inside the process; both can be reported.
+//
+// It returns the problems, in the operator's words. An empty slice means "still the same file".
+func (s *Store) VerifyOnDisk() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var problems []string
+	if s.path != "" && s.openedAs != nil {
+		fi, err := os.Stat(s.path)
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Sprintf(
+				"the state database %s is no longer at that path (%v), but this process is still "+
+					"writing to the file it opened -- SQLite writes to an unlinked inode happily. Every "+
+					"write since then is invisible to the next start, which will find no account and no "+
+					"certificates. Restore the directory or the newest snapshot and restart",
+				s.path, err))
+		case !os.SameFile(s.openedAs, fi):
+			problems = append(problems, fmt.Sprintf(
+				"the state database %s has been replaced since this process opened it (a restore, or "+
+					"a second deployment on the same path); this process is still writing to the old "+
+					"file, so the two are now different databases and this process's writes are lost",
+				s.path))
+		}
+	}
+	if err := s.lock.VerifyHeld(); err != nil {
+		problems = append(problems, err.Error())
+	}
+	return problems
+}
+
+// missingWALWarning words the "-shm without -wal" signature.
+//
+// SQLite's WAL mode keeps committed transactions in state.db-wal until a checkpoint folds them into
+// the database, and a clean close removes both sidecars. A -shm file with no -wal is therefore the
+// signature of a wal that was deleted (a cleanup script matching -*wal, an operator "cleaning up",
+// a hostile rm) or of a checkpoint that never completed: everything committed since the last
+// checkpoint is GONE, and the database opens fine, reports no error, and holds fewer rows than the
+// last pass wrote. The row that matters most is the in-flight order URL -- losing it means the next
+// pass places a new order and spends the exact-identifier-set budget again.
+func missingWALWarning(path string) string {
+	return fmt.Sprintf("the write-ahead log %s-wal is missing while its shared-memory file "+
+		"%s-shm remains. Everything committed since the last checkpoint was in that file and is now "+
+		"gone (in-flight order URLs included), so check whether something removes state.db-wal, and "+
+		"compare this database against the newest snapshot in docs/recovery.md", path, path)
 }
 
 // missingDatabaseWarning words the "there was a database here and now there is not" case.
@@ -512,8 +683,13 @@ func sqliteDSN(path string) string {
 	// Host is what keeps the result in the "file:/abs/path" form SQLite expects
 	// (url.String() would otherwise emit "//" before an absolute path).
 	u := url.URL{Path: path}
+	// _txlock=immediate makes every transaction this connection opens take the write lock at BEGIN
+	// rather than at its first write. In WAL a deferred transaction that reads before it writes can
+	// fail at COMMIT with SQLITE_BUSY -- after all its work, and at the point where the failure
+	// looks like a commit bug rather than a lock conflict. See tx.go.
 	return "file:" + u.EscapedPath() +
-		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+		"?_txlock=immediate" +
+		"&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 }
 
 // databaseFilePath reports the filesystem path the connection actually opened, and
@@ -587,6 +763,17 @@ func databaseFilePath(db *sql.DB, configured string) (actual string, diverged bo
 
 // Close closes the state database and releases the cross-process lock.
 func (s *Store) Close() error {
+	// Wait for an in-flight operation before closing.
+	//
+	// Every statement goes through s.mu (WithTx holds it for the whole transaction), so closing
+	// without it let a transaction that was already running COMMIT after Close returned -- and after
+	// the flock was released, so a second process could be writing at the same time. The direction
+	// was favourable for the data (the promotion landed), but the shutdown warning in cmd/wecert
+	// describes the opposite mechanism, and "the store is closed" has to mean no writer is still
+	// inside it.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	err := s.db.Close()
 	if relErr := s.lock.release(); err == nil {
 		err = relErr
@@ -651,6 +838,10 @@ CREATE TABLE IF NOT EXISTS authorizations (
     txt_value       TEXT NOT NULL DEFAULT '',
     presented       INTEGER NOT NULL DEFAULT 0,
     challenge_sent  INTEGER NOT NULL DEFAULT 0,
+    -- When the challenge currently in this row was chosen (see the acme package). Crash recovery
+    -- needs it: an authoritative "no such record" is only trustworthy once the write would have had
+    -- time to propagate, and DNSPod's authoritative servers lag the API write by up to a minute.
+    challenge_prepared_at INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (cert_name, authz_url)
 );
 
@@ -734,6 +925,12 @@ CREATE TABLE IF NOT EXISTS cert_fallback (
 CREATE TABLE IF NOT EXISTS revoke_requests (
     cert_name   TEXT PRIMARY KEY,
     reason      INTEGER NOT NULL DEFAULT 0,
+    -- The certificate the operator asked to revoke, as an identity derived from its material
+    -- (see acme.certIdentity). Without it the retry revoked "whatever is stored under this name
+    -- now" -- and a renewal between the request and the retry replaces exactly that, so the
+    -- request could revoke the NEW certificate while the compromised one stayed valid, then
+    -- clear itself as a success. Empty means unknown: a request recorded by an older build.
+    cert_identity TEXT NOT NULL DEFAULT '',
     requested_at INTEGER NOT NULL DEFAULT 0,
     attempts    INTEGER NOT NULL DEFAULT 0,
     last_error  TEXT NOT NULL DEFAULT '',
@@ -767,6 +964,22 @@ CREATE TABLE IF NOT EXISTS rate_buckets (
 	return nil
 }
 
+// schemaTables are the tables this binary creates.
+//
+// Declared as data for the same reason schemaColumns is: an unlocked open has to be able to say
+// whether the database in front of it is one this build understands, without applying anything.
+var schemaTables = []string{
+	"accounts",
+	"certificates",
+	"orders",
+	"authorizations",
+	"retired_certificates",
+	"identifier_failures",
+	"cert_fallback",
+	"revoke_requests",
+	"rate_buckets",
+}
+
 // schemaColumns are the columns added to tables that predate them.
 //
 // Declared as data, and read by both migrate (which adds them) and pendingMigrations (which only
@@ -782,6 +995,14 @@ var schemaColumns = []struct{ table, column, decl string }{
 	// value would look like a usable (empty) certificate.
 	{"retired_certificates", "cert_pem", "BLOB"},
 	{"retired_certificates", "key_pem", "BLOB"},
+	// Certificate identity on a pending revocation. Legacy rows keep the empty default, which
+	// reads as "unknown" and makes the retry fall back to the pre-column behaviour (revoke the
+	// material stored now); inventing an identity would make the retry refuse to act on the
+	// operator's request for a reason that was not true when they made it.
+	{"revoke_requests", "cert_identity", "TEXT NOT NULL DEFAULT ''"},
+	// When the challenge in an authorization row was chosen. Legacy rows keep 0, which reads as
+	// "unknown age" and makes the reclaim probe fall back to its previous behaviour.
+	{"authorizations", "challenge_prepared_at", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // pendingMigrations reports schema changes this binary would apply, without applying them.
@@ -791,6 +1012,23 @@ var schemaColumns = []struct{ table, column, decl string }{
 // which names neither the cause nor the fix.
 func (s *Store) pendingMigrations() ([]string, error) {
 	var out []string
+	// Tables first, then columns.
+	//
+	// Checking only columns let an unlocked open accept a database that was missing one of the
+	// tables this build adds (the column check cannot see a table that is not there at all), and the
+	// operator then got a raw `no such table: revoke_requests` from whichever operation happened to
+	// touch it, instead of the "this binary needs a schema update, stop the process and run wecert
+	// -once" instruction that exists for exactly this. Reachable for any database written by a build
+	// whose column set is current but which predates a table -- which is every release that adds one.
+	for _, t := range schemaTables {
+		exists, err := s.tableExists(t)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			out = append(out, t)
+		}
+	}
 	for _, m := range schemaColumns {
 		exists, err := s.columnExists(m.table, m.column)
 		if err != nil {
@@ -801,6 +1039,17 @@ func (s *Store) pendingMigrations() ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// tableExists reports whether the store's schema contains a table.
+func (s *Store) tableExists(table string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("check table %s: %w", table, err)
+	}
+	return n > 0, nil
 }
 
 // ensureColumn adds a column to a table (when it does not already exist).
@@ -1027,8 +1276,10 @@ func (s *Store) PutCert(c *CertState) error {
 	return s.putCertLocked(c)
 }
 
-func (s *Store) putCertLocked(c *CertState) error {
-	_, err := s.db.Exec(`
+func (s *Store) putCertLocked(c *CertState) error { return putCertExec(s.db, c) }
+
+func putCertExec(e execer, c *CertState) error {
+	_, err := e.Exec(`
 		INSERT INTO certificates (
 			name, not_after, cert_url, cert_pem, key_pem, issued_at,
 			ari_cert_id, ari_window_start, ari_window_end, ari_checked_at, ari_retry_after_ns,
@@ -1125,8 +1376,11 @@ func (s *Store) PutOrder(o *Order) error {
 func (s *Store) DeleteOrder(certName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM orders WHERE cert_name = ?`, certName)
-	if err != nil {
+	return deleteOrderExec(s.db, certName)
+}
+
+func deleteOrderExec(e execer, certName string) error {
+	if _, err := e.Exec(`DELETE FROM orders WHERE cert_name = ?`, certName); err != nil {
 		return fmt.Errorf("delete order for %s: %w", certName, err)
 	}
 	return nil
@@ -1140,7 +1394,7 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`
 		SELECT cert_name, authz_url, identifier, status, challenge_url, challenge_token,
-		       txt_name, txt_value, presented, challenge_sent
+		       txt_name, txt_value, presented, challenge_sent, challenge_prepared_at
 		FROM authorizations WHERE cert_name = ? ORDER BY authz_url`, certName)
 	if err != nil {
 		return nil, fmt.Errorf("list authorizations for %s: %w", certName, err)
@@ -1150,14 +1404,35 @@ func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
 	var out []*Authorization
 	for rows.Next() {
 		a := &Authorization{}
+		var preparedAt int64
 		if err := rows.Scan(&a.CertName, &a.AuthzURL, &a.Identifier, &a.Status,
 			&a.ChallengeURL, &a.ChallengeToken, &a.TxtName, &a.TxtValue,
-			&a.Presented, &a.ChallengeSent); err != nil {
+			&a.Presented, &a.ChallengeSent, &preparedAt); err != nil {
 			return nil, fmt.Errorf("scan authorization: %w", err)
 		}
+		a.ChallengePreparedAt = fromUnix(preparedAt)
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// ExecForTest runs one statement against the open database.
+//
+// For tests that need to inject a fault the public API cannot express -- most often a trigger that
+// refuses a specific write, which is how "the write fails but the read did not" (a full disk, a
+// corrupt page) is reproduced deterministically. The alternative is a fake store, and a fake store
+// would not exercise the real SQL, the real transaction or the real error mapping.
+func (s *Store) ExecForTest(query string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(query)
+	return err
+}
+
+// ListAuthorizationsForTest is ListAuthorizations, exposed for tests in other packages that need to
+// observe what is on disk at a specific moment (see the acme package's Present hook).
+func (s *Store) ListAuthorizationsForTest(certName string) ([]*Authorization, error) {
+	return s.ListAuthorizations(certName)
 }
 
 // ListPresentedAuthorizations lists every authorization this state store still believes
@@ -1173,7 +1448,7 @@ func (s *Store) ListPresentedAuthorizations() ([]*Authorization, error) {
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`
 		SELECT cert_name, authz_url, identifier, status, challenge_url, challenge_token,
-		       txt_name, txt_value, presented, challenge_sent
+		       txt_name, txt_value, presented, challenge_sent, challenge_prepared_at
 		FROM authorizations WHERE presented = 1 ORDER BY txt_name, cert_name`)
 	if err != nil {
 		return nil, fmt.Errorf("list presented authorizations: %w", err)
@@ -1183,11 +1458,13 @@ func (s *Store) ListPresentedAuthorizations() ([]*Authorization, error) {
 	var out []*Authorization
 	for rows.Next() {
 		a := &Authorization{}
+		var preparedAt int64
 		if err := rows.Scan(&a.CertName, &a.AuthzURL, &a.Identifier, &a.Status,
 			&a.ChallengeURL, &a.ChallengeToken, &a.TxtName, &a.TxtValue,
-			&a.Presented, &a.ChallengeSent); err != nil {
+			&a.Presented, &a.ChallengeSent, &preparedAt); err != nil {
 			return nil, fmt.Errorf("scan presented authorization: %w", err)
 		}
+		a.ChallengePreparedAt = fromUnix(preparedAt)
 		out = append(out, a)
 	}
 	return out, rows.Err()
@@ -1195,13 +1472,16 @@ func (s *Store) ListPresentedAuthorizations() ([]*Authorization, error) {
 
 // PutAuthorization writes a single authorization.
 func (s *Store) PutAuthorization(a *Authorization) error {
+	if a == nil {
+		return fmt.Errorf("nil authorization")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`
 		INSERT INTO authorizations (
 			cert_name, authz_url, identifier, status, challenge_url, challenge_token,
-			txt_name, txt_value, presented, challenge_sent
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			txt_name, txt_value, presented, challenge_sent, challenge_prepared_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(cert_name, authz_url) DO UPDATE SET
 			identifier      = excluded.identifier,
 			status          = excluded.status,
@@ -1210,9 +1490,14 @@ func (s *Store) PutAuthorization(a *Authorization) error {
 			txt_name        = excluded.txt_name,
 			txt_value       = excluded.txt_value,
 			presented       = excluded.presented,
-			challenge_sent  = excluded.challenge_sent`,
+			challenge_sent  = excluded.challenge_sent,
+			-- Kept, not overwritten with 0, when the writer does not know: several paths persist a
+			-- row they did not pick a challenge for (a status update), and losing the age there
+			-- would silently switch the reclaim probe back to trusting a fresh denial.
+			challenge_prepared_at = CASE WHEN excluded.challenge_prepared_at > 0
+				THEN excluded.challenge_prepared_at ELSE authorizations.challenge_prepared_at END`,
 		a.CertName, a.AuthzURL, a.Identifier, a.Status, a.ChallengeURL, a.ChallengeToken,
-		a.TxtName, a.TxtValue, a.Presented, a.ChallengeSent)
+		a.TxtName, a.TxtValue, a.Presented, a.ChallengeSent, toUnix(a.ChallengePreparedAt))
 	if err != nil {
 		return fmt.Errorf("put authorization %s: %w", a.AuthzURL, err)
 	}
@@ -1270,9 +1555,19 @@ type RetiredCert struct {
 // certificate wecert never held a copy of). The row is still useful then: the reaper must
 // delete it from the cloud either way.
 func (s *Store) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) error {
+	if certID == "" {
+		// A row with no id is one the reaper can never delete: Delete("") fails every round and the
+		// slot is held forever, which is the opposite of what a reclaim list is for. The only
+		// caller that could produce it guards against an empty id itself; this is the second line.
+		return fmt.Errorf("refusing to queue an empty certificate id for reclaim under %q", certName)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`
+	return addRetiredCertExec(s.db, certID, certName, certPEM, keyPEM)
+}
+
+func addRetiredCertExec(e execer, certID, certName string, certPEM, keyPEM []byte) error {
+	_, err := e.Exec(`
 		INSERT INTO retired_certificates (cert_id, cert_name, retired_at, cert_pem, key_pem)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(cert_id) DO UPDATE SET
@@ -1284,7 +1579,15 @@ func (s *Store) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) 
 		    -- overwritten by a later empty write, and lets it be filled in when the empty write
 		    -- came first.
 		    cert_pem = COALESCE(EXCLUDED.cert_pem, retired_certificates.cert_pem),
-		    key_pem  = COALESCE(EXCLUDED.key_pem,  retired_certificates.key_pem)`,
+		    key_pem  = COALESCE(EXCLUDED.key_pem,  retired_certificates.key_pem),
+		    -- The clock restarts on the write that actually retires the certificate. Without
+		    -- this a row first written by the orphan path (which records a certificate it merely
+		    -- uploaded, with no material) kept the ORPHAN's timestamp when the same cert_id was
+		    -- later retired with the fullchain and key: ReapRetired, which reaps on retired_at,
+		    -- would then delete the cloud copy and the freshly archived rollback material on the
+		    -- earlier clock -- and before the rebind it asks to delete a certificate that may
+		    -- still be serving, refused only by the cloud-side binding check.
+		    retired_at = EXCLUDED.retired_at`,
 		certID, certName, time.Now().Unix(), certPEM, keyPEM)
 	if err != nil {
 		return fmt.Errorf("add retired cert %s: %w", certID, err)
@@ -1311,6 +1614,39 @@ func (s *Store) ListRetiredCertsBefore(cutoff time.Time) ([]*RetiredCert, error)
 		var retiredAt int64
 		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt, &r.CertPEM, &r.KeyPEM); err != nil {
 			return nil, fmt.Errorf("scan retired cert: %w", err)
+		}
+		r.RetiredAt = fromUnix(retiredAt)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListRetiredCertMaterial returns the archived certificate material of every retired certificate
+// recorded under one name, newest first.
+//
+// Rows without material are skipped: the orphan path records a certificate wecert merely uploaded
+// and never held a copy of, and an empty blob would look like a usable (empty) certificate. What
+// this answers is "is the certificate the operator asked to revoke still here somewhere", which is
+// how a revocation request that outlives its renewal can still be honoured.
+func (s *Store) ListRetiredCertMaterial(certName string) ([]*RetiredCert, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`
+		SELECT cert_id, cert_name, retired_at, cert_pem, key_pem
+		FROM retired_certificates
+		WHERE cert_name = ? AND cert_pem IS NOT NULL
+		ORDER BY retired_at DESC`, certName)
+	if err != nil {
+		return nil, fmt.Errorf("list archived material for %s: %w", certName, err)
+	}
+	defer rows.Close()
+
+	var out []*RetiredCert
+	for rows.Next() {
+		r := &RetiredCert{}
+		var retiredAt int64
+		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt, &r.CertPEM, &r.KeyPEM); err != nil {
+			return nil, fmt.Errorf("scan archived material for %s: %w", certName, err)
 		}
 		r.RetiredAt = fromUnix(retiredAt)
 		out = append(out, r)

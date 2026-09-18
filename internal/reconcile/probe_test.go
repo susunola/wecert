@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"github.com/susunola/wecert/internal/spec"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -231,7 +232,7 @@ func TestProbeExpectationFollowsTheDeployedSubsetNotTheConfig(t *testing.T) {
 // A host's probe series must survive a round that could not probe it because its
 // certificate's pass was already in flight.
 //
-// RunAll skips a certificate whose claim is held, so that certificate never reaches
+// A pass skips a certificate whose claim is held, so that certificate never reaches
 // probeCert and never lands in this round's probed set. Reclaiming on "absent from this
 // round" alone then deletes the series of a host that is being probed right now -- the
 // flicker reclaimStaleProbeSeries exists to avoid, and a false alert for anything paging on
@@ -401,4 +402,50 @@ func gaugeValue(t *testing.T, metric, label string) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// A host whose certificate is still desired but not confirmed deployed keeps its series.
+//
+// probeCert returns early for an unconfirmed deployment (there is no deployed certificate to compare
+// against), so during a renewal's mid-rebind window -- up to the next binding check, six hours -- the
+// host is absent from this round's probe set. Deleting there made probe_match, probe_not_after and
+// probe_trusted flicker once per renewal, and for a rebind that then failed the series a
+// `probe_match == 0` alert fires on were gone: the documented alert stayed silent for the failure it
+// exists to catch.
+func TestAnUnconfirmedDeploymentKeepsItsProbeSeries(t *testing.T) {
+	mgr := &fakeManager{}
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	certs := []config.Certificate{{Name: "example-com", Domains: []string{"pending.example.com"}}}
+	cfg := &config.Config{Certificates: certs}
+	r := New(cfg, spec.NewStatic(certs), store, mgr, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	// Desired, but not confirmed deployed: the mid-rebind state.
+	if err := store.PutCert(&state.CertState{Name: "example-com", DeployConfirmed: false}); err != nil {
+		t.Fatal(err)
+	}
+	metrics.CertificateProbeMatch.WithLabelValues("pending.example.com").Set(0)
+
+	fake := &fakeProber{hosts: []string{"pending.example.com"}}
+	r.prober = fake
+	r.probedHosts = map[string]struct{}{}
+
+	r.reclaimStaleProbeSeries()
+
+	if !probeMatchSeriesExists(t, "pending.example.com") {
+		t.Error("a certificate that is merely unconfirmed is still being worked on: its probe series " +
+			"must survive the mid-rebind window, or the alert for a failed rebind has nothing to fire on")
+	}
+
+	// Once the deployment is confirmed and the host is still not probed, it is stale as before.
+	if err := store.PutCert(&state.CertState{Name: "example-com", DeployConfirmed: true}); err != nil {
+		t.Fatal(err)
+	}
+	r.reclaimStaleProbeSeries()
+	if probeMatchSeriesExists(t, "pending.example.com") {
+		t.Error("a host that is no longer probed for a confirmed deployment must be reclaimed")
+	}
 }

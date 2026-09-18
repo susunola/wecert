@@ -1,10 +1,12 @@
 package state
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A corrupt state file must be reported as corrupt, with somewhere to go next.
@@ -245,5 +247,229 @@ func TestMissingDatabaseBesideALockFileStillWarns(t *testing.T) {
 	}
 	if !strings.Contains(out, "probably deleted or lost") {
 		t.Errorf("a lock file with no database must warn; stderr was:\n%s", out)
+	}
+}
+
+// A symlinked state path and a shared-writable state directory are warned about, not refused.
+//
+// Both are legitimate arrangements -- state.db on another volume, a staging symlink, an operator's
+// own directory that happens to be 0775 -- and refusing them would break working deployments. Both
+// also let a local user redirect or replace what this process writes, so the operator is told
+// plainly and left to judge. The database is still created through the symlink: that is the
+// behaviour being kept on purpose.
+func TestStatePathHazardsAreWarnedAboutNotRefused(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "data", "state.db")
+
+	warnings := statePathWarnings(real, filepath.Dir(real))
+	if len(warnings) != 0 {
+		t.Errorf("a private directory and a missing file have nothing to warn about, got %v", warnings)
+	}
+
+	// A symlink: warned about, and open() still works through it.
+	if err := os.MkdirAll(filepath.Dir(real), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(real, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "state.db")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	warnings = statePathWarnings(link, dir)
+	if len(warnings) == 0 {
+		t.Fatal("a symlinked state path must be reported: this process writes through it, so whoever " +
+			"can write the target's directory chooses where the account key goes")
+	}
+	if !strings.Contains(warnings[0], "symlink") {
+		t.Errorf("the warning has to say what it saw, got %q", warnings[0])
+	}
+	s, err := Open(link)
+	if err != nil {
+		t.Fatalf("a symlinked state path must still open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	// A group/world-writable directory: warned about.
+	shared := filepath.Join(dir, "shared")
+	if err := os.MkdirAll(shared, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	warnings = statePathWarnings(filepath.Join(shared, "state.db"), shared)
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "world-writable") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a 0777 state directory must be reported: 0600 on state.db does not stop another "+
+			"user unlinking it, got %v", warnings)
+	}
+}
+
+// VerifyOnDisk reports a database that is no longer the file at its path, and a lock that was taken
+// away underneath the process.
+//
+// SQLite writes to the inode it opened and flock is bound to the inode it locked, so both failures
+// are invisible from inside the process: reads answer, writes succeed, and the next start comes up
+// with nothing. The removal cannot be prevented; it can be noticed.
+func TestVerifyOnDiskNoticesADeletedOrReplacedDatabaseAndALostLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if problems := s.VerifyOnDisk(); len(problems) != 0 {
+		t.Fatalf("a healthy store has nothing to report, got %v", problems)
+	}
+
+	// The lock file disappears: flock keeps working on the unlinked inode, so the next process can
+	// take a lock on a fresh file and both write.
+	if err := os.Remove(path + ".lock"); err != nil {
+		t.Fatal(err)
+	}
+	problems := s.VerifyOnDisk()
+	if len(problems) == 0 {
+		t.Fatal("a lock file that has been removed must be reported: another process can now hold " +
+			"the lock this one believes it owns")
+	}
+	if !strings.Contains(strings.Join(problems, " "), "lock") {
+		t.Errorf("the report must name the lock, got %v", problems)
+	}
+
+	// The database itself disappears. It has to be re-created first for the lock check to be the
+	// only one complaining, then removed outright.
+	if err := os.WriteFile(path+".lock", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	problems = s.VerifyOnDisk()
+	joined := strings.Join(problems, " ")
+	if !strings.Contains(joined, "no longer at that path") {
+		t.Errorf("a state database removed from under a running store must be reported: every later "+
+			"write goes to an unlinked file and the next start finds nothing. Got %v", problems)
+	}
+}
+
+// A missing -wal beside a present -shm is reported, because it means commits were lost.
+//
+// SQLite keeps committed transactions in state.db-wal until a checkpoint folds them in, and a clean
+// close removes both sidecars. A -shm with no -wal is therefore the signature of a wal that was
+// removed (a cleanup script, an operator, a hostile rm): the database opens without complaint and
+// holds fewer rows than the last pass wrote -- the in-flight order URL among them, which is the row
+// whose loss costs a fresh order against the exact-identifier-set limit.
+func TestAMissingWriteAheadLogIsReported(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+
+	if walMissing(path) {
+		t.Fatal("nothing exists yet, so there is nothing to report")
+	}
+	if err := os.WriteFile(path+"-shm", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !walMissing(path) {
+		t.Error("a shared-memory file with no write-ahead log must be reported")
+	}
+	if warning := missingWALWarning(path); !strings.Contains(warning, "state.db-wal") ||
+		!strings.Contains(warning, "recovery.md") {
+		t.Errorf("the warning must name the file and point at the recovery procedure, got %q", warning)
+	}
+
+	// Both sidecars present is the normal running state; neither present is a clean close.
+	if err := os.WriteFile(path+"-wal", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if walMissing(path) {
+		t.Error("a -wal beside its -shm is normal")
+	}
+	if err := os.Remove(path + "-wal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path + "-shm"); err != nil {
+		t.Fatal(err)
+	}
+	if walMissing(path) {
+		t.Error("no sidecars at all is a clean close, not a missing wal")
+	}
+}
+
+// Close must not return while a transaction is still committing.
+//
+// Every statement goes through the store mutex and WithTx holds it for the whole transaction, so a
+// Close that skipped the lock let an in-flight promotion commit after Close returned -- and after
+// the flock was released, so a second process could already be writing to the same database.
+func TestCloseWaitsForAnInFlightTransaction(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	txDone := make(chan error, 1)
+	go func() {
+		txDone <- s.WithTx(context.Background(), func(tx *Tx) error {
+			close(entered)
+			<-release
+			return tx.PutCert(&CertState{Name: "inside-the-transaction"})
+		})
+	}()
+	<-entered
+
+	closed := make(chan error, 1)
+	go func() { closed <- s.Close() }()
+
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) while a transaction was still running; its commit then lands "+
+			"after the store is closed and after the lock is released", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-txDone; err != nil {
+		t.Fatalf("the transaction must complete: %v", err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatalf("Close after the transaction: %v", err)
+	}
+}
+
+// A reclaim row with no certificate id must be refused.
+//
+// The reaper's only handle is the id: Delete("") fails every round, so the row is never removed and
+// the slot is held forever -- the opposite of what a reclaim list is for. The one caller that could
+// produce it checks first; this is the second line, and it is cheap because a wrong row here leaks a
+// cloud certificate rather than an HTTP request.
+func TestARetiredRowWithNoCertificateIdIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.AddRetiredCert("", "example-com", nil, nil); err == nil {
+		t.Error("queueing an empty certificate id for reclaim must be refused: the reaper can never " +
+			"delete it and the row is held forever")
+	}
+	rows, err := s.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("nothing may be queued by a refused call, got %+v", rows)
 	}
 }

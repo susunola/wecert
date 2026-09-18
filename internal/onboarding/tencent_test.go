@@ -3,11 +3,13 @@ package onboarding
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	clbsdk "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
+	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	dnssdk "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
 
@@ -35,6 +37,12 @@ type fakeDNSPod struct {
 	// error check only fires when Error.Code is set, and ErrorResponse.Response is an
 	// inline struct), so this is what a version mismatch or a proxy looks like.
 	nilResponse bool
+
+	// realEmptyError makes DescribeRecordListWithContext behave like the API: a query that
+	// matches no record is an ERROR (ResourceNotFound.NoDataOfRecord) unless the caller asked for
+	// an empty list with ErrorOnEmpty=no. Without this the fake is friendlier than production and
+	// the request field can be dropped without any test noticing.
+	realEmptyError bool
 }
 
 func (f *fakeDNSPod) DescribeDomainListWithContext(_ context.Context, req *dnssdk.DescribeDomainListRequest) (*dnssdk.DescribeDomainListResponse, error) {
@@ -83,6 +91,14 @@ func (f *fakeDNSPod) DescribeRecordListWithContext(_ context.Context, req *dnssd
 	}
 	if req.Limit != nil {
 		limit = *req.Limit
+	}
+	emptyMatch := len(all) == 0 || offset >= uint64(len(all))
+	wantsEmpty := req.ErrorOnEmpty != nil && *req.ErrorOnEmpty == "no"
+	if f.realEmptyError && emptyMatch && !wantsEmpty {
+		return nil, &tcerrors.TencentCloudSDKError{
+			Code:    "ResourceNotFound.NoDataOfRecord",
+			Message: "No records on the list.",
+		}
 	}
 	end := offset + limit
 	if end > uint64(len(all)) {
@@ -360,6 +376,15 @@ type fakeCLB struct {
 	// forward records the generation filter the last DescribeLoadBalancers call sent, so a
 	// test can assert that none is sent.
 	forward *int64
+
+	// lbTotal and listenerTotal override the count each response reports, so a test can model a
+	// TRUNCATED answer: the API says more objects exist than it returned.
+	lbTotal       *uint64
+	listenerTotal *uint64
+
+	// paging makes DescribeLoadBalancers answer one page at a time, as the API does. Without it
+	// the fake returns every load balancer at once and the page loop is never entered.
+	paging bool
 }
 
 func (f *fakeCLB) DescribeLoadBalancersWithContext(_ context.Context, req *clbsdk.DescribeLoadBalancersRequest) (*clbsdk.DescribeLoadBalancersResponse, error) {
@@ -370,13 +395,42 @@ func (f *fakeCLB) DescribeLoadBalancersWithContext(_ context.Context, req *clbsd
 	if f.nilResponse {
 		return &clbsdk.DescribeLoadBalancersResponse{}, nil
 	}
-	var out []*clbsdk.LoadBalancer
+	var all []*clbsdk.LoadBalancer
 	for _, v := range f.lbs {
-		out = append(out, v...)
+		all = append(all, v...)
+	}
+	// TotalCount is the number of instances matching the filter -- documented as independent of
+	// Limit -- so it is computed BEFORE the page is cut. Computing it from the page made the fake
+	// report "one page is everything", which is exactly the shape that hides a paging bug.
+	total := uint64(len(all))
+	if f.lbTotal != nil {
+		total = *f.lbTotal
+	}
+	out := all
+	// Honour Offset/Limit the way the API does. Returning everything in one page (what this fake
+	// used to do) hides the paging bugs entirely: the completeness check and the page loop can
+	// only be exercised by an answer that really is a page.
+	if f.paging {
+		limit := int64(100)
+		if req.Limit != nil && *req.Limit > 0 {
+			limit = *req.Limit
+		}
+		offset := int64(0)
+		if req.Offset != nil && *req.Offset > 0 {
+			offset = *req.Offset
+		}
+		if offset > int64(len(all)) {
+			offset = int64(len(all))
+		}
+		end := offset + limit
+		if end > int64(len(all)) {
+			end = int64(len(all))
+		}
+		out = all[offset:end]
 	}
 	return &clbsdk.DescribeLoadBalancersResponse{
 		Response: &clbsdk.DescribeLoadBalancersResponseParams{
-			TotalCount: common.Uint64Ptr(uint64(len(out))), LoadBalancerSet: out,
+			TotalCount: common.Uint64Ptr(total), LoadBalancerSet: out,
 		},
 	}, nil
 }
@@ -400,9 +454,13 @@ func (f *fakeCLB) DescribeListenersWithContext(_ context.Context, req *clbsdk.De
 		})
 	}
 	listeners := []*clbsdk.Listener{{ListenerId: common.StringPtr("lbl-0"), Rules: rules}}
+	total := uint64(len(listeners))
+	if f.listenerTotal != nil {
+		total = *f.listenerTotal
+	}
 	return &clbsdk.DescribeListenersResponse{
 		Response: &clbsdk.DescribeListenersResponseParams{
-			TotalCount: common.Uint64Ptr(uint64(len(listeners))), Listeners: listeners,
+			TotalCount: common.Uint64Ptr(total), Listeners: listeners,
 		},
 	}, nil
 }
@@ -631,7 +689,12 @@ func TestEnumerationSkipsNilListElements(t *testing.T) {
 		}
 	})
 
-	t.Run("load balancers and rules", func(t *testing.T) {
+	t.Run("load balancers", func(t *testing.T) {
+		// A nil element is not dereferenced -- and it is not skipped either. An element without an
+		// id is a load balancer whose listeners can never be enumerated, so its rules are missing
+		// from the list the guard checks declarations against: answering with the rules of the
+		// OTHER load balancers is a knowingly short answer, and a short guard list is what makes a
+		// served name look unreferenced.
 		fake := &fakeCLB{
 			lbs: map[string][]*clbsdk.LoadBalancer{
 				"ap-guangzhou": {nil, {LoadBalancerId: common.StringPtr("lb-1")}},
@@ -639,12 +702,63 @@ func TestEnumerationSkipsNilListElements(t *testing.T) {
 			rules: map[string][]string{"lb-1": {"api.example.com"}},
 		}
 		stubCLB(t, fake)
-		got, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
-		if err != nil {
-			t.Fatalf("a nil element must be skipped, got %v", err)
+		_, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
+		if err == nil {
+			t.Fatal("an unusable element must make the read fail as incomplete, not silently drop the " +
+				"rules of the load balancer it names")
 		}
-		if len(got) != 1 || got[0] != "api.example.com" {
-			t.Errorf("got %v, want the rule of the non-nil load balancer only", got)
+		if !errors.Is(err, errIncompleteRuleList) {
+			t.Errorf("the failure must be recognisable as an incomplete list, got %v", err)
+		}
+	})
+}
+
+// A response that reports more objects than it returned must not be used as a complete list.
+//
+// Both enumerations feed the CLB guard, and the guard's answer decides whether a name still has a
+// rule. A silently short list therefore reads "this name is unserved", which (before the carry rule)
+// took the name out of the desired state -- a guard bug turning into lost coverage. The count the
+// API sends with the response is what makes that failure visible.
+func TestListRuleDomainsRefusesATruncatedAnswer(t *testing.T) {
+	t.Run("load balancers", func(t *testing.T) {
+		fake := &fakeCLB{
+			lbs: map[string][]*clbsdk.LoadBalancer{
+				"ap-guangzhou": {{LoadBalancerId: common.StringPtr("lb-1")}},
+			},
+			rules: map[string][]string{"lb-1": {"api.example.com"}},
+		}
+		// The API says three instances exist and hands over one.
+		fake.lbTotal = common.Uint64Ptr(3)
+		stubCLB(t, fake)
+
+		_, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
+		if err == nil {
+			t.Fatal("a load-balancer list shorter than the reported total must not be used as the guard")
+		}
+		if !errors.Is(err, errIncompleteRuleList) {
+			t.Errorf("the failure must be recognisable as an incomplete list, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "3") {
+			t.Errorf("the error must carry the counts, got %v", err)
+		}
+	})
+
+	t.Run("listeners", func(t *testing.T) {
+		fake := &fakeCLB{
+			lbs: map[string][]*clbsdk.LoadBalancer{
+				"ap-guangzhou": {{LoadBalancerId: common.StringPtr("lb-1")}},
+			},
+			rules: map[string][]string{"lb-1": {"api.example.com"}},
+		}
+		fake.listenerTotal = common.Uint64Ptr(4)
+		stubCLB(t, fake)
+
+		_, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
+		if err == nil {
+			t.Fatal("a listener list shorter than the reported total must not be used as the guard")
+		}
+		if !errors.Is(err, errIncompleteRuleList) {
+			t.Errorf("the failure must be recognisable as an incomplete list, got %v", err)
 		}
 	})
 }
@@ -669,5 +783,80 @@ func TestLoadBalancerEnumerationDoesNotFilterByInstanceGeneration(t *testing.T) 
 		t.Errorf("DescribeLoadBalancers sent Forward=%d; that is the instance generation, not a "+
 			"layer-7 filter, so it hides classic load balancers and their rule domains with them",
 			*fake.forward)
+	}
+}
+
+// A zone with no TXT records -- or one page request past the end -- must not fail the whole
+// declaration read.
+//
+// The API's default is to report "nothing matched" as an ERROR, not as an empty list, and a
+// failed declaration source freezes the round: the desired-state document and the state file are
+// then not written for any certificate until a human edits DNS. Two ordinary situations reach it:
+// any enumerated zone without TXT records, and the page request this loop makes whenever a zone's
+// TXT count is an exact multiple of the page size.
+func TestAnEmptyZoneDoesNotFreezeTheDeclarationRead(t *testing.T) {
+	fake := &fakeDNSPod{
+		realEmptyError: true,
+		domains: []*dnssdk.DomainListItem{
+			{Name: common.StringPtr("empty.example.com")},
+			{Name: common.StringPtr("full.example.com")},
+		},
+		records: map[string][]*dnssdk.RecordListItem{},
+	}
+	// Exactly one full page, so the loop asks for the page after it.
+	for i := 0; i < int(dnsPageSize); i++ {
+		fake.records["full.example.com"] = append(fake.records["full.example.com"], &dnssdk.RecordListItem{
+			Name:  common.StringPtr(fmt.Sprintf("_wecert.api.n%03d", i)),
+			Type:  common.StringPtr("TXT"),
+			Value: common.StringPtr("domains=a.example.com"),
+		})
+	}
+	stubDNSPod(t, fake)
+
+	got, err := newDeclarations(t, nil).ListDeclarations(context.Background())
+	if err != nil {
+		t.Fatalf("a zone with no TXT records must read as \"no declarations\", not fail the round: %v", err)
+	}
+	if len(got) != int(dnsPageSize) {
+		t.Errorf("declarations = %d, want the %d from the full zone", len(got), dnsPageSize)
+	}
+}
+
+// A region with more load balancers than one page must be paged, not called incomplete.
+//
+// The completeness check compared TotalCount against the bytes read SO FAR, inside the page loop.
+// TotalCount is the total matching the filter and is documented as independent of Limit, so for
+// any region with more instances than one page the first iteration saw "100 returned, 250
+// reported" and returned errIncompleteRuleList: paging was dead code, and guard 1 was reported
+// incomplete (and therefore disabled: no rule check, no removals) for the whole account. The
+// in-tree fake returned every instance in one page, which is why no test could see it.
+func TestListRuleDomainsPagesPastOnePage(t *testing.T) {
+	const count = 250
+	lbs := make([]*clbsdk.LoadBalancer, 0, count)
+	rules := map[string][]string{}
+	for i := range count {
+		id := "lb-" + itoa(i)
+		lbs = append(lbs, &clbsdk.LoadBalancer{LoadBalancerId: common.StringPtr(id)})
+		rules[id] = []string{"host-" + itoa(i) + ".example.com"}
+	}
+	fake := &fakeCLB{
+		paging: true,
+		lbs:    map[string][]*clbsdk.LoadBalancer{"ap-guangzhou": lbs},
+		rules:  rules,
+	}
+	stubCLB(t, fake)
+
+	got, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background())
+	if err != nil {
+		t.Fatalf("a region with %d load balancers must be paged, not reported incomplete: %v", count, err)
+	}
+	if len(got) != count {
+		t.Errorf("the guard saw %d rule domains, want %d: the pages after the first were skipped", len(got), count)
+	}
+
+	// And a genuinely short answer is still reported: the check moved, it did not disappear.
+	fake.lbTotal = common.Uint64Ptr(count + 50)
+	if _, err := newRules(t, []string{"ap-guangzhou"}).ListRuleDomains(context.Background()); !errors.Is(err, errIncompleteRuleList) {
+		t.Errorf("a response that reports more instances than its pages returned must stay an error, got %v", err)
 	}
 }

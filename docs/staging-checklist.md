@@ -34,7 +34,7 @@ The one flow a human is part of, and the one that is hardest to fake.
 
 | # | Do | Expect |
 |---|---|---|
-| 1.1 | `wecert -config … -once` on a fresh state store | uploads, prints the uploaded CertId, logs "waiting for a one-time manual bind in the CLB console"; issuance succeeds and `wecert_certificate_deployed` stays **0** |
+| 1.1 | `sudo -u wecert wecert -config … -once` on a fresh state store, **with the daemon stopped** (the state database is locked by a running process, and the refusal is by design) | uploads, prints the uploaded CertId, logs "waiting for a one-time manual bind in the CLB console"; issuance succeeds and `wecert_certificate_deployed` stays **0** |
 | 1.2 | Bind that certificate to a CLB listener in the console (an **SNI** listener needs `multi_cert_info`; the primary `certificate_id` is silently ignored) | — |
 | 1.3 | Wait one reconcile pass, or POST `/hook/reconcile` | logs "confirmed the certificate is bound"; `wecert_certificate_deployed{cert}` becomes **1** |
 | 1.4 | Force the next renewal window (`renewBefore` shorter, or a second staging cert), run a pass | `UpdateCertificateInstance` runs, the listener moves to the new CertId **without** console work |
@@ -62,7 +62,7 @@ still references this certificate". Both halves need to be seen once.
 
 ## 3. CAM policy is minimal and sufficient
 
-The policy files were wrong once: they omitted three `ssl:*` actions the runtime calls, so a role
+The policy files were wrong once: they omitted four `ssl:*` actions the runtime calls, so a role
 built from them failed every rebind. Reading the JSON cannot catch a recurrence; running it can.
 
 | # | Do | Expect |

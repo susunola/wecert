@@ -14,8 +14,12 @@ import (
 var (
 	CertNotAfter = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_not_after_timestamp_seconds",
-		Help: "notAfter of the live certificate, in unix seconds.",
-	}, []string{"cert"})
+		Help: "notAfter of the live certificate, in unix seconds, by certificate and profile.",
+		// The profile is a label because the profiles have different validities (90 days classic,
+		// 45 tlsserver, 160 hours shortlived): an expiry warning expressed in days is either wrong
+		// for a short-lived certificate for its whole life, or too late for it. With the label each
+		// profile gets its own threshold.
+	}, []string{"cert", "profile"})
 
 	CertDeployed = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_deployed",
@@ -144,12 +148,12 @@ var (
 
 	OrphanedCertificates = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "wecert_orphaned_certificates",
-		Help: "Certificates present in the state store but absent from the desired state. They will not be renewed and will eventually expire.",
+		Help: "Certificates present in the state store but absent from the desired state. They are not renewed and their row is deliberately KEPT (so a re-added name resumes its history), so this gauge stays 1 until an operator deletes the row; it is not a transient condition.",
 	})
 
 	CertificateProbeMatch = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_probe_match",
-		Help: "1 when the certificate actually served for this host is the one that was deployed, 0 otherwise. Only set after a probe that completed.",
+		Help: "1 when the certificate actually served for this host is the one that was deployed, 0 otherwise. 0 also covers a probe where SOME resolved addresses answered with the right certificate and others could not be reached: an unverified address is not a verified one, so read wecert_certificate_probe_errors_total next to it to tell the two apart.",
 	}, []string{"host"})
 
 	CertificateProbeNotAfter = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -164,12 +168,18 @@ var (
 
 	CertificateProbeErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "wecert_certificate_probe_errors_total",
-		Help: "Probes that could not be completed at all (resolve, dial or handshake failed). Distinct from probe_match=0, which means the probe succeeded and found the wrong certificate.",
+		Help: "Probe attempts that failed to resolve, dial or handshake. A non-zero value together with probe_match=0 means at least one address could not be checked -- an environment problem (a dead AAAA record, a firewall) rather than a wrong certificate; probe_match=0 with no such errors means every address answered and at least one served the wrong certificate.",
 	}, []string{"host"})
 
 	CertificateFallbackActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_certificate_fallback_active",
-		Help: "1 when this certificate is being served by a partial certificate with some names dropped (failure fallback). Partial availability beats total failure, but this is not a state to leave unattended.",
+		// "in force", not "serving": the gauge is set when the degradation DECISION is taken (and
+		// cleared only when a full certificate has been issued and deployed), so it covers the pass
+		// that is about to issue the reduced set. That is deliberate -- the decision is the event an
+		// operator can act on, and waiting for the deployment would hide a fallback whose own
+		// issuance is failing -- but the help text used to claim the certificate was already being
+		// served, which is not true for that first pass.
+		Help: "1 while a failure fallback is in force for this certificate: names whose authorizations keep failing have been dropped, so the certificate it serves (or is about to serve) is partial. Partial availability beats total failure, but this is not a state to leave unattended.",
 	}, []string{"cert"})
 
 	CertificateFallbackDropped = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -189,8 +199,12 @@ var (
 // that is also unbounded series growth, since certificate names are derived from
 // registered domains and domains churn by design.
 func DeleteCertSeries(name string) {
+	// CertNotAfter carries a second label (profile), and DeleteLabelValues requires exactly as many
+	// values as the vector has labels -- passing one aborts the delete with an inconsistent-cardinality
+	// panic, which is how a removed certificate's frozen expiry series survived reclamation. A partial
+	// match names the cert label and removes every profile it was published under.
+	CertNotAfter.DeletePartialMatch(prometheus.Labels{"cert": name})
 	for _, v := range []*prometheus.GaugeVec{
-		CertNotAfter,
 		CertDeployed,
 		CertConsecutiveFailures,
 		CertARIWindowStart,

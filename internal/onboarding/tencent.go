@@ -2,6 +2,7 @@ package onboarding
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/tcerr"
 )
 
 // Page sizes. DNSPod's DescribeRecordList caps a page at 3000; 100 is used here:
@@ -200,9 +202,21 @@ func (d *DNSPodDeclarations) listTXTRecords(ctx context.Context, client dnspodAP
 		req.RecordType = common.StringPtr("TXT")
 		req.Offset = common.Uint64Ptr(offset)
 		req.Limit = common.Uint64Ptr(dnsPageSize)
+		// The server default is to FAIL a query that matches nothing
+		// (ResourceNotFound.NoDataOfRecord), not to return an empty list. Leaving it at the
+		// default makes one TXT-less zone -- or one page request past the end, which this loop
+		// makes whenever a zone's TXT count is an exact multiple of the page size -- fail the
+		// whole declaration read, and a failed declaration source freezes the round: the desired
+		// state document and the state file are then not written for ANY certificate until a
+		// human edits DNS. Ask for an empty list instead, and keep the code below tolerant of
+		// older API behaviour that reports the error anyway.
+		req.ErrorOnEmpty = common.StringPtr("no")
 
 		resp, err := client.DescribeRecordListWithContext(ctx, req)
 		if err != nil {
+			if tcerr.IsNoDataOfRecord(err) {
+				break
+			}
 			return nil, fmt.Errorf("list TXT records: %w", err)
 		}
 		if resp == nil || resp.Response == nil {
@@ -281,11 +295,23 @@ func NewCLBRules(cfg config.Tencent, regions []string, log *slog.Logger) (*CLBRu
 	return &CLBRules{credential: src, regions: regions, log: log}, nil
 }
 
+// errIncompleteRuleList marks a guard reading that came back short of what the API itself said
+// existed.
+//
+// It is deliberately distinct from "the guard could not be read at all". Both make the round treat
+// the guard as unavailable (no deletions), but this one means the API answered and the answer was
+// TRUNCATED -- a partial success, which is the shape of failure that used to be invisible: the
+// guard silently sees fewer rules, concludes a name is unserved, and walks into the deletion path.
+// Nothing in the API contract promises a short list; a default page limit or a proxy cutting a
+// response would produce exactly this.
+var errIncompleteRuleList = errors.New("the CLB rule list is incomplete")
+
 // ListRuleDomains implements RuleLister.
 //
 // As with declaration enumeration, failure to read any one region fails the whole
 // round: a partial result would misread "the rule is still there" as "the rule is
-// gone", and that walks into the deletion path.
+// gone", and that walks into the deletion path. The count each response carries is
+// checked against what it returned, so "partial" cannot arrive looking complete.
 func (r *CLBRules) ListRuleDomains(ctx context.Context) ([]string, error) {
 	if len(r.regions) == 0 {
 		return nil, fmt.Errorf("no region is configured (tencent.regions); CLB is regional, so an empty list would silently guard nothing")
@@ -307,7 +333,7 @@ func (r *CLBRules) ListRuleDomains(ctx context.Context) ([]string, error) {
 			return nil, fmt.Errorf("region %s: build CLB client: %w", region, err)
 		}
 
-		lbs, err := r.listLoadBalancers(ctx, client)
+		lbs, err := r.listLoadBalancers(ctx, client, region)
 		if err != nil {
 			return nil, fmt.Errorf("region %s: %w", region, err)
 		}
@@ -343,9 +369,9 @@ var newCLBClient = func(cred common.CredentialIface, region string, cpf *profile
 
 // listLoadBalancers returns every load balancer in the region, of either instance
 // generation.
-func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI) ([]string, error) {
+func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI, region string) ([]string, error) {
 	var out []string
-	var offset int64
+	var offset, read, reported int64
 	for {
 		req := clbsdk.NewDescribeLoadBalancersRequest()
 		// Forward is deliberately NOT set. Despite the name it is not "layer 7 only": the
@@ -373,13 +399,19 @@ func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI) ([]stri
 			return nil, fmt.Errorf("describe load balancers: the API returned no result")
 		}
 		list := resp.Response.LoadBalancerSet
+		read += int64(len(list))
+		if resp.Response.TotalCount != nil {
+			reported = int64(*resp.Response.TotalCount)
+		}
 		for _, lb := range list {
-			if lb == nil {
-				continue
+			if lb == nil || lb.LoadBalancerId == nil || *lb.LoadBalancerId == "" {
+				// One unusable entry is enough to make the whole guard answer incomplete: the
+				// listeners of the load balancer we could not name are never enumerated, so its
+				// rules are missing from the list the guard checks declarations against.
+				return nil, fmt.Errorf("%w: region %s returned a load balancer without an id",
+					errIncompleteRuleList, region)
 			}
-			if lb.LoadBalancerId != nil && *lb.LoadBalancerId != "" {
-				out = append(out, *lb.LoadBalancerId)
-			}
+			out = append(out, *lb.LoadBalancerId)
 		}
 		if len(list) < clbPageSize {
 			break
@@ -388,6 +420,20 @@ func (r *CLBRules) listLoadBalancers(ctx context.Context, client clbAPI) ([]stri
 		if offset > maxLoadBalancers {
 			return nil, fmt.Errorf("more than %d load balancers; refusing to keep paging", offset)
 		}
+	}
+
+	// The count is compared AFTER the loop, against everything the pages returned.
+	//
+	// It used to be compared inside the loop, against the bytes read so far -- which is wrong by
+	// construction: TotalCount ("the total number of load balancers matching the filter; this
+	// value is independent of Limit") is larger than the first page for ANY region with more
+	// instances than one page, so paging was dead code and the guard reported itself incomplete
+	// for every account with more than clbPageSize load balancers in a region -- disabling guard
+	// 1 entirely (no rule check, no removals) and printing a false "the rule list is truncated"
+	// every round.
+	if reported > read {
+		return nil, fmt.Errorf("%w: region %s reported %d load balancers and the pages returned %d",
+			errIncompleteRuleList, region, reported, read)
 	}
 	sort.Strings(out)
 	return out, nil
@@ -408,6 +454,14 @@ func (r *CLBRules) listRuleDomainsFor(ctx context.Context, client clbAPI, lbID s
 	}
 	if resp == nil || resp.Response == nil {
 		return nil, fmt.Errorf("describe listeners: the API returned no result")
+	}
+
+	// The listeners of one load balancer are not paged (this request has no offset or limit), so
+	// the count it reports is the count it must have returned. A short answer means rules are
+	// missing from the guard's view, which is the one thing that must never pass unnoticed here.
+	if resp.Response.TotalCount != nil && int64(*resp.Response.TotalCount) != int64(len(resp.Response.Listeners)) {
+		return nil, fmt.Errorf("%w: load balancer %s reported %d listeners and returned %d",
+			errIncompleteRuleList, lbID, *resp.Response.TotalCount, len(resp.Response.Listeners))
 	}
 
 	var out []string

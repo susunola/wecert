@@ -25,6 +25,17 @@ type TencentCLB struct {
 	types      []string
 	log        *slog.Logger
 	now        func() time.Time
+	// enumerationBudget overrides defaultEnumerationBudget when non-zero. Tests set it to
+	// keep the polling loop short in real time; production uses the default.
+	enumerationBudget time.Duration
+}
+
+// enumerationWait is the effective bind-resource enumeration budget.
+func (d *TencentCLB) enumerationWait() time.Duration {
+	if d.enumerationBudget > 0 {
+		return d.enumerationBudget
+	}
+	return defaultEnumerationBudget
 }
 
 // LazyTencentCLB creates the Tencent Cloud deployer only when an operation
@@ -111,13 +122,32 @@ func NewTencentCLB(cfg config.Tencent, log *slog.Logger) (*TencentCLB, error) {
 // wait concludes that nothing was bound. See waitDeployRecord.
 const deployRecordGrace = 15 * time.Second
 
+// defaultEnumerationBudget is how long the bind-resource enumeration may take before the
+// verification gives up and reports ErrSwitchUnverified instead of an answer.
+//
+// The enumeration is asynchronous and its latency belongs to the server, not to us:
+// measured on a shared account holding 36 certificates, a task that was already cached
+// answered in about 25s and fresh ones took longer than the 30s this used to allow --
+// which turned an already-successful rebind into a failed pass on every attempt, with the
+// state never recording the certificate that was serving traffic. The budget is generous
+// on purpose: it costs one wait per deployment, and the alternative to waiting is a
+// verification that never answers.
+const defaultEnumerationBudget = 3 * time.Minute
+
 // sslAPI is the narrow slice of the Tencent Cloud SSL client this package uses.
 //
-// *ssl.Client is a concrete struct with no interface seam, and client() used to rebuild
-// it on every call -- which left the polling logic in updateInstance and
+// *ssl.Client is a concrete struct with no interface seam, and client() rebuilds it
+// on every call -- which left the polling logic in updateInstance and
 // waitDeployRecord (the most failure-prone part of the package) impossible to
 // unit-test. Declaring only the used methods as an interface lets tests substitute a
 // fake while the production implementation stays the real SDK client.
+//
+// "Rebuilds it on every call" is literal: the SDK wraps each client in its own clone of
+// http.DefaultTransport, so every deploy, reap and binding check opens a fresh TLS
+// connection and leaves one idle for 30s. Reusing a client would be wrong for the other
+// reason client() exists (credentials are fetched per call and the instance role's are
+// temporary), and the SDK has no seam for injecting a shared transport: it applies
+// ReqTimeout by mutating the client it is handed.
 type sslAPI interface {
 	UploadCertificateWithContext(ctx context.Context, req *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error)
 	UpdateCertificateInstanceWithContext(ctx context.Context, req *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error)
@@ -175,6 +205,23 @@ func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM
 }
 
 // Upload stores the certificate and returns its durable Tencent Cloud identity.
+// sdkCallError classifies a failed Tencent Cloud SDK call.
+//
+// The SDK does not wrap the transport error it saw: common@v1.3.180's netretry layer builds a fresh
+// *TencentCloudSDKError from the string, so a call cut short by a shutdown arrives upstream as
+// `ClientError.NetworkError ... Post ...: context canceled` -- an error that neither unwraps to
+// context.Canceled nor looks like one. The caller's rule is explicit ("a stopped process is not a
+// business failure": the certificate would get a failure counter and a backoff for a stop signal,
+// and after the restart the pass it should have pushed on at once is locked out of the window), and
+// it can only apply if the error carries the sentinel. The context is the authority on why the call
+// stopped, so it is consulted first.
+func sdkCallError(ctx context.Context, what string, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("%s: %w", what, cerr)
+	}
+	return fmt.Errorf("%s: %w", what, err)
+}
+
 func (d *TencentCLB) Upload(ctx context.Context, certName string, certPEM, keyPEM []byte) (string, error) {
 	client, err := d.client(ctx)
 	if err != nil {
@@ -204,6 +251,27 @@ func (d *TencentCLB) deployUploaded(ctx context.Context, client sslAPI, certName
 	// The caller must record it in the reclamation list, otherwise this certificate becomes a
 	// cloud orphan that occupies the account's uploaded-certificate quota forever.
 	if err := d.updateInstance(ctx, client, oldID, newID); err != nil {
+		// Nothing is bound to either certificate: this is not a failed switch, it is the
+		// documented first-issuance state, reached on a renewal because the first upload was never
+		// bound by hand.
+		//
+		// The distinction matters because the two look identical to the cloud
+		// (FailedOperation.CertificateDeployInstanceEmpty) and call for opposite answers. Before
+		// this, every renewal of a certificate nobody had bound yet failed the pass, so the
+		// promotion never ran and st.NotAfter/CertPEM stayed on the certificate that was expiring:
+		// the state kept naming a certificate whose only remaining future was to expire, and each
+		// failed cycle issued and uploaded another one.
+		//
+		// Both answers must be COMPLETE for this reading: a partial enumeration reports 0 for a
+		// certificate that is bound in a region the read could not reach, and treating that as
+		// "nothing is bound" is how a needed switch gets skipped and a listener keeps serving a
+		// certificate that is about to expire.
+		if d.nothingBoundYet(ctx, client, oldID, newID) {
+			d.log.Warn("neither the old nor the new certificate is bound to anything yet; "+
+				"recording the new one as uploaded and waiting for the one-time manual bind",
+				"oldCertId", oldID, "newCertId", newID)
+			return newID, ErrNothingBoundYet
+		}
 		// Repair the historical wedge only when the old anchor is entirely gone. A
 		// non-zero new binding alone is not completion: a partially failed task has
 		// exactly that shape and must remain an error.
@@ -279,7 +347,7 @@ func (d *TencentCLB) upload(ctx context.Context, client sslAPI, certName string,
 
 	resp, err := client.UploadCertificateWithContext(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("UploadCertificate: %w", err)
+		return "", sdkCallError(ctx, "UploadCertificate", err)
 	}
 	if resp.Response == nil {
 		return "", errors.New("UploadCertificate returned an empty response")
@@ -326,7 +394,7 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 	for {
 		resp, err := client.UpdateCertificateInstanceWithContext(ctx, req)
 		if err != nil {
-			return fmt.Errorf("UpdateCertificateInstance: %w", err)
+			return sdkCallError(ctx, "UpdateCertificateInstance", err)
 		}
 		if resp.Response != nil && resp.Response.DeployRecordId != nil && *resp.Response.DeployRecordId > 0 {
 			recordID = *resp.Response.DeployRecordId
@@ -352,6 +420,7 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 			// So an adopted task is waited on and then verified the only way that answers
 			// the question that matters: is THIS certificate bound anywhere?
 			if resp.Response.DeployStatus != nil && *resp.Response.DeployStatus == 0 {
+				verifyStart := d.now()
 				d.log.Warn("another update task is already in progress; waiting for it and then "+
 					"verifying that this certificate is the one that got bound",
 					"oldCertId", oldID, "newCertId", newID, "deployRecordId", recordID)
@@ -362,24 +431,34 @@ func (d *TencentCLB) updateInstance(ctx context.Context, client sslAPI, oldID, n
 				// cached task result from before the switch answers a different question.
 				n, berr := d.bindingsWith(ctx, client, newID, false)
 				if berr != nil {
-					return fmt.Errorf("the in-progress update task finished, but verifying whether %s is "+
-						"bound failed: %w (refusing to report success on an unverified switch)", newID, berr)
+					// The task is done and the record says it succeeded, but the enumeration that
+					// would confirm which certificate ended up bound did not answer in time. That is
+					// "unknown", not "failed" -- see ErrSwitchUnverified for why failing here never
+					// converges.
+					return fmt.Errorf("%w: the in-progress update task finished, but enumerating the "+
+						"bindings of %s failed: %v", ErrSwitchUnverified, newID, berr)
 				}
 				if n.count == 0 && !n.complete {
 					// Not the same as "it is not bound": at least one region went unanswered, so
 					// this program cannot tell. Reporting failure here would be wrong about a
 					// switch that did happen, and reporting success would be wrong about one that
-					// did not, so it says which it is and refuses to guess.
-					return fmt.Errorf("an update task was already in progress and finished, but the "+
-						"bind-resource enumeration for %s did not cover every region, so whether this "+
-						"switch took effect is unknown (refusing to report success on an unverified switch)",
-						newID)
+					// did not -- so it reports the uncertainty and lets the binding probe settle it.
+					return fmt.Errorf("%w: an update task was already in progress and finished, but the "+
+						"bind-resource enumeration for %s did not cover every region", ErrSwitchUnverified, newID)
 				}
 				if n.count == 0 {
 					return fmt.Errorf("an update task was already in progress, and this certificate (%s) is "+
 						"not bound to any resource afterwards; the task belonged to a different switch, so "+
 						"this deploy did not happen", newID)
 				}
+				// Say how long the verification took. It is bounded by the record wait (3m) plus the
+				// enumeration budget (3m), so a pass can legitimately spend minutes here, and without
+				// this line a slow verification is indistinguishable from a hung one in the journal.
+				// It is the same path that used to fail whenever the enumeration was slower than 30s,
+				// so the number is also the evidence that the budget is now adequate.
+				d.log.Info("verified the adopted update task",
+					"oldCertId", oldID, "newCertId", newID, "deployRecordId", recordID,
+					"boundResources", n.count, "took", d.now().Sub(verifyStart).Round(time.Second))
 				return nil
 			}
 
@@ -513,7 +592,7 @@ func (d *TencentCLB) describeDeployRecord(ctx context.Context, client sslAPI, re
 	req.DeployRecordId = common.StringPtr(strconv.FormatUint(recordID, 10))
 	resp, err := client.DescribeHostUpdateRecordDetailWithContext(ctx, req)
 	if err != nil {
-		return 0, 0, 0, 0, false, err
+		return 0, 0, 0, 0, false, sdkCallError(ctx, fmt.Sprintf("DescribeHostUpdateRecordDetail(%d)", recordID), err)
 	}
 	if resp.Response == nil {
 		return 0, 0, 0, 0, false, errors.New("DescribeHostUpdateRecordDetail returned an empty response")
@@ -565,7 +644,7 @@ func (d *TencentCLB) Delete(ctx context.Context, certID string) error {
 
 	resp, err := client.DeleteCertificateWithContext(ctx, req)
 	if err != nil {
-		return fmt.Errorf("DeleteCertificate(%s): %w", certID, err)
+		return sdkCallError(ctx, "DeleteCertificate("+certID+")", err)
 	}
 	if resp.Response == nil {
 		return fmt.Errorf("DeleteCertificate(%s): the API returned an empty response", certID)
@@ -618,7 +697,7 @@ func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, 
 		req.TaskIds = []*string{common.StringPtr(taskID)}
 		resp, err := client.DescribeDeleteCertificatesTaskResultWithContext(ctx, req)
 		if err != nil {
-			return fmt.Errorf("DescribeDeleteCertificatesTaskResult(%s): %w", taskID, err)
+			return sdkCallError(ctx, "DescribeDeleteCertificatesTaskResult("+taskID+")", err)
 		}
 
 		status, detail, found, err := deleteTaskStatus(resp, taskID)
@@ -699,6 +778,12 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready 
 	var n int64
 	listed := 0
 	answered := 0
+	// An entry -- or a region -- that is present but says nothing is an UNANSWERED part of the
+	// response, not an absent one. Counting only what was listed made a half-populated answer read
+	// as a finished one, and a finished answer of zero is what licenses the caller's hard
+	// noResourceBoundError branch instead of deferring to the authoritative deploy record. Same
+	// shape as countBindings, which was fixed for exactly this.
+	unanswered := 0
 	for _, p := range progress {
 		// The SDK hands back []*T; a nil element is not a "region with no count", it is a
 		// missing entry, and dereferencing it panics inside updateInstance -- after the
@@ -706,10 +791,17 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready 
 		// survives, but recordFailure never runs: no backoff, no last_error, and the deploy
 		// never completes. Every other SDK list in this file is guarded; these two were not.
 		if p == nil {
+			unanswered++
 			continue
+		}
+		if len(p.UpdateSyncProgressRegions) == 0 {
+			// The resource type came back with no regions at all: whatever it was bound to is not
+			// in this answer.
+			unanswered++
 		}
 		for _, r := range p.UpdateSyncProgressRegions {
 			if r == nil {
+				unanswered++
 				continue
 			}
 			listed++
@@ -719,7 +811,7 @@ func progressBoundCount(progress []*ssl.UpdateSyncProgress) (count int64, ready 
 			}
 		}
 	}
-	return n, listed > 0 && answered == listed
+	return n, listed > 0 && answered == listed && unanswered == 0
 }
 
 // noResourceBoundError is the diagnosis shared by the two places that can conclude the
@@ -812,6 +904,25 @@ type bindingCount struct {
 	complete bool
 }
 
+// ErrNothingBoundYet means the certificate was uploaded, but neither it nor the certificate it
+// replaces is bound to any cloud resource.
+//
+// It is the documented first-issuance state ("upload once, bind it by hand once, renewals switch
+// automatically afterwards") met during a renewal, and it is deliberately not a failure: there was
+// no switch to perform. Callers must record the new certificate id and leave DeployConfirmed false,
+// so the deployed metric keeps saying "uploaded, not serving yet" until the enumeration finds it.
+var ErrNothingBoundYet = errors.New("the certificate is uploaded but nothing is bound to it yet")
+
+// nothingBoundYet reports whether BOTH certificates have zero bindings, from complete answers.
+func (d *TencentCLB) nothingBoundYet(ctx context.Context, client sslAPI, oldID, newID string) bool {
+	newBindings, nerr := d.bindingsWith(ctx, client, newID, false)
+	if nerr != nil || !newBindings.complete || newBindings.count > 0 {
+		return false
+	}
+	oldBindings, oerr := d.bindingsWith(ctx, client, oldID, false)
+	return oerr == nil && oldBindings.complete && oldBindings.count == 0
+}
+
 // bindingsWith enumerates a certificate's bindings against an existing client.
 //
 // Split out so Deploy's recovery path can reuse it: that path already holds a client,
@@ -833,7 +944,7 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 
 	createResp, err := client.CreateCertificateBindResourceSyncTaskWithContext(ctx, createReq)
 	if err != nil {
-		return bindingCount{}, fmt.Errorf("CreateCertificateBindResourceSyncTask: %w", err)
+		return bindingCount{}, sdkCallError(ctx, "CreateCertificateBindResourceSyncTask", err)
 	}
 	// No task ids is not the answer "bound nowhere": it is the absence of an answer, and an older
 	// API version or a throttled call both look like this.
@@ -854,16 +965,18 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 		return bindingCount{complete: false}, nil
 	}
 
-	// Enumeration is asynchronous, so poll until there is a result. Keep the ceiling short:
-	// this is only a confirmation action and not worth blocking reconciliation on for long.
-	deadline := d.now().Add(30 * time.Second)
+	// Enumeration is asynchronous, so poll until there is a result. The ceiling comes from
+	// enumerationWait: this is only a confirmation action, but a budget shorter than the
+	// server's own latency produces a verification that never answers, which is worse than
+	// waiting (see defaultEnumerationBudget).
+	deadline := d.now().Add(d.enumerationWait())
 	for {
 		queryReq := ssl.NewDescribeCertificateBindResourceTaskResultRequest()
 		queryReq.TaskIds = []*string{common.StringPtr(taskID)}
 
 		queryResp, err := client.DescribeCertificateBindResourceTaskResultWithContext(ctx, queryReq)
 		if err != nil {
-			return bindingCount{}, fmt.Errorf("DescribeCertificateBindResourceTaskResult: %w", err)
+			return bindingCount{}, sdkCallError(ctx, "DescribeCertificateBindResourceTaskResult", err)
 		}
 
 		n, done, err := countBindings(queryResp, taskID)
@@ -885,7 +998,8 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 		}
 
 		if d.now().After(deadline) {
-			return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within 30s (taskId=%s)", taskID)
+			return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within %s (taskId=%s)",
+				d.enumerationWait(), taskID)
 		}
 		if err := waitBetweenPolls(ctx, 2*time.Second); err != nil {
 			return bindingCount{}, err
@@ -940,7 +1054,17 @@ func countBindings(
 		complete := true
 		for _, res := range r.BindResourceResult {
 			if res == nil {
+				// A resource-type entry with no body counted nothing. Treating that as an answered
+				// enumeration is how a total of zero becomes authoritative: the repair path reads
+				// "complete && count == 0" as "the old certificate is gone" and reports the switch
+				// as done. The empty outer list is refused above for the same reason, one level up.
+				complete = false
 				continue
+			}
+			if len(res.BindResourceRegionResult) == 0 {
+				// Same shape one level down: the entry exists but no region was counted, so the
+				// zero is a missing answer rather than the number zero.
+				complete = false
 			}
 			for _, region := range res.BindResourceRegionResult {
 				// A region that is absent from the answer, or that carries no TotalCount, is a

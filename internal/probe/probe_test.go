@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"net"
 	"strings"
@@ -529,5 +530,96 @@ func TestForgetDropsTheRememberedState(t *testing.T) {
 	r.Forget(host)
 	if got := r.LastState(host); got != "" {
 		t.Errorf("Forget should drop the remembered state, still have %q", got)
+	}
+}
+
+// A host that stops resolving must not keep a stale probe_match of 1 either.
+//
+// The resolve failure takes a different branch from "some addresses could not be dialled", and that
+// branch used to leave the series alone: a host that matched last round and then lost its DNS kept
+// reporting probe_match=1 while its verdict was unreachable, so the documented alert on
+// probe_match == 0 -- the one signal that says "traffic is being served by something else" -- could
+// never fire for the host that had actually stopped resolving.
+func TestResolveFailureMarksProbeMatchZero(t *testing.T) {
+	const host = "no-longer-resolves.example"
+	cert := makeCert(t, []string{host},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+	good := resultFromCert(t, cert, host)
+	expectation := Expectation{Domains: []string{host}, NotAfter: good.NotAfter}
+
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{{Address: "192.0.2.10:443", Result: good}}, nil
+	}
+	if v := r.Check(context.Background(), host, expectation); !v.OK {
+		t.Fatalf("the priming round should pass, got: %s", v.Summary())
+	}
+	if got := testutil.ToFloat64(metrics.CertificateProbeMatch.WithLabelValues(host)); got != 1 {
+		t.Fatalf("probe_match should be 1 after a clean round, got %v", got)
+	}
+
+	// The name no longer resolves: probeAll fails before any address is tried.
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return nil, &net.DNSError{Name: host, Err: "no such host", IsNotFound: true}
+	}
+	if v := r.Check(context.Background(), host, expectation); v.OK {
+		t.Fatal("a name that does not resolve must not pass")
+	}
+	if got := testutil.ToFloat64(metrics.CertificateProbeMatch.WithLabelValues(host)); got != 0 {
+		t.Errorf("probe_match must drop to 0 when the name cannot be resolved, got %v (stale 1)", got)
+	}
+}
+
+// A name with more addresses than the cap is reported as unverified, never sampled.
+//
+// Every resolved address has to be checked -- a rebind takes effect per backend -- so "here are the
+// first N" would be a claim the probe cannot support, and it would be indistinguishable from a
+// clean verdict. The cap exists so one name cannot spend an unbounded slice of a pass: the cost of
+// probing is len(addresses) dials of up to Timeout each, inside that certificate's own pass claim.
+func TestTooManyAddressesIsRefusedRatherThanSampled(t *testing.T) {
+	ips := make([]string, 0, maxProbeAddresses+1)
+	for i := 0; i <= maxProbeAddresses; i++ {
+		ips = append(ips, fmt.Sprintf("192.0.2.%d", i%256))
+	}
+
+	// The resolver is not injectable, so the decision is tested where it is made: the cap is a
+	// comparison against maxProbeAddresses, and this asserts the documented boundary.
+	if maxProbeAddresses < 8 {
+		t.Fatalf("the cap must be comfortably above any real deployment, got %d", maxProbeAddresses)
+	}
+	if len(ips) <= maxProbeAddresses {
+		t.Fatalf("the fixture must exceed the cap, got %d addresses", len(ips))
+	}
+	err := capCheck("example.com", len(ips))
+	if err == nil {
+		t.Fatal("a name past the cap must produce an error, not a silent sample")
+	}
+	if !strings.Contains(err.Error(), "unverified") {
+		t.Errorf("the message has to say the name is unverified rather than probed, got %v", err)
+	}
+	if err := capCheck("example.com", maxProbeAddresses); err != nil {
+		t.Errorf("the cap itself must be allowed, got %v", err)
+	}
+}
+
+// A misspelled -expect-san must not be reported as both missing and extra.
+//
+// normalizeSet trimmed the spaces BEFORE stripping the dot, so it was not idempotent: a name written
+// "www.example.com.." kept one dot after the first pass and lost it on the second. Verify compares
+// two normalized sets, so the same name landed in both "missing names that were deployed" and "has
+// names that were not deployed" -- one typo, a self-contradictory verdict and exit code 2.
+func TestExpectSANNormalisationIsIdempotent(t *testing.T) {
+	for _, spelling := range []string{"www.example.com", "WWW.Example.com ", "www.example.com.", "www.example.com..", " www.example.com ."} {
+		first := normalizeSet([]string{spelling})
+		for name := range first {
+			second := normalizeSet([]string{name})
+			if len(second) != 1 || !second[name] {
+				t.Errorf("normalizeSet is not idempotent for %q: first pass %q, second pass %v",
+					spelling, name, second)
+			}
+			if name != "www.example.com" {
+				t.Errorf("%q normalised to %q, want www.example.com", spelling, name)
+			}
+		}
 	}
 }

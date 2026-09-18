@@ -57,6 +57,11 @@ type harness struct {
 	rules *fakeRules
 	clock *clock
 	opts  Options
+
+	// logs holds everything the round wrote to the journal. The report is the primary artifact,
+	// but some facts deliberately live only in the log (an ignored record whose hostname is
+	// declared elsewhere), and a test has to be able to see them.
+	logs *bytes.Buffer
 }
 
 func newHarness(t *testing.T, opts Options) *harness {
@@ -84,9 +89,11 @@ func newHarness(t *testing.T, opts Options) *harness {
 		rules: &fakeRules{},
 		clock: c,
 		opts:  opts,
+		logs:  &bytes.Buffer{},
 	}
 
-	ob, err := New(Sources{Declarations: h.decls, Rules: h.rules}, opts, testLogger())
+	ob, err := New(Sources{Declarations: h.decls, Rules: h.rules}, opts,
+		slog.New(slog.NewTextHandler(h.logs, nil)))
 	if err != nil {
 		t.Fatalf("constructing the onboarder failed: %v", err)
 	}
@@ -1055,16 +1062,24 @@ func TestThirdDeclarationForAConflictedHostnameIsRejectedToo(t *testing.T) {
 	if got := h.domains(t); len(got) != 1 || got[0] != "ok.example.com" {
 		t.Fatalf("the conflicted hostname must stay out, got %v", got)
 	}
-	rejections := 0
+	// Exactly one verdict for the name, and it is an exclusion: the report carries one entry per
+	// hostname (reject keeps the first reason -- the conflict -- and refuses to append another for
+	// the repeat), while the repeat itself is still refused rather than accepted.
+	var verdicts []spec.Decision
 	for _, d := range rep.Decisions {
-		if d.Hostname == "fight.example.com" && !d.Included &&
-			strings.Contains(d.Reason, "conflicting declarations") {
-			rejections++
+		if d.Hostname == "fight.example.com" {
+			verdicts = append(verdicts, d)
 		}
 	}
-	if rejections != 2 {
-		t.Errorf("both the conflict and the later repeat must be rejected, got %d rejections in %+v",
-			rejections, rep.Decisions)
+	if len(verdicts) != 1 {
+		t.Fatalf("one hostname, one verdict: got %d entries for fight.example.com in %+v",
+			len(verdicts), rep.Decisions)
+	}
+	if verdicts[0].Included {
+		t.Errorf("the third record must not resurrect a conflicted hostname: %+v", verdicts[0])
+	}
+	if !strings.Contains(verdicts[0].Reason, "conflicting declarations") {
+		t.Errorf("the entry must say why the name is out: %+v", verdicts[0])
 	}
 }
 
@@ -1576,7 +1591,16 @@ func TestLostStateFileDoesNotDeleteNamesWithoutAGracePeriod(t *testing.T) {
 // no longer declared and only absent for 0s -- and worse, carry() put them back into the
 // eligible set, so the round kept converging on a name the guard had just rejected. That is
 // exactly the certificate-without-a-rule that guard 1 exists to prevent.
-func TestStillDeclaredNameIsNotReportedAsRemoved(t *testing.T) {
+// A guard that stops serving a still-declared name must not strip its coverage.
+//
+// The reversal is deliberate. Guard 1 is a NETWORK read and cannot express "my answer may be
+// incomplete" (a region that did not answer, a rule that a partial list omitted), so a wobble in
+// it used to change the document: the name left the certificate, wecert reissued without it, the
+// guard recovered, and the name was issued all over again -- two issuances and two rounds without
+// coverage, for a name that never stopped being declared. What the guard is for is preventing NEW
+// coverage of a name no rule serves; that job is intact (see
+// TestADeclarationWithNoRuleIsStillNotIssued).
+func TestAGuardWobbleDoesNotStripCoverageOfADeclaredName(t *testing.T) {
 	const served = "served.example.com"
 	const unserved = "unserved.example.com"
 
@@ -1589,41 +1613,84 @@ func TestStillDeclaredNameIsNotReportedAsRemoved(t *testing.T) {
 	if first.Certificates != 1 {
 		t.Fatalf("round 1 should cover both names, got %d certificates", first.Certificates)
 	}
+	if got := h.domains(t); len(got) != 2 {
+		t.Fatalf("round 1 domains = %v, want both names", got)
+	}
 
-	// Round 2: the rule for `unserved` disappears, but its declaration stays in DNS.
-	// Guard 1 must reject it -- once, with the guard's own reason.
+	// Round 2: the rule for `unserved` disappears from the guard, but its declaration stays.
 	h.rules.domains = []string{served}
 	second := h.run(t)
 
-	var rejections, carries int
-	var reasons []string
-	for _, d := range second.Decisions {
-		if d.Hostname != unserved {
-			continue
-		}
-		if d.Included {
-			carries++
-			reasons = append(reasons, "included: "+d.Reason)
-		} else {
-			rejections++
-			reasons = append(reasons, "rejected: "+d.Reason)
+	d, ok := decisionFor(second, unserved)
+	if !ok {
+		t.Fatalf("%s must still be reported; decisions: %+v", unserved, second.Decisions)
+	}
+	if !d.Included {
+		t.Errorf("%s is still declared, so it keeps its coverage; got excluded: %s", unserved, d.Reason)
+	}
+	if !strings.Contains(d.Reason, "no CLB rule serves this name") {
+		t.Errorf("the report must still say why the guard did not accept it, got %q", d.Reason)
+	}
+	if strings.Contains(d.Reason, "no longer declared") {
+		t.Errorf("a name that is declared right now was reported as no longer declared: %s", d.Reason)
+	}
+	// Exactly one verdict for this hostname: an exclusion plus a carry would show the same name
+	// twice with opposite answers.
+	var verdicts int
+	for _, x := range second.Decisions {
+		if x.Hostname == unserved {
+			verdicts++
 		}
 	}
-	for _, r := range reasons {
-		t.Logf("decision for %s -> %s", unserved, r)
+	if verdicts != 1 {
+		t.Errorf("%s must get exactly one decision, got %d: %+v", unserved, verdicts, second.Decisions)
 	}
 
-	if carries > 0 {
-		t.Errorf("%s is still declared but has no CLB rule; it must not be carried forward, "+
-			"because that keeps issuing a certificate for a name guard 1 rejected", unserved)
+	// The document is unchanged, which is the whole point: the same revision means no reissue.
+	if second.Revision != first.Revision {
+		t.Errorf("a guard wobble changed the revision (%s -> %s), so wecert reissues the certificate "+
+			"without the name -- and reissues again when the guard recovers",
+			first.Revision, second.Revision)
 	}
-	if rejections != 1 {
-		t.Errorf("%s must get exactly one decision (the guard's), got %d", unserved, rejections)
+	if got := h.domains(t); len(got) != 2 {
+		t.Errorf("the covered set must not shrink on a guard wobble, got %v", got)
 	}
-	for _, r := range reasons {
-		if strings.Contains(r, "no longer declared") {
-			t.Errorf("a name that is declared right now was reported as no longer declared: %s", r)
-		}
+
+	// Round 3: the rule comes back. Nothing changed, so nothing is issued again.
+	h.rules.domains = []string{served, unserved}
+	third := h.run(t)
+	if third.Revision != first.Revision {
+		t.Errorf("recovery changed the revision (%s -> %s); the guard's own recovery must not cost "+
+			"a second issuance", first.Revision, third.Revision)
+	}
+	if got := h.domains(t); len(got) != 2 {
+		t.Errorf("domains after recovery = %v, want both names", got)
+	}
+}
+
+// The guard's actual job -- "do not issue a name no rule serves" -- must survive the carry.
+//
+// A declaration that was never covered has no coverage to keep, so it is excluded as before: the
+// carry applies to names that are in the certificate, not to new ones.
+func TestADeclarationWithNoRuleIsStillNotIssued(t *testing.T) {
+	h := newHarness(t, Options{RequireRule: true})
+
+	h.decls.raw = []RawDeclaration{decl("new.example.com")}
+	h.rules.domains = []string{"other.example.com"}
+
+	rep := h.run(t)
+	d, ok := decisionFor(rep, "new.example.com")
+	if !ok {
+		t.Fatalf("the declaration must be reported; decisions: %+v", rep.Decisions)
+	}
+	if d.Included {
+		t.Errorf("a name that was never covered and that no CLB rule serves must not be issued, got %q", d.Reason)
+	}
+	// Nothing is covered, so the round refuses to write an empty document (an empty one is
+	// indistinguishable from a failed generation). That is the pre-existing behaviour and it is
+	// what "the guard still prevents new coverage" looks like from the outside.
+	if !rep.Frozen() {
+		t.Errorf("with no name covered the round must freeze rather than write an empty document, mode=%s", rep.Mode)
 	}
 }
 
@@ -1723,5 +1790,449 @@ func TestQuotaLedgerIsPrunedOnEveryRound(t *testing.T) {
 	if n := len(after.Changes); n != 0 {
 		t.Errorf("a change older than the budget window must be pruned even on a round that does "+
 			"not consult the budget, got %d entries", n)
+	}
+}
+
+// A declaration's profile/keyType value is rejected where it is written, so one typo cannot stop
+// every certificate from updating.
+//
+// The values used to be copied into the certificate verbatim and validated only inside
+// spec.WriteDocument at Commit: Run() reported "written", Commit then failed with `unknown profile
+// "tlsserver2"`, and neither the document nor the state file was written -- every later round failed
+// identically for EVERY certificate until a human edited DNS. This package's contract is that one
+// bad declaration is recorded as a rejection and skipped (TestOneBadDeclarationDoesNotFreezeEverything).
+func TestParseDeclarationRejectsUnknownProfileAndKeyType(t *testing.T) {
+	if _, err := ParseDeclaration("example.com", "_wecert.api.example.com", []string{"profile=tlsserver2"}); err == nil {
+		t.Error("an unknown profile must be refused where it is parsed, not at document-write time")
+	} else if !strings.Contains(err.Error(), "tlsserver2") {
+		t.Errorf("the error must name the offending value, got %q", err)
+	}
+	if _, err := ParseDeclaration("example.com", "_wecert.api.example.com", []string{"keytype=rsa-2048"}); err == nil {
+		t.Error("an unknown keytype must be refused at parse time too")
+	}
+
+	// The real values still parse, including the empty/absent case (the key simply not appearing).
+	for _, ok := range [][]string{
+		{"profile=tlsserver", "keytype=ecdsa-p256"},
+		{"keytype=rsa4096"},
+		{""},
+	} {
+		if _, err := ParseDeclaration("example.com", "_wecert.api.example.com", ok); err != nil {
+			t.Errorf("%v must parse: %v", ok, err)
+		}
+	}
+}
+
+// The report is a claim about what the round did, so it must be written last.
+//
+// It carries "mode": "written" and the revision, and it is the artifact a human reads to find out
+// what onboarding decided. Writing it before the document and the state file meant a failure in
+// between left a report announcing a revision that was never written -- and nothing in the report
+// said so. Written last, the file exists exactly when the round finished, which is a property an
+// operator can rely on without cross-checking two other files.
+func TestAFailedCommitWritesNoReport(t *testing.T) {
+	reportDir := t.TempDir()
+	docDir := t.TempDir()
+	reportPath := filepath.Join(reportDir, "report.json")
+
+	h := newHarness(t, Options{
+		DocumentPath: filepath.Join(docDir, "desired-state.yaml"),
+		StatePath:    filepath.Join(docDir, "onboard-state.json"),
+		ReportPath:   reportPath,
+	})
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	h.rules.domains = []string{"a.example.com"}
+
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if rep.Frozen() {
+		t.Fatalf("this round must not freeze: %v", rep.FreezeReasons)
+	}
+
+	// The desired-state document cannot be written, and the report is somewhere writable: the
+	// only thing that can keep the report off disk is the order.
+	if err := os.Chmod(docDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(docDir, 0o700) })
+
+	if err := h.ob.Commit(rep); err == nil {
+		t.Fatal("the document write must fail in an unwritable directory")
+	}
+	if _, err := os.Stat(reportPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a round that could not write revision %s must not leave a report claiming it did "+
+			"(stat: %v)", rep.Revision, err)
+	}
+
+	// And the report is still written when the round does complete: "never write it" would
+	// satisfy the check above.
+	if err := os.Chmod(docDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ob.Commit(rep); err != nil {
+		t.Fatalf("Commit failed once the document was writable again: %v", err)
+	}
+	if _, err := os.Stat(reportPath); err != nil {
+		t.Errorf("a completed round must leave its report behind: %v", err)
+	}
+}
+
+// A guard answer that is short of what the API reported must be its own signal.
+//
+// "The guard could not be read" and "the guard answered, but not about everything" both suppress
+// removals, and an operator has to be able to tell them apart: the first is weather to retry, the
+// second means the rule list itself is being truncated, and every name it did not mention was never
+// checked against anything. Treating a short answer as a complete one is what let a guard bug
+// become lost coverage; treating it as an ordinary error hides that the API is truncating.
+func TestATruncatedGuardAnswerIsReportedAndRemovesNothing(t *testing.T) {
+	// Grace period 0 and a high fuse threshold: the only thing standing between this round and a
+	// removal is the guard's answer.
+	h := newHarness(t, Options{DropThreshold: 0.9})
+
+	h.decls.raw = []RawDeclaration{decl("a.example.com"), decl("b.example.com")}
+	h.rules.domains = []string{"a.example.com", "b.example.com"}
+	h.run(t)
+
+	// b's declaration is gone, and the guard cannot be trusted this round: the API reported more
+	// rules than it returned.
+	h.decls.raw = []RawDeclaration{decl("a.example.com")}
+	h.rules.domains = []string{"a.example.com"}
+	h.rules.err = errIncompleteRuleList
+
+	rep := h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("a truncated guard must not freeze the round: %v", rep.FreezeReasons)
+	}
+	if !rep.GuardIncomplete {
+		t.Error("the report must say the guard answered INCOMPLETELY; without it, this is " +
+			"indistinguishable from a transient read failure that an operator would just retry")
+	}
+	if !rep.GuardUnavailable {
+		t.Error("an incomplete guard must also count as unavailable for the removal decisions")
+	}
+	if got := h.domains(t); len(got) != 2 {
+		t.Errorf("a name must not be removed on the strength of a rule list that is known to be "+
+			"short, got %v", got)
+	}
+	d, ok := decisionFor(rep, "b.example.com")
+	if !ok || !d.Included {
+		t.Errorf("b must be kept and reported as kept, got %+v", d)
+	}
+}
+
+// A carried declaration must keep its settings, not just its name.
+//
+// applyGrace keeps a still-declared name whose filter rejected it, but groupSettings skipped every
+// declaration the filters had not accepted -- so the certificate was rebuilt from the onboarding
+// defaults. A declaration saying `profile=tlsserver, deploy=0` came back as the default profile
+// with deployment ON: the revision changed, wecert reissued, and it began deploying a certificate
+// the declaration explicitly said not to deploy. That is the opposite of the promise the carry
+// makes ("the name keeps its coverage, nothing is reissued").
+func TestACarriedDeclarationKeepsItsSettings(t *testing.T) {
+	const name = "api.example.com"
+
+	h := newHarness(t, Options{RequireRule: true})
+	h.decls.raw = []RawDeclaration{decl(name, "profile=tlsserver", "deploy=0")}
+	h.rules.domains = []string{name}
+	first := h.run(t)
+
+	doc := h.document(t)
+	if len(doc.Certificates) != 1 {
+		t.Fatalf("expected one certificate, got %d", len(doc.Certificates))
+	}
+	c := doc.Certificates[0]
+	if c.Profile != config.ProfileTLSServer || c.Deploy.Enabled {
+		t.Fatalf("the declaration's own settings must reach the document first, got profile=%s deploy=%v",
+			c.Profile, c.Deploy.Enabled)
+	}
+
+	// The rule disappears; the declaration stays, so the name is carried.
+	h.rules.domains = nil
+	second := h.run(t)
+
+	doc = h.document(t)
+	if len(doc.Certificates) != 1 {
+		t.Fatalf("expected one certificate, got %d", len(doc.Certificates))
+	}
+	c = doc.Certificates[0]
+	if c.Profile != config.ProfileTLSServer {
+		t.Errorf("the carried certificate's profile flipped to %q: the declaration's settings were "+
+			"dropped, which changes the revision and reissues", c.Profile)
+	}
+	if c.Deploy.Enabled {
+		t.Errorf("deployment was turned ON for a declaration that says deploy=0: the filter changed " +
+			"what the declaration asked for")
+	}
+	if second.Revision != first.Revision {
+		t.Errorf("a guard wobble changed the revision (%s -> %s): the certificate is reissued even "+
+			"though nothing about the declaration changed", first.Revision, second.Revision)
+	}
+	if !containsAllDomains(h.domains(t), name) {
+		t.Errorf("the carried name must stay covered, got %v", h.domains(t))
+	}
+}
+
+// A group is capped by the profile it will actually be issued with.
+//
+// onboarding.maxNames is validated only as "not negative", and on its own it is legal for classic
+// (100). A declaration asking for tlsserver inside such a group produced a certificate with more
+// than 25 identifiers, which spec.WriteDocument then rejected -- on every round, for every
+// certificate, with no document, no state and no report, while Run still reported "written". The
+// cap has to come from the profile, and exceeding it has to be a reported decision (overLimit)
+// rather than an unwritable document.
+func TestAGroupIsCappedByTheProfileItWillUse(t *testing.T) {
+	h := newHarness(t, Options{RequireRule: true, MaxNames: 100, DropThreshold: 0.9})
+
+	names := make([]string, 0, 26)
+	h.decls.raw = append(h.decls.raw, decl("api.example.com", "profile=tlsserver"))
+	names = append(names, "api.example.com")
+	for i := range 25 {
+		host := "n" + itoa(i) + ".example.com"
+		h.decls.raw = append(h.decls.raw, decl(host))
+		names = append(names, host)
+	}
+	h.rules.domains = names
+
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	// The failure the fix removes: Commit rejecting a document Run called "written".
+	if err := h.ob.Commit(rep); err != nil {
+		t.Fatalf("Commit failed on a document the round reported as %s: %v. A cap that ignores the "+
+			"profile produces a document no writer accepts, so every round fails for every "+
+			"certificate", rep.Mode, err)
+	}
+
+	// And the reason is reported rather than silently dropped.
+	var explained bool
+	for _, d := range rep.Decisions {
+		if strings.Contains(d.Reason, "max is 25") || strings.Contains(d.Reason, "cannot be expressed") {
+			explained = true
+		}
+	}
+	for _, r := range rep.FreezeReasons {
+		if strings.Contains(r, "max is 25") {
+			explained = true
+		}
+	}
+	if !explained {
+		t.Errorf("the group exceeds the tlsserver cap, so the round must say so: decisions=%+v freeze=%v",
+			rep.Decisions, rep.FreezeReasons)
+	}
+}
+
+// containsAllDomains reports whether every wanted name is in got.
+func containsAllDomains(got []string, want ...string) bool {
+	for _, w := range want {
+		var found bool
+		for _, g := range got {
+			if g == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// A hostname that ends up included must not also be reported as excluded.
+//
+// The parse loop records an exclusion for an unparseable record, and that exclusion was never
+// cleared when another record for the SAME hostname parsed and was accepted -- which happens
+// whenever the same name is declared in a parent zone and in a delegated subzone, one of them
+// with a typo. The report is the artifact a human reads to find out what happened, and it said
+// both things at once; stillDeclaredReason could also quote the stale text for a name it carries.
+func TestAnIncludedHostnameIsNotAlsoReportedAsExcluded(t *testing.T) {
+	const host = "api.example.com"
+	h := newHarness(t, Options{RequireRule: true})
+
+	// One record for api.example.com is a typo; another (from the delegated subzone) is valid.
+	broken := RawDeclaration{Zone: "example.com", Record: DeclarationPrefix + host, Values: []string{"unknownkey=1"}}
+	good := RawDeclaration{Zone: "sub.example.com", Record: DeclarationPrefix + host, Values: []string{"v=wecert1"}}
+
+	// BOTH orders matter: which record the zone walk returns first is not something the report may
+	// depend on. The first version of this fix only cleared the exclusion when the valid record came
+	// second, so the other order still reported the name twice with opposite verdicts.
+	for _, order := range [][]RawDeclaration{{broken, good}, {good, broken}} {
+		h.decls.raw = order
+		h.rules.domains = []string{host}
+
+		rep := h.run(t)
+
+		var included, excluded int
+		for _, d := range rep.Decisions {
+			if d.Hostname != host {
+				continue
+			}
+			if d.Included {
+				included++
+			} else {
+				excluded++
+			}
+		}
+		// The label compares ZONES, not record strings: both records name the same record, so
+		// comparing Record made it print "broken-first=true" for either order.
+		if included != 1 {
+			t.Errorf("[order broken-first=%v] %s is declared by a valid record, so it must be included "+
+				"once, got %d: %+v", order[0].Zone == broken.Zone, host, included, rep.Decisions)
+		}
+		if excluded != 0 {
+			t.Errorf("[order broken-first=%v] %s must not be reported as excluded as well: the report "+
+				"would say two opposite things about one name: %+v",
+				order[0].Zone == broken.Zone, host, rep.Decisions)
+		}
+	}
+}
+
+// The wildcard note must not erase the reason a filter gave.
+//
+// A name that is covered by a declared wildcard AND was rejected by a filter this round (so it is
+// carried) used to end up with only "covered by the declared wildcard ...": the guard that is
+// dropping it disappeared from the report, which is the artifact an operator reads to find out why
+// something is not being issued.
+func TestAWildcardCoveredCarryKeepsItsFilterReason(t *testing.T) {
+	const apex = "example.com"
+	const api = "api.example.com"
+
+	h := newHarness(t, Options{RequireRule: true})
+
+	// Round 1: the wildcard and the concrete name are both declared and both served.
+	h.decls.raw = []RawDeclaration{decl(apex, "wildcard=1"), decl(api)}
+	h.rules.domains = []string{apex, api}
+	h.run(t)
+
+	// Round 2: the rule for api.example.com disappears, so guard 1 rejects that declaration --
+	// but *.example.com is still declared and served, so the name stays covered by it.
+	h.rules.domains = []string{apex}
+	rep := h.run(t)
+
+	d, ok := decisionFor(rep, api)
+	if !ok {
+		t.Fatalf("%s must still be reported: %+v", api, rep.Decisions)
+	}
+	if !d.Included {
+		t.Fatalf("%s is still covered by the declared wildcard: %+v", api, d)
+	}
+	if !strings.Contains(d.Reason, "no CLB rule serves this name") {
+		t.Errorf("the reason must still say a filter rejected it, got %q", d.Reason)
+	}
+	if !strings.Contains(d.Reason, "covered by the declared wildcard") {
+		t.Errorf("and it must still say the wildcard covers it, got %q", d.Reason)
+	}
+	if rep.CoveredByWildcard == 0 {
+		t.Error("the covered-by-wildcard count must include it")
+	}
+}
+
+// One hostname, one verdict -- whichever record the zone walk returns first, and whichever way the
+// records disagree.
+//
+// Two independent reviewers reproduced this family of holes. A conflict followed by a third record
+// appended a second exclusion with a different story; two typo'd records for one name in two zones
+// produced two or three identical exclusions; and a record written with a non-canonical spelling
+// produced an exclusion for the dotted name beside an inclusion for the clean one, because the
+// guard's key was not normalised the way ParseDeclaration normalises the declaration's Hostname.
+func TestOneVerdictPerHostname(t *testing.T) {
+	broken := RawDeclaration{Zone: "example.com", Record: DeclarationPrefix + "api.example.com", Values: []string{"unknownkey=1"}}
+	good := RawDeclaration{Zone: "sub.example.com", Record: DeclarationPrefix + "api.example.com", Values: []string{"v=wecert1"}}
+	// Same name, one trailing dot too many, and a key nothing knows: unparseable, and spelled
+	// differently from the declaration that does parse.
+	dotted := RawDeclaration{Zone: "example.com", Record: DeclarationPrefix + "api.example.com..", Values: []string{"unknownkey=1"}}
+	conflictA := RawDeclaration{Zone: "example.com", Record: DeclarationPrefix + "fight.example.com", Values: []string{"profile=classic"}}
+	conflictB := RawDeclaration{Zone: "sub.example.com", Record: DeclarationPrefix + "fight.example.com", Values: []string{"profile=tlsserver"}}
+	conflictC := RawDeclaration{Zone: "deep.example.com", Record: DeclarationPrefix + "fight.example.com", Values: []string{"profile=classic"}}
+
+	cases := []struct {
+		name     string
+		raw      []RawDeclaration
+		host     string
+		included bool
+	}{
+		{"a conflict and then a third record", []RawDeclaration{conflictA, conflictB, conflictC}, "fight.example.com", false},
+		{"two broken records for one name", []RawDeclaration{broken, good, broken}, "api.example.com", true},
+		// Nothing declares the name validly, so every one of these is an exclusion -- and they must
+		// still collapse into a single verdict, or the report lists the same typo two or three times.
+		{"only broken records for one name", []RawDeclaration{broken, {Zone: "sub.example.com", Record: broken.Record, Values: broken.Values}}, "api.example.com", false},
+		{"three broken records for one name", []RawDeclaration{broken, {Zone: "sub.example.com", Record: broken.Record, Values: broken.Values}, {Zone: "deep.example.com", Record: broken.Record, Values: broken.Values}}, "api.example.com", false},
+		{"the broken record second", []RawDeclaration{good, broken}, "api.example.com", true},
+		{"the broken record first", []RawDeclaration{broken, good}, "api.example.com", true},
+		{"a non-canonical spelling of a declared name", []RawDeclaration{dotted, good}, "api.example.com", true},
+		{"the non-canonical spelling first", []RawDeclaration{good, dotted}, "api.example.com", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Options{})
+			h.decls.raw = tc.raw
+			h.rules.domains = []string{tc.host}
+
+			rep := h.run(t)
+
+			var forHost []spec.Decision
+			for _, d := range rep.Decisions {
+				if d.Hostname == tc.host || strings.TrimSuffix(d.Hostname, ".") == tc.host {
+					forHost = append(forHost, d)
+				}
+			}
+			if len(forHost) != 1 {
+				t.Fatalf("one hostname, one verdict: got %d entries for %s in %+v",
+					len(forHost), tc.host, rep.Decisions)
+			}
+			if forHost[0].Included != tc.included {
+				t.Errorf("included=%v, want %v: %+v", forHost[0].Included, tc.included, forHost[0])
+			}
+			if forHost[0].Hostname != tc.host {
+				t.Errorf("the verdict must carry the canonical name %q, got %q (a dotted or padded "+
+					"spelling is a different string in the report, not a different name)",
+					tc.host, forHost[0].Hostname)
+			}
+		})
+	}
+}
+
+// A record that is ignored because the name is declared elsewhere still leaves a trace.
+//
+// The report cannot carry it without contradicting the declaration that won, so the journal is the
+// only place left. Without this warning a typo'd `wildcard=1` disappears silently, and the operator
+// sees a certificate that does not cover the subdomain they thought they had declared.
+func TestAnIgnoredBrokenRecordIsNamedInTheJournal(t *testing.T) {
+	h := newHarness(t, Options{})
+	h.decls.raw = []RawDeclaration{
+		decl("api.example.com"),
+		{Zone: "sub.example.com", Record: DeclarationPrefix + "api.example.com", Values: []string{"wildcard=maybe"}},
+	}
+	h.rules.domains = []string{"api.example.com"}
+
+	rep := h.run(t)
+
+	if got := h.domains(t); len(got) != 1 || got[0] != "api.example.com" {
+		t.Fatalf("the usable declaration must win, got %v", got)
+	}
+	var forHost []spec.Decision
+	for _, d := range rep.Decisions {
+		if d.Hostname == "api.example.com" {
+			forHost = append(forHost, d)
+		}
+	}
+	if len(forHost) != 1 || !forHost[0].Included {
+		t.Fatalf("one verdict for the name, and it is the inclusion: %+v", rep.Decisions)
+	}
+
+	logs := h.logs.String()
+	if !strings.Contains(logs, "could not be parsed and was ignored") {
+		t.Errorf("the ignored record must be named in the journal, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, "wildcard") || !strings.Contains(logs, "maybe") {
+		t.Errorf("the warning has to carry what was wrong with the record -- the key and the value "+
+			"that was refused -- got:\n%s", logs)
+	}
+	if !strings.Contains(logs, "sub.example.com") {
+		t.Errorf("the warning has to say which zone the ignored record came from, got:\n%s", logs)
 	}
 }

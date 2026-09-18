@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -55,7 +56,10 @@ func runRevoke(configPath, statePathOverride, certName, reasonName string, assum
 	// The daemon holds the state lock, and "cannot revoke because the daemon is running" is the
 	// wrong answer for a security action. The unlocked open is the same one -dry-run uses: this
 	// path reads the account key and writes one row, and initiates no issuance.
-	store, err := state.OpenUnlocked(cfg.StatePath)
+	// OpenForTool, not OpenUnlocked: the daemon usually holds the lock (this is the command an
+	// operator runs while it is up), but if it does not, taking the lock means a schema that is
+	// behind gets migrated instead of the revocation failing.
+	store, err := state.OpenForTool(cfg.StatePath)
 	if err != nil {
 		return fmt.Errorf("open the state store: %w", err)
 	}
@@ -74,10 +78,17 @@ func runRevoke(configPath, statePathOverride, certName, reasonName string, assum
 	// it obvious that this path cannot issue or deploy anything.
 	m := acme.NewManager(store, acme.NewAPI(core), nil, nil, log)
 	if err := m.RequestRevocation(context.Background(), certName, reason); err != nil {
-		// The request is recorded regardless, so this is reported as "not yet", not "failed".
 		fmt.Fprintf(os.Stderr, "\nNOT YET REVOKED: %v\n", err)
-		fmt.Fprintf(os.Stderr, "The request is recorded in %s and will be retried on every pass.\n",
-			cfg.StatePath)
+		// "It is recorded and will be retried" is only true when it reached the store. Saying it
+		// unconditionally told an operator acting on a key compromise that the revocation was
+		// queued while wecert_revocation_pending stayed 0 and nothing would ever retry it.
+		if errors.Is(err, acme.ErrRevocationNotRecorded) {
+			fmt.Fprintf(os.Stderr, "Nothing was recorded, so nothing will retry this on its own: fix the "+
+				"reason above and run the command again.\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "The request is recorded in %s and will be retried on every pass.\n",
+				cfg.StatePath)
+		}
 		return err
 	}
 

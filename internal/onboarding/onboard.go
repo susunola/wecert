@@ -28,11 +28,11 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/susunola/wecert/internal/atomicfile"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/spec"
@@ -209,8 +209,21 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 	if opts.Profile == "" {
 		opts.Profile = config.ProfileClassic
 	}
+	if !config.ValidProfile(opts.Profile) {
+		// A CLI -profile/-keytype flag lands in Options directly, bypassing the validation the
+		// config file and the declaration parser both apply. A typo then produced a round that
+		// reported mode="written" with a certificate count while Commit failed and nothing reached
+		// the document -- the same "written but nothing on disk" shape the config path already
+		// refuses.
+		return nil, fmt.Errorf("onboarding: unknown profile %q (want %s/%s/%s)",
+			opts.Profile, config.ProfileClassic, config.ProfileTLSServer, config.ProfileShortLived)
+	}
 	if opts.KeyType == "" {
 		opts.KeyType = config.KeyTypeECDSAP256
+	}
+	if !config.ValidKeyType(opts.KeyType) {
+		return nil, fmt.Errorf("onboarding: unknown keyType %q (want %s/%s)",
+			opts.KeyType, config.KeyTypeECDSAP256, config.KeyTypeRSA2048)
 	}
 	if opts.MaxNames <= 0 {
 		opts.MaxNames = 25 // Aligned with tlsserver so a future profile switch needs no redesign.
@@ -283,6 +296,12 @@ type Report struct {
 	// GuardUnavailable means the CLB guard is unavailable this round. No deletion
 	// decisions are made this round.
 	GuardUnavailable bool `json:"guardUnavailable,omitempty"`
+
+	// GuardIncomplete means the guard ANSWERED, but short of what the API said existed. It is
+	// reported apart from GuardUnavailable on purpose: both suppress removals, but this one is
+	// not weather to retry -- it means the rule list itself is being truncated, and the names it
+	// did not mention were never checked against anything.
+	GuardIncomplete bool `json:"guardIncomplete,omitempty"`
 
 	Declared          int `json:"declared"`
 	Included          int `json:"included"`
@@ -373,22 +392,17 @@ func (o *Onboarder) Run(ctx context.Context) (*Report, error) {
 	return r.rep, nil
 }
 
-// Commit persists: the desired-state document, the decision report, the onboarding
-// state.
+// Commit persists: the desired-state document, the onboarding state, the decision
+// report.
 //
 // When frozen it writes only the report -- the report is exactly what tells a human
 // why nothing moved this round.
 func (o *Onboarder) Commit(rep *Report) error {
-	if o.opts.ReportPath != "" {
-		if err := writeJSONAtomic(o.opts.ReportPath, rep); err != nil {
-			return err
-		}
-	}
 	if rep.Frozen() {
 		// When frozen no state is touched: AbsentSince would advance, but this round
 		// we do not know whether the names still exist; advancing it shortens the
 		// grace period on noise.
-		return nil
+		return o.writeReport(rep)
 	}
 
 	// The document goes first, the state second. A failure between the two leaves
@@ -406,7 +420,21 @@ func (o *Onboarder) Commit(rep *Report) error {
 			return err
 		}
 	}
-	return nil
+
+	// The report is written LAST, and the order is the contract: it is the human-readable
+	// claim about what this round did ("mode": "written", with a revision), so writing it
+	// before the files it describes leaves a report announcing a revision that was never
+	// written whenever a write fails in between -- and the operator reading the report has no
+	// way to see that. Written last, the report exists exactly when the round completed.
+	return o.writeReport(rep)
+}
+
+// writeReport persists the decision report, when a path is configured.
+func (o *Onboarder) writeReport(rep *Report) error {
+	if o.opts.ReportPath == "" {
+		return nil
+	}
+	return writeJSONAtomic(o.opts.ReportPath, rep)
 }
 
 // run carries the intermediate state of one evaluation round.
@@ -585,6 +613,18 @@ func (r *run) loadRules(ctx context.Context) {
 	}
 
 	domains, err := r.o.src.Rules.ListRuleDomains(ctx)
+	if errors.Is(err, errIncompleteRuleList) {
+		// Answering with the rules that did arrive would be read as "every other name has no
+		// rule", and that is the shape that removes coverage of a name that is still served.
+		r.guardUnavailable = true
+		r.rep.GuardUnavailable = true
+		r.rep.GuardIncomplete = true
+		r.o.log.Warn("the CLB rule list came back incomplete, so this round treats the guard as "+
+			"unavailable: no name will be removed, and additions are not checked against a list "+
+			"that is known to be short",
+			"err", err)
+		return
+	}
 	if err != nil {
 		// A broken guard is not "all rules are gone".
 		//
@@ -615,9 +655,11 @@ func (r *run) loadRules(ctx context.Context) {
 
 // parse turns raw TXT records into declarations.
 //
-// Unparseable records do not enter the desired state, but they do leave a decision
-// entry: silently dropping a declaration leaves a human doubting their sanity in
-// front of the DNS console.
+// Unparseable records do not enter the desired state, and the first one for a hostname leaves a
+// decision entry: silently dropping a declaration leaves a human doubting their sanity in front of
+// the DNS console. The exception is a record whose hostname already has a usable declaration --
+// the report carries one verdict per name, so that record is named in the journal instead (see the
+// guard in the loop below).
 func (r *run) parse(raw []RawDeclaration) {
 	r.reasons = map[string]string{}
 	byHost := map[string]*Declaration{}
@@ -629,16 +671,30 @@ func (r *run) parse(raw []RawDeclaration) {
 	for _, rec := range raw {
 		d, err := ParseDeclaration(rec.Zone, rec.Record, rec.Values)
 		if err != nil {
-			r.reject(hostnameFromRecord(rec.Record), fmt.Sprintf("unparseable declaration: %v", err))
+			// Do not report a hostname as excluded when another record already gave it a usable
+			// declaration. The mirror of this rule is the unreject below: a name that ends up
+			// included must carry exactly one verdict, and which record the zone walk happened to
+			// return first is not something the report should depend on.
+			host := hostnameFromRecord(rec.Record)
+			if _, usable := byHost[host]; usable {
+				// Not silent, though: the decision list is the artifact an operator reads, and it
+				// cannot carry this record without contradicting the declaration that won. The
+				// journal is where "one of your records is broken and was ignored" has to show up,
+				// or a typo'd wildcard=1 vanishes without a trace.
+				r.o.log.Warn("a declaration record could not be parsed and was ignored because the same "+
+					"name is declared by a record that does parse",
+					"record", rec.Record, "zone", rec.Zone, "hostname", host, "err", err)
+				continue
+			}
+			r.reject(host, fmt.Sprintf("unparseable declaration: %v", err))
 			continue
 		}
 		if rejected[d.Hostname] {
 			// Once two records for one hostname disagreed, the hostname is poisoned
 			// for the round: accepting a third record would let whoever writes last
-			// silently win the conflict.
-			r.reject(d.Hostname, fmt.Sprintf(
-				"conflicting declarations for the same name: %s repeats a hostname already rejected for conflicting declarations",
-				d.Record))
+			// silently win the conflict. The exclusion is already recorded (the conflict is the
+			// cause, and reject keeps a name's first reason), so there is nothing to add here --
+			// only this record to refuse.
 			continue
 		}
 		if prev, dup := byHost[d.Hostname]; dup {
@@ -647,9 +703,13 @@ func (r *run) parse(raw []RawDeclaration) {
 			// and guessing which one is right would be wrong either way.
 			if prev.Wildcard != d.Wildcard || prev.Profile != d.Profile ||
 				prev.KeyType != d.KeyType || !sameBoolPtr(prev.Deploy, d.Deploy) {
+				// Zones are in the message because the record name usually is not enough to tell
+				// the two apart: the same name declared in a parent zone and in a delegated
+				// subzone has the same record string, and the message used to print it twice.
 				r.reject(d.Hostname, fmt.Sprintf(
-					"conflicting declarations for the same name (%s and %s): they disagree on wildcard/profile/keytype/deploy",
-					byHostRecord[d.Hostname], d.Record))
+					"conflicting declarations for the same name (%s in zone %s and %s in zone %s): "+
+						"they disagree on wildcard/profile/keytype/deploy",
+					byHostRecord[d.Hostname], prev.Zone, d.Record, d.Zone))
 				rejected[d.Hostname] = true
 				delete(byHost, d.Hostname)
 				delete(byHostRecord, d.Hostname)
@@ -657,6 +717,13 @@ func (r *run) parse(raw []RawDeclaration) {
 			}
 			continue
 		}
+		// This record parsed and survived the conflict checks, so the hostname has a usable
+		// declaration. Any exclusion recorded for it earlier in this loop is stale: the usual
+		// case is a typo'd record in one zone and a valid one for the same name in another
+		// (a parent zone and a delegated subzone), and leaving the exclusion in place showed the
+		// same hostname twice in the report -- once as excluded and once as included -- while
+		// stillDeclaredReason could quote the stale text for a name it carries.
+		r.unreject(d.Hostname)
 		byHost[d.Hostname] = d
 		byHostRecord[d.Hostname] = d.Record
 	}
@@ -680,12 +747,35 @@ func (r *run) parse(raw []RawDeclaration) {
 }
 
 // reject records a "this name was excluded" decision.
+//
+// One verdict per hostname: a name that is already excluded keeps the reason it was excluded for
+// first, which is the cause. A third record for a name a conflict already poisoned, or a second
+// rejection from a later stage, used to append another exclusion -- the report then listed the same
+// hostname two or three times with different stories, in the artifact a human reads to find out
+// what happened. The opposite transition (a name that ends up included) is unreject's job, and
+// include calls it.
 func (r *run) reject(hostname, reason string) {
+	for _, d := range r.rep.Decisions {
+		if d.Hostname == hostname && !d.Included {
+			return
+		}
+	}
 	r.rep.Decisions = append(r.rep.Decisions, spec.Decision{
 		Hostname: hostname,
 		Included: false,
 		Reason:   reason,
 	})
+}
+
+// include records a "this name is covered" decision.
+//
+// It drops any exclusion recorded for the name first, so the report cannot carry two opposite
+// verdicts for one hostname whichever order the stages ran in. unreject is deliberately separate:
+// the carry path needs to drop the exclusion and *then* decide the reason, and calling include
+// there would add a second inclusion.
+func (r *run) include(d spec.Decision) {
+	r.unreject(d.Hostname)
+	r.rep.Decisions = append(r.rep.Decisions, d)
 }
 
 // hostnameFromRecord does its best to extract the recognizable name from a record.
@@ -697,9 +787,20 @@ func (r *run) reject(hostname, reason string) {
 func hostnameFromRecord(record string) string {
 	full := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(record)), ".")
 	if !strings.HasPrefix(full, DeclarationPrefix) {
-		return record
+		return full
 	}
-	return strings.TrimPrefix(full, DeclarationPrefix)
+	// Normalise the way ParseDeclaration does, so that the name this reports is the same string
+	// the declaration carries. Trimming one trailing dot and skipping group.Normalize meant a
+	// record written "_wecert.api.example.com.." (or with stray whitespace) produced an exclusion
+	// for "api.example.com." beside an inclusion for "api.example.com" -- one DNS name, two
+	// verdicts, two spellings.
+	host, err := group.Normalize(strings.TrimPrefix(full, DeclarationPrefix))
+	if err != nil {
+		// Not a name anything could be declared under, so there is nothing to match; the label
+		// only has to be recognisable.
+		return strings.TrimPrefix(full, DeclarationPrefix)
+	}
+	return host
 }
 
 // fuse is §5.2: the abrupt desired-state change fuse.
@@ -911,20 +1012,24 @@ func (r *run) applyGrace() {
 	sort.Strings(absent)
 
 	// A name covered last round but not eligible now is only "absent" in the sense that it
-	// left the certificate. It has NOT necessarily stopped being declared: guard 1 rejects a
-	// declaration whose name no CLB rule serves, and a declaration that failed the conflict
-	// check never reaches the eligible set either. Treating those as removed produced two
-	// lies at once:
+	// left the accepted set. It has NOT necessarily stopped being declared: guard 1 rejects a
+	// declaration whose name no CLB rule serves, the allowlist rejects a declaration outside
+	// it, and a declaration that failed the conflict check never reaches the eligible set
+	// either. Treating those as removed was wrong twice over:
 	//
 	//   - the report said "no longer declared, but only absent for 0s" about a name that is
 	//     declared right now, and
-	//   - because carry() puts the name back into eligible, the round then kept converging
-	//     on a name the guard had just rejected -- re-issuing a certificate for a name with
-	//     no rule, which is precisely what guard 1 exists to prevent.
+	//   - dropping it from the document changes the revision, so the certificate is reissued
+	//     without the name -- and when the filter recovers (a rule flaps back, a region becomes
+	//     visible again) the revision changes back and the name is issued all over again. One
+	//     wobble in a network-read guard therefore cost two issuances AND two rounds without
+	//     coverage of a name that never stopped being declared.
 	//
-	// So the grace period applies only to names that genuinely stopped being declared. A
-	// still-declared name that a guard filtered out is reported once, by that guard, with the
-	// real reason.
+	// So the rule is: a DECLARATION keeps a name covered. A filter that does not accept it --
+	// a guard read, or an allowlist a human narrowed -- prevents new coverage and is reported
+	// with its own reason, but it never removes coverage that exists. Removing coverage is done
+	// by removing the declaration, which then goes through the grace period and the reference
+	// check below like any other removal (or with -force, for an operator who wants it now).
 	declaredNow := r.declaredNameSet()
 	stillDeclared := make([]string, 0)
 	genuinelyAbsent := make([]string, 0, len(absent))
@@ -938,12 +1043,18 @@ func (r *run) applyGrace() {
 	absent = genuinelyAbsent
 
 	for _, n := range stillDeclared {
-		// Deliberately not carried and deliberately not marked absent: the name is still
-		// here, it just did not pass a guard. MarkAbsent would start a grace clock for a
-		// name that never left.
+		// MarkPresent because the name is here right now: a stale absence marker from an
+		// earlier round must not shorten the grace period if the declaration is later removed.
+		// MarkAbsent would start a grace clock for a name that never left.
 		r.st.MarkPresent(n)
-		r.o.log.Debug("a declared name did not reach the certificate this round; the guard that "+
-			"filtered it already reported the reason", "hostname", n)
+
+		// One verdict per hostname in the report: the filter's exclusion is replaced by the
+		// carry, with the filter's own words explaining why it was not accepted on its merits.
+		reason := r.stillDeclaredReason(n)
+		r.unreject(n)
+		r.carry(n, reason)
+		r.o.log.Info("a declared name did not pass a filter this round; keeping its coverage",
+			"hostname", n, "reason", reason)
 	}
 
 	for _, n := range absent {
@@ -1030,6 +1141,40 @@ func (r *run) carry(name, reason string) {
 	r.rep.CarriedForward++
 }
 
+// stillDeclaredReason explains why a still-declared name was not accepted this round.
+//
+// The wording comes from the decision the filter already recorded for it -- guard 1 and the
+// allowlist each reject with their own reason -- so the report does not grow a second vocabulary
+// for the same fact. A name with no recorded decision (a conflict, or a wildcard whose declaration
+// was rejected under its apex name) falls back to a sentence that says what is known: it is
+// declared, it did not pass, and it keeps what it has.
+func (r *run) stillDeclaredReason(name string) string {
+	for _, d := range r.rep.Decisions {
+		if d.Hostname == name && !d.Included {
+			return fmt.Sprintf("%s; the declaration is still there, so the name keeps its coverage "+
+				"(removing coverage means removing the declaration)", d.Reason)
+		}
+	}
+	return "declared, but it did not pass a filter this round; keeping its coverage " +
+		"(removing coverage means removing the declaration)"
+}
+
+// unreject drops the exclusion decision recorded for a hostname this round carries anyway.
+//
+// The report carries ONE verdict per hostname, and the verdict for a name that keeps its coverage
+// is "included". Leaving the earlier exclusion in place showed the same name twice with opposite
+// answers, in the artifact a human reads to find out what happened.
+func (r *run) unreject(hostname string) {
+	kept := r.rep.Decisions[:0]
+	for _, d := range r.rep.Decisions {
+		if d.Hostname == hostname && !d.Included {
+			continue
+		}
+		kept = append(kept, d)
+	}
+	r.rep.Decisions = kept
+}
+
 // referenced reports whether a name is still referenced by some CLB rule.
 //
 // "Cannot tell" counts as referenced: the conservative direction is to keep, not
@@ -1087,7 +1232,22 @@ func (r *run) build() {
 	}
 
 	for _, g := range groups {
-		cov, err := g.Cover(r.o.opts.MaxNames)
+		// The settings come first, because they decide the SAN cap.
+		//
+		// Cover used the configured default cap alone, so a group whose declarations ask for a
+		// shorter profile (tlsserver / shortlived allow 25 identifiers) was split by the default
+		// -- legal at 100 for classic -- and the resulting document was then rejected by
+		// spec.WriteDocument on EVERY round for EVERY certificate: no document, no state, no
+		// report, while Run still reported mode "written". Capping by the profile the group will
+		// actually use routes that case through overLimit instead, which keeps the previous
+		// revision for that certificate and says why.
+		profile, keyType, deploy, err := r.groupSettings(g)
+		if err != nil {
+			r.overSettingsConflict(g, err)
+			continue
+		}
+
+		cov, err := g.Cover(groupNameCap(r.o.opts.MaxNames, profile))
 		if err != nil {
 			if errors.Is(err, group.ErrTooManyNames) {
 				r.overLimit(g, err)
@@ -1095,12 +1255,6 @@ func (r *run) build() {
 			}
 			r.freeze(fmt.Sprintf("certificate %q: %v", g.Name, err))
 			return
-		}
-
-		profile, keyType, deploy, err := r.groupSettings(g)
-		if err != nil {
-			r.overSettingsConflict(g, err)
-			continue
 		}
 
 		r.certs = append(r.certs, config.Certificate{
@@ -1114,7 +1268,17 @@ func (r *run) build() {
 		for _, n := range append(append([]string(nil), g.Names...), g.Wildcards...) {
 			reason := r.reasons[n]
 			if coverer, ok := cov.Covered[n]; ok {
-				reason = fmt.Sprintf("covered by the declared wildcard %s, so it costs no extra issuance", coverer)
+				// The wildcard note is ADDED to whatever reason the name already carries, not
+				// written over it. Overwriting it hid the fact that a filter rejected this name
+				// (the carried-by-declaration case): the report then said only "covered by the
+				// wildcard", so the guard that is dropping it was invisible in the one artifact
+				// an operator reads.
+				note := fmt.Sprintf("covered by the declared wildcard %s, so it costs no extra issuance", coverer)
+				if reason == "" {
+					reason = note
+				} else {
+					reason += "; " + note
+				}
 				r.rep.CoveredByWildcard++
 			} else if reason == "" {
 				reason = "declared via a " + DeclarationPrefix + " TXT record"
@@ -1122,7 +1286,7 @@ func (r *run) build() {
 					reason += " and served by a CLB rule"
 				}
 			}
-			r.rep.Decisions = append(r.rep.Decisions, spec.Decision{
+			r.include(spec.Decision{
 				Hostname:    n,
 				Included:    true,
 				Reason:      reason,
@@ -1144,7 +1308,7 @@ func (r *run) overLimit(g group.Group, cause error) {
 	if prev := r.previousCert(g.Name); prev != nil {
 		r.certs = append(r.certs, *prev)
 		for _, n := range all {
-			r.rep.Decisions = append(r.rep.Decisions, spec.Decision{
+			r.include(spec.Decision{
 				Hostname:    n,
 				Included:    true,
 				Reason:      fmt.Sprintf("kept at the previous revision: %v", cause),
@@ -1172,6 +1336,35 @@ func (r *run) previousCert(name string) *config.Certificate {
 	return nil
 }
 
+// groupNameCap is the SAN cap a group may use: the smaller of the configured onboarding cap and
+// the cap of the profile the group will actually be issued with.
+func groupNameCap(configured int, profile string) int {
+	cap := configured
+	if pm := config.ProfileMaxNames(profile); pm > 0 && (cap <= 0 || pm < cap) {
+		cap = pm
+	}
+	return cap
+}
+
+// settingsStillApply reports whether a declaration a filter did not accept still contributes its
+// profile / keyType / deploy settings.
+//
+// It does when the names it contributes are still covered this round: applyGrace carries a
+// still-declared name whose filter rejected it, so the certificate keeps that name -- and it must
+// also keep the settings that declaration asked for. Dropping them would rebuild the certificate
+// from the onboarding defaults, which changes the document's revision, reissues the certificate,
+// and can even turn deployment ON for a declaration that said deploy=0: the opposite of "the name
+// keeps its coverage and nothing is reissued", and a second issuance on a guard wobble -- exactly
+// what the carry exists to avoid.
+func (r *run) settingsStillApply(d *Declaration) bool {
+	for _, n := range d.Names() {
+		if r.eligible[n] {
+			return true
+		}
+	}
+	return false
+}
+
 // groupSettings aggregates the metadata of the declarations in a group.
 //
 // Only declarations that survived the guards contribute: see run.accepted.
@@ -1180,9 +1373,9 @@ func (r *run) groupSettings(g group.Group) (profile, keyType string, deploy bool
 	var profileSet, keyTypeSet, deploySet bool
 
 	for _, d := range r.declarations {
-		if !r.accepted[d.Hostname] {
-			// Excluded this round (allowlist or guard 1). Its settings must not leak onto
-			// names it is not part of.
+		if !r.accepted[d.Hostname] && !r.settingsStillApply(d) {
+			// Excluded this round (allowlist or guard 1) and NOT still covered: its settings
+			// must not leak onto names it is not part of.
 			continue
 		}
 		if group.RegisteredDomain(d.Hostname) != g.Registered {
@@ -1217,7 +1410,7 @@ func (r *run) overSettingsConflict(g group.Group, cause error) {
 	if prev := r.previousCert(g.Name); prev != nil {
 		r.certs = append(r.certs, *prev)
 		for _, n := range append(append([]string(nil), g.Names...), g.Wildcards...) {
-			r.rep.Decisions = append(r.rep.Decisions, spec.Decision{Hostname: n, Included: true, Certificate: g.Name, Reason: fmt.Sprintf("kept at the previous revision: %v", cause)})
+			r.include(spec.Decision{Hostname: n, Included: true, Certificate: g.Name, Reason: fmt.Sprintf("kept at the previous revision: %v", cause)})
 		}
 		r.rep.CarriedForward += len(g.Names) + len(g.Wildcards)
 		return
@@ -1400,38 +1593,17 @@ func sortDecisions(ds []spec.Decision) {
 	})
 }
 
+// writeJSONAtomic replaces the report in one step.
+//
+// The temp+fsync+rename protocol lives in internal/atomicfile: this writer, the desired-state
+// document and the onboarding state file each had their own copy, and the copies had drifted (this
+// one was missing the fsync, so a crash could leave a renamed, truncated report behind a round that
+// otherwise completed).
 func writeJSONAtomic(path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", path, err)
 	}
 	data = append(data, '\n')
-
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".onboard-report-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp file in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		if tmpName != "" {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", path, err)
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return fmt.Errorf("chmod %s: %w", path, err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("replace %s: %w", path, err)
-	}
-	tmpName = ""
-	return nil
+	return atomicfile.Write(path, data, 0o644)
 }

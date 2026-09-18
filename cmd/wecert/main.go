@@ -38,6 +38,13 @@ import (
 var version = "dev"
 
 func main() {
+	// The ACME User-Agent names the running build, so a CA-side log lines up with the binary that
+	// sent the request. It is set here, at process start, rather than inside run(): run() returns
+	// from the -revoke branch early, and having the call after that branch meant every revocation
+	// -- the request an operator makes about a compromised key -- identified itself as "wecert/dev".
+	// A global with no dependencies belongs at the top, where no branch can skip it.
+	acme.SetUserAgentVersion(version)
+
 	if err := run(); err != nil {
 		slog.Error("wecert exited with an error", "err", err)
 		os.Exit(1)
@@ -71,10 +78,6 @@ func run() error {
 
 	log := newLogger(*logLevel)
 
-	// Let the ACME User-Agent name the running build, so a CA-side log lines up with the
-	// binary that sent the request.
-	acme.SetUserAgentVersion(version)
-
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
@@ -93,7 +96,9 @@ func run() error {
 	// blindly editing the config. This path only reads the existing ACME account; no issuance.
 	openStore := state.Open
 	if *dryRun {
-		openStore = state.OpenUnlocked
+		// Prefers the lock and falls back when the daemon holds it: see state.OpenForTool. Opening
+		// unlocked unconditionally is what made `-dry-run` fail on a fresh installation.
+		openStore = state.OpenForTool
 	}
 	store, err := openStore(cfg.StatePath)
 	if err != nil {
@@ -178,7 +183,10 @@ func run() error {
 	var notifier reconcile.Notifier
 	if n := webhook.NewNotifier(cfg.Webhook.NotifyURL, cfg.Webhook.NotifySecret, log); n != nil {
 		notifier = n
-		log.Info("renewal results will be pushed out", "url", cfg.Webhook.NotifyURL,
+		// The target is logged redacted: a chat/CI notification URL carries its secret in the path
+		// (Slack, Feishu, DingTalk) or in the query, and the journal has a wider audience than the
+		// daemon's owner. See webhook.RedactNotifyURL.
+		log.Info("renewal results will be pushed out", "target", webhook.RedactNotifyURL(cfg.Webhook.NotifyURL),
 			"signed", cfg.Webhook.NotifySecret != "")
 	}
 
@@ -224,12 +232,18 @@ func run() error {
 	if backupDir == "" {
 		backupDir = filepath.Dir(cfg.StatePath)
 	}
-	if cfg.StateBackup.EnabledOr(dirIsWritable(backupDir)) {
+	// The switch and the directory are checked separately. Treating "enabled" as sufficient
+	// (EnabledOr returns the explicit setting whenever it is set) made the unwritable case fall
+	// into the running branch: the loop started, took a snapshot every interval, failed, and
+	// logged an ERROR each time -- while the branch written to say exactly that was unreachable,
+	// because its guard was the same condition the first branch had already consumed.
+	switch planStateBackups(cfg.StateBackup.Enabled, dirIsWritable(backupDir)) {
+	case backupsRun:
 		startStateBackups(ctx, store, cfg, log)
-	} else if cfg.StateBackup.Enabled != nil && *cfg.StateBackup.Enabled {
+	case backupsEnabledButUnwritable:
 		log.Error("periodic state database snapshots are ENABLED but the directory is not writable, "+
 			"so none will be taken", "dir", backupDir)
-	} else {
+	default:
 		log.Warn("periodic state database snapshots are DISABLED: losing state.db means a new ACME " +
 			"account and re-placed orders, and nothing here will be able to restore it")
 	}
@@ -245,19 +259,47 @@ func run() error {
 	}
 
 	if *once {
-		reconciler.RunOnce(ctx)
-		// The pass has finished, but the notifications it triggered are delivered on
-		// their own goroutines. Returning here would exit with them in flight and lose
-		// them -- including the "result":"error" one, which is the notification an
-		// operator most needs.
+		// RunDetailed, not a wrapper that drops the report: the one-shot unit is what a systemd
+		// timer runs, and "exited 0 with every certificate failing" is the failure mode this
+		// report exists to prevent -- the timer would report success while the fleet went
+		// unmanaged. A pass that
+		// attempted nothing and skipped everything counts as trouble too, because that is a
+		// desired state that resolved to nothing.
+		rep := reconciler.RunDetailed(ctx)
+		// That pass has finished, but a webhook-triggered one may be running: the listener is
+		// started before this branch, so -once can coexist with an accepted background pass. Both
+		// it and the notifications have to be waited for before the deferred store.Close() runs.
+		drainBackground(reconciler, log)
 		drainNotifier(notifier, log)
-		return nil
+		return onceExit(rep)
 	}
 
 	log.Info("entering daemon mode", "interval", *interval)
-	runDaemon(ctx, reconciler, *interval, log)
+	runDaemon(ctx, *interval, log, reconciler.RunDetailed)
+	// Wait for background passes and notifications before returning: the deferred store.Close()
+	// would otherwise close SQLite under a pass that is mid-renewal, losing the promotion or the
+	// resume anchor it was writing. See Reconciler.Drain.
+	drainBackground(reconciler, log)
 	drainNotifier(notifier, log)
 	return nil
+}
+
+// backgroundDrainTimeout bounds how long a shutdown waits for webhook-triggered passes.
+//
+// A pass can be inside a CA call that lego's context-free API cannot interrupt, and a stop signal
+// must not hang forever; the timeout is generous enough for the state writes that matter, and the
+// warning says plainly what a timeout means.
+const backgroundDrainTimeout = 30 * time.Second
+
+func drainBackground(reconciler *reconcile.Reconciler, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundDrainTimeout)
+	defer cancel()
+	if err := reconciler.Drain(ctx); err != nil {
+		log.Warn("a background pass did not finish before shutdown; the state store is about to be "+
+			"closed under it, so its last write may be lost (the next pass resumes from the order URL "+
+			"that is already on disk)",
+			"waited", backgroundDrainTimeout, "err", err)
+	}
 }
 
 // dirIsWritable reports whether a directory can be written to, creating it first if it does not
@@ -277,6 +319,53 @@ func dirIsWritable(dir string) bool {
 	_ = f.Close()
 	_ = os.Remove(name)
 	return true
+}
+
+// backupPlan is what the state-backup switch and the directory's writability together imply.
+type backupPlan int
+
+const (
+	backupsDisabled backupPlan = iota
+	backupsEnabledButUnwritable
+	backupsRun
+)
+
+// planStateBackups decides between running, refusing loudly, and warning.
+//
+// The two inputs are independent and that is the whole point: "enabled" says what the operator
+// asked for, "writable" says whether it can happen. Collapsing them (treating an explicit true as
+// sufficient) started the loop against an unwritable directory, where it failed and logged an
+// ERROR every interval -- noise that trains the reader to ignore the one line that means the
+// recovery posture is gone -- while the branch written to report exactly that was unreachable.
+func planStateBackups(enabled *bool, writable bool) backupPlan {
+	switch {
+	case enabled != nil && *enabled:
+		if writable {
+			return backupsRun
+		}
+		return backupsEnabledButUnwritable
+	case enabled != nil && !*enabled:
+		return backupsDisabled
+	case writable:
+		// Unset means "take them when the directory allows it", the documented default.
+		return backupsRun
+	default:
+		return backupsDisabled
+	}
+}
+
+// onceExit turns a one-shot pass's report into the process outcome.
+//
+// A systemd timer runs this with -once, so exiting 0 while every certificate failed reports
+// success for a fleet that went unmanaged. A pass that attempted nothing and skipped everything
+// counts as trouble too: it means the desired state resolved to nothing to do.
+func onceExit(rep reconcile.RunReport) error {
+	if !rep.Trouble() {
+		return nil
+	}
+	return fmt.Errorf("the pass did not converge: attempted=%d succeeded=%d failed=%d skipped=%d "+
+		"desiredStateUnreadable=%t", rep.Attempted, rep.Succeeded, rep.Failed, len(rep.Skipped),
+		rep.DesiredStateUnreadable)
 }
 
 // drainNotifier waits briefly for accepted notifications to be delivered.
@@ -350,7 +439,13 @@ func newProvider(cfg *config.Config, log *slog.Logger) (spec.Provider, error) {
 	return nil, fmt.Errorf("unknown desiredState.mode %q", cfg.DesiredState.Mode)
 }
 
-func runDaemon(ctx context.Context, r *reconcile.Reconciler, interval time.Duration, log *slog.Logger) {
+// runDaemon runs one pass after startup and then one per (jittered) interval.
+//
+// The pass is injected rather than reached through the Reconciler so the loop's own contract can
+// be tested: a pass that did not converge must NOT stop the daemon. That is the whole difference
+// between the daemon and the one-shot unit, and it is the kind of behaviour that is easy to lose
+// when the two paths are edited separately.
+func runDaemon(ctx context.Context, interval time.Duration, log *slog.Logger, pass func(context.Context) reconcile.RunReport) {
 	// Run one pass after startup, then loop on the interval; jitter avoids simultaneous knocking.
 	next := time.After(jitter(time.Second))
 	for {
@@ -362,8 +457,16 @@ func runDaemon(ctx context.Context, r *reconcile.Reconciler, interval time.Durat
 		}
 
 		start := time.Now()
-		r.RunOnce(ctx)
-		log.Info("reconcile pass finished", "duration", time.Since(start).Round(time.Millisecond))
+		// The daemon does not fail on a bad pass -- it keeps running and retries on the interval,
+		// which is the point of the daemon -- but it does say what the pass did. Without this the
+		// only signal was one line per failing certificate, and "a pass ran and converged nothing"
+		// looked the same as "a pass converged everything".
+		rep := pass(ctx)
+		log.Info("reconcile pass finished",
+			"duration", time.Since(start).Round(time.Millisecond),
+			"attempted", rep.Attempted, "succeeded", rep.Succeeded, "failed", rep.Failed,
+			"backoff", rep.Backoff, "skipped", len(rep.Skipped),
+			"trouble", rep.Trouble())
 
 		// Re-jitter every round: a fixed interval keeps all instances phase-locked.
 		next = time.After(jitter(interval))
@@ -390,6 +493,11 @@ func jitter(d time.Duration) time.Duration {
 // perfectly healthy while monitoring never hears another signal, and certificates slide
 // silently into expiry. That is precisely the failure this project exists to prevent,
 // and it should not manufacture one itself.
+//
+// The doc comment above belongs to startMetricsServer; the one below to startStateBackups. They
+// had run together when the pair was split out of run(), which left startStateBackups documented
+// by both and startMetricsServer by neither.
+//
 // startStateBackups snapshots the state database on an interval, in the background.
 //
 // It never fails the process: a snapshot that cannot be written is a degraded recovery
@@ -402,20 +510,7 @@ func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Conf
 		dir = filepath.Dir(cfg.StatePath)
 	}
 
-	snapshot := func() {
-		path, err := store.Snapshot(dir, cfg.StateBackup.Keep)
-		if err != nil {
-			// A partial failure still writes the file; say which, so a successful
-			// snapshot with a failed prune is not read as "no backup exists".
-			log.Error("state database snapshot failed", "dir", dir, "err", err)
-			if path != "" {
-				log.Info("a snapshot was written despite the error", "path", path)
-			}
-			return
-		}
-		log.Info("state database snapshotted", "path", path,
-			"interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
-	}
+	snapshot := func() { takeSnapshot(store, dir, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log) }
 
 	go func() {
 		// One immediately: waiting a whole interval means a fresh deployment has no
@@ -436,6 +531,41 @@ func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Conf
 
 	log.Info("periodic state database snapshots are on",
 		"dir", dir, "interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
+}
+
+// takeSnapshot writes one snapshot, unless the database holds nothing a snapshot could recover.
+//
+// The second half is the point. A copy of a freshly created database is not a recovery point, but
+// retention counts it as one -- and the case snapshots exist for is exactly the case that produces
+// an empty database: after state.db is lost, every restart wrote a snapshot of the empty
+// replacement and evicted a genuine backup, so three restarts with keep=3 destroyed all three real
+// snapshots before anyone looked at the directory. Rate buckets and failure counters do not count
+// as recoverable state: losing them costs rate-limit knowledge, not a certificate.
+func takeSnapshot(store *state.Store, dir string, keep int, interval time.Duration, log *slog.Logger) {
+	has, err := store.HasRecoverableState()
+	if err != nil {
+		log.Error("cannot tell whether the state database holds anything worth snapshotting", "err", err)
+		return
+	}
+	if !has {
+		log.Warn("skipping this snapshot: the state database holds no account, certificate, order "+
+			"or revocation request yet, so a copy of it is not a recovery point -- and retention "+
+			"would count it as one and evict a snapshot that is",
+			"dir", dir, "keep", keep)
+		return
+	}
+
+	path, err := store.Snapshot(dir, keep)
+	if err != nil {
+		// A partial failure still writes the file; say which, so a successful snapshot with a
+		// failed prune is not read as "no backup exists".
+		log.Error("state database snapshot failed", "dir", dir, "err", err)
+		if path != "" {
+			log.Info("a snapshot was written despite the error", "path", path)
+		}
+		return
+	}
+	log.Info("state database snapshotted", "path", path, "interval", interval, "keep", keep)
 }
 
 func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) error {

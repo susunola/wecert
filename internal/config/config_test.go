@@ -754,15 +754,14 @@ dns:
 	}
 }
 
-// Whether a *valid* lego config loads depends on the build tag, and this package cannot see the
-// tag: acme owns it and config must not import acme (that would be a cycle), so all this package
-// can observe is its own zero value for the flag. A test here therefore cannot tell "correctly
-// refused in a default build" from "wrongly refused in a -tags lego_dns build" -- an earlier
-// version of this test asserted only that the error mentioned lego_dns, which is true in both,
-// and so passed in a tagged binary that would have rejected a valid config.
-//
-// The contract is asserted in internal/acme/lego_build_config_test.go instead, where acme's init
-// has by construction run.
+// Whether a *valid* lego config loads depends on the build tag. This package used to be unable to
+// answer that -- the flag was set by internal/acme's init, and config must not import acme (that is
+// a cycle), so all config could observe was its own zero value. The flag now comes from this
+// package's own build-tagged file (lego_registry_tags.go), which is what makes a config-only binary
+// such as wecert-onboard agree with a full one: before that, a -tags lego_dns build of
+// wecert-onboard refused a valid config and told the operator to rebuild with the tag they had just
+// used. The contract is asserted in lego_registry_tags_test.go / lego_registry_notags_test.go here,
+// and end-to-end in internal/acme/lego_build_config_test.go.
 
 // A provider name that is not one of wecert's own must not fall through to a default: silently
 // issuing with dnspod credentials because someone wrote "cloudflare" is the kind of mistake that
@@ -849,5 +848,182 @@ func TestTencentListsAreNormalised(t *testing.T) {
 `)))
 	if err == nil || !strings.Contains(err.Error(), "empty entry") {
 		t.Errorf("a blank region must be rejected rather than sent to the cloud API, got %v", err)
+	}
+}
+
+// A credential in config.yaml is a credential in every backup and every scrollback. These tests
+// pin the three ways out of that: a file, a systemd credential, and the environment.
+func TestDNSLoginTokenCanComeFromAFileOrTheEnvironment(t *testing.T) {
+	const token = "12345,abcdef0123456789"
+
+	t.Run("from a file", func(t *testing.T) {
+		dir := t.TempDir()
+		secret := filepath.Join(dir, "dnspod.token")
+		if err := os.WriteFile(secret, []byte(token+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginTokenFile: "+secret+"\n", 1)
+		cfg, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`))
+		if err != nil {
+			t.Fatalf("a token read from a file must be accepted: %v", err)
+		}
+		if cfg.DNS.LoginToken != token {
+			t.Errorf("LoginToken = %q, want the file's contents with the newline trimmed", cfg.DNS.LoginToken)
+		}
+	})
+
+	t.Run("from a systemd credential path", func(t *testing.T) {
+		// The path is environment-expanded because CREDENTIALS_DIRECTORY only exists once systemd
+		// has started the unit -- a literal path cannot express it.
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "dnspod-token"), []byte(token), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("CREDENTIALS_DIRECTORY", dir)
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token\n", 1)
+		cfg, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`))
+		if err != nil {
+			t.Fatalf("a LoadCredential path must be accepted: %v", err)
+		}
+		if cfg.DNS.LoginToken != token {
+			t.Errorf("LoginToken = %q, want the credential's contents", cfg.DNS.LoginToken)
+		}
+	})
+
+	t.Run("from the environment", func(t *testing.T) {
+		t.Setenv(EnvDNSPodLoginToken, token)
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n", "", 1)
+		cfg, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`))
+		if err != nil {
+			t.Fatalf("an environment token must be accepted: %v", err)
+		}
+		if cfg.DNS.LoginToken != token {
+			t.Errorf("LoginToken = %q, want the environment value", cfg.DNS.LoginToken)
+		}
+	})
+
+	// Each of these is a mistake that would otherwise be discovered by the provider, after an order
+	// had already been placed.
+	t.Run("a typo'd path fails where the operator can fix it", func(t *testing.T) {
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginTokenFile: /nonexistent/dnspod.token\n", 1)
+		if _, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)); err == nil || !strings.Contains(err.Error(), "dnspod.token") {
+			t.Errorf("an unreadable secret file must be a config error naming the path, got %v", err)
+		}
+	})
+
+	t.Run("an empty file is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		empty := filepath.Join(dir, "empty.token")
+		if err := os.WriteFile(empty, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginTokenFile: "+empty+"\n", 1)
+		if _, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)); err == nil || !strings.Contains(err.Error(), "empty") {
+			t.Errorf("a blank credential must be refused here, not by the provider, got %v", err)
+		}
+	})
+
+	t.Run("setting both is ambiguous and refused", func(t *testing.T) {
+		body := strings.Replace(minimalPrefix, "  loginToken: token\n",
+			"  loginToken: token\n  loginTokenFile: /etc/wecert/dnspod.token\n", 1)
+		if _, err := Load(writeConfig(t, body+`certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)); err == nil || !strings.Contains(err.Error(), "both set") {
+			t.Errorf("two sources for one secret must be refused, got %v", err)
+		}
+	})
+}
+
+// probe.minValidFor must be satisfiable by the shortest profile in use.
+//
+// The check exists because the failure is so misleading: probe.Verify fails every probe whose
+// remaining validity is below the floor, the runner turns that into
+// wecert_certificate_probe_match = 0, and the critical alert that watches it blames the rebind or
+// SNI -- while the real cause is a threshold no certificate of that profile can ever meet (the
+// shipped example uses 168h, which a shortlived certificate's 160h can never satisfy).
+func TestProbeMinValidForMustBeSatisfiableByTheProfile(t *testing.T) {
+	const certs = `
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+    profile: shortlived
+`
+	// 168h cannot be satisfied by a 160h certificate: refused, naming the setting and the profile.
+	path := writeConfig(t, minimalPrefix+`
+probe:
+  minValidFor: 168h
+`+certs)
+	if _, err := Load(path); err == nil {
+		t.Error("168h cannot be satisfied by a 160h shortlived certificate, so this must be refused " +
+			"rather than pinning the probe metric at zero forever")
+	} else if !strings.Contains(err.Error(), "minValidFor") || !strings.Contains(err.Error(), "shortlived") {
+		t.Errorf("the error must name the setting and the profile, got %q", err)
+	}
+
+	// A satisfiable floor, and the default (unset), both load.
+	path = writeConfig(t, minimalPrefix+`
+probe:
+  minValidFor: 24h
+`+certs)
+	if _, err := Load(path); err != nil {
+		t.Errorf("24h is satisfiable by shortlived, got %v", err)
+	}
+	path = writeConfig(t, minimalPrefix+certs)
+	if _, err := Load(path); err != nil {
+		t.Errorf("an unset floor must stay accepted, got %v", err)
+	}
+}
+
+// An IP literal and a bare public suffix must be rejected where they are written.
+//
+// Neither can be issued, and neither fails cleanly on its own. lego promotes an IP literal to an
+// RFC 8738 "ip" identifier, the CA then offers only tls-alpn-01 and http-01 for it, and the DNS-01
+// selector finds no challenge -- so the WHOLE certificate (every SAN on it) stops issuing every
+// pass with an error about a challenge type rather than about the line in the document that caused
+// it. A bare TLD or public suffix has nothing above it to validate against, and a single label is
+// the "internal name" the CA/B baseline requirements forbid a public CA to sign.
+func TestIdentifiersThatCannotBeIssuedAreRejected(t *testing.T) {
+	cases := []struct {
+		domain string
+		why    string
+	}{
+		{"203.0.113.10", "IPv4 literal"},
+		{"*.198.51.100.7", "IPv4 literal behind a wildcard"},
+		{"com", "bare TLD"},
+		{"co.uk", "public suffix"},
+		{"localhost", "single label"},
+	}
+	for _, tc := range cases {
+		if err := ValidateDomain(tc.domain); err == nil {
+			t.Errorf("%s (%s) must be rejected when the document is written, not discovered when the "+
+				"whole certificate fails to issue", tc.domain, tc.why)
+		}
+	}
+
+	// The ordinary shapes must keep working, including a wildcard and a delegated subzone.
+	for _, ok := range []string{"example.com", "*.example.com", "a.b.example.co.uk", "xn--bcher-kva.example"} {
+		if err := ValidateDomain(ok); err != nil {
+			t.Errorf("%q is a normal identifier and must be accepted, got %v", ok, err)
+		}
 	}
 }

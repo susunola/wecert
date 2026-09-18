@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -53,9 +55,22 @@ func NewNotifier(url, secret string, log *slog.Logger) *Notifier {
 	return &Notifier{
 		url:    url,
 		secret: secret,
-		client: &http.Client{Timeout: 10 * time.Second},
-		log:    log,
-		sem:    make(chan struct{}, maxNotifyInFlight),
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			// Redirects are refused rather than followed.
+			//
+			// The Go default follows up to ten of them, and every hop is wrong for this request:
+			// a 301/302/303 turns the signed POST into a bodiless GET at the new location (the
+			// event is lost, and a receiver that answers the GET with 200 is reported as a
+			// delivery), and a 307/308 re-sends the body -- with the X-Wecert-Signature header --
+			// to whatever host the redirect names. Treating it as a failure tells the operator
+			// that the notify target moved, which is the actionable truth.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return errors.New("the notify target answered with a redirect; point webhook.notifyURL at its final location")
+			},
+		},
+		log: log,
+		sem: make(chan struct{}, maxNotifyInFlight),
 	}
 }
 
@@ -116,7 +131,8 @@ func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
 	}
 	resp, err := n.client.Do(req)
 	if err != nil {
-		n.log.Warn("failed to deliver the renewal notification", "cert", ev.Cert, "result", ev.Result, "err", err)
+		n.log.Warn("failed to deliver the renewal notification", "cert", ev.Cert, "result", ev.Result,
+			"target", RedactNotifyURL(n.url), "err", withoutURL(err))
 		return
 	}
 	defer resp.Body.Close()
@@ -158,4 +174,44 @@ func (n *Notifier) Drain(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// RedactNotifyURL keeps a notification target's scheme and host and withholds everything else.
+//
+// A chat or CI notification URL IS a credential: Slack, Feishu, DingTalk and friends put the
+// secret in the path, and a signed target can carry it in the query. The journal is shipped
+// somewhere with a wider audience than the daemon's owner, so the operator gets "where", not the
+// bearer token for "where". cmd/wecert logs this form at startup, and every failed delivery logs
+// it too.
+func RedactNotifyURL(raw string) string {
+	if raw == "" {
+		return "(no notification URL)"
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		// Unparseable: the host cannot be separated from the credential, so nothing is printed.
+		return "(notification URL withheld)"
+	}
+	out := u.Scheme + "://" + u.Host
+	if u.Path != "" && u.Path != "/" {
+		out += "/...(path withheld)"
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		out += "?..."
+	}
+	return out
+}
+
+// withoutURL returns err without the URL a *url.Error embeds in its message.
+//
+// "Post \"https://hooks.example/T00/B00/SECRET\": dial tcp: connection refused" is the shape
+// net/http produces, and it is logged on every failed delivery -- which for a wrong target is
+// every renewal. The transport's own reason is what an operator needs; the URL is already in the
+// redacted "target" field.
+func withoutURL(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.Err != nil {
+		return uerr.Err
+	}
+	return err
 }

@@ -96,6 +96,34 @@ func TestBackwardClockDoesNotCreateTokens(t *testing.T) {
 	}
 }
 
+// A spend taken while the clock is behind must not move the anchor back with it.
+//
+// Remaining refuses to credit an interval that has not passed, but Spend still stamped the
+// snapshot with `now`. s.Tokens had already been credited up to s.At, so anchoring at an earlier
+// instant made [now, s.At] creditable a second time: after the clock caught up, the same hour was
+// refilled twice and the estimate reported quota the CA would refuse. The anchor therefore only
+// moves forward, and an already-credited interval can never be credited again.
+func TestASpendOnABackwardClockDoesNotReAnchorTheSnapshot(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	l := NewOrdersPerAccount
+
+	// Spend 100, then spend again while the clock reads an hour earlier, then read at the
+	// original instant.
+	s := Spend(Snapshot{}, l, 100, now)
+	s = Spend(s, l, 1, now.Add(-time.Hour))
+
+	want := l.Capacity - 101
+	if got := Remaining(s, l, now); got != want {
+		t.Errorf("tokens after a spend taken on a backward clock = %v, want %v: the anchor moved back, "+
+			"so the interval between the two instants is credited twice and the estimate hands out "+
+			"quota the CA would refuse", got, want)
+	}
+	if s.At.Before(now) {
+		t.Errorf("the snapshot anchor moved backwards to %v (was %v): every later read re-credits the "+
+			"interval in between", s.At, now)
+	}
+}
+
 func TestParseRetryAfter(t *testing.T) {
 	cases := []struct {
 		name string
@@ -144,29 +172,6 @@ func TestParseRetryAfter(t *testing.T) {
 				t.Errorf("instant = %s, want %s", got, c.want)
 			}
 		})
-	}
-}
-
-func TestWorstCaseBlockedByTakesTheLatest(t *testing.T) {
-	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
-	deadlines := []Deadline{
-		{At: now.Add(time.Hour), Reason: "new-orders"},
-		{At: now.Add(6 * time.Hour), Reason: "certs-per-registered-domain"},
-		{At: now.Add(-time.Hour), Reason: "already passed"},
-		{},
-	}
-
-	got, ok := WorstCaseBlockedBy(deadlines, now)
-	if !ok {
-		t.Fatal("expected a deadline")
-	}
-	// The CA reports the furthest-resetting limit when several are exceeded; waiting for
-	// anything less means the next request fails again.
-	if !got.At.Equal(now.Add(6 * time.Hour)) {
-		t.Errorf("worst deadline = %s, want the 6h one", got.At)
-	}
-	if _, ok := WorstCaseBlockedBy(nil, now); ok {
-		t.Error("no deadlines must report not blocked")
 	}
 }
 
@@ -227,5 +232,114 @@ func TestZeroInstantIsNotADeadline(t *testing.T) {
 	// The documented format still parses.
 	if _, ok := ParseRetryAfter("retry after 2026-09-23 04:00:00 UTC"); !ok {
 		t.Error("the documented format must still parse")
+	}
+}
+
+// Spending while in debt must carry the debt, not forgive it.
+//
+// Spend subtracted from Remaining(), which clamps a debt to zero: a bucket at -5 that was spent
+// again landed at -1 instead of -6, so the next token arrived several refill intervals early. The
+// package's own contract is the opposite ("an over-spend is not silently forgiven"), and the
+// existing over-spend test only ever READS the bucket afterwards, so it never saw this.
+func TestSpendingWhileInDebtCarriesTheDebt(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	l := AuthzFailuresPerIdentifier // capacity 5, one token back every 12m
+
+	// Ten against a capacity of five: five spent, five of debt.
+	s := Spend(Snapshot{}, l, 10, now)
+	if s.Tokens != -5 {
+		t.Fatalf("an over-spend of 5 against a capacity of 5 must leave -5, got %v", s.Tokens)
+	}
+
+	// One refill interval later, one more spend. Remaining() would report 0 here, so subtracting
+	// from it turns -5 into -1 and hands back four tokens that do not exist.
+	after := now.Add(l.Refill)
+	s = Spend(s, l, 1, after)
+	if s.Tokens != -5 {
+		t.Errorf("spending 1 while in debt must leave -5 (one refill earned, one token spent), got %v: "+
+			"the debt below zero was forgiven", s.Tokens)
+	}
+	if got := Remaining(s, l, after); got != 0 {
+		t.Errorf("a bucket in debt has nothing available, got %v", got)
+	}
+
+	// The debt is worked off by refills, not forgiven: the bucket is at -5, so five refills bring it
+	// to exactly zero and the sixth is the first spendable token.
+	if got := Remaining(s, l, after.Add(4*l.Refill)); got != 0 {
+		t.Errorf("after 4 more refills the bucket is still in debt, got %v", got)
+	}
+	if got := Remaining(s, l, after.Add(5*l.Refill)); got != 0 {
+		t.Errorf("five refills clear the debt to exactly zero, got %v", got)
+	}
+	if got := Remaining(s, l, after.Add(6*l.Refill)); got != 1 {
+		t.Errorf("the sixth refill is the first available token, got %v (forgiven debt shows up here "+
+			"as several)", got)
+	}
+}
+
+// An idle bucket refills to its CAPACITY, not beyond it.
+//
+// level() keeps counting past the capacity, and Spend subtracted from that uncapped value: a
+// certificate limit of 5 refilling every 34h stored 45.35 tokens after two months of idleness, and
+// the stored count then read "full" for a hundred spends where the CA would have allowed none.
+// Remaining() clamps what it REPORTS, so the surplus was invisible in the metric and in the alert
+// that watches it -- the estimate was wrong in the optimistic direction, which is the one this
+// package promises never to be wrong in (see the package comment's "lower bound").
+func TestSpendingAnIdleBucketStoresNoMoreThanCapacity(t *testing.T) {
+	l := Limit{Name: "certs-per-exact-identifier-set", Capacity: 5, Refill: 34 * time.Hour}
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	full := Snapshot{Tokens: l.Capacity, At: start}
+
+	// Two months later the bucket is idle-and-full, not full a hundred times over.
+	idle := start.Add(60 * 24 * time.Hour)
+	after := Spend(full, l, 1, idle)
+	if after.Tokens > l.Capacity-1 {
+		t.Errorf("a spend from an idle bucket stored %v tokens (capacity %v): the surplus is "+
+			"spendable slack that makes the estimate read higher than reality",
+			after.Tokens, l.Capacity)
+	}
+
+	// And the burst proves it is gone: five spends from full leave nothing, and the sixth is
+	// debt rather than another "full" reading.
+	// All five at the same instant, so the assertion is exactly about the surplus rather than
+	// about the fraction of a token a minute of refill is worth.
+	snap := full
+	for i := 0; i < int(l.Capacity); i++ {
+		snap = Spend(snap, l, 1, idle)
+		if got := Remaining(snap, l, idle); got != l.Capacity-1-float64(i) {
+			t.Fatalf("spend %d: remaining = %v, want %v", i+1, got, l.Capacity-1-float64(i))
+		}
+	}
+	if got := Remaining(snap, l, idle); got != 0 {
+		t.Errorf("the bucket is spent, so remaining must read 0, got %v", got)
+	}
+}
+
+// The real refusal message carries a documentation link after the instant.
+//
+// Boulder formats the deadline and then appends ": see <url>", so the instant is a PREFIX of the
+// text (boulder/ratelimits/limiter.go + errors/errors.go). This function required the message to
+// END at the instant, so every genuine refusal was rejected: no deadline was stored, nothing was
+// ever marked blocked, and the CRITICAL WecertRateLimitBlocked alert could not fire. The existing
+// test passed because it used a fabricated message with no suffix.
+func TestParseRetryAfterAcceptsTheRealMessage(t *testing.T) {
+	const want = "2026-09-18 12:34:56 UTC"
+	cases := []string{
+		"acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: too many new orders recently, " +
+			"retry after 2026-09-18 12:34:56 UTC: see https://letsencrypt.org/docs/rate-limits/#new-orders-per-account",
+		"too many certificates already issued for this exact set of identifiers, retry after " +
+			"2026-09-18 12:34:56.123456789 UTC: see https://letsencrypt.org/docs/rate-limits/#certificates-per-exact-set-of-identifiers",
+		// The suffix-free form must keep working: it is what a CA that says nothing more sends.
+		"too many new orders recently, retry after 2026-09-18 12:34:56 UTC",
+	}
+	for _, msg := range cases {
+		got, ok := ParseRetryAfter(msg)
+		if !ok {
+			t.Errorf("the CA named an instant; a suffix after it must not hide the deadline:\n%s", msg)
+			continue
+		}
+		if got.Format("2006-01-02 15:04:05 MST") != want {
+			t.Errorf("deadline = %s, want %s", got, want)
+		}
 	}
 }

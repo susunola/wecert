@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // snapshotStore builds a store with one row worth protecting, in its own directory so the
@@ -411,5 +412,406 @@ func TestForeignFilesInTheBackupDirectoryAreLeftAlone(t *testing.T) {
 	}
 	if len(seen) != 1 {
 		t.Errorf("only our own snapshots may be listed, got %v", seen)
+	}
+}
+
+// The snapshot must be CREATED with restrictive permissions, not tightened after the fact.
+//
+// The file is a logical copy of the ACME account key and every certificate private key, and SQLite
+// creates it with the process umask -- 0644 on a default system. Chmod'ing afterwards leaves a
+// window any local user can read through, and a crash inside the window leaves a world-readable
+// `.snapshot-*.tmp` behind that nothing revisits: the listing matches only the final
+// `<base>.backup-<stamp>.db` names. Asserting the final mode cannot see the difference (the chmod
+// is a backstop), so the mode is observed at the moment the copy lands.
+func TestSnapshotIsBornWithRestrictivePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no POSIX permission assertions on Windows")
+	}
+
+	old := setUmask(0)
+	defer setUmask(old)
+
+	saved := snapshotCopied
+	var modeAtCopy os.FileMode
+	var statErr error
+	snapshotCopied = func(path string) {
+		info, err := os.Stat(path)
+		if err != nil {
+			statErr = err
+			return
+		}
+		modeAtCopy = info.Mode().Perm()
+	}
+	defer func() { snapshotCopied = saved }()
+
+	s, dir := snapshotStore(t)
+	if _, err := s.Snapshot(filepath.Join(dir, "backups"), 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if statErr != nil {
+		t.Fatalf("the snapshot was not readable when the copy landed: %v", statErr)
+	}
+	if modeAtCopy&0o077 != 0 {
+		t.Errorf("the snapshot was created with mode %o (umask 0): group and other can read every "+
+			"private key for the whole duration of the copy, and a crash in that window leaves a "+
+			"world-readable temp file nothing ever cleans up (want 0600 from the start)", modeAtCopy)
+	}
+}
+
+// A same-millisecond collision must sort AFTER the name it collides with.
+//
+// Retention prunes from the front of a lexicographic sort, so the collision suffix has to be
+// greater than '.': with "<stamp>-1.db" ('-' is 0x2D, '.' is 0x2E) the suffixed file sorted first
+// and keep=1 deleted the NEWER snapshot while keeping the older one -- the opposite of what the
+// code comment claimed, and the very failure the pid suffix had been blamed for.
+func TestACollisionSnapshotSortsLastAndStillCountsAsOurs(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+
+	first, err := s.Snapshot(backups, 3)
+	if err != nil {
+		t.Fatalf("first snapshot: %v", err)
+	}
+	stamp, ok := s.snapshotStampOf(filepath.Base(first))
+	if !ok {
+		t.Fatalf("%s is not recognised as a snapshot of this store", filepath.Base(first))
+	}
+
+	// The name a collision produces, and the ordering property retention depends on.
+	collision := s.snapshotName(stamp + "~1")
+	if !(collision > filepath.Base(first)) {
+		t.Errorf("the collision name %q must sort after %q, or pruning keeps the older snapshot",
+			collision, filepath.Base(first))
+	}
+	if _, ok := s.snapshotStampOf(collision); !ok {
+		t.Errorf("%q must still count as a snapshot of this store, or retention never prunes it",
+			collision)
+	}
+	// The separator this used before must keep being recognised, or snapshots written by an older
+	// build stay on disk forever.
+	if _, ok := s.snapshotStampOf(s.snapshotName(stamp + "-1")); !ok {
+		t.Error("the old '-' collision suffix must keep counting as a snapshot")
+	}
+}
+
+// Retiring a certificate restarts the retention clock.
+//
+// The orphan path records a certificate that was merely uploaded (no material) so the reaper can
+// delete it; the retirement path later records the same cert_id WITH the fullchain and key, which is
+// the material docs/recovery.md's manual rollback needs. The upsert refreshed the material but not
+// retired_at, so the row was reaped on the orphan's clock: the cloud copy and the just-archived
+// rollback material went away as soon as the earlier window expired.
+func TestRetiringACertificateRestartsTheRetentionClock(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// The orphan write: no material, and an old timestamp.
+	if err := store.AddRetiredCert("cert-1", "site", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	orphanAt := time.Now().Add(-6 * 24 * time.Hour)
+	if _, err := store.db.Exec(`UPDATE retired_certificates SET retired_at = ? WHERE cert_id = ?`,
+		orphanAt.Unix(), "cert-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The retirement write: real material, now.
+	if err := store.AddRetiredCert("cert-1", "site", []byte("fullchain"), []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+
+	retired, err := store.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retired) != 1 {
+		t.Fatalf("expected one retired row, got %+v", retired)
+	}
+	if !retired[0].RetiredAt.After(orphanAt.Add(time.Hour)) {
+		t.Errorf("retired_at is still the orphan's timestamp (%v): retention would reap this row -- "+
+			"cloud copy and archived key material included -- on the earlier clock, not from the "+
+			"retirement", retired[0].RetiredAt)
+	}
+	if string(retired[0].CertPEM) != "fullchain" {
+		t.Errorf("the archived material must survive the upsert, got %q", retired[0].CertPEM)
+	}
+}
+
+// A collision probe that cannot answer must be reported, not treated as "taken".
+//
+// The suffix loop exists for the millisecond collision, and it used to treat ANY Stat failure as
+// "this name is taken". "Unknown" is not "taken": every candidate suffix fails the same way, so the
+// loop spins forever -- a directory that lost its search permission, an unreachable mount, a
+// symlink loop -- burning a core in the backup goroutine while no snapshot is ever written and
+// nothing is logged. This is the same failure mode, one layer down, as reading an unreadable quota
+// as zero: a failed read must not be turned into an answer.
+func TestAnUnanswerableCollisionProbeIsReported(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const stamp = "20260101T000000.000Z"
+
+	// A free name is used as-is.
+	name, err := s.freeSnapshotName(backups, stamp)
+	if err != nil {
+		t.Fatalf("a free directory must produce a name: %v", err)
+	}
+	if want := filepath.Join(backups, s.snapshotName(stamp)); name != want {
+		t.Errorf("name = %s, want the unsuffixed %s", name, want)
+	}
+
+	// A real collision advances to the next suffix, which still sorts after it.
+	if err := os.WriteFile(name, []byte("existing snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, err := s.freeSnapshotName(backups, stamp)
+	if err != nil {
+		t.Fatalf("a collision must produce the next free name: %v", err)
+	}
+	if next == name {
+		t.Fatalf("the occupied name %s must not be handed out again: the snapshot would overwrite "+
+			"an existing one", name)
+	}
+	if !(filepath.Base(next) > filepath.Base(name)) {
+		t.Errorf("the collision name %q must sort after %q, or retention keeps the older snapshot",
+			filepath.Base(next), filepath.Base(name))
+	}
+
+	// Now make the probe itself unanswerable: a symlink pointing at itself fails with ELOOP,
+	// which is neither "free" nor "taken".
+	loop := filepath.Join(backups, s.snapshotName("20260102T000000.000Z"))
+	if err := os.Symlink(filepath.Base(loop), loop); err != nil {
+		t.Skipf("this filesystem cannot create a symlink loop: %v", err)
+	}
+	if got, err := s.freeSnapshotName(backups, "20260102T000000.000Z"); err == nil {
+		t.Errorf("a probe that cannot answer must be reported, not silently worked around; got %q. "+
+			"Treating it as \"taken\" spins the suffix loop forever when every candidate fails the "+
+			"same way", got)
+	}
+}
+
+// A backward clock step must not make retention delete the snapshot it just wrote.
+//
+// Snapshot names are wall-clock stamps and pruning deletes from the front of a lexicographic sort,
+// which is "oldest first" only while the clock moves forwards. After an NTP correction, a VM resumed
+// from a snapshot, or a backup directory restored from a host whose clock was ahead, the file just
+// written carries the newest CONTENT and the oldest NAME -- so the old code deleted exactly that
+// file, logged a fresh snapshot at a path that no longer existed, and left the recovery point stuck
+// on an older copy without saying so.
+func TestPruningKeepsTheSnapshotItJustWroteWhenTheClockWentBackwards(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// A snapshot from "before" the clock stepped backwards: its name sorts after anything this
+	// process will write now.
+	future := filepath.Join(backups, s.snapshotName(time.Now().UTC().Add(time.Hour).Format(snapshotStamp)))
+	if err := os.WriteFile(future, []byte("older content, later name"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	path, err := s.Snapshot(backups, 1)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the snapshot this call just wrote was deleted by its own pruning: %v", err)
+	}
+	if _, err := os.Stat(future); !os.IsNotExist(err) {
+		t.Errorf("retention still has to hold at keep=1, so the other snapshot must be the victim, "+
+			"got stat err %v", err)
+	}
+	left, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 {
+		t.Errorf("keep=1 must leave one snapshot, got %d: %v", len(left), left)
+	}
+}
+
+// An empty database is not worth snapshotting, and the daemon must not treat it as one.
+//
+// This is what the daemon gates on before writing a snapshot. Without it, after the documented
+// state.db loss every restart wrote a snapshot of the empty replacement and retention evicted a
+// genuine backup -- three restarts with keep=3 destroyed all three.
+func TestHasRecoverableStateTracksWhatASnapshotCouldRecover(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if has, err := s.HasRecoverableState(); err != nil || has {
+		t.Fatalf("a freshly created database holds nothing to recover: has=%v err=%v", has, err)
+	}
+
+	// Rate buckets and failure counters are not recovery material: losing them costs
+	// rate-limit knowledge, not a certificate.
+	if err := s.PutRateBucket(&RateBucket{
+		LimitName: "new-orders", ScopeID: "acct", Tokens: 1, ObservedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("PutRateBucket: %v", err)
+	}
+	if has, err := s.HasRecoverableState(); err != nil || has {
+		t.Errorf("rate-limit bookkeeping is not a recovery point: has=%v err=%v", has, err)
+	}
+
+	if err := s.PutCert(&CertState{Name: "example-com", KeyPEM: []byte("PRIVATE KEY")}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	if has, err := s.HasRecoverableState(); err != nil || !has {
+		t.Errorf("a stored certificate is exactly what a snapshot exists for: has=%v err=%v", has, err)
+	}
+}
+
+// A snapshot named in the future must not hold a retention slot forever.
+//
+// Names are wall-clock stamps and retention keeps the newest, so one forward clock excursion writes
+// a file that sorts after every honest stamp and is therefore never pruned again: with keep=3 the
+// deployment kept only two genuine recovery points and deleted the oldest fresh one every round.
+// The file's contents are fine, so it is renamed to when it was actually written.
+func TestAFutureDatedSnapshotIsAgedRatherThanKeptForever(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two honest snapshots and one from "the future".
+	for _, d := range []time.Duration{-2 * time.Hour, -time.Hour} {
+		if _, err := s.Snapshot(backups, 10); err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		_ = d
+	}
+	future := filepath.Join(backups, s.snapshotName(time.Now().UTC().Add(48*time.Hour).Format(snapshotStamp)))
+	if err := os.WriteFile(future, []byte("snapshot from a host whose clock was ahead"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Snapshot(backups, 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	left, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 3 {
+		t.Fatalf("keep=3 must leave three snapshots, got %d: %v", len(left), left)
+	}
+	for _, name := range left {
+		stamp, ok := s.snapshotStampOf(filepath.Base(name))
+		if !ok {
+			t.Fatalf("unexpected file in the snapshot list: %s", name)
+		}
+		at, err := time.Parse(snapshotStamp, stamp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if at.After(time.Now().Add(time.Minute)) {
+			t.Errorf("a future-dated name survived: %s. It sorts after every honest stamp, so "+
+				"retention can never pick it and one recovery point is lost for good", filepath.Base(name))
+		}
+	}
+}
+
+// One undeletable snapshot must not stop pruning the rest.
+//
+// Returning on the first os.Remove failure meant a single immutable snapshot (chattr +i, an ACL, a
+// read-only attribute -- ransomware hardening an operator may well have applied) stalled pruning for
+// the life of the directory: the backup directory grew by one file per interval while every round
+// reported the same error against the same oldest name.
+func TestPruningAttemptsEveryVictim(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	for i := 0; i < 4; i++ {
+		if _, err := s.Snapshot(backups, 10); err != nil {
+			t.Fatalf("Snapshot %d: %v", i, err)
+		}
+	}
+
+	// The oldest snapshot cannot be removed; the next two must still go.
+	saved := removeSnapshotFile
+	t.Cleanup(func() { removeSnapshotFile = saved })
+	blocked := ""
+	removeSnapshotFile = func(name string) error {
+		if blocked == "" {
+			blocked = name
+			return os.ErrPermission
+		}
+		return os.Remove(name)
+	}
+
+	if _, err := s.Snapshot(backups, 2); err == nil {
+		t.Error("the failure has to be reported: the operator needs to know a snapshot could not be " +
+			"removed and the directory will grow")
+	}
+	removeSnapshotFile = saved
+
+	left, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 3 {
+		t.Errorf("keep=2 with one undeletable snapshot must leave 3 files (the two newest plus the "+
+			"one that cannot go), got %d: %v", len(left), left)
+	}
+	if blocked == "" {
+		t.Fatal("the fixture never blocked a removal, so this test proves nothing")
+	}
+	found := false
+	for _, name := range left {
+		if name == blocked {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the undeletable snapshot must still be there, got %v", left)
+	}
+}
+
+// A stale temporary snapshot is swept; a fresh one is left alone.
+//
+// A crash between VACUUM INTO and the rename leaves a partial copy under a `.snapshot-*.tmp` name
+// that nothing else revisits. The sweep is age-based so it can never delete a write in progress.
+func TestStaleSnapshotTempsAreSweptAndFreshOnesKept(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := filepath.Join(backups, ".snapshot-20200101T000000.000-0.tmp")
+	fresh := filepath.Join(backups, ".snapshot-29990101T000000.000-0.tmp")
+	for _, p := range []string{stale, fresh} {
+		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-3 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Snapshot(backups, 3); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("a stale temporary snapshot must be swept, stat err %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("a fresh temporary file must be left alone (a write may be in progress): %v", err)
 	}
 }

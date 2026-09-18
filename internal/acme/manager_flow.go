@@ -1,6 +1,8 @@
 package acme
 
 import (
+	"strings"
+
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"github.com/go-acme/lego/v4/challenge/dns01"
 
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -48,12 +51,12 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 			if derr := m.discardOrder(ctx, c.Name); derr != nil {
 				// Discarding failed too, so the order row survives; still report the failure so
 				// the backoff applies, and the next round tries again.
-				return m.recordFailure(st, errors.Join(fmt.Errorf("get order: %w", err), derr))
+				return m.recordFailure(ctx, st, errors.Join(fmt.Errorf("get order: %w", err), derr))
 			}
-			return m.recordFailure(st, fmt.Errorf(
+			return m.recordFailure(ctx, st, fmt.Errorf(
 				"get order: %w (the order was discarded; the next attempt places a new one)", err))
 		}
-		return m.recordFailure(st, fmt.Errorf("get order: %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("get order: %w", err))
 	}
 	// It answered, so the URL is alive: forget any earlier failures.
 	m.clearOrderFetchFailures(o.OrderURL)
@@ -62,7 +65,7 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 	// Discarding it would defeat the point of making it return one, and Go does not
 	// warn about a dropped return value.
 	if err := m.persistOrder(o, order); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	switch order.Status {
@@ -80,7 +83,7 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		if derr := m.discardOrder(ctx, c.Name); derr != nil {
 			err = errors.Join(err, derr)
 		}
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 
 	case "ready":
 		return m.finalize(ctx, c, st, o, order, rd)
@@ -94,10 +97,10 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		// on track. Just wait for the outcome and download.
 		final, err := m.awaitOrderStatus(ctx, o.OrderURL, "valid", orderWaitTimeout)
 		if err != nil {
-			return m.recordFailure(st, err)
+			return m.recordFailure(ctx, st, err)
 		}
 		if err := m.persistOrder(o, final); err != nil {
-			return m.recordFailure(st, err)
+			return m.recordFailure(ctx, st, err)
 		}
 		return m.download(ctx, c, st, o, final, rd)
 	}
@@ -115,10 +118,10 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 	// Every authorization is valid; wait for the order to turn ready, then finalize.
 	ready, err := m.awaitOrderStatus(ctx, o.OrderURL, "ready", orderWaitTimeout)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 	if err := m.persistOrder(o, ready); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 	if ready.Status == "valid" {
 		return m.download(ctx, c, st, o, ready, rd)
@@ -187,13 +190,19 @@ func (m *Manager) solveChallenges(
 ) (bool, error) {
 	authzs, err := m.loadAuthorizations(c.Name, order.Authorizations)
 	if err != nil {
-		return false, m.recordFailure(st, err)
+		return false, m.recordFailure(ctx, st, err)
 	}
 
 	current, err := m.fetchAuthzs(ctx, authzs)
 	if err != nil {
-		return false, m.recordFailure(st, err)
+		return false, m.recordFailure(ctx, st, err)
 	}
+
+	// As in the polling loop: a pass that sees several invalid authorizations books ALL of them.
+	// The ledger is what the degraded-set decision reads, so learning about one of two broken names
+	// leaves the certificate re-ordering a set that still contains a name the CA rejects.
+	var invalid []string
+	var invalidErr error
 
 	// Phase 1: write every TXT that is still awaiting validation, all in one go.
 	// Here we must never do "write one -> validate one -> delete one": for
@@ -224,7 +233,7 @@ func (m *Manager) solveChallenges(
 		switch cur.Status {
 		case "valid":
 			if err := m.store.PutAuthorization(a); err != nil {
-				return false, m.recordFailure(st, fmt.Errorf("persist a validated authorization (%s): %w", a.Identifier, err))
+				return false, m.recordFailure(ctx, st, fmt.Errorf("persist a validated authorization (%s): %w", a.Identifier, err))
 			}
 			continue
 		case "invalid":
@@ -246,24 +255,59 @@ func (m *Manager) solveChallenges(
 			// stops this process from spending the identifier's hourly failure budget on
 			// retries inside the same window (see identifierCooldown).
 			m.noteIdentifierFailure(targeted)
+			m.spendAuthzFailure(targeted)
 			if rerr := m.store.RecordIdentifierFailure(
 				c.Name, targeted, authzError(cur), m.now()); rerr != nil {
 				m.log.Warn("failed to record the identifier failure",
 					"cert", c.Name, "identifier", targeted, "err", rerr)
 			}
 
-			return false, m.recordFailure(st, fmt.Errorf(
-				"the authorization for identifier %s is invalid: %s", targeted, authzError(cur)))
+			// Booked, not returned: the ledger is what the degraded-set decision reads, so a pass
+			// that sees two invalid identifiers has to record both. See the loop tail.
+			invalid = append(invalid, targeted)
+			if invalidErr == nil {
+				invalidErr = fmt.Errorf(
+					"the authorization for identifier %s is invalid: %s", targeted, authzError(cur))
+			}
+			continue
+
+		case "deactivated", "expired", "revoked":
+			// RFC 8555 section 7.1.6: these statuses are closed. The authorization can never
+			// become valid again, so the order carrying it can never be finalized -- but with no
+			// case for them the pass treated them as pending and re-presented a challenge (a real
+			// TXT write plus a propagation wait), POSTed AcceptChallenge for a closed
+			// authorization, and then polled it for the whole authzWait, every pass, until the
+			// order's own 7-day TTL expired.
+			//
+			// Discarding the order is what ends that: the next pass places a fresh one, whose
+			// authorizations are new. No identifier failure is booked -- nothing about the name
+			// failed validation, and booking one would arm the pre-expiry fallback against a
+			// healthy identifier.
+			if perr := m.store.PutAuthorization(a); perr != nil {
+				m.log.Warn("failed to record the closed authorization",
+					"cert", c.Name, "identifier", targeted, "status", cur.Status, "err", perr)
+			}
+			m.log.Warn("the authorization is closed and can never be satisfied; discarding the order "+
+				"so the next pass places a fresh one",
+				"cert", c.Name, "identifier", targeted, "status", cur.Status, "authz", a.AuthzURL)
+			if derr := m.discardOrder(ctx, c.Name); derr != nil {
+				return false, m.recordFailure(ctx, st, fmt.Errorf(
+					"the authorization for %s is %s and discarding the order failed: %w",
+					targeted, cur.Status, derr))
+			}
+			return false, m.recordFailure(ctx, st, fmt.Errorf(
+				"the authorization for identifier %s is %s, which cannot be satisfied; a fresh order "+
+					"will be placed on the next pass", targeted, cur.Status))
 		}
 
 		if !a.Presented {
 			chlg, err := pickDNS01(cur)
 			if err != nil {
-				return false, m.recordFailure(st, err)
+				return false, m.recordFailure(ctx, st, err)
 			}
 			keyAuth, err := m.keyAuth.GetKeyAuthorization(chlg.Token)
 			if err != nil {
-				return false, m.recordFailure(st, fmt.Errorf("compute the key authorization: %w", err))
+				return false, m.recordFailure(ctx, st, fmt.Errorf("compute the key authorization: %w", err))
 			}
 
 			// The row must describe the challenge this pass is actually solving. The token
@@ -286,21 +330,51 @@ func (m *Manager) solveChallenges(
 			// so. markResumedUnpresented clears Presented for the same reason and forgot this one.
 			if a.ChallengeToken != chlg.Token {
 				a.ChallengeSent = false
+				// The old token hashed to a record this row no longer uses, so its lease is dead.
+				// Releasing it is what keeps the name cleanable: while a lease is held, every
+				// later cleanup here takes the "another challenge is still live" branch, and the
+				// provider's delete-EVERY-TXT call never fires again for the rest of the process.
+				// The record itself (if it is still up) goes with the next delete-all, which the
+				// new value's cleanup fires once it is the last leaver.
+				m.releaseStaleLease(a.TxtName, a.TxtValue)
 			}
-			a.ChallengeURL = chlg.URL
-			a.ChallengeToken = chlg.Token
+			// Remember when this challenge was chosen. Crash recovery probes for the record of a row
+			// that was never marked presented, and a denial is only evidence once the write would
+			// have had time to reach the authoritative servers (see reclaimUnpresentedTXT).
+			a.ChallengePreparedAt = m.now()
 
-			adopted := false
+			// The refreshed instant has to be durable BEFORE the DNS write it describes: persisting
+			// it afterwards leaves a stored age older than the write, and the reclaim probe could
+			// then trust an authoritative denial for a record that is still propagating.
+			//
+			// What else may be persisted along with it depends on whether this row already names a
+			// record, because the row's token is the only clue that locates one (reclaimUnpresentedTXT
+			// derives the value it probes for from it).
 			if firstVisit {
-				// First visit: persist the challenge **before** writing DNS. A pass that
-				// dies between the write and the persist below leaves the record up while
-				// the row still says Presented=false -- and the token is then the only
-				// way to locate that record again (the probe right below relies on it,
-				// and so does cleanupOrphanTXT).
+				// Nothing can belong to this row yet -- there is no token -- so the new one may go
+				// to disk before the write: if the pass dies in between, recovery probes for a value
+				// that was never written, is denied, and strands nothing.
+				a.ChallengeURL = chlg.URL
+				a.ChallengeToken = chlg.Token
 				if err := m.store.PutAuthorization(a); err != nil {
-					return false, m.recordFailure(st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
+					return false, m.recordFailure(ctx, st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
 				}
 			} else {
+				// The row already names the record an earlier attempt wrote, so only the refreshed
+				// age may be persisted here. Writing the new token first means that a write which
+				// then fails -- an ordinary DNSPod API error, no crash needed -- overwrites that
+				// clue: recovery probes the new value, is authoritatively denied, drops the row, and
+				// the old record stays in DNS with nothing naming it. See
+				// TestAFailedWriteOnTheRevisitPathKeepsTheTokenThatNamesTheRecord.
+				if err := m.store.PutAuthorization(a); err != nil {
+					return false, m.recordFailure(ctx, st, fmt.Errorf("persist the age of a new challenge (%s): %w", a.Identifier, err))
+				}
+				a.ChallengeURL = chlg.URL
+				a.ChallengeToken = chlg.Token
+			}
+
+			adopted := false
+			if !firstVisit {
 				// Been here before: an earlier pass was interrupted between the DNS write
 				// and marking Presented. Re-Present blindly and the record is duplicated;
 				// probe first and, if the old record is already up, adopt it instead.
@@ -329,7 +403,7 @@ func (m *Manager) solveChallenges(
 				// so that is minutes right there).
 				rec, err := m.dns.Present(ctx, a.Identifier, chlg.Token, keyAuth)
 				if err != nil {
-					return false, m.recordFailure(st, fmt.Errorf("present TXT (%s): %w", a.Identifier, err))
+					return false, m.recordFailure(ctx, st, fmt.Errorf("present TXT (%s): %w", a.Identifier, err))
 				}
 
 				a.TxtName = rec.FQDN
@@ -346,10 +420,36 @@ func (m *Manager) solveChallenges(
 		}
 
 		if err := m.store.PutAuthorization(a); err != nil {
-			return false, m.recordFailure(st, fmt.Errorf("persist a presented challenge (%s): %w", a.Identifier, err))
+			// The record is in DNS and the state write that would have named it failed, so nothing
+			// on disk points at it any more: the row still carries the token of the earlier attempt
+			// (that is exactly what the revisit path holds back until the write succeeds), and
+			// recovery derives the value it probes for from the token. Left alone, the record stays
+			// in DNS for the rest of the certificate's life -- a stale TXT at the challenge name that
+			// no row, no lease and no log line mentions. Take it back out instead.
+			if a.Presented {
+				if cleaned, cerr := m.removeAuthzTXT(ctx, a); cerr != nil || !cleaned {
+					m.log.Warn("the presented TXT could not be reclaimed after the state write failed, "+
+						"so it is in DNS under the name recorded in the row's txt_name",
+						"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName, "err", cerr)
+				} else {
+					m.log.Warn("the state write failed after the TXT was presented, so the record was "+
+						"taken back out rather than left unnamed in DNS",
+						"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName)
+				}
+			}
+			return false, m.recordFailure(ctx, st, fmt.Errorf("persist a presented challenge (%s): %w", a.Identifier, err))
 		}
 		records = append(records, DNSRecord{FQDN: a.TxtName, Value: a.TxtValue})
 		pending = append(pending, a)
+	}
+
+	if invalidErr != nil {
+		if len(invalid) > 1 {
+			m.log.Warn("several identifiers were already invalid at the start of this pass; all of "+
+				"them are in the failure ledger, which is what the degraded-set decision reads",
+				"cert", c.Name, "identifiers", strings.Join(invalid, ","))
+		}
+		return false, m.recordFailure(ctx, st, invalidErr)
 	}
 
 	if len(pending) == 0 {
@@ -372,7 +472,7 @@ func (m *Manager) solveChallenges(
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			m.markResumedUnpresented(c.Name, resumed)
 		}
-		return false, m.recordFailure(st, fmt.Errorf("wait for TXT propagation: %w", err))
+		return false, m.recordFailure(ctx, st, fmt.Errorf("wait for TXT propagation: %w", err))
 	}
 
 	// Phase 3: only once propagation is confirmed do we tell the CA, one by one, to validate.
@@ -380,21 +480,33 @@ func (m *Manager) solveChallenges(
 		if a.ChallengeSent {
 			continue
 		}
+		// The identifier's failure budget is claimed BEFORE the CA is asked to validate.
+		//
+		// This is the point of no return for spending it: once the challenge is accepted, a failure
+		// costs one of the five authorizations per identifier per hour, and the budget belongs to
+		// the IDENTIFIER -- several certificates for the same name share it. The decision used to be
+		// check-then-act, and the webhook fan-out admits up to eight passes at once, so eight
+		// certificates sharing a name all read "not cooling" and all failed inside one window,
+		// leaving the bucket at -3 against a capacity of five. Claiming here means the second pass
+		// sees the first pass's claim whatever order the scheduler picks; a success clears it again
+		// (see awaitAuthorizations), and an order that is merely refused by the CA never claims
+		// anything, which is why this is not done where the order is placed.
+		m.noteIdentifierFailure(a.Identifier)
 		if err := m.core.AcceptChallenge(a.ChallengeURL); err != nil {
-			return false, m.recordFailure(st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
+			return false, m.recordFailure(ctx, st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
 		}
 		a.ChallengeSent = true
 		if err := m.store.PutAuthorization(a); err != nil {
 			// The challenge WAS accepted; only the record of it failed. Counting the pass as a
 			// failure is still right: without the row, the next pass cannot tell that this
 			// challenge is already in flight, and the pass has not finished its job.
-			return false, m.recordFailure(st, fmt.Errorf("persist that a challenge was accepted (%s): %w", a.Identifier, err))
+			return false, m.recordFailure(ctx, st, fmt.Errorf("persist that a challenge was accepted (%s): %w", a.Identifier, err))
 		}
 	}
 
 	// Phase 4: poll until everything is valid.
 	if err := m.awaitAuthorizations(ctx, pending); err != nil {
-		return false, m.recordFailure(st, err)
+		return false, m.recordFailure(ctx, st, err)
 	}
 
 	// Phase 5: only after every validation passes do we clean up the TXT records together.
@@ -465,6 +577,15 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 		}
 
 		stillPending := pending[:0]
+		// Every invalid authorization this poll sees is booked, not just the first.
+		//
+		// Returning on the first one left the failure ledger knowing about one name of however many
+		// the CA rejected: measured with a certificate whose [a,b,c] had a AND b invalid, the ledger
+		// recorded a three times, the degraded round ordered [b,c] -- still containing the invalid b --
+		// and the certificate could never degrade far enough to issue at all. The ledger is what the
+		// fallback decides from, so a name the CA calls invalid has to be in it after this pass.
+		var invalid []string
+		var invalidErr error
 		for i, a := range pending {
 			cur := current[i]
 
@@ -491,16 +612,34 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 				// ledger key wildcard-aware, just as solveChallenges does.
 				targeted := challenge.GetTargetedDomain(cur)
 				m.noteIdentifierFailure(targeted)
+				// The same budget as in solveChallenges: whichever poll observes the invalid
+				// authorization first is the one that spends the identifier's hourly failure slot,
+				// and both paths can be the first to see it.
+				m.spendAuthzFailure(targeted)
 				if rerr := m.store.RecordIdentifierFailure(a.CertName, targeted, authzError(cur), m.now()); rerr != nil {
 					m.log.Warn("failed to record the identifier failure", "cert", a.CertName, "identifier", targeted, "err", rerr)
 				}
-				return fmt.Errorf("validation failed for identifier %s: %s", targeted, authzError(cur))
+				invalid = append(invalid, targeted)
+				if invalidErr == nil {
+					invalidErr = fmt.Errorf("validation failed for identifier %s: %s", targeted, authzError(cur))
+				}
+				continue
 			default:
 				stillPending = append(stillPending, a)
 			}
 		}
 		pending = stillPending
 
+		if invalidErr != nil {
+			// Reported once, after every invalid authorization in this poll has been booked. The
+			// message names the first one; the ledger now holds all of them.
+			if len(invalid) > 1 {
+				m.log.Warn("several identifiers failed validation in this poll; all of them are in the "+
+					"failure ledger, which is what the degraded-set decision reads",
+					"identifiers", strings.Join(invalid, ","))
+			}
+			return invalidErr
+		}
 		if len(pending) == 0 {
 			return nil
 		}
@@ -543,6 +682,80 @@ func (m *Manager) registerRecoveredLeases() {
 			challengeLeases.addUnderLock(a.TxtName, a.TxtValue)
 		}
 	}
+}
+
+// releaseStaleLease drops one TXT lease whose value the caller has established is dead.
+//
+// The registry cannot tell a dead value from a live one by itself: a value stays in it until
+// someone removes it, and while one is held every later cleanup at that name takes the "another
+// challenge is still live" branch -- so the provider's delete-EVERY-TXT call never fires again for
+// the rest of the process, every TXT record written at that name afterwards stays in DNS until a
+// restart, and the name's record quota fills up with values nothing will ever collect. The two
+// callers are the places where a value's fate is actually known: a row repointed at a different
+// challenge token, and a probe that proved the record absent.
+//
+// A presented authorization row that still claims the same (name, value) keeps the lease. That is
+// the one way a value the caller has given up on can still be needed: another certificate's record
+// at the same name, whose rows this call does not own. The check reads the store, so a store that
+// cannot be read keeps the lease -- the safe direction, because a leftover lease only delays a
+// delete-all, while dropping a live one takes out a record another certificate is waiting on.
+func (m *Manager) releaseStaleLease(fqdn, value string) {
+	m.releaseStaleLeaseExcept(fqdn, value, nil)
+}
+
+// releaseStaleLeaseExcept is releaseStaleLease with one row excluded from the "another row still
+// claims this value" check.
+//
+// The exclusion exists for the row being cleaned up right now: that row is itself a presented
+// authorization claiming (name, TxtValue), so asking "does any presented row still need this value"
+// would always answer yes and the lease would never be released. See releaseRowStaleLease.
+func (m *Manager) releaseStaleLeaseExcept(fqdn, value string, except *state.Authorization) {
+	if fqdn == "" || value == "" {
+		return
+	}
+	rows, err := m.store.ListPresentedAuthorizations()
+	if err != nil {
+		m.log.Warn("cannot check whether another authorization still needs a TXT record; keeping its lease",
+			"name", fqdn, "err", err)
+		return
+	}
+	for _, r := range rows {
+		if except != nil && r.CertName == except.CertName && r.AuthzURL == except.AuthzURL {
+			continue
+		}
+		if r.TxtName == fqdn && r.TxtValue == value {
+			return
+		}
+	}
+	if othersLive := challengeLeases.remove(fqdn, value); othersLive {
+		m.log.Info("another challenge is still live at the TXT name; the provider's delete-all waits for the last leaver",
+			"name", fqdn)
+		return
+	}
+	m.log.Info("released a TXT lease whose record is gone; the name can be cleaned up again",
+		"name", fqdn)
+}
+
+// releaseRowStaleLease drops the lease a row's PERSISTED value is holding when its token no longer
+// hashes to that value.
+//
+// The registry has two writers for one row. registerRecoveredLeases (and Present) register
+// a.TxtValue, because that is the value recorded as being in DNS; CleanUp removes the value derived
+// from the challenge token, because that is what lego's provider deletes by. For a row written
+// before the token was refreshed -- the shape the comment in removeAuthzTXT describes as real -- the
+// two differ, so the lease that went in can never come out: every later cleanup at that name takes
+// the "another challenge is still live" branch, the provider's delete-all never fires again for the
+// process lifetime, and the record this row owns stays in DNS. Releasing it here is what makes the
+// decision correct rather than making it earlier: the value is this row's own record, and the
+// exclusion keeps a different certificate's claim on it intact.
+func (m *Manager) releaseRowStaleLease(a *state.Authorization, keyAuth string) {
+	if a == nil || a.TxtName == "" || a.TxtValue == "" {
+		return
+	}
+	if dns01.GetChallengeInfo(a.Identifier, keyAuth).Value == a.TxtValue {
+		return
+	}
+	m.releaseStaleLeaseExcept(a.TxtName, a.TxtValue, a)
 }
 
 // cleanup deletes every TXT this round wrote. It is only called once all authorizations pass.
@@ -599,6 +812,9 @@ func (m *Manager) removeAuthzTXT(ctx context.Context, a *state.Authorization) (c
 	if a.TxtName != "" {
 		challengeLeases.add(a.TxtName, dns01.GetChallengeInfo(a.Identifier, keyAuth).Value)
 	}
+	// And release the lease the row's own persisted value is holding, if it is not the value this
+	// call is about to remove: otherwise that lease blocks the delete-all forever.
+	m.releaseRowStaleLease(a, keyAuth)
 	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
 		return false, fmt.Errorf("clean up TXT %s: %w", a.TxtName, err)
 	}
@@ -690,10 +906,41 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 		return false
 	}
 	if !found {
+		// A denial is only evidence once the write would have had time to appear.
+		//
+		// The row this probes exists for the pass that died between the DNS write and the state
+		// persist -- but it also exists for the one that died between persisting the challenge and
+		// writing DNS, and the two are indistinguishable from the record alone. What separates them
+		// is time: if the challenge was chosen moments ago, every authoritative server may simply
+		// not have it yet (DNSPod's addresses lag the API write, measured at up to ~60s for a
+		// deletion this session), and deleting the row then drops the only clue to a record that is
+		// about to appear -- which stays in DNS and can poison a later challenge at the same name.
+		//
+		// A row with no timestamp predates the column, so its age is unknown and the previous
+		// behaviour is kept: refusing to delete those would strand every one of them forever.
+		if age := m.now().Sub(a.ChallengePreparedAt); !a.ChallengePreparedAt.IsZero() &&
+			age < m.dns.PropagationTimeout() {
+			m.log.Info("an unpresented row's record was denied, but its challenge is newer than the "+
+				"propagation window; keeping the row so a record that is still propagating is not lost",
+				"cert", a.CertName, "identifier", a.Identifier, "name", a.TxtName,
+				"preparedAgo", age.Round(time.Second),
+				"window", m.dns.PropagationTimeout())
+			return false
+		}
+
 		// Every reachable authoritative nameserver denied this value, which is the
 		// only answer that licenses deleting the row: the write genuinely never
 		// happened. Any other outcome -- including one that merely could not be
 		// confirmed -- reaches the caller as err, and the row is kept.
+		//
+		// The lease an interrupted Present registered for this value is dead for the same
+		// reason, and leaving it behind is not harmless: the registry would keep reporting
+		// "another challenge is still live at this name" for a record that is not there, so
+		// the provider's delete-EVERY-TXT call would never fire again for the rest of the
+		// process and every record written here afterwards would stay in DNS. Proof of
+		// absence is what makes dropping it safe: nothing can depend on a record that is not
+		// there, and the probe is the same evidence the row deletion rests on.
+		m.releaseStaleLease(rec.FQDN, rec.Value)
 		return true
 	}
 	m.log.Info("found the TXT of an interrupted pass; reclaiming it before deleting the row",
@@ -703,6 +950,9 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 	// this value is invisible to the registry and the delete-all would go ahead -- taking
 	// out any other certificate's record at the same name.
 	challengeLeases.add(rec.FQDN, rec.Value)
+	// The row's persisted value may be a different one (a token refresh before either was written);
+	// its lease would block the delete-all for the rest of the process. See releaseRowStaleLease.
+	m.releaseRowStaleLease(a, keyAuth)
 	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
 		m.log.Warn("failed to reclaim the TXT of an interrupted pass; keeping the row",
 			"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN, "err", err)
@@ -717,15 +967,15 @@ func (m *Manager) finalize(
 ) error {
 	key, err := ParsePrivateKeyPEM(o.KeyPEM)
 	if err != nil {
-		return m.recordFailure(st, fmt.Errorf("load the order's private key: %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("load the order's private key: %w", err))
 	}
 	csr, err := CreateCSRDER(key, c.Domains)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	if o.FinalizeURL == "" {
-		return m.recordFailure(st, errors.New("the order has no finalize URL; cannot submit the CSR"))
+		return m.recordFailure(ctx, st, errors.New("the order has no finalize URL; cannot submit the CSR"))
 	}
 
 	// RFC 8555 section 7.4: the CSR must be POSTed to the order's finalize URL.
@@ -734,15 +984,15 @@ func (m *Manager) finalize(
 	// whatever URL you hand it. Passing the order URL makes LE treat it as POST-as-GET and
 	// fail with "POST-as-GET requests must have an empty payload".
 	if _, err := m.core.UpdateOrderForCSR(o.FinalizeURL, csr); err != nil {
-		return m.recordFailure(st, fmt.Errorf("submit CSR (finalize): %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("submit CSR (finalize): %w", err))
 	}
 
 	final, err := m.awaitOrderStatus(ctx, o.OrderURL, "valid", orderWaitTimeout)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 	if err := m.persistOrder(o, final); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 	return m.download(ctx, c, st, o, final, rd)
 }
@@ -779,4 +1029,20 @@ func (m *Manager) awaitOrderStatus(
 		case <-time.After(m.pollInterval):
 		}
 	}
+}
+
+// spendAuthzFailure books one failed authorization against the identifier's hourly budget.
+//
+// This is one of the five failed authorizations per identifier per hour that Let's Encrypt allows.
+// Nobody spent it while a gauge for it was published anyway, and Remaining on a bucket nobody
+// writes returns Capacity by design -- so the number was structurally always full and the alert
+// built on it could never fire, on the limit a DNS-01 misconfiguration burns first.
+//
+// The scope matches the one publishQuota derives (the lowercased identifier), so the spend and the
+// gauge land on the same series.
+func (m *Manager) spendAuthzFailure(identifier string) {
+	if m.quota == nil {
+		return
+	}
+	m.quota.Spend(ratelimit.AuthzFailuresPerIdentifier, strings.ToLower(identifier), 1)
 }

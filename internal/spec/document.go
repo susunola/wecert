@@ -16,6 +16,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/susunola/wecert/internal/atomicfile"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/group"
 )
@@ -132,9 +133,14 @@ func LoadDocument(path string) (*Document, error) {
 		return nil, err
 	}
 
-	data, err := io.ReadAll(io.LimitReader(f, maxDocumentBytes))
+	data, err := io.ReadAll(io.LimitReader(f, maxDocumentBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read desired-state document: %w", err)
+	}
+	if len(data) > maxDocumentBytes {
+		return nil, fmt.Errorf("desired-state document %s is larger than %d bytes: refusing a "+
+			"truncated read, because a cut that lands on a certificate boundary parses as a complete "+
+			"document and would silently drop the rest of the fleet", path, maxDocumentBytes)
 	}
 
 	doc := &Document{}
@@ -177,14 +183,25 @@ const maxGeneratedAtSkew = time.Hour
 // maxDocumentBytes bounds a document read. A desired-state document for even a few
 // thousand names is far below this; the cap is here so a runaway generator cannot make
 // the daemon allocate without limit.
+//
+// The cap is enforced by reading one byte past it, not by truncating: a LimitReader silently cut
+// an oversized document, and a cut that happens to land on a certificate boundary parses as a
+// complete YAML document -- measured with 114,909 of 200,000 certificates, accepted as the desired
+// state. Acting on that strips the rest of the fleet from every certificate.
 const maxDocumentBytes = 16 << 20
 
 // openDocumentFile opens the document for reading, refusing to follow a symlink.
 //
 // O_NOFOLLOW makes the symlink refusal a property of the open call rather than of a
 // separate Lstat that a concurrent writer can invalidate between the two.
+//
+// O_NONBLOCK is what makes the regular-file check below reachable. open(2) on a FIFO with no
+// writer BLOCKS until one appears, so a FIFO planted at desiredState.path hung the daemon inside
+// newProvider -- before metrics, the webhook and the snapshots start -- and a Type=simple unit
+// never notices. With O_NONBLOCK the open returns immediately, the stat below sees a non-regular
+// file, and the reader refuses it. On a regular file the flag is a no-op.
 func openDocumentFile(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EMLINK) {
 			return nil, fmt.Errorf("the desired-state document %s is a symlink; refusing to follow it -- point the config at the real file", path)
@@ -388,44 +405,12 @@ func WriteDocumentUnchecked(path string, doc *Document) error {
 		return fmt.Errorf("encode desired-state document: %w", err)
 	}
 
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".desired-state-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp file in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	// Every failure path must remove the temp file, or the directory slowly fills
-	// with junk.
-	defer func() {
-		if tmpName != "" {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.WriteString(DocumentHeader); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write document header: %w", err)
-	}
-	if _, err := tmp.Write(body); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write document body: %w", err)
-	}
-	// fsync before rename: otherwise a power loss can leave behind a renamed,
-	// zero-byte document whose contents never reached disk.
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("sync document: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close document: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return fmt.Errorf("chmod document: %w", err)
-	}
-
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("replace %s: %w", path, err)
-	}
-	tmpName = "" // Already renamed away; do not delete.
-	return nil
+	// 0644: the document is read by the enforcement half of the deployment and by humans, and it
+	// holds no secrets -- but it does decide which names are served, which is why the reader
+	// refuses a group- or world-writable one and why the shared writer installs it by rename.
+	//
+	// The protocol (temp file in the same directory, fsync, permissions before the rename, rename,
+	// sync the directory) lives in internal/atomicfile: this writer, the onboarding report and the
+	// onboarding state file each grew their own copy and they had already drifted.
+	return atomicfile.Write(path, append([]byte(DocumentHeader), body...), 0o644)
 }

@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -47,7 +48,7 @@ type fakeManager struct {
 	reaped int
 
 	// quotaScopes records every PublishQuota call.
-	quotaScopes []map[string]string
+	quotaScopes []map[string][]string
 
 	// pendingRevocations drives PendingRevocations, and revocationRetries counts the
 	// retry calls, so a test can assert the gate is honoured. pendingRevocationsErr makes the
@@ -60,6 +61,12 @@ type fakeManager struct {
 	onReconcile func(name string)
 
 	reapBefore chan struct{}
+
+	// orphanEntered is signalled on every CleanupOrphan, and orphanRelease makes it block until
+	// closed. Together they hold the orphan teardown open so a test can observe what may happen
+	// while it runs.
+	orphanEntered chan struct{}
+	orphanRelease chan struct{}
 }
 
 func (f *fakeManager) Reconcile(_ context.Context, c *config.Certificate) error {
@@ -112,16 +119,33 @@ func (f *fakeManager) RetryPendingRevocations(context.Context) {
 	f.revocationRetries++
 }
 
-func (f *fakeManager) PublishQuota(scopes map[string]string) {
+func (f *fakeManager) PublishQuota(scopes map[string][]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.quotaScopes = append(f.quotaScopes, scopes)
 }
 
-func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
+// publishedQuota returns the scopes of every PublishQuota call so far.
+func (f *fakeManager) publishedQuota() []map[string][]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return append([]map[string][]string(nil), f.quotaScopes...)
+}
+
+func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
+	f.mu.Lock()
 	f.cleaned = append(f.cleaned, certName)
+	entered, release := f.orphanEntered, f.orphanRelease
+	f.mu.Unlock()
+
+	// Blocking happens outside the mutex: a test holds this call open while it reads the
+	// reconciler's own state, and holding the fake's lock would deadlock that read.
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
 	return nil
 }
 
@@ -186,7 +210,7 @@ func TestNotifierReceivesRenewalResult(t *testing.T) {
 	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
 	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	select {
 	case ev := <-notifier.events:
@@ -212,7 +236,7 @@ func TestNotifierReceivesFailure(t *testing.T) {
 	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
 	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	select {
 	case ev := <-notifier.events:
@@ -339,7 +363,7 @@ func TestStartAllSkipsBusyCerts(t *testing.T) {
 	close(release)
 }
 
-func TestRunAllSkipsBusyCerts(t *testing.T) {
+func TestAPassSkipsBusyCerts(t *testing.T) {
 	const busy = "busy-runall"
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -355,9 +379,9 @@ func TestRunAllSkipsBusyCerts(t *testing.T) {
 	go func() { _ = r.RunCert(context.Background(), busy) }()
 	<-entered
 
-	skipped := r.RunAll(context.Background())
+	skipped := r.RunDetailed(context.Background()).Skipped
 	if len(skipped) != 1 || skipped[0] != busy {
-		t.Errorf("RunAll should skip %q, got %v", busy, skipped)
+		t.Errorf("a pass should skip %q, got %v", busy, skipped)
 	}
 	close(release)
 }
@@ -385,16 +409,16 @@ func TestCertNamesPreservesConfigOrder(t *testing.T) {
 	}
 }
 
-// This is the entire reason RunOnce exists: one exploding certificate must not
+// This is the entire reason a pass does not abort: one exploding certificate must not
 // stall the others' renewals. The most dangerous thing in automation is that
 // coupling — one mistyped domain and no certificate on the site renews.
-func TestRunOnceContinuesAfterOneCertFails(t *testing.T) {
+func TestAPassContinuesAfterOneCertFails(t *testing.T) {
 	mgr := &fakeManager{failWith: map[string]error{
 		"b": errors.New("boom"),
 	}}
 	r, _ := newTestReconciler(t, []string{"a", "b", "c"}, mgr)
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if len(mgr.calls) != 3 {
 		t.Fatalf("all three certificates should be processed, only got %v", mgr.calls)
@@ -408,11 +432,11 @@ func TestRunOnceContinuesAfterOneCertFails(t *testing.T) {
 	}
 }
 
-func TestRunOnceReapsRetiredCerts(t *testing.T) {
+func TestAPassReapsRetiredCerts(t *testing.T) {
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"only"}, mgr)
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if mgr.reaped != 1 {
 		t.Errorf("every pass should reap retired certificates once, got %d", mgr.reaped)
@@ -420,14 +444,14 @@ func TestRunOnceReapsRetiredCerts(t *testing.T) {
 }
 
 // After a stop signal, no further certificates should be processed.
-func TestRunOnceStopsOnContextCancel(t *testing.T) {
+func TestAPassStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	mgr := &fakeManager{onReconcile: func(string) { cancel() }}
 	r, _ := newTestReconciler(t, []string{"a", "b", "c"}, mgr)
 
-	r.RunOnce(ctx)
+	r.RunDetailed(ctx)
 
 	if len(mgr.calls) != 1 {
 		t.Errorf("after cancellation it should stop at the first, processed %v", mgr.calls)
@@ -443,9 +467,9 @@ func TestPublishExportsNotAfter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
-	got := testutil.ToFloat64(metrics.CertNotAfter.WithLabelValues("pub-notafter"))
+	got := testutil.ToFloat64(metrics.CertNotAfter.WithLabelValues("pub-notafter", "classic"))
 	if int64(got) != notAfter.Unix() {
 		t.Errorf("CertNotAfter = %d, want %d", int64(got), notAfter.Unix())
 	}
@@ -464,7 +488,7 @@ func TestPublishDeployedRequiresConfirmation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.CertDeployed.WithLabelValues(name)); got != 0 {
 		t.Errorf("CertDeployed should be 0 when the binding is unconfirmed, got %v", got)
 	}
@@ -476,7 +500,7 @@ func TestPublishDeployedRequiresConfirmation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.CertDeployed.WithLabelValues(name)); got != 1 {
 		t.Errorf("CertDeployed should be 1 after confirmation, got %v", got)
 	}
@@ -489,7 +513,7 @@ func TestPublishMissingCertIsNoop(t *testing.T) {
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{name}, mgr)
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	// The point is no panic. The metric should be at its default 0 here.
 	if got := testutil.ToFloat64(metrics.CertConsecutiveFailures.WithLabelValues(name)); got != 0 {
@@ -497,7 +521,7 @@ func TestPublishMissingCertIsNoop(t *testing.T) {
 	}
 }
 
-func TestRunOnceCountsFailuresInMetrics(t *testing.T) {
+func TestAPassCountsFailuresInMetrics(t *testing.T) {
 	const name = "pub-failcount"
 	mgr := &fakeManager{failWith: map[string]error{name: errors.New("boom")}}
 	r, store := newTestReconciler(t, []string{name}, mgr)
@@ -506,7 +530,7 @@ func TestRunOnceCountsFailuresInMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if got := testutil.ToFloat64(metrics.CertConsecutiveFailures.WithLabelValues(name)); got != 3 {
 		t.Errorf("the consecutive failure count should surface as 3, got %v", got)
@@ -547,7 +571,7 @@ func TestUnreadableSourceSkipsThePassEntirely(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	before := testutil.ToFloat64(metrics.DesiredStateErrors)
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if len(mgr.calls) != 0 {
 		t.Errorf("an unreadable source should process no certificates, processed %v", mgr.calls)
@@ -583,7 +607,7 @@ func TestOrphanedCertificatesAreReported(t *testing.T) {
 
 	r := New(cfg, spec.NewStatic(cfg.Certificates), store, &fakeManager{}, nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	r.RunOnce(context.Background())
+	r.RunDetailed(context.Background())
 
 	if got := testutil.ToFloat64(metrics.OrphanedCertificates); got != 1 {
 		t.Errorf("should report 1 orphaned certificate, got %v", got)
@@ -769,7 +793,7 @@ func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
 		}
 	}
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if !hasCertSeries(t, "gone") || !hasCertSeries(t, "kept") {
 		t.Fatal("both certificates should be exported after the first pass")
 	}
@@ -777,7 +801,7 @@ func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
 	// The declaration disappears.
 	prov.set(config.Certificate{Name: "kept"})
 	cfg.Certificates = []config.Certificate{{Name: "kept"}}
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	if hasCertSeries(t, "gone") {
 		t.Error("the removed certificate's series must be reclaimed, or its frozen " +
@@ -790,7 +814,7 @@ func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
 
 // RunCert asks for one specific certificate, so its caller must hear the pass's
 // own failure -- reporting success while the pass errored makes a targeted
-// trigger look healthy when it was not. RunAll deliberately stays
+// trigger look healthy when it was not. A pass deliberately stays
 // fire-and-forget: one failing certificate must not stall the others.
 func TestRunCertPropagatesTheReconcileError(t *testing.T) {
 	boom := errors.New("boom")
@@ -899,7 +923,7 @@ func TestReconcileOneRecoversPanics(t *testing.T) {
 	}
 
 	// And a full pass must still reach the certificates after the panicking one.
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	calls := mgr.reconciled()
 	seen := map[string]bool{}
 	for _, n := range calls {
@@ -1007,7 +1031,7 @@ func TestOrphanCleanupIsWired(t *testing.T) {
 		t.Fatal("the prober should remember the host before the drop")
 	}
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	if cleaned := mgr.orphanCleaned(); len(cleaned) != 1 || cleaned[0] != gone {
 		t.Errorf("CleanupOrphan should be called exactly once, for %q, got %v", gone, cleaned)
@@ -1195,7 +1219,7 @@ func (panickingProber) Forget(string) {}
 // re-orders into the "5 certificates per exact set of identifiers / 7 days" limit.
 //
 // The claim is held here directly rather than by racing a real pass, so the assertion is
-// deterministic: publishOrphans runs at the top of RunAll, before the loop that claims.
+// deterministic: publishOrphans runs at the top of a pass, before the loop that claims.
 func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 	const (
 		gone = "in-flight-cert"
@@ -1233,7 +1257,7 @@ func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 		t.Fatal("acquiring the claim should succeed on a fresh reconciler")
 	}
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	if cleaned := mgr.orphanCleaned(); len(cleaned) != 0 {
 		t.Errorf("the orphan teardown ran for a certificate with a pass in flight (%v); "+
@@ -1242,7 +1266,7 @@ func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 
 	// Once the pass releases, the next round must reap it -- skipping must not mean losing.
 	r.release(gone)
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	if cleaned := mgr.orphanCleaned(); len(cleaned) != 1 || cleaned[0] != gone {
 		t.Errorf("after the claim is released the orphan must be reaped exactly once, got %v", cleaned)
@@ -1280,7 +1304,7 @@ func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
 	// earlier run already counted it".
 	before := reconcileCounts(t, name)
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	// No notification: nothing was attempted.
 	select {
@@ -1336,7 +1360,7 @@ func TestGenuineFailureStillCountsAndNotifies(t *testing.T) {
 
 	before := reconcileCounts(t, name)
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 
 	select {
 	case ev := <-notifier.events:
@@ -1404,7 +1428,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 
 	// Nothing outstanding: the pass must not even ask the manager to retry, and the gauge must say
 	// so -- an operator reading wecert_revocation_pending at rest has to see 0, not nothing at all.
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if mgr.revocationRetries != 0 {
 		t.Errorf("with nothing outstanding the pass must skip the retry entirely, got %d calls",
 			mgr.revocationRetries)
@@ -1419,7 +1443,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 	mgr.pendingRevocations = 1
 	mgr.mu.Unlock()
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if mgr.revocationRetries != 1 {
 		t.Errorf("an outstanding revocation must be retried on the pass, got %d calls",
 			mgr.revocationRetries)
@@ -1429,7 +1453,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 			got)
 	}
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if mgr.revocationRetries != 2 {
 		t.Errorf("it must be retried on every pass until it succeeds, got %d calls",
 			mgr.revocationRetries)
@@ -1440,7 +1464,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 	mgr.pendingRevocations = 0
 	mgr.mu.Unlock()
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if mgr.revocationRetries != 2 {
 		t.Errorf("an accepted revocation must not be retried again, got %d calls",
 			mgr.revocationRetries)
@@ -1455,7 +1479,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 	mgr.mu.Lock()
 	mgr.pendingRevocations = 2
 	mgr.mu.Unlock()
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.RevocationPending); got != 2 {
 		t.Fatalf("setup: the gauge must track the count before the failure, got %v", got)
 	}
@@ -1466,7 +1490,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 	mgr.pendingRevocationsErr = errors.New("state.db is unreadable")
 	mgr.mu.Unlock()
 
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.RevocationPending); got != 2 {
 		t.Errorf("a failed read must leave wecert_revocation_pending stale, not rewrite it to %v",
 			got)
@@ -1491,7 +1515,7 @@ func TestOnlyAFullPassStampsLastReconcile(t *testing.T) {
 	metrics.LastReconcile.Set(0)
 
 	started := time.Now().Add(-time.Second).Unix()
-	r.RunAll(context.Background())
+	_ = r.RunDetailed(context.Background())
 	if got := testutil.ToFloat64(metrics.LastReconcile); got < float64(started) {
 		t.Errorf("a completed pass must stamp wecert_last_reconcile_timestamp_seconds with the time "+
 			"it finished; got %v, which is not after the pass started", got)
@@ -1512,5 +1536,392 @@ func TestOnlyAFullPassStampsLastReconcile(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.LastReconcile); got != 0 {
 		t.Errorf("StartAll must not stamp the pass timestamp, got %v", got)
+	}
+}
+
+// A webhook-triggered pass must publish the rate-limit gauges when it finishes.
+//
+// Publishing lived only at the end of RunDetailed, so the webhook path -- which spends quota and
+// records the CA's Retry-After exactly like a scheduled pass -- never refreshed either gauge. A
+// deadline shorter than the polling interval (an hour by default) was then never visible as
+// blocked, which is the whole window it describes: WecertRateLimitBlocked could not fire for it.
+// The publish also has to come *after* the pass, or the spend it just made is not in the number.
+func TestAWebhookTriggeredPassPublishesQuotaWhenItFinishes(t *testing.T) {
+	started := make(chan struct{}, 4)
+	hold := make(chan struct{})
+	mgr := &fakeManager{onReconcile: func(string) {
+		started <- struct{}{}
+		<-hold
+	}}
+	r, _ := newTestReconciler(t, []string{"webhook-a"}, mgr)
+
+	if _, _, err := r.StartAll(context.Background()); err != nil {
+		t.Fatalf("StartAll failed: %v", err)
+	}
+	<-started
+
+	// The pass is in flight (blocked inside Reconcile), so nothing has been spent or decided yet.
+	if n := len(mgr.publishedQuota()); n != 0 {
+		t.Errorf("the gauges must be published when the pass finishes, not before it runs; got %d "+
+			"call(s) while the pass was still in flight", n)
+	}
+
+	close(hold)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(mgr.publishedQuota()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a webhook-triggered pass must publish the rate-limit gauges; otherwise a quota " +
+				"spend and the CA's deadline stay invisible until the next scheduled round, which " +
+				"an hour away is too late for a deadline that is shorter than that")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The orphan teardown must hold the claim while it runs, not just look at it.
+//
+// The check that protects an in-flight pass from having its TXT records and order deleted
+// underneath it used to read the claim and release the lock immediately, so a webhook-triggered
+// pass could claim the name in the gap before CleanupOrphan ran -- the exact destructive
+// interleaving the check exists to prevent. It is reachable: the desired state is resolved twice
+// (once by the pass that sees the name as an orphan, once by the webhook after the declaration was
+// restored), and a document revision can land in between.
+func TestTheOrphanTeardownHoldsTheClaimWhileItRuns(t *testing.T) {
+	const orphan = "orphan-cert"
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	mgr := &fakeManager{orphanEntered: entered, orphanRelease: release}
+	r, store := newTestReconciler(t, []string{"kept"}, mgr)
+
+	// In the store but not in the desired state: an orphan.
+	if err := store.PutCert(&state.CertState{Name: orphan}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.RunDetailed(context.Background())
+	}()
+	<-entered
+
+	// The teardown is inside CleanupOrphan. Anything that wants to claim this name now has to be
+	// refused -- that is what startCert asks, and a "yes" here means the pass would run against a
+	// name whose order and TXT records are being deleted.
+	if r.acquire(orphan) {
+		r.release(orphan)
+		t.Error("the teardown must hold the claim for its whole duration: a pass that claims the " +
+			"name now has its order and TXT records deleted underneath it, fails with a propagation " +
+			"error, and re-orders into the exact-set quota")
+	}
+
+	close(release)
+	<-done
+
+	// And the claim is released when the teardown ends, so the name is not wedged against every
+	// later pass.
+	if !r.acquire(orphan) {
+		t.Error("the teardown must release the claim when it finishes")
+	} else {
+		r.release(orphan)
+	}
+}
+
+// A panicking pass must still notify.
+//
+// The panic recover sits in a defer, so the notifier call at the end of reconcileOne is
+// unreachable while the stack unwinds: the pass was counted as an error and logged, but the
+// operator's channel heard nothing -- and a panic is precisely the failure that must not go quiet.
+func TestAPanickingPassStillNotifies(t *testing.T) {
+	const name = "boom"
+	mgr := &fakeManager{onReconcile: func(n string) {
+		if n == name {
+			panic("simulated nil map write")
+		}
+	}}
+	notifier := newFakeNotifier()
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, notifier,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err := r.RunCert(context.Background(), name); err == nil {
+		t.Fatal("the pass must report the panic as a failure")
+	}
+
+	select {
+	case ev := <-notifier.events:
+		if ev.cert != name {
+			t.Errorf("notification was for %q, want %q", ev.cert, name)
+		}
+		if ev.err == nil {
+			t.Error("the notified result must be the failure, not a success")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a panicking pass emitted no notification: the recover unwinds past the notifier, " +
+			"so the one failure an operator must hear about is the one that goes quiet")
+	}
+}
+
+// Shutdown must wait for a webhook-triggered pass.
+//
+// The accepted pass writes the promotion, the resume anchor and the failure counter, and the caller
+// closes the state store as soon as it returns. Nothing used to wait for them: on SIGTERM the
+// daemon returned and the deferred Close() closed SQLite under a pass still mid-renewal, so its
+// epilogue failed -- and the worst case is named in the code itself: an exit between an upload
+// returning an id and PutOrder recording it leaves a cloud certificate in neither table, billed and
+// never reclaimed.
+func TestDrainWaitsForABackgroundPass(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+
+	mgr := &fakeManager{onReconcile: func(string) {
+		entered <- struct{}{}
+		<-release
+	}}
+	r, _ := newTestReconciler(t, []string{"a"}, mgr)
+
+	if err := r.StartCert(context.Background(), "a"); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+
+	drained := make(chan error, 1)
+	go func() { drained <- r.Drain(context.Background()) }()
+
+	select {
+	case <-drained:
+		close(release)
+		t.Fatal("Drain returned while a pass was still running: the store would be closed under it")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Errorf("Drain reported %v after the pass finished", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain never returned after the pass finished")
+	}
+}
+
+// A pass that cannot be interrupted must not hang shutdown forever.
+//
+// lego's low-level API is context-free, so a pass inside a CA call cannot be cancelled; the caller
+// bounds the wait and says what a timeout means.
+func TestDrainIsBounded(t *testing.T) {
+	hold := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	defer close(hold)
+
+	mgr := &fakeManager{onReconcile: func(string) {
+		entered <- struct{}{}
+		<-hold
+	}}
+	r, _ := newTestReconciler(t, []string{"a"}, mgr)
+
+	if err := r.StartCert(context.Background(), "a"); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := r.Drain(ctx); err == nil {
+		t.Error("a pass that cannot finish must be reported, so the operator knows the store is " +
+			"about to be closed under it")
+	}
+}
+
+// A pass may not be admitted once Drain has been called.
+//
+// Drain's contract is that the state store is safe to close when it returns, and a pass admitted
+// afterwards breaks it in two ways: it writes its promotion, resume anchor and failure counter into
+// a database that is already closed, and registering it is a sync.WaitGroup misuse (an Add that
+// starts from a zero counter concurrent with Wait), which Go answers with the process-fatal
+// "sync: WaitGroup is reused before previous Wait has returned". The webhook's HTTP shutdown is
+// asynchronous, so a trigger arriving during shutdown reaches exactly this path.
+func TestAPassStartedAfterDrainIsRefused(t *testing.T) {
+	mgr := &fakeManager{}
+	r, _ := newTestReconciler(t, []string{"a", "b"}, mgr)
+
+	if err := r.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain with no pass in flight: %v", err)
+	}
+
+	if err := r.StartCert(context.Background(), "a"); !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("StartCert after Drain must be refused with ErrShuttingDown, got %v", err)
+	}
+	if _, _, err := r.StartAll(context.Background()); !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("StartAll after Drain must be refused with ErrShuttingDown, got %v", err)
+	}
+	if _, _, _, err := r.StartNamed(context.Background(), []string{"a", "b"}); !errors.Is(err, ErrShuttingDown) {
+		t.Errorf("StartNamed after Drain must be refused with ErrShuttingDown, got %v", err)
+	}
+
+	// A refusal, not a pass that runs anyway. (No goroutine was started, so reading the record
+	// without the mutex is safe.)
+	if len(mgr.calls) != 0 {
+		t.Errorf("no pass may run after Drain returned, these did: %v", mgr.calls)
+	}
+}
+
+// A refused trigger must not be reported as "already running".
+//
+// The webhook maps a start error to the "skipped" bucket, which means "already running" -- so
+// answering ErrAlreadyRunning for a shutdown would tell the caller to poll for a pass that will
+// never happen.
+func TestAShutdownRefusalIsNotReportedAsAlreadyRunning(t *testing.T) {
+	mgr := &fakeManager{}
+	r, _ := newTestReconciler(t, []string{"a"}, mgr)
+	if err := r.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	started, running, unknown, err := r.StartNamed(context.Background(), []string{"a"})
+	if !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("want ErrShuttingDown, got %v", err)
+	}
+	if len(started) != 0 || len(running) != 0 || len(unknown) != 0 {
+		t.Errorf("a refused trigger must report nothing but the error, got started=%v running=%v unknown=%v",
+			started, running, unknown)
+	}
+}
+
+// Registering a pass and entering Drain must not race.
+//
+// This is the window bgMu exists for: startCert's registration (bg.Add) running concurrently with
+// Drain's bg.Wait. Without the lock this test fails with the process-fatal "sync: WaitGroup is
+// reused before previous Wait has returned" panic, and -race reports the Add/Wait pair as a data
+// race. Each iteration builds its own reconciler because draining is terminal by design.
+func TestStartingAPassDoesNotRaceWithDrain(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		mgr := &fakeManager{}
+		r, _ := newTestReconciler(t, []string{"a", "b", "c", "d"}, mgr)
+
+		begin := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-begin
+			_, _, _ = r.StartAll(context.Background())
+		}()
+		go func() {
+			defer wg.Done()
+			<-begin
+			_ = r.Drain(context.Background())
+		}()
+		close(begin)
+		wg.Wait()
+
+		// Whatever the interleaving, nothing may be left running once Drain returns: a pass
+		// admitted before the transition is waited for, and one attempted after it is refused.
+		if err := r.Drain(context.Background()); err != nil {
+			t.Fatalf("iteration %d: Drain after the race reported %v", i, err)
+		}
+	}
+}
+
+// A probe floor the desired state cannot satisfy must be reported, not silently ignored.
+//
+// In enforce mode config.normalize sees an empty certificate list -- the document is the only source
+// of certificates -- so its probe.minValidFor check never runs. The floor then fails every probe of
+// a shortlived certificate, which pins wecert_certificate_probe_match at 0 and fires the critical
+// "not serving the deployed certificate" alert with a diagnosis that blames the rebind or SNI. The
+// pass must say what the real cause is. It must not refuse to renew: the document may change between
+// passes, and a monitoring misconfiguration is not a reason to stop issuing.
+func TestAProbeFloorTheDocumentCannotSatisfyIsReported(t *testing.T) {
+	mgr := &fakeManager{}
+	provider := &mutableProvider{}
+	provider.set(config.Certificate{
+		Name: "short", Profile: config.ProfileShortLived, Domains: []string{"short.example.com"},
+	})
+
+	var logs bytes.Buffer
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{}
+	cfg.Probe.MinValidDur = 168 * time.Hour
+	r := New(cfg, provider, store, mgr, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	// A certificate with no stored state is attempted, which is what makes this a pass rather
+	// than an empty sweep; the manager is a fake, so nothing else is needed.
+	r.RunDetailed(context.Background())
+
+	if got := logs.String(); !strings.Contains(got, "probe's minimum remaining validity") ||
+		!strings.Contains(got, "short") {
+		t.Errorf("the pass must report the unsatisfiable probe floor and name the certificate, got:\n%s", got)
+	}
+	if len(mgr.calls) == 0 {
+		t.Error("a probe-setting mismatch must not stop the certificate from being renewed")
+	}
+}
+
+// The gauges must cover every managed scope, not one representative per limit family.
+//
+// Publishing only the first certificate's first domain left the per-domain families with a single
+// series: the alert that compares against them could not fire for any other domain, and for a fleet
+// laid out one certificate per domain that is every domain but one. Each family gets every scope
+// the resolved desired state actually spends against, deduplicated (a wildcard and its apex share a
+// registered domain; a multi-name certificate appears once).
+func TestQuotaPublishingCoversEveryManagedScope(t *testing.T) {
+	mgr := &fakeManager{}
+	r, _ := newTestReconciler(t, []string{"a-example-com", "b-example-com"}, mgr)
+
+	// newTestReconciler builds certificates with no domains, so give them real ones through the
+	// provider the pass resolves.
+	spec := spec.NewStatic([]config.Certificate{
+		{Name: "a-example-com", Domains: []string{"a.example.com", "*.a.example.com"}},
+		{Name: "b-example-com", Domains: []string{"b.example.com", "other.test"}},
+	})
+	r = New(r.cfg, spec, r.store, mgr, nil, r.log)
+
+	r.RunDetailed(context.Background())
+
+	published := mgr.publishedQuota()
+	if len(published) == 0 {
+		t.Fatal("a pass must publish the rate-limit gauges")
+	}
+	got := published[len(published)-1]
+
+	inList := func(list []string, want string) bool {
+		for _, got := range list {
+			if got == want {
+				return true
+			}
+		}
+		return false
+	}
+	for _, want := range []string{"a.example.com", "b.example.com", "other.test"} {
+		if !inList(got["identifier"], want) {
+			t.Errorf("identifier scope %q is missing from %v; its series does not exist, so the "+
+				"exhaustion alert cannot fire for it", want, got["identifier"])
+		}
+	}
+	for _, want := range []string{"example.com", "other.test"} {
+		if !inList(got["registered-domain"], want) {
+			t.Errorf("registered-domain scope %q is missing from %v", want, got["registered-domain"])
+		}
+	}
+	if n := len(got["registered-domain"]); n != 2 {
+		t.Errorf("the registered domains are deduplicated (a wildcard shares its apex's), got %d: %v",
+			n, got["registered-domain"])
+	}
+	if n := len(got["exact-identifier-set"]); n != 2 {
+		t.Errorf("one identifier set per certificate, got %d: %v", n, got["exact-identifier-set"])
 	}
 }
