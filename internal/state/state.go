@@ -289,10 +289,26 @@ func LockFile(path string) (unlock func() error, err error) {
 }
 
 func open(path string, exclusive bool) (*Store, error) {
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create state dir %s: %w", dir, err)
 		}
+	}
+
+	// Both of these are warnings, not refusals, and the difference is deliberate.
+	//
+	// A symlinked statePath is a legitimate, common arrangement -- state.db on a different volume,
+	// or a staging symlink during a migration -- and refusing it would break a working deployment
+	// to prevent a hazard that needs a hostile local user. The hazard is real, though: the file is
+	// opened through the link (no O_NOFOLLOW), so whoever can write the target's directory can have
+	// this process create the schema and the ACME account key inside a file of their choosing. A
+	// shared-writable state directory has the same shape for a different reason: 0600 on state.db
+	// stops another user from READING it, not from unlinking it and creating their own in its place.
+	// Both are stated plainly and left to the operator, because this program cannot tell "my
+	// operator symlinked it on purpose" from "someone is redirecting my writes".
+	for _, w := range statePathWarnings(path, dir) {
+		fmt.Fprintf(os.Stderr, "wecert: WARNING: %s\n", w)
 	}
 
 	// Sample both facts BEFORE the lock is taken, not after.
@@ -453,6 +469,39 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 		}
 	}
 	return s, nil
+}
+
+// statePathWarnings words the two local-filesystem hazards around the state database.
+//
+// Split out so the wording and the decision are testable without capturing stderr from open(),
+// exactly like missingDatabaseWarning. Empty means "nothing to say".
+func statePathWarnings(path, dir string) []string {
+	var out []string
+
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		target := ""
+		if resolved, rerr := filepath.EvalSymlinks(path); rerr == nil {
+			target = resolved
+		}
+		out = append(out, fmt.Sprintf(
+			"the state database %s is a symlink (to %s). That is allowed, but this process writes "+
+				"through it: anyone who can write the target's directory can have wecert create the "+
+				"schema and the ACME account key in a file they choose. If the symlink is not yours, "+
+				"point statePath at the real file", path, target))
+	}
+
+	if dir != "" && dir != "." {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+				out = append(out, fmt.Sprintf(
+					"the state directory %s is group- or world-writable (%04o). state.db itself is "+
+						"0600, which stops another user reading it, but not unlinking it and putting "+
+						"their own file in its place. 0700 is what the shipped systemd unit sets "+
+						"(StateDirectoryMode)", dir, perm))
+			}
+		}
+	}
+	return out
 }
 
 // missingDatabaseWarning words the "there was a database here and now there is not" case.

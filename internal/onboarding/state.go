@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/susunola/wecert/internal/atomicfile"
 	"os"
-	"path/filepath"
 	"sort"
 	"time"
 )
@@ -83,37 +83,9 @@ func (s *State) Save(path string) error {
 	}
 	data = append(data, '\n')
 
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".onboard-state-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp state file in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		if tmpName != "" {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write onboarding state: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("sync onboarding state: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close onboarding state: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		return fmt.Errorf("chmod onboarding state: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("replace %s: %w", path, err)
-	}
-	tmpName = ""
-	return nil
+	// 0600: the file names the domains this deployment serves, and the grace-period clock that
+	// decides when one is dropped.
+	return atomicfile.Write(path, data, 0o600)
 }
 
 // MarkPresent clears a name's absence marker. The name is back, so the grace

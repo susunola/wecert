@@ -28,11 +28,11 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/susunola/wecert/internal/atomicfile"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/spec"
@@ -1593,48 +1593,17 @@ func sortDecisions(ds []spec.Decision) {
 	})
 }
 
+// writeJSONAtomic replaces the report in one step.
+//
+// The temp+fsync+rename protocol lives in internal/atomicfile: this writer, the desired-state
+// document and the onboarding state file each had their own copy, and the copies had drifted (this
+// one was missing the fsync, so a crash could leave a renamed, truncated report behind a round that
+// otherwise completed).
 func writeJSONAtomic(path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", path, err)
 	}
 	data = append(data, '\n')
-
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".onboard-report-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp file in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		if tmpName != "" {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	// fsync before the rename, like the document writer and the state writer.
-	//
-	// Both of them do this; the report did not, so a crash (or a full disk losing the tail of the
-	// page cache) could leave a renamed, truncated -- even zero-byte -- report behind after a round
-	// that otherwise completed. The report is the artifact a human reads to find out what the round
-	// decided, and "it exists exactly when the round completed" is the contract Commit documents.
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("sync %s: %w", path, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", path, err)
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return fmt.Errorf("chmod %s: %w", path, err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("replace %s: %w", path, err)
-	}
-	tmpName = ""
-	return nil
+	return atomicfile.Write(path, data, 0o644)
 }
