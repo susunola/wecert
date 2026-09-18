@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"net"
 	"strings"
@@ -566,5 +567,37 @@ func TestResolveFailureMarksProbeMatchZero(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.CertificateProbeMatch.WithLabelValues(host)); got != 0 {
 		t.Errorf("probe_match must drop to 0 when the name cannot be resolved, got %v (stale 1)", got)
+	}
+}
+
+// A name with more addresses than the cap is reported as unverified, never sampled.
+//
+// Every resolved address has to be checked -- a rebind takes effect per backend -- so "here are the
+// first N" would be a claim the probe cannot support, and it would be indistinguishable from a
+// clean verdict. The cap exists so one name cannot spend an unbounded slice of a pass: the cost of
+// probing is len(addresses) dials of up to Timeout each, inside that certificate's own pass claim.
+func TestTooManyAddressesIsRefusedRatherThanSampled(t *testing.T) {
+	ips := make([]string, 0, maxProbeAddresses+1)
+	for i := 0; i <= maxProbeAddresses; i++ {
+		ips = append(ips, fmt.Sprintf("192.0.2.%d", i%256))
+	}
+
+	// The resolver is not injectable, so the decision is tested where it is made: the cap is a
+	// comparison against maxProbeAddresses, and this asserts the documented boundary.
+	if maxProbeAddresses < 8 {
+		t.Fatalf("the cap must be comfortably above any real deployment, got %d", maxProbeAddresses)
+	}
+	if len(ips) <= maxProbeAddresses {
+		t.Fatalf("the fixture must exceed the cap, got %d addresses", len(ips))
+	}
+	err := capCheck("example.com", len(ips))
+	if err == nil {
+		t.Fatal("a name past the cap must produce an error, not a silent sample")
+	}
+	if !strings.Contains(err.Error(), "unverified") {
+		t.Errorf("the message has to say the name is unverified rather than probed, got %v", err)
+	}
+	if err := capCheck("example.com", maxProbeAddresses); err != nil {
+		t.Errorf("the cap itself must be allowed, got %v", err)
 	}
 }

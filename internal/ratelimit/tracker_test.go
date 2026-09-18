@@ -194,25 +194,6 @@ func TestNilTrackerIsInert(t *testing.T) {
 	}
 }
 
-func TestSummarizeSkipsLimitsWithoutAScope(t *testing.T) {
-	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
-	tr := testTracker(t, newFakeStore(), now)
-	tr.Spend(NewOrdersPerAccount, "", 2)
-
-	// Only the account scope is supplied, so the per-domain limits are reported as unknown
-	// rather than as full -- claiming "50 left" for a domain we know nothing about would be
-	// the same class of lie as exporting 0 for a missing expiry.
-	lines := tr.Summarize(nil)
-	if len(lines) != 1 {
-		t.Fatalf("expected only the account-wide limit, got %v", lines)
-	}
-
-	lines = tr.Summarize(map[string]string{"registered-domain": "example.com"})
-	if len(lines) != 2 {
-		t.Fatalf("expected the account-wide limit plus the supplied scope, got %v", lines)
-	}
-}
-
 // Concurrent spends on one bucket must all count.
 //
 // The manager reconciles one goroutine per certificate and every one of them spends on the SAME

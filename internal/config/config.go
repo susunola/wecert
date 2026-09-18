@@ -71,12 +71,6 @@ const (
 // and config must not import acme's dependency graph merely to ask.
 var acmeSupportsLegoProviders = false
 
-// SetLegoProviderSupport exists for tests that need to exercise both answers of the validation in
-// one binary. The production value is set by this package's own build-tagged file
-// (lego_registry_tags.go / lego_registry_notags.go), so it can never depend on which packages a
-// binary links.
-func SetLegoProviderSupport(available bool) { acmeSupportsLegoProviders = available }
-
 // profileMaxNames is the maximum identifier count each profile allows.
 // classic allows 100, but the newer tlsserver / shortlived only 25 — reject
 // locally rather than send an order the CA will refuse and burn quota on.

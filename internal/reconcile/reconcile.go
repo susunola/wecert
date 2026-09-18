@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,7 +85,7 @@ type CertManager interface {
 	// PublishQuota refreshes the rate-limit gauges. Optional in spirit -- a manager that has
 	// no quota accounting simply reports nothing -- but part of the interface because every
 	// production manager has one.
-	PublishQuota(scopes map[string]string)
+	PublishQuota(scopes map[string][]string)
 
 	// RetryPendingRevocations re-attempts every revocation the CA has not accepted yet.
 	RetryPendingRevocations(ctx context.Context)
@@ -634,23 +635,34 @@ func (r *Reconciler) publishQuota(res *spec.Result) {
 	if res == nil {
 		return
 	}
-	scopes := map[string]string{}
-	// One representative per family is enough for the account-wide limit, which is the one
-	// that gates everything; the per-domain families are reported for the first certificate
-	// because that is the bucket an operator is about to spend against when they add a name.
+	// Every scope this deployment actually spends against, not one representative per family.
+	//
+	// Publishing only the first certificate's first domain meant the per-domain and per-identifier
+	// series existed for exactly one scope: for the normal one-certificate-per-domain layout,
+	// WecertRateLimitNearlyExhausted could never fire for any other domain -- the series it
+	// compares against was simply absent, and an absent series reads as "nothing to see". The sets
+	// are deduplicated because two certificates routinely share a registered domain (a wildcard and
+	// its apex, a multi-name certificate).
+	registered := map[string]bool{}
+	identifiers := map[string]bool{}
+	sets := map[string]bool{}
 	for i := range res.Certificates {
 		c := &res.Certificates[i]
-		if _, ok := scopes["registered-domain"]; !ok && len(c.Domains) > 0 {
-			scopes["registered-domain"] = group.RegisteredDomain(c.Domains[0])
+		for _, d := range c.Domains {
+			if rd := group.RegisteredDomain(d); rd != "" {
+				registered[rd] = true
+			}
+			identifiers[strings.ToLower(d)] = true
 		}
-		if _, ok := scopes["exact-identifier-set"]; !ok {
-			scopes["exact-identifier-set"] = c.DomainKey()
-		}
-		if _, ok := scopes["identifier"]; !ok && len(c.Domains) > 0 {
-			scopes["identifier"] = strings.ToLower(c.Domains[0])
+		if key := c.DomainKey(); key != "" {
+			sets[key] = true
 		}
 	}
-	r.manager.PublishQuota(scopes)
+	r.manager.PublishQuota(map[string][]string{
+		"registered-domain":    sortedKeys(registered),
+		"exact-identifier-set": sortedKeys(sets),
+		"identifier":           sortedKeys(identifiers),
+	})
 }
 
 // retryRevocations re-attempts outstanding revocations and publishes how many remain.
@@ -1234,4 +1246,18 @@ func (r *Reconciler) publish(c *config.Certificate) {
 				"consecutiveFailures", st.ConsecutiveFailures, "lastError", st.LastError)
 		}
 	}
+}
+
+// sortedKeys returns a map's keys in a stable order.
+//
+// Stable because the published series feed an alert: an unstable order would not change the metric
+// values, but it does change the order of the Reset-then-Set window, and a reader comparing two
+// scrapes should not have to wonder whether a scope moved or a value changed.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

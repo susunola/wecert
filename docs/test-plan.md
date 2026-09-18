@@ -34,7 +34,7 @@
 | 层级 | 目标 | 现有资产 | 运行位置 | 频率 |
 |---|---|---|---|---|
 | **L0 静态门禁** | 格式、静态错误、已知 CVE、英文源码、图表不过期 | `gofmt`、`go vet`、`govulncheck`、`scripts/check-english.py`、`scripts/check-diagram-fit.py` | CI | 每次 push / PR |
-| **L1 单元** | 纯逻辑：集合运算、状态迁移、解析、退避 | 60 个测试文件、633 个测试函数 | CI（`-race`） | 每次 push / PR |
+| **L1 单元** | 纯逻辑：集合运算、状态迁移、解析、退避 | 76 个测试文件、787 个测试函数（`go test ./... -list 'Test.*' \| grep -c '^Test'`） | CI（`-race`） | 每次 push / PR |
 | **L2 集成（注入替身）** | 跨组件编排：订单状态机、DNS 传播、清理、收敛循环 | 注入式 exchange 函数、假状态库、`httptest` | CI | 每次 push / PR |
 | **L2.5 真实 DNS-01 端到端（本地，无需云凭证）** | 真 ACME 服务端 + 真权威 DNS（53 端口）+ 真 solver 写记录 + 真传播检查回读 + 真签发 | `internal/acme/e2e_dns_test.go`、`make e2e`、[实跑报告](e2e-run-2026-09-17.html) | 本地 / CI（Linux 需 `CAP_NET_BIND_SERVICE`） | 改动触及签发、DNS 或状态机时 |
 | **L3 端到端（staging）** | 真实 ACME + 真实 DNSPod 的全流程 | `docs/lifecycle-acceptance.md`、`scripts/e2e-test.sh` | 本地，人工 | 发版前 / 改动触及状态机时 |

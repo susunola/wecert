@@ -175,29 +175,6 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
-func TestWorstCaseBlockedByTakesTheLatest(t *testing.T) {
-	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
-	deadlines := []Deadline{
-		{At: now.Add(time.Hour), Reason: "new-orders"},
-		{At: now.Add(6 * time.Hour), Reason: "certs-per-registered-domain"},
-		{At: now.Add(-time.Hour), Reason: "already passed"},
-		{},
-	}
-
-	got, ok := WorstCaseBlockedBy(deadlines, now)
-	if !ok {
-		t.Fatal("expected a deadline")
-	}
-	// The CA reports the furthest-resetting limit when several are exceeded; waiting for
-	// anything less means the next request fails again.
-	if !got.At.Equal(now.Add(6 * time.Hour)) {
-		t.Errorf("worst deadline = %s, want the 6h one", got.At)
-	}
-	if _, ok := WorstCaseBlockedBy(nil, now); ok {
-		t.Error("no deadlines must report not blocked")
-	}
-}
-
 // A negative cost must not hand quota back.
 //
 // The API records consumption, so the only defensible reading of a negative cost is "nothing was

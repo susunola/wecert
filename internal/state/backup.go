@@ -2,6 +2,7 @@ package state
 
 import (
 	"fmt"
+	"github.com/susunola/wecert/internal/atomicfile"
 	"os"
 	"path/filepath"
 	"sort"
@@ -108,12 +109,12 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 	if execErr != nil {
 		return "", fmt.Errorf("snapshot state database: %w", execErr)
 	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		return "", fmt.Errorf("tighten snapshot permissions: %w", err)
-	}
-	if err := os.Rename(tmpName, final); err != nil {
+	// The permissions are set on the temporary file and the rename is made durable by
+	// internal/atomicfile, which is where the protocol lives.
+	if err := atomicfile.Install(tmpName, final, 0o600, dir); err != nil {
 		return "", fmt.Errorf("install snapshot %s: %w", final, err)
 	}
+	tmpName = ""
 	// Verify the rename landed before pruning, so a failure here cannot leave us with
 	// fewer snapshots than before.
 	if _, err := os.Stat(final); err != nil {
