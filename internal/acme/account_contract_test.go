@@ -29,7 +29,7 @@ func accountFixture(t *testing.T) (*fakeACME, *state.Store, *config.Config) {
 
 	cfg := &config.Config{}
 	cfg.ACME.Directory = fake.srv.URL + "/directory"
-	cfg.ACME.Email = "ops@example.com"
+	cfg.ACME.Email = "ops@atomwangnus.com"
 	return fake, store, cfg
 }
 

@@ -15,13 +15,15 @@ They are ordered by real exposure over effort.
 
    `SECURITY.md` documents a fallback — an empty public issue asking for a private channel — because the real channel is **off** in this repository (the API reports `"enabled": false`). One setting, and it removes an awkward step from the only path a reporter has.
 
-3. **Finish off-host snapshots and one-command restore (option A in docs/availability.md)**
+3. **Finish off-host snapshots (option A in docs/availability.md)**
 
-   The real availability exposure. Process death is already covered by `Restart=on-failure` plus resumable orders, and host loss is bounded by `state.db` living on local disk — so a second wecert process on the same host shares its fate and duplicates what systemd already does. The snapshot machinery (`VACUUM INTO`, retention, the documented restore procedure) already exists; what is missing is getting the file off the host automatically and making restore one command instead of a sequence. Needs a decision that is not mine to make: where the snapshots go, and what RTO is being bought.
+   The real availability exposure. Process death is already covered by `Restart=on-failure` plus resumable orders, and host loss is bounded by `state.db` living on local disk — so a second wecert process on the same host shares its fate and duplicates what systemd already does. The snapshot machinery (`VACUUM INTO`, retention) already exists, and **restore is now one command**: `wecert -restore latest` keeps the database it replaced, moves the `-wal`/`-shm` with it, verifies the snapshot before touching anything, and records the rate-limit caveat for the next start. What is still missing is getting the file off the host automatically. Needs a decision that is not mine to make: where the snapshots go, and what RTO is being bought.
 
-4. **Guard against restoring a stale snapshot**
+4. **Notice a state database that was restored without `wecert -restore`**
 
-   A real, unhandled operational risk. An operator restores a snapshot from several days ago, so `NextAttemptAt`, the ARI window and the rate-limit buckets all move backwards; wecert then believes it has spent nothing and tries to issue — while the exact-set limit is a 7-day window with no override. Startup should notice that the store is far older than the wall clock and refuse, or degrade to read-only.
+   Half done, and the remaining half is the awkward one. `wecert -restore` writes `state.db.restored`, and the next start warns for seven days that the rate-limit ledger stops at the snapshot (`state.RestoreCaveatWindow`); what is still invisible is the hand path — `cp snapshot state.db`, which is what docs/recovery.md documented for years. Nothing inside the file records that it was swapped in, so `NextAttemptAt`, the ARI window and the rate-limit buckets can all move backwards in silence.
+
+   The tempting signal is "the file's mtime is much newer than the newest row in it", and it is a false-positive generator: SQLite checkpoints the WAL at open and at close, so a daemon that wrote once and then idled for a week has exactly that signature after an ordinary restart. Ruling that out needs something the file does not carry today — a heartbeat row, or a start/stop ledger — and a warning that also fires on legitimate restarts teaches the reader to ignore the one that matters. Worth doing only once that design is settled; until then the answer is "restore through the command, which records it".
 
 5. **Sign the release artifacts**
 

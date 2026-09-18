@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,28 +23,46 @@ import (
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 )
 
+// exitUsage is the conventional "the command line itself is wrong" code, the same one wecert,
+// wecert-onboard and wecert-probe use -- not 1 (documented here as "the program ran and failed") and
+// not flag's default 2 (documented as wecert-onboard's "deliberately frozen" code).
+const exitUsage = 64
+
+// errUsage marks a command-line error; the flag package has already explained it on stderr.
+var errUsage = errors.New("invalid command line")
+
 func main() {
 	if err := run(); err != nil {
+		if errors.Is(err, errUsage) {
+			os.Exit(exitUsage)
+		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
 func run() error {
+	fs := flag.NewFlagSet("clbverify", flag.ContinueOnError)
 	var (
-		region     = flag.String("region", "", "region, e.g. ap-guangzhou")
+		region     = fs.String("region", "", "region, e.g. ap-guangzhou")
 		lbID       = flag.String("clb", "", "CLB instance ID")
-		listenerID = flag.String("listener", "", "listener ID; when omitted, the first listener on that CLB is used")
-		expect     = flag.String("expect", "", "certificate ID that must be in the asserted set; when set the assertion must hold")
-		domain     = flag.String("domain", "", "assert on the certificate the forwarding rule for this domain serves (SNI); when omitted every certificate on the listener and its rules is asserted")
-		notExpect  = flag.String("not-expect", "", "certificate ID that must NOT be present")
-		raw        = flag.Bool("raw", false, "dump the raw DescribeListeners JSON response for troubleshooting")
-		wait       = flag.Duration("wait", 0, "how long to poll for the expected certificate (UpdateCertificateInstance is asynchronous)")
+		listenerID = fs.String("listener", "", "listener ID; when omitted, the first listener on that CLB is used")
+		expect     = fs.String("expect", "", "certificate ID that must be in the asserted set; when set the assertion must hold")
+		domain     = fs.String("domain", "", "assert on the certificate the forwarding rule for this domain serves (SNI); when omitted every certificate on the listener and its rules is asserted")
+		notExpect  = fs.String("not-expect", "", "certificate ID that must NOT be present")
+		raw        = fs.Bool("raw", false, "dump the raw DescribeListeners JSON response for troubleshooting")
+		wait       = fs.Duration("wait", 0, "how long to poll for the expected certificate (UpdateCertificateInstance is asynchronous)")
 	)
-	flag.Parse()
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return errUsage
+	}
 
 	if *region == "" || *lbID == "" {
-		return fmt.Errorf("-region and -clb are required (-listener is optional; when omitted, the first listener on that CLB is used)")
+		return fmt.Errorf("%w: -region and -clb are required (-listener is optional; when omitted, "+
+			"the first listener on that CLB is used)", errUsage)
 	}
 
 	cred := common.NewCredential(

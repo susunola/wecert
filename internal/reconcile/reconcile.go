@@ -457,7 +457,18 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string) {
 // was never issued was also never probed (probing requires a confirmed deploy),
 // so there is nothing to reclaim then.
 func (r *Reconciler) orphanProbeHosts(st *state.CertState) []string {
-	return probeHosts(r.issuedSANs(st), r.cfg.Probe.MaxHostsPerCert)
+	hosts := probeHosts(r.issuedSANs(st), r.cfg.Probe.MaxHostsPerCert)
+	if len(hosts) == 0 && st != nil && len(st.CertPEM) > 0 {
+		// An orphan has no configured names to fall back to, so an unreadable certificate means the
+		// per-host probe series cannot be reclaimed here. Say that, because the consequence is a
+		// series frozen at its last value -- and if probe_match was 0 for one of those hosts, the
+		// documented alert on it fires forever for a host nobody manages.
+		r.log.Warn("cannot read the names out of the stored certificate of a certificate that left "+
+			"the desired state, so its per-host probe series cannot be reclaimed automatically; "+
+			"delete them by hand if one of them is frozen at 0",
+			"cert", st.Name)
+	}
+	return hosts
 }
 
 // issuedSANs returns the names of the certificate actually stored for this certificate, or
@@ -485,8 +496,11 @@ func (r *Reconciler) issuedSANs(st *state.CertState) []string {
 	}
 	leaf, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		r.log.Warn("cannot parse the stored certificate; falling back to the configured names",
-			"cert", st.Name, "err", err)
+		// No warning here. The message used to live in this function and claim it was "falling back
+		// to the configured names" -- which is what probeCert does with a nil answer, but this
+		// function has no configured names and its other caller (orphanProbeHosts) has none at all:
+		// a certificate that left the desired state still has its SANs nowhere else, so the honest
+		// statement is "the names are unknown", and each caller now says what that costs it.
 		return nil
 	}
 	return leaf.DNSNames
@@ -524,16 +538,23 @@ type RunReport struct {
 
 // Trouble reports whether this pass should be treated as a failure by a one-shot run.
 //
-// A plain "Failed > 0" is not enough on its own. A certificate whose retries are all inside
-// a backoff window produces Backoff > 0 and Failed == 0, so a run that attempted nothing
-// and skipped everything would look clean -- which is exactly the state a certificate stuck
-// in a long backoff sits in, and exactly what a caller running once per interval needs to
-// hear about.
+// A plain "Failed > 0" is not enough on its own. A certificate whose retries are all inside a backoff
+// window produces Backoff > 0 and Failed == 0, so a run that attempted nothing would look clean --
+// which is exactly the state a certificate stuck in a long backoff sits in, and exactly what a caller
+// running once per interval needs to hear about.
+//
+// Backoff and Skipped are both "attempted nothing", and they are the whole guard: the version of this
+// function that checked only Skipped could never fire for the case its own comment was about, because
+// an ErrBackoff pass increments Backoff and never appends to Skipped (see RunDetailed). The gap is
+// reachable in practice, not theoretical: the backoff is 1m<<n capped at 6h, so after about seven
+// consecutive failures it exceeds an hourly timer's interval, and from then on the unit exits 0 with
+// a green journal while the certificate is not being renewed. README.md and
+// docs/lifecycle-acceptance.md both document the exit code as the timer's only alert channel.
 func (rep RunReport) Trouble() bool {
 	if rep.Failed > 0 || rep.DesiredStateUnreadable {
 		return true
 	}
-	return rep.Attempted == 0 && len(rep.Skipped) > 0
+	return rep.Attempted == 0 && (rep.Backoff > 0 || len(rep.Skipped) > 0)
 }
 
 // RunDetailed runs one pass over every certificate and reports what happened.
@@ -1135,7 +1156,12 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 		// result="ok" hid a certificate stuck in backoff behind a healthy-looking counter,
 		// and an error every interval would train people to ignore the channel.
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "skipped").Inc()
-		r.log.Debug("pass skipped: still inside the retry backoff window", "cert", c.Name)
+		// Info, not Debug: this is the only line that explains a pass which attempted nothing, and a
+		// one-shot run now exits non-zero for exactly this state (see Trouble). At Debug the timer's
+		// journal said "the pass did not converge: attempted=0 ..." with no certificate, no reason
+		// and no next attempt in it.
+		r.log.Info("pass skipped: still inside the retry backoff window an earlier failure scheduled",
+			"cert", c.Name)
 	case err != nil:
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
 		// manager already logged and scheduled backoff; this is just a summary.
@@ -1185,6 +1211,10 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 	// reported every host as a mismatch. See issuedSANs.
 	domains := r.issuedSANs(st)
 	if len(domains) == 0 {
+		r.log.Warn("cannot read the names out of the stored certificate, so probing falls back to the "+
+			"configured names (a certificate that was issued for a fallback subset would be probed "+
+			"under the full set, which can report a mismatch that is not real)",
+			"cert", c.Name)
 		domains = c.Domains
 	}
 	hosts := probeHosts(domains, r.cfg.Probe.MaxHostsPerCert)

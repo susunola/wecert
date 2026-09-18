@@ -214,7 +214,10 @@ sudo chmod 640 /etc/wecert/config.yaml
 sudo -u wecert ./bin/wecert -config /etc/wecert/config.yaml -dry-run
 ```
 
-`-dry-run` validates the config and initialises the ACME account, but signs and deploys nothing.
+`-dry-run` validates the config, initialises the ACME account, and builds the DNS provider and the
+deployer -- so a missing or malformed static credential fails here rather than on the first real pass
+-- but it signs and deploys nothing, and it makes no cloud API call: a CVM role's credentials are
+fetched on first use, so "the credentials work" is `wecert-preflight`'s job, not this flag's.
 
 ### 5. Start the service
 
@@ -317,7 +320,7 @@ The ACME order state machine is in [Order state machine](#4-order-state-machine)
 
 ### State schema
 
-A single SQLite file. Losing it means re-ordering, which collides with the rate limits — so it is the one thing to back up. wecert snapshots it on an interval by default (`stateBackup`, using `VACUUM INTO` so the copy is consistent despite WAL) and keeps the newest `keep` of them beside it; snapshots are not off-host backup, and **docs/recovery.md** is the restore procedure.
+A single SQLite file. Losing it means re-ordering, which collides with the rate limits — so it is the one thing to back up. wecert snapshots it on an interval by default (`stateBackup`, using `VACUUM INTO` so the copy is consistent despite WAL) and keeps the newest `keep` of them beside it; snapshots are not off-host backup. Restoring one is `wecert -restore latest` (a file, a directory, or `latest`); **docs/recovery.md** is the procedure and the caveat that comes with it.
 
 ```
 accounts                      -- one ACME account per directory URL
@@ -518,7 +521,7 @@ The CA/Browser Forum has scheduled **≤100 days from 2027-03-15 and ≤47 days 
 | `desired-state.yaml` | wecert-onboard | wecert | **Safe** — wecert freezes on the previous revision and alarms |
 | `onboard-state.json` | wecert-onboard | wecert-onboard | **Matters** — the grace period resets, so deletion becomes aggressive |
 | `desired-state.report.json` | wecert-onboard | a human | **Harmless** — troubleshooting only |
-| `state.db` | wecert | wecert | **Disaster** — order URLs, ARI certIDs and CertIds all gone, so orders are re-placed into the exact-set limit. Snapshotted automatically (`stateBackup`); restore with **docs/recovery.md** |
+| `state.db` | wecert | wecert | **Disaster** — order URLs, ARI certIDs and CertIds all gone, so orders are re-placed into the exact-set limit. Snapshotted automatically (`stateBackup`); restore with `wecert -restore latest` (see **docs/recovery.md**) |
 | The ACME account key | wecert | wecert | **Disaster** — accounts are a limited resource (10 per IP per 3 hours) |
 
 ### Failure semantics
@@ -1023,7 +1026,11 @@ is still bound (status 4) keeps the certificate on the reclaim list for the next
 | `-once` | `false` | Run one pass and exit (for systemd timer / cron) |
 | `-interval` | `1h` | Reconcile interval in daemon mode |
 | `-log-level` | `info` | `debug` \| `info` \| `warn` \| `error` |
-| `-dry-run` | `false` | Validate config and initialise the ACME account; sign and deploy nothing |
+| `-dry-run` | `false` | Validate config, initialise the ACME account, and build the DNS provider and deployer (so a bad static credential fails here); sign and deploy nothing |
+| `-revoke` | — | Ask the CA to revoke this certificate and exit (writes the decision to state first, so a transient CA failure is retried by the daemon) |
+| `-revoke-reason` | `unspecified` | `unspecified` \| `keyCompromise` \| `affiliationChanged` \| `superseded` \| `cessationOfOperation` |
+| `-yes` | `false` | With `-revoke`: skip the interactive confirmation (you must otherwise type the certificate name) |
+| `-restore` | — | Restore a state snapshot and exit: a snapshot file, a directory of snapshots, or `latest` (see **docs/recovery.md**). Refuses while the daemon holds the lock; keeps the database it replaces at `state.db.replaced-<stamp>` |
 | `-version` | `false` | Print version and exit |
 
 ### `wecert-preflight` (diagnostic; `-prune-certs` deletes)

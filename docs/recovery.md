@@ -19,8 +19,8 @@ the file as the system's only source of truth.
 > 并把你指到这里。那个组合意味着 **WAL 被人删掉了**（清理脚本匹配 `*-wal`、手工清理、或者更糟），
 > 而 WAL 里装着上次 checkpoint 以来已提交的全部事务——**in-flight 订单 URL 就在里面**。丢了它，
 > 下一轮会重新下单，再花一次「同一标识符集合每 7 天 5 张」的额度。
-> 这时不要继续跑：先按下文「2. 从快照恢复」把最新快照装回去（快照是 `VACUUM INTO` 的完整副本，
-> 不依赖任何 sidecar），再启动。
+> 这时不要继续跑：先按下文第 2 节把最新快照装回去（`systemctl stop wecert` 之后
+> `wecert -restore latest`，快照是 `VACUUM INTO` 的完整副本，不依赖任何 sidecar），再启动。
 
 ## 1. Snapshots
 
@@ -57,6 +57,75 @@ If `stateBackup.enabled: false`, wecert logs a warning at startup saying so.
 
 ## 2. Restoring
 
+### The short way: one command
+
+```sh
+systemctl stop wecert          # the restore refuses while the daemon holds the lock
+wecert -restore latest         # newest snapshot of this state.db, found from stateBackup.dir
+systemctl start wecert
+```
+
+`-restore` takes a snapshot **file**, a **directory** (the newest snapshot of *this* state database
+in it), or `latest` (the directory `stateBackup.dir` points at — the form that does not require
+knowing a path during an incident).
+
+It does the file work as one transaction, and it is deliberately careful about the order:
+
+- **Refuses while another wecert process holds the lock.** Restoring underneath a running daemon
+  does not fail loudly: the daemon keeps writing to the inode it already opened, so everything it
+  does afterwards is lost when it exits. Stop it first.
+- **Verifies the snapshot before touching the live database**: the 16-byte SQLite magic, then
+  `PRAGMA integrity_check`, then that the file actually has wecert's tables. A file that fails any
+  of these is refused by name, so a wrong path or a half-copied snapshot costs nothing.
+- **Copies first, then swaps.** The snapshot is copied and fsynced beside `state.db` before the old
+  database is moved, so a full disk leaves the deployment exactly as it was. The staged copy is
+  verified a second time before the swap, for the same reason.
+- **Keeps what it replaced** at `state.db.replaced-<UTC stamp>`, together with that database's
+  `-wal` and `-shm` (sidecars must never be split from the file they describe). A restore is a step
+  backwards; the file it displaced holds everything written since the snapshot, including order
+  URLs. Retention never prunes these names.
+- **Writes `state.db.restored`.** The next start reads it and warns that the rate-limit ledger stops
+  at the snapshot's date — see below.
+
+```
+$ wecert -restore latest
+Restored /var/lib/wecert/state.db.backup-20260918T055804.461Z.db over /var/lib/wecert/state.db.
+  The snapshot holds an ACME account and 4 certificate(s); its data is from 2026-09-18T13:58:04+08:00.
+  The rate-limit ledger in the snapshot stops at that date: any order placed after it
+  is still counted by the CA but not here. Until 2026-09-25T13:58:06+08:00 the CA may refuse an
+  order it believes is over quota -- wecert records that refusal and backs off, so the
+  certificate is not lost, it is late.
+Start wecert again when you are ready.
+```
+
+#### The rate-limit caveat, and why it is 7 days
+
+A snapshot is a copy of what wecert *believed* at the time it was written. Anything ordered after
+that is still counted by Let's Encrypt but no longer counted locally, so the restored database can
+understate what it has spent. The next start says so plainly:
+
+```
+level=WARN msg="this state database was restored from a snapshot, so its rate-limit accounting is
+short by every order placed after the snapshot was written" restoredAt=... caveatUntil=...
+whatToExpect="the CA may refuse one order it believes is over quota; wecert records the refusal and
+backs off, and wecert_ratelimit_remaining_tokens overstates what is left until the window above
+passes"
+```
+
+The warning stops on its own after 7 days — the longest window in the limits we account for. A spend
+that is 7 days old no longer counts against any of them, so after a full window every bucket that
+could have been under-counted has refilled and the ledger is whole again. Until then, treat
+`wecert_ratelimit_remaining_tokens` as an upper bound, and if you are close to a limit, wait.
+
+What a refusal costs is time, not a certificate: wecert records the CA's `Retry-After` (or its own
+deadline for the named limit), backs off, and retries. The one limit with no override is 5
+certificates per exact set of identifiers per 7 days, so a refusal there means waiting.
+
+### The long way: doing it by hand
+
+Still supported, and the right thing when the state directory itself is gone, when you want to
+inspect the snapshot with `sqlite3` first, or when `wecert` will not run at all:
+
 ```sh
 # 1. Stop the daemon. Two processes on one state directory is a startup failure, and the
 #    lock makes it obvious rather than silent.
@@ -84,6 +153,13 @@ sqlite3 /var/lib/wecert/state.db 'SELECT cert_name, order_url FROM orders;'  # i
 systemctl start wecert
 journalctl -u wecert -f
 ```
+
+A hand restore does **not** write `state.db.restored`, so the rate-limit warning above will not
+appear and cannot be inferred afterwards: nothing in the file records that it was swapped in. If you
+restore by hand and the backup is more than a few minutes old, expect the same caveat and watch for a
+refused order. (Reproducing it is easy — copy the installed `state.db` aside, run
+`wecert -restore <the same snapshot>`, and it is recorded; the copy is then redundant and can be
+deleted.)
 
 ### What to check in the logs
 
