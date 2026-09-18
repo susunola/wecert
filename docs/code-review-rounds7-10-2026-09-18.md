@@ -62,3 +62,50 @@
 - 快照：三种保留边界（keep≤0、keep=1、旧式命名）、VACUUM INTO 中途失败不留残骸、目录消失/被替换。
 - 时钟：限额桶两个方向（不向后发币、锚点不回退、前跳只补到容量、欠债只还一次、CA 的截止时间是绝对时刻）；onboarding 的宽限期与预算在两个方向都偏保守；DNS 判定（NXDOMAIN=否认、SERVFAIL=不可达、第二个陈旧权威不覆盖）。
 - 网络：`FetchRenewalInfo` 在非 200 时**没有**丢 `Retry-After`（实测 503 + `Retry-After: 3600` → 1h0m0s，响应体关闭）；notifier 的 `Drain` 会等、能扛住被取消的 pass ctx、有界、拒绝 Drain 之后的投递。
+
+---
+
+## 2. 第 8 轮：协议一致性 / 配额经济学 / 性质与模糊测试（3 个复审者）
+
+**方法**：一个复审者逐条把代码对着 RFC 原文核（并要求引用章节号）；一个只打**配额经济学与状态机不变量**（要求给出「这一下花掉多少额度」的数字）；一个**生成输入**而不是读代码（自己写 fuzz/property target，各跑 30–150 秒）。返回：协议 8 条（9 驳回）、配额 9 条（7 驳回）、性质 5 条（全是 low、10 个新 target）。**核实后修掉 15 条**，驳回 1 条（有反证），其余记为已知取舍。
+
+### 2.1 已修（high）
+
+| 位置 | 缺陷 | 修法与用例 |
+|---|---|---|
+| `internal/config/config.go` | **含 IP 字面量的证书永远签不出来**：`validateDomain` 接受 IPv4 字面量，lego 会把它提升为 RFC 8738 的 `ip` 标识符，CA 于是只提供 tls-alpn-01/http-01，DNS-01 选择器找不到挑战 —— **整张证书**（连同其它 SAN）每一轮都失败，错误信息指向挑战类型而不是文档里那行字。裸公共后缀（`co.uk`）与单标签同理（没有可验证的上级） | 在**写入文档的地方**就拒绝：IP 字面量、以及「自己就是公共后缀」的名字（`publicsuffix.PublicSuffix` 直接判，因为 `internal/group` 反向依赖本包，不能引）。用例 `TestIdentifiersThatCannotBeIssuedAreRejected`（5 个反例 + 4 个正例，含通配符与 punycode） |
+
+### 2.2 已修（medium）
+
+| # | 位置 | 缺陷 | 修法与用例 |
+|---|---|---|---|
+| 1 | `internal/acme/manager_renew.go` | **CA 自己给的截止时间没人看**：桶只被写、被发布成指标，然后被忽略——「retry after 3h」之后我们按自己的 1m..6h 退避又发了 **8 次** newOrder（实测窗口内 8 次）。每一次都是 CA 已经说过不可能成功的请求，而在按标识符记的限额上它们还要花掉整个账号共用的预算 | 下单前先查已记录的截止时间：账号级（new-orders）直接停这一轮，按 scope 记的只停**它点名的那张证书**（因为一个域名被暂停就拒掉整个机群会停摆）。用例 `TestARecordedDeadlineStopsTheOrderBeforeItIsPlaced`（账号级 + 按域名级 + 「另一个注册域名不受影响」） |
+| 2 | `internal/acme/manager_renew.go` | **429 的 `Retry-After` 头从未被读**：lego 把它放在类型化错误上（`RateLimitedError.RetryAfter`），而代码只解析错误**文本**——CA 只发头、不在文本里重复时刻时（协议允许：头是答案，散文是注释），就完全没记截止时间；而且紧接着还会发出「去掉 replaces 再试一次」的那次重试，正好落在 CA 刚说的窗口里 | 新增 `ParseRetryAfterHeader`（秒数与 HTTP-date 两种形式）与 `Tracker.NoteDeadline`（非文本来源的截止时间）；记录的截止时间同时意味着「现在不要重试」。用例 `TestTheRetryAfterHeaderIsHonouredAndNotRetriedInto` |
+| 3 | `internal/acme/manager_renew.go` | **Boulder 的第四条 newOrder 限额**（`too many failed authorizations (5) for %q …`）没有归类，于是截止时间被记在账号级的 new-orders 桶上，而真正被暂停的那个标识符序列仍然显示「还剩 5」——告警把运维指向整个账号 | `refusedLimits` 认出 `failed authorizations`，`newOrderRefusalScope` 优先用消息里点名的那个域名（与注册域名限额同一规则）。用例 `TestTheFailedAuthorizationRefusalIsBookedOnTheIdentifier` |
+| 4 | `internal/acme/manager.go` | **冷却只在进程内**：它保护的预算（`rate_buckets`）是持久化的，但重启不会重新武装——实测同一进程 +3m 被挡住，重启后同一个 +3m 又花掉一个 token。多张证书共用一个名字时，每轮重启一次就能花光 5/小时的预算 | 冷却可以从持久账本（`identifier_failures.last_failed_at`）重新播种；读不到账本时不猜（当作没有冷却） |
+| 5 | `internal/acme/manager_flow.go` | **一次 pass 只登记第一个失效授权**：实测 [a,b,c] 里 a、b 都被 CA 判失效，账本只记了 a；降级轮于是下单 **[b,c]**（仍然含 CA 拒绝的 b），两张坏名字的证书永远降不到能签出来的程度 | 初次抓取与轮询两处都改成「先把这一轮看到的**全部**失效授权登记完，再让这一轮失败」。用例覆盖两处（并修掉了一个我自己引入的回归：把返回放在「pending 为空就提前返回」之后，会让一张既有用例变成 120 秒超时） |
+
+### 2.3 已修（low）
+
+- **ARI 不再为已过期证书发请求**（RFC 9773 §4.3 MUST NOT）：过期证书没有可续的东西，而一个失败数月的机群成员会在它一直留在期望状态期间被一直轮询。用例 `TestAnExpiredCertificateDoesNotAskTheCAForARI`。
+- **ARI 的长期/临时错误不再混为一谈**（§4.3.3）：404 是长期（CA 根本不认识这张证书），此时服务器给的短 `Retry-After` 会让轮询变成「每分钟问一次，问一辈子」；现在 404 走自己的 6 小时下限（新增 `ErrRenewalInfoLongTerm`）。同时 `start == end` 的空窗口（§4.2 不允许）会留下一条 WARN，而不是无声回退。
+- **`probe -expect-san` 的规范化不再依赖调用次数**：先 trim 空格、再去一个尾点的写法不是幂等的，`www.example.com..` 会在两次规范化后变成两个不同的键，于是同一个名字既出现在「缺失」里又出现在「多余」里（自相矛盾的判定 + 退出码 2）。改为循环到稳定。用例 `TestExpectSANNormalisationIsIdempotent`。
+- **限额桶不会被非有限值毒化**：`Spend` 会清洗负 cost，但不挡 NaN/±Inf，一个这样的值会让 `Tokens` 永远是 NaN（所有比较为假，欠债钳制失效）。现在直接拒绝并告警（今天四个调用方都传字面量 1，正因如此守卫要放在函数里而不是注释里）。
+- **空证书 id 不能再进回收清单**：这种行 `ReapRetired` 永远删不掉（`Delete("")` 每轮失败），槽位被永久占住——与回收清单的目的正好相反。用例 `TestARetiredRowWithNoCertificateIdIsRefused`。
+- **「估算的界」方向写反了**：包文档与 `Remaining` 说「下限 / 至少还剩这么多」，而只统计自己花掉的量得到的是**上限**（别的账号花了就只会更少）。README 在第 6 轮改过，包文档没有；现在两处都写「最多还剩这么多」，并说明为什么方向重要。
+- **下单日志说真话**：`replaces=true` 记录的是「我们请求了什么」，lego 在目录不声明 renewalInfo 时会把这个字段丢掉；字段改名为 `replacesRequested`，历史真机报告里引用的旧日志加了一行说明。
+
+### 2.4 驳回 / 记为已知取舍
+
+| 复审说法 | 处理 |
+|---|---|
+| ARI 的 `[1m,24h]` 钳制违反 RFC | **驳回**：§4.3.2 明确允许客户端对窗口做合理钳制，而代码正是这么做的（复审者自己也纠正了他给的章节号：badNonce 是 §6.5.1、rateLimited 是 §6.6/§6.7、DNS-01 是 §8.4） |
+| 订单/授权轮询忽略 `Retry-After` | **记为限制**：lego 的 `ExtendedOrder` 没有这个字段（它自己的 `pollInterval` 3s 恰好等于 Boulder 给 processing 订单的 3s，所以对 LE 无影响）。要修得先让 lego 暴露它，记入待办 |
+| `DomainKey` 用逗号连接且不校验成员：一个 SAN 里含逗号的证书（`"a.example.com,b.example.com"`）能让 `CoverageDrift` 误判「没有漂移」 | **记为限制**：需要 CA 签发这种 SAN（公共 CA 不会），而且 `VerifyCoverage` 用的是集合而不是拼接键、能看见。记入待办（改为长度前缀或结构化比较） |
+| 「失效授权登记」这条修复会不会让 pass 在该失败时不失败 | **驳回**：登记完仍然在 `pending` 为空之前 `recordFailure`，行为与之前一致（而且我自己先写错过一次，被 120 秒的用例逮住） |
+| 第五个限额（连续授权失败导致**标识符暂停**，1152、每天回 1、成功即清零）没有建模 | **记为缺口**：要建模需要「成功即清零」的语义，现有桶没有；运维的出路是 CA 的 unpause 门户。已写入报告而不是半实现 |
+| 降级集合一旦生效，即使原因消失也只能等到续期窗口/改配置才恢复（WARN 文案承诺的「证据过期后重试完整集合」不成立） | **记为缺口**：改动涉及 hold 的设计；本轮只把文案与事实对齐的评估留到第 9 轮文档审计 |
+
+### 2.5 复审者另外跑过的性质测试（「这些面查过了」，但不是证明）
+
+声明解析器（60s / 416 万次执行，含 `hostnameFromRecord == Hostname` 与幂等性）、`parse()` 的「每个名字一个结论 + 与记录次序无关」（77s）、`validateDomain`（42s / 630 万次 + 归一化不动点）、`CertName` 单射与分组稳定性、`LoadDocument`（77s：加载即校验、写读往返、十亿笑声/深层嵌套/重复键/非 UTF-8 全部拒绝、16.77MB 合法文档 1.2s 读完）、限额桶序列（62+46+45+45s，最多 2900 万次，含「时钟回拨不发币」与冻结时钟的守恒）、`tcerr`（2×30s）、probe 判定（不变性/单调性）、状态库 120 组随机操作序列（每步断言不变量 + 重开后 9 张表逐字节一致）+ 62s fuzz、reconciler 决策属性（153s：不 due 不下单、失败必排重试、收缩必有 fallback 记录、不超 profile 上限）。

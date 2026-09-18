@@ -44,9 +44,16 @@ type Tx struct {
 // which matters more than it looks, because a panic in the middle of the epilogue is exactly the
 // partial state this exists to prevent.
 //
-// Reads made through the store (not through Tx) inside fn see the pre-transaction state: the
-// store's methods use the pool, and the pool's one connection is held by this transaction. Callers
-// should therefore read what they need before entering, which is what the epilogue does.
+// Reads made through the store (not through Tx) inside fn DO NOT WORK AT ALL: every store method
+// takes s.mu, WithTx holds it for the whole transaction, and the mutex is not reentrant -- so such a
+// read blocks forever on a lock only this goroutine could release. The context does not help (the
+// store's methods do not take one), and the held mutex then freezes every later store call, Close
+// included. An earlier version of this comment said the read "sees the pre-transaction state",
+// which was both wrong and reassuring: the first maintainer to believe it gets a deadlock instead of
+// a stale value.
+//
+// Read everything you need through Tx (or before entering). Both production callbacks obey this;
+// it is enforced by nothing but this paragraph, which is why it says what actually happens.
 //
 // Holding s.mu for the whole transaction also makes the periodic snapshot consistent for free:
 // Snapshot takes the same mutex, so a backup always sees the state either entirely before or

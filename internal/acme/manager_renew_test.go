@@ -197,3 +197,46 @@ func TestAnExpiredCertificateDoesNotAskTheCAForARI(t *testing.T) {
 }
 
 var _ = config.ProfileClassic
+
+// A refusal must be booked against the name the CA actually named.
+//
+// The scope extractor recognised only the "already issued for %q" phrasing, so Boulder's
+// failed-authorization refusal fell through to the certificate's FIRST domain. That was invisible
+// while nothing read the deadline; round 8 made the deadline gate ordering, and then it became an
+// availability bug in both directions: the certificate containing the paused name kept ordering
+// inside the CA's window, and an unrelated certificate that happened to share the first domain was
+// refused for the whole window.
+func TestARefusalIsBookedAgainstTheNameTheCANamed(t *testing.T) {
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+
+	// A certificate whose FIRST domain is not the one the CA paused.
+	cert := &config.Certificate{Name: "site", Domains: []string{"a.example.com", "b.example.com"}}
+	msg := "acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: too many failed " +
+		"authorizations (5) for \"b.example.com\" in the last 1h0m0s, retry after " +
+		"2026-09-16 15:00:00 UTC: see https://letsencrypt.org/docs/rate-limits/"
+
+	got := newOrderRefusalScope(ratelimit.AuthzFailuresPerIdentifier, cert, msg)
+	if got != "b.example.com" {
+		t.Fatalf("the refusal names b.example.com, so the deadline must be booked against it; got %q. "+
+			"Booked against a.example.com instead, the certificate that actually holds the paused name "+
+			"is not gated and an unrelated one sharing that first domain is", got)
+	}
+
+	// The registered-domain wording must keep working (it never contains the words "registered
+	// domain"): the name it counts is the quoted one.
+	got = newOrderRefusalScope(ratelimit.CertsPerRegisteredDomain, cert,
+		"acme: error: 429 :: too many certificates (50) already issued for \"example.com\" in the "+
+			"last 168h0m0s, retry after 2026-09-16 15:00:00 UTC")
+	if got != "example.com" {
+		t.Errorf("registered-domain scope = %q, want example.com", got)
+	}
+
+	// No quoted name at all: the fallback stays the certificate's own first domain, which is the
+	// best guess available and is what the wildcard case relies on.
+	got = newOrderRefusalScope(ratelimit.AuthzFailuresPerIdentifier, cert,
+		"acme: error: 429 :: too many failed authorizations, retry after 2026-09-16 15:00:00 UTC")
+	if got != "a.example.com" {
+		t.Errorf("with nothing quoted the first domain is the only answer available, got %q", got)
+	}
+	_ = fixed
+}

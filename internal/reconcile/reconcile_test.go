@@ -469,7 +469,7 @@ func TestPublishExportsNotAfter(t *testing.T) {
 
 	r.RunDetailed(context.Background())
 
-	got := testutil.ToFloat64(metrics.CertNotAfter.WithLabelValues("pub-notafter"))
+	got := testutil.ToFloat64(metrics.CertNotAfter.WithLabelValues("pub-notafter", "classic"))
 	if int64(got) != notAfter.Unix() {
 		t.Errorf("CertNotAfter = %d, want %d", int64(got), notAfter.Unix())
 	}

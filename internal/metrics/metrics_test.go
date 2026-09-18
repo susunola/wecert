@@ -49,7 +49,7 @@ func TestDeleteCertSeries(t *testing.T) {
 	)
 
 	for _, name := range []string{gone, stays} {
-		CertNotAfter.WithLabelValues(name).Set(1)
+		CertNotAfter.WithLabelValues(name, "classic").Set(1)
 		CertDeployed.WithLabelValues(name).Set(1)
 		CertConsecutiveFailures.WithLabelValues(name).Set(2)
 		CertARIWindowStart.WithLabelValues(name).Set(3)

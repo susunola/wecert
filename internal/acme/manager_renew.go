@@ -208,7 +208,7 @@ func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate, msg string) 
 	case ratelimit.CertsPerExactIdentifierSet.Name:
 		return c.DomainKey()
 	case ratelimit.CertsPerRegisteredDomain.Name:
-		if named := quotedIssuedDomain(msg); named != "" {
+		if named := quotedDomain(msg); named != "" {
 			return named
 		}
 		if doms := uniqueRegisteredDomains(c.Domains); len(doms) > 0 {
@@ -219,8 +219,10 @@ func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate, msg string) 
 		// (`too many failed authorizations (5) for "bad.example.com"`). Preferring the name in the
 		// message over the certificate's first domain matters for the same reason it does above: a
 		// certificate with several names would otherwise have the deadline recorded against one that
-		// is fine.
-		if named := quotedIssuedDomain(msg); named != "" {
+		// is fine -- and because the deadline now GATES ordering, that is not cosmetic: measured with
+		// two certificates sharing a first domain, the one containing the paused name kept ordering
+		// inside the CA's window while the unrelated one was refused.
+		if named := quotedDomain(msg); named != "" {
 			return named
 		}
 		if len(c.Domains) > 0 {
@@ -230,23 +232,30 @@ func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate, msg string) 
 	return ""
 }
 
-// quotedIssuedDomain extracts the domain from the CA's "already issued for %q" wording, or "" when
-// the message does not carry one.
-func quotedIssuedDomain(msg string) string {
-	const marker = "already issued for "
-	i := indexOfFold(msg, marker)
+// quotedDomain extracts the FIRST quoted name from a refusal, or "" when there is none.
+//
+// Boulder names the thing it counted with %q in every limit message that has a scope:
+//
+//	too many certificates (%d) already issued for %q in the last %s, retry after %s
+//	too many failed authorizations (%d) for %q in the last %s, retry after %s
+//
+// Matching on the whole phrase ("already issued for ") recognised only the first of those, so the
+// second fell through to "the certificate's first domain" -- which books the deadline against a
+// name the CA never mentioned. That was invisible while nothing read the deadline; once ordering
+// consulted it, the certificate holding the paused name kept ordering and an unrelated certificate
+// sharing the first domain was refused. A rate-limit message quotes the identifier it counted and
+// nothing else, so the first quoted token is the right answer for both.
+func quotedDomain(msg string) string {
+	i := strings.IndexByte(msg, '"')
 	if i < 0 {
 		return ""
 	}
-	rest := msg[i+len(marker):]
-	if !strings.HasPrefix(rest, "\"") {
+	rest := msg[i+1:]
+	j := strings.IndexByte(rest, '"')
+	if j <= 0 {
 		return ""
 	}
-	rest = rest[1:]
-	if j := strings.IndexByte(rest, '"'); j >= 0 {
-		return strings.ToLower(rest[:j])
-	}
-	return ""
+	return strings.ToLower(rest[:j])
 }
 
 // refusedLimits maps the CA's own wording to the limits it refused.
@@ -290,11 +299,6 @@ func refusedLimits(msg string) []ratelimit.Limit {
 		out = append(out, ratelimit.NewOrdersPerAccount)
 	}
 	return out
-}
-
-// indexOfFold is strings.Index for a case-insensitive needle.
-func indexOfFold(s, sub string) int {
-	return strings.Index(strings.ToLower(s), strings.ToLower(sub))
 }
 
 func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {

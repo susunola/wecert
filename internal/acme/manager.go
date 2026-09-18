@@ -623,8 +623,9 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		} else {
 			m.log.Warn("the live certificate's SANs no longer match the config; reissuing now",
 				"cert", c.Name, "detail", detail,
-				"note", "an order after a domain-set change does not count as a same-name renewal and will consume "+
-					"the Certificates per Registered Domain quota (50 per 7 days, shared across accounts)")
+				"note", "this order carries replaces, so it keeps the ARI exemption as long as one identifier is "+
+					"shared with the certificate being replaced; a wholly disjoint set is the case that spends "+
+					"Certificates per Registered Domain (50 per 7 days, shared across accounts)")
 			// `replaces` IS sent here, which reverses an earlier decision.
 			//
 			// It used to be dropped on the premise that "the ARI exemption needs an
