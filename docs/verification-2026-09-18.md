@@ -207,15 +207,24 @@ make test-pebble → pass，exit 0
 用 pebble 的 `shortlived` profile（`validityPeriod: 900` 秒）让守护进程按**真实时间**等 ARI 窗口自己打开：
 
 ```
-run 1（-once）签发 shortlived 证书
-守护进程随后自行续期，没有任何人改状态或改时钟：
+run 1（-once）签发 shortlived 证书：notAfter 2026-09-18T08:52:09Z（pebble 该 profile 钉死 900 秒）
+守护进程（-interval 30s，真实时钟，没人改状态、没人改时钟）：
+  "ARI window refreshed" start=08:37:10Z end=08:52:09Z retryAfter=6h0m0s
+  每轮 "not yet due for renewal" renewAt=2026-09-18T08:46:08.836Z —— 一直等到这个时刻
   "starting renewal" renewAt=2026-09-18T08:46:08.836Z ariReplaces=true      （签发后 536 秒）
-  "ACME order created" … replacesRequested=true
-  notAfter 08:52:09Z → 09:01:08Z
-pebble 侧日志："ARI: order … is a replacement of …"
+  "ACME order created" status=pending … replacesRequested=true
+  "certificate issued and recorded locally" notAfter=2026-09-18T09:01:08.000Z
+pebble 侧："ARI: order "GPKy…" is a replacement of "UxHM…""；权威侧 3 次 TCP TXT 查询
+关停：SIGTERM → "daemon exited after SIGTERM (exit=0)"
+状态库前后（第三个快照对照过的轮次）：not_after 09:18:30 → 09:26:33、ari_cert_id 的序列号部分
+  由 …H87DwFTMN6g 变为 …YezV8r2Nw6c；期间只有 cp、grep 轮询、守护进程自己的写入与 kill -TERM
 ```
 
-关键细节：签发时 `renewBefore=1h` **已经过期**，所以这次续期的时点**完全由 CA 给的 ARI 窗口决定** —— 这正是"自然到期续期"里可以在这里验证的那一半（真实时钟、真实 ARI、真实 `replaces`）；剩下"真实 CA 上等 60 天"那一半仍然只能靠时间（§4.1）。
+三个让它站得住的细节：**签发时 `renewBefore=1h` 已经过期**（回退阈值在签发那一刻就是过去时，回退逻辑第一轮就会续期），所以这次续期的时点**只能由 CA 给的 ARI 窗口决定**；守护进程报出的 `renewAt` 与**独立重实现的 `internal/acme/ari.go RenewalTime`** 逐位一致（`2026-09-18T08:46:08.836Z`）；pebble 自己确认了"这是一次 replacement"。
+
+顺带两条真实观察：**CA 的 authz 复用真的会发生**（三轮里有一轮 pebble 直接说 `Order … is fully authorized`，那一轮续期没有写任何 TXT —— 与生产续期观察到的现象一致），以及短有效期证书每轮都会打 `certificate approaching expiry … daysLeft=1`（正确行为，不是缺陷）。
+
+**这条的边界**：续期实验里的 DNS 层是**桩**（容器内自建权威服务器 + lego 的 `httpreq` provider），因为容器里没有公网域名；不被打桩的是**续期时点本身** —— 真实守护进程、真实 ARI 客户端、真实 15 分钟 CA 有效期、真实墙钟。
 
 顺带一条环境观察：容器里跑第一次 `make e2e` 时编译失败（`cleanup_test.go:450:11: undefined: bytes`），原因是**我本人正在同时编辑那棵树**（那次提交把 `bytes` 的 import 补上之前的一瞬间被拷走），不是仓库缺陷；重新拷贝后一次通过。
 
