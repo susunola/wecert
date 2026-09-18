@@ -134,7 +134,9 @@
 
   值得记一笔的是**这一轮差点把 SKIP 当成通过**：rebase 之前的分支用的还是旧 `e2e.sh`，它对 SKIP 套件打印 `pass in 9s`；本轮的 #68 修好之后同一条命令才如实报"缺 Go 报告 + 退出 1"。这条修正本身就是上一轮那类缺陷（"跳过的套件被写成通过"）在真实环境里再抓到一次。
 
-提交：本轮 13 个提交都在 `test/e2e-tlsserver-renewal` 上（恢复功能 → 两个视角的修复 → CI 门禁补强 → 规模修复 → 本报告）。**分支基底需要留意**：这一轮开始时该分支的基底早于 `main` 上的 #66/#68，直接推上去会把 #68（"SKIP 的套件算失败"+ 缺 Go 报告不再 traceback）在合并时**回退**；发现后已把本轮 13 个提交 rebase 到当时的 `origin/main` 上，并确认 `docs/stage-c-cvm-systemd.md`、`scripts/e2e-sni.sh`、`scripts/e2e-report.py` 的修复都还在。恢复功能与两轮 review 的修复在同一提交里，因为它们是同一轮的工作。
+CI：分支推上去后 `ci` 全绿（run 35315246281，head `36008b9`）—— 12 个步骤全部 success，包含**这一轮新加进去的** `test (build tags)` 与 `alert rules and CAM policies` 两个门禁，以及 `gofmt`/English/`vet`/`govulncheck`/`test -race`/`build`/cross build。PR：[#69](https://github.com/susunola/wecert/pull/69)。
+
+提交：本轮的提交都在 `test/e2e-tlsserver-renewal` 上（恢复功能 → 两个视角的修复 → CI 门禁补强 → 规模修复 → 本报告）。**分支基底需要留意**：这一轮开始时该分支的基底早于 `main` 上的 #66/#68，直接推上去会把 #68（"SKIP 的套件算失败"+ 缺 Go 报告不再 traceback）在合并时**回退**；发现后已把本轮 13 个提交 rebase 到当时的 `origin/main` 上，并确认 `docs/stage-c-cvm-systemd.md`、`scripts/e2e-sni.sh`、`scripts/e2e-report.py` 的修复都还在。恢复功能与两轮 review 的修复在同一提交里，因为它们是同一轮的工作。
 
 ---
 
