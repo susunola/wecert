@@ -626,7 +626,7 @@ func TestRealDNS01Lifecycle(t *testing.T) {
 
 	cfg := &config.Config{}
 	cfg.ACME.Directory = dirURL
-	cfg.ACME.Email = "e2e@example.test"
+	cfg.ACME.Email = "e2e@atomwangnus.com"
 
 	core, err := EnsureAccount(cfg, store, client)
 	if err != nil {

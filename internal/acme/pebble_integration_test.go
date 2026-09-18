@@ -261,7 +261,7 @@ func TestPebbleFullIssuance(t *testing.T) {
 
 	cfg := &config.Config{}
 	cfg.ACME.Directory = dirURL
-	cfg.ACME.Email = "ops@example.test"
+	cfg.ACME.Email = "ops@atomwangnus.com"
 
 	core, err := EnsureAccount(cfg, store, client)
 	if err != nil {
@@ -339,7 +339,7 @@ func TestPebbleAccountIsReusedAcrossRuns(t *testing.T) {
 
 	cfg := &config.Config{}
 	cfg.ACME.Directory = dirURL
-	cfg.ACME.Email = "ops@example.test"
+	cfg.ACME.Email = "ops@atomwangnus.com"
 
 	if _, err := EnsureAccount(cfg, store, client); err != nil {
 		t.Fatalf("first registration: %v", err)

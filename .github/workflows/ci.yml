@@ -59,6 +59,15 @@ jobs:
       - name: test (build tags)
         run: make test-tags
 
+      # The shipped Prometheus rules and the CAM policies are the only thing watching several
+      # failures that are silent by construction, and both are checked by a Python script that
+      # nothing in CI ran -- so a renamed metric or a policy that no longer covers an API call
+      # reached main with a green build. Both are stdlib-only and take under a second.
+      - name: alert rules and CAM policies
+        run: |
+          make check-alerts
+          make check-scripts
+
       - name: build
         run: make build
 

@@ -2,7 +2,7 @@ package reconcile
 
 import (
 	"context"
-	"github.com/susunola/wecert/internal/spec"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -16,6 +16,7 @@ import (
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/probe"
+	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -294,6 +295,65 @@ func TestReclaimStaleProbeSeriesKeepsHostsOfAClaimedCertificate(t *testing.T) {
 	if !forgotGone {
 		t.Errorf("the runner's transition memory must be reclaimed alongside the series, forgot=%v",
 			r.prober.(*fakeProber).forgotten)
+	}
+}
+
+// Reclaiming stale hosts must resolve the desired state once, not once per host.
+//
+// hostIsUnconfirmed called resolve() per host, and a resolve is a file read, a YAML decode, a
+// validation pass and a sha256 of the document. The round-11 scale work measured the result at the
+// default probe cap: 500 certificates, a pass that reclaims stale hosts took 27.8 s against 0.18 s
+// for the same pass with nothing to reclaim (155x), and the cost was exactly O(staleHosts x
+// fleetSize) -- the shape an ordinary fleet edit produces, since removing certificates or names is
+// what leaves hosts behind.
+func TestReclaimingManyStaleHostsResolvesOnce(t *testing.T) {
+	const certs = 40
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	var (
+		cfgCerts []config.Certificate
+		stale    []string
+	)
+	for i := 0; i < certs; i++ {
+		c := config.Certificate{
+			Name:    fmt.Sprintf("cert-%02d", i),
+			Domains: []string{fmt.Sprintf("live-%02d.example.com", i)},
+		}
+		cfgCerts = append(cfgCerts, c)
+		stale = append(stale, fmt.Sprintf("stale-%02d.example.com", i))
+	}
+
+	prov := &countingProvider{inner: spec.NewStatic(cfgCerts)}
+	r := New(&config.Config{Certificates: cfgCerts}, prov, store, &fakeManager{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Every host the runner remembers, live ones included: the stale ones are the difference from
+	// this round's probed set, which is empty here.
+	all := append([]string{}, stale...)
+	for _, c := range cfgCerts {
+		all = append(all, c.Domains...)
+	}
+	r.prober = &fakeProber{hosts: all}
+
+	for _, h := range append(append([]string{}, stale...), "live-00.example.com") {
+		metrics.CertificateProbeMatch.WithLabelValues(h).Set(1)
+	}
+
+	r.reclaimStaleProbeSeries()
+
+	if got := prov.calls.Load(); got != 1 {
+		t.Errorf("resolved the desired state %d times for %d stale hosts; one resolve per reclaim "+
+			"pass is the difference between 0.18 s and 27.8 s at 500 certificates", got, len(stale))
+	}
+	if probeMatchSeriesExists(t, stale[0]) {
+		t.Error("a host that is no longer probed must still have its series reclaimed")
+	}
+	if !probeMatchSeriesExists(t, "live-00.example.com") {
+		t.Error("a host that is still probed must keep its series")
 	}
 }
 

@@ -607,7 +607,7 @@ func (r *run) loadRules(ctx context.Context) {
 	r.rules = map[string]bool{}
 	if r.o.src.Rules == nil {
 		if r.o.opts.RequireRule {
-			r.freeze("guards.requireCLBRule is on but no CLB rule source is configured")
+			r.freeze("onboarding.requireCLBRule is on but no CLB rule source is configured")
 		}
 		return
 	}

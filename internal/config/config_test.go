@@ -21,7 +21,7 @@ const minimalPrefix = `
 statePath: /tmp/wecert-test.db
 acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  email: ops@example.com
+  email: ops@atomwangnus.com
 dns:
   provider: dnspod
   loginToken: token
@@ -31,6 +31,52 @@ tencent:
   secretKey: key
   regions: [ap-guangzhou]
 `
+
+// A contact address a CA will refuse must be refused here, by name.
+//
+// The shipped example config carried ops@example.com, so the documented quick start failed at the
+// documented -dry-run step with the CA's own error ("contact email has forbidden domain") -- which
+// names neither the file nor the line, and arrives after install.sh has already put the units in
+// place. This is the local check that turns it into an actionable one.
+func TestContactEmailRejectsWhatACARefuses(t *testing.T) {
+	bad := []struct {
+		email string
+		want  string
+	}{
+		{"ops@example.com", "reserved documentation domain"},
+		{"ops@example.org", "reserved documentation domain"},
+		{"ops@sub.example.net", "reserved documentation domain"},
+		{"ops@host.invalid", "reserved special-use TLD"},
+		{"ops@host.test", "reserved special-use TLD"},
+		{"ops@host.example", "reserved special-use TLD"},
+		{"ops@localhost", "reserved special-use name"},
+		{"no-at-sign", "must look like"},
+		{"trailing@", "must look like"},
+		{"@leading", "must look like"},
+	}
+	for _, tc := range bad {
+		err := validateContactEmail(tc.email)
+		if err == nil {
+			t.Errorf("%q must be refused: a CA answers 400 invalidContact for it", tc.email)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%q: the error should carry %q, got: %v", tc.email, tc.want, err)
+		}
+	}
+
+	good := []string{
+		"ops@atomwangnus.com",
+		"ops@mail.example.co.uk", // a real TLD under a reserved-looking label
+		"ops@examplecompany.com", // "example" as a label is not the reserved domain
+		"ops@x.io",
+	}
+	for _, email := range good {
+		if err := validateContactEmail(email); err != nil {
+			t.Errorf("%q must be accepted, got: %v", email, err)
+		}
+	}
+}
 
 func TestLoadMinimal(t *testing.T) {
 	path := writeConfig(t, minimalPrefix+`
@@ -199,7 +245,7 @@ func TestMissingRegionsRejected(t *testing.T) {
 statePath: /tmp/wecert-test.db
 acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  email: ops@example.com
+  email: ops@atomwangnus.com
 dns:
   provider: dnspod
   loginToken: token
@@ -231,7 +277,7 @@ func TestDNSPodProviderRequiresLoginToken(t *testing.T) {
 statePath: /tmp/wecert-test.db
 acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  email: ops@example.com
+  email: ops@atomwangnus.com
 dns:
   provider: dnspod
 tencent:
@@ -258,7 +304,7 @@ func TestTencentCloudProviderNeedsNoLoginToken(t *testing.T) {
 statePath: /tmp/wecert-test.db
 acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  email: ops@example.com
+  email: ops@atomwangnus.com
 dns:
   provider: tencentcloud
 tencent:
@@ -284,7 +330,7 @@ func TestUnknownDNSProviderRejected(t *testing.T) {
 statePath: /tmp/wecert-test.db
 acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  email: ops@example.com
+  email: ops@atomwangnus.com
 dns:
   provider: route53
 tencent:
@@ -727,7 +773,7 @@ const minimalWithDNS = `
 statePath: /tmp/wecert-test.db
 acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
-  email: ops@example.com
+  email: ops@atomwangnus.com
 tencent:
   credentialMode: static
   secretId: id

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -15,6 +16,47 @@ import (
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/state"
 )
+
+// The two time-keyed maps must not grow with the number of names the deployment has ever seen.
+//
+// coolingDown deletes an expired identifier only when the same identifier is asked about again, and
+// nothing deleted a binding-check entry at all, so a deployment that renames or drops certificates --
+// which is ordinary -- kept one entry per name forever. The round-11 scale work measured 50 -> 600
+// entries over 600 churned names.
+func TestTimeKeyedMapsAreSwept(t *testing.T) {
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	m, _ := newTestManager(t, nil, nil)
+	m.SetNow(func() time.Time { return now })
+
+	// Fill both maps with entries for names that are long gone, plus one live entry each.
+	for i := 0; i < cooldownMapLimit; i++ {
+		m.identifierCooldown[fmt.Sprintf("gone-%04d.example.com", i)] = now.Add(-time.Hour)
+		m.bindingChecked[fmt.Sprintf("gone-cert-%04d", i)] = now.Add(-24 * time.Hour)
+	}
+	m.identifierCooldown["live.example.com"] = now.Add(time.Minute)
+	m.bindingChecked["live-cert"] = now
+
+	// A write to each map is what triggers the sweep.
+	m.noteIdentifierFailure("newly-broken.example.com")
+	if !m.bindingCheckDue("newly-seen-cert") {
+		t.Fatal("a certificate that has never been checked must be due")
+	}
+
+	if len(m.identifierCooldown) > 2 {
+		t.Errorf("identifierCooldown still holds %d entries; expired ones must be swept",
+			len(m.identifierCooldown))
+	}
+	if _, ok := m.identifierCooldown["live.example.com"]; !ok {
+		t.Error("the sweep must not drop a cooldown that is still in force")
+	}
+	if len(m.bindingChecked) > 2 {
+		t.Errorf("bindingChecked still holds %d entries; entries past the check interval must be swept",
+			len(m.bindingChecked))
+	}
+	if _, ok := m.bindingChecked["live-cert"]; !ok {
+		t.Error("the sweep must not drop a binding check that is still current")
+	}
+}
 
 func TestParseOrderExpiresEmptyUsesFallback(t *testing.T) {
 	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)

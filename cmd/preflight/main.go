@@ -16,6 +16,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -32,13 +33,26 @@ import (
 	"github.com/susunola/wecert/internal/tcerr"
 )
 
+// exitUsage is the conventional "the command line itself is wrong" code, the same one wecert,
+// wecert-onboard and wecert-probe use. It used to be 1 for the no-arguments case and 2 (flag's
+// default) for an unknown flag, which every document in this repository defines as "the program ran
+// and failed" -- and 2 as wecert-onboard's "deliberately frozen, a human should look".
+const exitUsage = 64
+
 func main() {
-	domain := flag.String("domain", "", "domain to verify, e.g. atomwangnus.com")
-	listCerts := flag.Bool("list-certs", false, "list SSL certificates in the account (ID / alias / domain / status)")
-	pruneCerts := flag.Bool("prune-certs", false, "delete the certificates wecert uploaded (alias starting with wecert/)")
-	yes := flag.Bool("yes", false, "use with -prune-certs to skip the interactive confirmation")
-	bindings := flag.String("bindings", "", "dump the raw bind-resource result for a certificate ID (debugging)")
-	flag.Parse()
+	// ContinueOnError, so an unknown flag does not exit 2 behind our back (see exitUsage).
+	fs := flag.NewFlagSet("preflight", flag.ContinueOnError)
+	domain := fs.String("domain", "", "domain to verify, e.g. atomwangnus.com")
+	listCerts := fs.Bool("list-certs", false, "list SSL certificates in the account (ID / alias / domain / status)")
+	pruneCerts := fs.Bool("prune-certs", false, "delete the certificates wecert uploaded (alias starting with wecert/)")
+	yes := fs.Bool("yes", false, "use with -prune-certs to skip the interactive confirmation")
+	bindings := fs.String("bindings", "", "dump the raw bind-resource result for a certificate ID (debugging)")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		os.Exit(exitUsage)
+	}
 
 	if *bindings != "" {
 		if err := dumpBindings(*bindings); err != nil {
@@ -65,7 +79,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: preflight -domain <domain>")
 		fmt.Fprintln(os.Stderr, "      preflight -list-certs")
 		fmt.Fprintln(os.Stderr, "      preflight -prune-certs [-yes]")
-		os.Exit(1)
+		os.Exit(exitUsage)
 	}
 
 	if err := run(*domain); err != nil {
@@ -393,7 +407,15 @@ func listCertificates() error {
 	}
 
 	listed := len(resp.Response.Certificates)
-	total := derefU64(resp.Response.TotalCount)
+	// certificateCount, not derefU64: the SDK documents this field as possibly null (the model's own
+	// annotation says so), and a nil total printed as "0 total" under a non-empty table is a false
+	// all-clear about the account's certificate count -- the same mistake the check above
+	// (certificateCount) exists to refuse, made 180 lines later in the same file.
+	total, err := certificateCount(resp)
+	if err != nil {
+		fmt.Printf("\n%d listed; the account's total is unknown (%v)\n", listed, err)
+		return nil
+	}
 	fmt.Printf("\n%d total\n", total)
 	if total > uint64(listed) {
 		// Without paging some certificates go unlisted (and thus undeleted), and the list still looks complete.
