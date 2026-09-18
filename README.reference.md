@@ -380,7 +380,10 @@ cert_fallback                 -- the degraded name set currently in service, if 
 
 identifier_failures           -- per-identifier failure ledger ("who has been broken lately")
 ├── cert_name, identifier PK
-└── failures, first_seen, last_seen
+├── failures               INTEGER -- consecutive-ish count, pruned once the name is healthy
+├── last_error             TEXT    -- the CA's own words for the last failure
+└── last_failed_at         INTEGER -- when it happened; the identifier cooldown is seeded from
+                                   -- this after a restart
 
 revoke_requests               -- durable operator decisions (a leaked key stays leaked)
 ├── cert_name  TEXT PK
@@ -545,7 +548,7 @@ Every kind of "cannot read it" has a defined reaction. **None of them treats "un
 | New Certs / registered domain | 50 / 7 days, **shared across accounts** | Frequent changes to the name set | Wildcard-first plus a 25-changes-per-week budget |
 | New Certs / **exact identifier set** | 5 / 7 days, **no override** | Reissuing the same name set repeatedly | At most one in-flight order per certificate |
 | Authorization failures / identifier | 5 / hour | Retrying a name whose DNS is not configured | Backoff, then hand over to a human |
-| **ARI-coordinated renewals** | **exempt from all of the above** | — | The order must carry `replaces` and the identifier set must be unchanged |
+| **ARI-coordinated renewals** | **exempt from all of the above** | — | The order must carry `replaces` and share at least one identifier with the certificate being replaced (an unchanged set qualifies; a wholly disjoint set does not) |
 
 That last row is what makes wildcard-first more than an optimisation: **changing the name set makes the issuance a brand-new certificate**, which forfeits the ARI exemption. The cost of "add one domain" therefore has to be driven to nearly zero, and a wildcard is the only way to do that. It is also why the desired-state generator prefers to report "covered by the declared wildcard, 0 issuances" over touching the SAN set.
 
@@ -563,7 +566,7 @@ A certificate may carry many SANs, and that set changes. Three things exist spec
 
 > ### ⚠️ Changing domains has a quota cost
 >
-> ARI's renewal exemption requires a *same-identifier* renewal. As soon as you add or remove a domain, that issuance becomes a new certificate and counts against **Certificates per Registered Domain (50 / 7 days, shared across accounts)**.
+> ARI's renewal exemption needs the order to share **at least one identifier** with the certificate it replaces (Let's Encrypt's wording). Adding a domain to an existing certificate keeps that overlap and keeps the exemption; a **wholly disjoint** set -- every name moving elsewhere -- is what counts against **Certificates per Registered Domain (50 / 7 days, shared across accounts)**.
 >
 > If you churn identifiers frequently, watch that ceiling. Splitting unrelated services across different registered domains keeps them from competing for the same budget. This is logged as a warning on the drift path.
 
@@ -811,7 +814,8 @@ Wildcards are skipped — `*.example.com` has no address of its own to dial. A c
 Two metrics keep the failure modes apart:
 
 - `wecert_certificate_probe_errors_total{host}` — the probe could not run at all (resolve, dial or handshake failed). This is an environment problem, not a certificate problem.
-- `wecert_certificate_probe_match{host}` — the probe completed and compares what was served against what was deployed. `0` means a rebind did not take effect, or another certificate is winning SNI.
+- A name that resolves to more than **32 addresses** is refused rather than sampled (`probe: … more than the 32 this program will dial`): every resolved address has to be checked, so "here are the first 32" would be a claim the probe cannot support. The verdict for that host is an error, and `probe_match` is 0 while it lasts.
+- `wecert_certificate_probe_match{host}` — the probe completed and compares what was served against what was deployed. `0` means a rebind did not take effect, another certificate is winning SNI, **or** at least one of the host's resolved addresses could not be reached (an unverified address is not a verified one). Read `wecert_certificate_probe_errors_total` with it: errors climbing means the environment, not the certificate.
 
 > **The comparison is against what was deployed, not "some valid certificate".** `wecert_certificate_probe_not_after_timestamp_seconds` (read over the network) sitting next to `wecert_certificate_not_after_timestamp_seconds` (read from the state store) is what makes "the rebind silently did nothing" visible.
 
@@ -937,7 +941,7 @@ row per bucket in `rate_buckets`: the bucket model is its own memory, so no even
 | `wecert_last_reconcile_timestamp_seconds` | When the last **full pass finished**. Stamped on completion, never on start, so a hung pass goes stale exactly like a dead process; `0` means none has finished since startup. This is how "the daemon is up and converging nothing" becomes visible — the counter above stops moving both when nothing is due and when the loop is wedged |
 | `wecert_revocation_pending` | Revocation requests recorded but not yet accepted by the CA. **Non-zero is an outstanding security action**, not a background task: the row exists because someone decided a certificate must stop being trusted |
 | `wecert_revocation_query_errors_total` | Passes that could not read the outstanding revocation requests. `wecert_revocation_pending` holds its last value when that read fails rather than reporting a false `0`, so this counter is what distinguishes "the queue is empty" from "we have been unable to look" |
-| `wecert_certificate_probe_match{host}` | 1 when the certificate served is the one deployed; 0 when a rebind did not take effect or another certificate is winning SNI |
+| `wecert_certificate_probe_match{host}` | 1 when the certificate served is the one deployed; 0 when a rebind did not take effect, another certificate is winning SNI, or some resolved addresses could not be checked (see `wecert_certificate_probe_errors_total`) |
 | `wecert_certificate_probe_not_after_timestamp_seconds{host}` | `notAfter` read back over the network — compare against the state-store value |
 | `wecert_certificate_probe_errors_total{host}` | The probe could not run at all. An environment problem, not a certificate problem |
 | `wecert_certificate_fallback_active{cert}` | 1 while a partial certificate is being served because some names keep failing |
@@ -1165,25 +1169,26 @@ make test-pebble  # a real ACME lifecycle against a local CA (needs the pebble b
 make cover      # coverage
 ```
 
-CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI does **not** run `check-scripts`, `check-alerts`, `make fuzz` or `make test-pebble` yet — those are on whoever pushes.
+CI (`.github/workflows/ci.yml`) runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make build` + `make release`. `make check` additionally runs `test-tags` (the same tests under `-tags "pebble lego_dns"`, which is the only gate for two tag-selected production files), `check-scripts` (the shell self-test and the CAM policy drift check) and `check-alerts`. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it. CI does **not** run `check-scripts`, `check-alerts`, `make fuzz` or `make test-pebble` yet — those are on whoever pushes.
 
 ### Test layout
 
-787 test functions across 76 files in 19 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
+817 test functions across 78 files in 20 packages (`go test ./... -list 'Test.*' | grep -c '^Test'`):
 
 | Package | Files | Tests | What it covers |
 |---|---|---|---|
-| `internal/acme` | 27 | 226 | The issuance state machine |
-| `internal/deploy` | 7 | 81 | Upload, bind confirmation, replacement |
-| `internal/onboarding` | 4 | 80 | Document generation and the CLB guard |
-| `internal/state` | 10 | 76 | Schema, permissions, backups, the lease-held lock |
-| `internal/config` | 7 | 66 | Validation, domain normalisation, profiles |
+| `internal/acme` | 28 | 235 | The issuance state machine |
+| `internal/state` | 10 | 83 | Schema, permissions, backups, transactions |
+| `internal/deploy` | 7 | 82 | Upload, bind confirmation, replacement |
+| `internal/onboarding` | 4 | 81 | Document generation and the CLB guard |
+| `internal/config` | 7 | 67 | Validation, domain normalisation, profiles |
 | `internal/webhook` | 3 | 61 | Trigger parsing, token enforcement, notifications |
-| `internal/reconcile` | 2 | 54 | Whether to order at all, metric publication, shutdown |
-| `internal/spec` | 2 | 25 | Source selection, document read/write |
+| `internal/reconcile` | 2 | 55 | Whether to order at all, metric publication, shutdown |
+| `internal/spec` | 2 | 26 | Source selection, document read/write |
 | `internal/ratelimit` | 4 | 20 | Token arithmetic, including the fuzz targets |
-| `internal/probe` | 1 | 18 | The black-box probe and every-resolved-address logic |
+| `internal/probe` | 1 | 19 | The black-box probe and every-resolved-address logic |
 | `internal/group` | 1 | 14 | Grouping and the PSL registered domain |
+| `internal/atomicfile` | 1 | 6 | The temp-file/fsync/rename protocol |
 | `internal/metrics` | 1 | 2 | The registry itself |
 | `internal/tcerr` | 1 | 1 | The DNSPod "no data" classification |
 | `cmd/*` | 6 | 65 | Per-tool argument handling and exit codes |

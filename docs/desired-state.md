@@ -280,9 +280,15 @@ WantedBy=timers.target
 
 先跑 observe 的话，可以再加一个单元，让它在期望状态真的变了之后再触发 wecert：
 
+> 注意：`${WEBHOOK_TOKEN}` 必须真的存在于这个单元的环境里 —— systemd 对未定义的变量展开成**空串**，
+> 于是请求会以 401 失败，而 `curl -sf` 让这个单元看起来"只是没触发"。用
+> `EnvironmentFile=/etc/wecert/webhook.env`（0600 root:wecert，里面一行 `WEBHOOK_TOKEN=…`）
+> 或 `Environment="WEBHOOK_TOKEN=…"` 提供它。
+
 ```ini
 # /etc/systemd/system/wecert-reload.service
 [Service]
+EnvironmentFile=/etc/wecert/webhook.env
 Type=oneshot
 ExecStart=/usr/bin/curl -sf -X POST \
   -H "X-Wecert-Token: ${WEBHOOK_TOKEN}" \

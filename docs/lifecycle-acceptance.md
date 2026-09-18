@@ -184,7 +184,7 @@ certificates:
 | A4b | 整组换域名 | 与旧证书零重叠也必须能签发 | 签发成功、**不带** `replaces` |
 | A5 | 中断续跑 | 半途失败后复用同一订单 | 恢复时 `order_url` 不变、无新订单 |
 | A6 | 并发双证书 | 同名 TXT 不互删 | 两张证书都签发成功（这正是被修复的缺陷类） |
-| A7 | 续期·ARI | 走 ARI 窗口 + `replaces` | `starting renewal`、`replaces=true`、window 归零 |
+| A7 | 续期·ARI | 走 ARI 窗口 + `replaces` | `starting renewal`、`replacesRequested=true`、window 归零 |
 | A8 | 续期·回退 | ARI 不可用时按时间阈值 | `replaces=false`、仍成功 |
 | A9 | 孤儿回收 | 未持久化的记录被找回 | `reclaiming it before deleting the row`、TXT 与行都被清掉 |
 | B0 | 声明→契约 | `_wecert` 记录生成文档 | 证书名=`example-com`、SAN=声明集合、revision 稳定 |
@@ -335,7 +335,7 @@ txt "_acme-challenge.sub.$APEX"
 - `not_after` 比 A0 的晚；`orders`=0；`_acme-challenge.sub.$APEX` 为空
 
 **判据**：以上全部成立。额外记录（**不作为判据**）：`ACME order created` 可能出现
-`replaces=true` —— 代码把 ARI certID 一并带上；若 CA 不接受 `replaces`，
+`replacesRequested=true` —— 代码把 ARI certID 一并带上；若 CA 不接受 `replaces`，
 lego 会自动去掉并重试一次，最终签发成功仍算通过。
 
 **失败说明**：没有漂移告警却重签了，说明判断落在续期窗口上（那不是这条设计）；
@@ -508,7 +508,7 @@ identifiers in this order do not match any identifiers in the certificate being 
 | 检查 | 期望 |
 |---|---|
 | 结果 | **签发成功**（这是本阶段唯一真正重要的一条） |
-| 日志 | `ACME order created` 存在，且其中 **没有** `replaces=true` |
+| 日志 | `ACME order created` 存在，且其中 **没有** `replacesRequested=true` |
 | 日志 | **没有** `Could not validate ARI 'replaces' field` |
 | 日志 | 没有 `the CA refused the ARI replaces field; retrying the order without it`（走的是"一开始就不发"，不是"发了被拒再重试") |
 | 新 SAN | `{moving.$APEX}` |
@@ -681,7 +681,7 @@ OLD_ARI="$(q "SELECT ari_cert_id FROM certificates WHERE name='lifecycle';")"
 **期望**
 
 - `starting renewal`，该行 `ariReplaces=true`
-- `ACME order created` 一行里 `replaces=true`
+- `ACME order created` 一行里 `replacesRequested=true`
 - 新叶证书的 SAN 与配置一致，`not_after` 前移
 - 成功后 `ari_window_start` / `ari_window_end` 被**归零**（下一轮重新拉取），
   且 `ari_cert_id` 变成**新证书**的
@@ -697,7 +697,7 @@ q "SELECT ari_window_start, ari_window_end, ari_checked_at, ari_cert_id FROM cer
 | 检查 | 期望 |
 |---|---|
 | `starting renewal` 行 | 存在，且 `ariReplaces=true` |
-| `ACME order created` 行 | 存在，且 `replaces=true` |
+| `ACME order created` 行 | 存在，且 `replacesRequested=true` |
 | `replaces` 是否真被 CA 接受 | 签发成功即证明（staging 会校验 `replaces` 指向的证书） |
 | `ari_cert_id` | 与 `OLD_ARI` **不同**（新证书的 AKI/serial） |
 | `ari_window_start` / `_end` | 0 / 0 |
@@ -1269,7 +1269,7 @@ staging 签发的证书**不需要**吊销，也不占生产配额。若 `deploy
 3. A4：中断态下同一个 `txt_name` 有 2 行授权、`dig` 返回 2 条 TXT
 4. A5：恢复时 `resuming the existing order`，且没有第二张订单
 5. A6：并发两张共享挑战名的证书都签发成功
-6. A7：`ACME order created` 里 `replaces=true`
+6. A7：`ACME order created` 里 `replacesRequested=true`
 7. A9：`reclaiming it before deleting the row` 出现，且授权行清空
 8. A4b：换到零重叠的域名集合仍能签发（不带 `replaces`）
 
