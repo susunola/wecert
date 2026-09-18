@@ -17,6 +17,13 @@ import (
 type RevokeRequest struct {
 	CertName string
 
+	// CertIdentity names the certificate the operator asked to revoke, derived from its material
+	// and not from the name: a renewal replaces the material under the same name.
+	//
+	// Empty means the request predates this column, and the retry then has nothing to compare --
+	// it revokes whatever is stored, which is what it did before. See acme.processRevocation.
+	CertIdentity string
+
 	// Reason is the RFC 5280 CRLReason code (0 unspecified, 1 keyCompromise, 4 superseded,
 	// 5 cessationOfOperation, ...). Stored so the operator's choice survives every retry.
 	Reason int
@@ -33,7 +40,12 @@ type RevokeRequest struct {
 // Idempotent in the sense that matters: asking again for a certificate already pending keeps
 // the original RequestedAt, because "how long has this been outstanding" is the number an
 // operator needs, and refreshing it would hide a request that has been failing for a week.
-func (s *Store) AddRevokeRequest(certName string, reason int, now time.Time) error {
+//
+// certIdentity is refreshed along with the reason, and the two go together: this call IS the
+// operator asking, right now, for the certificate stored under this name now. A retry does not
+// come through here, so it keeps targeting the certificate the request was made about -- which is
+// the whole point of storing the identity.
+func (s *Store) AddRevokeRequest(certName string, reason int, certIdentity string, now time.Time) error {
 	if certName == "" {
 		return errors.New("revoke request needs a certificate name")
 	}
@@ -41,10 +53,12 @@ func (s *Store) AddRevokeRequest(certName string, reason int, now time.Time) err
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec(`
-		INSERT INTO revoke_requests (cert_name, reason, requested_at, attempts, last_error, last_attempt_at)
-		VALUES (?, ?, ?, 0, '', 0)
-		ON CONFLICT(cert_name) DO UPDATE SET reason = excluded.reason`,
-		certName, reason, toUnix(now))
+		INSERT INTO revoke_requests (cert_name, reason, cert_identity, requested_at, attempts, last_error, last_attempt_at)
+		VALUES (?, ?, ?, ?, 0, '', 0)
+		ON CONFLICT(cert_name) DO UPDATE SET
+		    reason = excluded.reason,
+		    cert_identity = excluded.cert_identity`,
+		certName, reason, certIdentity, toUnix(now))
 	if err != nil {
 		return fmt.Errorf("record revoke request for %s: %w", certName, err)
 	}
@@ -57,7 +71,7 @@ func (s *Store) ListRevokeRequests() ([]*RevokeRequest, error) {
 	defer s.mu.Unlock()
 
 	rows, err := s.db.Query(`
-		SELECT cert_name, reason, requested_at, attempts, last_error, last_attempt_at
+		SELECT cert_name, reason, cert_identity, requested_at, attempts, last_error, last_attempt_at
 		FROM revoke_requests ORDER BY requested_at`)
 	if err != nil {
 		return nil, fmt.Errorf("list revoke requests: %w", err)
@@ -71,7 +85,7 @@ func (s *Store) ListRevokeRequests() ([]*RevokeRequest, error) {
 			requestedAt   int64
 			lastAttemptAt int64
 		)
-		if err := rows.Scan(&r.CertName, &r.Reason, &requestedAt, &r.Attempts, &r.LastError, &lastAttemptAt); err != nil {
+		if err := rows.Scan(&r.CertName, &r.Reason, &r.CertIdentity, &requestedAt, &r.Attempts, &r.LastError, &lastAttemptAt); err != nil {
 			return nil, fmt.Errorf("scan revoke request: %w", err)
 		}
 		r.RequestedAt = fromUnix(requestedAt)
@@ -92,9 +106,9 @@ func (s *Store) GetRevokeRequest(certName string) (*RevokeRequest, error) {
 		lastAttemptAt int64
 	)
 	err := s.db.QueryRow(`
-		SELECT cert_name, reason, requested_at, attempts, last_error, last_attempt_at
+		SELECT cert_name, reason, cert_identity, requested_at, attempts, last_error, last_attempt_at
 		FROM revoke_requests WHERE cert_name = ?`, certName).
-		Scan(&r.CertName, &r.Reason, &requestedAt, &r.Attempts, &r.LastError, &lastAttemptAt)
+		Scan(&r.CertName, &r.Reason, &r.CertIdentity, &requestedAt, &r.Attempts, &r.LastError, &lastAttemptAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -117,7 +131,10 @@ func (s *Store) RecordRevokeAttempt(certName string, attemptErr error, now time.
 
 	msg := ""
 	if attemptErr != nil {
-		msg = attemptErr.Error()
+		// Bounded like every other last_error writer in this package: lego hands back the CA's
+		// body verbatim, and one huge HTML error page in every attempt row is how a state file
+		// grows without bound.
+		msg = truncate(attemptErr.Error(), maxLastErrorBytes)
 	}
 	_, err := s.db.Exec(`
 		UPDATE revoke_requests

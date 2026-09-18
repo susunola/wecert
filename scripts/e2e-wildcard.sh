@@ -41,6 +41,16 @@ DIG="${DIG:-dig}"
 SAMPLE_SECONDS="${SAMPLE_SECONDS:-600}"
 # How often to sample.
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-2}"
+# How long to keep re-checking after the process exits before calling a value a leftover.
+#
+# Removal is eventually consistent: the DNSPod API drops the record at once, but the
+# authoritative servers can keep answering with it for a few seconds -- the same propagation
+# lag the sampling above exists to observe, in the other direction. Checking the instant the
+# process exits reported a leak that was not one (two values still visible on the authorities
+# ~2s after the delete, gone at the API and on every authority a minute later). Zero disables
+# the wait, which the canned self-test uses.
+SETTLE_SECONDS="${SETTLE_SECONDS:-120}"
+SETTLE_INTERVAL="${SETTLE_INTERVAL:-5}"
 
 if ! command -v "${DIG}" >/dev/null 2>&1; then
 	echo "Error: ${DIG} is required (dig / BIND utils)." >&2
@@ -264,10 +274,24 @@ echo
 
 echo "--- [5/6] assert: cleanup left nothing behind ---"
 REMAINING="$(all_txt_values)"
+SETTLE_WAITED=0
+if [[ -n "${REMAINING}" && "${SETTLE_SECONDS}" -gt 0 ]]; then
+	echo "    values are still visible; waiting up to ${SETTLE_SECONDS}s for the deletion to reach every authority"
+	SETTLE_DEADLINE=$(( $(date +%s) + SETTLE_SECONDS ))
+	while [[ -n "${REMAINING}" && "$(date +%s)" -lt "${SETTLE_DEADLINE}" ]]; do
+		sleep "${SETTLE_INTERVAL}"
+		SETTLE_WAITED=$(( SETTLE_WAITED + SETTLE_INTERVAL ))
+		REMAINING="$(all_txt_values)"
+	done
+fi
 if [[ -z "${REMAINING}" ]]; then
-	pass "no TXT values remain at ${CHALLENGE}"
+	if [[ "${SETTLE_WAITED}" -gt 0 ]]; then
+		pass "no TXT values remain at ${CHALLENGE} (the deletion took ${SETTLE_WAITED}s to reach every authority)"
+	else
+		pass "no TXT values remain at ${CHALLENGE}"
+	fi
 else
-	fail "TXT values were left behind at ${CHALLENGE}:"
+	fail "TXT values were still at ${CHALLENGE} after waiting ${SETTLE_WAITED}s:"
 	printf '       %s\n' "${REMAINING}" >&2
 	echo "     Leftovers consume the DNSPod record quota and are the classic DNS-01 leak." >&2
 	if [[ -n "${BASELINE}" ]]; then

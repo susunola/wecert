@@ -1,7 +1,9 @@
 package state
 
 import (
+	"errors"
 	"fmt"
+	"github.com/susunola/wecert/internal/atomicfile"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,6 +23,19 @@ const backupSuffix = ".backup-"
 // snapshotStamp is the timestamp layout in a snapshot name. Fixed width and zero padded, so
 // lexicographic order is chronological order.
 const snapshotStamp = "20060102T150405.000Z"
+
+// removeSnapshotFile is os.Remove, as a seam.
+//
+// Pruning has to attempt every victim even when one cannot be removed, and the only portable way to
+// prove that is to make one removal fail on purpose: "undeletable" normally means an immutable flag
+// or an ACL, neither of which a test can rely on across platforms.
+var removeSnapshotFile = os.Remove
+
+// snapshotCopied runs after the copy lands and before its permissions are tightened. Tests use it
+// to observe the mode the copy was CREATED with: the chmod that follows makes the window invisible
+// to any assertion made after Snapshot returns, so without this hook the umask above could be
+// dropped without a test noticing.
+var snapshotCopied = func(string) {}
 
 // Snapshot writes a consistent copy of the state database, and prunes older snapshots.
 //
@@ -52,24 +67,22 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 	// second meant keep=1 deleted the NEWER one and kept the older -- silently, and only under
 	// load, which is exactly when a fresh snapshot matters.
 	stamp := time.Now().UTC().Format(snapshotStamp)
-	final := filepath.Join(dir, s.snapshotName(stamp))
 
-	// VACUUM INTO refuses to overwrite, and creating the file itself would be the wrong
-	// way to get the 0600 mode: the driver creates it 0644 (the process umask), and this
-	// file holds the ACME account key and every certificate private key. Write to a
-	// private temp name, tighten it, then rename into place.
-	tmp, err := os.CreateTemp(dir, ".snapshot-*.tmp")
+	// VACUUM INTO refuses to overwrite, and the file it creates must already be private: the
+	// driver creates it with the process umask (0644 by default) and this file holds the ACME
+	// account key and every certificate private key. So the copy is made under a restrictive umask
+	// (below) into a name that does not exist yet, and renamed into place afterwards.
+	//
+	// The name is picked by trial rather than by CreateTemp-then-Remove. Creating the file and
+	// deleting it again made the whole snapshot impossible in a directory that allows creating but
+	// not deleting (an ACL, a chattr'd directory): every interval failed on the Remove, and each
+	// attempt left a 0-byte .snapshot-*.tmp that nothing revisits. Picking a free name needs only
+	// stat, and a crash mid-VACUUM now leaves a file the sweep below recognises.
+	sweepStaleSnapshotTemps(dir)
+	s.repairFutureDatedSnapshots(dir)
+	tmpName, err := s.freeTempName(dir)
 	if err != nil {
-		return "", fmt.Errorf("create snapshot temp file in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return "", fmt.Errorf("close snapshot temp file: %w", err)
-	}
-	// VACUUM INTO needs a path that does not exist yet.
-	if err := os.Remove(tmpName); err != nil {
-		return "", fmt.Errorf("clear snapshot temp file %s: %w", tmpName, err)
+		return "", err
 	}
 
 	defer func() {
@@ -80,37 +93,172 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 		}
 	}()
 
-	// Two snapshots can still collide at millisecond precision. The fallback keeps the sort order
-	// intact: a numeric suffix appended after the stamp sorts LATER, so the newer file stays
-	// "newest" for retention. (The pid-based version this replaces did the opposite.)
-	for n := 1; ; n++ {
-		if _, err := os.Stat(final); os.IsNotExist(err) {
-			break
-		}
-		final = filepath.Join(dir, s.snapshotName(fmt.Sprintf("%s-%d", stamp, n)))
+	// Two snapshots can still collide at millisecond precision; the collision name has to sort
+	// after the unsuffixed one, which freeSnapshotName explains.
+	final, err := s.freeSnapshotName(dir, stamp)
+	if err != nil {
+		return "", err
 	}
 
-	if _, err := s.db.Exec(`VACUUM INTO ?`, tmpName); err != nil {
-		return "", fmt.Errorf("snapshot state database: %w", err)
+	// The copy is born under a restrictive umask, not tightened afterwards.
+	//
+	// Open() does the same for the database it migrates (see restrictiveUmask in state.go) for the
+	// same reason: this file is a logical copy of the ACME account key and every certificate private
+	// key, and the driver creates it with the process umask -- 0644 on a default system. Chmod after
+	// the copy left a window in which any local user could read it, and a crash inside that window
+	// left behind a world-readable `.snapshot-*.tmp` that nothing ever revisits (listing matches
+	// only the final `<base>.backup-<stamp>.db` names). The chmod stays as the backstop for a file
+	// that already existed.
+	restoreUmask := restrictiveUmask()
+	_, execErr := s.db.Exec(`VACUUM INTO ?`, tmpName)
+	restoreUmask()
+	snapshotCopied(tmpName)
+	if execErr != nil {
+		return "", fmt.Errorf("snapshot state database: %w", execErr)
 	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		return "", fmt.Errorf("tighten snapshot permissions: %w", err)
-	}
-	if err := os.Rename(tmpName, final); err != nil {
+	// The permissions are set on the temporary file and the rename is made durable by
+	// internal/atomicfile, which is where the protocol lives.
+	if err := atomicfile.Install(tmpName, final, 0o600, dir); err != nil {
+		// The rename and the directory sync are two steps, and only the first one changes what is
+		// on disk: if the file is there, the caller has a usable snapshot and must be told so --
+		// reporting "no snapshot" while one exists is the same false all-clear this caller's
+		// "a snapshot was written despite the error" branch exists to prevent.
+		if _, statErr := os.Stat(final); statErr == nil {
+			tmpName = ""
+			return final, fmt.Errorf("snapshot written to %s, but making the name durable failed: %w", final, err)
+		}
 		return "", fmt.Errorf("install snapshot %s: %w", final, err)
 	}
+	tmpName = ""
 	// Verify the rename landed before pruning, so a failure here cannot leave us with
 	// fewer snapshots than before.
 	if _, err := os.Stat(final); err != nil {
 		return "", fmt.Errorf("snapshot %s is missing after rename: %w", final, err)
 	}
 
-	if err := s.pruneSnapshots(dir, keep); err != nil {
+	if err := s.pruneSnapshots(dir, keep, final); err != nil {
 		// The snapshot itself succeeded; failing to prune is worth reporting but must not
 		// be reported as a failed snapshot.
 		return final, fmt.Errorf("snapshot written to %s, but pruning old snapshots failed: %w", final, err)
 	}
 	return final, nil
+}
+
+// freeTempName returns a path under dir for a snapshot being written, that does not exist yet.
+//
+// VACUUM INTO insists on a path that does not exist, so the name has to be chosen rather than
+// created: CreateTemp's O_EXCL is exactly the guarantee that cannot be used here. The stamp plus a
+// counter is enough -- one process writes snapshots (the store lock makes that true), and a
+// collision is detected by the stat instead of assumed away.
+func (s *Store) freeTempName(dir string) (string, error) {
+	stamp := time.Now().UTC().Format("20060102T150405.000")
+	for n := 0; ; n++ {
+		candidate := filepath.Join(dir, fmt.Sprintf(".snapshot-%s-%d.tmp", stamp, n))
+		_, err := os.Stat(candidate)
+		if os.IsNotExist(err) {
+			return candidate, nil
+		}
+		if err != nil {
+			// Unknown state (an unreachable mount, a lost search permission): every candidate
+			// fails the same way, so retrying would spin.
+			return "", fmt.Errorf("cannot tell whether snapshot temp file %s is free: %w", candidate, err)
+		}
+	}
+}
+
+// snapshotTempMaxAge is how long a `.snapshot-*.tmp` file may sit in the backup directory before
+// the next snapshot removes it.
+//
+// A crash between VACUUM INTO and the rename leaves a partial copy behind, and nothing else ever
+// looks at those names. An hour is far longer than any snapshot takes (the pass that writes one is
+// bounded by the store's own work, seconds at most) and far shorter than the shortest retention
+// interval, so a live write can never be swept.
+const snapshotTempMaxAge = time.Hour
+
+// repairFutureDatedSnapshots renames snapshots whose stamp is in the future.
+//
+// The stamp is wall-clock, so a forward excursion (an NTP correction, a VM resumed from a snapshot
+// taken on a machine whose clock was ahead) writes names that sort AFTER every later, honest stamp.
+// Retention keeps the newest names, so such a file is never pruned again: it holds a slot forever
+// and the deployment keeps one fewer genuine recovery point -- measured with keep=3, which retained
+// only two real snapshots and deleted the oldest fresh one every round. The content is fine, so the
+// file is renamed rather than deleted, to the time it was actually written (its mtime) or to now
+// when the mtime is in the future too.
+func (s *Store) repairFutureDatedSnapshots(dir string) {
+	names, err := s.listSnapshots(dir)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, name := range names {
+		stamp, ok := s.snapshotStampOf(filepath.Base(name))
+		if !ok {
+			continue
+		}
+		at, err := time.Parse(snapshotStamp, stamp)
+		if err != nil || !at.After(now) {
+			continue
+		}
+		info, err := os.Stat(name)
+		if err != nil {
+			continue
+		}
+		target := info.ModTime().UTC()
+		if target.After(now) {
+			target = now
+		}
+		fixed, err := s.freeSnapshotName(dir, target.Format(snapshotStamp))
+		if err != nil || fixed == name {
+			continue
+		}
+		_ = os.Rename(name, fixed)
+	}
+}
+
+// sweepStaleSnapshotTemps removes leftover temporary snapshots from an interrupted write.
+func sweepStaleSnapshotTemps(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, ".snapshot-") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || time.Since(info.ModTime()) < snapshotTempMaxAge {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+}
+
+// freeSnapshotName returns the first snapshot name under dir that is free for this stamp.
+//
+// The suffix has to sort AFTER the unsuffixed name or retention keeps the wrong one: pruning
+// deletes from the front of a lexicographic sort, so "<stamp>-1.db" ('-' is 0x2D) sorted BEFORE
+// "<stamp>.db" ('.' is 0x2E) and keep=1 deleted the newer snapshot while the comment claimed the
+// opposite. "~" is 0x7E.
+func (s *Store) freeSnapshotName(dir, stamp string) (string, error) {
+	final := filepath.Join(dir, s.snapshotName(stamp))
+	for n := 1; ; n++ {
+		_, statErr := os.Stat(final)
+		if statErr == nil {
+			// Taken. Try the next suffix.
+			final = filepath.Join(dir, s.snapshotName(fmt.Sprintf("%s~%d", stamp, n)))
+			continue
+		}
+		// Any other failure leaves the name's state UNKNOWN, and "unknown" must not be read as
+		// "taken": every candidate suffix fails the same way, so the loop would spin here forever
+		// -- a directory that lost its search permission, an unreachable mount, a symlink loop --
+		// burning a core in the backup goroutine while no snapshot is ever written. Reporting it
+		// skips this round, which the caller logs, and the next round tries again.
+		if !os.IsNotExist(statErr) {
+			return "", fmt.Errorf("cannot tell whether snapshot %s already exists: %w", final, statErr)
+		}
+		return final, nil
+	}
 }
 
 // snapshotName builds the filename for one snapshot of this store.
@@ -136,8 +284,12 @@ func (s *Store) snapshotStampOf(name string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	// A collision suffix ("<stamp>-2") is not part of the timestamp.
-	if i := strings.IndexByte(rest, '-'); i >= 0 {
+	// A collision suffix ("<stamp>~2") is not part of the timestamp. The '-' form is still
+	// accepted: snapshots written before the separator changed must keep counting as ours, or
+	// retention stops seeing them and they stay on disk forever.
+	if i := strings.IndexByte(rest, '~'); i >= 0 {
+		rest = rest[:i]
+	} else if i := strings.IndexByte(rest, '-'); i >= 0 {
 		rest = rest[:i]
 	}
 	if _, err := time.Parse(snapshotStamp, rest); err != nil {
@@ -168,8 +320,17 @@ func (s *Store) listSnapshots(dir string) ([]string, error) {
 	return out, nil
 }
 
-// pruneSnapshots keeps the newest `keep` snapshots and removes the rest.
-func (s *Store) pruneSnapshots(dir string, keep int) error {
+// pruneSnapshots keeps the newest `keep` snapshots and removes the rest, never removing protect
+// (the snapshot this call just wrote).
+//
+// Names are wall-clock stamps, so name order and content order agree only while the clock moves
+// forwards. After a backward step -- an NTP correction, a VM resumed from a snapshot, a backup
+// directory restored from a host whose clock was ahead -- the file just written has the newest
+// CONTENT and the OLDEST name, and "delete from the front" removed exactly that file: the caller
+// logged a fresh snapshot at a path that no longer existed and the recovery point silently stopped
+// advancing. Protecting the name and taking one extra victim from the rest keeps retention at
+// `keep` while guaranteeing the newest content survives.
+func (s *Store) pruneSnapshots(dir string, keep int, protect string) error {
 	names, err := s.listSnapshots(dir)
 	if err != nil {
 		return err
@@ -177,15 +338,60 @@ func (s *Store) pruneSnapshots(dir string, keep int) error {
 	if len(names) <= keep {
 		return nil
 	}
-	for _, name := range names[:len(names)-keep] {
-		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove old snapshot %s: %w", name, err)
+	// names is oldest-first, so filling the victim set in order preserves "oldest goes first".
+	victims := make([]string, 0, len(names)-keep)
+	for _, name := range names {
+		if len(victims) == len(names)-keep {
+			break
+		}
+		if name == protect {
+			continue
+		}
+		victims = append(victims, name)
+	}
+	// Every victim is attempted even when one of them cannot be removed.
+	//
+	// Returning on the first failure meant ONE undeletable snapshot stopped all pruning for the
+	// life of the directory: an operator who makes snapshots immutable (chattr +i, or ACLs, as
+	// ransomware hardening) then watched the directory grow by one file per interval while every
+	// round reported the same error against the same oldest name. The failures are joined instead,
+	// so the caller's log line names all of them and the snapshots that CAN be removed are gone.
+	var failed []error
+	for _, name := range victims {
+		if err := removeSnapshotFile(name); err != nil && !os.IsNotExist(err) {
+			failed = append(failed, fmt.Errorf("remove old snapshot %s: %w", name, err))
 		}
 	}
-	return nil
+	return errors.Join(failed...)
 }
 
 // Snapshots lists the snapshots this store would prune, oldest first. For diagnostics.
 func (s *Store) Snapshots(dir string) ([]string, error) {
 	return s.listSnapshots(dir)
+}
+
+// HasRecoverableState reports whether this database holds anything a snapshot could recover.
+//
+// The question is not idle when retention is in play. A snapshot of a freshly created database is
+// not a recovery point, but retention counts it as one: after the documented state.db loss -- the
+// case snapshots exist for -- every restart wrote one of these and evicted a real backup, so three
+// restarts with keep=3 destroyed all three genuine snapshots and the operator's last good copy was
+// gone before anyone looked. The answer is "is there an account key, a certificate, an order, a
+// revocation decision or retired material in here"; rate buckets and identifier-failure counters
+// are deliberately not counted, because losing them costs rate-limit knowledge, not a certificate.
+func (s *Store) HasRecoverableState() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, table := range []string{"accounts", "certificates", "orders", "revoke_requests", "retired_certificates"} {
+		var exists int
+		err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ` + table + `)`).Scan(&exists)
+		if err != nil {
+			return false, fmt.Errorf("check %s for recoverable state: %w", table, err)
+		}
+		if exists == 1 {
+			return true, nil
+		}
+	}
+	return false, nil
 }

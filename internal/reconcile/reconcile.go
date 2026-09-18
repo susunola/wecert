@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,14 @@ var ErrDesiredStateUnavailable = errors.New("cannot read the desired state")
 // ErrUnknownCert means the requested name is not in the current desired state.
 var ErrUnknownCert = errors.New("no such certificate in the desired state")
 
+// ErrShuttingDown means the process is draining, so no new pass may start.
+//
+// It is a sentinel for the same reason as ErrDesiredStateUnavailable: "we are going away, try
+// again after the restart" is a different answer from "that certificate is already running" and
+// must not be reported as the latter. A pass started now would write its promotion, resume anchor
+// or failure counter into a state store that the shutdown path closes as soon as Drain returns.
+var ErrShuttingDown = errors.New("the reconciler is shutting down")
+
 // Notifier is notified after each certificate finishes processing. May be nil.
 //
 // It lives on this layer rather than in the webhook layer so the "renewal
@@ -76,7 +85,7 @@ type CertManager interface {
 	// PublishQuota refreshes the rate-limit gauges. Optional in spirit -- a manager that has
 	// no quota accounting simply reports nothing -- but part of the interface because every
 	// production manager has one.
-	PublishQuota(scopes map[string]string)
+	PublishQuota(scopes map[string][]string)
 
 	// RetryPendingRevocations re-attempts every revocation the CA has not accepted yet.
 	RetryPendingRevocations(ctx context.Context)
@@ -107,6 +116,31 @@ type Reconciler struct {
 
 	mu      sync.Mutex
 	running map[string]struct{}
+
+	// bg counts the passes started by the webhook surface, so shutdown can wait for them.
+	//
+	// A pass can take minutes (DNS propagation), and the store, the ACME account and the process
+	// are all shared with it. Nothing used to wait: on SIGTERM the daemon cancelled its context,
+	// returned, and the deferred store.Close() closed SQLite under any pass still running -- so its
+	// epilogue (promotion, resume-anchor PutOrder, authorization update, recordFailure) failed. The
+	// worst case is the one this code already names elsewhere: an exit between an upload returning
+	// an id and PutOrder recording it leaves a cloud certificate in neither certificates nor
+	// retired_certificates, so it is billed and never reclaimed. Add happens before the goroutine
+	// starts, so a pass still queued for a start slot is counted too.
+	bg sync.WaitGroup
+
+	// bgMu serializes a pass's registration against Drain's transition to draining.
+	//
+	// sync.WaitGroup requires that a positive Add which starts from zero does not run concurrently
+	// with Wait ("Note that calls with a positive delta that start when the counter is zero must
+	// happen before a Wait"). The webhook's StartAll could Add while Drain was inside Wait -- the
+	// HTTP server's Shutdown is asynchronous -- which Go reports as
+	// "sync: WaitGroup is reused before previous Wait has returned", a process-fatal panic, and
+	// which also let a pass start after Drain had returned and write into a closed store.
+	bgMu sync.Mutex
+
+	// draining is set under bgMu by Drain. After that, startCert refuses new passes.
+	draining bool
 
 	// startSlots bounds how many certificates a full trigger converges at once.
 	//
@@ -205,19 +239,6 @@ func (r *Reconciler) release(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.running, name)
-}
-
-// isClaimable reports whether no pass currently holds this certificate.
-//
-// It reads the claim without taking it, for callers that need to know "is anyone working on
-// this right now" rather than "may I start". Taking the claim instead would be wrong for
-// those callers: the orphan teardown is not a convergence pass, it must not block one, and
-// a claim it failed to acquire would otherwise have to be released on every path.
-func (r *Reconciler) isClaimable(name string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, busy := r.running[name]
-	return !busy
 }
 
 // ── Desired state ────────────────────────────────────────────────────────────────
@@ -359,54 +380,73 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		// So leave a claimed name alone: its own pass owns the teardown, and the next round
 		// reaps it once the claim is released. This is the same check the convergence loop
 		// below makes; this function used to skip it.
-		if !r.isClaimable(name) {
+		//
+		// The claim is TAKEN, not merely looked at. Reading the flag and releasing the lock
+		// immediately left a window in which a webhook-triggered pass claims the name, and the
+		// teardown that follows deletes the TXT records and the order that pass is waiting on --
+		// the exact interleaving the paragraph above exists to prevent, and it needs a webhook
+		// request to arrive during the store read a few lines down. Holding the claim for the
+		// teardown closes it: a pass that starts meanwhile is refused (and retried by its caller)
+		// rather than run against a name being dismantled. The teardown is not a convergence pass,
+		// so it claims the name only for the length of this block.
+		if !r.acquire(name) {
 			r.log.Info("skipping the orphan teardown: a pass for this certificate is still running",
 				"cert", name)
 			continue
 		}
 
 		orphans++
-
-		st, stErr := r.store.GetCert(name)
-
-		// Reclaim whatever an in-flight issuance left behind. Until now nothing
-		// ever tore down an order whose certificate left the desired state
-		// mid-flight: its challenge leases stayed on DNSPod forever, and a stale
-		// TXT value poisons every other certificate that writes the same
-		// _acme-challenge name (a wildcard and its apex always share one).
-		if err := r.manager.CleanupOrphan(ctx, name); err != nil {
-			r.log.Warn("failed to reclaim the orphaned order and its TXT records", "cert", name, "err", err)
-		}
-
-		// Reclaim the per-certificate series. Nothing else ever revisits a name that
-		// has left the desired state, so its gauges would sit at their last value
-		// forever -- and a not_after frozen at its last value trips the documented
-		// expiry rule permanently, for a certificate that no longer exists.
-		metrics.DeleteCertSeries(name)
-
-		// The probe side has the same leak, per host: the served-certificate series
-		// stay at their last value and the prober's transition memory grows with
-		// every host ever seen. The hosts are not in the desired state anymore, so
-		// they are recovered from the last issued certificate's SANs.
-		if stErr == nil && st != nil {
-			for _, host := range r.orphanProbeHosts(st) {
-				metrics.DeleteProbeSeries(host)
-				if r.prober != nil {
-					r.prober.Forget(host)
-				}
-			}
-		}
-
-		attrs := []any{"cert", name}
-		if stErr == nil && st != nil && !st.NotAfter.IsZero() {
-			attrs = append(attrs, "notAfter", st.NotAfter,
-				"daysLeft", config.DaysUntil(st.NotAfter, time.Now()))
-		}
-		r.log.Error("this certificate is no longer in the desired state, so it will not be renewed "+
-			"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard",
-			attrs...)
+		r.tearDownOrphan(ctx, name)
 	}
 	metrics.OrphanedCertificates.Set(float64(orphans))
+}
+
+// tearDownOrphan reclaims everything a certificate that left the desired state still holds.
+//
+// The claim on the name is already held by the caller (see publishOrphans); this function
+// releases it on every path, including a panic in the middle of the teardown, so a failure here
+// cannot wedge the name against every later pass.
+func (r *Reconciler) tearDownOrphan(ctx context.Context, name string) {
+	defer r.release(name)
+
+	st, stErr := r.store.GetCert(name)
+
+	// Reclaim whatever an in-flight issuance left behind. Until now nothing
+	// ever tore down an order whose certificate left the desired state
+	// mid-flight: its challenge leases stayed on DNSPod forever, and a stale
+	// TXT value poisons every other certificate that writes the same
+	// _acme-challenge name (a wildcard and its apex always share one).
+	if err := r.manager.CleanupOrphan(ctx, name); err != nil {
+		r.log.Warn("failed to reclaim the orphaned order and its TXT records", "cert", name, "err", err)
+	}
+
+	// Reclaim the per-certificate series. Nothing else ever revisits a name that
+	// has left the desired state, so its gauges would sit at their last value
+	// forever -- and a not_after frozen at its last value trips the documented
+	// expiry rule permanently, for a certificate that no longer exists.
+	metrics.DeleteCertSeries(name)
+
+	// The probe side has the same leak, per host: the served-certificate series
+	// stay at their last value and the prober's transition memory grows with
+	// every host ever seen. The hosts are not in the desired state anymore, so
+	// they are recovered from the last issued certificate's SANs.
+	if stErr == nil && st != nil {
+		for _, host := range r.orphanProbeHosts(st) {
+			metrics.DeleteProbeSeries(host)
+			if r.prober != nil {
+				r.prober.Forget(host)
+			}
+		}
+	}
+
+	attrs := []any{"cert", name}
+	if stErr == nil && st != nil && !st.NotAfter.IsZero() {
+		attrs = append(attrs, "notAfter", st.NotAfter,
+			"daysLeft", config.DaysUntil(st.NotAfter, time.Now()))
+	}
+	r.log.Error("this certificate is no longer in the desired state, so it will not be renewed "+
+		"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard",
+		attrs...)
 }
 
 // orphanProbeHosts recovers the dialable names of a dropped certificate from the
@@ -454,21 +494,16 @@ func (r *Reconciler) issuedSANs(st *state.CertState) []string {
 
 // ── Convergence ────────────────────────────────────────────────────────────────────
 
-// RunAll runs one pass over every certificate.
-//
-// One certificate failing does not abort the pass: otherwise a certificate with
-// a mistyped domain stalls every other certificate's renewal — the most
-// dangerous kind of coupling in automation.
-//
-// Certificates already being processed elsewhere are skipped and listed.
 // RunReport summarizes what one full pass actually did.
 //
-// It exists so a caller can tell "everything worked" from "nothing ran" and from
-// "something failed". RunAll deliberately discards the per-certificate errors -- one
-// failing certificate must not stop the others, which is the whole reason the loop is
-// shaped the way it is -- but without this the information was not merely discarded, it
-// was unavailable: a one-shot run exited 0 with every certificate failing, so a systemd
-// timer reported success while the fleet went unmanaged.
+// It exists so a caller can tell "everything worked" from "nothing ran" and from "something
+// failed". A pass deliberately does not abort on the first bad certificate -- one mistyped domain
+// must not stall every other renewal, the most dangerous kind of coupling in automation -- so the
+// failures have to be reported rather than thrown.
+//
+// Without this the information was not merely discarded, it was unavailable: a one-shot run exited
+// 0 with every certificate failing, so a systemd timer reported success while the fleet went
+// unmanaged. Certificates already being processed elsewhere are skipped and listed.
 type RunReport struct {
 	// Attempted counts certificates whose pass ran, whether it succeeded or failed.
 	Attempted int
@@ -501,18 +536,17 @@ func (rep RunReport) Trouble() bool {
 	return rep.Attempted == 0 && len(rep.Skipped) > 0
 }
 
-// RunAll runs one pass over every certificate.
+// RunDetailed runs one pass over every certificate and reports what happened.
 //
-// One certificate failing does not abort the pass: otherwise a certificate with
-// a typo in its DNS would stop every other certificate from renewing. The cost is
-// that the caller cannot see the failures from here -- use RunDetailed when the outcome
-// matters.
-func (r *Reconciler) RunAll(ctx context.Context) (skipped []string) {
-	return r.RunDetailed(ctx).Skipped
-}
-
-// RunDetailed runs one pass and reports what happened, for callers that must react to the
-// outcome (a one-shot timer run, an operator-facing exit code).
+// One certificate failing does not abort the pass: otherwise a certificate with a mistyped domain
+// would stall every other certificate's renewal, the most dangerous kind of coupling in
+// automation. The failures are therefore reported through RunReport rather than by aborting.
+//
+// This is the only entry point for a whole pass. There used to be three (RunOnce, RunAll and this
+// one), and the extra two were not harmless: RunOnce discarded the report entirely, which is how a
+// one-shot systemd run came to exit 0 while every certificate failed. A caller that does not care
+// about the outcome is better off saying so explicitly (`_ = r.RunDetailed(ctx)`) than calling a
+// wrapper that cannot tell it.
 func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 	var rep RunReport
 
@@ -534,7 +568,31 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 		r.retryRevocations(ctx)
 		return rep
 	}
+	// Before anything is written this pass: is the database still the file this process opened, and
+	// does it still hold the cross-process lock? SQLite and flock bind to the inode, so a state
+	// directory removed (or a database restored) under a running daemon is invisible to every
+	// read and write that follows -- the pass keeps converging into a file nothing will read again.
+	for _, problem := range r.store.VerifyOnDisk() {
+		r.log.Error("the state database underneath this process has changed", "problem", problem,
+			"hint", "stop the daemon, restore the directory or the newest snapshot, then start it again")
+	}
+
 	r.publishOrphans(ctx, res)
+
+	// The probe floor and the certificates finally meet here.
+	//
+	// In enforce mode the config's certificate list is empty by construction, so config.normalize's
+	// check never sees the profiles the document actually uses: a floor longer than a shortlived
+	// profile's validity then fails every probe of that certificate, pins
+	// wecert_certificate_probe_match at 0 and fires the critical "not serving the deployed
+	// certificate" alert with a diagnosis that blames the rebind. Reported rather than fatal: the
+	// document is allowed to change between passes, and refusing to renew over a probe setting
+	// would turn a monitoring misconfiguration into an outage.
+	if err := config.CheckProbeFloor(r.cfg.Probe.MinValidDur, res.Certificates); err != nil {
+		r.log.Error("the probe's minimum remaining validity cannot be satisfied by this desired "+
+			"state, so probes of the certificate it names will fail while it is still valid",
+			"err", err)
+	}
 
 	for i := range res.Certificates {
 		c := &res.Certificates[i]
@@ -586,23 +644,34 @@ func (r *Reconciler) publishQuota(res *spec.Result) {
 	if res == nil {
 		return
 	}
-	scopes := map[string]string{}
-	// One representative per family is enough for the account-wide limit, which is the one
-	// that gates everything; the per-domain families are reported for the first certificate
-	// because that is the bucket an operator is about to spend against when they add a name.
+	// Every scope this deployment actually spends against, not one representative per family.
+	//
+	// Publishing only the first certificate's first domain meant the per-domain and per-identifier
+	// series existed for exactly one scope: for the normal one-certificate-per-domain layout,
+	// WecertRateLimitNearlyExhausted could never fire for any other domain -- the series it
+	// compares against was simply absent, and an absent series reads as "nothing to see". The sets
+	// are deduplicated because two certificates routinely share a registered domain (a wildcard and
+	// its apex, a multi-name certificate).
+	registered := map[string]bool{}
+	identifiers := map[string]bool{}
+	sets := map[string]bool{}
 	for i := range res.Certificates {
 		c := &res.Certificates[i]
-		if _, ok := scopes["registered-domain"]; !ok && len(c.Domains) > 0 {
-			scopes["registered-domain"] = group.RegisteredDomain(c.Domains[0])
+		for _, d := range c.Domains {
+			if rd := group.RegisteredDomain(d); rd != "" {
+				registered[rd] = true
+			}
+			identifiers[strings.ToLower(d)] = true
 		}
-		if _, ok := scopes["exact-identifier-set"]; !ok {
-			scopes["exact-identifier-set"] = c.DomainKey()
-		}
-		if _, ok := scopes["identifier"]; !ok && len(c.Domains) > 0 {
-			scopes["identifier"] = strings.ToLower(c.Domains[0])
+		if key := c.DomainKey(); key != "" {
+			sets[key] = true
 		}
 	}
-	r.manager.PublishQuota(scopes)
+	r.manager.PublishQuota(map[string][]string{
+		"registered-domain":    sortedKeys(registered),
+		"exact-identifier-set": sortedKeys(sets),
+		"identifier":           sortedKeys(identifiers),
+	})
 }
 
 // retryRevocations re-attempts outstanding revocations and publishes how many remain.
@@ -683,6 +752,20 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 		if r.anyPassInFlight() {
 			continue
 		}
+		// And a certificate that is merely UNCONFIRMED is still being worked on.
+		//
+		// probeCert returns early for a certificate whose deployment is not confirmed (the honest
+		// thing: there is no "deployed certificate" to compare against), so a host disappears from
+		// this round's probe set during exactly the window a renewal is mid-rebind -- which can last
+		// until the next binding check, up to six hours. Deleting there made probe_match,
+		// probe_not_after and probe_trusted flicker once per renewal, and for a rebind that then
+		// FAILED it was worse than flicker: the series a `probe_match == 0` alert would fire on were
+		// gone, so the documented alert stayed silent for the failure it exists to catch.
+		//
+		// A host whose certificate has left the desired state entirely is reclaimed as before.
+		if r.hostIsUnconfirmed(h) {
+			continue
+		}
 		metrics.DeleteProbeSeries(h)
 		// The runner's transition memory has to go with the series. Its own comment says
 		// both are needed -- otherwise a host that leaves a SAN set leaks an entry there and
@@ -693,6 +776,35 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 	}
 }
 
+// hostIsUnconfirmed reports whether h belongs to a certificate that is still in the desired state
+// but not confirmed deployed, i.e. a host the probe deliberately skips rather than one that left.
+func (r *Reconciler) hostIsUnconfirmed(h string) bool {
+	if r.store == nil || r.provider == nil {
+		// A reconciler without a store or a provider has no desired state to judge from; that is a
+		// partially built one (tests), and the caller's own fallback applies.
+		return false
+	}
+	res := r.resolve(context.Background())
+	if res == nil {
+		// No desired state to judge from: keep the series rather than deleting evidence.
+		return true
+	}
+	for i := range res.Certificates {
+		c := &res.Certificates[i]
+		for _, d := range probeHosts(c.Domains, len(c.Domains)) {
+			if d != h {
+				continue
+			}
+			st, err := r.store.GetCert(c.Name)
+			if err != nil || st == nil {
+				return true
+			}
+			return !st.DeployConfirmed
+		}
+	}
+	return false
+}
+
 // anyPassInFlight reports whether any certificate currently holds a convergence claim.
 func (r *Reconciler) anyPassInFlight() bool {
 	r.mu.Lock()
@@ -700,14 +812,9 @@ func (r *Reconciler) anyPassInFlight() bool {
 	return len(r.running) > 0
 }
 
-// RunOnce is a compatibility alias for RunAll.
-func (r *Reconciler) RunOnce(ctx context.Context) {
-	r.RunAll(ctx)
-}
-
 // RunCert processes exactly one named certificate. An unknown name returns an
-// error; one already being processed returns ErrAlreadyRunning. Unlike RunAll,
-// the pass's own error is propagated: a caller that asked for one specific
+// error; one already being processed returns ErrAlreadyRunning. Unlike a whole pass,
+// the certificate's own error is propagated: a caller that asked for one specific
 // certificate needs to hear that it failed, not a bare "accepted".
 func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 	res := r.resolve(ctx)
@@ -742,6 +849,10 @@ func (r *Reconciler) RunCert(ctx context.Context, name string) error {
 func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
 	started, alreadyRunning, unknown []string, err error,
 ) {
+	if r.drainingNow() {
+		// As in StartAll: "shutting down" is not "already running".
+		return nil, nil, nil, ErrShuttingDown
+	}
 	res := r.resolve(ctx)
 	if res == nil {
 		// No desired state: every name is unanswerable rather than unknown. Reporting
@@ -768,6 +879,10 @@ func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
 			continue
 		}
 		if err := r.startCert(ctx, res, found); err != nil {
+			if errors.Is(err, ErrShuttingDown) {
+				// Drain began between the check above and this start.
+				return nil, nil, nil, ErrShuttingDown
+			}
 			alreadyRunning = append(alreadyRunning, name)
 			continue
 		}
@@ -794,13 +909,21 @@ func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
 // sha256 of the document -- and a full trigger would otherwise pay that once per
 // certificate.
 func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.Certificate) error {
+	// Refuse while draining, and register the pass before the shutdown path can reach Wait: see
+	// beginPass. A pass admitted here is counted, so Drain waits for it.
+	if !r.beginPass() {
+		return ErrShuttingDown
+	}
 	if !r.acquire(c.Name) {
+		// This pass never starts, so undo the registration.
+		r.bg.Done()
 		return ErrAlreadyRunning
 	}
 
 	// res is heap-allocated and not reused during this pass, so referring to its
 	// elements is safe.
 	go func() {
+		defer r.bg.Done()
 		defer r.release(c.Name)
 
 		// Queue for a start slot instead of running immediately. Nothing is dropped:
@@ -819,6 +942,17 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		}
 
 		r.reconcileOne(ctx, c)
+
+		// Publish the rate-limit gauges when a webhook-triggered pass finishes.
+		//
+		// RunDetailed publishes them at the end of a scheduled round, and this path used to have
+		// no equivalent: a pass started from the webhook spends quota and records the CA's
+		// Retry-After just the same, but nothing republished either gauge. A deadline shorter than
+		// the polling interval (an hour by default) was therefore never shown as blocked at all,
+		// which is exactly the window it describes -- the critical WecertRateLimitBlocked alert
+		// could not fire for it. Publishing here also means the spend is in the number, which it
+		// would not be if this only ran before the pass started.
+		r.publishQuota(res)
 	}()
 	return nil
 }
@@ -835,6 +969,33 @@ func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 	return r.startCert(ctx, res, found)
 }
 
+// beginPass registers a background pass, or refuses it once Drain has begun.
+//
+// One mutex decides both questions, and that is the whole point: the pass is either counted before
+// Wait can be called, or it is rejected. Without it the webhook's StartAll could Add while Drain
+// was already inside Wait -- sync.WaitGroup forbids that ("calls with a positive delta that start
+// when the counter is zero must happen before a Wait") and Go turns it into a process-fatal
+// "sync: WaitGroup is reused before previous Wait has returned" panic; it also let a pass start
+// after Drain had returned, whose store writes then failed against the closed database.
+//
+// It returns false rather than an error so the caller can name the refusal in its own terms.
+func (r *Reconciler) beginPass() bool {
+	r.bgMu.Lock()
+	defer r.bgMu.Unlock()
+	if r.draining {
+		return false
+	}
+	r.bg.Add(1)
+	return true
+}
+
+// drainingNow reports whether Drain has been called.
+func (r *Reconciler) drainingNow() bool {
+	r.bgMu.Lock()
+	defer r.bgMu.Unlock()
+	return r.draining
+}
+
 // StartAll processes every certificate asynchronously and synchronously returns
 // which ones were accepted and which were skipped (already running).
 //
@@ -844,6 +1005,11 @@ func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 // "accepted: all certificates" (from the last good cache) while nothing started
 // is exactly the lie this return value exists to prevent.
 func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, err error) {
+	if r.drainingNow() {
+		// Answer for the whole trigger at once. Reporting every certificate as "skipped" would
+		// mean "already running" to the caller, which is the opposite of what is happening.
+		return nil, nil, ErrShuttingDown
+	}
 	res := r.resolve(ctx)
 	if res == nil {
 		return nil, nil, ErrDesiredStateUnavailable
@@ -853,6 +1019,10 @@ func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, 
 	// slice would make this O(n^2).
 	for i := range res.Certificates {
 		if err := r.startCert(ctx, res, &res.Certificates[i]); err != nil {
+			if errors.Is(err, ErrShuttingDown) {
+				// Drain began between the check above and this start: stop the walk and say so.
+				return nil, nil, ErrShuttingDown
+			}
 			skipped = append(skipped, res.Certificates[i].Name)
 		} else {
 			accepted = append(accepted, res.Certificates[i].Name)
@@ -861,9 +1031,58 @@ func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, 
 	return accepted, skipped, nil
 }
 
+// Drain waits for the passes this reconciler started in the background, up to ctx's deadline.
+//
+// The caller is the shutdown path, and what it protects is the state store: an accepted pass writes
+// promotions, resume anchors and failure counters, and closing SQLite underneath one loses whichever
+// of those was in flight (see the bg field). A pass still parked waiting for a start slot is counted
+// as well, and returns as soon as the cancelled context reaches it.
+//
+// A pass already inside a CA call cannot be interrupted (lego's low-level API is context-free), so
+// this is bounded rather than absolute: the caller decides how long a shutdown may take, and a
+// timeout is reported so the operator knows the store is about to be closed under a live pass.
+func (r *Reconciler) Drain(ctx context.Context) error {
+	// Refuse new passes from here on, and publish that to beginPass before Wait is called: an Add
+	// racing this transition is exactly what made the WaitGroup panic (see beginPass). The lock is
+	// released before waiting, so a pass already being registered can finish and be counted.
+	r.bgMu.Lock()
+	r.draining = true
+	r.bgMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		r.bg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("still waiting for background passes to finish: %w", ctx.Err())
+	}
+}
+
+// notifyPanicSafe delivers one renewal notification without letting a panic out.
+//
+// It exists for the one call site that runs while a panic is already being handled: anything raised
+// there is unrecoverable, and on the webhook path it reaches a bare goroutine and kills the
+// process. A notification is worth having; it is not worth the daemon.
+func (r *Reconciler) notifyPanicSafe(ctx context.Context, certName string, err error) {
+	if r.notifier == nil {
+		return
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			r.log.Error("the renewal notification itself panicked; the pass result is unaffected",
+				"cert", certName, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+		}
+	}()
+	r.notifier.Renewal(ctx, certName, err)
+}
+
 // reconcileOne processes one certificate and mirrors the result into metrics
 // and notifications. The pass's error is returned for callers that need it
-// (RunCert); RunAll and startCert deliberately discard it -- one failing
+// (RunCert); a whole pass and startCert deliberately discard it -- one failing
 // certificate must not stall the others.
 func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (err error) {
 	// Contain a panic at the certificate boundary.
@@ -874,20 +1093,40 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 	// from renewing, which is the same "one failure blocks everything" coupling this
 	// package exists to avoid. Recovering here turns it into an ordinary failed pass:
 	// counted, logged with a stack, and retried on the usual backoff.
+	// accounted is set once the switch below has run, so a later panic does not double-count the
+	// pass: the counter the switch picked is the pass's answer.
+	var accounted bool
 	defer func() {
 		if p := recover(); p != nil {
 			metrics.ReconcilePanics.WithLabelValues(c.Name).Inc()
-			// The panic skipped the accounting below, so record the failed pass here --
-			// otherwise reconcile_total under-reports exactly the passes that went worst.
-			metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
+			// The panic skipped the accounting below, so record the failed pass here -- but only if
+			// the switch really did not run. A panic raised AFTER it (in publish, probeCert or the
+			// notification) used to increment "error" on top of the "ok" the pass had already
+			// earned, so one pass counted as both.
+			if !accounted {
+				metrics.ReconcileTotal.WithLabelValues(c.Name, "error").Inc()
+			}
 			r.log.Error("recovered from a panic: this certificate's pass was aborted, "+
 				"the other certificates are unaffected; this is a bug, please report it",
 				"cert", c.Name, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
 			err = fmt.Errorf("panic while reconciling %s: %v", c.Name, p)
+
+			// The notification is sent from here because the normal call below is unreachable
+			// while the stack unwinds -- and a panic is the failure an operator most needs to
+			// hear about, not the one that goes quiet. Same contract as any other failure: the
+			// pass attempted something and it did not succeed.
+			//
+			// In its OWN recover, because this runs while a panic is being handled: a second panic
+			// raised here (the notifier is a user-supplied path -- an HTTP POST, a template, a
+			// channel send) has no handler left, and on the webhook path that goroutine is
+			// `go func(){ r.reconcileOne(...) }()`, so it takes the process down. Measured before
+			// this: a panic in the notification path escaped and killed the pass loop.
+			r.notifyPanicSafe(ctx, c.Name, err)
 		}
 	}()
 
 	err = r.manager.Reconcile(ctx, c)
+	accounted = true
 	switch {
 	case errors.Is(err, state.ErrBackoff):
 		// The manager deliberately did not run this pass: the certificate is inside the
@@ -1020,7 +1259,17 @@ func probeHosts(domains []string, max int) []string {
 // publish mirrors the current state store into Prometheus.
 func (r *Reconciler) publish(c *config.Certificate) {
 	st, err := r.store.GetCert(c.Name)
-	if err != nil || st == nil {
+	if err != nil {
+		// Say so. Everything below this line either sets or deletes series, so a silent return
+		// leaves wecert_certificate_not_after_timestamp_seconds -- the series this project
+		// documents as THE expiry signal -- reporting the previous pass's value while
+		// wecert_last_reconcile keeps advancing, i.e. a stale number that looks freshly written.
+		// There is no dedicated staleness counter for this read; the journal is the signal.
+		r.log.Warn("cannot read this certificate's state, so its metric series keep their previous "+
+			"values (including the expiry timestamp the alerts watch)", "cert", c.Name, "err", err)
+		return
+	}
+	if st == nil {
 		return
 	}
 
@@ -1043,10 +1292,18 @@ func (r *Reconciler) publish(c *config.Certificate) {
 	// expiry has no answer, so it is absent from the comparison instead of being compared
 	// as 1970. "Never issued" remains visible — `wecert_certificate_deployed` is 0 and
 	// `wecert_certificate_consecutive_failures` carries the retry count.
+	// The profile label is never empty: the alert rules select on it, and an empty value would
+	// silently match none of them -- a certificate whose profile fell through (a document written
+	// before the field existed, a certificate built by hand) would then have an expiry series no
+	// rule looks at.
+	profile := c.Profile
+	if profile == "" {
+		profile = config.ProfileClassic
+	}
 	if st.NotAfter.IsZero() {
-		metrics.CertNotAfter.DeleteLabelValues(c.Name)
+		metrics.CertNotAfter.DeleteLabelValues(c.Name, profile)
 	} else {
-		metrics.CertNotAfter.WithLabelValues(c.Name).Set(float64(st.NotAfter.Unix()))
+		metrics.CertNotAfter.WithLabelValues(c.Name, profile).Set(float64(st.NotAfter.Unix()))
 	}
 
 	// Only a confirmed swap to the new certificate counts as "deployed": the first
@@ -1079,4 +1336,18 @@ func (r *Reconciler) publish(c *config.Certificate) {
 				"consecutiveFailures", st.ConsecutiveFailures, "lastError", st.LastError)
 		}
 	}
+}
+
+// sortedKeys returns a map's keys in a stable order.
+//
+// Stable because the published series feed an alert: an unstable order would not change the metric
+// values, but it does change the order of the Reset-then-Set window, and a reader comparing two
+// scrapes should not have to wonder whether a scope moved or a value changed.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

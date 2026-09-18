@@ -16,7 +16,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -26,10 +25,11 @@ import (
 	"time"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
-	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	dnspod "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
+
+	"github.com/susunola/wecert/internal/tcerr"
 )
 
 func main() {
@@ -196,12 +196,29 @@ func checkSSL(ctx context.Context, cred common.CredentialIface) error {
 		return fmt.Errorf("DescribeCertificates failed (check the ssl:DescribeCertificates permission): %w", err)
 	}
 
-	var total uint64
-	if resp.Response != nil && resp.Response.TotalCount != nil {
-		total = *resp.Response.TotalCount
+	total, err := certificateCount(resp)
+	if err != nil {
+		return err
 	}
 	fmt.Printf("      OK - the account already holds %d certificates\n", total)
 	return nil
+}
+
+// certificateCount reads the account's certificate total out of a DescribeCertificates answer.
+//
+// A missing result body is the SDK's shape for a well-formed HTTP 200 with no body, or for an
+// API-version mismatch -- and treating it as zero printed "OK - the account already holds 0
+// certificates" for an answer that was never read, which is the one thing a preflight check must
+// not do. Every other SDK call in this repository guards the same field.
+func certificateCount(resp *ssl.DescribeCertificatesResponse) (uint64, error) {
+	if resp == nil || resp.Response == nil {
+		return 0, fmt.Errorf("DescribeCertificates returned no result, so the account's certificate " +
+			"count cannot be read (an unreadable answer is not zero)")
+	}
+	if resp.Response.TotalCount == nil {
+		return 0, fmt.Errorf("DescribeCertificates returned no total count; that is unreadable, not zero")
+	}
+	return *resp.Response.TotalCount, nil
 }
 
 // describeDomainList is the seam over the SDK call, so the paging logic in findDomain
@@ -229,6 +246,14 @@ func findDomain(ctx context.Context, client *dnspod.Client, domain string) (*dns
 
 		resp, err := describeDomainList(ctx, client, req)
 		if err != nil {
+			// "No data for this domain" is not a permission problem: it is the answer this
+			// function is documented to give as nil, nil ("the domain is not under DNSPod in this
+			// account"). Classifying only the record-level code left the filtered-empty shape
+			// pointing the operator at a permission that was fine.
+			if tcerr.IsNoDataOfDomain(err) {
+				// nil, nil is this function's documented answer for "not in this account".
+				return nil, nil
+			}
 			return nil, fmt.Errorf("DescribeDomainList failed (check the dnspod:DescribeDomainList permission): %w", err)
 		}
 		if resp.Response == nil {
@@ -297,7 +322,7 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 	if err != nil {
 		// When there are no records at all DNSPod returns an error code rather than an
 		// empty list -- which is exactly the state we want, so it must not count as failure.
-		if isNoRecord(err) {
+		if tcerr.IsNoDataOfRecord(err) {
 			fmt.Println()
 			fmt.Println("[3/4] _acme-challenge leftover check")
 			fmt.Println("      OK - no leftover TXT records")
@@ -330,22 +355,6 @@ func deref(s *string) string {
 		return "<nil>"
 	}
 	return *s
-}
-
-// isNoRecord reports whether the error means "the record list is empty".
-// DNSPod expresses that with ResourceNotFound.NoDataOfRecord.
-func isNoRecord(err error) bool {
-	if err == nil {
-		// A nil error is not "no record": it means the call succeeded, and reporting that as an
-		// absent record would silently pass the delegation check. Guarding also keeps the
-		// substring fallback below from dereferencing nil, which panicked before.
-		return false
-	}
-	var sdkErr *tcerrors.TencentCloudSDKError
-	if errors.As(err, &sdkErr) {
-		return sdkErr.Code == "ResourceNotFound.NoDataOfRecord"
-	}
-	return strings.Contains(err.Error(), "NoDataOfRecord")
 }
 
 // listCertificates lists the SSL certificates in the account.
@@ -533,8 +542,18 @@ func pruneCertificates(assumeYes bool) error {
 		// confirmation gate (skipped only by -yes) is the entire protection against
 		// deleting a certificate a CLB still references.
 		req.IsCheckResource = common.BoolPtr(false)
-		if _, err := client.DeleteCertificateWithContext(ctx, req); err != nil {
+		resp, err := client.DeleteCertificateWithContext(ctx, req)
+		if err != nil {
 			fmt.Printf("  failed to delete %s: %v\n", deref(c.CertificateId), err)
+			failed++
+			continue
+		}
+		// The response decides, exactly as internal/deploy does for the same call. It was thrown
+		// away here, so a refusal (DeleteResult=false, no transport error) printed "deleted <id>"
+		// and the command exited 0: a destructive action reported as done that the API declined.
+		deleted, detail := deleteOutcome(resp)
+		if !deleted {
+			fmt.Printf("  failed to delete %s: %s\n", deref(c.CertificateId), detail)
 			failed++
 			continue
 		}
@@ -544,6 +563,26 @@ func pruneCertificates(assumeYes bool) error {
 		return fmt.Errorf("%d certificates could not be deleted (the rest were)", failed)
 	}
 	return nil
+}
+
+// deleteOutcome judges one DeleteCertificate answer.
+//
+// IsCheckResource=false makes the call synchronous, so DeleteResult IS the outcome: false means
+// the API refused (a nil field means "no objection", the same reading internal/deploy uses). An
+// empty response, or one that came back with a task id after all, is not a deletion this tool can
+// confirm -- and "deleted" is the one thing it must never print for those.
+func deleteOutcome(resp *ssl.DeleteCertificateResponse) (bool, string) {
+	if resp == nil || resp.Response == nil {
+		return false, "the API returned no result"
+	}
+	if resp.Response.DeleteResult != nil && !*resp.Response.DeleteResult {
+		return false, "the API refused the delete (DeleteResult=false)"
+	}
+	if resp.Response.TaskId != nil && *resp.Response.TaskId != "" {
+		return false, "the API answered with an asynchronous task (" + *resp.Response.TaskId +
+			"), so the deletion is not confirmed; check the SSL console"
+	}
+	return true, ""
 }
 
 // confirm reads one y/N from the terminal, and treats a non-interactive stdin (not a

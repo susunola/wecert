@@ -34,11 +34,16 @@ groups:
       # certificate that has never been issued -- exporting 0 made this comparison true at roughly
       # -20,700 days, so every new certificate paged someone about a certificate that did not exist
       # yet. The guard is defence in depth for anyone re-implementing the exporter.
+      # Each rule selects its own profile: the profiles have different validities (90 days classic,
+      # 45 tlsserver, 160 hours shortlived), so a single threshold either fires for a short-lived
+      # certificate's entire life or is late for it. The profile label is what makes one rule per
+      # profile possible -- without it, "expires in under 22.5 days" was true for every short-lived
+      # certificate from the moment it was issued.
       - alert: WecertCertificateExpiringClassic
         expr: |
-          (wecert_certificate_not_after_timestamp_seconds > 0)
+          (wecert_certificate_not_after_timestamp_seconds{profile="classic"} > 0)
           and
-          (wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 22.5
+          (wecert_certificate_not_after_timestamp_seconds{profile="classic"} - time()) / 86400 < 22.5
         for: 15m
         labels:
           severity: warning
@@ -53,9 +58,9 @@ groups:
 
       - alert: WecertCertificateExpiringTLSServer
         expr: |
-          (wecert_certificate_not_after_timestamp_seconds > 0)
+          (wecert_certificate_not_after_timestamp_seconds{profile="tlsserver"} > 0)
           and
-          (wecert_certificate_not_after_timestamp_seconds - time()) / 86400 < 11.25
+          (wecert_certificate_not_after_timestamp_seconds{profile="tlsserver"} - time()) / 86400 < 11.25
         for: 15m
         labels:
           severity: warning
@@ -67,9 +72,9 @@ groups:
 
       - alert: WecertCertificateExpiringShortLived
         expr: |
-          (wecert_certificate_not_after_timestamp_seconds > 0)
+          (wecert_certificate_not_after_timestamp_seconds{profile="shortlived"} > 0)
           and
-          (wecert_certificate_not_after_timestamp_seconds - time()) / 3600 < 40
+          (wecert_certificate_not_after_timestamp_seconds{profile="shortlived"} - time()) / 3600 < 40
         for: 10m
         labels:
           severity: critical
@@ -99,7 +104,11 @@ groups:
       # The probe could not run. This is an environment problem, not a certificate problem, and
       # keeping the two apart is why they are separate metrics.
       - alert: WecertProbeCannotReachTheEndpoints
-        expr: increase(wecert_certificate_probe_errors_total[1h]) > 3
+        # Six hours, not one: a probe error is one increment per host per pass, and passes run
+        # hourly -- so `> 3` over one hour could never be reached by a single failing host, and the
+        # warning that exists to say "this is an environment problem, not a certificate problem"
+        # never fired. Six hours of a persistently failing probe is the signal.
+        expr: increase(wecert_certificate_probe_errors_total[6h]) > 3
         for: 30m
         labels:
           severity: warning
@@ -132,11 +141,15 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.cert }} is serving a certificate missing {{ $value }} name(s)"
+          # No {{ $value }} here: this expression is `== 1`, so the value is always 1 and the summary
+          # said "missing 1 name(s)" no matter how many were dropped. The count lives in
+          # wecert_certificate_fallback_dropped_names, which a template cannot join to.
+          summary: "{{ $labels.cert }} is in failure fallback: a partial certificate is planned or serving"
           description: >-
-            A partial certificate is in production: some names are covered and others are not. The
-            cause is a name whose authorizations keep failing. wecert_desired_state_* and the log
-            name the dropped identifiers.
+            A degradation decision is in force for this certificate: the names whose authorizations
+            keep failing have been dropped, so the certificate it serves (or is about to serve) is
+            partial. The dropped count is wecert_certificate_fallback_dropped_names; the identifiers
+            themselves are in the log and in wecert_desired_state_*.
 
       # "Nothing is happening" is its own failure mode, and no error counter sees it: the daemon can
       # be up, healthy-looking, and issuing nothing.
@@ -144,8 +157,13 @@ groups:
       # This used to read wecert_reconcile_total_created_timestamp, which is not a series that
       # exists: the exposition is the classic text format, which carries no _created timestamps at
       # all. The alert could never fire.
+      # `> 0` matters: the gauge is published on the first pass and starts at zero, so without the
+      # guard this fired half an hour after every process start -- before a first pass could have
+      # finished -- with the message "no pass has finished in over 2 hours". A first pass that
+      # legitimately takes longer than 30 minutes (a large fleet, a slow CA) then paged for a
+      # process that was working normally.
       - alert: WecertHasNotReconciledRecently
-        expr: (time() - wecert_last_reconcile_timestamp_seconds) > 7200
+        expr: (wecert_last_reconcile_timestamp_seconds > 0) and (time() - wecert_last_reconcile_timestamp_seconds) > 7200
         for: 30m
         labels:
           severity: critical
@@ -232,17 +250,22 @@ groups:
             has no override; the per-account order and per-registered-domain limits can be raised
             through Let's Encrypt's rate-limit adjustment form, which takes weeks.
 
+      # The threshold is one token, not five: the exact-identifier-set limit (5 per 7 days,
+      # refilling one every 34 hours) and the per-identifier failure budget (5 per hour) both have a
+      # capacity of five, so `remaining < 5` was true for roughly a day and a half after every
+      # single issuance -- a warning that is on half the time is not a warning.
       - alert: WecertRateLimitNearlyExhausted
-        expr: wecert_ratelimit_remaining_tokens < 5
+        expr: wecert_ratelimit_remaining_tokens < 1
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "{{ $labels.limit }} has under 5 tokens left (lower bound)"
+          summary: "{{ $labels.limit }} has under 1 token left (upper bound on what is left)"
           description: >-
-            This is a LOWER BOUND: it counts only this program's spend, while the per-domain and
-            per-exact-set limits are global across accounts. The real remaining allowance can be
-            smaller, never larger. Stop configuration churn until it refills.
+            This is an UPPER BOUND on what is left: it counts only this program's spend, while the
+            per-domain and per-exact-set limits are global across accounts. The real remaining
+            allowance can be smaller, never larger -- which is why the threshold is one token and
+            not five. Stop configuration churn until it refills.
 
       # A revocation the CA has not accepted is an outstanding security action, not a background
       # task: it exists because someone decided a certificate must stop being trusted.

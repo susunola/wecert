@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -48,6 +49,11 @@ type challengeSolver interface {
 	// "cannot tell" -- which is the answer for an empty resolver cache too, because a
 	// cached negative must never be mistaken for proof that nothing was written.
 	LookupTXT(ctx context.Context, domain, keyAuth string) (DNSRecord, bool, error)
+
+	// PropagationTimeout is the budget the solver waits for a record to appear. Crash recovery uses
+	// it as the floor under "an authoritative denial means the write never happened": inside that
+	// window a denial proves nothing, because the write may still be propagating.
+	PropagationTimeout() time.Duration
 }
 
 // keyAuthProvider only needs "convert a challenge token into a key authorization".
@@ -241,22 +247,54 @@ func (m *Manager) clearOrderFetchFailures(orderURL string) {
 const identifierCooldownFor = time.Hour
 
 // coolingDown returns the identifier among these names that is inside its cooldown, if any.
-func (m *Manager) coolingDown(domains []string) (string, time.Time, bool) {
+func (m *Manager) coolingDown(certName string, domains []string) (string, time.Time, bool) {
 	now := m.now()
 	m.identifierMu.Lock()
 	defer m.identifierMu.Unlock()
 	for _, d := range domains {
 		until, ok := m.identifierCooldown[d]
-		if !ok {
-			continue
-		}
-		if !now.Before(until) {
-			delete(m.identifierCooldown, d)
+		if !ok || !now.Before(until) {
+			if ok {
+				delete(m.identifierCooldown, d)
+			}
+			// The cooldown map is per-process, and the budget it protects is persisted. A restart
+			// used to re-arm nothing: the same process held the second attempt back, but a restart
+			// three minutes after the first failure let it through -- and with several certificates
+			// sharing the identifier, one restart per round spends the whole 5-per-hour budget.
+			// The ledger the fallback already relies on records when each name last failed, so it is
+			// the authority here too.
+			if seeded, ok := m.persistedCooldown(certName, d, now); ok {
+				m.identifierCooldown[d] = seeded
+				return d, seeded, true
+			}
 			continue
 		}
 		return d, until, true
 	}
 	return "", time.Time{}, false
+}
+
+// persistedCooldown reports the cooldown left for an identifier according to the stored ledger.
+func (m *Manager) persistedCooldown(certName, identifier string, now time.Time) (time.Time, bool) {
+	if identifier == "" || m.store == nil {
+		return time.Time{}, false
+	}
+	rows, err := m.store.ListIdentifierFailures(certName)
+	if err != nil {
+		// Unreadable evidence is not evidence of health: leave the decision to the in-memory map
+		// rather than inventing a cooldown, and the next pass retries the read.
+		return time.Time{}, false
+	}
+	for _, r := range rows {
+		if r.Identifier != identifier || r.LastFailedAt.IsZero() {
+			continue
+		}
+		until := r.LastFailedAt.Add(identifierCooldownFor)
+		if now.Before(until) {
+			return until, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // noteIdentifierFailure starts (or extends) the cooldown for a name whose authorization failed.
@@ -320,6 +358,13 @@ type round struct {
 	// fullSet is set when this pass ordered the FULL configured identifier set.
 	fullSet bool
 
+	// fallbackUnknown records that the degradation state could not be read this pass.
+	//
+	// It holds the SAN-drift branch (do not reissue the known-bad full set) WITHOUT telling
+	// applyFallback that a degradation is in force: that path skips the expiry gate and can drop
+	// names, which a state-store blip has no business doing.
+	fallbackUnknown bool
+
 	// fallbackActive records that a degradation decision is in force for this certificate
 	// (a cert_fallback row exists), whether or not this pass dropped anything.
 	//
@@ -380,7 +425,15 @@ func newManager(
 func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	st, err := m.store.GetCert(c.Name)
 	if err != nil {
-		return err
+		// recordFailure, not a bare return: the doc comment above promises that a failed decision
+		// schedules the retry, and the sibling reads of the order row and the fallback record were
+		// fixed for exactly this reason. A bare return left a state store that fails this read
+		// invisible in wecert_certificate_consecutive_failures and retrying at the pass rate.
+		//
+		// st is nil here (the read failed), so the failure is recorded against a fresh row for this
+		// name: PutCert upserts, and the next pass reads the counter back.
+		return m.recordFailure(ctx, &state.CertState{Name: c.Name}, fmt.Errorf(
+			"read the certificate state: %w", err))
 	}
 	if st == nil {
 		st = &state.CertState{Name: c.Name}
@@ -396,6 +449,24 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	rd := round{}
 	if fb, ferr := m.store.GetFallback(c.Name); ferr == nil {
 		rd.fallbackActive = fb != nil
+	} else {
+		// A read that failed is not "no fallback is in force".
+		//
+		// The drift branch below reads fallbackActive to decide whether a missing SAN is the
+		// degradation working or a config change to converge on. Treating an unreadable store as
+		// "no fallback" ordered the full -- known-bad -- identifier set immediately, while the
+		// sibling decision in fallback.go holds on the very same failure. Holding costs one pass;
+		// the other direction spends an order on the set whose broken identifier caused the
+		// degradation, which is the oscillation the fallback exists to stop.
+		//
+		// It is a SEPARATE flag, not fallbackActive: that one also means "a degradation is being
+		// continued" to applyFallback, which skips the expiry gate -- so setting it here would let a
+		// state-store blip drop names from a certificate that is nowhere near expiry, which is the
+		// opposite of holding.
+		rd.fallbackUnknown = true
+		m.log.Warn("cannot read whether a degradation is in force; holding the current certificate "+
+			"this pass rather than reissuing the full identifier set",
+			"cert", c.Name, "err", ferr)
 	}
 	// Skip straight through the backoff window. Once a retry is scheduled, stop knocking
 	// on the CA's door.
@@ -438,7 +509,11 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	// Invariant 1: with an unexpired order in progress, keep advancing it, never create a
 	// new one.
 	if o, err := m.store.GetOrder(c.Name); err != nil {
-		return err
+		// recordFailure, not a bare return: the doc comment above promises that a failed decision
+		// schedules the retry, and a bare return skipped the counter, the backoff and the in-memory
+		// transient backoff -- so a state store that fails this read was invisible in
+		// wecert_certificate_consecutive_failures and retried at the pass rate.
+		return m.recordFailure(ctx, st, fmt.Errorf("read the order in progress: %w", err))
 	} else if o != nil {
 		switch {
 		// A zero ExpiresAt means the server gave no expiry: keep advancing and let the CA
@@ -447,7 +522,11 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 			m.log.Warn("order expired; discarding it and deciding again",
 				"cert", c.Name, "order", o.OrderURL, "expiredAt", o.ExpiresAt)
 			if err := m.discardOrder(ctx, c.Name); err != nil {
-				return err
+				// A store failure here has to schedule the retry, exactly as the sibling call site in
+				// manager_flow.go does: returning the bare error skips the backoff entirely, so the
+				// next pass retries at the pass rate (re-running cleanupOrphanTXT's authoritative DNS
+				// probes and provider deletes each time) and nothing escalates or records why.
+				return m.recordFailure(ctx, st, fmt.Errorf("discard the expired order: %w", err))
 			}
 
 		case !orderMatchesConfig(o, c):
@@ -461,7 +540,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 				"orderIdentifiers", o.Identifiers,
 				"configIdentifiers", c.DomainKey())
 			if err := m.discardOrder(ctx, c.Name); err != nil {
-				return err
+				return m.recordFailure(ctx, st, fmt.Errorf("discard the order for the changed domain set: %w", err))
 			}
 
 		default:
@@ -515,7 +594,16 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 	if leaf, lerr := ParseLeaf(st.CertPEM); lerr != nil {
 		m.log.Warn("could not parse the live certificate; skipping the SAN comparison", "cert", c.Name, "err", lerr)
 	} else if drifted, detail := CoverageDrift(leaf, c.Domains); drifted {
-		if rd.fallbackActive && driftIsTheDegradation(leaf, c, m.store, c.Name, m.log) {
+		if rd.fallbackUnknown {
+			// The degradation state could not be read, so this drift cannot be classified as either
+			// "the fallback working" or "the config changed". Holding is the conservative answer:
+			// reissuing now would order the full set -- the one whose broken identifier caused the
+			// degradation -- and that is the oscillation the fallback exists to stop. Nothing is
+			// dropped this pass either (see fallbackUnknown's field comment).
+			m.log.Warn("cannot read whether a degradation is in force, so this certificate's SAN drift "+
+				"cannot be classified; holding it this pass instead of re-ordering the full set",
+				"cert", c.Name, "detail", detail)
+		} else if rd.fallbackActive && driftIsTheDegradation(leaf, c, m.store, c.Name, m.log) {
 			// A degradation is in force, so the live certificate is *supposed* to be
 			// missing names: this drift is the fallback working, not a config change that
 			// needs converging on.
@@ -535,8 +623,9 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		} else {
 			m.log.Warn("the live certificate's SANs no longer match the config; reissuing now",
 				"cert", c.Name, "detail", detail,
-				"note", "an order after a domain-set change does not count as a same-name renewal and will consume "+
-					"the Certificates per Registered Domain quota (50 per 7 days, shared across accounts)")
+				"note", "this order carries replaces, so it keeps the ARI exemption as long as one identifier is "+
+					"shared with the certificate being replaced; a wholly disjoint set is the case that spends "+
+					"Certificates per Registered Domain (50 per 7 days, shared across accounts)")
 			// `replaces` IS sent here, which reverses an earlier decision.
 			//
 			// It used to be dropped on the premise that "the ARI exemption needs an
@@ -574,7 +663,15 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		// overdue" -- so without this guard a shutdown (or a state-store hiccup) would
 		// place a real new order, burning the exact-set rate-limit quota. Stop the round
 		// instead; the next pass decides again.
-		return ariErr
+		//
+		// Recorded as a pass failure rather than returned bare. The write that failed is the one
+		// carrying ARICheckedAt, which is the only thing throttling the ARI call, so a bare return
+		// means the next pass queries renewalInfo again -- at the pass rate, for every certificate,
+		// for as long as the store is broken. That is the loop renewalDecision's own default branch
+		// exists to avoid, and recordFailure's unpersisted backoff is what breaks it. A cancelled
+		// pass is filtered inside recordFailure, so a shutdown still does not lock the certificate
+		// out of the next window.
+		return m.recordFailure(ctx, st, ariErr)
 	}
 	if ariErr != nil {
 		m.log.Warn("ARI lookup failed; falling back to a time-based threshold", "cert", c.Name, "err", ariErr)
@@ -613,8 +710,17 @@ func (m *Manager) bindingCheckDue(certName string) bool {
 	m.bindingMu.Lock()
 	defer m.bindingMu.Unlock()
 
-	if last, ok := m.bindingChecked[certName]; ok && now.Sub(last) < m.bindingCheckEvery {
-		return false
+	if last, ok := m.bindingChecked[certName]; ok {
+		// A stored instant in the future means the clock moved BACKWARDS, not that a check just
+		// happened. now.Sub(last) is then negative, and every "less than the interval" test treats
+		// a negative duration as "recently checked": measured over three passes spanning 48 hours of
+		// wall time after a backward step, ZERO binding lookups ran, DeployConfirmed stayed false,
+		// and because probeCert returns early for a certificate that is not confirmed deployed the
+		// network probe never ran either -- the certificate was simply unverified until the clock
+		// caught up. A future instant is due now.
+		if !last.After(now) && now.Sub(last) < m.bindingCheckEvery {
+			return false
+		}
 	}
 	m.bindingChecked[certName] = now
 	return true

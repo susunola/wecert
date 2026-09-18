@@ -113,7 +113,7 @@ Flags:
 
 	worst := exitOK
 	for _, host := range hosts {
-		worst = worseExitCode(worst, checkOne(ctx, host, opts, e, *wait, *asJSON, probe.Probe))
+		worst = worseExitCode(worst, checkOne(ctx, host, opts, e, *wait, *asJSON, probe.ProbeAll))
 	}
 	return worst
 }
@@ -133,6 +133,13 @@ func worseExitCode(current, next int) int {
 	return exitOK
 }
 
+// minAttemptBudget is the floor an attempt gets when -wait leaves no room.
+//
+// It exists so "the budget is spent" cannot become "no probe happened": the first attempt runs
+// whatever is left, with just enough time for a dial to fail. It is deliberately small -- a
+// caller who asked for a nanosecond of waiting asked for a verdict, not for a ten-second dial.
+const minAttemptBudget = 250 * time.Millisecond
+
 // retryInterval is how long to wait between attempts under -wait.
 //
 // The comment used to read "only 'not in effect yet' is worth waiting for", which contradicted
@@ -145,16 +152,45 @@ func worseExitCode(current, next int) int {
 var retryInterval = 5 * time.Second
 
 // checkOne probes one name, polling while there is time, and returns its exit code.
-func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expectation, wait time.Duration, asJSON bool, prober func(context.Context, string, probe.Options) (*probe.Result, error)) int {
+func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expectation, wait time.Duration, asJSON bool, prober func(context.Context, string, probe.Options) ([]probe.Attempt, error)) int {
 	deadline := time.Time{}
 	if wait > 0 {
 		deadline = time.Now().Add(wait)
 	}
 
 	attempt := 0
+	var lastCode int
 	for {
 		attempt++
-		code, retry := attemptOnce(ctx, host, opts, e, asJSON, attempt, prober)
+		// Each attempt is bounded by what is left of the wait, not just by its own -timeout.
+		//
+		// The deadline used to be checked only between attempts, so an attempt already in flight ran
+		// to the full per-attempt timeout: with the default 10s timeout, `-wait 1s` took ten seconds
+		// and `-wait 1s -timeout 5s` took five -- the flag bounded the attempt count and the sleep,
+		// but not the command. The comment above the sleep already promises the caller that -wait is
+		// how long the command may take.
+		attemptOpts := opts
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining < minAttemptBudget {
+				// The budget cannot cover another attempt. That is a reason to stop RETRYING, not
+				// a reason to report a verdict without looking: the first attempt always runs,
+				// with a floor that at least lets a socket fail. Returning before the first dial
+				// handed back lastCode's zero value -- which is exitOK -- so
+				// `wecert-probe -wait 1ns` reported "every host served the expected certificate"
+				// having opened nothing. The documented contract agrees: one attempt with -wait
+				// (TC-PROBE-11/15) and a total that stays close to the wait (TC-PROBE-13).
+				if attempt > 1 {
+					return lastCode
+				}
+				remaining = minAttemptBudget
+			}
+			if attemptOpts.Timeout <= 0 || attemptOpts.Timeout > remaining {
+				attemptOpts.Timeout = remaining
+			}
+		}
+		code, retry := attemptOnce(ctx, host, attemptOpts, e, asJSON, attempt, prober)
+		lastCode = code
 
 		// Retry on both outcomes. An unreachable host may be a network blip, a VIP that is not
 		// up yet or DNS that has not propagated; a mismatch is the normal shape for roughly 15
@@ -199,11 +235,11 @@ func checkOne(ctx context.Context, host string, opts probe.Options, e probe.Expe
 }
 
 // attemptOnce probes once. A true retry means "waiting a little longer might help".
-func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.Expectation, asJSON bool, attempt int, prober func(context.Context, string, probe.Options) (*probe.Result, error)) (code int, retry bool) {
-	res, err := prober(ctx, host, opts)
+func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.Expectation, asJSON bool, attempt int, prober func(context.Context, string, probe.Options) ([]probe.Attempt, error)) (code int, retry bool) {
+	attempts, err := prober(ctx, host, opts)
 	if err != nil {
 		if asJSON {
-			emitJSON(map[string]any{"host": host, "error": err.Error()})
+			emitJSON(map[string]any{"host": host, "error": err.Error(), "attempt": attempt})
 		} else {
 			fmt.Printf("%s\n  unreachable: %v\n\n", host, err)
 		}
@@ -214,19 +250,45 @@ func attemptOnce(ctx context.Context, host string, opts probe.Options, e probe.E
 	if e.Now.IsZero() {
 		e.Now = time.Now()
 	}
-	v := res.Verify(e)
 
-	if asJSON {
-		emitJSON(map[string]any{"host": host, "result": res, "verdict": v, "attempt": attempt})
-	} else {
-		printHuman(res, v, e.Now)
+	// EVERY resolved address decides the verdict, not the first one that answered.
+	//
+	// Probe (the first successful address) was what this used, while the daemon's runner uses
+	// ProbeAll so that "an updated node cannot hide a node still serving an old cert". A rebind
+	// rolls through the backends one at a time, so the CLI's whole reason to exist -- "wait until
+	// the certificate took effect" -- was answered by whichever address happened to answer first,
+	// next to a printed list of every resolved IP.
+	code = exitOK
+	for i, a := range attempts {
+		if a.Err != nil {
+			if asJSON {
+				emitJSON(map[string]any{"host": host, "address": a.Address, "error": a.Err.Error(), "attempt": attempt})
+			} else {
+				fmt.Printf("%s (%s)\n  unreachable: %v\n\n", host, a.Address, a.Err)
+			}
+			code = worseExitCode(code, exitUnreachable)
+			continue
+		}
+		if a.Result == nil {
+			continue
+		}
+		v := a.Result.Verify(e)
+		if asJSON {
+			emitJSON(map[string]any{
+				"host": host, "address": a.Address, "result": a.Result, "verdict": v,
+				"attempt": attempt, "addressIndex": i,
+			})
+		} else {
+			printHuman(a.Result, v, e.Now)
+		}
+		if !v.OK {
+			code = worseExitCode(code, exitMismatch)
+		}
 	}
 
-	if v.OK {
-		return exitOK, false
-	}
-	// Retry on a bad verdict too: seeing the old certificate in the ~15s after a rebind is normal.
-	return exitMismatch, true
+	// A mismatch outranks unreachable (see worseExitCode), and any bad answer means "waiting a
+	// little longer might help": seeing the old certificate in the ~15s after a rebind is normal.
+	return code, code != exitOK
 }
 
 func printHuman(res *probe.Result, v probe.Verdict, now time.Time) {
@@ -257,9 +319,15 @@ func printHuman(res *probe.Result, v probe.Verdict, now time.Time) {
 	fmt.Println()
 }
 
+// emitJSON writes one JSON object per line.
+//
+// It used to indent, which made each object span ~30 lines: the documented contract (README.md,
+// README.zh-cn.md, docs/test-cases.md TC-PROBE-20/21/21b) is NDJSON -- one attempt per line, so
+// `... | while read -r line; do jq . <<<"$line"; done` works -- and the docs were right about the
+// intent while the code was not. A multi-address host or a -wait retry therefore produced a
+// stream that no line-oriented consumer could read.
 func emitJSON(v any) {
 	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
 }
 

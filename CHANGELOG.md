@@ -87,6 +87,27 @@
 
 ### Added
 
+- **Secrets can come from a file or a systemd credential instead of `config.yaml`.** `dns.loginTokenFile`,
+  `tencent.secretIdFile` and `tencent.secretKeyFile` read the credential from a file, and their paths are
+  **environment-expanded** so systemd's `LoadCredential` works:
+  `LoadCredential=dnspod-token:/etc/wecert/dnspod.token` plus
+  `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token`. `DNSPOD_LOGIN_TOKEN` is accepted from the
+  environment when neither field is set. A token in `config.yaml` was a token in every backup of it and in
+  every paste into a chat window; the file variants are the difference between rotating the token and also
+  rewriting every copy of the config that ever existed. Setting both is refused rather than guessed at, an
+  unreadable or empty file is a config error naming the path, and the check runs at load time — before an
+  order is placed, not when the challenge fails.
+- **`state.Store` has transactions, and the renewal epilogue uses one.** The end of a renewal — promote the
+  new certificate, retire the old one, record the certificate the order uploaded but never bound, clear the
+  fallback record and the identifier ledger, discard the order — used to commit as separate statements, and
+  both halves of a partial failure were states no later pass could repair: promoted-without-retired leaves
+  the certificate that was serving in no table at all (never reaped, never deleted from the cloud, holding
+  uploaded-certificate quota forever), and retired-without-promoted schedules the certificate that *is*
+  serving for deletion. `Store.WithTx` plus `_txlock=immediate` in the DSN makes it one unit; the promotion
+  is now staged on a copy, because writing it into the live state first quietly defeated the transaction —
+  the failure path calls `recordFailure`, which persists that state, so the rollback was overwritten by a
+  fresh write of the very promotion it had just rolled back. The failure message now says what is true: the
+  certificate IS issued and deployed, the cloud does not roll back, and the next pass will re-order.
 - **`make test-repeat`** (`-race -shuffle=on -count=3`), and the two defects it found. Two tests in
   `internal/reconcile` asserted absolute values on process-global counters, which holds only on the
   first run of a test binary: `go test -count=2 ./internal/reconcile/` failed with "got 2". They now

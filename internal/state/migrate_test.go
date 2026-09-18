@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -461,5 +462,54 @@ func TestMigrateAddsArchiveColumnsToLegacyRetiredTable(t *testing.T) {
 	if len(retired[0].CertPEM) != 0 || len(retired[0].KeyPEM) != 0 {
 		t.Errorf("a legacy row has no archive; got cert=%q key=%q",
 			retired[0].CertPEM, retired[0].KeyPEM)
+	}
+}
+
+// A database missing a TABLE (not a column) must be reported as needing a migration.
+//
+// pendingMigrations only looked at columns, and a column check cannot see a table that is not there:
+// the unlocked open accepted the file, and whatever touched the missing table then failed with a raw
+// `no such table: revoke_requests` instead of the instruction the check exists to produce ("this
+// binary needs a schema update: stop the process and run wecert -once"). Every release that adds a
+// table makes that reachable for databases written by the build before it.
+func TestPendingMigrationsSeesAMissingTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := store.pendingMigrations(); err != nil {
+		t.Fatal(err)
+	} else if len(pending) != 0 {
+		t.Fatalf("a freshly created database has nothing pending, got %v", pending)
+	}
+	if _, err := store.db.Exec(`DROP TABLE revoke_requests`); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.pendingMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range pending {
+		if m == "revoke_requests" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a missing table must be reported as a pending migration, got %v", pending)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// And the unlocked open refuses with the actionable message, naming the table, instead of
+	// letting the caller discover it later as a raw SQLite error.
+	if _, err := OpenUnlocked(path); err == nil {
+		t.Error("an unlocked open must refuse a database whose schema needs an update")
+	} else if !strings.Contains(err.Error(), "revoke_requests") {
+		t.Errorf("the refusal must name the missing table so the operator knows what to run, got %v", err)
 	}
 }

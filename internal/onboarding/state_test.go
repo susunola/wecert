@@ -3,8 +3,11 @@ package onboarding
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // A corrupt state file must fail outright, never continue as empty state: "treat as
@@ -53,5 +56,51 @@ func TestLoadStateTreatsMissingAndEmptyFilesAsEmptyState(t *testing.T) {
 	}
 	if _, err := LoadState(empty); err != nil {
 		t.Errorf("a whitespace-only state file must count as empty state, got %v", err)
+	}
+}
+
+// A FIFO at the state path must be refused, not opened.
+//
+// The onboarding run takes the cross-process lock before it reads this file, so a blocking open here
+// does not just hang one run: every later run fails with ErrLocked behind it.
+func TestAFIFOAtTheStatePathIsRefusedNotOpened(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no FIFOs on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "onboard-state.json")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("cannot create a FIFO here: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { _, err := LoadState(path); done <- err }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a FIFO is not a state file")
+		}
+		if !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("the refusal must say what it saw, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("LoadState blocked on a FIFO; the run holds the lock by then, so every later round " +
+			"would queue up behind it forever")
+	}
+
+	// A symlinked state file is refused too: Save replaces the link, so reading through it and
+	// writing over it would leave two files disagreeing about the grace period.
+	target := filepath.Join(dir, "real.json")
+	if err := os.WriteFile(target, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadState(link); err == nil {
+		t.Error("a symlinked state file must be refused: Save would destroy the link and leave the " +
+			"target stale")
 	}
 }

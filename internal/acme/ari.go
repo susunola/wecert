@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,6 +48,15 @@ func CertID(leaf *x509.Certificate) (string, error) {
 	return aki + "." + serial, nil
 }
 
+// ErrRenewalInfoLongTerm marks a renewalInfo answer that cannot change by retrying: a 404, which
+// means the CA does not know this certificate at all (RFC 9773 section 4.3.3).
+//
+// It exists so the caller can tell it apart from a transient failure: the server's Retry-After is
+// the right thing to obey for a 429 or a 5xx, and the wrong thing for "I have never heard of this
+// certificate" -- a short header there made the poll come back in a minute instead of the six-hour
+// floor, every hour, forever.
+var ErrRenewalInfoLongTerm = errors.New("renewalInfo cannot answer for this certificate")
+
 // FetchRenewalInfo queries ARI and also returns the Retry-After the server asked for.
 //
 // ARI is the single most important piece of this system: a renewal that goes through
@@ -69,6 +79,14 @@ func FetchRenewalInfo(core API, certID string) (*RenewalInfo, time.Duration, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// RFC 9773 section 4.3.3 splits the failures in two. A 404 is LONG-TERM: the CA does not
+		// know this certificate (it was issued by another CA, or predates the account), and no
+		// amount of retrying changes that -- the server's Retry-After, if it sends one, describes
+		// when the answer could differ, not when a new window will appear. Everything else (429,
+		// 5xx) is transient, and there the header is exactly what to honour.
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, 0, fmt.Errorf("%w: renewalInfo returned 404", ErrRenewalInfoLongTerm)
+		}
 		return nil, retryAfter, fmt.Errorf("renewalInfo returned %d", resp.StatusCode)
 	}
 

@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/miekg/dns"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 func dnsReply(question *dns.Msg, answers ...dns.RR) *dns.Msg {
@@ -209,9 +212,16 @@ func TestResponseHasTXT(t *testing.T) {
 type recordingProvider struct {
 	presents []string
 	cleanups []string
+
+	// onPresent runs before the write is recorded, so a test can observe the state of the world at
+	// the moment the DNS write starts.
+	onPresent func()
 }
 
 func (p *recordingProvider) Present(domain, _, _ string) error {
+	if p.onPresent != nil {
+		p.onPresent()
+	}
 	p.presents = append(p.presents, domain)
 	return nil
 }
@@ -238,6 +248,13 @@ func TestCleanUpDefersDeleteAllWhileAnotherValueIsLive(t *testing.T) {
 	solver := &DNSSolver{
 		newProvider: func(context.Context) (challenge.Provider, error) { return p, nil },
 		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// Present resolves the zone before handing the write to the provider, so the fixture
+		// needs a resolver that answers. This test is about the lease registry, not discovery.
+		recursiveNameservers: []string{"192.0.2.53:53"},
+		exchange: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
+			return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{
+				Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}}), nil
+		},
 	}
 	ctx := context.Background()
 
@@ -581,4 +598,307 @@ func oneAuthority(addrs ...string) []nsServer {
 		out = append(out, nsServer{ns: "ns1.example.net.", addr: a})
 	}
 	return out
+}
+
+// The success verdict must carry the evidence it rests on, not just a server count.
+//
+// "TXT propagated" is a lower bound on global propagation derived from this host's view: an
+// authority that is unreachable from here contributes nothing, while the CA's resolver may
+// reach it and be told the record does not exist. That asymmetry is what turned a
+// "propagated" verdict into an NXDOMAIN at the CA in production, and with only
+// `nameservers=10 records=1` in the log there was no way to see afterwards how thin the
+// evidence had been.
+func TestPropagatedVerdictLogsItsEvidenceIncludingUnreachableAuthorities(t *testing.T) {
+	var logs bytes.Buffer
+	solver := &DNSSolver{
+		recursiveNameservers: []string{"192.0.2.53:53"},
+		log:                  slog.New(slog.NewTextHandler(&logs, nil)),
+		interval:             time.Millisecond,
+		timeout:              5 * time.Second,
+		exchange: func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+			switch server {
+			case "198.51.100.1:53", "198.51.100.2:53":
+				resp := dnsReply(msg, &dns.TXT{
+					Hdr: dns.RR_Header{Name: msg.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+					Txt: []string{"wanted"},
+				})
+				resp.Authoritative = true
+				return resp, nil
+			}
+			// One authority is unreachable from here -- exactly the case that used to be
+			// invisible in the success line.
+			return nil, errors.New("network unreachable")
+		},
+	}
+	servers := []nsServer{
+		{ns: "ns1.example.net.", addr: "198.51.100.1:53"},
+		{ns: "ns2.example.net.", addr: "198.51.100.2:53"},
+		{ns: "ns3.example.net.", addr: "198.51.100.3:53"},
+	}
+	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
+	now := time.Now()
+	budget := zoneBudget{passStart: now, zoneStart: now, deadline: now.Add(5 * time.Second)}
+
+	if err := solver.waitZone(context.Background(), "example.com.", servers, recs, budget); err != nil {
+		t.Fatalf("two authorities confirmed and none denied, so this is propagated: %v", err)
+	}
+	out := logs.String()
+	for _, want := range []string{"TXT propagated", "confirmed 2/3 server(s)", "unreachable 1 (of 3 addresses)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the success line must carry the evidence it rests on; %q is missing from:\n%s", want, out)
+		}
+	}
+}
+
+// recursiveTestSolver builds a solver whose authoritative servers always confirm the value and
+// whose single configured recursive resolver answers however the test says.
+func recursiveTestSolver(t *testing.T, logs *bytes.Buffer, resolver func(*dns.Msg) (*dns.Msg, error)) *DNSSolver {
+	t.Helper()
+	const resolverAddr = "192.0.2.53:53"
+	return &DNSSolver{
+		recursiveNameservers: []string{resolverAddr},
+		log:                  slog.New(slog.NewTextHandler(logs, nil)),
+		interval:             time.Millisecond,
+		timeout:              2 * time.Second,
+		exchange: func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+			if server == resolverAddr {
+				return resolver(msg)
+			}
+			resp := dnsReply(msg, &dns.TXT{
+				Hdr: dns.RR_Header{Name: msg.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+				Txt: []string{"wanted"},
+			})
+			resp.Authoritative = true
+			return resp, nil
+		},
+	}
+}
+
+func recursiveTestServers() []nsServer {
+	return []nsServer{
+		{ns: "ns1.example.net.", addr: "198.51.100.1:53"},
+		{ns: "ns2.example.net.", addr: "198.51.100.2:53"},
+	}
+}
+
+func recursiveTestBudget(d time.Duration) zoneBudget {
+	now := time.Now()
+	return zoneBudget{passStart: now, zoneStart: now, deadline: now.Add(d)}
+}
+
+// The verdict must not be handed to the CA while the path the CA actually uses says no.
+//
+// This is the production failure this check exists for: every authoritative server wecert
+// could reach confirmed the value, so the old rule said "propagated", and the CA -- resolving
+// through a recursive resolver that reached a lagging authority -- was told NXDOMAIN. The
+// failed validation then cost a quota slot (5 per hour per identifier) for a round that could
+// simply have waited.
+func TestRecursiveDenialBlocksAnOtherwiseConfirmedVerdict(t *testing.T) {
+	var logs bytes.Buffer
+	solver := recursiveTestSolver(t, &logs, func(msg *dns.Msg) (*dns.Msg, error) {
+		resp := new(dns.Msg)
+		resp.SetRcode(msg, dns.RcodeNameError)
+		return resp, nil
+	})
+	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
+
+	err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), recs,
+		recursiveTestBudget(60*time.Millisecond))
+	if err == nil {
+		t.Fatal("every recursive resolver answered NXDOMAIN, which is exactly what the CA would be " +
+			"handed; reporting this as propagated spends a failed-validation quota slot for nothing")
+	}
+	if !strings.Contains(err.Error(), "recursive") {
+		t.Errorf("the timeout must say the recursive view is what held it back, got: %v", err)
+	}
+}
+
+// A recursive resolver that has the value is the happy path, and it must still pass.
+func TestRecursiveConfirmationAllowsTheVerdict(t *testing.T) {
+	var logs bytes.Buffer
+	solver := recursiveTestSolver(t, &logs, func(msg *dns.Msg) (*dns.Msg, error) {
+		return dnsReply(msg, &dns.TXT{
+			Hdr: dns.RR_Header{Name: msg.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+			Txt: []string{"wanted"},
+		}), nil
+	})
+	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
+
+	if err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), recs,
+		recursiveTestBudget(2*time.Second)); err != nil {
+		t.Fatalf("both views have the value, so this is propagated: %v", err)
+	}
+}
+
+// "Nobody answered" must not become "refuse to issue": a host with no usable public DNS still
+// has to be able to get certificates, and the authoritative verdict already passed.
+func TestUnreachableRecursiveResolversDegradeToAWarning(t *testing.T) {
+	var logs bytes.Buffer
+	solver := recursiveTestSolver(t, &logs, func(*dns.Msg) (*dns.Msg, error) {
+		return nil, errors.New("network unreachable")
+	})
+	recs := []DNSRecord{{FQDN: "_acme-challenge.example.com.", Value: "wanted"}}
+
+	if err := solver.waitZone(context.Background(), "example.com.", recursiveTestServers(), recs,
+		recursiveTestBudget(2*time.Second)); err != nil {
+		t.Fatalf("no recursive resolver was reachable, so the authoritative verdict stands: %v", err)
+	}
+	if !strings.Contains(logs.String(), "no recursive resolver could answer") {
+		t.Errorf("degrading must be visible in the log, got:\n%s", logs.String())
+	}
+}
+
+// The zone must be resolved by us, before the provider is asked to write.
+//
+// lego performs the same SOA walk internally and has no guard for it climbing to the public
+// suffix: when the resolver answers for `com.` but not for the domain, lego concludes the zone
+// is `com.` and the write fails with "zone com. not found in dnspod for domain ...", which
+// reads like a DNSPod account problem. Observed for real on a run whose configured resolvers
+// were the host's own ones. findZone already refuses to return a public suffix, so asking it
+// first turns the confusing failure into the actionable one.
+func TestPresentReportsTheZoneInsteadOfLettingLegoBlameTheAccount(t *testing.T) {
+	provider := &stubChallengeProvider{}
+	solver := &DNSSolver{
+		recursiveNameservers: []string{"192.0.2.53:53"},
+		log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		newProvider: func(context.Context) (challenge.Provider, error) {
+			return provider, nil
+		},
+		exchange: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
+			// Only the public suffix answers an SOA; the domain itself never does.
+			if msg.Question[0].Qtype == dns.TypeSOA && msg.Question[0].Name == "com." {
+				return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{
+					Name: "com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}}), nil
+			}
+			return dnsReply(msg), nil
+		},
+	}
+
+	_, err := solver.Present(context.Background(), "example.com", "token", "key-auth")
+	if err == nil {
+		t.Fatal("no SOA was ever returned for the domain, so the TXT write cannot work; it must fail here")
+	}
+	if !strings.Contains(err.Error(), "public suffix") {
+		t.Errorf("the error must name the real cause (the SOA walk stopped at the public suffix), got: %v", err)
+	}
+	if provider.presented != 0 {
+		t.Error("the provider must not be asked to write into a zone we could not resolve")
+	}
+}
+
+// stubChallengeProvider records whether it was asked to write anything.
+type stubChallengeProvider struct{ presented int }
+
+func (p *stubChallengeProvider) Present(string, string, string) error { p.presented++; return nil }
+func (p *stubChallengeProvider) CleanUp(string, string, string) error { return nil }
+func (p *stubChallengeProvider) Timeout() (time.Duration, time.Duration) {
+	return time.Second, time.Second
+}
+
+// A truncated answer must not shrink the authority set.
+//
+// exchangeDNS retries over TCP and, when that fails, hands the UDP answer back with Truncated
+// still set -- the probe paths check it, queryRecursive did not. Its callers read the answer
+// structurally: authoritativeNS builds the server list out of resp.Answer. A truncated response
+// therefore removes servers silently, and a reduced list is how "two independent servers must
+// agree" degrades into the single-authority exemption that rule exists to prevent.
+func TestATruncatedAnswerDoesNotShrinkTheAuthoritySet(t *testing.T) {
+	const truncated = "192.0.2.53:53"
+	const full = "192.0.2.54:53"
+
+	nsNames := []string{"ns1.example.net.", "ns2.example.net.", "ns3.example.net."}
+	solver := &DNSSolver{
+		recursiveNameservers: []string{truncated, full},
+		log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		exchange: func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
+			q := msg.Question[0]
+			if server == truncated {
+				// The TCP retry failed, so this is all the caller gets -- and it says so.
+				resp := dnsReply(msg, &dns.NS{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET},
+					Ns:  nsNames[0],
+				})
+				resp.Truncated = true
+				return resp, nil
+			}
+			switch q.Qtype {
+			case dns.TypeNS:
+				answers := make([]dns.RR, 0, len(nsNames))
+				for _, ns := range nsNames {
+					answers = append(answers, &dns.NS{
+						Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET},
+						Ns:  ns,
+					})
+				}
+				return dnsReply(msg, answers...), nil
+			case dns.TypeA:
+				// One distinct address per NS name: authoritativeNS deduplicates by address, so
+				// answering the same IP for every name would leave one server no matter what the
+				// truncation handling does.
+				last := byte(0)
+				for i, ns := range nsNames {
+					if ns == q.Name {
+						last = byte(10 + i)
+						break
+					}
+				}
+				if last == 0 {
+					return dnsReply(msg), nil
+				}
+				return dnsReply(msg, &dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET},
+					A:   []byte{198, 51, 100, last},
+				}), nil
+			default:
+				return dnsReply(msg), nil
+			}
+		},
+	}
+
+	servers, err := solver.authoritativeNS(context.Background(), "example.com.")
+	if err != nil {
+		t.Fatalf("the second resolver answers in full, so this must succeed: %v", err)
+	}
+	if len(servers) != len(nsNames) {
+		t.Errorf("authoritativeNS returned %d servers, want %d: a truncated answer from one resolver "+
+			"must not decide the authority set (that is what silently downgrades the multi-authority "+
+			"propagation rule to its single-authority exemption)", len(servers), len(nsNames))
+	}
+}
+
+// A DNS provider built from a literal does not inherit lego's defaults, so the timeout must be set.
+//
+// lego's NewDefaultConfig gives the tencentcloud provider a 30s HTTPTimeout, but we build the
+// config ourselves -- and the zero value reaches the SDK as ReqTimeout=0, which the SDK turns into
+// an http.Client with NO timeout. Present and CleanUp hold the per-name TXT lease mutex across that
+// call, so a single stalled connection wedges every certificate that shares the challenge name, the
+// pass never finishes, and the TXT records stay in DNS. The DNSPod provider takes an HTTP client
+// instead; a nil one falls back to http.DefaultClient, which also has no timeout.
+func TestDNSProviderConfigsBoundTheirAPICalls(t *testing.T) {
+	dnsCfg := config.DNS{
+		LoginToken:  "token",
+		TTL:         600,
+		Propagation: 5 * time.Minute,
+		Polling:     5 * time.Second,
+	}
+
+	tc := tencentDNSConfig("id", "key", "session", dnsCfg)
+	if tc.HTTPTimeout <= 0 {
+		t.Errorf("the tencentcloud provider's HTTP timeout is %s: a zero value reaches the SDK as "+
+			"ReqTimeout=0 and produces a client with no timeout at all", tc.HTTPTimeout)
+	}
+	if tc.SessionToken != "session" || tc.TTL != 600 || tc.PropagationTimeout != dnsCfg.Propagation {
+		t.Errorf("the config must still carry what the caller passed, got %+v", tc)
+	}
+
+	dp := dnspodConfig(dnsCfg)
+	if dp.HTTPClient == nil {
+		t.Fatal("a nil HTTP client makes the DNSPod provider use http.DefaultClient, which has no timeout")
+	}
+	if dp.HTTPClient.Timeout <= 0 {
+		t.Errorf("the DNSPod client's timeout is %s", dp.HTTPClient.Timeout)
+	}
+	if dp.LoginToken != "token" || dp.TTL != 600 {
+		t.Errorf("the config must still carry what the caller passed, got %+v", dp)
+	}
 }

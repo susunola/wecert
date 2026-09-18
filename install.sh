@@ -17,6 +17,11 @@ CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 # Must match statePath in the config the installer puts in place; the example config's
 # statePath is /var/lib/wecert/state.db. Override it if you changed that.
 STATE_DIR="${WECERT_STATE_DIR:-/var/lib/wecert}"
+# The shipped units run with StateDirectory=wecert and ProtectSystem=strict, which makes every path
+# outside /var/lib/wecert (and the unit's other writable paths) READ-ONLY for the service. Pointing
+# statePath elsewhere therefore needs a matching ReadWritePaths in the unit -- the installer says so
+# below rather than producing a service that cannot write its own state.
+UNITS_STATE_DIR="/var/lib/wecert"
 
 if [[ -z "${BINARY}" ]]; then
 	echo "Usage: sudo $0 <path to the wecert binary>" >&2
@@ -37,6 +42,14 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Checking binary architecture"
+if ! command -v file >/dev/null 2>&1; then
+	# A minimal image without file(1) used to abort here with `file: command not found` under set -e,
+	# exit 127 -- and the line after it misdiagnosed the missing TOOL as a missing ELF header.
+	echo "Error: the 'file' command is not installed, so the binary cannot be checked." >&2
+	echo "       Install it (apt-get install -y file) or verify the build yourself:" >&2
+	echo "       it must be a linux/amd64 or linux/arm64 ELF." >&2
+	exit 1
+fi
 file -- "${BINARY}"
 if ! file -- "${BINARY}" | grep -q 'ELF 64-bit'; then
 	echo "Error: this is not a Linux ELF binary. The CVM needs a linux/amd64 or linux/arm64 build." >&2
@@ -94,6 +107,19 @@ fi
 echo "==> Installing binary to ${INSTALL_PATH}"
 install -m 0755 -o root -g root -- "${BINARY}" "${INSTALL_PATH}"
 
+# The onboarding component ships with the product and its timer unit execs it from the same
+# directory -- installing only wecert left `wecert-onboard.service` failing with 203/EXEC every
+# tick, which is a silent no-op for the desired-state document. Install it from the same directory
+# as the wecert binary when it is there (a release tarball has both).
+ONBOARD_SRC="$(dirname -- "${BINARY}")/wecert-onboard"
+if [[ -f "${ONBOARD_SRC}" ]]; then
+	echo "==> Installing ${ONBOARD_SRC} to ${INSTALL_PATH%/*}/wecert-onboard"
+	install -m 0755 -o root -g root -- "${ONBOARD_SRC}" "${INSTALL_PATH%/*}/wecert-onboard"
+else
+	echo "Note: no wecert-onboard next to ${BINARY}; the wecert-onboard.service unit will not" >&2
+	echo "      start until it is installed to ${INSTALL_PATH%/*}/wecert-onboard." >&2
+fi
+
 echo "==> Preparing config directory ${CONFIG_DIR}"
 mkdir -p "${CONFIG_DIR}"
 chown root:wecert "${CONFIG_DIR}"
@@ -140,6 +166,7 @@ if [[ "${units_installed}" -eq 0 ]]; then
 	echo "       The binary and config are installed, but there is no service to start." >&2
 	echo "       Copy the repository's deploy/systemd/ directory next to this script, or" >&2
 	echo "       install the unit by hand before enabling anything." >&2
+	UNITS_MISSING=1
 fi
 systemctl daemon-reload
 
@@ -175,3 +202,13 @@ Note: the first issuance only uploads the certificate to Tencent Cloud and print
 the CertId. You have to bind it once by hand in the CLB console; every renewal
 after that is fully automatic.
 EOF
+
+if [[ "${STATE_DIR}" != "${UNITS_STATE_DIR}" ]]; then
+	echo "Warning: statePath is under ${STATE_DIR}, but the shipped units only grant write access to" >&2
+	echo "         ${UNITS_STATE_DIR} (StateDirectory=wecert with ProtectSystem=strict). Add" >&2
+	echo "         ReadWritePaths=${STATE_DIR} to the unit, or the service cannot write its state." >&2
+fi
+
+if [[ "${UNITS_MISSING:-0}" -eq 1 ]]; then
+	exit 1
+fi

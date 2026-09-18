@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -45,11 +46,15 @@ func NewCredentialSource(cfg config.Tencent) (CredentialFunc, error) {
 		// long-lived CAM key world-readable. Put them in an EnvironmentFile that is
 		// 0600 root:wecert instead.
 		id, key := cfg.SecretID, cfg.SecretKey
+		// Trimmed, because the config layer trims the same variables when it validates them
+		// (config.go's resolveSecretFiles): a value of "   " passed that check and then reached the
+		// CAM client verbatim, so a whitespace-only secret produced a SignatureFailure from the API
+		// -- a wrong-key diagnosis -- instead of the honest "no credentials configured".
 		if id == "" {
-			id = os.Getenv(EnvSecretID)
+			id = strings.TrimSpace(os.Getenv(EnvSecretID))
 		}
 		if key == "" {
-			key = os.Getenv(EnvSecretKey)
+			key = strings.TrimSpace(os.Getenv(EnvSecretKey))
 		}
 		if id == "" || key == "" {
 			return nil, fmt.Errorf(

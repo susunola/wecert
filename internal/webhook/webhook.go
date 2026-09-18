@@ -15,6 +15,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -141,6 +142,23 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		// in the default deployment, so RemoteAddr is the honest source.
 		addr := clientIP(r)
 
+		// The token is checked FIRST, and the lockout only ever applies to requests that failed
+		// it. Checking the lockout first meant an unauthenticated caller spent the budget of the
+		// address it shares with the legitimate one -- and the README's own deployment puts a TLS
+		// terminator in front of this listener, which collapses every client onto one address. A
+		// correct token then answered 429 for a renewable 15 minutes, on every hook route
+		// including the read-only /hook/status. Brute force is bounded exactly as before: a wrong
+		// token is counted, and after authMaxFailures the address is refused before the comparison.
+		if s.tokenMatches(r) {
+			// A good token is evidence this address also carries the legitimate
+			// caller, so the accumulated failures are decayed -- not wiped, or one
+			// interleaved success would forgive a shared-IP attacker indefinitely
+			// (see recordSuccess).
+			s.limiter.recordSuccess(addr, s.now())
+			next(w, r)
+			return
+		}
+
 		if ok, retryAfter := s.limiter.allowed(addr, s.now()); !ok {
 			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
 			writeJSON(w, http.StatusTooManyRequests,
@@ -148,21 +166,11 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if !s.tokenMatches(r) {
-			s.limiter.recordFailure(addr, s.now())
-			s.log.Warn("webhook authentication failed",
-				"remote", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
-			writeJSON(w, http.StatusUnauthorized,
-				map[string]string{"error": "missing or invalid token"})
-			return
-		}
-
-		// A good token is evidence this address also carries the legitimate
-		// caller, so the accumulated failures are decayed -- not wiped, or one
-		// interleaved success would forgive a shared-IP attacker indefinitely
-		// (see recordSuccess).
-		s.limiter.recordSuccess(addr, s.now())
-		next(w, r)
+		s.limiter.recordFailure(addr, s.now())
+		s.log.Warn("webhook authentication failed",
+			"remote", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
+		writeJSON(w, http.StatusUnauthorized,
+			map[string]string{"error": "missing or invalid token"})
 	}
 }
 
@@ -236,30 +244,56 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap the body with MaxBytesReader rather than a LimitReader.
+	//
+	// LimitReader reports a clean EOF at the cap, so an oversized body was silently truncated and
+	// then parsed as if it were the whole request: a body cut at a valid JSON boundary was accepted,
+	// and one cut mid-value failed as "invalid JSON", which sends the caller looking at their JSON
+	// instead of at the size. MaxBytesReader reports the overflow, and the two answers stay apart.
+	r.Body = http.MaxBytesReader(w, r.Body, maxTriggerBody)
+
 	req, err := parseTrigger(r)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+				"error": fmt.Sprintf("request body exceeds %d bytes", maxTriggerBody),
+			})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
-	targets, unknown := s.resolveTargets(req)
+	targets := requestedTargets(req)
 
-	resp := reconcileResponse{Unknown: unknown}
+	// Initialised, not nil: a trigger where nothing was accepted otherwise answers
+	// `{"accepted": null, "skipped": [...]}`, and this package's own /hook/status documents the
+	// convention that "clients that iterate the field read null as 'no answer'". An empty array is
+	// the honest answer here -- we know nothing was accepted.
+	resp := reconcileResponse{Accepted: []string{}}
 
 	// No cert/certs means a full trigger.
-	if len(targets) == 0 && len(unknown) == 0 {
+	if len(targets) == 0 {
 		accepted, skipped, err := s.rec.StartAll(s.baseCtx)
 		if err != nil {
-			// The desired state is unreadable, so nothing started. Answering 202
-			// with every certificate "accepted" (from the last good cache) would
-			// report a convergence that will never happen.
-			s.log.Warn("full trigger failed: the desired state is unreadable",
+			// Two causes, both "nothing started", and both an answer of 202
+			// with every certificate "accepted" would misreport as a
+			// convergence that is on its way: the desired state is unreadable,
+			// or the process is shutting down -- the HTTP server's shutdown is
+			// asynchronous, so a trigger can still arrive while the reconciler
+			// is draining and refuses new passes.
+			s.log.Warn("full trigger failed: the desired state is unreadable or the process is shutting down",
 				"err", err, "remote", r.RemoteAddr)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
-		resp.Accepted = accepted
-		resp.Skipped = skipped
+		// append, not assign: StartAll hands back a nil slice when it accepted nothing, and
+		// assigning it would undo the initialisation above -- a full trigger that skipped every
+		// certificate answered `{"accepted": null}`, the exact shape the comment rules out. The
+		// named-trigger branch below already appends, which is why only this one regressed.
+		resp.Accepted = append(resp.Accepted, accepted...)
+		resp.Skipped = append(resp.Skipped, skipped...)
 		s.log.Info("webhook triggered a full convergence",
 			"accepted", len(resp.Accepted), "skipped", len(resp.Skipped), "remote", r.RemoteAddr)
 	} else {
@@ -269,15 +303,23 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		// which has a 15s write timeout.
 		started, running, notFound, err := s.rec.StartNamed(s.baseCtx, targets)
 		if err != nil {
-			// Anything else -- above all an unreadable desired state -- is a
-			// transient internal failure, not "not managed". Reporting it in
-			// unknown would tell the caller to give up on a certificate that
-			// may well exist and simply could not be resolved this time.
-			s.log.Warn("trigger failed: cannot resolve the desired state",
+			// Anything else -- an unreadable desired state, or a process that is
+			// already draining and refuses new passes -- is a transient internal
+			// failure, not "not managed". Reporting it in unknown would tell the
+			// caller to give up on a certificate that may well exist and simply
+			// could not be resolved this time.
+			s.log.Warn("trigger failed: cannot resolve the desired state, or the process is shutting down",
 				"certs", targets, "err", err, "remote", r.RemoteAddr)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
+		// The buckets are StartNamed's answer, from the desired state it just resolved. They used
+		// to come from a pre-filter against CertNames(), the cache refreshed once per pass, and
+		// that inverted the answer for exactly the flow this endpoint exists for: a name added
+		// since the last pass was reported "not in the configuration" and -- because the pre-filter
+		// had already emptied the target list -- the fresh resolution inside StartNamed never ran,
+		// so the certificate was not started either. The caller was told the opposite of the truth
+		// and issuance waited up to a full interval.
 		resp.Accepted = append(resp.Accepted, started...)
 		resp.Skipped = append(resp.Skipped, running...)
 		resp.Unknown = append(resp.Unknown, notFound...)
@@ -292,6 +334,10 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
+// maxTriggerBody bounds a trigger request body. This endpoint names certificates; it has no
+// legitimate large payload.
+const maxTriggerBody = 64 << 10
+
 // parseTrigger reads the request body. An empty body is legal and means a full
 // trigger.
 func parseTrigger(r *http.Request) (reconcileRequest, error) {
@@ -300,9 +346,9 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 		return req, nil
 	}
 
-	// Cap the size: this is a trigger endpoint and has no reason to accept large
-	// bodies.
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	// The caller has already wrapped the body in http.MaxBytesReader (see handleReconcile), so an
+	// oversized request surfaces here as an error rather than as a truncated read.
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return req, err
 	}
@@ -343,12 +389,14 @@ func parseTrigger(r *http.Request) (reconcileRequest, error) {
 }
 
 // resolveTargets maps requested names onto certificates that actually exist.
-func (s *Server) resolveTargets(req reconcileRequest) (targets, unknown []string) {
-	known := make(map[string]struct{})
-	for _, n := range s.rec.CertNames() {
-		known[n] = struct{}{}
-	}
-
+// requestedTargets returns the names a trigger asked for, deduplicated and in order.
+//
+// It deliberately does NOT classify them. CertNames() reads the cache that a pass refreshes, while
+// StartNamed resolves the desired-state document itself, so classifying here answers an older
+// question than the one the caller asked -- and answering it here also decides whether StartNamed
+// gets to run at all. Whether a name exists, is already running, or was started is StartNamed's
+// answer to give.
+func requestedTargets(req reconcileRequest) (targets []string) {
 	var wanted []string
 	if req.Cert != nil {
 		wanted = []string{*req.Cert}
@@ -364,13 +412,9 @@ func (s *Server) resolveTargets(req reconcileRequest) (targets, unknown []string
 			continue
 		}
 		seen[n] = struct{}{}
-		if _, ok := known[n]; ok {
-			targets = append(targets, n)
-		} else {
-			unknown = append(unknown, n)
-		}
+		targets = append(targets, n)
 	}
-	return targets, unknown
+	return targets
 }
 
 // ── Status endpoint ────────────────────────────────────────────────────────────────
@@ -384,6 +428,10 @@ type certStatus struct {
 	ConsecutiveFailures int    `json:"consecutiveFailures"`
 	NextAttemptAt       string `json:"nextAttemptAt,omitempty"`
 	LastError           string `json:"lastError,omitempty"`
+
+	// Error reports that this certificate's state could not be read at all. Without it the entry
+	// is the zero value, which a caller cannot tell from "no state recorded yet".
+	Error string `json:"error,omitempty"`
 }
 
 // handleStatus lets the caller look up the result after triggering.
@@ -414,7 +462,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 		rec, err := s.store.GetCert(name)
 		if err != nil {
+			// Say that the state could not be READ, rather than answering with the zero value.
+			//
+			// The zero certStatus is indistinguishable from "this certificate has no state yet",
+			// so a caller polling after a trigger could not tell "the store is unreadable" from
+			// "nothing happened" -- on the endpoint whose whole job is to answer whether the
+			// trigger worked.
 			s.log.Warn("failed to read the certificate state", "cert", name, "err", err)
+			st.Error = err.Error()
 			out.Certificates = append(out.Certificates, st)
 			continue
 		}

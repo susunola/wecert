@@ -37,7 +37,7 @@ wecert 今天已经能做到"域名集合变了 → 立刻重签"（`CoverageDri
 | 域名集合漂移检测 | `acme.CoverageDrift` | 线上证书的 SAN ≠ 配置 → 立即重签 |
 | 事件触发 | `POST /hook/reconcile` | 外部可以按需触发一轮收敛 |
 | 单证书并发闸门 | `reconcile.Reconciler` | 定时器与事件触发不会重复下单 |
-| 收敛循环 | `reconcile.RunAll/RunCert` | 已经能收敛任意的 `[]config.Certificate` |
+| 收敛循环 | `reconcile.RunDetailed/RunCert` | 已经能收敛任意的 `[]config.Certificate`（`RunAll` 在 OCR 那轮删掉了，守护进程与 `-once` 都走 `RunDetailed`） |
 
 **结论：`internal/reconcile` 几乎不用改。** 它已经能收敛任何一份期望状态，
 问题只在于今天这份期望状态来自一个静态 YAML。
@@ -285,7 +285,8 @@ t3: DNS 恢复           → 又重签                 ✗ 再烧一次
 
 ### 5.4 配额熔断
 
-域名集合变化**不算同名续期**，实打实消耗
+域名集合变化时，只要与被替换的证书**至少共享一个标识符**（`replaces` 的豁免条件），
+仍然享受 ARI 豁免；**完全不相交**的集合才实打实消耗
 `Certificates per Registered Domain`（50 / 7 天，跨账号共享）。
 
 必须有：

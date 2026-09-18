@@ -619,3 +619,48 @@ func writeDoc(t *testing.T, doc *Document) string {
 	}
 	return path
 }
+
+// A frozen shadow source is "no comparison", not "no differences".
+//
+// A file source never errors once it has read the document successfully: a later unreadable or
+// invalid revision comes back frozen, with a nil error and the last good revision. Comparing
+// against that and reporting a quiet diff is the false confidence observe mode exists to avoid --
+// the gate that decides whether it is safe to switch to enforce watches shadow_errors_total and
+// shadow_last_read, and both would look healthy while the document nobody can read is what the
+// shadow is actually made of.
+func TestObserverReportsAFrozenShadowAsNoComparison(t *testing.T) {
+	primary := NewStatic([]config.Certificate{{Name: "primary", Domains: []string{"p.example.com"}}})
+	// A provider that answers with a frozen result and no error, which is exactly what File does
+	// after its first successful read.
+	o := NewObserver(primary, frozenProvider{}, testLogger())
+
+	res, err := o.DesiredWithReasons(context.Background())
+	if err != nil {
+		t.Fatalf("a frozen shadow must not fail the pass: %v", err)
+	}
+	if res.Shadow == nil {
+		t.Fatal("the shadow report must exist")
+	}
+	if res.Shadow.Error == "" {
+		t.Error("a frozen shadow means no comparison was produced; reporting an empty error makes " +
+			"the diff look fresh and quiet when it was computed against a document nobody can read")
+	}
+	if res.Shadow.Empty() {
+		t.Error("a report that compared nothing must not read as agreement")
+	}
+}
+
+// frozenProvider returns a frozen result with no error, like File after its first good read.
+type frozenProvider struct{}
+
+func (frozenProvider) Desired(context.Context) ([]config.Certificate, error) {
+	return []config.Certificate{{Name: "shadow", Domains: []string{"s.example.com"}}}, nil
+}
+func (frozenProvider) DesiredWithReasons(context.Context) (*Result, error) {
+	return &Result{
+		Certificates: []config.Certificate{{Name: "shadow", Domains: []string{"s.example.com"}}},
+		Revision:     "rev-1",
+		Frozen:       true,
+		FreezeReason: "document is unreadable",
+	}, nil
+}

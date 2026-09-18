@@ -68,6 +68,13 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 	if err != nil {
 		metrics.CertificateProbeErrors.WithLabelValues(host).Inc()
 
+		// The verdict is not OK, so "the served certificate is the deployed one" must stop claiming
+		// it is. This branch used to leave probe_match at its previous value: a host that resolved
+		// and matched last round, then lost its DNS, kept a stale 1 for as long as the resolution
+		// failed -- and the documented alert on probe_match == 0 could not fire for the one host
+		// whose name no longer resolves. The two sibling branches below already say this.
+		metrics.CertificateProbeMatch.WithLabelValues(host).Set(0)
+
 		// Unreachable and wrong-certificate must be reported separately: being unable to dial
 		// out from the machine running wecert is an environment problem, not a certificate
 		// problem. Merging them into one conclusion sends people down the wrong path -- and
@@ -141,6 +148,12 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		// the deployed one" is unproven. Leaving probe_match at its previous value
 		// would keep reporting a stale 1 while the verdict is non-OK -- exactly the
 		// false green this metric exists to rule out.
+		//
+		// The consequence to know when reading a dashboard: on a dual-stack host whose AAAA is
+		// unreachable, the addresses that DID answer served exactly the deployed certificate, and
+		// this still exports 0 with a probe error. That is deliberate (an unverified address is not
+		// a verified one) but it means "probe_match == 0" alone does not say WHICH failure it is:
+		// read wecert_certificate_probe_errors_total next to it, and the per-address log lines.
 		metrics.CertificateProbeMatch.WithLabelValues(host).Set(0)
 		msg := "some resolved addresses could not be probed: " + strings.Join(attemptErrs, " | ")
 		r.transition(host, stateUnreachable,

@@ -11,6 +11,8 @@ import (
 	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	dnspod "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod/v20210323"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
+
+	"github.com/susunola/wecert/internal/tcerr"
 )
 
 // The delegation check is the highest-value check this tool runs, and its old
@@ -299,8 +301,8 @@ func TestIsNoRecordOnlyMatchesTheAbsenceCode(t *testing.T) {
 		if tc.code != "" {
 			err = tcerrors.NewTencentCloudSDKError(tc.code, "message", "request-1")
 		}
-		if got := isNoRecord(err); got != tc.want {
-			t.Errorf("isNoRecord(%q) = %v, want %v", tc.code, got, tc.want)
+		if got := tcerr.IsNoDataOfRecord(err); got != tc.want {
+			t.Errorf("tcerr.IsNoDataOfRecord(%q) = %v, want %v", tc.code, got, tc.want)
 		}
 	}
 }
@@ -308,13 +310,93 @@ func TestIsNoRecordOnlyMatchesTheAbsenceCode(t *testing.T) {
 // A non-SDK error still gets the substring check, which is what a wrapped or re-worded error
 // from a different layer looks like.
 func TestIsNoRecordFallsBackToTheSubstring(t *testing.T) {
-	if !isNoRecord(errors.New("dnspod: ResourceNotFound.NoDataOfRecord")) {
+	if !tcerr.IsNoDataOfRecord(errors.New("dnspod: ResourceNotFound.NoDataOfRecord")) {
 		t.Error("a non-SDK error carrying the code should still be recognised")
 	}
-	if isNoRecord(errors.New("dnspod: something else went wrong")) {
+	if tcerr.IsNoDataOfRecord(errors.New("dnspod: something else went wrong")) {
 		t.Error("an unrelated error must not be read as an absent record")
 	}
-	if isNoRecord(nil) {
+	if tcerr.IsNoDataOfRecord(nil) {
 		t.Error("nil must not be read as an absent record")
+	}
+}
+
+// A refused delete must not be reported as a deletion.
+//
+// pruneCertificates threw the response away and printed "deleted <id>" for every call that did not
+// return a transport error -- but DeleteCertificate answers a refusal in the body
+// (DeleteResult=false), which is the same field internal/deploy checks for the identical call. A
+// destructive cleanup tool that reports a deletion the API declined is worse than one that fails:
+// the operator stops looking.
+func TestDeleteOutcomeReportsARefusal(t *testing.T) {
+	t.Run("refused by the API", func(t *testing.T) {
+		resp := &ssl.DeleteCertificateResponse{
+			Response: &ssl.DeleteCertificateResponseParams{DeleteResult: common.BoolPtr(false)},
+		}
+		deleted, detail := deleteOutcome(resp)
+		if deleted {
+			t.Error("DeleteResult=false is a refusal: reporting it as deleted claims an action that " +
+				"did not happen")
+		}
+		if !strings.Contains(detail, "refused") {
+			t.Errorf("the reason must say the API refused it, got %q", detail)
+		}
+	})
+
+	t.Run("accepted", func(t *testing.T) {
+		resp := &ssl.DeleteCertificateResponse{
+			Response: &ssl.DeleteCertificateResponseParams{DeleteResult: common.BoolPtr(true)},
+		}
+		if deleted, detail := deleteOutcome(resp); !deleted {
+			t.Errorf("DeleteResult=true is a deletion, got %q", detail)
+		}
+	})
+
+	t.Run("no result body", func(t *testing.T) {
+		if deleted, _ := deleteOutcome(&ssl.DeleteCertificateResponse{}); deleted {
+			t.Error("a response with no result body cannot be read as a deletion")
+		}
+		if deleted, _ := deleteOutcome(nil); deleted {
+			t.Error("a nil response cannot be read as a deletion")
+		}
+	})
+
+	t.Run("asynchronous answer is not a confirmation", func(t *testing.T) {
+		resp := &ssl.DeleteCertificateResponse{
+			Response: &ssl.DeleteCertificateResponseParams{TaskId: common.StringPtr("task-1")},
+		}
+		deleted, detail := deleteOutcome(resp)
+		if deleted {
+			t.Error("an asynchronous answer means the deletion has not happened yet")
+		}
+		if !strings.Contains(detail, "task-1") {
+			t.Errorf("the message must name the task so the operator can follow it, got %q", detail)
+		}
+	})
+}
+
+// An unreadable DescribeCertificates answer is not "the account holds zero certificates".
+//
+// The SDK hands back a typed response with a nil body for a well-formed HTTP 200 with no body (and
+// for an API-version mismatch). The check read the total out of that nil and printed
+// "OK - the account already holds 0 certificates": a preflight reporting a pass it never verified.
+func TestAnUnreadableCertificateCountIsNotZero(t *testing.T) {
+	if _, err := certificateCount(nil); err == nil {
+		t.Error("a nil response must be reported as unreadable, not as zero certificates")
+	}
+	if _, err := certificateCount(&ssl.DescribeCertificatesResponse{}); err == nil {
+		t.Error("a response with no result body must be reported as unreadable")
+	}
+	if _, err := certificateCount(&ssl.DescribeCertificatesResponse{
+		Response: &ssl.DescribeCertificatesResponseParams{},
+	}); err == nil {
+		t.Error("a response with no total count must be reported as unreadable")
+	}
+
+	got, err := certificateCount(&ssl.DescribeCertificatesResponse{
+		Response: &ssl.DescribeCertificatesResponseParams{TotalCount: common.Uint64Ptr(7)},
+	})
+	if err != nil || got != 7 {
+		t.Errorf("a readable answer must be returned as-is, got (%d, %v)", got, err)
 	}
 }

@@ -28,8 +28,9 @@ backend RS pool takes no part in TLS. Every challenge type asks the CA to fetch 
 **HTTP-01 would be a complement, never a replacement.** It cannot issue wildcards, so a deployment
 using it would lose the property that makes the rate-limit arithmetic work: with
 `*.example.com` declared, adding `foo.example.com` costs **zero** issuances because the SAN set
-does not change. Without wildcards, every subdomain addition is a new identifier set — which
-forfeits the ARI exemption and spends *50 certificates per registered domain per 7 days*.
+does not change. Without wildcards, a subdomain addition that shares no identifier with the certificate
+being replaced forfeits the ARI exemption and spends *50 certificates per registered domain
+per 7 days*; adding it to an existing certificate keeps the exemption.
 
 Its real use case is narrow and worth stating plainly: **an operator who cannot create a DNS API
 credential** (the zone belongs to someone else, or the provider has no API) but *can* add a CLB

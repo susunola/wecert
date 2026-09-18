@@ -16,17 +16,23 @@
 //     stored as an override (see Deadline).
 //  2. Local accounting. Limits are token buckets: capacity N refilling at a published rate.
 //     Knowing what we spent and when is enough to compute what is left, because the refill is
-//     deterministic. This is a LOWER BOUND: other accounts sharing a domain, and any operator
-//     activity outside this program, consume from the same bucket and are invisible here.
+//     deterministic. This is an UPPER BOUND on what is left: other accounts sharing a domain, and
+//     any operator activity outside this program, consume from the same bucket and are invisible
+//     here, so the real remainder can only be smaller.
 //
-// The lower bound is the honest framing and the useful one: it answers "can I safely do this
-// now", and the estimate can only be wrong in the direction that makes the operator more
-// careful. The package name says estimate, not quota.
+// The bound direction is stated because it is the whole safety argument, and this comment used to
+// state it backwards ("a lower bound ... at least this much is left"). "At most this much is left"
+// answers "can I safely do this now" with the wrong answer if it is read as "at least"; the alert
+// file and the metric table in README.reference.md both have it right. The package name says
+// estimate, not quota.
 package ratelimit
 
 import (
 	"fmt"
 	"math"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -48,14 +54,6 @@ type Limit struct {
 	// Source records where the numbers come from, so a future change to the CA's published
 	// limits is traceable to the page it was read from rather than to folklore.
 	Source string
-}
-
-// RefillPerSecond is the bucket's refill rate.
-func (l Limit) RefillPerSecond() float64 {
-	if l.Refill <= 0 {
-		return 0
-	}
-	return 1 / l.Refill.Seconds()
 }
 
 // String renders the limit for a log line.
@@ -129,7 +127,14 @@ type Snapshot struct {
 //
 // A zero At means nothing has been spent yet, so the bucket is full. That is the honest answer
 // for "this program has never done this", not a guess.
-func Remaining(s Snapshot, l Limit, now time.Time) float64 {
+// level is the token count before the public clamps: negative means the bucket is in debt.
+//
+// Remaining and Spend share it deliberately. Remaining clamps a debt to zero for callers asking
+// "how much may I spend right now"; Spend must subtract from the UNCLAMPED value, because
+// subtracting from a clamped zero forgives whatever debt lies below it -- a bucket at -5 that is
+// spent again would land at -1 instead of -6, so its next token would arrive several refill
+// intervals early, which is the opposite of what this package promises.
+func level(s Snapshot, l Limit, now time.Time) float64 {
 	if l.Capacity <= 0 {
 		return 0
 	}
@@ -146,12 +151,6 @@ func Remaining(s Snapshot, l Limit, now time.Time) float64 {
 	// Treating it as a bucket that never refills is the conservative reading: fewer tokens
 	// available means less issuance, never more.
 	if l.Refill <= 0 {
-		if s.Tokens > l.Capacity {
-			return l.Capacity
-		}
-		if s.Tokens < 0 {
-			return 0
-		}
 		return s.Tokens
 	}
 	if now.After(s.At) {
@@ -166,7 +165,14 @@ func Remaining(s Snapshot, l Limit, now time.Time) float64 {
 		frac := float64(elapsed%l.Refill) / float64(l.Refill)
 		tokens += whole + frac
 	}
-	// A clock that moved backwards must not create tokens.
+	return tokens
+}
+
+// Remaining reports how many tokens are available now, never less than zero.
+func Remaining(s Snapshot, l Limit, now time.Time) float64 {
+	tokens := level(s, l, now)
+	// A clock that moved backwards must not create tokens, and a bucket in debt cannot be spent
+	// from: both read as "nothing available".
 	if tokens > l.Capacity {
 		tokens = l.Capacity
 	}
@@ -182,6 +188,14 @@ func Remaining(s Snapshot, l Limit, now time.Time) float64 {
 // is full again before the withdrawal -- which is what makes "50 per 7 days, 1 back every 202
 // minutes" behave as the CA does rather than as a naive counter would.
 //
+// "Full" is the CAPACITY, not however much the idle interval would have produced. A bucket left
+// alone for two refill periods refills to twice its capacity if nothing caps it, and every token
+// above the capacity is invisible (Remaining clamps what it reports) while still being there to
+// spend: the stored count then reads "full" for many spends longer than the CA would allow, which
+// is exactly the direction this estimate must never be wrong in. TestSpendingAnIdleBucketStores-
+// NoMoreThanCapacity pins it; Remaining's clamp alone cannot, because the surplus lives in the
+// snapshot.
+//
 // A spend that exceeds what is available drives the bucket negative on purpose: the negative
 // value is what makes Remaining report 0 AND tells the next refill how much debt to work off,
 // so an over-spend is not silently forgiven. The CA would have rejected that request, so a
@@ -194,7 +208,18 @@ func Spend(s Snapshot, l Limit, cost float64, now time.Time) Snapshot {
 	if cost < 0 {
 		cost = 0
 	}
-	tokens := Remaining(s, l, now) - cost
+	// The anchor only moves forward.
+	//
+	// Remaining already refuses to credit an interval that has not passed, but the snapshot this
+	// returns would still move its anchor back to `now`. If the clock steps backwards (NTP, a VM
+	// restored from a snapshot, a manual change), s.Tokens has already been credited up to s.At,
+	// and storing At=now makes the interval [now, s.At] creditable a second time -- free tokens,
+	// on the limits this estimate exists to stay under. An interval that has been credited can
+	// never be credited again if the anchor never goes backwards.
+	if now.Before(s.At) {
+		now = s.At
+	}
+	tokens := math.Min(level(s, l, now), l.Capacity) - cost
 	// Clamp the debt. Without a floor, one catastrophic burst (or a clock jump) could leave a
 	// bucket so negative that it takes longer than the window to recover and the estimate
 	// stays pinned at zero long after the CA would have allowed the request again.
@@ -239,6 +264,21 @@ func ParseRetryAfter(msg string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	rest := msg[i+len(marker):]
+	// The instant is a PREFIX of what follows it, not the whole of it.
+	//
+	// Boulder formats "retry after 2006-01-02 15:04:05 MST" and then appends the documentation
+	// link: a real refusal reads
+	//
+	//	too many new orders recently, retry after 2026-09-18 12:34:56 UTC: see
+	//	https://letsencrypt.org/docs/rate-limits/#new-orders-per-account
+	//
+	// Requiring the message to end at the instant made every genuine refusal return false, so no
+	// deadline was ever recorded and the WecertRateLimitBlocked alert was unreachable -- the one
+	// signal that says the whole account has to wait. The test used a fabricated message with no
+	// suffix, which is why the suite stayed green.
+	if j := indexOf(rest, ": see "); j >= 0 {
+		rest = rest[:j]
+	}
 	// Trim the trailing sentence punctuation the message may carry.
 	rest = trimTrailing(rest)
 
@@ -254,6 +294,30 @@ func ParseRetryAfter(msg string) (time.Time, bool) {
 			}
 			return t.UTC(), true
 		}
+	}
+	return time.Time{}, false
+}
+
+// ParseRetryAfterHeader parses an HTTP Retry-After header value.
+//
+// RFC 9110 section 10.2.3 allows two forms: a delay in seconds, or an HTTP-date. It is a different
+// syntax from the free text Boulder puts in the error MESSAGE (see ParseRetryAfter), and it is the
+// authoritative field: a CA may send the header without repeating the instant in the message, and
+// lego exposes it on its typed error. Reading only the message meant such a refusal recorded no
+// deadline at all, so the pass retried inside the window the CA had just named.
+func ParseRetryAfterHeader(value string) (time.Time, bool) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return time.Time{}, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return time.Time{}, false
+		}
+		return time.Now().Add(time.Duration(secs) * time.Second).UTC(), true
+	}
+	if t, err := http.ParseTime(v); err == nil && !t.IsZero() {
+		return t.UTC(), true
 	}
 	return time.Time{}, false
 }
@@ -280,29 +344,4 @@ func trimTrailing(s string) string {
 		break
 	}
 	return s[:end]
-}
-
-// WorstCaseBlockedBy reports the latest deadline among those still in the future, which is
-// what a caller should wait for. Multiple limits can be exceeded at once, and the CA reports
-// the furthest-resetting one; when several deadlines have been collected individually, the
-// same rule applies.
-func WorstCaseBlockedBy(deadlines []Deadline, now time.Time) (Deadline, bool) {
-	var worst Deadline
-	found := false
-	for _, d := range deadlines {
-		if d.At.IsZero() || !now.Before(d.At) {
-			continue
-		}
-		if !found || d.At.After(worst.At) {
-			worst, found = d, true
-		}
-	}
-	return worst, found
-}
-
-// Describe renders a remaining-token count for an operator, clamping display at zero so a
-// negative bucket does not read as a negative allowance.
-func Describe(l Limit, remaining float64) string {
-	return fmt.Sprintf("%s: %.0f of %.0f left (1 back every %s)",
-		l.Name, math.Max(0, remaining), l.Capacity, l.Refill)
 }

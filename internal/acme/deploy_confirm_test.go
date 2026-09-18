@@ -248,7 +248,10 @@ func TestFailedDeployIsRecordedForReclaimAndThenReaped(t *testing.T) {
 	m, store, cert := newConfirmHarness(t, dep, nil)
 
 	// The deploy failed after the upload, so the new CertId is an orphan.
-	m.recordOrphanCert("ap-new", "ap-live", cert.Name)
+	seedUploadedOrder(t, store, cert.Name, "ap-new", "ap-live")
+	if err := m.discardOrder(context.Background(), cert.Name); err != nil {
+		t.Fatalf("discarding an order that carries an uploaded certificate must record it: %v", err)
+	}
 
 	if got := listRetired(t, store, m, time.Hour); len(got) != 1 || got[0].CertID != "ap-new" {
 		t.Fatalf("the orphaned certificate must be recorded for reclaim, got %+v", got)
@@ -281,7 +284,10 @@ func TestReapingKeepsTheRecordWhenDeleteFails(t *testing.T) {
 	dep := &fakeDeployer{deleteErr: errors.New("API blip")}
 	m, store, cert := newConfirmHarness(t, dep, nil)
 
-	m.recordOrphanCert("ap-new", "ap-live", cert.Name)
+	seedUploadedOrder(t, store, cert.Name, "ap-new", "ap-live")
+	if err := m.discardOrder(context.Background(), cert.Name); err != nil {
+		t.Fatal(err)
+	}
 	base := time.Now()
 	m.now = func() time.Time { return base.Add(2 * m.retention) }
 	m.ReapRetired(context.Background())
@@ -291,17 +297,28 @@ func TestReapingKeepsTheRecordWhenDeleteFails(t *testing.T) {
 	}
 }
 
-// Recording the certificate that is actually serving traffic would schedule the
-// live certificate for deletion.
-func TestRecordOrphanCertIgnoresTheLiveCertificate(t *testing.T) {
+// Recording the certificate that is actually serving traffic would schedule the live certificate
+// for deletion. Neither the live id nor "nothing was uploaded" may reach the reclaim list.
+func TestDiscardingAnOrderNeverRetiresTheLiveCertificate(t *testing.T) {
 	dep := &fakeDeployer{}
 	m, store, cert := newConfirmHarness(t, dep, nil)
 
-	m.recordOrphanCert("ap-live", "ap-live", cert.Name) // same id as live
-	m.recordOrphanCert("", "ap-live", cert.Name)        // nothing was uploaded
-
+	// The order carries the id that is ALSO the live one.
+	seedUploadedOrder(t, store, cert.Name, "ap-live", "ap-live")
+	if err := m.discardOrder(context.Background(), cert.Name); err != nil {
+		t.Fatal(err)
+	}
 	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 0 {
-		t.Fatalf("the live certificate (or an empty id) must never be recorded for reclaim, got %+v", got)
+		t.Fatalf("the live certificate must never be recorded for reclaim, got %+v", got)
+	}
+
+	// And an order that uploaded nothing at all.
+	seedUploadedOrder(t, store, cert.Name, "", "ap-live")
+	if err := m.discardOrder(context.Background(), cert.Name); err != nil {
+		t.Fatal(err)
+	}
+	if got := listRetired(t, store, m, 365*24*time.Hour); len(got) != 0 {
+		t.Fatalf("an order with no uploaded certificate must record nothing, got %+v", got)
 	}
 }
 
@@ -370,5 +387,27 @@ func TestReconcileLooksUpBindingsOncePerInterval(t *testing.T) {
 	_ = m.Reconcile(context.Background(), cert)
 	if dep.calls != 2 {
 		t.Errorf("Bindings ran %d times; want a second lookup once the interval elapsed", dep.calls)
+	}
+}
+
+// seedUploadedOrder records an order that carries a certificate uploaded to the cloud, which is the
+// shape a failed deploy leaves behind: the upload succeeded, the rebind did not.
+func seedUploadedOrder(t *testing.T, store *state.Store, certName, uploadedID, liveID string) {
+	t.Helper()
+	if err := store.PutOrder(&state.Order{
+		CertName: certName, OrderURL: "https://ca.test/order/1",
+		FinalizeURL: "https://ca.test/finalize/1", Status: "pending",
+		Identifiers: "a.example.com", DeploymentCertID: uploadedID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if liveID == "" {
+		return
+	}
+	if err := store.UpdateCert(certName, func(st *state.CertState) error {
+		st.DeployedCertID = liveID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }

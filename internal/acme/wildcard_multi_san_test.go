@@ -81,6 +81,9 @@ func (s *faithfulSolver) Present(_ context.Context, domain, token, keyAuth strin
 	return rec, nil
 }
 
+// PropagationTimeout is the window the reclaim probe uses as its floor for trusting a denial.
+func (s *faithfulSolver) PropagationTimeout() time.Duration { return 5 * time.Minute }
+
 func (s *faithfulSolver) WaitAll(_ context.Context, records []DNSRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

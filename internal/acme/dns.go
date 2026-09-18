@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -64,12 +65,7 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		// zone in the account) into stdout, which under systemd means the journal.
 		//
 		// Keep it out of the unit and out of any drop-in; debug DNS locally instead.
-		p, err := dnspod.NewDNSProviderConfig(&dnspod.Config{
-			LoginToken:         dnsCfg.LoginToken,
-			TTL:                dnsCfg.TTL,
-			PropagationTimeout: dnsCfg.Propagation,
-			PollingInterval:    dnsCfg.Polling,
-		})
+		p, err := dnspod.NewDNSProviderConfig(dnspodConfig(dnsCfg))
 		if err != nil {
 			return nil, fmt.Errorf("initialise the dnspod provider: %w", err)
 		}
@@ -81,22 +77,25 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		if err != nil {
 			return nil, err
 		}
-		// Fetch and build on the spot every time. Constructing a provider only creates
-		// an SDK client, a negligible cost, and what we get for it is never calling the
-		// API with expired credentials.
+		// Fetch and build on the spot every time, so the API is never called with credentials
+		// that have expired since they were fetched -- the CVM instance role hands out temporary
+		// ones.
+		//
+		// The cost is not quite negligible, and it is worth writing down because it is invisible
+		// here: the SDK builds each client's HTTP client around a CLONE of http.DefaultTransport
+		// (common.Client.Init, unless common.DefaultHttpClient is set, which this program does not
+		// set), so every provider instance has its own connection pool. One Present or CleanUp is
+		// therefore one fresh TLS handshake, plus one connection left idle for the SDK's 30s
+		// IdleConnTimeout. That is the price of not reusing a client; sharing one is not free
+		// either, because the SDK applies ReqTimeout by mutating the client it was given, so a
+		// shared client would couple unrelated timeouts.
 		newProvider = func(ctx context.Context) (challenge.Provider, error) {
 			cred, err := creds(ctx)
 			if err != nil {
 				return nil, err
 			}
-			return tencentcloud.NewDNSProviderConfig(&tencentcloud.Config{
-				SecretID:           cred.GetSecretId(),
-				SecretKey:          cred.GetSecretKey(),
-				SessionToken:       cred.GetToken(),
-				TTL:                dnsCfg.TTL,
-				PropagationTimeout: dnsCfg.Propagation,
-				PollingInterval:    dnsCfg.Polling,
-			})
+			return tencentcloud.NewDNSProviderConfig(tencentDNSConfig(
+				cred.GetSecretId(), cred.GetSecretKey(), cred.GetToken(), dnsCfg))
 		}
 
 	case config.DNSProviderLego:
@@ -118,6 +117,49 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 	}
 	return &DNSSolver{newProvider: newProvider, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS}, nil
 }
+
+// dnsAPITimeout bounds one call to the DNS provider's API.
+//
+// It has to be set explicitly, because a provider built from a struct literal does NOT get lego's
+// NewDefaultConfig defaults: the tencentcloud provider would leave the SDK's ReqTimeout at 0, and
+// the SDK then builds an http.Client with Timeout 0 -- no timeout at all. Present and CleanUp hold
+// the per-name TXT lease mutex across that call (see challengeLeases), so one stalled connection
+// would wedge every certificate sharing the challenge FQDN for as long as the TCP connection
+// lives, with the pass never finishing and the TXT records left in DNS. Sixty seconds matches the
+// other Tencent Cloud client in this program (internal/deploy).
+const dnsAPITimeout = 60 * time.Second
+
+// tencentDNSConfig builds the tencentcloud provider's config, timeout included.
+//
+// Split out so a test can assert the timeout is there: it cannot be read back from the constructed
+// provider (lego keeps its config unexported), and that is exactly the field whose absence is
+// invisible until a connection stalls.
+func tencentDNSConfig(secretID, secretKey, sessionToken string, dnsCfg config.DNS) *tencentcloud.Config {
+	return &tencentcloud.Config{
+		SecretID:           secretID,
+		SecretKey:          secretKey,
+		SessionToken:       sessionToken,
+		TTL:                dnsCfg.TTL,
+		PropagationTimeout: dnsCfg.Propagation,
+		PollingInterval:    dnsCfg.Polling,
+		HTTPTimeout:        dnsAPITimeout,
+	}
+}
+
+// dnspodConfig builds the DNSPod provider's config, with a bounded HTTP client for the same reason
+// as tencentDNSConfig: a nil client falls back to http.DefaultClient, which has no timeout either.
+func dnspodConfig(dnsCfg config.DNS) *dnspod.Config {
+	return &dnspod.Config{
+		LoginToken:         dnsCfg.LoginToken,
+		TTL:                dnsCfg.TTL,
+		PropagationTimeout: dnsCfg.Propagation,
+		PollingInterval:    dnsCfg.Polling,
+		HTTPClient:         &http.Client{Timeout: dnsAPITimeout},
+	}
+}
+
+// PropagationTimeout reports the budget WaitAll waits for a record to appear.
+func (s *DNSSolver) PropagationTimeout() time.Duration { return s.timeout }
 
 // DNSRecord is one _acme-challenge TXT record that is to be written or verified.
 type DNSRecord struct {
@@ -155,6 +197,17 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 	defer release()
 	mu.Lock()
 	defer mu.Unlock()
+
+	// Resolve the zone before handing the write to the provider, so its answer is ours to
+	// report. lego does the same SOA walk internally but has no guard against the walk
+	// climbing to the public suffix: when the resolver answers for `com.` but not for the
+	// domain, lego concludes the zone is `com.` and the write fails with "zone com. not found
+	// in dnspod for domain ...", which reads like a DNSPod account problem and is not. This
+	// costs one short SOA walk (findZone already refuses to return a public suffix) and only
+	// runs when a record is about to be written.
+	if _, err := s.findZone(ctx, rec.FQDN); err != nil {
+		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
+	}
 
 	if err := provider.Present(domain, token, keyAuth); err != nil {
 		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
@@ -324,11 +377,47 @@ func (s *DNSSolver) waitZone(
 		}
 
 		if len(pending) == 0 {
+			// The authoritative servers agree. That is necessary but not sufficient: the CA
+			// validates through a recursive resolver, so ask that path too before telling the CA
+			// to look (see probeRecursive for why the two views can disagree).
+			if ready, why := s.recursiveReady(ctx, recs); !ready {
+				pending = why
+			}
+		}
+
+		if len(pending) == 0 {
+			// The evidence goes into the success line too, not just into the timeout error.
+			//
+			// This verdict is a lower bound on global propagation and it is derived from this
+			// host's view: a lagging authority that happens to be unreachable from here
+			// contributes nothing, while the CA's own resolver may reach it and be told the
+			// record does not exist. That asymmetry is exactly what turned a "propagated" verdict
+			// into an NXDOMAIN at the CA in production, and with only a server count in the log
+			// there was no way to see afterwards how thin the evidence had been. Every round
+			// re-probes every address, so the summary printed here is the state of the round that
+			// decided it.
+			readiness := make([]string, 0, len(results))
+			for _, res := range results {
+				readiness = append(readiness, fmt.Sprintf("%s = %s (%s)",
+					res.record.FQDN, res.record.Value, res.summary))
+			}
 			s.log.Info("TXT propagated",
-				"zone", zone, "nameservers", len(servers), "records", len(recs))
+				"zone", zone, "nameservers", len(servers), "records", len(recs),
+				"evidence", strings.Join(readiness, " | "))
 			return nil
 		}
 
+		// The context is checked BEFORE the budget.
+		//
+		// With the budget first, a cancellation that landed during the final probe round was
+		// reported as a propagation timeout -- and upstream a timeout is a business failure:
+		// solveChallenges calls markResumedUnpresented and recordFailure books a
+		// consecutive_failures increment and a backoff for what was actually a shutdown. Both of
+		// those rules ("a stop signal is not a failure", "a cancelled wait says nothing about DNS")
+		// depend on the cancellation being visible here.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if !time.Now().Before(b.deadline) {
 			return fmt.Errorf(
 				"TXT propagation not confirmed: this zone waited %s, entering it %s into the %s "+
@@ -504,6 +593,101 @@ func probeReady(servers []nsServer, fqdn, want string) (bool, string) {
 		resp, _, err := client.Exchange(msg, server)
 		return resp, err
 	})
+}
+
+// recursiveVerdict is what the CA-shaped view says about one record.
+//
+// A validator resolves through a recursive resolver, not by asking authoritative servers
+// directly, so this is the closest thing wecert has to the CA's own view -- and the two views
+// can disagree. Observed on a real account: the authoritative probe saw every reachable server
+// confirm the value while the CA was told NXDOMAIN for the same name, because a lagging
+// authority was unreachable from wecert's host and reachable from the CA's resolver. The cost
+// of that disagreement is a failed-validation quota slot (5 per hour per identifier), spent on
+// a round that could simply have waited.
+type recursiveVerdict struct {
+	confirmed bool // at least one resolver returned the value
+	denied    bool // at least one resolver answered definitively without it
+	reachable int  // resolvers that gave one of those two answers
+	summary   string
+}
+
+// probeRecursive asks every configured recursive resolver for the TXT value.
+//
+// The three-way split mirrors the authoritative probe, and for the same reason: "denied" and
+// "could not tell" are different answers and must not be collapsed.
+//
+//   - NOERROR with the value          -> confirmed
+//   - NXDOMAIN, or NOERROR without it -> denied (this includes a negatively cached answer,
+//     which is exactly what the CA would be handed, so waiting is the correct response)
+//   - anything else (timeout, SERVFAIL, REFUSED, truncation) -> inconclusive
+//
+// Callers block on a denial and require a confirmation, unless every resolver was
+// inconclusive: a host with no usable public DNS must still be able to issue certificates, so
+// "nobody answered" degrades to a warning rather than a refusal.
+func (s *DNSSolver) probeRecursive(ctx context.Context, fqdn, want string) recursiveVerdict {
+	v := recursiveVerdict{}
+	notes := make([]string, 0, len(s.recursiveNameservers))
+	for _, resolver := range s.recursiveNameservers {
+		msg := new(dns.Msg)
+		msg.SetQuestion(dns.Fqdn(fqdn), dns.TypeTXT)
+		msg.RecursionDesired = true
+		msg.SetEdns0(4096, false)
+
+		resp, err := s.exchange(ctx, msg, resolver)
+		switch {
+		case err != nil:
+			notes = append(notes, resolver+" unreachable")
+		case resp == nil:
+			notes = append(notes, resolver+" no response")
+		case resp.Truncated:
+			notes = append(notes, resolver+" truncated answer (TCP retry failed)")
+		case resp.Rcode == dns.RcodeSuccess:
+			v.reachable++
+			if responseHasTXT(resp, want) {
+				v.confirmed = true
+				notes = append(notes, resolver+" has the value")
+			} else {
+				v.denied = true
+				notes = append(notes, resolver+" answered NOERROR without the value")
+			}
+		case resp.Rcode == dns.RcodeNameError:
+			v.reachable++
+			v.denied = true
+			notes = append(notes, resolver+" answered NXDOMAIN")
+		default:
+			notes = append(notes, resolver+" answered "+dns.RcodeToString[resp.Rcode])
+		}
+	}
+	v.summary = fmt.Sprintf("recursive: confirmed=%t denied=%t reachable=%d/%d (%s)",
+		v.confirmed, v.denied, v.reachable, len(s.recursiveNameservers), strings.Join(notes, "; "))
+	return v
+}
+
+// recursiveReady reports whether the CA-shaped view permits the verdict, and why not.
+func (s *DNSSolver) recursiveReady(ctx context.Context, recs []DNSRecord) (bool, []string) {
+	var pending []string
+	for _, r := range recs {
+		v := s.probeRecursive(ctx, r.FQDN, r.Value)
+		if v.denied {
+			pending = append(pending, fmt.Sprintf(
+				"%s = %s (a recursive resolver, which is what the CA talks to, answered without the value: %s)",
+				r.FQDN, r.Value, v.summary))
+			continue
+		}
+		if !v.confirmed && v.reachable == 0 && len(s.recursiveNameservers) > 0 {
+			// Not one resolver could answer. Refusing here would make issuance impossible on a
+			// host without public DNS egress -- a configuration wecert supports -- and the
+			// authoritative verdict above already passed, so this is a warning, not a blocker.
+			s.log.Warn("no recursive resolver could answer; falling back to the authoritative verdict alone",
+				"name", r.FQDN)
+			continue
+		}
+		if !v.confirmed {
+			pending = append(pending, fmt.Sprintf(
+				"%s = %s (no recursive resolver returned the value yet: %s)", r.FQDN, r.Value, v.summary))
+		}
+	}
+	return len(pending) == 0, pending
 }
 
 // challengeLeases tracks, per effective challenge FQDN, the TXT values this process
@@ -842,6 +1026,16 @@ func (s *DNSSolver) queryRecursive(ctx context.Context, msg *dns.Msg) (*dns.Msg,
 	var errs []error
 	for _, resolver := range s.recursiveNameservers {
 		resp, err := s.exchange(ctx, msg.Copy(), resolver)
+		if err == nil && resp != nil && resp.Truncated {
+			// exchangeDNS hands back the UDP answer when its TCP retry fails, with Truncated still
+			// set so the caller can decide -- the probe paths do decide. Callers of this one read
+			// the answer structurally (authoritativeNS builds the server list out of resp.Answer),
+			// so accepting it would silently shrink the authority set, and a reduced set is how the
+			// "two independent servers must agree" rule degrades into the single-authority
+			// exemption it exists to avoid. Ask the next resolver instead.
+			errs = append(errs, fmt.Errorf("%s: truncated answer (TCP retry failed)", resolver))
+			continue
+		}
 		if err == nil && resp != nil && (resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError) {
 			return resp, nil
 		}

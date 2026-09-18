@@ -34,13 +34,24 @@
 | 层级 | 目标 | 现有资产 | 运行位置 | 频率 |
 |---|---|---|---|---|
 | **L0 静态门禁** | 格式、静态错误、已知 CVE、英文源码、图表不过期 | `gofmt`、`go vet`、`govulncheck`、`scripts/check-english.py`、`scripts/check-diagram-fit.py` | CI | 每次 push / PR |
-| **L1 单元** | 纯逻辑：集合运算、状态迁移、解析、退避 | 39 个测试文件、384 个用例 | CI（`-race`） | 每次 push / PR |
+| **L1 单元** | 纯逻辑：集合运算、状态迁移、解析、退避 | 76 个测试文件、787 个测试函数（`go test ./... -list 'Test.*' \| grep -c '^Test'`） | CI（`-race`） | 每次 push / PR |
 | **L2 集成（注入替身）** | 跨组件编排：订单状态机、DNS 传播、清理、收敛循环 | 注入式 exchange 函数、假状态库、`httptest` | CI | 每次 push / PR |
+| **L2.5 真实 DNS-01 端到端（本地，无需云凭证）** | 真 ACME 服务端 + 真权威 DNS（53 端口）+ 真 solver 写记录 + 真传播检查回读 + 真签发 | `internal/acme/e2e_dns_test.go`、`make e2e`、[实跑报告](e2e-run-2026-09-17.html) | 本地 / CI（Linux 需 `CAP_NET_BIND_SERVICE`） | 改动触及签发、DNS 或状态机时 |
 | **L3 端到端（staging）** | 真实 ACME + 真实 DNSPod 的全流程 | `docs/lifecycle-acceptance.md`、`scripts/e2e-test.sh` | 本地，人工 | 发版前 / 改动触及状态机时 |
+| **L3 端到端（staging，自动化）** | 同上，但由 `wecert-onboard` 驱动声明、`wecert-probe` 独立佐证 | `scripts/e2e.sh` 输出的 [实跑报告](e2e-run-2026-09-17.html) | 本地，人工 | 同上 |
 | **L4 部署验收** | 真实 CLB 绑定、SNI、TLS 实际握手、CVM 角色 | `testenv/`（Terraform）、`scripts/run-stage-ab.sh`、`scripts/validate-cloudinit.py` | 腾讯云测试账号，人工 | 发版前 / 改动触及部署时 |
 | **L5 线上巡检** | 生产上"证书真的在服务" | `wecert-probe`、`tatrun`、Prometheus 指标 | 生产 | 持续 |
 
 **L3/L4 是人工的，这不是偷懒，是结构性的** —— 见第 6 节。
+
+**L2.5 是这一层里唯一"真到 DNS 线路上"的自动化层级**：它用一个真实的权威 DNS 服务器（0.0.0.0:53）、pebble 的真实校验、以及生产同一条 solver→传播检查代码路径，把"记录真的写进去了、真的能读回来、CA 真的签了"三件事分开断言。它不需要任何云凭证，所以能进 CI；跑不了的部分（云部署、staging）在报告里逐条列出并给出命令，而不是当作通过。
+
+2026-09-17 追加两个用例，把"配置真的生效"和"续期真的自动"也放进这一层：
+
+- `tlsserver-profile-issuance`：profile 名必须逐字出现在 new-order 请求里（记录请求本身，而不是只看有效期——pebble 对没带 profile 的订单**随机**挑一个，只看 45 天会三次里漏掉一次），并且签回来的证书有效期必须真是该 profile 的 3888000 秒，而不是 classic 的 90 天。
+- `automatic-renewal-of-a-tlsserver-certificate`：先把管理器时钟拨到 CA 自己的 ARI 窗口所蕴含的那个确定时刻（`RenewalTime`），再一次 `Reconcile` 完成整轮续期——换发、挑战记录的写入与清理、订单携带 `replaces`。用例把 `renewBefore` 设成 24h：本地回退时刻因此落在 notAfter-24h（再加抖动），而 CA 窗口的末端是 notAfter-(有效期/3)+24h，对这个 profile 就是 notAfter-14d，两者至少相差 13 天，这样"续期发生在这个时刻"只可能由 CA 的窗口解释，而不是本地规则恰好也到期了；这个前提在用例里是断言，不是假设。
+
+为了让第二条可判定，pebble 现在用 `PEBBLE_AUTHZREUSE=0` 启动：CA 沿用仍然有效的授权（RFC 8555 §7.5.2）会让订单直接 ready，整条 DNS-01 路径被跳过——而那正是这一层要跑的东西。用例仍然按 CA 实际返回的授权状态逐名断言（0 是"每次都新授权"，但 pebble 的掷骰是 `rand.Intn(100) > percent`，仍有百分之一的沿用概率）。
 
 ---
 

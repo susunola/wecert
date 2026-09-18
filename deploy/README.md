@@ -12,12 +12,16 @@ Least-privilege CAM policies for running wecert and for the e2e environment.
 
 ## Why every statement uses `resource: "*"`
 
-The action lists are already minimal — wecert needs exactly seven `ssl:*` and five
-`dnspod:*` actions at runtime. The three `ssl:*` entries beyond upload/describe/delete
+The action lists are already minimal — wecert needs exactly eight `ssl:*` and five
+`dnspod:*` actions at runtime. Four of the `ssl:*` entries beyond upload/describe/delete
 are the asynchronous ones: `DescribeHostUpdateRecordDetail` polls every one-click
-rebind to completion, and `CreateCertificateBindResourceSyncTask` /
+rebind to completion, `CreateCertificateBindResourceSyncTask` /
 `DescribeCertificateBindResourceTaskResult` are how a first-issued certificate is
-confirmed to be bound after a human binds it in the console. The resource side is deliberately not narrowed,
+confirmed to be bound after a human binds it in the console, and
+`DescribeDeleteCertificatesTaskResult` is what says whether an
+`IsCheckResource=true` delete actually happened — without it the reclaim loop can never
+drop a retired certificate from its list. `scripts/check-cam-policies.py` (run by
+`make check`) fails when the policies stop covering an API the code calls. The resource side is deliberately not narrowed,
 for different reasons per service:
 
 - **`dnspod:*`** — DNSPod supports qcs resource scoping by domain

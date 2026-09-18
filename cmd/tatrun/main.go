@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -19,6 +20,8 @@ import (
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	tat "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/tat/v20201028"
+	"net/url"
+	"strings"
 )
 
 func main() {
@@ -95,6 +98,22 @@ var newTATClient = func(cred common.CredentialIface, region string, cpf *profile
 	return tat.NewClient(cred, region, cpf)
 }
 
+// timeoutErr turns "the deadline passed" into the message that names the invocation, whichever way
+// it surfaced.
+//
+// run() gives the context the same duration as the loop's own deadline and creates it first, so in
+// production the deadline always arrives through the context -- as an error from the SDK call or as
+// ctx.Done() -- and both used to hand back a bare "context deadline exceeded". That made the
+// diagnosable message below it unreachable, and left the operator with an error from a nested call
+// instead of the invocation id to look up. A cancellation (SIGINT) is not a timeout and is returned
+// unchanged.
+func timeoutErr(ctx context.Context, invocationID string) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("timed out waiting for the TAT result (invocation=%s)", invocationID)
+	}
+	return ctx.Err()
+}
+
 // waitForTask polls until the invocation reaches a terminal status.
 //
 // Split out of run() so the status table -- which is the whole point of this command, and where
@@ -104,22 +123,42 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 	for {
 		task, err := fetchTask(ctx, client, invocationID)
 		if err != nil {
+			// run() gives this context the same duration as the deadline below, and creates it
+			// first -- so in production the context always expires first and this returned its
+			// raw error, making the diagnosable message below unreachable: the operator saw
+			// "context deadline exceeded" from a nested SDK call instead of "the command did not
+			// finish in time, here is the invocation id". Both are the same event, and the second
+			// is the one with something to act on.
+			if ctx.Err() != nil {
+				return timeoutErr(ctx, invocationID)
+			}
 			return err
 		}
 
 		if task != nil {
 			switch deref(task.TaskStatus) {
 			case "SUCCESS":
-				out := ""
-				exitCode := int64(0)
-				if task.TaskResult != nil {
-					out = deref(task.TaskResult.Output)
-					exitCode = derefI64(task.TaskResult.ExitCode)
+				// A terminal SUCCESS with no result body is not "the command ran and printed
+				// nothing": it is the absence of the evidence this tool exists to fetch. Exiting 0
+				// with empty output makes the two indistinguishable, and the operator greps that
+				// empty output to decide what a listener is serving.
+				if task.TaskResult == nil {
+					return fmt.Errorf("the TAT task reported SUCCESS for invocation=%s but returned no "+
+						"result, so there is no evidence to report", invocationID)
 				}
+				out := decodeRemoteOutput(deref(task.TaskResult.Output))
+				exitCode := derefI64(task.TaskResult.ExitCode)
 				if !quiet {
 					fmt.Fprintf(os.Stderr, "--- command output (exit=%d) ---\n", exitCode)
 				}
 				fmt.Print(out)
+				// The API caps Output (24KB) and reports what it dropped, plus a link to the full
+				// log. This tool exists to be the evidence an operator greps: partial output
+				// presented as the whole answer turns "the certificate is missing from the log" into
+				// "this listener is not serving it".
+				if notice := truncationNotice(task.TaskResult); notice != "" {
+					fmt.Fprintf(os.Stderr, "\n%s\n", notice)
+				}
 				if exitCode != 0 {
 					return fmt.Errorf("command exited with code %d", exitCode)
 				}
@@ -133,7 +172,11 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 				// agent installed) sends the operator looking for a timeout that never
 				// happened, when the server already said exactly what was wrong.
 				if task.TaskResult != nil {
-					fmt.Print(deref(task.TaskResult.Output))
+					// Decoded like the success path. The API returns Base64, so printing it raw
+					// handed the operator a blob exactly when the command had failed -- the
+					// moment the output is the whole point. Found by using the tool: a command
+					// whose last statement exited non-zero printed its own error as Base64.
+					fmt.Print(decodeRemoteOutput(deref(task.TaskResult.Output)))
 				}
 				return fmt.Errorf("TAT task %s: %s", deref(task.TaskStatus), deref(task.ErrorInfo))
 			}
@@ -144,7 +187,7 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return timeoutErr(ctx, invocationID)
 		case <-time.After(interval):
 		}
 	}
@@ -190,6 +233,84 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// decodeRemoteOutput turns the API's encoding of a command's output into what the command printed.
+//
+// TaskResult.Output is documented as Base64-encoded command output (up to 24KB), and the
+// API really does return it that way -- the captures in this repository's own e2e runs decode from
+// Base64 to the openssl output they were checking. Printing the field verbatim therefore made the
+// tool's entire evidence a blob: `-quiet | grep` matched nothing, and a reader had to know to decode
+// it before they could tell which certificate a listener was serving.
+//
+// An undecodable value is printed as-is rather than dropped: whatever the server sent is still the
+// only evidence there is, and silently printing nothing would be worse than printing something
+// unreadable. The caller is told which happened.
+func decodeRemoteOutput(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw)); err == nil {
+		return string(decoded)
+	}
+	// Some encoders omit padding; try the unpadded alphabet before giving up.
+	if decoded, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(strings.TrimSpace(raw), "=")); err == nil {
+		return string(decoded)
+	}
+	return raw
+}
+
+// truncationNotice words the warning for a truncated TaskResult, or returns "" when the output is
+// whole.
+//
+// The API caps Output (24KB) and reports both the dropped byte count and a link to the full log.
+// This tool is the evidence an operator greps -- "which certificate is this listener serving" -- so
+// partial output presented as the whole answer turns "the certificate is missing from the log" into
+// "this listener is not serving it".
+func truncationNotice(r *tat.TaskResult) string {
+	if r == nil {
+		return ""
+	}
+	dropped := derefU64(r.Dropped)
+	full := deref(r.OutputUrl)
+	if dropped == 0 && full == "" {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: the remote output is incomplete: dropped=%d bytes, full log: %s",
+		dropped, redactSignedURL(full))
+}
+
+// redactSignedURL strips the query string from a log URL before it is printed.
+//
+// TAT stores the full output in COS and returns a link to it. A presigned link IS the credential:
+// anyone holding it can fetch the object until it expires, and this warning goes to stderr, which
+// under systemd means the journal -- routinely shipped somewhere with a wider audience than the
+// command's owner. The operator needs to know where the rest of the log is, not to be handed a
+// bearer token for it in a log line: the signature is dropped and the command that can fetch it
+// again is named instead.
+func redactSignedURL(raw string) string {
+	if raw == "" {
+		return "(no URL returned)"
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Unparseable: printing it verbatim is the one thing that must not happen, because the
+		// query cannot be separated from the credential.
+		return "(URL withheld: it may carry a signature)"
+	}
+	if u.RawQuery == "" && u.Fragment == "" {
+		return raw
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String() + " (query stripped: re-read it with the TAT console or DescribeInvocationTasks)"
+}
+
+func derefU64(v *uint64) uint64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func derefI64(v *int64) int64 {

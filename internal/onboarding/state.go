@@ -3,10 +3,13 @@ package onboarding
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/susunola/wecert/internal/atomicfile"
+	"io"
 	"os"
-	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 )
 
@@ -50,14 +53,38 @@ type State struct {
 }
 
 // LoadState reads the state file. A missing file counts as empty state (first run).
+//
+// The open is O_NONBLOCK and the file must be regular, for the same reason as the desired-state
+// document: open(2) on a FIFO blocks until a writer appears, so a FIFO at the state path hung the
+// onboarding run -- which already holds the cross-process lock by then, so every later run was
+// blocked behind it. A symlink is refused rather than followed, because Save replaces it: reading
+// through a link whose target the next write silently abandons is how two state files start to
+// disagree about the grace period.
 func LoadState(path string) (*State, error) {
 	st := &State{AbsentSince: map[string]time.Time{}}
 
-	data, err := os.ReadFile(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return st, nil
 		}
+		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EMLINK) {
+			return nil, fmt.Errorf("the onboarding state file %s is a symlink; refusing to follow it "+
+				"-- point the state path at the real file, because saving replaces the link", path)
+		}
+		return nil, fmt.Errorf("read onboarding state: %w", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat onboarding state %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("the onboarding state file %s is not a regular file (%s); refusing it",
+			path, fi.Mode().Type())
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
 		return nil, fmt.Errorf("read onboarding state: %w", err)
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
@@ -83,37 +110,9 @@ func (s *State) Save(path string) error {
 	}
 	data = append(data, '\n')
 
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".onboard-state-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp state file in %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		if tmpName != "" {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write onboarding state: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("sync onboarding state: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close onboarding state: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		return fmt.Errorf("chmod onboarding state: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("replace %s: %w", path, err)
-	}
-	tmpName = ""
-	return nil
+	// 0600: the file names the domains this deployment serves, and the grace-period clock that
+	// decides when one is dropped.
+	return atomicfile.Write(path, data, 0o600)
 }
 
 // MarkPresent clears a name's absence marker. The name is back, so the grace

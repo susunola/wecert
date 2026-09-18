@@ -118,8 +118,22 @@ DNS zone 本来就是这个系统的信任根：谁能写这个 zone，谁本来
 **守卫读不到时一律不做任何删除决策**，并且把它当成"通过"处理（保守方向是保留）。
 不会降级成"那就只听声明的" —— 降级会让安全性随故障一起消失，而你恰好在那时最需要它。
 
-> 通配符声明不受守卫约束：七层规则的域名里不会出现 `*.example.com`，
-> 拿它去要求一条规则等于永远不通过。
+**守卫答得不全时也一样，而且会单独标记出来。** CLB 的应答自带总数，只要返回的对象
+比它声称的少（分页被截断、代理截断响应、某个 region 少给了一条），这一轮就当作
+"读不到"处理：不删任何名字，并在报告里写 `guardIncomplete: true`。它和
+`guardUnavailable` 的区别是给人看的 —— 后者是天气，重试即可；前者说明规则列表本身在被
+截断，而它没提到的每个名字都**没有和任何东西比对过**。
+
+**守卫拒绝 ≠ 摘掉覆盖。** 一个名字只要**声明还在**，即使规则暂时没了（或不在
+`allowlist` 里），它也**保持**当前证书里的覆盖：文档不变 → revision 不变 → 不触发签发，
+规则恢复时也不会再签一次。守卫只挡住**新增**覆盖。实测一次规则抖动 = 改两次文档、签两次、
+两轮没有覆盖；现在的行为是零次。要把覆盖真正摘掉，请删声明 —— 那之后走的是正常的
+宽限期 + 引用检查路径（见 §6 闸门 3）。
+
+> 通配符声明**同样**受守卫约束（f6e06d8 起）：判定用的是声明贡献的名字集合，
+> 所以 `*.example.com` 在一条通配符规则（或覆盖它的规则）下即可通过 —— 而拿它去要求
+> 一条恰好等于 `*.example.com` 的七层规则，仍然等于永远不通过。用例
+> `TestGuardOneAcceptsAWildcardServedByAWildcardRule` 钉住这个行为。
 
 ---
 
@@ -176,7 +190,7 @@ DNS zone 本来就是这个系统的信任根：谁能写这个 zone，谁本来
 |---|---|---|---|
 | 1 | 来源失败 ≠ 名字消失 | 整轮冻结，文档一个字不改 | 修好 DNS 权限 / API，下一轮自动恢复 |
 | 2 | 期望状态骤变 | 集合掉超过 30%（`dropThreshold`）→ 冻结 | 确认这次下线是有意的，然后 `-force` |
-| 3 | 删除比增加保守 | 必须**确认缺失 + 超过 24h 宽限 + 没人引用**三条件同时满足 | 等，或 `-force` |
+| 3 | 删除比增加保守 | 必须**确认缺失 + 超过 24h 宽限 + 没人引用**三条件同时满足；声明还在的名字根本不进这条路径（覆盖跟着声明走） | 等，或 `-force`；想立刻摘掉覆盖就删声明 |
 | 4 | 配额预算 | 7 天内超过 25 次集合变更（`budget`）→ 冻结 | 等窗口滑过，或申请 LE 的 rate limit override |
 | 5 | 显式授权 | 没有声明就不签；`allowlist` 限定可签发的注册域 | 加声明 |
 
@@ -266,9 +280,15 @@ WantedBy=timers.target
 
 先跑 observe 的话，可以再加一个单元，让它在期望状态真的变了之后再触发 wecert：
 
+> 注意：`${WEBHOOK_TOKEN}` 必须真的存在于这个单元的环境里 —— systemd 对未定义的变量展开成**空串**，
+> 于是请求会以 401 失败，而 `curl -sf` 让这个单元看起来"只是没触发"。用
+> `EnvironmentFile=/etc/wecert/webhook.env`（0600 root:wecert，里面一行 `WEBHOOK_TOKEN=…`）
+> 或 `Environment="WEBHOOK_TOKEN=…"` 提供它。
+
 ```ini
 # /etc/systemd/system/wecert-reload.service
 [Service]
+EnvironmentFile=/etc/wecert/webhook.env
 Type=oneshot
 ExecStart=/usr/bin/curl -sf -X POST \
   -H "X-Wecert-Token: ${WEBHOOK_TOKEN}" \
@@ -303,11 +323,11 @@ curl -s -H "X-Wecert-Token: $TOKEN" localhost:9801/hook/desired \
   | jq '.decisions[] | select(.hostname=="api.example.com")'
 ```
 
-`decisions[].reason` 是给人看的一句话，常见的几种：
+`decisions[].reason` 是给人看的一句话。注意它的来源：enforce 模式下这个端点返回的是**文档里记下的**决定（上一次 `wecert-onboard` 那一轮的判断），不是刚刚重新评估的结果 —— 想知道"现在"为什么没进去，先跑一次 `wecert-onboard -dry-run` 再读它，或者直接看那一轮的报告。常见的几种：
 
 | Reason | 含义 | 怎么办 |
 |---|---|---|
-| `no CLB rule serves this name` | 守卫 1 未通过 | 去 CLB 加规则，或关掉 `requireCLBRule` |
+| `no CLB rule serves this name; the declaration is still there, so the name keeps its coverage` | 守卫 1 没通过，但声明还在，所以覆盖保留（不会触发签发） | 去 CLB 加规则；想把覆盖摘掉就删声明 |
 | `covered by the declared wildcard *.example.com` | 它已经在证书覆盖范围内了，**不需要签发** | 什么都不用做（这正是省钱的地方） |
 | `unparseable declaration: unknown key "wildard"` | 声明里有拼写错误 | 改 TXT |
 | `registered domain "x.com" is not in the allowlist` | 不在允许清单里 | 加进 `allowlist` |

@@ -9,6 +9,7 @@ import (
 	legoacme "github.com/go-acme/lego/v4/acme"
 
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -313,5 +314,134 @@ func TestSuccessfulStagedDeployDoesNotReclaimTheCertificateItJustBound(t *testin
 	}
 	if !oldFound {
 		t.Fatalf("the superseded certificate should be reclaimed: %+v", retired)
+	}
+}
+
+// A renewal of a certificate nobody has bound yet must converge, not fail forever.
+//
+// deploy.enabled starts with one upload and a manual bind ("once bound, later renewals switch it
+// automatically"). If the renewal window arrives before that bind happens, the cloud has nothing
+// to switch: UpdateCertificateInstance answers FailedOperation.CertificateDeployInstanceEmpty
+// (observed on a real account, docs/e2e-run-2026-09-18-credentialed.md 5.3). Treating that as a
+// failed deploy meant the pass failed on every round, the promotion never ran, and the state kept
+// pointing at the certificate that was expiring -- while each cycle issued and uploaded another
+// one. It is the documented first-issuance state, so it promotes like one: the new upload becomes
+// the recorded cloud certificate, DeployConfirmed stays false, and the operator is told again
+// which certificate to bind.
+func TestARenewalWithNothingBoundYetConvergesAsAFirstBind(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	cert.Deploy.Enabled = true
+
+	dep := &stagedDeployer{uploadID: "cloud-new", rebindErr: deploy.ErrNothingBoundYet}
+	m.deployer = dep
+
+	seedIssuedCertificate(t, store, cert, "cloud-old")
+	fake.certNotAfter = time.Now().Add(90 * 24 * time.Hour)
+	fake.orders = []legoacme.ExtendedOrder{{Order: legoacme.Order{
+		Status: "valid", Certificate: "https://ca.test/new"}, Location: "https://ca.test/order/new"}}
+
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("nothing is bound, so there was no switch to fail: %v", err)
+	}
+
+	st, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.DeployedCertID != "cloud-new" {
+		t.Errorf("the renewed certificate must become the recorded cloud certificate, got %q; "+
+			"otherwise the state keeps pointing at the certificate that is expiring", st.DeployedCertID)
+	}
+	if st.DeployConfirmed {
+		t.Error("nothing is bound, so the deployment must not be confirmed: the deployed metric " +
+			"would claim a certificate is serving traffic when no listener has it")
+	}
+	// X.509 timestamps have second precision, so compare truncated values.
+	if !st.NotAfter.Truncate(time.Second).Equal(fake.certNotAfter.Truncate(time.Second)) {
+		t.Errorf("the renewal must be recorded (notAfter %s), got %s", fake.certNotAfter, st.NotAfter)
+	}
+	if st.ConsecutiveFailures != 0 {
+		t.Errorf("a pending first bind is not a failure, got %d consecutive failures", st.ConsecutiveFailures)
+	}
+	if dep.uploads != 1 {
+		t.Errorf("exactly one upload belongs here, got %d", dep.uploads)
+	}
+	// The next round must not re-upload: the order is gone and the state names the new id.
+	if o, err := store.GetOrder(cert.Name); err != nil || o != nil {
+		t.Errorf("the order must be finished, got %+v (err=%v)", o, err)
+	}
+
+	// The upload being replaced must not be forgotten. Nothing is bound to it (which is what makes
+	// the pending-first-bind reading correct), and the row that named it has just been overwritten,
+	// so without a reclaim record the id is in neither certificates nor retired_certificates and the
+	// certificate is billed against the account quota forever.
+	retired, err := store.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reclaimed bool
+	for _, r := range retired {
+		if r.CertID == "cloud-old" {
+			reclaimed = true
+		}
+	}
+	if !reclaimed {
+		t.Errorf("the replaced upload (%q) must be queued for reclamation, got %+v", "cloud-old", retired)
+	}
+}
+
+// An uploaded certificate whose resume-anchor write fails must still be reclaimable.
+//
+// The anchor is what lets the next pass resume instead of uploading again; when recording it fails,
+// the order cannot name the copy and the promotion never runs, so the id lived only in a log line:
+// not in certificates, not in retired_certificates, therefore invisible to ReapRetired and billed
+// against the account's uploaded-certificate quota forever, while the next pass uploaded a second
+// copy. The reclaim list is the only place left, and it is the right one -- nothing was ever bound
+// to that copy (the deploy that would have switched to it never ran), and Delete asks the cloud to
+// refuse if anything does reference it.
+//
+// The write is made to fail with a SQLite trigger, which is the same shape as a full disk: the read
+// that loaded the order succeeded, the UPDATE that would record the anchor does not.
+func TestAnUnrecordableResumeAnchorLeavesTheUploadReclaimable(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"example.com"})
+	cert.Deploy.Enabled = true
+
+	dep := &stagedDeployer{uploadID: "cloud-anchorless"}
+	m.deployer = dep
+	seedIssuedCertificate(t, store, cert, "cloud-live")
+	fake.certNotAfter = time.Now().Add(90 * 24 * time.Hour)
+	fake.orders = []legoacme.ExtendedOrder{{Order: legoacme.Order{
+		Status: "valid", Certificate: "https://ca.test/new"}, Location: "https://ca.test/order/new"}}
+
+	// Only the anchor write fails: the order is loaded, the UPDATE that would record
+	// deployment_cert_id is refused. Same shape as a full disk. The trigger is created through the
+	// admin connection the harness exposes for exactly this.
+	if err := store.ExecForTest(`CREATE TRIGGER r7b_no_anchor BEFORE UPDATE ON orders
+		WHEN NEW.deployment_cert_id <> '' AND OLD.deployment_cert_id = ''
+		BEGIN SELECT RAISE(ABORT, 'disk full'); END`); err != nil {
+		t.Fatalf("create the fault trigger: %v", err)
+	}
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("the anchor write is refused, so the pass must fail")
+	}
+	if dep.uploads != 1 {
+		t.Fatalf("the fixture must reach the upload, got %d", dep.uploads)
+	}
+
+	retired, err := store.ListRetiredCertsBefore(m.now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, r := range retired {
+		if r.CertID == "cloud-anchorless" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the uploaded certificate %q is named by no row (the order could not record the "+
+			"anchor and the promotion never ran), so ReapRetired can never see it and it occupies the "+
+			"account's uploaded-certificate quota forever. Reclaim list: %+v", "cloud-anchorless", retired)
 	}
 }

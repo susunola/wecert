@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"errors"
+	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -1138,4 +1139,176 @@ func updateRespWithStatus(recordID uint64, bound, status int64) *ssl.UpdateCerti
 	resp := updateResp(recordID, bound)
 	resp.Response.DeployStatus = common.Int64Ptr(status)
 	return resp
+}
+
+// An enumeration that never answers is not the same answer as "nothing is bound".
+//
+// The deploy record -- the authoritative account of the switch -- already reported it done,
+// and the enumeration is an asynchronous server-side cache whose latency belongs to the
+// server. Treating that timeout as a failed deploy is what put a real account into a loop
+// where every round re-ran the same switch, hit the same timeout, and never recorded the
+// certificate that was serving traffic. The caller gets a distinguishable answer instead, so
+// it can record the certificate as deployed-but-unconfirmed and let the cheap binding probe
+// settle it on the next pass.
+func TestAdoptedTaskWhoseEnumerationNeverAnswersIsUnverifiedNotFailed(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+
+	fake := &fakeSSLAPI{
+		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
+			return &ssl.UploadCertificateResponse{
+				Response: &ssl.UploadCertificateResponseParams{CertificateId: common.StringPtr("new-id")},
+			}, nil
+		},
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			// A task is already in progress and this is its record.
+			return updateRespWithStatus(42, 1, 0), nil
+		},
+		detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+			return detailResp(1, 0, 0), nil
+		},
+		createTaskFn: stubCreateTask("new-id", "task-1"),
+		// The task never reaches Status=1, so the polling loop runs out its budget.
+		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			return &ssl.DescribeCertificateBindResourceTaskResultResponse{
+				Response: &ssl.DescribeCertificateBindResourceTaskResultResponseParams{
+					SyncTaskBindResourceResult: []*ssl.SyncTaskBindResourceResult{{
+						TaskId: common.StringPtr("task-1"),
+						Status: common.Uint64Ptr(0),
+					}},
+				},
+			}, nil
+		},
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(clock.now)
+	id, err := d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if !errors.Is(err, ErrSwitchUnverified) {
+		t.Fatalf("an enumeration that never answers must be reported as unverified, so the caller "+
+			"can record the certificate and re-check later; got err = %v", err)
+	}
+	// The uploaded certificate must still be identified: without the ID the caller has
+	// nothing to record and the certificate leaks in the cloud account.
+	if id != "new-id" {
+		t.Errorf("id = %q, want new-id even on the unverified path", id)
+	}
+}
+
+// Nothing bound to either certificate is not a failed switch: it is a pending first bind.
+//
+// deploy.enabled starts with one upload plus a manual bind, and a renewal can arrive before a human
+// does that. The cloud then answers FailedOperation.CertificateDeployInstanceEmpty, which is also
+// what a genuinely broken switch looks like -- so the decision has to come from the bindings
+// enumeration, and both answers must be COMPLETE: a partial enumeration reports 0 for a certificate
+// that is bound in a region the read could not reach, and reading that as "nothing is bound" skips
+// a switch that was needed, leaving a listener on a certificate that is about to expire.
+func TestDeployReportsAPendingFirstBindInsteadOfAFailure(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	createTask, taskResult := bindingsFor(t, map[string]uint64{"new-id": 0, "old-id": 0})
+	fake := &fakeSSLAPI{
+		uploadFn: func(context.Context, *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
+			return &ssl.UploadCertificateResponse{
+				Response: &ssl.UploadCertificateResponseParams{CertificateId: common.StringPtr("new-id")},
+			}, nil
+		},
+		updateFn: func(context.Context, *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			// What the real API answers when no resource holds the old certificate.
+			return nil, errors.New("UpdateCertificateInstance: [TencentCloudSDKError] " +
+				"Code=FailedOperation.CertificateDeployInstanceEmpty, Message=no usable instance was found")
+		},
+		createTaskFn: createTask,
+		taskResultFn: taskResult,
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	id, err := d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if !errors.Is(err, ErrNothingBoundYet) {
+		t.Fatalf("nothing is bound anywhere, so this is a pending first bind, not a failure: %v", err)
+	}
+	if id != "new-id" {
+		t.Errorf("the uploaded certificate's id must still be reported for the caller to record, got %q", id)
+	}
+
+	// A partial enumeration must not be read as "nothing is bound".
+	createTask, taskResult = bindingsFor(t, map[string]uint64{"new-id": 0, "old-id": 0})
+	// Make the old certificate's answer incomplete: one region's enumeration fails.
+	partialResultFn := func(ctx context.Context, req *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+		resp, err := taskResult(ctx, req)
+		if err != nil || resp == nil || resp.Response == nil {
+			return resp, err
+		}
+		// One region's enumeration failed, so the answer is a lower bound.
+		for _, task := range resp.Response.SyncTaskBindResourceResult {
+			if task == nil {
+				continue
+			}
+			for _, res := range task.BindResourceResult {
+				if res == nil {
+					continue
+				}
+				for _, region := range res.BindResourceRegionResult {
+					if region != nil {
+						region.Error = common.StringPtr("region ap-shanghai did not answer")
+					}
+				}
+			}
+		}
+		return resp, nil
+	}
+	fake.createTaskFn, fake.taskResultFn = createTask, partialResultFn
+
+	_, err = d.Deploy(context.Background(), "my-cert", "old-id", []byte("cert"), []byte("key"))
+	if errors.Is(err, ErrNothingBoundYet) {
+		t.Error("an incomplete enumeration reports zero for a certificate that may be bound where the " +
+			"read did not reach: that must not be read as \"nothing is bound\", or a needed switch is skipped")
+	}
+}
+
+// A call cut short by a shutdown must carry the shutdown's sentinel.
+//
+// The SDK builds a fresh *TencentCloudSDKError from the transport error's string and does not wrap
+// it, so `errors.Is(err, context.Canceled)` is false for a cancelled call. Upstream, recordFailure
+// uses exactly that test to decide "a stopped process is not a business failure" -- without the
+// sentinel, a stop signal costs the certificate a failure counter, a backoff and a last_error it
+// must then serve out after the restart.
+func TestACancelledSDKCallCarriesTheContextError(t *testing.T) {
+	// The shape the SDK produces, verbatim from common@v1.3.180's netretry path.
+	sdkErr := tcerrors.NewTencentCloudSDKError("ClientError.NetworkError",
+		"Post \"https://ssl.tencentcloudapi.com\": context canceled", "req-1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := sdkCallError(ctx, "UploadCertificate", sdkErr)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("a cancelled call must unwrap to context.Canceled, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "UploadCertificate") {
+		t.Errorf("the call has to stay identifiable, got %v", err)
+	}
+
+	// A live context means the SDK error is a real failure, and it must keep its own identity so
+	// the caller can classify it (a throttle is retried, a permission error is not).
+	err = sdkCallError(context.Background(), "UploadCertificate", sdkErr)
+	if !errors.Is(err, sdkErr) {
+		t.Errorf("a failure on a live context must keep the SDK error, got %v", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Error("a live context must not manufacture a cancellation")
+	}
+
+	// A deadline that has expired is the same story as a cancellation: the context is the reason.
+	expired, cancelExpired := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelExpired()
+	time.Sleep(time.Millisecond)
+	if err := sdkCallError(expired, "UploadCertificate", sdkErr); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("an expired deadline must unwrap to context.DeadlineExceeded, got %v", err)
+	}
 }

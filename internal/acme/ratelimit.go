@@ -30,14 +30,26 @@ func (a rateBucketAdapter) GetRateBucket(limitName, scopeID string) (*ratelimit.
 	}, nil
 }
 
-func (a rateBucketAdapter) PutRateBucket(rec *ratelimit.BucketRecord) error {
-	return a.store.PutRateBucket(&state.RateBucket{
-		LimitName:   rec.LimitName,
-		ScopeID:     rec.ScopeID,
-		Tokens:      rec.Tokens,
-		ObservedAt:  rec.ObservedAt,
-		ResetAt:     rec.ResetAt,
-		ResetReason: rec.ResetReason,
+// UpdateRateBucket translates the boundary type and applies fn inside the store's own lock, so a
+// spend cannot be lost to a concurrent pass spending on the same account-scoped bucket.
+func (a rateBucketAdapter) UpdateRateBucket(limitName, scopeID string, fn func(*ratelimit.BucketRecord) error) error {
+	return a.store.UpdateRateBucket(limitName, scopeID, func(rec *state.RateBucket) error {
+		out := &ratelimit.BucketRecord{
+			LimitName:   rec.LimitName,
+			ScopeID:     rec.ScopeID,
+			Tokens:      rec.Tokens,
+			ObservedAt:  rec.ObservedAt,
+			ResetAt:     rec.ResetAt,
+			ResetReason: rec.ResetReason,
+		}
+		if err := fn(out); err != nil {
+			return err
+		}
+		rec.Tokens = out.Tokens
+		rec.ObservedAt = out.ObservedAt
+		rec.ResetAt = out.ResetAt
+		rec.ResetReason = out.ResetReason
+		return nil
 	})
 }
 
@@ -48,32 +60,53 @@ type QuotaReport struct {
 	Remaining    float64
 	Blocked      bool
 	BlockedUntil time.Time
+
+	// Unreadable means the stored bucket could not be read, so Remaining is NOT an answer.
+	//
+	// It used to be published as zero, which is the strongest possible claim ("no quota left") made
+	// on the strength of a failed read: one SQLITE_BUSY made wecert_ratelimit_remaining_tokens read
+	// 0 for every limit and fired the "nearly exhausted" alert until the next successful pass. The
+	// revocation gauge in this same package already declines to touch itself when its read fails;
+	// this is the same rule.
+	Unreadable bool
 }
 
 // QuotaStatus reports every spendable limit for the given per-scope buckets.
 //
-// notes is the account-wide scope plus one entry per limit family whose scope the caller can
-// name (the registered domains it manages, the certificate name for the order limit).
-func (m *Manager) QuotaStatus(scopes map[string]string) []QuotaReport {
+// The map is limit family -> every scope the caller manages in that family (the registered domains
+// it serves, each certificate's identifier set, every identifier). It used to be one scope per
+// family, chosen as "the first certificate's first domain" by the only caller -- so for the normal
+// one-certificate-per-domain layout, `wecert_ratelimit_remaining_tokens` had no series at all for
+// any domain but the first, and `WecertRateLimitNearlyExhausted` could not fire for the rest.
+func (m *Manager) QuotaStatus(scopes map[string][]string) []QuotaReport {
 	var out []QuotaReport
 	for _, l := range ratelimit.Spendable() {
-		scopeID := ""
-		if l.Scope != "account" {
-			scopeID = scopes[l.Scope]
+		if l.Scope == "account" {
+			out = append(out, m.quotaReport(l, ""))
+			continue
+		}
+		for _, scopeID := range scopes[l.Scope] {
 			if scopeID == "" {
 				continue
 			}
+			out = append(out, m.quotaReport(l, scopeID))
 		}
-		rep := QuotaReport{Limit: l.Name, Scope: scopeID}
-		if at, _, blocked := m.quota.BlockedUntil(l, scopeID); blocked {
-			rep.Blocked = true
-			rep.BlockedUntil = at
-		} else if left, ok := m.quota.Remaining(l, scopeID); ok {
-			rep.Remaining = left
-		}
-		out = append(out, rep)
 	}
 	return out
+}
+
+// quotaReport answers one (limit, scope) pair. Unreadable is NOT zero: see QuotaReport.
+func (m *Manager) quotaReport(l ratelimit.Limit, scopeID string) QuotaReport {
+	rep := QuotaReport{Limit: l.Name, Scope: scopeID}
+	if at, _, blocked := m.quota.BlockedUntil(l, scopeID); blocked {
+		rep.Blocked = true
+		rep.BlockedUntil = at
+	} else if left, ok := m.quota.Remaining(l, scopeID); ok {
+		rep.Remaining = left
+	} else {
+		rep.Unreadable = true
+	}
+	return rep
 }
 
 // PublishQuota refreshes the rate-limit gauges.
@@ -92,10 +125,15 @@ func (m *Manager) QuotaStatus(scopes map[string]string) []QuotaReport {
 // The cost is that a scrape landing in the window between Reset and the Sets below sees no series
 // at all. Absent reads as "not published", which is the honest answer for a scope that is no
 // longer in the desired state, and it is the same trade the blocked vector already made.
-func (m *Manager) PublishQuota(scopes map[string]string) {
+func (m *Manager) PublishQuota(scopes map[string][]string) {
 	metrics.RateLimitRemaining.Reset()
 	metrics.RateLimitBlocked.Reset()
 	for _, rep := range m.QuotaStatus(scopes) {
+		if rep.Unreadable {
+			// No series rather than a zero: absent reads as "not published", which is the honest
+			// answer for a bucket whose stored value could not be read.
+			continue
+		}
 		metrics.RateLimitRemaining.WithLabelValues(rep.Limit, rep.Scope).Set(rep.Remaining)
 		if rep.Blocked {
 			metrics.RateLimitBlocked.WithLabelValues(rep.Limit, rep.Scope).Set(1)

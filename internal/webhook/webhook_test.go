@@ -34,6 +34,16 @@ type fakeReconciler struct {
 
 	// startAllErr simulates "the desired state is unreadable": nothing started.
 	startAllErr error
+
+	// fresh is what the reconciler's own resolve finds. When it is set it differs from names,
+	// which stands for the cache CertNames() reads -- the situation a named trigger meets when a
+	// certificate was onboarded after the last pass.
+	fresh []string
+
+	// allBusy makes StartAll report every name as skipped and none as accepted, which is what the
+	// real reconciler answers when a pass already holds every claim. It returns a NIL accepted
+	// slice, as the real one does, which is the shape the response must survive.
+	allBusy bool
 }
 
 func (f *fakeReconciler) CertNames() []string { return f.names }
@@ -70,6 +80,14 @@ func (f *fakeReconciler) StartNamed(_ context.Context, names []string) (started,
 }
 
 func (f *fakeReconciler) known(name string) bool {
+	if f.fresh != nil {
+		for _, n := range f.fresh {
+			if n == name {
+				return true
+			}
+		}
+		return false
+	}
 	for _, n := range f.names {
 		if n == name {
 			return true
@@ -81,6 +99,9 @@ func (f *fakeReconciler) known(name string) bool {
 func (f *fakeReconciler) StartAll(ctx context.Context) (accepted, skipped []string, err error) {
 	if f.startAllErr != nil {
 		return nil, nil, f.startAllErr
+	}
+	if f.allBusy {
+		return nil, append([]string(nil), f.names...), nil
 	}
 	for _, n := range f.names {
 		if err := f.StartCert(ctx, n); err != nil {
@@ -201,6 +222,13 @@ func TestHealthzNeedsNoAuth(t *testing.T) {
 
 // Repeated token failures from one address must end in a lockout, or the
 // endpoint can be brute-forced at wire speed.
+//
+// The block applies to requests that FAIL authentication. It used to apply to the address
+// outright -- "the block is on the address, not on the credentials presented" -- which also
+// refused the correct token, and the README's own deployment terminates TLS in front of this
+// listener, so every client shares one address: a single unauthenticated caller answering 401s
+// took the trigger (and the read-only status endpoint) away from the operator for a renewable 15
+// minutes. A caller holding the token is not the threat this limiter exists for.
 func TestAuthLockoutAfterFailures(t *testing.T) {
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
@@ -213,17 +241,26 @@ func TestAuthLockoutAfterFailures(t *testing.T) {
 		}
 	}
 
-	// Once locked out, even the *correct* token gets a 429: the block is on the
-	// address, not on the credentials presented.
-	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer())
+	// The address is locked out: another wrong token is refused before the comparison, and the
+	// refusal carries the wait.
+	w := do(t, s, http.MethodPost, "/hook/reconcile", "", bad)
 	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("a locked-out address should return 429, got %d", w.Code)
+		t.Fatalf("a locked-out address should return 429 for a failing attempt, got %d", w.Code)
 	}
 	if ra := w.Header().Get("Retry-After"); ra == "" {
 		t.Error("a 429 should carry a Retry-After header")
 	}
 	if len(rec.started) != 0 {
 		t.Errorf("a locked-out address should trigger nothing, got %v", rec.started)
+	}
+
+	// The correct token still gets through, and that success decays the accumulated failures.
+	w = do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("the correct token must not be refused by the address's failure history, got %d", w.Code)
+	}
+	if len(rec.started) != 1 {
+		t.Errorf("the authenticated trigger must start the pass, got %v", rec.started)
 	}
 }
 
@@ -1040,5 +1077,184 @@ func TestDrainRefusesNewNotifications(t *testing.T) {
 
 	if atomic.LoadInt32(&got) != 0 {
 		t.Error("a notification accepted after Drain can never be waited for; it must be refused")
+	}
+}
+
+// A certificate onboarded after the last pass must be STARTED by a named trigger, not reported as
+// unknown.
+//
+// The classification used to run against CertNames(), the cache a pass refreshes, while StartNamed
+// resolves the document itself -- so the flow this endpoint exists for (README: CI triggers
+// convergence right after a domain is added) put the new name in "unknown" and, because the
+// pre-filter had already emptied the target list, handed StartNamed nothing to resolve. The caller
+// was told the certificate is not in the configuration, and issuance waited for the next pass.
+func TestTriggerStartsACertificateTheCacheHasNotSeen(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}, fresh: []string{"a", "new-one"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"new-one"}`, bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("accepted convergence should answer 202, got %d", w.Code)
+	}
+
+	var resp reconcileResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Accepted) != 1 || resp.Accepted[0] != "new-one" {
+		t.Errorf("the fresh desired state has this certificate, so it must be started, got %+v", resp)
+	}
+	if len(resp.Unknown) != 0 {
+		t.Errorf("reporting it unknown tells the caller to give up on a certificate that exists: %+v", resp)
+	}
+}
+
+// The full trigger's `accepted` must serialize as [] when nothing was accepted.
+//
+// The field is initialised to an empty slice for exactly that reason, but the full-trigger branch
+// then ASSIGNED StartAll's result over it -- and StartAll returns nil when it accepted nothing, so
+// a trigger where every certificate already held a claim answered `{"accepted": null}`. Clients
+// that iterate the field read null as "no answer", which is the one thing the initialisation was
+// there to prevent. (The named-trigger branch appends, which is why only this path regressed.)
+func TestFullTriggerWithNothingAcceptedSerializesAsEmptyArray(t *testing.T) {
+	// A pass already holds every claim, so StartAll accepts none of them -- and answers with a
+	// nil accepted slice, exactly like the real reconciler.
+	rec := &fakeReconciler{names: []string{"busy"}, allBusy: true}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", "", bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("a full trigger should answer 202, got %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"accepted": []`) {
+		t.Errorf("nothing was accepted, so the field must be an empty array (not null): %s", body)
+	}
+	if strings.Contains(body, `"accepted": null`) {
+		t.Errorf("null reads as \"no answer\" to a client that iterates the field: %s", body)
+	}
+	if !strings.Contains(body, `"skipped": [`) {
+		t.Errorf("the skipped certificate must be reported, got %s", body)
+	}
+}
+
+// An oversized trigger body must be refused, not truncated.
+//
+// The body was read through io.LimitReader, which reports a clean EOF at the cap: a body larger
+// than 64 KiB was silently cut and then parsed as if it were complete -- accepted outright when the
+// cut happened to land on a JSON boundary, and reported as "invalid JSON" otherwise, which sends
+// the caller to inspect their JSON rather than their payload size.
+func TestAnOversizedTriggerBodyIsRefused(t *testing.T) {
+	s, _ := newTestServer(t, &fakeReconciler{names: []string{"a"}})
+
+	// A valid JSON document with a long (ignored) field, so the truncation point cannot be reasoned
+	// about: the only correct answer is to refuse it.
+	big := `{"certs":["a"],"padding":"` + strings.Repeat("x", 70<<10) + `"}`
+	w := do(t, s, http.MethodPost, "/hook/reconcile", big, bearer())
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a %d-byte body must be refused with 413, got %d: %s", len(big), w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "exceeds") {
+		t.Errorf("the error must say the body is too large, got %s", w.Body.String())
+	}
+}
+
+// A certificate whose state cannot be read must say so, not answer with the zero value.
+//
+// /hook/status exists to answer "did the trigger work", and a read failure produced the same
+// certStatus a certificate with no recorded state produces: the caller could not tell an unreadable
+// store from "nothing has happened".
+func TestStatusReportsAnUnreadableCertificateState(t *testing.T) {
+	s, store := newTestServer(t, &fakeReconciler{names: []string{"a"}})
+	if err := store.PutCert(&state.CertState{Name: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	// Close the store so the read fails, the way a busy or broken database looks.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := do(t, s, http.MethodGet, "/hook/status", "", bearer())
+	if w.Code != http.StatusOK {
+		t.Fatalf("the endpoint itself worked, so it should answer 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"error"`) {
+		t.Errorf("an unreadable state must be reported as an error on the entry, got %s", w.Body.String())
+	}
+}
+
+// A trigger that arrives while the process is draining must be refused, and refused
+// distinguishably.
+//
+// The HTTP server's shutdown is asynchronous, so a trigger really can land after the reconciler
+// has started draining; the pass it would start writes its promotion or resume anchor into a state
+// store that is closed as soon as Drain returns. Answering 202 with the certificate "skipped"
+// would be worse than the refusal: "skipped" means "already running, poll for the result", and
+// there is no pass to poll for.
+func TestTriggerAllWhileShuttingDownIs503(t *testing.T) {
+	rec := &fakeReconciler{
+		names:       []string{"a", "b"},
+		startAllErr: reconcile.ErrShuttingDown,
+	}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", "", bearer())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("a draining process must answer 503, got %d", w.Code)
+	}
+	if len(rec.started) != 0 {
+		t.Errorf("nothing may be started while draining, got %v", rec.started)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "shutting down") {
+		t.Errorf("the answer has to name the reason, so a caller can tell it from an unreadable "+
+			"desired state, got %s", body)
+	}
+}
+
+// The same refusal behind a named trigger.
+func TestTriggerCertWhileShuttingDownIs503(t *testing.T) {
+	rec := &fakeReconciler{
+		names:   []string{"a"},
+		failFor: map[string]error{"a": reconcile.ErrShuttingDown},
+	}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("a draining process must answer 503, got %d", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "shutting down") {
+		t.Errorf("the answer has to name the reason, got %s", body)
+	}
+}
+
+// An attacker on the same address as the legitimate caller must not be able to lock it out.
+//
+// The README's own deployment puts a TLS terminator in front of this listener, so every client
+// arrives from one address; the lockout is keyed on that address. While the lockout was checked
+// before the token, a caller with the CORRECT token answered 429 for a renewable 15 minutes on
+// every hook route -- including the read-only /hook/status that exists to tell an operator what
+// happened. Brute force is still bounded: a wrong token is counted, and the address is refused once
+// the budget is spent.
+func TestACorrectTokenIsNotLockedOutByFailuresFromTheSameAddress(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	s, _ := newTestServer(t, rec)
+
+	// Someone on this address spends the whole budget without the token.
+	for i := 0; i < authMaxFailures; i++ {
+		if w := do(t, s, http.MethodPost, "/hook/reconcile", "", nil); w.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: want 401 for a missing token, got %d", i, w.Code)
+		}
+	}
+	// A caller without the token is now refused before the comparison.
+	if w := do(t, s, http.MethodPost, "/hook/reconcile", "", nil); w.Code != http.StatusTooManyRequests {
+		t.Errorf("a wrong token must still be rate limited, got %d", w.Code)
+	}
+	// The legitimate caller is not.
+	if w := do(t, s, http.MethodPost, "/hook/reconcile", "", bearer()); w.Code != http.StatusAccepted {
+		t.Errorf("the correct token must not be locked out by another caller's failures, got %d: %s",
+			w.Code, w.Body.String())
+	}
+	if w := do(t, s, http.MethodGet, "/hook/status", "", bearer()); w.Code == http.StatusTooManyRequests {
+		t.Error("the read-only status endpoint must not be locked out either")
 	}
 }

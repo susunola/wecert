@@ -25,6 +25,7 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -363,7 +364,10 @@ func (f *fakeAPI) RevokeCertificate(der []byte, reason int) error {
 	f.enter("RevokeCertificate")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.revoked = append(f.revoked, revokedCall{Reason: reason, DERLen: len(der)})
+	// The bytes are kept, not just their length: a revocation that sends the wrong certificate is
+	// a well-formed request for a harmful action, which the length cannot tell apart from the
+	// right one.
+	f.revoked = append(f.revoked, revokedCall{Reason: reason, DERLen: len(der), DER: append([]byte(nil), der...)})
 	if f.revokeErr != nil {
 		return f.revokeErr
 	}
@@ -373,6 +377,7 @@ func (f *fakeAPI) RevokeCertificate(der []byte, reason int) error {
 type revokedCall struct {
 	Reason int
 	DERLen int
+	DER    []byte
 }
 
 func (f *fakeAPI) GetRenewalInfo(string) (*http.Response, error) {
@@ -693,6 +698,17 @@ func TestAwaitAuthorizationInvalidRecordsIdentifierFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid authorization must fail")
 	}
+	// The CA's per-identifier failure budget is spent in the local estimate too. Without this the
+	// gauge published for that limit could only ever read "full" -- Remaining on a bucket nobody
+	// writes returns Capacity by design -- so the alert built on it was structurally unable to
+	// fire for the one limit that a DNS-01 misconfiguration burns.
+	if bucket, berr := store.GetRateBucket(ratelimit.AuthzFailuresPerIdentifier.Name, "bad.example.com"); berr != nil {
+		t.Fatal(berr)
+	} else if want := ratelimit.AuthzFailuresPerIdentifier.Capacity - 1; bucket.Tokens != want {
+		t.Errorf("the failed authorization was not counted against the identifier's budget: tokens=%v want %v",
+			bucket.Tokens, want)
+	}
+
 	got, err := store.ListIdentifierFailures(cert.Name)
 	if err != nil {
 		t.Fatal(err)
@@ -1254,5 +1270,183 @@ func TestSolveChallengesMarksResumedTXTUnpresentedWhenPropagationFails(t *testin
 	}
 	if as[0].Presented {
 		t.Error("the resumed row must go back to Presented=false, so the next round probes and re-presents it")
+	}
+}
+
+// A failure while recording a completed renewal must leave nothing half-recorded.
+//
+// The epilogue promotes the new certificate, retires what the order uploaded, clears the fallback
+// and identifier ledgers, and discards the order -- and it runs after the certificate is already
+// live in the cloud, where nothing rolls back. Committed one statement at a time, a failure in the
+// middle used to leave states no later pass repairs:
+//
+//   - promoted but not retired: the certificate that was serving is in no table, so ReapRetired
+//     never sees it, nothing deletes it from the cloud, and it holds uploaded-certificate quota
+//     forever -- the quota whose exhaustion stops renewal;
+//   - retired but not promoted: the certificate still bound to the listener is scheduled for
+//     deletion.
+//
+// So this test does two things: it proves the transaction leaves the state exactly as it was, and
+// it proves the next pass finishes the job once the store works again -- because "nothing
+// half-recorded" is only useful if the work is still there to do.
+func TestAFailedRenewalEpilogueLeavesNothingHalfRecorded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	fake := &fakeAPI{}
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cert := &config.Certificate{
+		Name: "epilogue-atomic", Domains: []string{"a.example.com"},
+		Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+	}
+	if err := config.NormalizeCertificates([]config.Certificate{*cert}); err != nil {
+		t.Fatal(err)
+	}
+
+	key, err := GenerateKey(cert.KeyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := MarshalPrivateKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const orderURL = "https://ca.test/order/atomic"
+	const finalizeURL = "https://ca.test/finalize/atomic"
+	const certURL = "https://ca.test/cert/atomic"
+
+	// The live certificate, and an order that uploaded a DIFFERENT one whose rebind never
+	// completed -- the orphan that has to reach the reclaim list in the same transaction.
+	before := selfSignedCertPEM(t, time.Now().Add(24*time.Hour), "a.example.com")
+	if err := store.PutCert(&state.CertState{
+		Name: cert.Name, CertURL: "https://ca.test/cert/old", CertPEM: before,
+		KeyPEM: keyPEM, NotAfter: time.Now().Add(24 * time.Hour), DeployedCertID: "ap-live",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutOrder(&state.Order{
+		CertName: cert.Name, OrderURL: orderURL, FinalizeURL: finalizeURL, Status: "ready",
+		KeyPEM: keyPEM, Identifiers: cert.DomainKey(), DeploymentCertID: "ap-orphan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fake.orders = []legoacme.ExtendedOrder{
+		{Order: legoacme.Order{Status: "ready", Finalize: finalizeURL}, Location: orderURL},
+		{Order: legoacme.Order{Status: "valid", Finalize: finalizeURL, Certificate: certURL}, Location: orderURL},
+	}
+
+	// Two more things the same transaction clears, and which nothing else in the failure path
+	// touches: they are how this test can tell a rollback from "the failure handler happened to
+	// write the old certificate back". A fallback record for a name that this issuance covers, and
+	// an identifier-failure ledger entry, both of which a successful full-set renewal retires.
+	if err := store.PutFallback(&state.Fallback{
+		CertName: cert.Name, Dropped: []string{"a.example.com"}, Since: time.Now(), Reason: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordIdentifierFailure(cert.Name, "a.example.com", "test", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fail the LAST statement of the epilogue, the order delete.
+	//
+	// The position matters for what this test can prove. Every other write in the transaction --
+	// the promotion, the reclaim record, both clears -- has already run by then, so if the
+	// transaction did not roll back they would all be visible: the certificate promoted, the
+	// fallback record gone, the ledger cleared. Failing the first statement instead would let the
+	// failure handler's own rewrite of the certificate row hide the difference.
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TRIGGER block_order_delete BEFORE DELETE ON orders
+		BEGIN SELECT RAISE(FAIL, 'orders blocked by test'); END;`); err != nil {
+		t.Fatal(err)
+	}
+
+	err = m.Reconcile(context.Background(), cert)
+	if err == nil {
+		t.Fatal("the epilogue failed, so the pass must be reported as failed rather than as success")
+	}
+	// The message has to be true about what happened: the certificate IS live in the cloud.
+	for _, want := range []string{"issued and deployed", "state.db"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the failure must say %q so the operator knows the cloud does not roll back, got %q",
+				want, err)
+		}
+	}
+
+	// Nothing from the transaction may be visible.
+	after, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.CertURL != "https://ca.test/cert/old" || string(after.CertPEM) != string(before) {
+		t.Errorf("the certificate was promoted by a transaction that failed: certUrl=%q", after.CertURL)
+	}
+	if retired, _ := store.ListRetiredCertsBefore(time.Now().Add(time.Hour)); len(retired) != 0 {
+		t.Errorf("a failed transaction left reclaim records: %+v", retired)
+	}
+	if o, _ := store.GetOrder(cert.Name); o == nil {
+		t.Error("the order was discarded by a transaction that failed, so the next pass has nothing " +
+			"to finish and the uploaded certificate is only recoverable from the cloud")
+	} else if o.DeploymentCertID != "ap-orphan" {
+		// The clear used to happen before the transaction, as a best-effort write. A rollback then
+		// left the order without its resume anchor: the next pass would upload a SECOND copy of the
+		// certificate instead of resuming the one already in the cloud, and the first copy was
+		// recorded nowhere at all.
+		t.Errorf("the failed epilogue dropped the order's resume anchor (DeploymentCertID=%q, want "+
+			"ap-orphan): the next pass cannot resume the upload it already paid for", o.DeploymentCertID)
+	}
+	if after.ConsecutiveFailures == 0 || after.NextAttemptAt.IsZero() {
+		t.Error("a failed epilogue must be recorded as a failure with backoff, not silently retried " +
+			"on every pass")
+	}
+	// The clears are part of the same unit of work, so they must not have happened either. This is
+	// also what makes the assertion decisive: the failure handler rewrites the certificate row from
+	// the in-memory state, so the row alone cannot distinguish a rollback from a repair.
+	if fb, err := store.GetFallback(cert.Name); err != nil || fb == nil {
+		t.Errorf("a failed epilogue cleared the fallback record (fb=%+v err=%v); the next pass then "+
+			"re-orders the full name set that the record exists to hold back", fb, err)
+	}
+	if fails, err := store.ListIdentifierFailures(cert.Name); err != nil || len(fails) == 0 {
+		t.Errorf("a failed epilogue cleared the identifier failure ledger (fails=%d err=%v), so a "+
+			"name that has been failing is retried as if it were healthy", len(fails), err)
+	}
+
+	// And with the store working again, the next pass completes the renewal -- which is the point
+	// of leaving nothing half-recorded.
+	//
+	// The clock has to move first: the failed pass recorded a failure, and the backoff that comes
+	// with it is the reason a store outage does not turn into a retry on every pass.
+	if _, err := db.Exec(`DROP TRIGGER block_order_delete`); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now()
+	m.SetNow(func() time.Time { return base.Add(2 * time.Hour) })
+	if err := m.Reconcile(context.Background(), cert); err != nil {
+		t.Fatalf("the pass after the store recovered: %v", err)
+	}
+	done, err := store.GetCert(cert.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.CertURL != certURL {
+		t.Errorf("the recovered pass did not promote the new certificate: certUrl=%q", done.CertURL)
+	}
+	retired, _ := store.ListRetiredCertsBefore(time.Now().Add(time.Hour))
+	if len(retired) != 1 || retired[0].CertID != "ap-orphan" {
+		t.Errorf("the recovered pass did not record the uploaded orphan for reclaim: %+v", retired)
+	}
+	if o, _ := store.GetOrder(cert.Name); o != nil {
+		t.Errorf("the recovered pass left the order in flight: %+v", o)
 	}
 }

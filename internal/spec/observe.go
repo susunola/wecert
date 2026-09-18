@@ -2,6 +2,7 @@ package spec
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"time"
@@ -96,6 +97,27 @@ func (o *Observer) DesiredWithReasons(ctx context.Context) (*Result, error) {
 		return res, nil
 	}
 
+	// A frozen shadow source is "no comparison", not "no differences".
+	//
+	// A file source never returns an error once it has read the document successfully: a later
+	// unreadable revision comes back as a FROZEN result with a nil error, carrying the last good
+	// revision. Comparing against that and reporting the result as a fresh diff is the false
+	// confidence this mode is supposed to be free of -- the diff would be computed against a
+	// document nobody can read, ShadowReport.Error would stay empty, and the gate that decides
+	// whether it is safe to switch to enforce (shadow_errors_total quiet, shadow_last_read recent)
+	// would report a quiet, up-to-date comparison.
+	if sh.Frozen {
+		res.Shadow = &ShadowReport{
+			Revision:    sh.Revision,
+			GeneratedAt: sh.GeneratedAt,
+			Error: fmt.Sprintf("the shadow source is frozen on revision %s: %s",
+				sh.Revision, sh.FreezeReason),
+		}
+		o.log.Warn("the shadow desired state is frozen, so there is nothing to compare against",
+			"shadow", KindOf(o.shadow), "revision", sh.Revision, "reason", sh.FreezeReason)
+		return res, nil
+	}
+
 	res.Shadow = Diff(res, sh)
 	if !res.Shadow.Empty() {
 		o.log.Warn("the shadow desired state differs from what is being enforced; "+
@@ -164,6 +186,15 @@ func diffCert(cur, want *config.Certificate) *CertificateChange {
 	}
 	if cur.Deploy.Enabled != want.Deploy.Enabled {
 		ch.Changed = append(ch.Changed, "deploy")
+	}
+	// renewBefore counts as a difference even though it changes no certificate name.
+	//
+	// Revision() hashes it and the onboarding generator never sets it, so a document that only
+	// differs there produced two different revisions and an EMPTY diff -- and an empty diff is the
+	// documented gate for switching to enforce ("stay at 0 before switching"). The operator would
+	// have promoted a change that moves how far ahead renewals start.
+	if cur.RenewBefore != want.RenewBefore {
+		ch.Changed = append(ch.Changed, "renewBefore")
 	}
 
 	if len(ch.Added) == 0 && len(ch.Removed) == 0 && len(ch.Changed) == 0 {

@@ -11,7 +11,9 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/metrics"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -25,7 +27,7 @@ func (m *Manager) download(
 	o *state.Order, order legoacme.ExtendedOrder, rd round,
 ) error {
 	if order.Certificate == "" {
-		return m.recordFailure(st, errors.New("the order is valid but has no certificate URL"))
+		return m.recordFailure(ctx, st, errors.New("the order is valid but has no certificate URL"))
 	}
 
 	// Idempotent backstop: the order's certificate is already the live one, which means the
@@ -44,23 +46,48 @@ func (m *Manager) download(
 			m.log.Warn("but this certificate is not confirmed deployed to a cloud resource; check that the CLB listener has it bound",
 				"cert", c.Name, "deployedCertId", st.DeployedCertID)
 		}
-		return m.discardOrder(ctx, c.Name)
+		if err := m.discardOrder(ctx, c.Name); err != nil {
+			// The issuance is already the live one; what failed is the bookkeeping that finishes the
+			// order. That is still a failed pass -- and the one thing it must not do is come back
+			// immediately, because discardOrder is what reclaims TXT records through authoritative
+			// DNS probes.
+			return m.recordFailure(ctx, st, fmt.Errorf("discard the already-live order: %w", err))
+		}
+		return nil
 	}
 
 	// bundle=true returns the fullchain (leaf + intermediate certificates), which is exactly
 	// the format CLB needs.
 	fullchain, _, err := m.core.GetCertificate(order.Certificate, true)
 	if err != nil {
-		return m.recordFailure(st, fmt.Errorf("download certificate: %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("download certificate: %w", err))
 	}
 
 	leaf, err := ParseLeaf(fullchain)
 	if err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	if err := VerifyCoverage(leaf, c.Domains); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
+	}
+
+	// A certificate exists at the CA now, so the two certificate budgets are spent -- here, not
+	// after the deploy, because the CA counts the issuance and a later failure of ours (the
+	// deploy, or the epilogue transaction) does not give that budget back.
+	//
+	// ARI-exempt renewals are counted too, which makes this estimate a LOWER bound on what is
+	// left. That is the direction this package promises to be wrong in: the alerting rule for
+	// "certs per exact identifier set" -- the limit with no override path -- must not be the one
+	// number that is structurally always full.
+	//
+	// A later failure of ours can double-count as well: the epilogue transaction may roll back
+	// after this point, and the next pass downloads the same certificate again (the CA issues it
+	// once, and the order is still valid) and spends a second slot. Also the conservative
+	// direction, and also bounded by one per retry.
+	m.quota.Spend(ratelimit.CertsPerExactIdentifierSet, c.DomainKey(), 1)
+	for _, domain := range uniqueRegisteredDomains(c.Domains) {
+		m.quota.Spend(ratelimit.CertsPerRegisteredDomain, domain, 1)
 	}
 	// Reject a certificate that is not actually a REPLACEMENT for the live one.
 	//
@@ -83,19 +110,19 @@ func (m *Manager) download(
 	// live certificate's material is unavailable or unparseable, where "later expiry" is the
 	// only evidence available.
 	if !st.NotAfter.IsZero() && !leaf.NotAfter.After(st.NotAfter) && !certIsNewer(leaf, st) {
-		return m.recordFailure(st, fmt.Errorf(
+		return m.recordFailure(ctx, st, fmt.Errorf(
 			"the new certificate's notAfter (%s) is not later than the current one (%s), and it was not "+
 				"issued after it either, so it is not a replacement; refusing to deploy",
 			leaf.NotAfter, st.NotAfter))
 	}
 	if len(o.KeyPEM) == 0 {
-		return m.recordFailure(st, errors.New("the order has no private key; cannot deploy"))
+		return m.recordFailure(ctx, st, errors.New("the order has no private key; cannot deploy"))
 	}
 	// The last gate of the same triad as coverage and notAfter: a certificate that covers
 	// the right names and lives long enough, but belongs to a different key, would be
 	// deployed over a working one and break every handshake.
 	if err := VerifyKeyMatch(leaf, o.KeyPEM); err != nil {
-		return m.recordFailure(st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	// Deploy. On a first issuance DeployedCertID is empty, so this only uploads and waits
@@ -105,6 +132,17 @@ func (m *Manager) download(
 	oldDeployedID := st.DeployedCertID
 	deployedID := oldDeployedID
 	rebound := false
+	// Set by the deploy-disabled branch below, applied to the STAGED promotion once it is staged:
+	// the flag belongs to the promotion, and the promotion is not real until the transaction that
+	// records it commits.
+	forceUndeployed := false
+	// Set when the switch is reported done but its binding could not be verified in time
+	// (deploy.ErrSwitchUnverified): the certificate is promoted, but not as a confirmed
+	// deployment.
+	unverified := false
+	// Set when nothing is bound to either certificate (deploy.ErrNothingBoundYet): the renewed
+	// certificate is promoted as uploaded-but-unbound, exactly like a first issuance.
+	waitingFirstBind := false
 	if c.Deploy.Enabled {
 		var id string
 		var derr error
@@ -119,7 +157,32 @@ func (m *Manager) download(
 			if derr == nil {
 				o.DeploymentCertID = id
 				if err := m.store.PutOrder(o); err != nil {
-					return err
+					// The certificate is uploaded; only recording its id failed. That id is the resume
+					// anchor, so losing it means the next pass uploads a SECOND copy -- and a bare
+					// `return err` also skips the backoff, so it retries at the pass rate instead.
+					// recordFailure keeps both (it schedules the retry and leaves the failure
+					// visible), which is what the sibling call sites already do.
+					//
+					// What recordFailure does NOT do is give the uploaded copy a row. Without the
+					// anchor the order cannot name it, and the promotion below never runs, so the id
+					// lives only in this log line: not in certificates, not in retired_certificates,
+					// therefore invisible to ReapRetired and billed against the account's uploaded
+					// certificate quota forever. The reclaim list is the only place left, and it is
+					// the right one -- this copy was never bound to anything (the deploy that would
+					// have switched to it never ran), and Delete asks the cloud to refuse if anything
+					// does reference it.
+					if rerr := m.store.AddRetiredCert(id, c.Name, nil, nil); rerr != nil {
+						m.log.Error("the uploaded certificate could not be recorded anywhere, so it "+
+							"will never be reclaimed and counts against the account's uploaded "+
+							"certificate quota", "cert", c.Name, "certId", id, "err", rerr)
+					} else {
+						m.log.Warn("the uploaded certificate could not be recorded as the resume anchor; "+
+							"it has been put on the reclaim list instead, and the next pass will upload "+
+							"a second copy", "cert", c.Name, "certId", id)
+					}
+					return m.recordFailure(ctx, st, fmt.Errorf(
+						"the certificate %s was uploaded but recording it for the resume anchor failed: %w",
+						id, err))
 				}
 				id, derr = staged.DeployUploaded(ctx, c.Name, oldDeployedID, id)
 			}
@@ -133,24 +196,74 @@ func (m *Manager) download(
 			// certificates table nor the retired table, ReapRetired never sees it, and one
 			// failure leaks one certificate in Tencent Cloud until the account quota is hit.
 			// The reclaim machinery exists precisely to prevent that.
-			if id != "" {
-				o.DeploymentCertID = id
-				if err := m.store.PutOrder(o); err != nil {
-					return err
+			//
+			// One error is not a failure: ErrSwitchUnverified means the cloud already reported
+			// the switch as done and only the independent binding enumeration did not answer in
+			// time. Failing the pass there is not self-correcting -- the old certificate has no
+			// bindings left by then, so every later round re-runs the same deploy and the state
+			// never records the certificate that is serving traffic. It is recorded as deployed
+			// but unconfirmed instead, which the next pass's binding probe turns into a
+			// confirmed deployment; DeployConfirmed stays false until then, so the deployed
+			// metric keeps telling the truth.
+			if errors.Is(derr, deploy.ErrSwitchUnverified) && id != "" {
+				m.log.Warn("the one-click switch is reported as done but its binding could not be verified in time; "+
+					"recording the new certificate as deployed but unconfirmed",
+					"cert", c.Name, "certId", id, "err", derr)
+				unverified = true
+			} else if errors.Is(derr, deploy.ErrNothingBoundYet) && id != "" {
+				// The documented first-issuance state, met on a renewal because nobody bound the
+				// first upload. There was no switch to perform, so this is not a failed deploy:
+				// before this case existed the pass failed every time, the promotion below never
+				// ran, and the state kept pointing at the certificate that was expiring while
+				// each cycle issued and uploaded another one.
+				//
+				// The hint names THIS certificate rather than "either certificate": the promotion
+				// below retires the predecessor onto the reclaim list, so binding that one would
+				// leave the row this program tracks unbound -- the next pass would report "nothing
+				// bound yet" again, overwrite the promoted row with a third upload, and burn one
+				// issuance per cycle. Naming the uploaded id (the field above) is what makes the
+				// instruction followable.
+				m.log.Warn("the renewed certificate is uploaded but neither it nor its predecessor is "+
+					"bound to any cloud resource; nothing was switched, and the one-time manual bind "+
+					"is still outstanding",
+					"cert", c.Name, "certId", id, "hint",
+					"bind this certificate (the certId above, also recorded as the deployed id) once "+
+						"in the CLB console; later renewals switch the binding automatically, and the "+
+						"unbound predecessor is deleted only once the cloud confirms nothing references it")
+				waitingFirstBind = true
+			} else {
+				if id != "" {
+					o.DeploymentCertID = id
+					if err := m.store.PutOrder(o); err != nil {
+						// As above: the upload happened, so the id is the only record of a cloud object,
+						// and the failure has to cost a backoff rather than a bare retry.
+						return m.recordFailure(ctx, st, fmt.Errorf(
+							"the certificate %s was uploaded but recording it for reclaim failed: %w", id, err))
+					}
 				}
+				return m.recordFailure(ctx, st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
 			}
-			return m.recordFailure(st, fmt.Errorf("deploy to Tencent Cloud: %w", derr))
 		}
 		deployedID = id
-		o.DeploymentCertID = ""
-		// Persist the clear, not just the in-memory field. discardOrder below re-reads the
-		// order from the store, and a stale ID left there would be reclaimed as an orphan
-		// even though this certificate is the one now in service. Best-effort: a successful
-		// issuance must not fail because a bookkeeping write did.
-		if err := m.store.PutOrder(o); err != nil {
-			m.log.Warn("cannot persist the cleared deployment ID", "cert", c.Name, "err", err)
-		}
-		rebound = oldDeployedID != ""
+		// The order's DeploymentCertID is deliberately NOT cleared here.
+		//
+		// It used to be, with a best-effort PutOrder that was allowed to fail ("a successful
+		// issuance must not fail because a bookkeeping write did"). Two things were wrong with
+		// that. The write is a durable statement outside the transaction below, so a rollback
+		// left the order without its resume anchor: the uploaded certificate was then in neither
+		// certificates nor retired_certificates, the next pass uploaded a second copy of it
+		// instead of resuming, and the first copy leaked against the account quota. And the
+		// orphan decision below reads the order back from the store, so when that write failed
+		// the order still named the certificate being promoted -- which the guard, comparing
+		// against the not-yet-promoted row, could only read as "an orphan".
+		//
+		// tx.DeleteOrder below removes the row (and with it the ID) inside the transaction, which
+		// is both atomic and sufficient: on success nothing stale survives, and on failure the
+		// anchor survives too, which is what lets the next pass resume instead of re-uploading.
+		// A first bind that has not happened yet is not a rebind: claiming DeployConfirmed here
+		// would make the deployed metric green for a certificate that is serving nothing, and the
+		// next renewal would try to switch from it.
+		rebound = oldDeployedID != "" && !waitingFirstBind
 	} else {
 		// A local-only renewal must never claim the older cloud certificate is this
 		// newly issued one: keeping DeployConfirmed would make the deployed metric
@@ -177,7 +290,9 @@ func (m *Manager) download(
 				"hint", "if it is no longer needed, delete it from the Tencent Cloud console or with wecert-preflight prune")
 		}
 		deployedID = ""
-		st.DeployConfirmed = false
+		// Applied to the staged copy below, not to st: the flag belongs to the promotion, and the
+		// promotion is not real until the transaction commits.
+		forceUndeployed = true
 	}
 
 	ariCertID, err := CertID(leaf)
@@ -195,26 +310,51 @@ func (m *Manager) download(
 	oldKeyPEM := st.KeyPEM
 
 	// The deploy succeeded; only now is the new certificate promoted to the live version.
-	st.NotAfter = leaf.NotAfter
-	st.CertURL = order.Certificate
-	st.CertPEM = fullchain
-	st.KeyPEM = o.KeyPEM
-	st.IssuedAt = m.now()
-	st.DeployedCertID = deployedID
+	//
+	// Staged on a copy, because the promotion is not real until the transaction below commits. It
+	// used to be written into st first, and that quietly defeated the transaction: the failure path
+	// calls recordFailure, which persists st, so a rollback was immediately overwritten by a
+	// recordFailure carrying the NEW certificate -- the promotion landed anyway, one statement
+	// later, outside the transaction it was supposed to be part of.
+	promoted := *st
+	promoted.NotAfter = leaf.NotAfter
+	promoted.CertURL = order.Certificate
+	promoted.CertPEM = fullchain
+	promoted.KeyPEM = o.KeyPEM
+	promoted.IssuedAt = m.now()
+	promoted.DeployedCertID = deployedID
+	if forceUndeployed {
+		promoted.DeployConfirmed = false
+	}
 	if rebound {
-		st.DeployConfirmed = true
+		promoted.DeployConfirmed = true
 	} else if oldDeployedID == "" {
 		// First upload: record the CertId so a human can bind it, but the metric should still
 		// read "not deployed".
-		st.DeployConfirmed = false
+		promoted.DeployConfirmed = false
 	}
-	st.ARICertID = ariCertID
-	st.ARIWindowStart = time.Time{}
-	st.ARIWindowEnd = time.Time{}
-	st.ARICheckedAt = time.Time{}
-	st.ARIRetryAfter = 0
-	st.NextAttemptAt = time.Time{}
-	st.LastError = ""
+	if unverified {
+		// Last word on the flag: the switch is reported as done but was not independently
+		// confirmed, so "deployed" is not something this program can claim yet. The next
+		// pass's binding probe sets it once the enumeration answers (see confirmBinding),
+		// which is why this does not have to be settled here.
+		promoted.DeployConfirmed = false
+	}
+	if waitingFirstBind {
+		// Neither certificate is bound, so the flag must be cleared rather than inherited from the
+		// row being replaced: the seed value came from an earlier confirmed deployment, and this
+		// promotion replaces a certificate that nothing is serving with one that nothing is
+		// serving either. Leaving it true would make the deployed metric green and let the next
+		// renewal try to switch away from a certificate no listener has.
+		promoted.DeployConfirmed = false
+	}
+	promoted.ARICertID = ariCertID
+	promoted.ARIWindowStart = time.Time{}
+	promoted.ARIWindowEnd = time.Time{}
+	promoted.ARICheckedAt = time.Time{}
+	promoted.ARIRetryAfter = 0
+	promoted.NextAttemptAt = time.Time{}
+	promoted.LastError = ""
 
 	// The failure counter is cleared only when this round actually ordered the full
 	// configured set. A successful issuance for the degraded subset is not evidence that
@@ -225,63 +365,134 @@ func (m *Manager) download(
 	// documented backoff, and both are things we want to stay alert while names are
 	// missing.
 	if rd.fullSet {
-		st.ConsecutiveFailures = 0
+		promoted.ConsecutiveFailures = 0
 	}
 
-	if err := m.store.PutCert(st); err != nil {
-		// Same rule as everywhere else: a store failure is a failed pass. Returning it raw would
-		// leave ConsecutiveFailures at 0 after a successful issuance whose bookkeeping could not be
-		// written, so nothing would back off and nothing would escalate.
-		return m.recordFailure(st, fmt.Errorf("persist the deployed certificate state: %w", err))
-	}
-	// The fallback record is cleared only when THIS round issued the full desired set --
-	// containsAll(c.Domains, fb.Dropped) is exactly that test, and it is why the record is no
-	// longer cleared by applyFallback: trying the full set is not recovery, issuing it is.
+	// ── the epilogue, in ONE transaction ────────────────────────────────────────────────
 	//
-	// Note what this does NOT do: clear the per-identifier ledger. See the block after
-	// discardOrder, which is gated the same way and for the same reason.
+	// Everything below decides what the state of the world is after a successful renewal, and the
+	// pieces only make sense together:
+	//
+	//   - promote the new certificate (it is live in the cloud right now);
+	//   - retire the old one, so the reaper can delete it and it stops holding a slot in the
+	//     uploaded-certificate quota;
+	//   - clear the fallback record and, for a full-set issuance, the identifier ledger;
+	//   - discard the order, which is what tells the next pass there is nothing in flight.
+	//
+	// Committed separately they could half-happen, and both halves are bad in ways no later pass
+	// repairs: promote without retire leaves the certificate that was serving in no table at all
+	// (never reaped, never deleted from the cloud, quota consumed forever), and retire without
+	// promote marks the certificate that IS serving for deletion. See internal/state/tx.go.
+	//
+	// The TXT cleanup that goes with discarding the order is NOT in here: it is network I/O to the
+	// DNS provider. It runs first, because it is idempotent and safe to repeat, while the state
+	// change below is not.
+	//
+	// What the transaction deliberately does not do is make a failure invisible. If it fails, the
+	// certificate has still been issued and deployed -- the cloud does not roll back -- and the
+	// next pass re-orders, which costs an issuance against the exact-set limit. That is the price
+	// of not being able to write the database, and the error below says so rather than reporting a
+	// generic failure.
+
+	// Read what the transaction needs BEFORE opening it: the store's own reads use the pool, and
+	// the pool's single connection is held by the transaction while it is open (see WithTx).
+	clearFallback := false
 	if fb, err := m.store.GetFallback(c.Name); err == nil && fb != nil && containsAll(c.Domains, fb.Dropped) {
-		if err := m.store.ClearFallback(c.Name); err != nil {
-			m.log.Warn("cannot clear the recovered fallback state", "cert", c.Name, "err", err)
-		} else {
-			metrics.CertificateFallbackActive.WithLabelValues(c.Name).Set(0)
-			metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(0)
-		}
+		// The fallback record is cleared only when THIS round issued the full desired set --
+		// containsAll(c.Domains, fb.Dropped) is exactly that test, and it is why the record is no
+		// longer cleared by applyFallback: trying the full set is not recovery, issuing it is.
+		clearFallback = true
+	}
+	// Only once the switch from the old certificate to the new one is confirmed does the old one go
+	// on the reclaim list. On a first upload nothing is bound to a listener yet, and retiring it
+	// would delete, 7 days later, the very certificate a human just bound.
+	retireOld := rebound && oldDeployedID != "" && oldDeployedID != deployedID
+
+	// A renewed certificate that replaces an upload nobody ever bound is not "retired" in the
+	// rollback sense -- nothing is serving it -- but the row that named it is about to be
+	// overwritten, so without this the id is lost: not in certificates, not in retired_certificates,
+	// and therefore never deleted. It is billed against the account's uploaded-certificate quota
+	// forever. Reclaiming it is safe because the deployer only reports ErrNothingBoundYet from
+	// COMPLETE enumerations of both certificates (see nothingBoundYet), and the delete itself still
+	// asks the cloud to refuse if anything is bound.
+	reclaimFirstBind := waitingFirstBind && oldDeployedID != "" && oldDeployedID != deployedID
+
+	// The order may also carry the ID of a certificate that was uploaded but never rebound. Hand it
+	// to the reclaim list inside the same transaction -- see discardOrder for why losing it is
+	// expensive.
+	orphanID, orphanPEM, orphanKey := m.orphanToRecord(c.Name, deployedID)
+
+	// The TXT records first: idempotent, repeatable, and useless to redo if the state change fails.
+	if err := m.cleanupOrphanTXT(ctx, c.Name); err != nil {
+		// A cleanup failure must not stop the renewal from being recorded -- that would leave us
+		// stuck on an order that can never produce a result, which is worse than one extra TXT.
+		m.log.Warn("failed to clean up TXT before discarding the order", "cert", c.Name, "err", err)
 	}
 
-	// Only once the switch from the old certificate to the new one is confirmed does the old
-	// one go on the reclaim list. On a first upload nothing is bound to a listener yet, and
-	// retiring it would delete, 7 days later, the very certificate a human just bound.
-	if rebound && oldDeployedID != "" && oldDeployedID != deployedID {
-		if err := m.store.AddRetiredCert(oldDeployedID, c.Name, oldCertPEM, oldKeyPEM); err != nil {
-			m.log.Warn("failed to record the certificate for reclaim", "cert", c.Name, "certId", oldDeployedID, "err", err)
+	txErr := m.store.WithTx(ctx, func(tx *state.Tx) error {
+		if err := tx.PutCert(&promoted); err != nil {
+			return fmt.Errorf("promote the new certificate: %w", err)
 		}
-	}
-
-	if err := m.discardOrder(ctx, c.Name); err != nil {
-		return err
-	}
-
-	// After an issuance of the FULL set, clear the per-identifier failure ledger.
-	//
-	// The ledger means "who has been broken lately", not "who has ever been broken", so a
-	// fully healthy issuance should retire it -- otherwise a long-since-fixed fault keeps a
-	// name out of the certificate forever, and since a dropped name is never attempted
-	// again it can never earn the success that would clear its name.
-	//
-	// A round that deployed the degraded subset must NOT clear it. Tying this to "is a
-	// fallback record present" (the previous test) meant the record was cleared by
-	// applyFallback during the subset round that followed, so the evidence was gone exactly
-	// when it was needed and the next pass re-ordered the broken full set. Keying on what
-	// was actually ordered is the honest question.
-	if rd.fullSet {
-		if cerr := m.store.ClearIdentifierFailures(c.Name); cerr != nil {
-			m.log.Warn("cannot clear the identifier failure ledger", "cert", c.Name, "err", cerr)
+		if retireOld || reclaimFirstBind {
+			if err := tx.AddRetiredCert(oldDeployedID, c.Name, oldCertPEM, oldKeyPEM); err != nil {
+				return fmt.Errorf("retire the previous certificate: %w", err)
+			}
 		}
-	} else if rd.degraded {
+		if orphanID != "" {
+			if err := tx.AddRetiredCert(orphanID, c.Name, orphanPEM, orphanKey); err != nil {
+				return fmt.Errorf("record the uploaded-but-unbound certificate: %w", err)
+			}
+		}
+		if clearFallback {
+			if err := tx.ClearFallback(c.Name); err != nil {
+				return fmt.Errorf("clear the fallback record: %w", err)
+			}
+		}
+		// After an issuance of the FULL set, clear the per-identifier failure ledger.
+		//
+		// The ledger means "who has been broken lately", not "who has ever been broken", so a fully
+		// healthy issuance should retire it -- otherwise a long-since-fixed fault keeps a name out
+		// of the certificate forever, and since a dropped name is never attempted again it can
+		// never earn the success that would clear its name.
+		//
+		// A round that deployed the degraded subset must NOT clear it. Tying this to "is a fallback
+		// record present" (the previous test) meant the record was cleared by applyFallback during
+		// the subset round that followed, so the evidence was gone exactly when it was needed and
+		// the next pass re-ordered the broken full set. Keying on what was actually ordered is the
+		// honest question.
+		if rd.fullSet {
+			if err := tx.ClearIdentifierFailures(c.Name); err != nil {
+				return fmt.Errorf("clear the identifier failure ledger: %w", err)
+			}
+		}
+		return tx.DeleteOrder(c.Name)
+	})
+	if txErr != nil {
+		// st is deliberately untouched: the promotion did not commit, so neither the in-memory
+		// state nor the failure row this records may claim it did. (It also keeps the operator's
+		// failure count attached to the certificate that is actually still live.)
+		return m.recordFailure(ctx, st, fmt.Errorf(
+			"the certificate was issued and deployed, but recording that in state.db failed, so it "+
+				"is unchanged on disk and this pass is reported as failed: %w. The next pass will "+
+				"re-order (which costs an issuance against the per-identifier-set limit); if this "+
+				"repeats, the state database is the problem, not the certificate", txErr))
+	}
+	// Committed, so the in-memory state may now become the durable one.
+	*st = promoted
+	if clearFallback {
+		metrics.CertificateFallbackActive.WithLabelValues(c.Name).Set(0)
+		metrics.CertificateFallbackDropped.WithLabelValues(c.Name).Set(0)
+	}
+	if !rd.fullSet && rd.degraded {
+		// c.Domains is the set that was ORDERED (the kept subset), so labelling it "dropped" told an
+		// operator the opposite of what happened -- and the count they need is on the ledger rows.
 		m.log.Warn("issued the degraded name set; keeping the identifier failure ledger so the "+
 			"next pass does not immediately re-order the full set",
-			"cert", c.Name, "dropped", len(c.Domains))
+			"cert", c.Name, "issued", len(c.Domains))
+	}
+	if orphanID != "" {
+		m.log.Info("the certificate uploaded during the failed deploy has been recorded for reclaim "+
+			"and will be deleted later", "cert", c.Name, "certId", orphanID)
 	}
 
 	if !c.Deploy.Enabled {
@@ -335,17 +546,43 @@ func (m *Manager) ReapRetired(ctx context.Context) {
 	}
 }
 
+// uniqueRegisteredDomains returns the registered domains a certificate's names belong to, once
+// each: "certs per registered domain" is counted per registered domain the certificate covers, and
+// a certificate spanning several of them spends that many slots.
+func uniqueRegisteredDomains(domains []string) []string {
+	seen := make(map[string]bool, len(domains))
+	out := make([]string, 0, len(domains))
+	for _, d := range domains {
+		rd := group.RegisteredDomain(d)
+		if rd == "" || seen[rd] {
+			continue
+		}
+		seen[rd] = true
+		out = append(out, rd)
+	}
+	return out
+}
+
 // recordFailure records a failure and schedules exponential backoff.
 //
 // The 6-hour cap is not arbitrary: once we have hit "5 authorization failures per
 // identifier per hour", hammering retries only makes things worse. Backing off to 6 hours
 // means at most 4 attempts a day, far below the rate-limit threshold, while still
 // guaranteeing that a fixed problem heals itself.
-func (m *Manager) recordFailure(st *state.CertState, err error) error {
+func (m *Manager) recordFailure(ctx context.Context, st *state.CertState, err error) error {
 	// A stopped process / cancelled parent context is not a business failure. Recording it
 	// would lengthen the backoff, so after a restart the same order should have been pushed
 	// on immediately but is instead locked out of the window.
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	//
+	// The question is whether THIS PASS was stopped, not what the error happens to wrap. Testing
+	// errors.Is against context.Canceled/DeadlineExceeded also matched every http.Client timeout,
+	// because net/http wraps its own deadline in *url.Error, whose Unwrap is
+	// context.DeadlineExceeded -- so an ordinary CA-side timeout, the commonest failure there is,
+	// was filed as "pass cancelled": no consecutive_failures, no last_error, no backoff, and on a
+	// first issuance not even a certificate row for the next pass to find. The context is the
+	// authority on why the pass stopped; if it is still alive, the error is a real failure whatever
+	// it unwraps to.
+	if ctx.Err() != nil {
 		m.log.Warn("pass cancelled; not counted as a failure and no backoff applied", "cert", st.Name, "err", err)
 		return err
 	}
@@ -396,30 +633,14 @@ func (m *Manager) recordFailure(st *state.CertState, err error) error {
 //
 // Cleanup is handed to cleanupOrphanTXT: it deletes the rows it has finished with, and keeps
 // the rows whose token cannot be located around for the next round to retry.
+// discardOrder cleans up after an order that is going away and returns nothing to record.
+//
+// Kept for callers that are not finishing a renewal (an order that can never produce a result
+// still has to be cleaned up and removed). The renewal epilogue does the same work through one
+// transaction instead; see orphanToRecord for the half of it that has to be decided in advance.
 func (m *Manager) discardOrder(ctx context.Context, certName string) error {
-	// An order can carry the ID of a certificate that was uploaded to Tencent Cloud but whose
-	// asynchronous rebind never completed. Deleting the row throws away the only local record
-	// of that certificate: it is then in neither the certificates table nor the retired table,
-	// ReapRetired never sees it, and it occupies the account's uploaded-certificate quota
-	// forever -- and quota exhaustion is what stops renewal.
-	//
-	// The order is going away, so the pending retry cannot happen. The reclaim list is the
-	// only thing left that can still delete it.
-	if o, err := m.store.GetOrder(certName); err != nil {
-		m.log.Warn("cannot read the order before discarding it; an uploaded certificate may be left unreclaimed",
-			"cert", certName, "err", err)
-	} else if o != nil && o.DeploymentCertID != "" {
-		liveID := ""
-		if st, cerr := m.store.GetCert(certName); cerr != nil {
-			m.log.Warn("cannot read the certificate before discarding its order", "cert", certName, "err", cerr)
-		} else if st != nil {
-			liveID = st.DeployedCertID
-		}
-		// liveID == "" errs toward reclaiming: recordOrphanCert only skips on an exact match,
-		// and a certificate still bound to a listener is protected by IsCheckResource refusing
-		// the delete.
-		m.recordOrphanCert(o.DeploymentCertID, liveID, certName)
-	}
+	// No promotion is in flight on this path, so the store's deployed_cert_id is the live one.
+	orphanID, orphanPEM, orphanKey := m.orphanToRecord(certName, "")
 
 	if err := m.cleanupOrphanTXT(ctx, certName); err != nil {
 		// A cleanup failure must not stop us discarding the order -- that would leave us stuck
@@ -427,7 +648,67 @@ func (m *Manager) discardOrder(ctx context.Context, certName string) error {
 		// record.
 		m.log.Warn("failed to clean up TXT before discarding the order", "cert", certName, "err", err)
 	}
-	return m.store.DeleteOrder(certName)
+
+	err := m.store.WithTx(ctx, func(tx *state.Tx) error {
+		if orphanID != "" {
+			if err := tx.AddRetiredCert(orphanID, certName, orphanPEM, orphanKey); err != nil {
+				return err
+			}
+		}
+		return tx.DeleteOrder(certName)
+	})
+	if err == nil && orphanID != "" {
+		m.log.Info("the certificate uploaded during the failed deploy has been recorded for reclaim "+
+			"and will be deleted later", "cert", certName, "certId", orphanID)
+	}
+	return err
+}
+
+// orphanToRecord decides whether the order's uploaded certificate has to go on the reclaim list,
+// and returns its id and material.
+//
+// An order can carry the ID of a certificate that was uploaded to Tencent Cloud but whose
+// asynchronous rebind never completed. Deleting the row throws away the only local record of that
+// certificate: it is then in neither the certificates table nor the retired table, ReapRetired never
+// sees it, and it occupies the account's uploaded-certificate quota forever -- and quota exhaustion
+// is what stops renewal.
+//
+// promotedID is the certificate id this pass is about to make live, and it is not optional
+// information: on the renewal path the promotion is still staged on a copy when this decision is
+// made (the transaction that writes it has not opened yet), so certificates.deployed_cert_id still
+// names the OUTGOING certificate. Comparing the order's id against that stale value could never
+// match the id being promoted, so the guard silently stopped guarding and the certificate that was
+// about to serve traffic was written to the reclaim list in the same transaction that promoted it.
+// Callers that are not promoting anything pass "" and the store's value is used instead.
+//
+// Split out of discardOrder because the renewal epilogue has to make this decision *before* it
+// opens the transaction that writes it: the store's reads use the pool, and the pool's connection
+// is held by the transaction while it is open.
+func (m *Manager) orphanToRecord(certName, promotedID string) (certID string, certPEM, keyPEM []byte) {
+	o, err := m.store.GetOrder(certName)
+	if err != nil {
+		m.log.Warn("cannot read the order before discarding it; an uploaded certificate may be left unreclaimed",
+			"cert", certName, "err", err)
+		return "", nil, nil
+	}
+	if o == nil || o.DeploymentCertID == "" {
+		return "", nil, nil
+	}
+
+	liveID := promotedID
+	if liveID == "" {
+		if st, cerr := m.store.GetCert(certName); cerr != nil {
+			m.log.Warn("cannot read the certificate before discarding its order", "cert", certName, "err", cerr)
+		} else if st != nil {
+			liveID = st.DeployedCertID
+		}
+	}
+	// liveID == "" errs toward reclaiming: recordOrphanCert only skips on an exact match, and a
+	// certificate still bound to a listener is protected by IsCheckResource refusing the delete.
+	if o.DeploymentCertID == liveID {
+		return "", nil, nil
+	}
+	return o.DeploymentCertID, nil, nil
 }
 
 // parseOrderExpires parses an ACME order's expires. On an empty or unparsable value it
@@ -482,29 +763,6 @@ func authzError(authz legoacme.Authorization) string {
 		}
 	}
 	return "the CA gave no specific reason"
-}
-
-// recordOrphanCert records a certificate that "already exists in the cloud but has no local
-// owner" in the reclaim list.
-//
-// The scenario is a Deploy whose upload succeeded but whose rebind failed. Without recording
-// it, the certificate is in neither the certificates table nor the retired table and the
-// reaper never sees it -- and uploaded certificates count against a quota in the Tencent
-// Cloud account, so after a few leaks renewal becomes impossible.
-func (m *Manager) recordOrphanCert(newID, liveID, certName string) {
-	if newID == "" || newID == liveID {
-		return
-	}
-	// No archived material: this certificate was uploaded during a failed deploy, so the
-	// local row still holds the previous live certificate and the uploaded one's key was
-	// never promoted. The row still matters -- the reaper has to delete it from the cloud.
-	if err := m.store.AddRetiredCert(newID, certName, nil, nil); err != nil {
-		m.log.Warn("failed to record the orphaned certificate (it will occupy Tencent Cloud certificate quota indefinitely)",
-			"cert", certName, "certId", newID, "err", err)
-		return
-	}
-	m.log.Info("the certificate uploaded during the failed deploy has been recorded for reclaim and will be deleted later",
-		"cert", certName, "certId", newID)
 }
 
 // certIsNewer reports whether the freshly issued leaf was issued after the certificate
