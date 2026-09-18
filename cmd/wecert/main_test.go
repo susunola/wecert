@@ -52,8 +52,44 @@ func TestEnforceDefersUnusedStaticCredentials(t *testing.T) {
 	}
 }
 
-// A one-shot run that did not converge must fail.
+// -dry-run must build what reads credentials, or its "all fine" is a claim it never checked.
 //
+// The flag documents itself as the pre-install check ("a green dry run means the credentials are
+// usable"), install.sh runs it as its last step, and it used to return several statements before the
+// DNS provider and the deployer were built -- the two places static credentials are validated. A
+// config with credentialMode=static and no credentials therefore exited 0, and failed on the first
+// real pass instead.
+func TestTheDryRunBuildsWhatReadsCredentials(t *testing.T) {
+	cfg := &config.Config{
+		Certificates: []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}},
+	}
+	cfg.DNS.Provider = config.DNSProviderDNSPod
+	cfg.DNS.LoginToken = "12345,abcdef"
+	cfg.Tencent.CredentialMode = config.CredentialStatic
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// No static credentials anywhere: this is the misconfiguration that used to pass.
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "")
+	t.Setenv("TENCENTCLOUD_SECRET_KEY", "")
+	err := buildCredentialBearingComponents(cfg, log)
+	if err == nil {
+		t.Fatal("a dry run must not report success when the credentials it claims to have checked are missing")
+	}
+	if !strings.Contains(err.Error(), "credentials") {
+		t.Errorf("the error should name the credentials, got: %v", err)
+	}
+
+	// With them present, the same call must succeed: this is not a check that always fails.
+	cfg.Tencent.SecretID = "id"
+	cfg.Tencent.SecretKey = "key"
+	cfg.Tencent.Regions = []string{"ap-guangzhou"}
+	if err := buildCredentialBearingComponents(cfg, log); err != nil {
+		t.Errorf("a complete static configuration must build: %v", err)
+	}
+}
+
+// A one-shot run that did not converge must fail.
+
 // wecert-once.service runs this with -once, and "exited 0 with every certificate failing" is the
 // failure this report exists to prevent: the timer reports success while the fleet goes unmanaged.
 func TestOnceExitFailsWhenThePassDidNotConverge(t *testing.T) {

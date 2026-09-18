@@ -213,11 +213,8 @@ func run() error {
 		// It costs no API call: the DNS provider and the CLB client are constructed, credentials are
 		// read and validated from config or environment, and for the CVM instance role the fetch
 		// stays deferred to first use.
-		if _, err := acme.NewDNSSolver(cfg.DNS, cfg.Tencent, log); err != nil {
-			return fmt.Errorf("dry run: the DNS provider would not build: %w", err)
-		}
-		if _, err := newDeployer(cfg, log); err != nil {
-			return fmt.Errorf("dry run: the deployer would not build: %w", err)
+		if err := buildCredentialBearingComponents(cfg, log); err != nil {
+			return fmt.Errorf("dry run: %w", err)
 		}
 
 		log.Info("dry run finished: the config, the ACME account, the desired-state source, the DNS "+
@@ -850,6 +847,31 @@ func logStartup(log *slog.Logger, cfg *config.Config, firstRun bool) {
 			}
 		}
 	}
+}
+
+// buildCredentialBearingComponents constructs the parts of the program that read credentials,
+// without issuing or deploying anything.
+//
+// It exists so -dry-run can make its own summary true: internal/config deliberately leaves the
+// validation of static Tencent credentials to deploy.NewCredentialSource, so a config with
+// credentialMode=static and no secretId/secretKey passed the documented pre-install check and exited
+// 0 with "all fine" -- failing on the first real pass instead, after a production ACME account had
+// been registered and an interval had gone by.
+//
+// Note the middle call: in enforce mode newDeployer returns the LAZY CLB client on purpose (the
+// document decides what is deployed), so without asking for the credential source directly, a
+// deployment using DNSPod tokens for DNS would still not have its CAM credentials checked here.
+func buildCredentialBearingComponents(cfg *config.Config, log *slog.Logger) error {
+	if _, err := acme.NewDNSSolver(cfg.DNS, cfg.Tencent, log); err != nil {
+		return fmt.Errorf("the DNS provider would not build: %w", err)
+	}
+	if _, err := deploy.NewCredentialSource(cfg.Tencent); err != nil {
+		return fmt.Errorf("the Tencent Cloud credentials would not build: %w", err)
+	}
+	if _, err := newDeployer(cfg, log); err != nil {
+		return fmt.Errorf("the deployer would not build: %w", err)
+	}
+	return nil
 }
 
 // certificateCountField is what the banner and the dry-run summary report as `certificates`.
