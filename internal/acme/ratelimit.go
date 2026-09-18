@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"maps"
 	"time"
 
 	"github.com/susunola/wecert/internal/metrics"
@@ -126,6 +127,25 @@ func (m *Manager) quotaReport(l ratelimit.Limit, scopeID string) QuotaReport {
 // at all. Absent reads as "not published", which is the honest answer for a scope that is no
 // longer in the desired state, and it is the same trade the blocked vector already made.
 func (m *Manager) PublishQuota(scopes map[string][]string) {
+	// The per-identifier family comes from the STORE, not from the desired state.
+	//
+	// It is the only unbounded family: "every SAN of every certificate" grows with the fleet, while
+	// the buckets that can actually be exhausted grow with what has been attempted. A name nobody has
+	// validated has a full budget, so a series for it carries no information an operator can act on --
+	// and the cost of publishing one per name is real: at 500 certificates of 20 names the round-11
+	// scale work measured 17,052 series, a 1.67 MB scrape and 22,002 SQL statements in an ordinary
+	// scheduled pass, all dominated by identifiers that had never been spent against.
+	scopes = maps.Clone(scopes)
+	if spent, err := m.store.ListRateBucketScopes(ratelimit.AuthzFailuresPerIdentifier.Name); err != nil {
+		// Not fatal and not silent: publishing the desired-state list is the expensive-but-complete
+		// answer, and the warning says the series may be larger than it needs to be.
+		m.log.Warn("cannot list the identifiers that have been spent against; publishing a quota "+
+			"series for every identifier in the desired state instead (more series than needed, "+
+			"and no wrong values)", "err", err)
+	} else {
+		scopes[ratelimit.AuthzFailuresPerIdentifier.Scope] = spent
+	}
+
 	metrics.RateLimitRemaining.Reset()
 	metrics.RateLimitBlocked.Reset()
 	for _, rep := range m.QuotaStatus(scopes) {

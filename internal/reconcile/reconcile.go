@@ -129,6 +129,12 @@ type Reconciler struct {
 	// starts, so a pass still queued for a start slot is counted too.
 	bg sync.WaitGroup
 
+	// quotaPasses counts the webhook-triggered passes that are still running, so the quota gauges are
+	// republished once when the last of them finishes rather than once per certificate. See startCert:
+	// publishing is proportional to the scopes in the desired state, so per-certificate publication
+	// made a full trigger quadratic in the fleet (11 million SQL statements at 500 certificates).
+	quotaPasses atomic.Int64
+
 	// bgMu serializes a pass's registration against Drain's transition to draining.
 	//
 	// sync.WaitGroup requires that a positive Add which starts from zero does not run concurrently
@@ -784,6 +790,40 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 	r.probedHosts = map[string]struct{}{}
 	r.probeMu.Unlock()
 
+	// Resolve the desired state ONCE for the whole loop, not once per stale host.
+	//
+	// This used to live in hostIsUnconfirmed, which the loop called per host: every stale host paid
+	// a full resolve -- a file read, a YAML decode, a validation pass and a sha256 of the document.
+	// The scale work in round 11 measured the result at the default probe cap: 500 certificates, a
+	// pass that reclaims stale hosts took 27.8 s against 0.18 s for the same pass with nothing to
+	// reclaim (155x), and it is exactly O(staleHosts x fleetSize): 0.41/1.48/5.66/22.9 s at
+	// 25/50/100/200 certificates. The hosts are also what a shrinking probe set produces -- removed
+	// certificates or names -- so this is the shape of an ordinary fleet edit, not a corner case.
+	//
+	// hostOwner is nil when there is no desired state to judge from (a partially built reconciler in
+	// tests, or an unreadable document): every stale host is then reclaimed, which is what the old
+	// helper did for the partially built case.
+	var hostOwner map[string]string
+	if r.store != nil && r.provider != nil {
+		res := r.resolve(context.Background())
+		if res == nil {
+			// No desired state: keep the series rather than deleting evidence.
+			return
+		}
+		hostOwner = make(map[string]string, len(res.Certificates))
+		for i := range res.Certificates {
+			c := &res.Certificates[i]
+			for _, d := range probeHosts(c.Domains, len(c.Domains)) {
+				// First certificate wins, matching the old helper's "return on the first match"
+				// order: a host covered by two certificates must be judged by the one the document
+				// lists first, not by whichever happened to be written last into the map.
+				if _, seen := hostOwner[d]; !seen {
+					hostOwner[d] = c.Name
+				}
+			}
+		}
+	}
+
 	for _, h := range all.ProbedHosts() {
 		if _, live := current[h]; live {
 			continue
@@ -812,8 +852,11 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 		// gone, so the documented alert stayed silent for the failure it exists to catch.
 		//
 		// A host whose certificate has left the desired state entirely is reclaimed as before.
-		if r.hostIsUnconfirmed(h) {
-			continue
+		if name, inDesiredState := hostOwner[h]; inDesiredState {
+			st, err := r.store.GetCert(name)
+			if err != nil || st == nil || !st.DeployConfirmed {
+				continue
+			}
 		}
 		metrics.DeleteProbeSeries(h)
 		// The runner's transition memory has to go with the series. Its own comment says
@@ -823,35 +866,6 @@ func (r *Reconciler) reclaimStaleProbeSeries() {
 		// design.
 		r.prober.Forget(h)
 	}
-}
-
-// hostIsUnconfirmed reports whether h belongs to a certificate that is still in the desired state
-// but not confirmed deployed, i.e. a host the probe deliberately skips rather than one that left.
-func (r *Reconciler) hostIsUnconfirmed(h string) bool {
-	if r.store == nil || r.provider == nil {
-		// A reconciler without a store or a provider has no desired state to judge from; that is a
-		// partially built one (tests), and the caller's own fallback applies.
-		return false
-	}
-	res := r.resolve(context.Background())
-	if res == nil {
-		// No desired state to judge from: keep the series rather than deleting evidence.
-		return true
-	}
-	for i := range res.Certificates {
-		c := &res.Certificates[i]
-		for _, d := range probeHosts(c.Domains, len(c.Domains)) {
-			if d != h {
-				continue
-			}
-			st, err := r.store.GetCert(c.Name)
-			if err != nil || st == nil {
-				return true
-			}
-			return !st.DeployConfirmed
-		}
-	}
-	return false
 }
 
 // anyPassInFlight reports whether any certificate currently holds a convergence claim.
@@ -968,12 +982,41 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		r.bg.Done()
 		return ErrAlreadyRunning
 	}
+	// Count this pass towards one quota publication for the whole trigger (see quotaPasses).
+	r.quotaPasses.Add(1)
 
 	// res is heap-allocated and not reused during this pass, so referring to its
 	// elements is safe.
 	go func() {
 		defer r.bg.Done()
 		defer r.release(c.Name)
+		// Publish the rate-limit gauges when a webhook-triggered pass finishes, ONCE PER TRIGGER.
+		//
+		// These gauges exist on this path at all because RunDetailed publishes them at the end of a
+		// scheduled round and the webhook had no equivalent: a pass started by a POST spends quota
+		// and records the CA's Retry-After just the same, so a deadline shorter than the polling
+		// interval (an hour by default) was never shown as blocked -- exactly the window it
+		// describes, and WecertRateLimitBlocked could not fire for it. Publishing on this path is
+		// also what puts the spend in the number.
+		//
+		// publishQuota's cost is proportional to the scopes the desired state produces, so calling it
+		// per certificate made a full trigger quadratic in the fleet: the round-11 scale work measured
+		// 11,001,500 SQL statements and 84.4 s for 500 certificates of 20 names, against 23,003
+		// statements and 0.234 s for the same fleet's scheduled pass -- minutes of the single SQLite
+		// connection and one core, with every other database user queued behind it.
+		//
+		// The last pass of a batch publishes for the whole batch, so the gauges still carry every
+		// spend the batch made, and a single StartCert still publishes for itself.
+		//
+		// Deferred rather than inlined at the end: the slot-wait below can also return early on
+		// shutdown, and a counter incremented on one path and not decremented on another would stick
+		// above zero and stop the gauges being republished for the rest of the process's life.
+		// Deferred functions run last-in-first-out, so this runs before the claim is released.
+		defer func() {
+			if r.quotaPasses.Add(-1) == 0 {
+				r.publishQuota(res)
+			}
+		}()
 
 		// Queue for a start slot instead of running immediately. Nothing is dropped:
 		// the caller has already been told "accepted", and the pass starts as soon as
@@ -991,17 +1034,6 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		}
 
 		r.reconcileOne(ctx, c)
-
-		// Publish the rate-limit gauges when a webhook-triggered pass finishes.
-		//
-		// RunDetailed publishes them at the end of a scheduled round, and this path used to have
-		// no equivalent: a pass started from the webhook spends quota and records the CA's
-		// Retry-After just the same, but nothing republished either gauge. A deadline shorter than
-		// the polling interval (an hour by default) was therefore never shown as blocked at all,
-		// which is exactly the window it describes -- the critical WecertRateLimitBlocked alert
-		// could not fire for it. Publishing here also means the spend is in the number, which it
-		// would not be if this only ran before the pass started.
-		r.publishQuota(res)
 	}()
 	return nil
 }
