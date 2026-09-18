@@ -861,16 +861,27 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 		return err
 	}
 
-	var cleaned, stuck int
+	var cleaned, stuck, deferred int
 	for _, a := range authzs {
 		if !a.Presented {
 			// A row carrying a token may still have its record up: the pass that wrote
 			// it died (or its persist failed) before marking Presented. Probe and try to
 			// reclaim before deleting the row -- deleting it blind would orphan that TXT
 			// for good, because the row is the only clue to the record's value.
-			if a.ChallengeToken != "" && !m.reclaimUnpresentedTXT(ctx, a) {
-				stuck++
-				continue
+			if a.ChallengeToken != "" {
+				switch m.reclaimUnpresentedTXT(ctx, a) {
+				case txtReclaimKeptPropagating:
+					// Deliberately kept, not stuck: the record was denied but the challenge is
+					// younger than the propagation window, so the row is the safety net for a record
+					// that may still appear. Counting it as "could not be reclaimed" made a normal
+					// pass (any pass within five minutes of an issuance) print a WARN that reads
+					// like a DNS cleanup failure -- observed in the round-11 production run.
+					deferred++
+					continue
+				case txtReclaimFailed:
+					stuck++
+					continue
+				}
 			}
 			// Rows that provably never reached DNS are deleted outright; leave no
 			// rubbish behind.
@@ -901,6 +912,11 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 	if cleaned > 0 {
 		m.log.Info("reclaimed a leftover _acme-challenge TXT record", "cert", certName, "count", cleaned)
 	}
+	if deferred > 0 {
+		m.log.Info("kept an unpresented authorization row until its propagation window has passed; the "+
+			"record was not found in DNS, and the row is what would reclaim it if the write were still "+
+			"in flight", "cert", certName, "count", deferred)
+	}
 	if stuck > 0 {
 		m.log.Warn("some TXT records could not be reclaimed automatically; their rows are kept and retried next round",
 			"cert", certName, "count", stuck,
@@ -909,23 +925,41 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 	return nil
 }
 
+// txtReclaim is the outcome of probing for the TXT of an interrupted pass.
+//
+// It is an enum rather than a bool because two outcomes that both mean "keep the row" have very
+// different meanings to the operator: one is a deliberate wait (the record was denied, but the
+// challenge is younger than the propagation window, so the row is the safety net for a write that may
+// still land) and the other is a failure to find out. The caller counts them separately, and only the
+// second is worth a WARN.
+type txtReclaim int
+
+const (
+	// txtReclaimDone: the record was reclaimed, or proved absent -- the row can be deleted.
+	txtReclaimDone txtReclaim = iota
+	// txtReclaimKeptPropagating: denied, but inside the propagation window; keep the row and retry.
+	txtReclaimKeptPropagating
+	// txtReclaimFailed: the probe or the cleanup failed; keep the row and retry next round.
+	txtReclaimFailed
+)
+
 // reclaimUnpresentedTXT probes DNS for the record of an authorization whose row says
 // Presented=false but which carries a challenge token -- the fingerprint of a pass that
-// died between the DNS write and the state persist. It returns false when the record's
-// fate is unknown (the probe failed, or the record is up but would not delete), and then
-// the caller must keep the row: its token is the only clue for locating the record again.
-func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorization) bool {
+// died between the DNS write and the state persist. It returns txtReclaimFailed when the
+// record's fate is unknown (the probe failed, or the record is up but would not delete), and
+// then the caller must keep the row: its token is the only clue for locating the record again.
+func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorization) txtReclaim {
 	keyAuth, err := m.keyAuth.GetKeyAuthorization(a.ChallengeToken)
 	if err != nil {
 		m.log.Warn("cannot compute the key authorization for an unpresented row; keeping it",
 			"cert", a.CertName, "identifier", a.Identifier, "err", err)
-		return false
+		return txtReclaimFailed
 	}
 	rec, found, err := m.dns.LookupTXT(ctx, a.Identifier, keyAuth)
 	if err != nil {
 		m.log.Warn("could not probe for the TXT of an interrupted pass; keeping the row",
 			"cert", a.CertName, "identifier", a.Identifier, "err", err)
-		return false
+		return txtReclaimFailed
 	}
 	if !found {
 		// A denial is only evidence once the write would have had time to appear.
@@ -947,7 +981,7 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 				"cert", a.CertName, "identifier", a.Identifier, "name", a.TxtName,
 				"preparedAgo", age.Round(time.Second),
 				"window", m.dns.PropagationTimeout())
-			return false
+			return txtReclaimKeptPropagating
 		}
 
 		// Every reachable authoritative nameserver denied this value, which is the
@@ -963,7 +997,7 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 		// absence is what makes dropping it safe: nothing can depend on a record that is not
 		// there, and the probe is the same evidence the row deletion rests on.
 		m.releaseStaleLease(rec.FQDN, rec.Value)
-		return true
+		return txtReclaimDone
 	}
 	m.log.Info("found the TXT of an interrupted pass; reclaiming it before deleting the row",
 		"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN)
@@ -978,9 +1012,9 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
 		m.log.Warn("failed to reclaim the TXT of an interrupted pass; keeping the row",
 			"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN, "err", err)
-		return false
+		return txtReclaimFailed
 	}
-	return true
+	return txtReclaimDone
 }
 
 func (m *Manager) finalize(

@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"database/sql"
@@ -423,6 +424,57 @@ func TestCleanupOrphanTXTProbeMissDeletesRow(t *testing.T) {
 	}
 	if as, _ := store.ListAuthorizations("c"); len(as) != 0 {
 		t.Errorf("the row should be deleted when DNS provably holds no record, %d remain", len(as))
+	}
+}
+
+// A denial inside the propagation window keeps the row WITHOUT calling it a failed reclaim.
+//
+// The row is the safety net for a write that may still be in flight, so it stays -- but this is a
+// deliberate wait, not a cleanup failure, and the caller's summary must not say otherwise. It fired
+// as a WARN in the round-11 production run: a pass that happened to run three minutes after an
+// issuance printed "some TXT records could not be reclaimed automatically" for a record that was
+// already gone from DNS, and only an Info line above it explained the truth.
+func TestCleanupOrphanTXTKeepsAYoungUnpresentedRowQuietly(t *testing.T) {
+	solver := &fakeSolver{lookupFound: false}
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+
+	prepared := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return prepared.Add(30 * time.Second) })
+
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+		ChallengeToken: "tok-1", Presented: false, ChallengePreparedAt: prepared,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	m.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+
+	if as, _ := store.ListAuthorizations("c"); len(as) != 1 {
+		t.Fatalf("the row must be kept inside the propagation window, %d remain", len(as))
+	}
+	if strings.Contains(logs.String(), "could not be reclaimed automatically") {
+		t.Errorf("a deliberate wait must not be reported as a failed reclaim:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "propagation window") {
+		t.Errorf("the wait must still be explained at Info level:\n%s", logs.String())
+	}
+
+	// Past the window the same row is verified absent and deleted, with no warning either.
+	m.SetNow(func() time.Time { return prepared.Add(10 * time.Minute) })
+	logs.Reset()
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+	if as, _ := store.ListAuthorizations("c"); len(as) != 0 {
+		t.Errorf("past the window a proven-absent record's row must go, %d remain", len(as))
+	}
+	if strings.Contains(logs.String(), "could not be reclaimed automatically") {
+		t.Errorf("nothing failed here either:\n%s", logs.String())
 	}
 }
 
