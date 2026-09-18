@@ -89,7 +89,7 @@
 | 每注册域名的配额序列只发布第一张证书的 scope（`WecertRateLimitNearlyExhausted` 对其它域名不响） | 修它要把 `PublishQuota(scopes map[string]string)` 改成「一个家族多个 scope」，涉及 `CertManager` 接口、manager、reconcile 与测试假件；这一轮不做半成品重构。**已记入待办**：改成 `map[string][]string` 后按解析出的每个注册域名发布 |
 | 三处重复的「临时文件→fsync→chmod→rename」持久化协议（onboarding 报告、期望状态文档、onboarding 状态文件；第 4 轮报告 fsync 的漂移就是这么来的） | 抽公共函数要同时改三处并保持各自的 fsync 语义，属重构而非缺陷修复；记入待办 |
 | `ratelimit/tracker.go` 的四个无调用方导出符号、`UpdateCert`、`PutRateBucket`、webhook 接口里的 `StartCert` 等 12 个移除候选 | 删除导出 API 需要单独一次「只做删除」的改动并跑全量门禁，混在这一轮里会让 diff 难以审阅。清单在 `/tmp/wecert-r6/architecture-security.json` |
-| CI 不构建 `-tags lego_dns`（两个 tag 相关的生产文件与其测试无门禁） | **我推不了 workflow**：token 没有 `workflow` scope，`.github/workflows/` 的改动会被拒。需要你自己加一行 `go build -tags lego_dns ./...` / `go test -tags lego_dns ./...` |
+| CI 不构建 `-tags lego_dns`（两个 tag 相关的生产文件与其测试无门禁） | **已在后续处理**：先用 `make release`（额外编译 linux/amd64 的 lego_dns 变体）与 `make test-tags`（进 `make check`）覆盖，随后用仓库所有者提供的、带 `workflow` scope 的凭据把 `make test-tags` 加进了 `.github/workflows/ci.yml`（提交 `b7b914d`） |
 | 文档里剩下的低价值漂移（测试数量 633/60/18 vs 775/75/19、Roadmap 的「Outstanding」有 4/5 已交付、参考文档的状态表只列了 9 张表里的 5 张且缺两列、`docs/test-plan.md` 的覆盖率数字、`/hook/desired` 在 enforce 模式下返回的是文档里的决定而非实时评估） | 都是「读了不会做错事」的陈旧描述；已记录在案，留给下一轮或你决定 |
 | `probe` 不限制解析地址数量（成本 = `ceil(N/8)×Timeout`，在证书自己的 pass claim 内） | 上限会与第 4 轮定下的「每个解析地址都必须判定」冲突；合理的修法是「超过上限即判定为无法完整验证（fail closed）」而不是抽样，需要设计。已记录 |
 
