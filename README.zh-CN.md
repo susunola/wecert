@@ -396,6 +396,10 @@ CA/Browser Forum 已排期 **2027-03-15 起 ≤100 天、2029-03-15 起 ≤47 �
 
 退出码：`0` 与预期一致 · `1` 探测根本没跑成 · `2` 探测跑成了，但服务的是错的证书。
 
+`-json` 下 `verdict.problems` 是对象数组（`{"kind": "...", "text": "..."}`），每个独立问题一条 ——
+因为排查方向不同：`min_valid_for` 表示服务的就是部署的那张证书、只是剩余有效期不够（续期还没跑），
+而 `not_after` 或 `names_extra` 才表示服务的是另一张证书。
+
 ```bash
 ./bin/wecert-probe -host www.example.com -min-valid 168h
 ./bin/wecert-probe -host www.example.com -wait 90s        # 刚换完绑
