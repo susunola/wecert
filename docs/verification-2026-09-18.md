@@ -183,7 +183,41 @@ level=INFO msg="an unpresented row's record was denied, but its challenge is new
 
 ## 6. 容器里的真实 DNS-01 与自然墙钟续期
 
-*(这一条仍在执行：在 Linux 容器里（本机 53 被占、容器里可用）跑 `make e2e` 与 `make test-pebble`，并用 pebble 的短有效期 profile 让守护进程按真实时间等到 ARI 窗口打开后自行续期。返回后补齐：suites 结果、CA 是否真的读到了我们写下的 TXT、自然续期的墙钟耗时与触发源。)*
+### 6.1 "真实 DNS-01 套件在本机永远跑不起来"—— **被反驳**
+
+那条结论（十一轮都写着 U86/U87）成立的前提是"53 端口在 macOS 上被占"，而**换到 Linux 容器里用 `--cap-add=NET_BIND_SERVICE` 就能真跑**。实测（ubuntu:24.04 + Go 1.26.8 + pebble v2.10.1，仓库只读挂载后 `diff -r` 核对过字节一致）：
+
+```
+make e2e → 三个套件全过、exit 0（23s / 6s / 22s）
+套件 1（真实 DNS-01）RUN 而不是 SKIP，18.49s，7 个子用例全 PASS：
+  e2e_dns_test.go:619: pebble https://127.0.0.1:14000/dir;
+  validation: real validation: the CA read the challenge record from the authority itself
+证据（套件自己记的权威查询日志，也在 HTML 报告的 UDP/TCP 表里）：
+  "propagation probe queried TXT _acme-challenge.a.e2e.example.com over UDP"
+  "the CA's validator queried TXT _acme-challenge.a.e2e.example.com over TCP"     （.b 同名一对）
+  合计 40 次 TCP TXT 查询 / 381 次 UDP；transports: authority answered over udp,tcp（没有不可达）
+签发："issued 2026-09-18T08:33:21Z..2026-12-17T08:33:20Z, 2 SAN(s)"，issuer "Pebble Intermediate CA 5501c2"
+make test-pebble → pass，exit 0
+```
+
+这是整份清单里最重要的一条：**CA 侧真的读到了我们写下的 TXT**（而且探针走 UDP、CA 的验证器走 TCP，两条路径都被真实查询过），不再只是"我们的传播检查说它看见了"。
+
+### 6.2 自然墙钟续期（压缩时间，但时钟是真的）
+
+用 pebble 的 `shortlived` profile（`validityPeriod: 900` 秒）让守护进程按**真实时间**等 ARI 窗口自己打开：
+
+```
+run 1（-once）签发 shortlived 证书
+守护进程随后自行续期，没有任何人改状态或改时钟：
+  "starting renewal" renewAt=2026-09-18T08:46:08.836Z ariReplaces=true      （签发后 536 秒）
+  "ACME order created" … replacesRequested=true
+  notAfter 08:52:09Z → 09:01:08Z
+pebble 侧日志："ARI: order … is a replacement of …"
+```
+
+关键细节：签发时 `renewBefore=1h` **已经过期**，所以这次续期的时点**完全由 CA 给的 ARI 窗口决定** —— 这正是"自然到期续期"里可以在这里验证的那一半（真实时钟、真实 ARI、真实 `replaces`）；剩下"真实 CA 上等 60 天"那一半仍然只能靠时间（§4.1）。
+
+顺带一条环境观察：容器里跑第一次 `make e2e` 时编译失败（`cleanup_test.go:450:11: undefined: bytes`），原因是**我本人正在同时编辑那棵树**（那次提交把 `bytes` 的 import 补上之前的一瞬间被拷走），不是仓库缺陷；重新拷贝后一次通过。
 
 ---
 
