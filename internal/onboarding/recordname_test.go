@@ -27,6 +27,18 @@ func TestJoinRecordName(t *testing.T) {
 		{"plain subdomain, short", "sub", "example.com", "sub.example.com"},
 		{"dotted relative name", "_wecert.alpha", "example.com", "_wecert.alpha.example.com"},
 
+		// A name that ALREADY contains the zone. The live API accepts and returns these verbatim
+		// (verified in the round-11 verification pass), so appending the zone again produced
+		// "x.example.com.example.com" -- a hostname ParseDeclaration then accepted, whose order can
+		// only fail validation. The boundary cases below are the reason the suffix test is on a label
+		// and not a plain string suffix.
+		{"absolute name in this zone", "_wecert.alpha.example.com", "example.com", "_wecert.alpha.example.com"},
+		{"the zone itself", "example.com", "example.com", "example.com"},
+		{"a name that merely ends with the zone text", "_wecert.notexample.com", "example.com",
+			"_wecert.notexample.com.example.com"},
+		{"a deeper name in this zone", "_wecert.alpha.beta.example.com", "example.com",
+			"_wecert.alpha.beta.example.com"},
+
 		// DNSPod uses "@" for the zone apex itself.
 		{"apex as @", "@", "example.com", "example.com"},
 		// An empty name is treated the same way; some responses come back blank for apex.
@@ -48,11 +60,20 @@ func TestJoinRecordName(t *testing.T) {
 		// would be seen as two different records.
 		{"zone is passed through untouched", "x", "Example.COM.", "x.Example.COM."},
 
-		// A name that already contains the zone is appended again. DNSPod returns relative
-		// names so this is unreachable in practice; it is pinned so nobody assumes the
-		// function de-duplicates.
-		{"absolute name is appended, not de-duplicated",
-			"alpha.example.com", "example.com", "alpha.example.com.example.com"},
+		// A name that already contains the zone is NOT appended again.
+		//
+		// This case used to pin the opposite -- "DNSPod returns relative names, so this is
+		// unreachable in practice" -- and the round-11 verification pass refuted that against the
+		// live API: a SubDomain written as a full host is accepted and returned verbatim. Appending
+		// the zone to it produced "alpha.example.com.example.com", which ParseDeclaration then
+		// accepted as a hostname, so the desired state carried a name that does not exist under the
+		// zone and its order could only fail validation (one authorization-failure credit per
+		// attempt). Reachability now depends on a third-party writer putting a zone-containing host
+		// in SubDomain, not on DNSPod's willingness to return one.
+		{"absolute name is de-duplicated, not appended",
+			"alpha.example.com", "example.com", "alpha.example.com"},
+		{"absolute name, case and dot differences", "Alpha.Example.COM.", "example.com",
+			"alpha.example.com"},
 	}
 
 	for _, tc := range cases {
