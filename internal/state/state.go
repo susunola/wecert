@@ -391,13 +391,27 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 		fmt.Fprintf(os.Stderr, "wecert: WARNING: %s\n", missingWALWarning(path))
 	}
 
-	if !existedBefore && lockExisted {
-		// See missingDatabaseWarning: a lock file with no database is what "someone deleted
-		// state.db" looks like. Warn rather than refuse -- a first run after restoring a
-		// backup, or an operator deliberately starting clean, are both legitimate -- but it
-		// must be loud, because the account key and every in-flight order are gone and the
-		// next issuance re-places orders.
-		fmt.Fprintf(os.Stderr, "wecert: WARNING: %s\n", missingDatabaseWarning(path))
+	// A lock file with no database is what "someone deleted state.db" looks like. A lock file with a
+	// ZERO-LENGTH database is the same shape one step later: the file was truncated to nothing (a
+	// crash during creation, a filesystem that lost the write, an rsync that was interrupted), and
+	// verifyDatabaseIntact deliberately accepts an empty file as a fresh database -- so without this
+	// the next start would come up "new" in silence. The round-11 crash-fault verification reproduced
+	// exactly that: an fsync EIO aborted the creation and left a 0-byte state.db next to its lock
+	// file, and the following healthy start printed only the ordinary first-run account message.
+	//
+	// Warn rather than refuse -- a first run after restoring a backup, or an operator deliberately
+	// starting clean, are both legitimate -- but it must be loud, because the account key and every
+	// in-flight order are gone and the next issuance re-places orders.
+	if lockExisted {
+		empty := false
+		if !existedBefore {
+			empty = true
+		} else if fi, statErr := os.Stat(path); statErr == nil && fi.Size() == 0 {
+			empty = true
+		}
+		if empty {
+			fmt.Fprintf(os.Stderr, "wecert: WARNING: %s\n", missingDatabaseWarning(path))
+		}
 	}
 
 	dsn := sqliteDSN(path)

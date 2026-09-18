@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -210,6 +211,56 @@ func TestTheDaemonKeepsRunningAfterAPassThatDidNotConverge(t *testing.T) {
 	}
 }
 
+// A one-shot run must not exit 0 when the snapshot it was supposed to write failed.
+//
+// `wecert-once.timer` runs -once hourly and its unit status is the only channel that deployment has
+// (round 9: /metrics does not live long enough for a rule with `for:`). A snapshot that cannot be
+// written leaves the recovery posture broken -- no copy of the account key, no in-flight order URL --
+// and that used to be an ERROR inside a background goroutine, so the timer stayed green. Reproduced
+// in the round-11 Linux verification with an injected fsync EIO: "state database snapshot failed",
+// exit 0.
+func TestAFailedSnapshotReachesTheOneShotExit(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.PutCert(&state.CertState{Name: "example-com", KeyPEM: []byte("KEY")}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// A path whose parent is a FILE cannot be created, which is the cheapest stand-in for a full or
+	// read-only disk: the store's Snapshot fails and says so.
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := takeSnapshot(store, filepath.Join(blocker, "snapshots"), 3, time.Hour, log); err == nil {
+		t.Error("a snapshot that could not be written must report a failure, or the one-shot exit " +
+			"code has nothing to act on")
+	}
+
+	// The healthy case is not a failure, and neither is the deliberate skip.
+	if err := takeSnapshot(store, filepath.Join(dir, "snapshots"), 3, time.Hour, log); err != nil {
+		t.Errorf("a writable directory must snapshot cleanly: %v", err)
+	}
+
+	// And the handle the one-shot path reads carries the error to onceExit.
+	health := &snapshotHealth{first: make(chan error, 1)}
+	health.first <- errors.New("disk I/O error")
+	if err := health.wait(time.Second); err == nil {
+		t.Error("the immediate snapshot's failure must reach the exit-code decision")
+	}
+	// A slow snapshot is not a failure: waiting has a bound, and a timeout must not fail a run whose
+	// pass converged (the daemon logs the real outcome).
+	slow := &snapshotHealth{first: make(chan error, 1)}
+	if err := slow.wait(10 * time.Millisecond); err != nil {
+		t.Errorf("a snapshot still in flight must not be reported as failed: %v", err)
+	}
+}
+
 // A restart on an empty database must not evict the snapshots that still hold the real state.
 //
 // This is the shape of the documented disaster: state.db is lost, the daemon starts with a fresh
@@ -229,7 +280,7 @@ func TestAnEmptyDatabaseIsNotSnapshotted(t *testing.T) {
 	var logs bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logs, nil))
 
-	takeSnapshot(store, backups, 3, time.Hour, log)
+	_ = takeSnapshot(store, backups, 3, time.Hour, log)
 
 	if _, err := os.Stat(backups); !os.IsNotExist(err) {
 		t.Errorf("no snapshot may be written for a database with nothing to recover, backup dir stat err %v", err)
@@ -244,7 +295,7 @@ func TestAnEmptyDatabaseIsNotSnapshotted(t *testing.T) {
 		t.Fatalf("PutCert: %v", err)
 	}
 	logs.Reset()
-	takeSnapshot(store, backups, 3, time.Hour, log)
+	_ = takeSnapshot(store, backups, 3, time.Hour, log)
 
 	snaps, err := store.Snapshots(backups)
 	if err != nil {

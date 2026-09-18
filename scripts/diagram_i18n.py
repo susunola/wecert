@@ -125,8 +125,8 @@ LABELS = {
     "3 · 发现两个 identifier": "3 · two identifiers turn out to",
     "指向同一个记录名": "share one record name",
     "5 · 传播检查（quorum）": "5 · propagation check (quorum)",
-    "无可达 NS 否认 且 ≥1 确认": "no reachable NS denies it, and ≥1 confirms",
-    "多台权威时要求 ≥2 台": "with multiple authorities, ≥2 must confirm",
+    "无可达 NS 否认 且 ≥1 确认": "no NS denial, ≥1 confirms",
+    "多台权威时要求 ≥2 台": "multi-NS zones: ≥2 confirm",
     "证书有效区间": "certificate validity",
     "ARI 建议窗口": "ARI suggested window",
     "renewBefore 兜底窗口（仅当 ARI 不可用）": "renewBefore fallback (only when ARI is unavailable)",
@@ -186,8 +186,8 @@ PROSE: dict[str, str] = {
         'From “somebody added a line to a DNS zone” to “deleted from the cloud”',
     '这套系统唯一的核心纪律是：wecert 永远不推断。 某个东西负责推断意图，并把结论写成一份可 diff 的文件；wecert 只读那份文件做收敛。 下面七张图从要解决的问题一路下钻到单个订单的状态机。':
         'The one rule everything else follows: <strong>wecert never infers.</strong>\n    Something else works out what should exist and writes it down; wecert only reads that document and converges.\n    The seven diagrams below go from the problem it solves down to the state machine of a single order.',
-    '默认模式 static 迁移路径 static → observe → enforce 当前版本 v0.5.0 Go 1.26.5':
-        '<span class="badge">default mode <b>static</b></span>\n    <span class="badge">migration <b>static → observe → enforce</b></span>\n    <span class="badge">version <b>v0.5.0</b></span>\n    <span class="badge">Go <b>1.26.5</b></span>',
+    '默认模式 static 迁移路径 static → observe → enforce 当前版本 v0.4.2 + 未发布改动 Go 1.26.6':
+        '<span class="badge">default mode <b>static</b></span>\n    <span class="badge">migration <b>static → observe → enforce</b></span>\n    <span class="badge">version <b>v0.4.2 + unreleased changes</b></span>\n    <span class="badge">Go <b>1.26.6</b></span>',
     '图 ①系统全景：谁拥有什么，谁只读什么':
         '<span class="num">diagram ①</span>System map — who owns what, who only reads',
     '从左到右是权限的传递：意图（人写）→ 推断（可丢弃）→ 契约（机器写）→ 执行（必须稳）→ 外部。 每一层的失败模式都不一样，这正是它们被拆开的原因。':
@@ -380,8 +380,8 @@ PROSE: dict[str, str] = {
         '<span class="num">table D</span>Field notes and pitfalls',
     '都是这套东西真跑起来之后才暴露的，按"如果不知道会浪费你多久"排序。':
         'All found by actually running this, ordered by how much time they would waste you.',
-    '打印 / 存为 PDF 最后更新 2026-09-16 · 对应 v0.5.0':
-        '<button class="print" type="button" onclick="window.print()">Print / save as PDF</button><br/>\n      <span style="font-size:12px">last updated 2026-09-16 · for v0.5.0</span>',
+    '打印 / 存为 PDF 最后更新 2026-09-18 · 对应 v0.4.2 + 未发布改动':
+        '<button class="print" type="button" onclick="window.print()">Print / save as PDF</button><br/>\n      <span style="font-size:12px">last updated 2026-09-18 · for v0.4.2 + unreleased changes</span>',
     '设计动机见 docs/desired-state-providers.md，操作手册见 docs/desired-state.md。 图 ① 的边语义：实线 = 同步，虚线 = 异步，点线 = 可选/兜底，粗线 = 关键路径。':
         'Design rationale in <code>docs/desired-state-providers.md</code>, operator guide in <code>docs/desired-state.md</code>.\n    Edge semantics in diagram ①: solid = synchronous, dashed = asynchronous, dotted = optional/fallback, thick = critical path.',
     'wecert · 证书生命周期架构图':
@@ -392,8 +392,8 @@ PROSE: dict[str, str] = {
         'default mode <b>static</b>',
     '迁移路径 static → observe → enforce':
         'migration <b>static → observe → enforce</b>',
-    '当前版本 v0.5.0':
-        'version <b>v0.5.0</b>',
+    '当前版本 v0.4.2 + 未发布改动':
+        'version <b>v0.4.2 + unreleased changes</b>',
     '① 系统全景':
         '① System map',
     '② 意图 → 契约':
@@ -576,8 +576,8 @@ PROSE: dict[str, str] = {
         'It shows up as a 504 while the TLS handshake is actually fine — very easy to misdiagnose as a certificate problem. Widening the security group fixes it.',
     '打印 / 存为 PDF':
         'Print / save as PDF',
-    '最后更新 2026-09-16 · 对应 v0.5.0':
-        'last updated 2026-09-16 · for v0.5.0',
+    '最后更新 2026-09-18 · 对应 v0.4.2 + 未发布改动':
+        'last updated 2026-09-18 · for v0.4.2 + unreleased changes',
     'wecert · 证书生命周期架构图 源码 github.com/susunola/wecert':
         '<strong>wecert</strong> · certificate lifecycle<br/>\n      source <code>github.com/susunola/wecert</code>',
     '图 ⓪':
