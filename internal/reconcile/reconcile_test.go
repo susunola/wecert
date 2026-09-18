@@ -614,6 +614,66 @@ func TestOrphanedCertificatesAreReported(t *testing.T) {
 	}
 }
 
+// A deployment with hundreds of orphans must not write hundreds of ERROR lines per pass.
+//
+// The orphan state is persistent by design (the row is kept so a re-added name resumes its history),
+// so the per-orphan line repeated on every pass: measured at 500 orphans that is 500 ERROR lines per
+// pass and 12,000 per day from one deployment, which is how a journal stops being read. The first few
+// keep their own line; the rest are counted, and every one of them is still reachable at Debug.
+func TestHundredsOfOrphansDoNotFloodTheJournal(t *testing.T) {
+	const orphans = orphanLogLimit + 5
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: "kept"}}}
+	for i := 0; i < orphans; i++ {
+		if err := store.PutCert(&state.CertState{
+			Name:     fmt.Sprintf("forgotten-%03d", i),
+			NotAfter: time.Now().Add(10 * 24 * time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var logs bytes.Buffer
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, &fakeManager{}, nil,
+		slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	r.RunDetailed(context.Background())
+
+	if got := testutil.ToFloat64(metrics.OrphanedCertificates); got != orphans {
+		t.Errorf("OrphanedCertificates = %v, want %d -- the count is what tells the operator the scale",
+			got, orphans)
+	}
+
+	// At Error: the first orphanLogLimit lines plus one summary. Everything else is Debug.
+	var errorLines, detailLines, summaries int
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		switch {
+		// The summary first: its wording contains the per-orphan sentence as well.
+		case strings.Contains(line, "more certificates are no longer"):
+			summaries++
+		case strings.Contains(line, "level=ERROR") && strings.Contains(line, "no longer in the desired state"):
+			errorLines++
+		case strings.Contains(line, "level=DEBUG") && strings.Contains(line, "no longer in the desired state"):
+			detailLines++
+		}
+	}
+	if errorLines != orphanLogLimit {
+		t.Errorf("ERROR orphan lines = %d, want %d (the bound)", errorLines, orphanLogLimit)
+	}
+	if summaries != 1 {
+		t.Errorf("expected exactly one summary line, got %d", summaries)
+	}
+	if detailLines != orphans-orphanLogLimit {
+		t.Errorf("the orphans past the bound must still be nameable at Debug: got %d, want %d",
+			detailLines, orphans-orphanLogLimit)
+	}
+}
+
 // ── a full trigger must resolve once and stay bounded ──────────────────────
 
 // countingProvider counts Desired calls.
