@@ -189,6 +189,45 @@
   deploy hook polling `/hook/status` finds the certificate absent from every field and concludes
   the trigger worked. A partial answer (some names started, others unknown) is still `202`, with
   the unrecognised names in `unknown`.
+- **`clbverify` accepts its own flags again.** `-clb` was registered on the package-level
+  `flag.CommandLine` instead of on the FlagSet `fs.Parse` actually reads, so every invocation
+  died with "flag provided but not defined: -clb" and the tool was unusable. The flags live in
+  an `options` struct behind `newFlagSet` now, and a test parses all eight of them.
+- **`wecert` catches the `-revoke` contradictions it defines.** `validateFlags` walked
+  `flag.Visit` — the package-level FlagSet, which nothing in this program parses — where
+  `fs.Visit` was meant, so the "explicitly set" map was always empty and every contradiction the
+  function exists to catch was accepted. Parsing is `parseArgs` now, and it is tested.
+- **A stale DNS-01 challenge lease is released under the per-name lock.**
+  `releaseStaleLeaseExcept` removed a lease without holding the per-name mutex, while
+  `dns.go:CleanUp` holds that same mutex across the whole provider call (remove, then
+  delete-ALL TXT). Interleaved, the delete-all ran when neither party held a lease, so a TXT
+  record stayed in DNS with no row and no lease holding it. The check-then-act now runs under
+  the lock.
+- **A failed read no longer resets an established backoff.** `RecordFailure`'s upsert overwrote
+  `consecutive_failures` and `next_attempt_at`. Its only caller passes a lower bound ("at least
+  one"), so one unreadable row during an already-backed-off certificate reset a 6-hour backoff
+  to the first retry — and dropped the count below the `ConsecutiveFailures >= 5` that failure
+  fallback needs, so the certificates that most needed degrading were the ones that could never
+  degrade. The upsert merges with `MAX` now: the count and the backoff are monotonic, and only a
+  successful pass (a whole-row `PutCert`) lowers them.
+- **A permanent deployment error no longer spins for the whole poll budget.** The three polling
+  loops did not distinguish a permanent API error from a transient one, so an `AuthFailure` or an
+  `UnsupportedOperation` spun for the full 3 minutes and the real cause was swallowed into "did
+  not finish within 3m". `tcerr.IsPermanent` / `IsThrottled` / `Code` classify the SDK error now:
+  permanent errors return at once, and a throttle doubles the poll interval instead of hammering
+  the limit. A cancelled call also keeps *both* identities — the context, so "a stopped process
+  is not a business failure" still sees it, and the API error, so a `RequestLimitExceeded` is
+  still classifiable — where before one replaced the other.
+- **A served chain that no client will accept is a failed probe.** `probe.Verify` compared what
+  was deployed against what was served and never read `Trusted` or `ChainError`, so a listener
+  serving the leaf without its intermediate — the single most common CLB misconfiguration —
+  passed every check and reported `probe_match = 1`, and so did a self-signed chain. Chain
+  verification is a fifth check now, reported as its own `untrusted` problem with the chain error
+  as the diagnosis. It is on by default in the reconcile loop, because there the question is
+  "will a client accept this"; turn it off with the new `probe.requireTrusted: false` when the CA
+  is internal, where "does not chain to a public root" is permanent and trains everyone to
+  ignore the alert. **This can flip `probe_match` from 1 to 0 on an existing deployment** — that
+  is the point, but it is a change in what the metric means.
 - **Smaller corrections:** the webhook `/hook/desired` endpoint reports a store read error as
   `error` instead of as `issued: false`; `RecordRevokeAttempt` refuses to count attempts against
   a non-existent request; `PutRateBucket(nil)` is an error like `PutAuthorization(nil)`;

@@ -338,9 +338,14 @@ func run() error {
 	reconciler.SetProber(prober)
 	if prober != nil {
 		cap := cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert)
+		// Reported at startup because it decides what probe_match means: with it on, a listener
+		// serving the deployed certificate without its intermediate is a mismatch, which is a
+		// change from every earlier version. Someone who turns it off for an internal CA should
+		// see that in the log too, next to the rest of the probe configuration.
+		requireTrusted := cfg.Probe.RequireTrustedOr(true)
 		log.Info("network-side certificate probing is on",
 			"port", cfg.Probe.Port, "timeout", cfg.Probe.TimeoutDur,
-			"maxHostsPerCert", cap)
+			"maxHostsPerCert", cap, "requireTrusted", requireTrusted)
 		if cap <= 0 {
 			// A cap of 0 is "probe nothing", which looks exactly like "probing is on" in every
 			// other line this program prints. Say it once at startup, where the config is being

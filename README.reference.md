@@ -813,6 +813,7 @@ Every pass, wecert dials a real TLS connection to each deployed certificate's fi
 | `timeout` | `10s` | Per-attempt timeout. Cross-AZ handshakes routinely take 3–5s; too small a value causes false alarms, and false alarms train people to ignore alarms |
 | `maxHostsPerCert` | `3` | Names probed per certificate. Not exhaustive on purpose: 25 handshakes per pass has linearly growing cost and diminishing returns. An explicit `0` dials nothing (pauses probing without removing the prober, unlike `enabled: false`) |
 | `minValidFor` | unset | Fail when the served certificate has less than this left. Redundant with the expiry alarm, but it asserts *the served* certificate is valid, not *the recorded* one |
+| `requireTrusted` | `true` | Whether a chain that does not verify against the system roots counts as a failed probe. On by default: a listener serving the leaf without its intermediate is the right certificate in the right place, still broken. Set to `false` for an internal CA, where "does not chain to a public root" is permanent |
 
 Wildcards are skipped — `*.example.com` has no address of its own to dial. A certificate that is entirely wildcards is therefore never probed, and is logged at debug level when that happens.
 
