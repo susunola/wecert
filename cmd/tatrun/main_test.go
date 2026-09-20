@@ -467,3 +467,62 @@ func TestDecodeRemoteOutputKeepsPlaintextThatMerelyDecodes(t *testing.T) {
 		t.Errorf("a decode that is not text must fall back to the raw value, got %q", got)
 	}
 }
+
+// TestEveryFlagIsRegisteredOnTheParsedFlagSet covers the bug that made this binary unusable
+// through its own command line: the flags were registered on the package-level flag.CommandLine
+// and read through flag.Parse(), so any invocation printed "flag provided but not defined" and
+// exited 2 -- the code wecert-onboard reserves for "deliberately frozen, a human should look".
+func TestEveryFlagIsRegisteredOnTheParsedFlagSet(t *testing.T) {
+	got, err := parseArgs([]string{
+		"-region", "ap-guangzhou",
+		"-instance", "ins-abc123",
+		"-cmd", "echo hello",
+		"-timeout", "45s",
+		"-interval", "2s",
+		"-quiet",
+	})
+	if err != nil {
+		t.Fatalf("parseArgs returned %v; every documented flag must be accepted", err)
+	}
+	want := options{
+		region:   "ap-guangzhou",
+		instance: "ins-abc123",
+		command:  "echo hello",
+		timeout:  45 * time.Second,
+		interval: 2 * time.Second,
+		quiet:    true,
+	}
+	if *got != want {
+		t.Errorf("options = %+v, want %+v", *got, want)
+	}
+}
+
+// TestUnknownFlagIsAUsageErrorNotAProcessExit pins the exit code: a typo on the command line must
+// come back as errUsage (64 through main), never as flag.ExitOnError's 2.
+func TestUnknownFlagIsAUsageErrorNotAProcessExit(t *testing.T) {
+	if _, err := parseArgs([]string{"-instace", "ins-abc123"}); !errors.Is(err, errUsage) {
+		t.Errorf("err = %v, want errUsage (main exits %d, not 2)", err, exitUsage)
+	}
+	// -h is not an error: the flag package has already printed the usage.
+	if _, err := parseArgs([]string{"-h"}); !errors.Is(err, errHelp) {
+		t.Errorf("err = %v, want errHelp", err)
+	}
+}
+
+// TestTheParsedFlagSetKeepsItsDefaults checks that flags left out keep the documented defaults,
+// so a caller that omits -timeout does not silently poll with a zero deadline.
+func TestTheParsedFlagSetKeepsItsDefaults(t *testing.T) {
+	got, err := parseArgs([]string{"-region", "ap-guangzhou", "-instance", "ins-1", "-cmd", "true"})
+	if err != nil {
+		t.Fatalf("parseArgs returned %v", err)
+	}
+	if got.timeout != 180*time.Second {
+		t.Errorf("timeout default = %s, want 180s", got.timeout)
+	}
+	if got.interval != 3*time.Second {
+		t.Errorf("interval default = %s, want 3s", got.interval)
+	}
+	if got.quiet {
+		t.Error("quiet default = true, want false")
+	}
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 
@@ -344,5 +345,53 @@ func TestCredentialGuardRequiresBothHalves(t *testing.T) {
 	}
 	if got := missingCredential("id", "key"); got != "" {
 		t.Errorf("both halves present must pass, got %q", got)
+	}
+}
+
+// Every flag must be reachable through the flag set this command parses.
+//
+// Regression: "-clb" was registered on the package-level flag.CommandLine instead of fs, so
+// fs.Parse answered "flag provided but not defined: -clb" and the tool could never reach a
+// single query -- while every test here still passed, because they only call the pure
+// helpers. Parsing is now testable through newFlagSet, so this cannot regress silently.
+func TestEveryFlagIsRegisteredOnTheParsedFlagSet(t *testing.T) {
+	var o options
+	fs := newFlagSet(&o)
+	args := []string{
+		"-region", "ap-guangzhou",
+		"-clb", "lb-1234abcd",
+		"-listener", "lbl-5678efgh",
+		"-expect", "cert-new",
+		"-domain", "www.example.com",
+		"-not-expect", "cert-old",
+		"-raw",
+		"-wait", "45s",
+	}
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("fs.Parse(%v) = %v, want every flag this command documents to be defined", args, err)
+	}
+
+	want := options{
+		region:     "ap-guangzhou",
+		lbID:       "lb-1234abcd",
+		listenerID: "lbl-5678efgh",
+		expect:     "cert-new",
+		domain:     "www.example.com",
+		notExpect:  "cert-old",
+		raw:        true,
+		wait:       45 * time.Second,
+	}
+	if o != want {
+		t.Errorf("parsed options = %+v, want %+v", o, want)
+	}
+}
+
+// An unknown flag is still a command-line error, not a silent default.
+func TestUnknownFlagIsRejected(t *testing.T) {
+	var o options
+	fs := newFlagSet(&o)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse([]string{"-nope"}); err == nil {
+		t.Error("fs.Parse accepted an undefined flag, want an error")
 	}
 }

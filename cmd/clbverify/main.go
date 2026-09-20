@@ -41,18 +41,40 @@ func main() {
 	}
 }
 
-func run() error {
+// options holds every flag this command takes.
+//
+// It is a struct rather than a set of local *string variables so that the flag set can be
+// built by newFlagSet and parsed in a test: the parsing path is where "-clb" once sat on the
+// package-level flag.CommandLine, invisible to fs.Parse, which made the tool reject its own
+// required flag and never run a single query.
+type options struct {
+	region     string
+	lbID       string
+	listenerID string
+	expect     string
+	domain     string
+	notExpect  string
+	raw        bool
+	wait       time.Duration
+}
+
+// newFlagSet registers every flag on fs -- never on the package-level flag.CommandLine.
+func newFlagSet(o *options) *flag.FlagSet {
 	fs := flag.NewFlagSet("clbverify", flag.ContinueOnError)
-	var (
-		region     = fs.String("region", "", "region, e.g. ap-guangzhou")
-		lbID       = fs.String("clb", "", "CLB instance ID")
-		listenerID = fs.String("listener", "", "listener ID; when omitted, the first listener on that CLB is used")
-		expect     = fs.String("expect", "", "certificate ID that must be in the asserted set; when set the assertion must hold")
-		domain     = fs.String("domain", "", "assert on the certificate the forwarding rule for this domain serves (SNI); when omitted every certificate on the listener and its rules is asserted")
-		notExpect  = fs.String("not-expect", "", "certificate ID that must NOT be present")
-		raw        = fs.Bool("raw", false, "dump the raw DescribeListeners JSON response for troubleshooting")
-		wait       = fs.Duration("wait", 0, "how long to poll for the expected certificate (UpdateCertificateInstance is asynchronous)")
-	)
+	fs.StringVar(&o.region, "region", "", "region, e.g. ap-guangzhou")
+	fs.StringVar(&o.lbID, "clb", "", "CLB instance ID")
+	fs.StringVar(&o.listenerID, "listener", "", "listener ID; when omitted, the first listener on that CLB is used")
+	fs.StringVar(&o.expect, "expect", "", "certificate ID that must be in the asserted set; when set the assertion must hold")
+	fs.StringVar(&o.domain, "domain", "", "assert on the certificate the forwarding rule for this domain serves (SNI); when omitted every certificate on the listener and its rules is asserted")
+	fs.StringVar(&o.notExpect, "not-expect", "", "certificate ID that must NOT be present")
+	fs.BoolVar(&o.raw, "raw", false, "dump the raw DescribeListeners JSON response for troubleshooting")
+	fs.DurationVar(&o.wait, "wait", 0, "how long to poll for the expected certificate (UpdateCertificateInstance is asynchronous)")
+	return fs
+}
+
+func run() error {
+	var o options
+	fs := newFlagSet(&o)
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -60,7 +82,7 @@ func run() error {
 		return errUsage
 	}
 
-	if *region == "" || *lbID == "" {
+	if o.region == "" || o.lbID == "" {
 		return fmt.Errorf("%w: -region and -clb are required (-listener is optional; when omitted, "+
 			"the first listener on that CLB is used)", errUsage)
 	}
@@ -76,7 +98,7 @@ func run() error {
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "clb.tencentcloudapi.com"
 
-	client, err := clb.NewClient(cred, *region, cpf)
+	client, err := clb.NewClient(cred, o.region, cpf)
 	if err != nil {
 		return fmt.Errorf("build CLB client: %w", err)
 	}
@@ -85,12 +107,12 @@ func run() error {
 	defer cancel()
 
 	req := clb.NewDescribeListenersRequest()
-	req.LoadBalancerId = common.StringPtr(*lbID)
+	req.LoadBalancerId = common.StringPtr(o.lbID)
 	// With no ListenerIds, every listener on the CLB comes back.
 	// Observed while debugging: filtering by ListenerIds can return entries without the
 	// Certificate field, so the unfiltered path is kept for cross-checking.
-	if *listenerID != "" {
-		req.ListenerIds = []*string{common.StringPtr(*listenerID)}
+	if o.listenerID != "" {
+		req.ListenerIds = []*string{common.StringPtr(o.listenerID)}
 	}
 
 	resp, err := client.DescribeListenersWithContext(ctx, req)
@@ -98,20 +120,20 @@ func run() error {
 		return fmt.Errorf("DescribeListeners: %w", err)
 	}
 	if resp.Response == nil || len(resp.Response.Listeners) == 0 {
-		return noListenersError(*lbID, *listenerID)
+		return noListenersError(o.lbID, o.listenerID)
 	}
 
 	// The verdict comes from one place, so -raw cannot skip the assertions. It used to return
 	// here with the dump and no verdict, which silently disabled -expect/-not-expect: a script
 	// that added -raw while debugging kept exiting 0 without asserting anything.
 	return evaluateListener(os.Stdout, resp, verifyOptions{
-		raw:       *raw,
-		domain:    *domain,
-		expect:    *expect,
-		notExpect: *notExpect,
-		wait:      *wait,
+		raw:       o.raw,
+		domain:    o.domain,
+		expect:    o.expect,
+		notExpect: o.notExpect,
+		wait:      o.wait,
 	}, func(ctx context.Context) ([]string, error) {
-		return fetchBoundCertIDs(ctx, client, *lbID, *listenerID, *domain)
+		return fetchBoundCertIDs(ctx, client, o.lbID, o.listenerID, o.domain)
 	})
 }
 
