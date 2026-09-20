@@ -342,6 +342,17 @@ type Expectation struct {
 	// MinValidFor is "how much validity must at least remain".
 	MinValidFor time.Duration
 
+	// RequireTrusted makes a chain that does not verify against the system roots a problem
+	// (ProblemUntrusted) instead of something only the trusted metric records.
+	//
+	// Off by default, because the two facts are deliberately separable: "the certificate does
+	// not chain to a public root" and "the certificate is not the one I deployed" send you to
+	// different places, and an internal CA makes the first one permanent and meaningless.
+	// The reconcile loop turns it on (see probe.requireTrusted) because there the question is
+	// "will a client accept this", and a listener serving the leaf without its intermediate
+	// passes every other check while failing in every real client.
+	RequireTrusted bool
+
 	// Now is injectable to make testing easier.
 	Now time.Time
 }
@@ -377,6 +388,15 @@ const (
 	ProblemNotAfter ProblemKind = "not_after"
 	// ProblemMinValidFor: the deployed certificate is served, with less validity left than required.
 	ProblemMinValidFor ProblemKind = "min_valid_for"
+	// ProblemUntrusted: the peer's chain does not verify against the system roots.
+	//
+	// A deployment can be "the right certificate, in the right place, still broken": a
+	// listener serving the leaf without its intermediate verifies for nobody, and a
+	// self-signed or unexpired-but-untrusted chain is the same shape. Everything else here
+	// compares what was deployed against what is served, so without this check a chain that
+	// no client will accept still came back OK -- the false green this package exists to
+	// rule out. Set Expectation.RequireTrusted to false for a private CA.
+	ProblemUntrusted ProblemKind = "untrusted"
 	// ProblemUnreachable: the probe could not answer at all (resolution, dial or handshake), or could
 	// answer for only some of the host's addresses. It is an environment problem, not a certificate
 	// one, and the runner reports it as such.
@@ -406,10 +426,11 @@ func (v Verdict) Summary() string {
 
 // Verify compares the probe result against the expectation.
 //
-// The four classes of problem are reported separately rather than merged into one
+// The five classes of problem are reported separately rather than merged into one
 // "verification failed": they point in completely different directions -- a name mismatch
 // means looking at DNS and CLB rules, a different certificate means checking whether the
-// rebind took effect, and an expired one means finding out why renewal never ran.
+// rebind took effect, an expired one means finding out why renewal never ran, and a chain
+// that does not verify means the listener's certificate configuration is incomplete.
 func (r *Result) Verify(e Expectation) Verdict {
 	now := e.Now
 	if now.IsZero() {
@@ -458,6 +479,25 @@ func (r *Result) Verify(e Expectation) Verdict {
 				"the served certificate has %s left, less than the required %s",
 				left.Round(time.Hour), e.MinValidFor)})
 		}
+	}
+
+	// 5. Will a client accept it?
+	//
+	// The four checks above all answer "is this the certificate I deployed". None of them
+	// answers "does it work": a listener that serves the leaf without its intermediate --
+	// the single most common CLB configuration mistake -- passes every one of them and
+	// fails in every real client. Trusted is only meaningful when a certificate was
+	// captured at all, so a missing leaf stays ProblemNoCertificate rather than doubling up.
+	if r.cert != nil && e.RequireTrusted && !r.Trusted {
+		text := "the served certificate's chain does not verify against the system roots"
+		if r.ChainError != "" {
+			// The chain error is the diagnosis (a missing intermediate, an internal CA,
+			// an expired root); without it this says "broken" and not what to look at.
+			text += ": " + r.ChainError
+		} else {
+			text += " (no chain error was recorded)"
+		}
+		problems = append(problems, Problem{Kind: ProblemUntrusted, Text: text})
 	}
 
 	return Verdict{OK: len(problems) == 0, Problems: problems}
