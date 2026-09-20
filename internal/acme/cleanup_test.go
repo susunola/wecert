@@ -137,6 +137,56 @@ func seedOrderWithAuthzs(t *testing.T, store *state.Store, certName string, auth
 	}
 }
 
+// ---------- the release path must hold the per-name mutex ----------
+
+// Releasing a lease has to happen under the same per-name mutex CleanUp holds.
+//
+// Regression: releaseStaleLeaseExcept took only the registry lock, so its "is any other value
+// still live?" check and its remove were not ordered against CleanUp's check-then-act. The two
+// interleaved like this: CleanUp sees value B live, skips the delete-all and returns; this call
+// then removes B's lease. Nothing is live and nobody is left to delete, so the record stays in
+// DNS with no row and no lease pointing at it -- invisible to cleanupOrphanTXT, which walks the
+// authorization rows, and poisoning every later order that writes the same challenge name.
+func TestReleaseStaleLeaseTakesThePerNameMutex(t *testing.T) {
+	saved := challengeLeases
+	challengeLeases = newTXTLeases()
+	t.Cleanup(func() { challengeLeases = saved })
+
+	const fqdn = "_acme-challenge.example.com."
+	const value = "value-a"
+
+	m, _ := newTestManager(t, &fakeSolver{}, fakeKeyAuth{})
+
+	// Hold the name's mutex the way CleanUp does: across the check and the provider call.
+	mu, release := challengeLeases.lock(fqdn)
+	defer release()
+	mu.Lock()
+	defer mu.Unlock()
+	challengeLeases.add(fqdn, value)
+
+	done := make(chan struct{})
+	go func() {
+		m.releaseStaleLease(fqdn, value)
+		close(done)
+	}()
+
+	// It must wait for the mutex rather than release the lease underneath a live CleanUp.
+	select {
+	case <-done:
+		t.Fatal("released a lease without holding the per-name mutex: it ran while CleanUp's " +
+			"check-then-act was in flight")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the release never ran after the mutex was freed; it is deadlocked")
+	}
+	mu.Lock()
+}
+
 // ---------- leak regression: the core of this file ----------
 
 // The worst leak path: the order is already ready, so advance goes straight to

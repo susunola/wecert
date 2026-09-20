@@ -635,10 +635,13 @@ func (m *Manager) recordFailure(ctx context.Context, st *state.CertState, err er
 // which narrows the write to the failure bookkeeping columns and never touches the rest
 // of the row.
 //
-// What an unreadable row costs is the counter itself: the consecutive failure count
-// cannot be known without the row, so it restarts at 1 and the backoff is the base
-// window. A store whose reads are failing is exactly the case this path exists for, and
-// the material an exact count would take down with it is worth more than the count.
+// What an unreadable row costs is precision, not the count: the consecutive failure count
+// cannot be computed without the row, so this pass contributes "at least one" and the base
+// window. RecordFailure merges those with MAX, so what is already on disk survives -- the
+// count keeps climbing towards the fallback threshold and the backoff keeps its width
+// instead of collapsing every time a read happens to fail. A store whose reads are failing
+// is exactly the case this path exists for, and the material an exact count would take down
+// with it is worth more than the count.
 func (m *Manager) recordFailureUnreadable(ctx context.Context, name string, err error) error {
 	// Same contract as recordFailure: a stopped pass is not a business failure.
 	if ctx.Err() != nil {
@@ -658,7 +661,7 @@ func (m *Manager) recordFailureUnreadable(ctx context.Context, name string, err 
 
 	m.log.Error("pass failed; a retry has been scheduled (the certificate row could not be read, "+
 		"so only the failure bookkeeping was written and the stored certificate material is untouched)",
-		"cert", name, "err", err, "consecutiveFailures", 1, "nextAttemptAt", nextAttemptAt)
+		"cert", name, "err", err, "consecutiveFailures", "at least 1 (the stored count is kept)", "nextAttemptAt", nextAttemptAt)
 	return err
 }
 

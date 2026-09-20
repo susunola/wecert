@@ -15,6 +15,7 @@ import (
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
 
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/tcerr"
 )
 
 // TencentCLB uses the Tencent Cloud SSL certificate service to one-click update a
@@ -216,8 +217,25 @@ func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM
 // it can only apply if the error carries the sentinel. The context is the authority on why the call
 // stopped, so it is consulted first.
 func sdkCallError(ctx context.Context, what string, err error) error {
-	if cerr := ctx.Err(); cerr != nil {
+	// Only an explicit cancellation outranks the API's own error.
+	//
+	// A deadline is most often the API being slow, and throttling makes that the common
+	// case: replacing RequestLimitExceeded with "context deadline exceeded" took away the
+	// only signal the caller had that it should back off, so it retried at the same rate
+	// into a limit it had just hit.
+	if cerr := ctx.Err(); errors.Is(cerr, context.Canceled) {
 		return fmt.Errorf("%s: %w", what, cerr)
+	}
+	// A deadline that has expired keeps BOTH identities rather than one replacing the other.
+	//
+	// Replacing the API error with "context deadline exceeded" took away the only signal that
+	// the call had been throttled (RequestLimitExceeded), so the caller retried at the same
+	// rate into a limit it had just hit. Replacing the context with the API error hid that the
+	// call never finished -- which is what "a stopped process is not a business failure" keys
+	// on. Both are wrapped, so `errors.Is` finds either and the message names them in the order
+	// they happened.
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("%s: %w (context: %w)", what, err, cerr)
 	}
 	return fmt.Errorf("%s: %w", what, err)
 }
@@ -524,6 +542,13 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 	// misdiagnoses a task that was making progress as "no resource bound to the old
 	// certificate" and sends the operator off to check a listener that is fine.
 	var success, failed, running, pending int64
+	// The last error a query returned, and how many there were, so a timeout says why the
+	// polls kept failing instead of only saying that they did.
+	var lastQueryErr error
+	var pollFailures int
+	// Throttling is transient, but retrying at the polling interval amplifies it, so once the
+	// API asks for a slower caller the rest of this loop waits longer.
+	throttled := false
 
 	// Between the task being created and the server marking it running, every counter is
 	// zero. Concluding "no resource is bound" from that instant would repeat the very
@@ -535,6 +560,17 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 	for {
 		s, f, r, p, instrumented, err := d.describeDeployRecord(ctx, client, recordID)
 		if err != nil {
+			// Not every query failure means "the answer is not ready yet". A revoked key or a
+			// missing permission answers the same way for the rest of the process, so waiting
+			// for the deadline only hides it behind "did not finish within 3m".
+			if tcerr.IsPermanent(err) {
+				return fmt.Errorf("cannot query one-click update task %d: %w", recordID, err)
+			}
+			pollFailures++
+			lastQueryErr = err
+			if tcerr.IsThrottled(err) {
+				throttled = true
+			}
 			d.log.Warn("failed to query the deploy record; retrying shortly", "deployRecordId", recordID, "err", err)
 		} else if !instrumented {
 			// The record detail has the same async-population hazard as the sync
@@ -570,13 +606,32 @@ func (d *TencentCLB) waitDeployRecord(ctx context.Context, client sslAPI, record
 			}
 		}
 		if d.now().After(deadline) {
+			// The counters are the last *known* state, so they are worth reporting even when
+			// the polls were failing -- but so is the reason, without which this reads as a
+			// slow task rather than as an API that refused to answer.
+			if lastQueryErr != nil {
+				return fmt.Errorf("one-click update task %d did not finish within 3m (success=%d failed=%d running=%d pending=%d); the last %d polls failed, most recently: %w",
+					recordID, success, failed, running, pending, pollFailures, lastQueryErr)
+			}
 			return fmt.Errorf("one-click update task %d did not finish within 3m (success=%d failed=%d running=%d pending=%d)",
 				recordID, success, failed, running, pending)
 		}
-		if err := waitBetweenPolls(ctx, 5*time.Second); err != nil {
+		if err := waitBetweenPolls(ctx, pollWait(5*time.Second, throttled)); err != nil {
 			return err
 		}
 	}
+}
+
+// pollWait is how long to wait before the next poll.
+//
+// Throttling is transient so it is not a reason to give up, but retrying at the ordinary
+// interval is what turns a limit into a longer one: the caller keeps consuming the very
+// budget the API asked it to spare.
+func pollWait(base time.Duration, throttled bool) time.Duration {
+	if throttled {
+		return 3 * base
+	}
+	return base
 }
 
 // describeDeployRecord queries the resource-level detail of a deploy record once.
@@ -705,6 +760,8 @@ const (
 func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, certID string) error {
 	deadline := d.now().Add(deleteTaskTimeout)
 
+	var lastQueryErr error
+	throttled := false
 	for {
 		req := ssl.NewDescribeDeleteCertificatesTaskResultRequest()
 		req.TaskIds = []*string{common.StringPtr(taskID)}
@@ -716,6 +773,17 @@ func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, 
 			// hit. Retry within the same deadline, exactly as waitDeployRecord does; the
 			// deadline and the ctx-aware wait below bound the retry, and a caller
 			// cancellation still surfaces through waitBetweenPolls.
+			//
+			// Except when the error is one retrying cannot fix: a revoked key or a missing
+			// permission answers identically for the rest of the process, so waiting for the
+			// deadline would only report it as a task that never finished.
+			if tcerr.IsPermanent(err) {
+				return fmt.Errorf("cannot query the delete task for %s (taskId=%s): %w", certID, taskID, err)
+			}
+			lastQueryErr = err
+			if tcerr.IsThrottled(err) {
+				throttled = true
+			}
 			d.log.Warn("failed to query the delete task's result; retrying shortly",
 				"taskId", taskID, "err", err)
 		} else {
@@ -733,11 +801,17 @@ func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, 
 		}
 
 		if d.now().After(deadline) {
+			if lastQueryErr != nil {
+				return fmt.Errorf(
+					"the delete task for %s did not finish within %s (taskId=%s); every poll failed, most recently: %w; "+
+						"keeping it on the reclaim list to retry",
+					certID, deleteTaskTimeout, taskID, lastQueryErr)
+			}
 			return fmt.Errorf(
 				"the delete task for %s did not finish within %s (taskId=%s); keeping it on the reclaim list to retry",
 				certID, deleteTaskTimeout, taskID)
 		}
-		if err := waitBetweenPolls(ctx, deleteTaskPoll); err != nil {
+		if err := waitBetweenPolls(ctx, pollWait(deleteTaskPoll, throttled)); err != nil {
 			return err
 		}
 	}
@@ -990,38 +1064,57 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 	// server's own latency produces a verification that never answers, which is worse than
 	// waiting (see defaultEnumerationBudget).
 	deadline := d.now().Add(d.enumerationWait())
+	var lastQueryErr error
+	throttled := false
 	for {
 		queryReq := ssl.NewDescribeCertificateBindResourceTaskResultRequest()
 		queryReq.TaskIds = []*string{common.StringPtr(taskID)}
 
 		queryResp, err := client.DescribeCertificateBindResourceTaskResultWithContext(ctx, queryReq)
 		if err != nil {
-			return bindingCount{}, sdkCallError(ctx, "DescribeCertificateBindResourceTaskResult", err)
-		}
-
-		n, done, err := countBindings(queryResp, taskID)
-		if err != nil {
-			return bindingCount{}, err
-		}
-		if done {
-			if !n.complete {
-				// The task finished, but at least one region's query failed inside it. Polling
-				// again is not obviously better -- the region error is not a "not ready yet"
-				// signal -- so the caller gets the lower bound and decides. For the confirmation
-				// poll a non-zero count still confirms; for the two verification calls a zero
-				// from an incomplete answer is refused rather than believed.
-				d.log.Warn("the bind-resource enumeration finished with at least one region "+
-					"unanswered; the binding count is a lower bound",
-					"certId", certID, "taskId", taskID, "boundResources", n.count)
+			// A failed QUERY is not "no bindings": the answer was never read. Returning it as
+			// an error here abandoned a switch that had already succeeded -- the repair path
+			// skipped its fix and nothingBoundYet answered false -- on the strength of one
+			// network hiccup during a poll that can legitimately run for minutes. The
+			// deadline below is the budget; only an error retrying cannot fix ends the wait.
+			if tcerr.IsPermanent(err) {
+				return bindingCount{}, sdkCallError(ctx, "DescribeCertificateBindResourceTaskResult", err)
 			}
-			return n, nil
+			lastQueryErr = err
+			if tcerr.IsThrottled(err) {
+				throttled = true
+			}
+			d.log.Warn("failed to query the bind-resource enumeration; retrying within the budget",
+				"certId", certID, "taskId", taskID, "err", err)
+		} else {
+			n, done, err := countBindings(queryResp, taskID)
+			if err != nil {
+				return bindingCount{}, err
+			}
+			if done {
+				if !n.complete {
+					// The task finished, but at least one region's query failed inside it. Polling
+					// again is not obviously better -- the region error is not a "not ready yet"
+					// signal -- so the caller gets the lower bound and decides. For the confirmation
+					// poll a non-zero count still confirms; for the two verification calls a zero
+					// from an incomplete answer is refused rather than believed.
+					d.log.Warn("the bind-resource enumeration finished with at least one region "+
+						"unanswered; the binding count is a lower bound",
+						"certId", certID, "taskId", taskID, "boundResources", n.count)
+				}
+				return n, nil
+			}
 		}
 
 		if d.now().After(deadline) {
+			if lastQueryErr != nil {
+				return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within %s "+
+					"(taskId=%s); every poll failed, most recently: %w", d.enumerationWait(), taskID, lastQueryErr)
+			}
 			return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within %s (taskId=%s)",
 				d.enumerationWait(), taskID)
 		}
-		if err := waitBetweenPolls(ctx, 2*time.Second); err != nil {
+		if err := waitBetweenPolls(ctx, pollWait(2*time.Second, throttled)); err != nil {
 			return bindingCount{}, err
 		}
 	}
