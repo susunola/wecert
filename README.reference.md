@@ -724,6 +724,8 @@ It answers `202 Accepted` — not `200` — because convergence is handed to the
 - `skipped` — already running, **not** started a second time
 - `unknown` — not in the configuration
 
+If **every** name you sent comes back `unknown`, the answer is `404`, not `202`: nothing is converging, and a `202` there tells a deploy hook its trigger worked when it did nothing. A partial answer (some names started, others unknown) is still `202`, with the unrecognised names in `unknown`.
+
 Poll `/hook/status` for the outcome:
 
 ```json
@@ -809,7 +811,7 @@ Every pass, wecert dials a real TLS connection to each deployed certificate's fi
 | `enabled` | `true` | Turn the probe off if wecert runs somewhere that cannot reach the VIP |
 | `port` | `443` | TCP port to dial |
 | `timeout` | `10s` | Per-attempt timeout. Cross-AZ handshakes routinely take 3–5s; too small a value causes false alarms, and false alarms train people to ignore alarms |
-| `maxHostsPerCert` | `3` | Names probed per certificate. Not exhaustive on purpose: 25 handshakes per pass has linearly growing cost and diminishing returns |
+| `maxHostsPerCert` | `3` | Names probed per certificate. Not exhaustive on purpose: 25 handshakes per pass has linearly growing cost and diminishing returns. An explicit `0` dials nothing (pauses probing without removing the prober, unlike `enabled: false`) |
 | `minValidFor` | unset | Fail when the served certificate has less than this left. Redundant with the expiry alarm, but it asserts *the served* certificate is valid, not *the recorded* one |
 
 Wildcards are skipped — `*.example.com` has no address of its own to dial. A certificate that is entirely wildcards is therefore never probed, and is logged at debug level when that happens.

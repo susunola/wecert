@@ -234,6 +234,9 @@ metrics:
 #   # Maximum number of names to dial per certificate. Not all of them: dialing
 #   # all 25 names of a 25-name certificate every round has diminishing returns
 #   # and linearly growing cost.
+#   # An explicit 0 means "dial nothing" (pause probing without disabling it --
+#   # enabled: false removes the prober entirely). It used to be rewritten to the
+#   # default on load, so writing 0 silently kept probing three hosts per cert.
 #   maxHostsPerCert: 3
 #   # Empty means do not check remaining validity. This check is redundant, but it
 #   # fails differently: it verifies "the edge really is serving a non-expired

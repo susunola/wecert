@@ -147,6 +147,48 @@
   file was passed in becomes a root-owned binary" — and the same directory's second binary was
   installed as root with no check at all. Both are verified now, and the ELF check compares the
   binary's machine against `uname -m` instead of passing any 64-bit ELF on any architecture.
+- **`tatrun` no longer exits 2 on a typo.** It was the last command in the tree using the
+  package-level `flag.Parse()`, whose `ExitOnError` prints the usage and exits 2 — the code
+  `wecert-onboard` reserves for "deliberately frozen, a human should look". It now parses its own
+  `ContinueOnError` FlagSet and returns the conventional usage code 64, like every other command.
+- **A state snapshot is no longer cut short by shutdown.** `startStateBackups` returned nothing, so
+  the one background worker that writes to SQLite on its own schedule was never waited for: a pass
+  that ended as the ticker fired raced the deferred `store.Close()` against `Snapshot`'s
+  `VACUUM INTO`. It now returns a stop function that cancels the loop and waits for it.
+- **A rejected webhook token no longer leaks the port.** `startWebhookServer` bound the listener
+  and then returned on a `webhook.New` error, so the fix — edit `webhook.token`, restart — failed
+  with "address already in use", pointing at a phantom instance instead of the setting just changed.
+- **`preflight` cannot page a domain list forever.** `findDomain`'s two exits are both answers the
+  server gives (an empty page, or a covered total), so a server that ignores `Offset` looped
+  without end. It is now capped at 100 pages, and hitting the cap is an error rather than the
+  function's documented "the account does not hold this domain" answer.
+- **`probe.maxHostsPerCert: 0` is honoured.** As a plain int it was indistinguishable from unset,
+  so `normalize` rewrote it to the default and reconcile's "a cap of 0 means probing is off" branch
+  was unreachable in production: writing 0 to pause probing silently kept probing three hosts per
+  certificate. It is a `*int` now, like `enabled` and `requireTrusted`, and `wecert` warns at
+  startup when the cap is 0 so the silence of the probe series is not read as "nothing to report".
+- **A panic after the pass's answer no longer changes that answer.** `publish` and `probeCert`
+  run after the switch that decides ok/error/skipped and are both best-effort, but they ran bare: a
+  panic in either unwound into `reconcileOne`'s recover, so a certificate that had just been
+  renewed was reported as a failed pass — metric `ok`, report `Failed`, `-once` exiting non-zero
+  for a certificate that was fine. Both are contained now: counted, logged with a stack, and no
+  longer an answer.
+- **One in-flight pass no longer suspends probe-series reclamation for the whole fleet.**
+  `reclaimStaleProbeSeries` skipped everything while ANY pass was running, and a webhook-triggered
+  pass runs for minutes while the timer's own pass finishes around it — so hosts whose certificate
+  had already left the desired state kept their series, which is the permanent false alert that
+  function exists to remove. The guard is per certificate now; only a pass for a certificate that
+  is no longer in the desired state can still hold back a host with no owner.
+- **An unreadable desired state no longer destroys the probe record.** `reclaimStaleProbeSeries`
+  cleared the per-round `probedHosts` set *before* the branch that returns with "keep the series
+  rather than deleting evidence", so one unreadable document threw away the record of what was
+  probed — and the next round that did resolve a document deleted the series of every host the
+  previous round probed and this one did not.
+- **A webhook trigger that names nothing managed here answers 404, not 202.** `202` says
+  "accepted, convergence is on its way" for a request that will never converge anything, and a
+  deploy hook polling `/hook/status` finds the certificate absent from every field and concludes
+  the trigger worked. A partial answer (some names started, others unknown) is still `202`, with
+  the unrecognised names in `unknown`.
 - **Smaller corrections:** the webhook `/hook/desired` endpoint reports a store read error as
   `error` instead of as `issued: false`; `RecordRevokeAttempt` refuses to count attempts against
   a non-existent request; `PutRateBucket(nil)` is an error like `PutAuthorization(nil)`;
