@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -97,5 +98,64 @@ func TestParseLogLevelRejectsUnknownValues(t *testing.T) {
 		} else if !strings.Contains(err.Error(), bad) {
 			t.Errorf("the error must echo the offending value %q, got %v", bad, err)
 		}
+	}
+}
+
+// The "explicitly set" map must come from the flag set this command actually parses.
+//
+// Regression: it was built with flag.Visit -- the package-level flag.CommandLine, which nothing
+// in wecert ever parses -- so explicit was always empty and "-revoke x -once" was accepted
+// despite the contradiction. TestValidateFlagsRejectsContradictions above cannot catch that:
+// it hands validateFlags a map it built itself, so it passes even when the real wiring is dead.
+func TestParseArgsReportsExplicitlySetFlags(t *testing.T) {
+	f, explicit, err := parseArgs([]string{"-revoke", "www.example.com", "-once"})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	if !explicit["revoke"] {
+		t.Error("-revoke was given but is not marked explicitly set")
+	}
+	if !explicit["once"] {
+		t.Error("-once was given but is not marked explicitly set")
+	}
+	if f.revokeCert != "www.example.com" || !f.once {
+		t.Errorf("parsed flags = %+v, want revoke=www.example.com and once=true", f)
+	}
+	// The whole point of the map: with it populated, validateFlags sees the contradiction.
+	if err := validateFlags(explicit, f.once, f.dryRun, f.interval); err == nil {
+		t.Error("-revoke together with -once must be rejected, not resolved silently")
+	}
+}
+
+// Flags left at their default must not count as set: -log-level and -interval always have a
+// value, so counting values instead of visits would make "-revoke x" look contradictory and
+// refuse a perfectly ordinary revocation.
+func TestParseArgsLeavesDefaultsOutOfTheExplicitMap(t *testing.T) {
+	f, explicit, err := parseArgs([]string{"-revoke", "www.example.com"})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	for name := range explicit {
+		if name != "revoke" {
+			t.Errorf("flag %q was never given yet is marked explicitly set", name)
+		}
+	}
+	if err := validateFlags(explicit, f.once, f.dryRun, f.interval); err != nil {
+		t.Errorf("-revoke alone must pass validateFlags, got %v", err)
+	}
+	// The defaults still landed, so nothing downstream reads a zero value.
+	if f.logLevel != "info" || f.interval != time.Hour || f.configPath != "config.yaml" {
+		t.Errorf("defaults were not applied: %+v", f)
+	}
+}
+
+// A typo is a command-line error with the usage exit code, never a silent fall back.
+func TestParseArgsRejectsAnUnknownFlag(t *testing.T) {
+	_, _, err := parseArgs([]string{"-reovke", "www.example.com"})
+	if err == nil {
+		t.Fatal("an unknown flag must be an error")
+	}
+	if !errors.Is(err, errUsage) {
+		t.Errorf("err = %v, want errUsage (exit %d, not 1)", err, exitUsage)
 	}
 }

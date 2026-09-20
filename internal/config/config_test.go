@@ -693,6 +693,30 @@ certificates:
 	}
 }
 
+// A config that merely ends with a separator is one document, not two.
+//
+// Regression: yaml.v3 decodes a trailing "---" to a nil value with no error, so the
+// multi-document guard took it for a second document and refused the file. This is
+// fail-closed in the worst place -- Load failing keeps the daemon from starting, so every
+// certificate stops being renewed because of a separator that changes nothing.
+func TestLoadAcceptsATrailingDocumentSeparator(t *testing.T) {
+	for _, body := range []string{
+		"---\n",
+		"---",
+		"---\n---\n",
+		"---\n# nothing but a comment\n",
+	} {
+		path := writeConfig(t, minimalPrefix+`
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`+body)
+		if _, err := Load(path); err != nil {
+			t.Errorf("a config ending in %q is one document and must load, got %v", body, err)
+		}
+	}
+}
+
 // Two certificates asking for the same identifier set share one quota bucket and cover
 // the same names, so the second buys nothing. The desired-state path already rejected
 // this shape via checkNameStability; static and observe mode did not.

@@ -26,28 +26,84 @@ import (
 	"strings"
 )
 
+// exitUsage is the conventional "the command line itself is wrong" code, the same one wecert,
+// wecert-onboard, wecert-probe, preflight and clbverify use. It matters here because the
+// alternative was flag.ExitOnError's 2, which this repository documents as wecert-onboard's
+// "deliberately frozen, a human should look" code.
+const exitUsage = 64
+
+// errUsage marks a command-line error, so main can pick the exit code without re-printing
+// what the flag package already printed to stderr.
+var errUsage = errors.New("invalid command line")
+
+// errHelp is parseArgs' answer to -h: the flag package has already printed the usage, and
+// asking for help is not an error.
+var errHelp = errors.New("help requested")
+
 func main() {
 	if err := run(); err != nil {
+		if errors.Is(err, errUsage) {
+			os.Exit(exitUsage)
+		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	var (
-		region   = flag.String("region", "", "region, e.g. ap-guangzhou")
-		instance = flag.String("instance", "", "CVM instance ID, e.g. ins-xxxx")
-		command  = flag.String("cmd", "", "shell command to run")
-		timeout  = flag.Duration("timeout", 180*time.Second, "overall timeout")
-		interval = flag.Duration("interval", 3*time.Second, "poll interval")
-		quiet    = flag.Bool("quiet", false, "print only the command's stdout, for piping")
-	)
-	flag.Parse()
+// options holds every flag this command takes.
+//
+// It left run's locals so parsing has a test. The flags used to be registered on the
+// package-level flag.CommandLine and parsed with flag.Parse(), which is ExitOnError: a typo
+// ("-instace") made the process exit 2 with the usage text, the same code wecert-onboard
+// uses to mean "deliberately frozen, a human should look". Every other command in this
+// repository parses its own FlagSet with ContinueOnError.
+type options struct {
+	region   string
+	instance string
+	command  string
+	timeout  time.Duration
+	interval time.Duration
+	quiet    bool
+}
 
-	if *region == "" || *instance == "" || *command == "" {
+// newFlagSet registers every flag on fs -- never on the package-level flag.CommandLine.
+func newFlagSet(o *options) *flag.FlagSet {
+	fs := flag.NewFlagSet("tatrun", flag.ContinueOnError)
+	fs.StringVar(&o.region, "region", "", "region, e.g. ap-guangzhou")
+	fs.StringVar(&o.instance, "instance", "", "CVM instance ID, e.g. ins-xxxx")
+	fs.StringVar(&o.command, "cmd", "", "shell command to run")
+	fs.DurationVar(&o.timeout, "timeout", 180*time.Second, "overall timeout")
+	fs.DurationVar(&o.interval, "interval", 3*time.Second, "poll interval")
+	fs.BoolVar(&o.quiet, "quiet", false, "print only the command's stdout, for piping")
+	return fs
+}
+
+// parseArgs parses args into options.
+func parseArgs(args []string) (*options, error) {
+	var o options
+	fs := newFlagSet(&o)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, errHelp
+		}
+		return nil, errUsage
+	}
+	return &o, nil
+}
+
+func run() error {
+	o, err := parseArgs(os.Args[1:])
+	if err != nil {
+		if errors.Is(err, errHelp) {
+			return nil
+		}
+		return err
+	}
+
+	if o.region == "" || o.instance == "" || o.command == "" {
 		return fmt.Errorf("-region, -instance and -cmd are required")
 	}
-	if err := validateInterval(*interval); err != nil {
+	if err := validateInterval(o.interval); err != nil {
 		return err
 	}
 
@@ -60,15 +116,15 @@ func run() error {
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "tat.tencentcloudapi.com"
 
-	client, err := newTATClient(common.NewCredential(secretID, secretKey), *region, cpf)
+	client, err := newTATClient(common.NewCredential(secretID, secretKey), o.region, cpf)
 	if err != nil {
 		return fmt.Errorf("build TAT client: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
 	defer cancel()
 
-	runResp, err := client.RunCommandWithContext(ctx, buildRunCommand(*command, *instance, *timeout))
+	runResp, err := client.RunCommandWithContext(ctx, buildRunCommand(o.command, o.instance, o.timeout))
 	if err != nil {
 		return fmt.Errorf("RunCommand (check the tat:RunCommand permission, and whether the CVM has the TAT agent installed): %w", err)
 	}
@@ -83,11 +139,11 @@ func run() error {
 		return fmt.Errorf("RunCommand returned no InvocationId")
 	}
 
-	if !*quiet {
+	if !o.quiet {
 		fmt.Fprintf(os.Stderr, "TAT command submitted (invocation=%s), waiting for it to run...\n", invocationID)
 	}
 
-	return waitForTask(ctx, client, invocationID, *timeout, *interval, *quiet)
+	return waitForTask(ctx, client, invocationID, o.timeout, o.interval, o.quiet)
 }
 
 // tatAPI is the slice of the TAT client this command uses, so the poll loop below can be

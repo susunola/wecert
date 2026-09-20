@@ -735,6 +735,20 @@ func (m *Manager) releaseStaleLeaseExcept(fqdn, value string, except *state.Auth
 	if fqdn == "" || value == "" {
 		return
 	}
+	// The per-name mutex, held across the whole check-then-act.
+	//
+	// DNSSolver.CleanUp holds this same mutex across "is any other value still live?" and the
+	// provider's delete-EVERY-TXT call, so releasing a lease without it inverted that guard:
+	// CleanUp would see this value live, skip the delete-all and return, and this call would
+	// then remove the last lease -- leaving no live value and nobody left to run the delete.
+	// The record then stays in DNS with no row and no lease pointing at it, so cleanupOrphanTXT
+	// (which walks the authorizations) cannot see it either, and it poisons every later order
+	// that writes the same challenge name.
+	mu, release := challengeLeases.lock(fqdn)
+	defer release()
+	mu.Lock()
+	defer mu.Unlock()
+
 	rows, err := m.store.ListPresentedAuthorizations()
 	if err != nil {
 		m.log.Warn("cannot check whether another authorization still needs a TXT record; keeping its lease",

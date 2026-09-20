@@ -1379,6 +1379,21 @@ func putCertExec(e execer, c *CertState) error {
 // schema default (each NOT NULL column of certificates has a DEFAULT, and
 // cert_pem/key_pem are nullable), which matches what putCertExec's INSERT
 // branch produces for a fresh row.
+//
+// The two counters are merged with MAX, not overwritten.
+//
+// The only caller is the path taken when the row could NOT be read, so the count it can
+// compute ("at least one failure: this one") is a lower bound, never the whole truth.
+// Overwriting with it destroyed evidence already on disk: a certificate that had failed
+// eight times straight and then hit one unreadable row went back to 1, which reset the
+// exponential backoff to its base window AND dropped it below the threshold the failure
+// fallback needs to trigger (ConsecutiveFailures >= 5), so a certificate that most needed
+// degrading was the one that could never degrade. MAX keeps the higher of the two: the
+// stored count is the same fact observed more completely.
+//
+// A successful pass still clears both -- it goes through PutCert, which is a whole-row
+// upsert and writes consecutive_failures from the CertState -- so MAX cannot strand a
+// stale backoff after recovery.
 func (s *Store) RecordFailure(name, lastErr string, consecutiveFailures int, nextAttemptAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1386,8 +1401,8 @@ func (s *Store) RecordFailure(name, lastErr string, consecutiveFailures int, nex
 		INSERT INTO certificates (name, consecutive_failures, next_attempt_at, last_error, updated_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
-			consecutive_failures = excluded.consecutive_failures,
-			next_attempt_at      = excluded.next_attempt_at,
+			consecutive_failures = MAX(consecutive_failures, excluded.consecutive_failures),
+			next_attempt_at      = MAX(next_attempt_at, excluded.next_attempt_at),
 			last_error           = excluded.last_error,
 			updated_at           = excluded.updated_at`,
 		// last_error is bounded here for the same reason putCertExec bounds it (see

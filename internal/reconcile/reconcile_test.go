@@ -1114,7 +1114,7 @@ func TestOrphanCleanupIsWired(t *testing.T) {
 
 	cfg := &config.Config{}
 	cfg.Certificates = []config.Certificate{{Name: kept}}
-	cfg.Probe.MaxHostsPerCert = 3
+	cfg.Probe.MaxHostsPerCert = intPtr(3)
 
 	mgr := &fakeManager{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -1306,7 +1306,7 @@ func TestPanicInTheProbeIsContained(t *testing.T) {
 	defer store.Close()
 
 	cfg := &config.Config{
-		Probe: config.Probe{MaxHostsPerCert: 1},
+		Probe: config.Probe{MaxHostsPerCert: intPtr(1)},
 		Certificates: []config.Certificate{{
 			Name:    "probed",
 			Domains: []string{"probed.example.com"},
@@ -2341,5 +2341,48 @@ func TestStartNamedReturnsTheAcceptedPrefixWhenShutdownBeginsMidWalk(t *testing.
 	}
 	if calls := mgr.reconciled(); len(calls) != 1 || calls[0] != "a" {
 		t.Errorf("the accepted pass must have run (Drain waited for it), reconciled=%v", calls)
+	}
+}
+
+// A panic in the work that runs AFTER the pass's answer has been decided must not change that
+// answer.
+//
+// publish and probeCert are best-effort -- publish only mirrors state into Prometheus, and
+// probeCert's own contract is "failing to reach a conclusion does not affect this pass". But
+// they ran bare, so a panic in either unwound into reconcileOne's recover, which set err: a
+// certificate that had just been renewed was reported as a FAILED pass (metrics said ok, the
+// report said Failed) and `-once` exited non-zero for a certificate that was fine. That is a
+// false alarm on the one channel whose whole point is to be believed.
+func TestAPanicAfterASuccessfulPassDoesNotFailThePass(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const name = "renewed"
+	if err := store.PutCert(&state.CertState{
+		Name: name, DeployConfirmed: true, NotAfter: time.Now().Add(30 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: name}}}
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, &fakeManager{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// publish reads the store unconditionally; a nil one panics the moment it is called, which
+	// is exactly the "panic in the post-pass work" shape under test.
+	r.store = nil
+
+	before := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues(name))
+
+	if err := r.RunCert(context.Background(), name); err != nil {
+		t.Errorf("a panic in the metric mirror must not fail a pass that renewed its certificate, "+
+			"got err=%v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues(name)) - before; got != 1 {
+		t.Errorf("the panic must still be counted (any nonzero wecert_reconcile_panics_total is a "+
+			"bug), got %v", got)
 	}
 }

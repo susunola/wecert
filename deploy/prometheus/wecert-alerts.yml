@@ -111,21 +111,30 @@ groups:
             that. This profile is used precisely where a lapse is immediate, so treat it as urgent
             even if wecert_certificate_consecutive_failures is still 0.
 
-      # Deployed but not serving the certificate wecert deployed.
+      # Deployed but not serving a usable copy of the certificate wecert deployed.
       #
       # This is the failure the state database cannot see: the API said the rebind succeeded, and
       # the TLS handshake serves something else. It is the reason the probe exists.
+      #
+      # "Not usable" includes a chain no client accepts: probe.requireTrusted (on by default)
+      # reports probe_match = 0 for a listener serving the leaf without its intermediate, which
+      # IS the deployed certificate. The annotation below says so, because the fix for that one
+      # is on the listener, not in wecert.
       - alert: WecertServedCertificateIsNotTheDeployedOne
         expr: wecert_certificate_probe_match == 0
         for: 15m
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.host }} is not serving the certificate wecert deployed"
+          summary: "{{ $labels.host }} is not serving a usable copy of the certificate wecert deployed"
           description: >-
-            Either the rebind did not take effect, another certificate is winning SNI, or the
+            Either the rebind did not take effect, another certificate is winning SNI, the
             certificate that is deployed is below probe.minValidFor (in which case it IS the
-            deployed one and the log line says so). The journal carries the per-address reason:
+            deployed one and the log line says so), or its chain does not verify against the
+            system roots -- probe.requireTrusted, on by default, counts "the right certificate
+            served without its intermediate" as a mismatch too, because no client accepts it.
+            Set probe.requireTrusted: false when the CA is internal and cannot chain to a public
+            root. The journal carries the per-address reason:
             wecert_certificate_probe_match == 0 with wecert_certificate_probe_errors_total flat
             means every address answered. To compare expiries by hand, find the certificate whose
             SANs cover {{ $labels.host }} (the config, the desired-state document, or

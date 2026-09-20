@@ -498,7 +498,7 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string, counted bo
 // was never issued was also never probed (probing requires a confirmed deploy),
 // so there is nothing to reclaim then.
 func (r *Reconciler) orphanProbeHosts(st *state.CertState) []string {
-	hosts := probeHosts(r.issuedSANs(st), r.cfg.Probe.MaxHostsPerCert)
+	hosts := probeHosts(r.issuedSANs(st), r.cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert))
 	if len(hosts) == 0 && st != nil && len(st.CertPEM) > 0 {
 		// An orphan has no configured names to fall back to, so an unreadable certificate means the
 		// per-host probe series cannot be reclaimed here. Say that, because the consequence is a
@@ -802,11 +802,6 @@ func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 		return
 	}
 
-	r.probeMu.Lock()
-	current := r.probedHosts
-	r.probedHosts = map[string]struct{}{}
-	r.probeMu.Unlock()
-
 	// Judge each candidate host against the desired state the pass already resolved.
 	//
 	// This used to resolve per host (inside hostIsUnconfirmed): every stale host paid a full
@@ -820,15 +815,27 @@ func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 	// hostOwner is nil when there is no store to judge deployment state from (a partially built
 	// reconciler in tests): every stale host is then reclaimed, which is what the old helper did
 	// for that case.
-	var hostOwner map[string]string
+	var (
+		hostOwner    map[string]string
+		desiredNames map[string]bool
+	)
 	if r.store != nil {
 		if res == nil {
 			// No desired state: keep the series rather than deleting evidence.
+			//
+			// And keep the record of what was probed too. The per-round set used to be cleared
+			// above, before this return, so "keep the evidence" threw away the very thing that
+			// says which hosts are live: the next pass that DID resolve a document judged
+			// every host last round probed -- and this round did not -- as stale, and deleted
+			// the series this branch exists to preserve. One unreadable document was enough to
+			// turn a whole round's probe evidence into deletions.
 			return
 		}
 		hostOwner = make(map[string]string, len(res.Certificates))
+		desiredNames = make(map[string]bool, len(res.Certificates))
 		for i := range res.Certificates {
 			c := &res.Certificates[i]
+			desiredNames[c.Name] = true
 			for _, d := range probeHosts(c.Domains, len(c.Domains)) {
 				// First certificate wins, matching the old helper's "return on the first match"
 				// order: a host covered by two certificates must be judged by the one the document
@@ -839,6 +846,16 @@ func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 			}
 		}
 	}
+	// A pass for a certificate the desired state no longer lists: the only in-flight pass that
+	// can still be about a host that has no owner here.
+	orphanPassInFlight := r.anyPassInFlightExcept(desiredNames)
+
+	// The record is per-round, so take it and reset it only now that the round is really being
+	// judged -- see the res == nil branch above.
+	r.probeMu.Lock()
+	current := r.probedHosts
+	r.probedHosts = map[string]struct{}{}
+	r.probeMu.Unlock()
 
 	for _, h := range all.ProbedHosts() {
 		if _, live := current[h]; live {
@@ -854,25 +871,39 @@ func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 		// host disappear and reappear, which is exactly the flicker this function's own
 		// contract says it avoids -- and a probe_match series that blinks is a false
 		// alert for whoever is paging on it.
-		if r.anyPassInFlight() {
-			continue
-		}
-		// And a certificate that is merely UNCONFIRMED is still being worked on.
 		//
-		// probeCert returns early for a certificate whose deployment is not confirmed (the honest
-		// thing: there is no "deployed certificate" to compare against), so a host disappears from
-		// this round's probe set during exactly the window a renewal is mid-rebind -- which can last
-		// until the next binding check, up to six hours. Deleting there made probe_match,
-		// probe_not_after and probe_trusted flicker once per renewal, and for a rebind that then
-		// FAILED it was worse than flicker: the series a `probe_match == 0` alert would fire on were
-		// gone, so the documented alert stayed silent for the failure it exists to catch.
-		//
-		// A host whose certificate has left the desired state entirely is reclaimed as before.
-		if name, inDesiredState := hostOwner[h]; inDesiredState {
+		// Judged PER CERTIFICATE, not globally. The guard used to be "is any pass anywhere in
+		// flight", which meant a single webhook-triggered pass -- and those run for minutes
+		// while the timer's own pass walks past them -- suspended reclamation for the whole
+		// fleet. A host whose certificate had already left the desired state then kept its
+		// series anyway, which is the permanent false alert this function exists to remove.
+		// Only the host's own certificate being mid-pass justifies waiting.
+		name, inDesiredState := hostOwner[h]
+		if inDesiredState {
+			if r.passInFlight(name) {
+				continue
+			}
+			// And a certificate that is merely UNCONFIRMED is still being worked on.
+			//
+			// probeCert returns early for a certificate whose deployment is not confirmed (the
+			// honest thing: there is no "deployed certificate" to compare against), so a host
+			// disappears from this round's probe set during exactly the window a renewal is
+			// mid-rebind -- which can last until the next binding check, up to six hours.
+			// Deleting there made probe_match, probe_not_after and probe_trusted flicker once
+			// per renewal, and for a rebind that then FAILED it was worse than flicker: the
+			// series a `probe_match == 0` alert would fire on were gone, so the documented
+			// alert stayed silent for the failure it exists to catch.
 			st, err := r.store.GetCert(name)
 			if err != nil || st == nil || !st.DeployConfirmed {
 				continue
 			}
+		} else if orphanPassInFlight {
+			// No owner in the desired state -- but a pass can still be running for the
+			// certificate this host belonged to before it was removed, and that pass may
+			// not have reached probeCert yet. Wait for THAT one rather than deleting a
+			// series a live pass is about to write. A pass for a certificate the desired
+			// state still lists is not a reason to wait: it cannot be about this host.
+			continue
 		}
 		metrics.DeleteProbeSeries(h)
 		// The runner's transition memory has to go with the series. Its own comment says
@@ -889,6 +920,37 @@ func (r *Reconciler) anyPassInFlight() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.running) > 0
+}
+
+// anyPassInFlightExcept reports whether any certificate outside names currently holds a
+// convergence claim.
+//
+// That is "is a pass running for a certificate that is no longer part of the desired state":
+// such a pass can still be about a host the desired state does not own, so its probeCert has
+// not necessarily run yet. A pass for a certificate the desired state DOES list cannot be about
+// that host, and must not hold reclamation up -- that is what the plain anyPassInFlight test
+// used to do to the whole fleet.
+func (r *Reconciler) anyPassInFlightExcept(names map[string]bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for n := range r.running {
+		if !names[n] {
+			return true
+		}
+	}
+	return false
+}
+
+// passInFlight reports whether this one certificate currently holds a convergence claim.
+//
+// The per-certificate form of anyPassInFlight, and the one reclaimStaleProbeSeries needs: a
+// global "anybody busy" test let one unrelated in-flight pass suspend reclamation for every
+// host in the fleet.
+func (r *Reconciler) passInFlight(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, busy := r.running[name]
+	return busy
 }
 
 // RunCert processes exactly one named certificate. An unknown name returns an
@@ -1260,8 +1322,15 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 		metrics.ReconcileTotal.WithLabelValues(c.Name, "ok").Inc()
 	}
 
-	r.publish(c)
-	r.probeCert(ctx, c)
+	// Both of these run AFTER the switch above has decided what this pass's answer is, and
+	// both are best-effort: publish only mirrors state into Prometheus, and probeCert is
+	// documented as "failing to reach a conclusion does not affect this pass". A panic in
+	// either therefore must not become the pass's answer -- it used to unwind into the recover
+	// above, which reported a certificate that had just been renewed as a FAILED pass: the
+	// metric said ok, the report said Failed, and `-once` exited non-zero for a certificate
+	// that was fine. Contained here, it is a counted, logged bug instead of a false alarm.
+	r.publishPanicSafe(c)
+	r.probeCertPanicSafe(ctx, c)
 
 	// Notified only when the pass actually attempted something: "every renewal attempt
 	// emits" is the documented meaning of this event, and a backoff skip is the absence of
@@ -1275,6 +1344,46 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *config.Certificate) (e
 		r.notifyPanicSafe(ctx, c.Name, err)
 	}
 	return err
+}
+
+// publishPanicSafe runs publish inside its own recover.
+//
+// publish mirrors the state store into Prometheus and nothing else: it is not part of the
+// pass's answer. Letting a panic in it escape into reconcileOne's recover turned a successful
+// renewal into a reported failure (see the call site), which is the shape of a false alarm --
+// and a false alarm on the renewal channel is what trains people to ignore it.
+func (r *Reconciler) publishPanicSafe(c *config.Certificate) {
+	defer func() {
+		if p := recover(); p != nil {
+			metrics.ReconcilePanics.WithLabelValues(c.Name).Inc()
+			r.log.Error("recovered from a panic while publishing this certificate's metrics; "+
+				"the pass itself is unaffected, but the expiry series may be stale. This is a bug, "+
+				"please report it",
+				"cert", c.Name, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+		}
+	}()
+	r.publish(c)
+}
+
+// probeCertPanicSafe runs probeCert inside its own recover.
+//
+// probeCert is documented as best-effort evidence -- "failing to reach a conclusion does not
+// affect this pass" -- and a panic is only the most abrupt way of failing to reach one. Its
+// per-host goroutines each recover already (a panic there is unrecoverable by the parent), but
+// the part that runs on this goroutine -- reading the stored certificate, building the
+// expectation -- had no handler, so a panic there reached reconcileOne's recover and reported a
+// renewed certificate as a failed pass.
+func (r *Reconciler) probeCertPanicSafe(ctx context.Context, c *config.Certificate) {
+	defer func() {
+		if p := recover(); p != nil {
+			metrics.ReconcilePanics.WithLabelValues(c.Name).Inc()
+			r.log.Error("recovered from a panic while probing the live endpoint; the pass itself is "+
+				"unaffected, but there is no network-side evidence for this certificate. This is a "+
+				"bug, please report it",
+				"cert", c.Name, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+		}
+	}()
+	r.probeCert(ctx, c)
 }
 
 // probeCert dials a real TLS connection to confirm the live endpoint really
@@ -1312,14 +1421,14 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 			"cert", c.Name)
 		domains = c.Domains
 	}
-	hosts := probeHosts(domains, r.cfg.Probe.MaxHostsPerCert)
+	hosts := probeHosts(domains, r.cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert))
 	if len(hosts) == 0 {
-		if r.cfg.Probe.MaxHostsPerCert <= 0 {
+		if r.cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert) <= 0 {
 			// A cap of 0 is "off" (probeHosts' contract, e.g. probing paused during an
 			// investigation) -- blaming wildcards would point the diagnosis at the
 			// certificate when the cause is the setting.
 			r.log.Debug("nothing to probe: the per-certificate host cap is 0, so probing is off",
-				"cert", c.Name, "maxHostsPerCert", r.cfg.Probe.MaxHostsPerCert)
+				"cert", c.Name, "maxHostsPerCert", r.cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert))
 		} else {
 			// Every name in this certificate is a wildcard: nothing concrete to dial.
 			r.log.Debug("nothing to probe: every name in this certificate is a wildcard",
@@ -1331,11 +1440,7 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 		return
 	}
 
-	e := probe.Expectation{
-		Domains:     domains,
-		NotAfter:    st.NotAfter,
-		MinValidFor: r.cfg.Probe.MinValidDur,
-	}
+	e := r.probeExpectation(domains, st.NotAfter)
 
 	// Dial the names of one certificate concurrently. Serially, a 3-name
 	// certificate takes 30 seconds when every probe times out, and this runs every
@@ -1365,6 +1470,23 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 		}(host)
 	}
 	wg.Wait()
+}
+
+// probeExpectation is what the probe must find for this certificate to count as deployed.
+//
+// Split out of probeCert so the trust switch has a test: it is the one field that is not
+// simply copied out of the state or the configuration, and getting it wrong either blinds the
+// probe to a chain no client accepts or reports a permanent mismatch for an internal CA.
+func (r *Reconciler) probeExpectation(domains []string, notAfter time.Time) probe.Expectation {
+	return probe.Expectation{
+		Domains:     domains,
+		NotAfter:    notAfter,
+		MinValidFor: r.cfg.Probe.MinValidDur,
+		// A chain that no client accepts is a failed deployment even when the certificate is
+		// the one that was deployed, so this is strict unless the configuration says the CA
+		// is internal (probe.requireTrusted: false).
+		RequireTrusted: r.cfg.Probe.RequireTrustedOr(true),
+	}
 }
 
 // probeHosts picks the dialable names out of one certificate's domains.

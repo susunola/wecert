@@ -147,6 +147,87 @@
   file was passed in becomes a root-owned binary" — and the same directory's second binary was
   installed as root with no check at all. Both are verified now, and the ELF check compares the
   binary's machine against `uname -m` instead of passing any 64-bit ELF on any architecture.
+- **`tatrun` no longer exits 2 on a typo.** It was the last command in the tree using the
+  package-level `flag.Parse()`, whose `ExitOnError` prints the usage and exits 2 — the code
+  `wecert-onboard` reserves for "deliberately frozen, a human should look". It now parses its own
+  `ContinueOnError` FlagSet and returns the conventional usage code 64, like every other command.
+- **A state snapshot is no longer cut short by shutdown.** `startStateBackups` returned nothing, so
+  the one background worker that writes to SQLite on its own schedule was never waited for: a pass
+  that ended as the ticker fired raced the deferred `store.Close()` against `Snapshot`'s
+  `VACUUM INTO`. It now returns a stop function that cancels the loop and waits for it.
+- **A rejected webhook token no longer leaks the port.** `startWebhookServer` bound the listener
+  and then returned on a `webhook.New` error, so the fix — edit `webhook.token`, restart — failed
+  with "address already in use", pointing at a phantom instance instead of the setting just changed.
+- **`preflight` cannot page a domain list forever.** `findDomain`'s two exits are both answers the
+  server gives (an empty page, or a covered total), so a server that ignores `Offset` looped
+  without end. It is now capped at 100 pages, and hitting the cap is an error rather than the
+  function's documented "the account does not hold this domain" answer.
+- **`probe.maxHostsPerCert: 0` is honoured.** As a plain int it was indistinguishable from unset,
+  so `normalize` rewrote it to the default and reconcile's "a cap of 0 means probing is off" branch
+  was unreachable in production: writing 0 to pause probing silently kept probing three hosts per
+  certificate. It is a `*int` now, like `enabled` and `requireTrusted`, and `wecert` warns at
+  startup when the cap is 0 so the silence of the probe series is not read as "nothing to report".
+- **A panic after the pass's answer no longer changes that answer.** `publish` and `probeCert`
+  run after the switch that decides ok/error/skipped and are both best-effort, but they ran bare: a
+  panic in either unwound into `reconcileOne`'s recover, so a certificate that had just been
+  renewed was reported as a failed pass — metric `ok`, report `Failed`, `-once` exiting non-zero
+  for a certificate that was fine. Both are contained now: counted, logged with a stack, and no
+  longer an answer.
+- **One in-flight pass no longer suspends probe-series reclamation for the whole fleet.**
+  `reclaimStaleProbeSeries` skipped everything while ANY pass was running, and a webhook-triggered
+  pass runs for minutes while the timer's own pass finishes around it — so hosts whose certificate
+  had already left the desired state kept their series, which is the permanent false alert that
+  function exists to remove. The guard is per certificate now; only a pass for a certificate that
+  is no longer in the desired state can still hold back a host with no owner.
+- **An unreadable desired state no longer destroys the probe record.** `reclaimStaleProbeSeries`
+  cleared the per-round `probedHosts` set *before* the branch that returns with "keep the series
+  rather than deleting evidence", so one unreadable document threw away the record of what was
+  probed — and the next round that did resolve a document deleted the series of every host the
+  previous round probed and this one did not.
+- **A webhook trigger that names nothing managed here answers 404, not 202.** `202` says
+  "accepted, convergence is on its way" for a request that will never converge anything, and a
+  deploy hook polling `/hook/status` finds the certificate absent from every field and concludes
+  the trigger worked. A partial answer (some names started, others unknown) is still `202`, with
+  the unrecognised names in `unknown`.
+- **`clbverify` accepts its own flags again.** `-clb` was registered on the package-level
+  `flag.CommandLine` instead of on the FlagSet `fs.Parse` actually reads, so every invocation
+  died with "flag provided but not defined: -clb" and the tool was unusable. The flags live in
+  an `options` struct behind `newFlagSet` now, and a test parses all eight of them.
+- **`wecert` catches the `-revoke` contradictions it defines.** `validateFlags` walked
+  `flag.Visit` — the package-level FlagSet, which nothing in this program parses — where
+  `fs.Visit` was meant, so the "explicitly set" map was always empty and every contradiction the
+  function exists to catch was accepted. Parsing is `parseArgs` now, and it is tested.
+- **A stale DNS-01 challenge lease is released under the per-name lock.**
+  `releaseStaleLeaseExcept` removed a lease without holding the per-name mutex, while
+  `dns.go:CleanUp` holds that same mutex across the whole provider call (remove, then
+  delete-ALL TXT). Interleaved, the delete-all ran when neither party held a lease, so a TXT
+  record stayed in DNS with no row and no lease holding it. The check-then-act now runs under
+  the lock.
+- **A failed read no longer resets an established backoff.** `RecordFailure`'s upsert overwrote
+  `consecutive_failures` and `next_attempt_at`. Its only caller passes a lower bound ("at least
+  one"), so one unreadable row during an already-backed-off certificate reset a 6-hour backoff
+  to the first retry — and dropped the count below the `ConsecutiveFailures >= 5` that failure
+  fallback needs, so the certificates that most needed degrading were the ones that could never
+  degrade. The upsert merges with `MAX` now: the count and the backoff are monotonic, and only a
+  successful pass (a whole-row `PutCert`) lowers them.
+- **A permanent deployment error no longer spins for the whole poll budget.** The three polling
+  loops did not distinguish a permanent API error from a transient one, so an `AuthFailure` or an
+  `UnsupportedOperation` spun for the full 3 minutes and the real cause was swallowed into "did
+  not finish within 3m". `tcerr.IsPermanent` / `IsThrottled` / `Code` classify the SDK error now:
+  permanent errors return at once, and a throttle doubles the poll interval instead of hammering
+  the limit. A cancelled call also keeps *both* identities — the context, so "a stopped process
+  is not a business failure" still sees it, and the API error, so a `RequestLimitExceeded` is
+  still classifiable — where before one replaced the other.
+- **A served chain that no client will accept is a failed probe.** `probe.Verify` compared what
+  was deployed against what was served and never read `Trusted` or `ChainError`, so a listener
+  serving the leaf without its intermediate — the single most common CLB misconfiguration —
+  passed every check and reported `probe_match = 1`, and so did a self-signed chain. Chain
+  verification is a fifth check now, reported as its own `untrusted` problem with the chain error
+  as the diagnosis. It is on by default in the reconcile loop, because there the question is
+  "will a client accept this"; turn it off with the new `probe.requireTrusted: false` when the CA
+  is internal, where "does not chain to a public root" is permanent and trains everyone to
+  ignore the alert. **This can flip `probe_match` from 1 to 0 on an existing deployment** — that
+  is the point, but it is a change in what the metric means.
 - **Smaller corrections:** the webhook `/hook/desired` endpoint reports a store read error as
   `error` instead of as `issued: false`; `RecordRevokeAttempt` refuses to count attempts against
   a non-existent request; `PutRateBucket(nil)` is an error like `PutAuthorization(nil)`;

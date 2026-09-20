@@ -73,55 +73,99 @@ const (
 // flag package already printed.
 var errUsage = errors.New("invalid command line")
 
-func run() error {
-	// A ContinueOnError FlagSet rather than the package-level one, because that one exits 2 on a
-	// typo (see main).
+// flags holds every flag this command takes.
+//
+// It left run's locals so that parsing has a test: the "explicitly set" map used to be built
+// with flag.Visit -- the package-level FlagSet, which nothing in this program ever parses --
+// so it was always empty and every contradiction validateFlags exists to catch was accepted.
+// See parseArgs.
+type flags struct {
+	configPath  string
+	statePath   string
+	once        bool
+	interval    time.Duration
+	logLevel    string
+	dryRun      bool
+	showVer     bool
+	revokeCert  string
+	restoreFrom string
+	revokeWhy   string
+	yesFlag     bool
+}
+
+// newFlagSet registers every flag on fs -- never on the package-level flag.CommandLine, which
+// fs.Parse cannot see.
+func newFlagSet(f *flags) *flag.FlagSet {
 	fs := flag.NewFlagSet("wecert", flag.ContinueOnError)
-	var (
-		configPath  = fs.String("config", "config.yaml", "path to the configuration file")
-		statePath   = fs.String("state", "", "override statePath from the config (handy for tests or running multiple instances)")
-		once        = fs.Bool("once", false, "run one pass and exit (for a systemd timer / cron)")
-		interval    = fs.Duration("interval", time.Hour, "reconcile interval in daemon mode")
-		logLevel    = fs.String("log-level", "info", "log level: debug|info|warn|error")
-		dryRun      = fs.Bool("dry-run", false, "validate the config, initialise the account and build the DNS provider and deployer; issue and deploy nothing")
-		showVer     = fs.Bool("version", false, "print the version and exit")
-		revokeCert  = fs.String("revoke", "", "ask the CA to revoke this certificate and exit (see also -yes)")
-		restoreFrom = fs.String("restore", "",
-			"restore a state snapshot and exit: a snapshot file, a directory of snapshots, or \"latest\"")
-		revokeWhy = fs.String("revoke-reason", "unspecified",
-			"revocation reason: unspecified|keyCompromise|affiliationChanged|superseded|cessationOfOperation")
-		yesFlag = fs.Bool("yes", false, "with -revoke: skip the interactive confirmation")
-	)
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	fs.StringVar(&f.configPath, "config", "config.yaml", "path to the configuration file")
+	fs.StringVar(&f.statePath, "state", "", "override statePath from the config (handy for tests or running multiple instances)")
+	fs.BoolVar(&f.once, "once", false, "run one pass and exit (for a systemd timer / cron)")
+	fs.DurationVar(&f.interval, "interval", time.Hour, "reconcile interval in daemon mode")
+	fs.StringVar(&f.logLevel, "log-level", "info", "log level: debug|info|warn|error")
+	fs.BoolVar(&f.dryRun, "dry-run", false, "validate the config, initialise the account and build the DNS provider and deployer; issue and deploy nothing")
+	fs.BoolVar(&f.showVer, "version", false, "print the version and exit")
+	fs.StringVar(&f.revokeCert, "revoke", "", "ask the CA to revoke this certificate and exit (see also -yes)")
+	fs.StringVar(&f.restoreFrom, "restore", "",
+		"restore a state snapshot and exit: a snapshot file, a directory of snapshots, or \"latest\"")
+	fs.StringVar(&f.revokeWhy, "revoke-reason", "unspecified",
+		"revocation reason: unspecified|keyCompromise|affiliationChanged|superseded|cessationOfOperation")
+	fs.BoolVar(&f.yesFlag, "yes", false, "with -revoke: skip the interactive confirmation")
+	return fs
+}
+
+// errHelp is parseArgs' answer to -h: the flag package has already printed the usage, and
+// asking for help is not an error.
+var errHelp = errors.New("help requested")
+
+// parseArgs parses args and reports which flags were set explicitly.
+func parseArgs(args []string) (*flags, map[string]bool, error) {
+	var f flags
+	fs := newFlagSet(&f)
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			// -h: the usage has been printed, and asking for help is not an error.
-			return nil
+			return nil, nil, errHelp
 		}
-		return errUsage
+		return nil, nil, errUsage
 	}
 
 	// Only an explicitly set flag can contradict another one: -log-level and -interval have
 	// defaults, so "-revoke x -log-level info" sets nothing the operator asked for.
+	//
+	// fs.Visit, not flag.Visit: the latter walks the package-level CommandLine, which this
+	// program never parses, so it reported nothing as explicitly set.
 	explicit := map[string]bool{}
-	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	fs.Visit(func(fl *flag.Flag) { explicit[fl.Name] = true })
+	return &f, explicit, nil
+}
 
-	if *showVer {
+func run() error {
+	// A ContinueOnError FlagSet rather than the package-level one, because that one exits 2 on a
+	// typo (see main).
+	f, explicit, err := parseArgs(os.Args[1:])
+	if err != nil {
+		if errors.Is(err, errHelp) {
+			return nil
+		}
+		return err
+	}
+
+	if f.showVer {
 		fmt.Println("wecert", version)
 		return nil
 	}
 
-	if err := validateFlags(explicit, *once, *dryRun, *interval); err != nil {
+	if err := validateFlags(explicit, f.once, f.dryRun, f.interval); err != nil {
 		return err
 	}
 
-	if *restoreFrom != "" {
+	if f.restoreFrom != "" {
 		// A mode flag next to -restore is a mistake worth refusing rather than ordering: every one of
 		// the others does something to a state database, and "restore, and then also reconcile once"
 		// is not a thing an operator can have meant.
-		if *once || *dryRun || *revokeCert != "" {
+		if f.once || f.dryRun || f.revokeCert != "" {
 			return errRestoreConflict
 		}
-		return runRestore(*configPath, *statePath, *restoreFrom)
+		return runRestore(f.configPath, f.statePath, f.restoreFrom)
 	}
 
 	// Install signal handling before anything touches the network (config load, EnsureAccount,
@@ -134,22 +178,22 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if *revokeCert != "" {
-		return runRevoke(*configPath, *statePath, *revokeCert, *revokeWhy, *yesFlag)
+	if f.revokeCert != "" {
+		return runRevoke(f.configPath, f.statePath, f.revokeCert, f.revokeWhy, f.yesFlag)
 	}
 
-	level, err := parseLogLevel(*logLevel)
+	level, err := parseLogLevel(f.logLevel)
 	if err != nil {
 		return err
 	}
 	log := newLogger(level)
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(f.configPath)
 	if err != nil {
 		return err
 	}
-	if *statePath != "" {
-		cfg.StatePath = *statePath
+	if f.statePath != "" {
+		cfg.StatePath = f.statePath
 	}
 
 	// Take the cross-process exclusive lock on the state store. "At most one in-flight
@@ -161,7 +205,7 @@ func run() error {
 	// "cannot even validate the config because the daemon is up" pushes people into
 	// blindly editing the config. This path only reads the existing ACME account; no issuance.
 	openStore := state.Open
-	if *dryRun {
+	if f.dryRun {
 		// Prefers the lock and falls back when the daemon holds it: see state.OpenForTool. Opening
 		// unlocked unconditionally is what made `-dry-run` fail on a fresh installation.
 		openStore = state.OpenForTool
@@ -219,11 +263,12 @@ func run() error {
 		return err
 	}
 
-	if *dryRun {
+	if f.dryRun {
 		probeState := "off"
 		if prober != nil {
 			probeState = fmt.Sprintf("on (port %d, timeout %s, max %d hosts/cert)",
-				cfg.Probe.Port, cfg.Probe.TimeoutDur, cfg.Probe.MaxHostsPerCert)
+				cfg.Probe.Port, cfg.Probe.TimeoutDur,
+				cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert))
 		}
 
 		// Build the two components that READ CREDENTIALS even though nothing is issued or deployed.
@@ -292,9 +337,24 @@ func run() error {
 	// Network-side probing: dial a real TLS connection to confirm the served cert is the deployed one.
 	reconciler.SetProber(prober)
 	if prober != nil {
+		cap := cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert)
+		// Reported at startup because it decides what probe_match means: with it on, a listener
+		// serving the deployed certificate without its intermediate is a mismatch, which is a
+		// change from every earlier version. Someone who turns it off for an internal CA should
+		// see that in the log too, next to the rest of the probe configuration.
+		requireTrusted := cfg.Probe.RequireTrustedOr(true)
 		log.Info("network-side certificate probing is on",
 			"port", cfg.Probe.Port, "timeout", cfg.Probe.TimeoutDur,
-			"maxHostsPerCert", cfg.Probe.MaxHostsPerCert)
+			"maxHostsPerCert", cap, "requireTrusted", requireTrusted)
+		if cap <= 0 {
+			// A cap of 0 is "probe nothing", which looks exactly like "probing is on" in every
+			// other line this program prints. Say it once at startup, where the config is being
+			// reported anyway -- otherwise the silence of the probe series reads as "nothing to
+			// report" rather than "nothing was dialled".
+			log.Warn("probe.maxHostsPerCert is 0, so nothing will actually be dialled: the probe "+
+				"series will report no host at all, and a probe_match alert that compares against "+
+				"an absent series stays silent", "maxHostsPerCert", cap)
+		}
 	} else {
 		log.Warn("network-side certificate probing is off: nothing will verify that the " +
 			"certificate the cloud API reports as deployed is the one actually being served")
@@ -339,9 +399,18 @@ func run() error {
 	// logged an ERROR each time -- while the branch written to say exactly that was unreachable,
 	// because its guard was the same condition the first branch had already consumed.
 	var snapshots *snapshotHealth
+	// Registered after `defer store.Close()` above, so it runs BEFORE it: defers are LIFO,
+	// and the snapshot goroutine writes to SQLite on its own schedule.
+	var stopBackups func()
+	defer func() {
+		if stopBackups != nil {
+			stopBackups()
+		}
+	}()
+
 	switch planStateBackups(cfg.StateBackup.Enabled, dirIsWritable(backupDir)) {
 	case backupsRun:
-		snapshots = startStateBackups(ctx, store, cfg, log)
+		snapshots, stopBackups = startStateBackups(ctx, store, cfg, log)
 	case backupsEnabledButUnwritable:
 		log.Error("periodic state database snapshots are ENABLED but the directory is not writable, "+
 			"so none will be taken", "dir", backupDir)
@@ -374,7 +443,7 @@ func run() error {
 		return err
 	}
 
-	if *once {
+	if f.once {
 		// RunDetailed, not a wrapper that drops the report: the one-shot unit is what a systemd
 		// timer runs, and "exited 0 with every certificate failing" is the failure mode this
 		// report exists to prevent -- the timer would report success while the fleet went
@@ -400,8 +469,8 @@ func run() error {
 		return onceExit(rep)
 	}
 
-	log.Info("entering daemon mode", "interval", *interval)
-	runDaemon(ctx, *interval, log, reconciler.RunDetailed)
+	log.Info("entering daemon mode", "interval", f.interval)
+	runDaemon(ctx, f.interval, log, reconciler.RunDetailed)
 	// Wait for background passes and notifications before returning: the deferred store.Close()
 	// would otherwise close SQLite under a pass that is mid-renewal, losing the promotion or the
 	// resume anchor it was writing. See Reconciler.Drain.
@@ -633,7 +702,14 @@ func jitter(d time.Duration) time.Duration {
 // posture, not a reason to stop renewing certificates. It is logged at ERROR so it shows
 // up in the same place every other operational problem does, and it is reported through
 // the same metric channel as everything else.
-func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Config, log *slog.Logger) *snapshotHealth {
+//
+// It returns the immediate snapshot's health -- which the one-shot run reads to decide its exit
+// code -- and a stop function, which the caller MUST call before the state store is closed.
+// The snapshot goroutine is the one background worker in this process that writes to SQLite
+// on its own schedule, and nothing waited for it: a pass that returned at the moment the
+// ticker fired raced the deferred store.Close() against store.Snapshot's VACUUM INTO, so
+// the process could exit holding the lock out from under a half-written snapshot file.
+func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Config, log *slog.Logger) (*snapshotHealth, func()) {
 	dir := cfg.StateBackup.Dir
 	if dir == "" {
 		dir = filepath.Dir(cfg.StatePath)
@@ -643,30 +719,34 @@ func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Conf
 		return takeSnapshot(store, dir, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log)
 	}
 
-	// first records the outcome of the immediate snapshot: the one-shot run reads it to decide its
-	// exit code (see snapshotHealth).
+	// first records the outcome of the immediate snapshot: the one-shot run reads it to decide
+	// its exit code (see snapshotHealth).
 	first := make(chan error, 1)
 	health := &snapshotHealth{first: first}
-	go func() {
-		// One immediately: waiting a whole interval means a fresh deployment has no
-		// recoverable state for its first day, which is exactly when orders are in flight.
-		first <- snapshot()
 
-		ticker := time.NewTicker(cfg.StateBackup.IntervalDur)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				_ = snapshot()
-			}
+	// Its own context, so shutdown does not depend on the process context having been
+	// cancelled: run() returns normally from -once and from a daemon stop, and
+	// signal.NotifyContext's stop() does not cancel. Waiting on ctx.Done() there would
+	// have hung forever.
+	snapCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	// Only the immediate snapshot's outcome is reported: first is buffered by exactly one, so
+	// sending every interval's result would block this goroutine forever once nobody reads it
+	// -- and a blocked snapshot goroutine is also a stop function that never returns.
+	var reported bool
+	go snapshotLoop(snapCtx, cfg.StateBackup.IntervalDur, func() {
+		err := snapshot()
+		if !reported {
+			reported = true
+			first <- err
 		}
-	}()
+	}, done)
 
 	log.Info("periodic state database snapshots are on",
 		"dir", dir, "interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
-	return health
+
+	return health, func() { stopSnapshotLoop(cancel, done, log) }
 }
 
 // snapshotHealth carries the immediate snapshot's outcome to the one-shot exit code.
@@ -702,6 +782,49 @@ func (h *snapshotHealth) wait(timeout time.Duration) error {
 		return nil
 	}
 }
+
+// snapshotLoop takes one snapshot immediately and then one per interval until ctx is done,
+// closing done as it returns.
+//
+// Split out of startStateBackups so the shutdown wait has a test: what it has to guarantee is
+// that stopSnapshotLoop does not return while a snapshot is still running, and that is only
+// observable with a snapshot function the test controls.
+func snapshotLoop(ctx context.Context, interval time.Duration, snapshot func(), done chan<- struct{}) {
+	defer close(done)
+	// One immediately: waiting a whole interval means a fresh deployment has no
+	// recoverable state for its first day, which is exactly when orders are in flight.
+	snapshot()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snapshot()
+		}
+	}
+}
+
+// stopSnapshotLoop cancels the loop and waits for it to finish.
+//
+// The wait is bounded on purpose: a snapshot is a VACUUM INTO of a database that is a few
+// hundred kilobytes, so 15s is generous -- and a stop signal must never hang on it. The wait
+// is best-effort, the same way drainBackground's is.
+func stopSnapshotLoop(cancel context.CancelFunc, done <-chan struct{}, log *slog.Logger) {
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(snapshotDrainTimeout):
+		log.Warn("a state snapshot was still running at shutdown; the state store is about to "+
+			"be closed under it, so that snapshot may be truncated",
+			"waited", snapshotDrainTimeout)
+	}
+}
+
+// snapshotDrainTimeout bounds how long shutdown waits for an in-flight state snapshot.
+const snapshotDrainTimeout = 15 * time.Second
 
 // takeSnapshot writes one snapshot, unless the database holds nothing a snapshot could recover.
 //
@@ -811,7 +934,14 @@ func startWebhookServer(
 
 	api, err := webhook.New(rec, store, cfg.Webhook.Token, ctx, log)
 	if err != nil {
-		return fmt.Errorf("failed to initialise the webhook server: %w", err)
+		// The port is already bound above, and returning here used to leak it: this process
+		// exits because of the error, so a restart is fine, but the exit path taken when
+		// webhook.New rejects the config is exactly the one an operator fixes by editing
+		// webhook.token and rerunning -- and the rerun then fails with "address already in
+		// use", pointing at a phantom instance instead of at the setting they just changed.
+		_ = ln.Close()
+		return fmt.Errorf("failed to initialise the webhook server (the port %s has been released): %w",
+			cfg.Webhook.Listen, err)
 	}
 
 	srv := &http.Server{

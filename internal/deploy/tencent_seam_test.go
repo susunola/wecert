@@ -12,6 +12,8 @@ import (
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
+
+	"github.com/susunola/wecert/internal/tcerr"
 )
 
 // ── The sslAPI seam ─────────────────────────────────────────────────────────
@@ -1467,5 +1469,152 @@ func TestWaitDeleteTaskStopsOnCancellationDespiteQueryErrors(t *testing.T) {
 	err := d.waitDeleteTask(ctx, fake, "del-task-1", "cert-1")
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("a cancelled wait must surface the cancellation, got %v", err)
+	}
+}
+
+// ── A query error that retrying cannot fix ──────────────────────────────────────
+//
+// The polling loops treat a failed query as "the answer is not ready yet", which is right for a
+// hiccup and wrong for an error the server will repeat verbatim: a dead key or a missing
+// permission then burns the whole three-minute budget and surfaces as "did not finish within
+// 3m", sending the operator to look for a slow task instead of a revoked credential.
+
+func permanentSDKError(code string) error {
+	return &tcerrors.TencentCloudSDKError{Code: code, Message: "the secret id is disabled"}
+}
+
+// A permanent query error ends the wait on the first poll, and the code survives.
+func TestWaitDeployRecordStopsOnAPermanentQueryError(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var polls int
+	api := &fakeSSLAPI{detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+		polls++
+		return nil, permanentSDKError("AuthFailure.SignatureFailure")
+	}}
+
+	err := d.waitDeployRecord(context.Background(), api, 42, "old-cert-id")
+	if err == nil {
+		t.Fatal("a permanent query error must fail the wait")
+	}
+	if polls != 1 {
+		t.Errorf("polled %d times, want 1: retrying an error that cannot be fixed only delays the report", polls)
+	}
+	if !strings.Contains(err.Error(), "AuthFailure.SignatureFailure") {
+		t.Errorf("the error must carry the API code, got %v", err)
+	}
+	if strings.Contains(err.Error(), "did not finish within") {
+		t.Errorf("the failure must not be reported as a timeout, got %v", err)
+	}
+}
+
+// The same loop still waits out a transient error, and says why when it gives up.
+func TestWaitDeployRecordRetriesATransientQueryError(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var polls int
+	api := &fakeSSLAPI{detailFn: func(context.Context, *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error) {
+		polls++
+		return nil, permanentSDKError("InternalError")
+	}}
+
+	err := d.waitDeployRecord(context.Background(), api, 42, "old-cert-id")
+	if err == nil {
+		t.Fatal("an error that never clears must still fail the wait")
+	}
+	if polls < 2 {
+		t.Errorf("polled %d times, want the loop to retry a transient error", polls)
+	}
+	// The reason is the point: without it this reads as a slow task.
+	if !strings.Contains(err.Error(), "InternalError") {
+		t.Errorf("the timeout must carry the last query error, got %v", err)
+	}
+}
+
+// The delete-task loop follows the same rule.
+func TestWaitDeleteTaskStopsOnAPermanentQueryError(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var polls int
+	api := &fakeSSLAPI{deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+		polls++
+		return nil, permanentSDKError("AuthFailure.UnauthorizedOperation")
+	}}
+
+	err := d.waitDeleteTask(context.Background(), api, "task-1", "cert-1")
+	if err == nil {
+		t.Fatal("a permanent query error must fail the wait")
+	}
+	if polls != 1 {
+		t.Errorf("polled %d times, want 1", polls)
+	}
+	if !strings.Contains(err.Error(), "AuthFailure") {
+		t.Errorf("the error must carry the API code, got %v", err)
+	}
+}
+
+// The enumeration loop must not abandon a switch that already succeeded: one unreachable
+// query used to fail the whole call, so the repair path skipped its fix and nothingBoundYet
+// answered false for a certificate whose rebind had in fact gone through.
+func TestBindingsWithRetriesATransientQueryError(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	taskID := "task-9"
+	api := &fakeSSLAPI{
+		createTaskFn: func(context.Context, *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error) {
+			return &ssl.CreateCertificateBindResourceSyncTaskResponse{
+				Response: &ssl.CreateCertificateBindResourceSyncTaskResponseParams{
+					CertTaskIds: []*ssl.CertTaskId{{CertId: common.StringPtr("cert-1"), TaskId: common.StringPtr(taskID)}},
+				},
+			}, nil
+		},
+		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			return nil, permanentSDKError("InternalError")
+		},
+	}
+
+	// The answer is a timeout carrying the reason, not "no bindings" and not a bare failure.
+	_, err := d.bindingsWith(context.Background(), api, "cert-1", false)
+	if err == nil {
+		t.Fatal("an error that never clears must still be reported")
+	}
+	if !strings.Contains(err.Error(), "InternalError") {
+		t.Errorf("the failure must carry the last query error, got %v", err)
+	}
+}
+
+// An expired deadline must keep BOTH identities: the context's (so "a stopped process is not a
+// business failure" can still see it) and the API's own (so a throttle is still classifiable).
+//
+// The two used to be mutually exclusive. Reporting only the context turned
+// `RequestLimitExceeded` into "context deadline exceeded", and the caller -- which backs off
+// three times as long when it sees a throttle -- retried at the usual rate into a limit it had
+// just hit. Reporting only the API error hid that the call never finished.
+func TestADeadlineKeepsBothTheContextAndTheAPIError(t *testing.T) {
+	sdkErr := permanentSDKError("RequestLimitExceeded")
+	expired, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(time.Millisecond)
+
+	err := sdkCallError(expired, "UploadCertificate", sdkErr)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the deadline must stay visible: errors.Is(context.DeadlineExceeded) = false, got %v", err)
+	}
+	if !errors.Is(err, sdkErr) {
+		t.Errorf("the API error must stay classifiable: errors.Is(sdkErr) = false, got %v", err)
+	}
+	// And the throttle must survive the wrapping, because that is the whole point: this is the
+	// signal that makes the caller back off longer instead of retrying into the same limit.
+	if !tcerr.IsThrottled(err) {
+		t.Errorf("a throttled call that hit its deadline must still be classified as throttled, got %v", err)
 	}
 }

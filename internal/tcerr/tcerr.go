@@ -67,3 +67,79 @@ func isNoData(err error, code string) bool {
 	}
 	return strings.Contains(err.Error(), code)
 }
+
+// permanentCodePrefixes are the error-code families a retry cannot fix.
+//
+// A polling loop that treats these the same as "the answer is not ready yet" burns its whole
+// budget on an error that will answer identically every time, and then reports the timeout --
+// so a revoked key or a missing permission reaches the operator as "the task was slow".
+//
+// Deliberately absent: RequestLimitExceeded (throttling is transient, it only needs a longer
+// wait -- see IsThrottled) and FailedOperation.* (its meaning is per-API and some of its
+// members are genuinely transient).
+var permanentCodePrefixes = []string{
+	"AuthFailure.",          // the key is wrong, disabled or deleted
+	"UnauthorizedOperation", // the key is fine, the account may not call this API
+	"InvalidParameter.",     // the request itself is malformed
+	"InvalidParameterValue.",
+	"MissingParameter",
+	"UnsupportedOperation", // not available for this account/region/resource
+	"UnsupportedRegion",
+	"LimitExceeded.", // a quota ceiling no retry will lift
+}
+
+// IsPermanent reports whether err is an API error that retrying cannot fix.
+//
+// It is the answer a polling loop needs before deciding to wait again: not every failure of a
+// *query* means "the answer is not ready yet". An error with no recognisable code at all is
+// treated as retryable -- guessing otherwise would abandon a task on the strength of an
+// error nobody classified.
+func IsPermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	if code := Code(err); code != "" {
+		return hasAnyPrefix(code, permanentCodePrefixes)
+	}
+	// A wrapped or plain error still carries the code somewhere in its text.
+	return containsAny(err.Error(), permanentCodePrefixes)
+}
+
+// IsThrottled reports whether err is the API asking the caller to slow down.
+//
+// It is retryable, so it must not be treated as permanent -- but hammering it at the polling
+// interval amplifies the throttling instead of waiting it out.
+func IsThrottled(err error) bool {
+	return strings.HasPrefix(Code(err), "RequestLimitExceeded") ||
+		strings.Contains(err.Error(), "RequestLimitExceeded")
+}
+
+// Code returns the Tencent Cloud API error code carried by err, or "" when it has none.
+func Code(err error) string {
+	if err == nil {
+		return ""
+	}
+	var sdkErr *tcerrors.TencentCloudSDKError
+	if errors.As(err, &sdkErr) {
+		return sdkErr.Code
+	}
+	return ""
+}
+
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAny(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.Contains(s, p) {
+			return true
+		}
+	}
+	return false
+}

@@ -324,11 +324,27 @@ type Probe struct {
 	// people to ignore alerts.
 	Timeout string `yaml:"timeout"`
 
-	// MaxHostsPerCert is how many names per certificate to probe. Default 3.
+	// MaxHostsPerCert is how many names per certificate to probe. Unset means
+	// DefaultMaxHostsPerCert; an explicit 0 means "probe nothing".
 	//
 	// Not exhaustive: a 25-name certificate would mean 25 handshakes every pass,
 	// with diminishing returns and linear cost.
-	MaxHostsPerCert int `yaml:"maxHostsPerCert"`
+	//
+	// A pointer, like Enabled: 0 is a meaningful setting -- it is how probing is paused
+	// during an investigation -- and as a plain int it was indistinguishable from unset,
+	// so normalize() rewrote 0 to the default and reconcile's "the per-certificate host
+	// cap is 0, so probing is off" branch was unreachable in production.
+	MaxHostsPerCert *int `yaml:"maxHostsPerCert"`
+
+	// RequireTrusted defaults to true: a served chain that does not verify against the
+	// system roots counts as a failed probe.
+	//
+	// "The right certificate, in the right place, still broken" is a real shape -- a listener
+	// serving the leaf without its intermediate passes every other check and fails in every
+	// real client. Set it to false when the CA is internal: those certificates never verify
+	// against the system roots, so the strict answer would be a permanent mismatch that
+	// trains everyone to ignore this alert.
+	RequireTrusted *bool `yaml:"requireTrusted"`
 
 	// MinValidFor is "at least this much validity must remain". Empty means skip.
 	//
@@ -348,6 +364,29 @@ func (p *Probe) EnabledOr(def bool) bool {
 		return def
 	}
 	return *p.Enabled
+}
+
+// RequireTrustedOr returns the chain-verification switch, or def when it is unset.
+func (p *Probe) RequireTrustedOr(def bool) bool {
+	if p.RequireTrusted == nil {
+		return def
+	}
+	return *p.RequireTrusted
+}
+
+// DefaultMaxHostsPerCert is the per-certificate probe cap when probe.maxHostsPerCert is unset.
+const DefaultMaxHostsPerCert = 3
+
+// MaxHostsPerCertOr returns the per-certificate probe cap, or def when it is unset.
+//
+// An explicit 0 is honoured rather than defaulted: it is the documented way to turn probing
+// off, and defaulting it (as the old int field forced) silently undid the operator's setting
+// every time the config was loaded.
+func (p *Probe) MaxHostsPerCertOr(def int) int {
+	if p.MaxHostsPerCert == nil {
+		return def
+	}
+	return *p.MaxHostsPerCert
 }
 
 func (p *Probe) normalize() error {
@@ -383,11 +422,11 @@ func (p *Probe) normalize() error {
 	if p.Port < 1 || p.Port > 65535 {
 		return fmt.Errorf("probe.port must be between 1 and 65535, got %d", p.Port)
 	}
-	if p.MaxHostsPerCert == 0 {
-		p.MaxHostsPerCert = 3
-	}
-	if p.MaxHostsPerCert < 0 {
-		return fmt.Errorf("probe.maxHostsPerCert must not be negative, got %d", p.MaxHostsPerCert)
+	// Only a negative value is rejected. 0 used to be rewritten to the default here, which made
+	// "probe nothing" -- a setting the caller in reconcile explicitly documents and reports --
+	// impossible to configure.
+	if p.MaxHostsPerCert != nil && *p.MaxHostsPerCert < 0 {
+		return fmt.Errorf("probe.maxHostsPerCert must not be negative, got %d", *p.MaxHostsPerCert)
 	}
 	return nil
 }
@@ -856,15 +895,29 @@ func Load(path string) (*Config, error) {
 }
 
 // rejectExtraDocuments fails when the input holds more than one YAML document.
+//
+// An **empty** trailing document is not a second document: yaml.v3 decodes "---\n" to a nil
+// value with no error, so a config that merely ends with a separator looked like a second
+// document here and was refused. Load failing means the daemon does not start at all, so that
+// guard was refusing a file whose meaning was never in doubt. Empty documents are skipped and
+// only a document with content in it is rejected.
 func rejectExtraDocuments(dec *yaml.Decoder, path string) error {
-	var extra any
-	if err := dec.Decode(&extra); err == nil {
+	for {
+		var extra any
+		if err := dec.Decode(&extra); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("parse config %s: %w", path, err)
+		}
+		if extra == nil {
+			// "---" with nothing behind it. Keep reading: the next Decode is what says
+			// whether the file really continues.
+			continue
+		}
 		return fmt.Errorf("%s contains more than one YAML document (a stray '---'?); "+
 			"everything after the first document would be ignored, so it is rejected instead", path)
-	} else if !errors.Is(err, io.EOF) {
-		return fmt.Errorf("parse config %s: %w", path, err)
 	}
-	return nil
 }
 
 // ── startup warnings ────────────────────────────────────────────────────────────────

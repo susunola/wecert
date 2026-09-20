@@ -128,3 +128,91 @@ func TestRecordFailureIsIdempotent(t *testing.T) {
 		t.Errorf("want exactly one row, got %v", names)
 	}
 }
+
+// A failure recorded for a row that could not be read carries a lower bound ("at least one
+// failure: this one"), so it must not erase the count and the backoff already on disk.
+//
+// Regression: RecordFailure overwrote both columns. A certificate that had failed eight times
+// straight -- and so earned a 6-hour backoff and was one failure away from the failure fallback
+// (ConsecutiveFailures >= 5) -- went back to 1 the moment one pass could not read its row. The
+// backoff collapsed to the base window and the fallback, which needs the count to reach its
+// threshold, could never fire for it: the certificate that most needed degrading was the one
+// that never could. And an unreadable row is precisely the condition this path exists for.
+func TestRecordFailureNeverLowersTheCountOrTheBackoff(t *testing.T) {
+	s := openTestStore(t)
+	// Eight failures straight: the row carries the 6-hour backoff they earned.
+	earned := time.Now().Add(6 * time.Hour).Truncate(time.Second)
+	if err := s.PutCert(&CertState{Name: "example-com", ConsecutiveFailures: 8, NextAttemptAt: earned}); err != nil {
+		t.Fatalf("PutCert failed: %v", err)
+	}
+	stored, err := s.GetCert("example-com")
+	if err != nil {
+		t.Fatalf("GetCert failed: %v", err)
+	}
+	storedBackoff := stored.NextAttemptAt
+	if storedBackoff.IsZero() {
+		t.Fatal("the fixture needs a backoff on disk; without one there is nothing to preserve")
+	}
+
+	// What recordFailureUnreadable sends when the row cannot be read: count 1, base window.
+	lower := time.Now().Add(time.Minute).Truncate(time.Second)
+	if err := s.RecordFailure("example-com", "state: read failed", 1, lower); err != nil {
+		t.Fatalf("RecordFailure failed: %v", err)
+	}
+
+	got, err := s.GetCert("example-com")
+	if err != nil {
+		t.Fatalf("GetCert failed: %v", err)
+	}
+	if got.ConsecutiveFailures != 8 {
+		t.Errorf("ConsecutiveFailures = %d, want 8: a lower bound must not lower the stored count",
+			got.ConsecutiveFailures)
+	}
+	if !got.NextAttemptAt.Equal(storedBackoff) {
+		t.Errorf("NextAttemptAt = %s, want the stored %s: a shorter window must not replace it",
+			got.NextAttemptAt, storedBackoff)
+	}
+	// The error itself is this pass's news, so it is overwritten whatever the counters did.
+	if got.LastError != "state: read failed" {
+		t.Errorf("LastError = %q, want the newest error", got.LastError)
+	}
+
+	// A genuinely worse failure still raises both.
+	higher := time.Now().Add(6 * time.Hour).Truncate(time.Second)
+	if err := s.RecordFailure("example-com", "state: read failed again", 9, higher); err != nil {
+		t.Fatalf("RecordFailure failed: %v", err)
+	}
+	got, err = s.GetCert("example-com")
+	if err != nil {
+		t.Fatalf("GetCert failed: %v", err)
+	}
+	if got.ConsecutiveFailures != 9 || !got.NextAttemptAt.Equal(higher) {
+		t.Errorf("ConsecutiveFailures = %d and NextAttemptAt = %s, want 9 and %s: MAX must still "+
+			"let the counters grow", got.ConsecutiveFailures, got.NextAttemptAt, higher)
+	}
+}
+
+// A recovered pass clears the counters, so merging with MAX cannot strand a stale backoff
+// after the certificate is healthy again.
+func TestRecordFailureDoesNotSurviveARecovery(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.PutCert(&CertState{Name: "example-com", ConsecutiveFailures: 3}); err != nil {
+		t.Fatalf("PutCert failed: %v", err)
+	}
+	if err := s.RecordFailure("example-com", "state: read failed", 1, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("RecordFailure failed: %v", err)
+	}
+
+	// The success path is a whole-row upsert that carries the cleared counters.
+	if err := s.PutCert(&CertState{Name: "example-com", ConsecutiveFailures: 0, NextAttemptAt: time.Time{}}); err != nil {
+		t.Fatalf("PutCert failed: %v", err)
+	}
+	got, err := s.GetCert("example-com")
+	if err != nil {
+		t.Fatalf("GetCert failed: %v", err)
+	}
+	if got.ConsecutiveFailures != 0 || !got.NextAttemptAt.IsZero() {
+		t.Errorf("after a recovery: ConsecutiveFailures = %d, NextAttemptAt = %s, want both clear",
+			got.ConsecutiveFailures, got.NextAttemptAt)
+	}
+}

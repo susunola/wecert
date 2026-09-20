@@ -162,6 +162,68 @@ func TestProbeSeparatesTrustFromCorrectness(t *testing.T) {
 	}
 }
 
+// A chain no client will accept is a failed deployment, and nothing else here notices.
+//
+// Regression: Verify compared the hostname, the names, the expiry and the remaining validity,
+// and never read Trusted or ChainError -- so a listener serving the leaf without its
+// intermediate (the most common CLB certificate mistake) came back OK with probe_match=1
+// while every real client failed the handshake. Trusted was only ever exported as a metric.
+func TestVerifyReportsAnUntrustedChainWhenTrustIsRequired(t *testing.T) {
+	port := startServer(t, makeCert(t, []string{"localhost"},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
+	res := probeLocalhost(t, port)
+	if res.Trusted {
+		t.Fatal("the test needs an untrusted chain; the fixture must stay self-signed")
+	}
+
+	v := res.Verify(Expectation{RequireTrusted: true})
+	if v.OK {
+		t.Fatal("an untrusted chain must not be a passing probe when trust is required")
+	}
+	if len(v.Problems) == 0 || v.Problems[0].Kind != ProblemUntrusted {
+		t.Fatalf("the problem must be ProblemUntrusted, got %+v", v.Problems)
+	}
+	// The chain error is the diagnosis: without it the message says "broken" and not what to
+	// look at.
+	if res.ChainError != "" && !strings.Contains(v.Summary(), res.ChainError) {
+		t.Errorf("the summary should carry the chain error %q, got: %s", res.ChainError, v.Summary())
+	}
+}
+
+// The same probe still passes when trust is not required: "does not chain to a public root"
+// and "is not the certificate I deployed" are different faults, and an internal CA makes the
+// first one permanent.
+func TestVerifyKeepsTrustOutOfTheVerdictByDefault(t *testing.T) {
+	port := startServer(t, makeCert(t, []string{"localhost"},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
+	res := probeLocalhost(t, port)
+
+	v := res.Verify(Expectation{})
+	if !v.OK {
+		t.Fatalf("trust must stay out of the verdict unless it is required, got: %s", v.Summary())
+	}
+	for _, p := range v.Problems {
+		if p.Kind == ProblemUntrusted {
+			t.Error("ProblemUntrusted must not appear when RequireTrusted is off")
+		}
+	}
+}
+
+// A trusted chain that matches is still a pass, so the new check does not turn into a
+// permanent mismatch once the deployment is right.
+func TestVerifyAcceptsATrustedMatchingChain(t *testing.T) {
+	port := startServer(t, makeCert(t, []string{"localhost"},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
+	res := probeLocalhost(t, port)
+	res.Trusted = true
+	res.ChainError = ""
+
+	v := res.Verify(Expectation{RequireTrusted: true})
+	if !v.OK {
+		t.Errorf("a trusted, matching certificate must pass, got: %s", v.Summary())
+	}
+}
+
 func TestProbeReportsAWrongCertificate(t *testing.T) {
 	// Someone else's certificate is being served.
 	port := startServer(t, makeCert(t, []string{"other.example"},

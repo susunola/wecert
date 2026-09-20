@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -205,6 +206,16 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 	}
 	if opts.DocumentPath == "" {
 		return nil, errors.New("onboarding: DocumentPath is required")
+	}
+	// Commit writes the document first and the state file second, so the same path for both
+	// means the round finishes by replacing the desired-state document with onboarding's own
+	// state -- the next round then cannot parse what it reads and the whole round is refused.
+	// It is one typo away (a copy-pasted -state flag), so refuse it here where the mistake is
+	// still obvious, rather than after the document is gone.
+	if opts.StatePath != "" && filepath.Clean(opts.StatePath) == filepath.Clean(opts.DocumentPath) {
+		return nil, fmt.Errorf("onboarding: StatePath and DocumentPath are the same file (%q); "+
+			"the state file is written after the document, so this round would overwrite the "+
+			"desired-state document with onboarding's own state", opts.DocumentPath)
 	}
 	if opts.Profile == "" {
 		opts.Profile = config.ProfileClassic

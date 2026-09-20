@@ -306,3 +306,84 @@ func TestAnEmptyDatabaseIsNotSnapshotted(t *testing.T) {
 			len(snaps), snaps, logs.String())
 	}
 }
+
+// TestStoppingTheSnapshotLoopWaitsForAnInFlightSnapshot covers the race the stop function
+// exists for: the snapshot goroutine writes to SQLite on its own schedule, and nothing waited
+// for it, so a pass that returned as the ticker fired let the deferred store.Close() run
+// against store.Snapshot's VACUUM INTO.
+//
+// The guarantee under test is that stopSnapshotLoop does NOT return while a snapshot is still
+// running -- cancelling alone returns immediately and would leave the store to be closed under
+// the very write it was supposed to wait for.
+func TestStoppingTheSnapshotLoopWaitsForAnInFlightSnapshot(t *testing.T) {
+	var started, finished int32
+	snapshot := func() {
+		atomic.AddInt32(&started, 1)
+		time.Sleep(150 * time.Millisecond) // long enough that "cancelled and returned" is visible
+		atomic.AddInt32(&finished, 1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go snapshotLoop(ctx, 10*time.Millisecond, snapshot, done)
+
+	// Wait until a snapshot is genuinely in flight, so the stop below has something to wait
+	// for. Polling the counter keeps this deterministic without a bare sleep.
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&started) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if atomic.LoadInt32(&started) == 0 {
+		t.Fatal("the snapshot loop never ran a snapshot")
+	}
+
+	var logs bytes.Buffer
+	stopSnapshotLoop(cancel, done, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	if s, f := atomic.LoadInt32(&started), atomic.LoadInt32(&finished); s != f {
+		t.Errorf("stop returned with a snapshot still running: started=%d finished=%d; "+
+			"the state store would be closed under that write", s, f)
+	}
+	select {
+	case <-done:
+	default:
+		t.Error("stop returned before the snapshot loop's goroutine had finished")
+	}
+	if logs.Len() != 0 {
+		t.Errorf("the wait should have completed normally, got:\n%s", logs.String())
+	}
+}
+
+// TestStartStateBackupsReturnsAWorkingStop checks the wiring: the daemon only ever holds the
+// stop function, so a nil or no-op one would leave the goroutine unwaited at shutdown.
+func TestStartStateBackupsReturnsAWorkingStop(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	cfg := &config.Config{
+		StatePath:   filepath.Join(dir, "state.db"),
+		StateBackup: config.StateBackup{Dir: filepath.Join(dir, "backups"), Keep: 3, IntervalDur: 10 * time.Millisecond},
+	}
+
+	health, stop := startStateBackups(context.Background(), store, cfg, log)
+	if stop == nil {
+		t.Fatal("startStateBackups must return a stop function")
+	}
+	if health == nil {
+		t.Fatal("startStateBackups must report the immediate snapshot's health")
+	}
+	stop()
+
+	// After the stop, the loop must not tick again: give it several intervals' worth of time
+	// and confirm no snapshot directory appears for an empty database either way. The point is
+	// that stop() returns at all -- without the cancel it would block forever.
+	if !strings.Contains(logs.String(), "periodic state database snapshots are on") {
+		t.Errorf("starting the loop must be logged, got:\n%s", logs.String())
+	}
+}

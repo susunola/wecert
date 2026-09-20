@@ -268,6 +268,17 @@ var describeDomainList = func(ctx context.Context, client *dnspod.Client, req *d
 	return client.DescribeDomainListWithContext(ctx, req)
 }
 
+// domainListMaxPages bounds findDomain's walk, the same way pruneMaxPages bounds
+// listAllPages'.
+//
+// Both stops in the loop below are answers the SERVER gives (an empty page, or a total that
+// has been covered), so a server that ignores Offset -- keeps returning the same full page
+// forever -- loops here without end, one API call per iteration, against a preflight check
+// that is supposed to finish in seconds. 100 pages of 100 is 10,000 domains: far past any
+// account this search is honest about, and small enough to be an obvious bound rather than
+// an outage.
+const domainListMaxPages = 100
+
 // findDomain looks the target domain up in this account's DNSPod domain list.
 //
 // Keyword is a substring filter capped by Limit, not an exact lookup: an account with
@@ -283,7 +294,17 @@ func findDomain(ctx context.Context, client *dnspod.Client, domain string) (*dns
 	// would false-report "not under DNSPod" for a domain that is.
 	domain = strings.TrimSuffix(domain, ".")
 	var offset int64
-	for {
+	for page := 0; ; page++ {
+		// The cap is an error, never a nil: "the account does not hold this domain" is this
+		// function's documented nil answer, and preflight turns that into "the domain is not
+		// under DNSPod in this account" -- so giving up on the walk would answer the question
+		// it was asked with the one conclusion it cannot support.
+		if page >= domainListMaxPages {
+			return nil, fmt.Errorf("DescribeDomainList did not advance after %d pages (%d domains): "+
+				"refusing to keep paging, and refusing to conclude that %q is not in this account",
+				page, offset, domain)
+		}
+
 		req := dnspod.NewDescribeDomainListRequest()
 		req.Keyword = common.StringPtr(domain)
 		req.Limit = common.Int64Ptr(100)

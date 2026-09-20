@@ -236,6 +236,18 @@ type reconcileResponse struct {
 	Unknown  []string `json:"unknown,omitempty"`
 }
 
+// unknownNamesResponse is the 404 body for a trigger that named nothing managed here.
+//
+// It repeats the accepted/skipped/unknown shape rather than being a bare {"error": ...} so a
+// caller parsing the response can read it with the same code: which names were rejected is the
+// whole answer, and "error" alone would send them back to their own JSON.
+type unknownNamesResponse struct {
+	Error   string   `json:"error"`
+	Unknown []string `json:"unknown"`
+	// Present so the same parser works on both answers; always empty here -- nothing started.
+	Accepted []string `json:"accepted"`
+}
+
 func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -323,6 +335,27 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		resp.Accepted = append(resp.Accepted, started...)
 		resp.Skipped = append(resp.Skipped, running...)
 		resp.Unknown = append(resp.Unknown, notFound...)
+
+		// Nothing started and nothing already running means every name the caller sent is one
+		// this deployment does not manage -- and answering 202 there says "accepted, convergence
+		// is on its way" for a request that will never converge anything. The caller (a CI job, a
+		// deploy hook) has no way to tell that from success: it polls /hook/status, finds the
+		// certificate absent from every field, and concludes the trigger worked. A typo in the
+		// name is the common cause and it is a caller error, so 404 is the answer -- with the
+		// names echoed back, in the same body shape the 202 uses.
+		//
+		// A partial answer stays 202: some names started, others are unknown, and the ones that
+		// started really are converging.
+		if len(resp.Accepted) == 0 && len(resp.Skipped) == 0 {
+			s.log.Warn("trigger named no certificate this deployment manages",
+				"unknown", resp.Unknown, "remote", r.RemoteAddr)
+			writeJSON(w, http.StatusNotFound, unknownNamesResponse{
+				Error:   "no certificate with any of those names is managed here",
+				Unknown: resp.Unknown,
+			})
+			return
+		}
+
 		s.log.Info("webhook triggered convergence",
 			"accepted", resp.Accepted, "skipped", resp.Skipped, "unknown", resp.Unknown,
 			"remote", r.RemoteAddr)

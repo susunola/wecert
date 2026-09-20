@@ -20,6 +20,43 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
+// The probe must insist on a chain a client will accept, unless the configuration says the CA
+// is internal.
+//
+// Regression: probeCert built the expectation without the trust switch at all, so Verify never
+// saw it and a listener serving the leaf without its intermediate -- a chain no client accepts --
+// was reported as a successful deployment. Strict is the default; an internal CA opts out
+// because its certificates never verify against the system roots.
+func TestProbeExpectationRequiresATrustedChainByDefault(t *testing.T) {
+	no, yes := false, true
+
+	cases := []struct {
+		name string
+		set  *bool
+		want bool
+	}{
+		{"unset means strict", nil, true},
+		{"explicitly on", &yes, true},
+		{"an internal CA opts out", &no, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Reconciler{cfg: &config.Config{Probe: config.Probe{RequireTrusted: tc.set}}}
+			got := r.probeExpectation([]string{"www.example.com"}, time.Now().Add(24*time.Hour))
+			if got.RequireTrusted != tc.want {
+				t.Errorf("RequireTrusted = %v, want %v", got.RequireTrusted, tc.want)
+			}
+			// The rest is copied straight through, so the switch cannot be the only thing set.
+			if len(got.Domains) != 1 || got.Domains[0] != "www.example.com" {
+				t.Errorf("Domains = %v, want the names handed in", got.Domains)
+			}
+			if got.NotAfter.IsZero() {
+				t.Error("NotAfter must be carried through; it is what proves the rebind took effect")
+			}
+		})
+	}
+}
+
 // A wildcard has no address of its own to dial.
 //
 // Take the first N in declaration order, not randomly or lexicographically:
@@ -205,7 +242,7 @@ func TestProbeExpectationFollowsTheDeployedSubsetNotTheConfig(t *testing.T) {
 	prov.set(config.Certificate{Name: certName, Domains: configured})
 	cfg := &config.Config{}
 	cfg.Certificates = []config.Certificate{{Name: certName, Domains: configured}}
-	cfg.Probe.MaxHostsPerCert = 10
+	cfg.Probe.MaxHostsPerCert = intPtr(10)
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	r := New(cfg, prov, store, &fakeManager{}, nil, log)
@@ -565,7 +602,7 @@ func TestProbeCertLogDistinguishesAZeroCapFromAllWildcards(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		cfg := &config.Config{Probe: config.Probe{MaxHostsPerCert: maxHosts}}
+		cfg := &config.Config{Probe: config.Probe{MaxHostsPerCert: &maxHosts}}
 		handler := &recordLogHandler{}
 		r := New(cfg, spec.NewStatic(nil), store, &fakeManager{}, nil, slog.New(handler))
 		r.prober = &fakeProber{}
@@ -586,5 +623,121 @@ func TestProbeCertLogDistinguishesAZeroCapFromAllWildcards(t *testing.T) {
 	r.probeCert(context.Background(), c)
 	if !handler.contains("every name in this certificate is a wildcard") {
 		t.Error("an all-wildcard certificate must still be diagnosed as such")
+	}
+}
+
+// intPtr is the *int literal the config field needs: probe.maxHostsPerCert is a pointer so an
+// explicit 0 ("probe nothing") is distinguishable from unset ("use the default").
+func intPtr(v int) *int { return &v }
+
+// An unreadable desired state must keep BOTH the probe series and the record of what was
+// probed.
+//
+// reclaimStaleProbeSeries bails out there with "keep the series rather than deleting evidence"
+// -- but it cleared the per-round probedHosts set before that return, so it threw away the very
+// thing that says which hosts are live. The next round that did resolve a document then judged
+// every host the previous round probed (and this one did not) as stale and deleted it: one
+// unreadable document turned a whole round of probe evidence into deletions, which is the
+// opposite of what the branch exists to do.
+func TestAnUnreadableDesiredStateKeepsTheProbeRecord(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const live, gone = "keepme.example.com", "dropme.example.com"
+	metrics.CertificateProbeMatch.WithLabelValues(live).Set(1)
+	metrics.CertificateProbeMatch.WithLabelValues(gone).Set(0)
+
+	r := &Reconciler{
+		store:       store,
+		probedHosts: map[string]struct{}{live: {}},
+		prober:      &fakeProber{hosts: []string{live, gone}},
+	}
+
+	r.reclaimStaleProbeSeries(nil)
+
+	if !probeMatchSeriesExists(t, gone) {
+		t.Error("no series may be reclaimed for a round whose desired state could not be read")
+	}
+	r.probeMu.Lock()
+	_, kept := r.probedHosts[live]
+	r.probeMu.Unlock()
+	if !kept {
+		t.Error("the record of what this round probed must survive the bail-out: it is what stops " +
+			"the next round from deleting those hosts' series")
+	}
+
+	// The next round resolves a document that no longer lists either certificate: the live host
+	// is still known to have been probed, so only the genuinely stale one goes.
+	r.reclaimStaleProbeSeries(&spec.Result{})
+
+	if !probeMatchSeriesExists(t, live) {
+		t.Error("a host recorded as probed must keep its series")
+	}
+	if probeMatchSeriesExists(t, gone) {
+		t.Error("a host that is no longer probed must have its series reclaimed")
+	}
+}
+
+// One unrelated in-flight pass must not suspend reclamation for the whole fleet.
+//
+// The guard was "is ANY pass in flight", and a webhook-triggered pass runs for minutes while the
+// timer's own pass walks past it and finishes. Every host then kept its series -- including hosts
+// whose certificate had already left the desired state, which is exactly the permanent false
+// alert this function exists to remove. Only the host's own certificate being mid-pass
+// justifies waiting.
+func TestAnUnrelatedPassInFlightDoesNotSuspendReclamation(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const gone = "orphan.example.com"
+	metrics.CertificateProbeMatch.WithLabelValues(gone).Set(0)
+
+	r := &Reconciler{
+		store:       store,
+		probedHosts: map[string]struct{}{},
+		prober:      &fakeProber{hosts: []string{gone}},
+		running:     map[string]struct{}{"elsewhere": {}}, // a pass for a certificate still wanted
+	}
+
+	r.reclaimStaleProbeSeries(&spec.Result{Certificates: []config.Certificate{{Name: "elsewhere"}}})
+
+	if probeMatchSeriesExists(t, gone) {
+		t.Error("a host whose certificate is not in the desired state must be reclaimed even while " +
+			"an unrelated certificate's pass is running")
+	}
+}
+
+// A pass for a certificate the desired state no longer lists CAN still be about a host that has
+// no owner here -- its probeCert has not necessarily run -- so that one still holds reclamation
+// up. This is the narrow case the old global guard was protecting; the difference is that it no
+// longer applies to hosts whose own certificate is simply busy.
+func TestAnOrphanedPassStillHoldsUpReclamation(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const gone = "orphan2.example.com"
+	metrics.CertificateProbeMatch.WithLabelValues(gone).Set(0)
+
+	r := &Reconciler{
+		store:       store,
+		probedHosts: map[string]struct{}{},
+		prober:      &fakeProber{hosts: []string{gone}},
+		running:     map[string]struct{}{"removed-cert": {}}, // not in the desired state
+	}
+
+	r.reclaimStaleProbeSeries(&spec.Result{Certificates: []config.Certificate{{Name: "elsewhere"}}})
+
+	if !probeMatchSeriesExists(t, gone) {
+		t.Error("a pass for a certificate that left the desired state may still be about to probe " +
+			"this host, so its series must be kept")
 	}
 }
