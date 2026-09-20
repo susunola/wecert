@@ -329,11 +329,13 @@ func TestTriggerMultipleCerts(t *testing.T) {
 	}
 }
 
+// An unknown name must not sink the names beside it: the ones that ARE managed still converge,
+// and the caller is told which ones were not recognised.
 func TestTriggerUnknownCertIsReportedNotFatal(t *testing.T) {
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
-	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"nope"}`, bearer())
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"certs":["a","nope"]}`, bearer())
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("an unknown name should not fail the whole request, got %d", w.Code)
 	}
@@ -342,6 +344,41 @@ func TestTriggerUnknownCertIsReportedNotFatal(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if len(resp.Unknown) != 1 || resp.Unknown[0] != "nope" {
 		t.Errorf("the unknown name should be reported in unknown, got %+v", resp)
+	}
+	if len(resp.Accepted) != 1 || resp.Accepted[0] != "a" {
+		t.Errorf("the managed name beside it must still be started, got %+v", resp)
+	}
+}
+
+// A trigger that names NOTHING this deployment manages is a caller error, not an accepted one.
+//
+// 202 says "accepted, convergence is on its way" -- and nothing is on its way. The caller (a CI
+// job, a deploy hook) has no way to tell that from success: it polls /hook/status, finds the
+// certificate absent from every field, and concludes the trigger worked. A typo in the name is
+// the common cause, and the cost is a certificate that quietly goes unmanaged until it expires --
+// which is the failure this whole project exists to prevent. The names are echoed back in the
+// same shape as the 202, so one parser reads both answers.
+func TestTriggerAllNamesUnknownIsNotFound(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"nope"}`, bearer())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("a trigger that started nothing must not be reported as accepted, got %d", w.Code)
+	}
+
+	var resp reconcileResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("the 404 body must keep the 202's shape so one parser reads both: %v", err)
+	}
+	if len(resp.Unknown) != 1 || resp.Unknown[0] != "nope" {
+		t.Errorf("the unknown name must be echoed back, got %+v (%s)", resp, w.Body.String())
+	}
+	if len(resp.Accepted) != 0 {
+		t.Errorf("nothing was accepted, got %+v", resp)
+	}
+	if len(rec.started) != 0 {
+		t.Errorf("nothing may be started, got %v", rec.started)
 	}
 }
 
@@ -641,9 +678,34 @@ func TestTriggerCertResolveFailureIs503(t *testing.T) {
 	}
 }
 
-// A true not-found still lands in the unknown bucket with a 202 -- that is the
-// one case where "we do not manage this name" is the honest answer.
+// ErrUnknownCert is the sentinel for "the desired state resolved and this name is not in it":
+// it lands in the unknown bucket, NOT in the 503 branch (a transient resolve failure) and not
+// among the started. Kept beside a name that does resolve, so the 202 path is exercised too.
 func TestTriggerUnknownCertSentinelIsReportedUnknown(t *testing.T) {
+	rec := &fakeReconciler{
+		names:   []string{"a", "b"},
+		failFor: map[string]error{"a": reconcile.ErrUnknownCert},
+	}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"certs":["a","b"]}`, bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("a partial answer is still an accepted trigger, got %d", w.Code)
+	}
+
+	var resp reconcileResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Unknown) != 1 || resp.Unknown[0] != "a" {
+		t.Errorf("the name should be reported in unknown, got %+v", resp)
+	}
+	if len(resp.Accepted) != 1 || resp.Accepted[0] != "b" {
+		t.Errorf("the resolvable name must still be started, got %+v", resp)
+	}
+}
+
+// The sentinel alone -- every name unknown -- is the same caller error as a typo, and must not
+// be softened into a 202 just because it arrived as a sentinel rather than a missing name.
+func TestTriggerUnknownCertSentinelAloneIsNotFound(t *testing.T) {
 	rec := &fakeReconciler{
 		names:   []string{"a"},
 		failFor: map[string]error{"a": reconcile.ErrUnknownCert},
@@ -651,14 +713,14 @@ func TestTriggerUnknownCertSentinelIsReportedUnknown(t *testing.T) {
 	s, _ := newTestServer(t, rec)
 
 	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer())
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("a genuine not-found should still return 202, got %d", w.Code)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("a trigger that started nothing must not be reported as accepted, got %d", w.Code)
 	}
 
 	var resp reconcileResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if len(resp.Unknown) != 1 || resp.Unknown[0] != "a" {
-		t.Errorf("the name should be reported in unknown, got %+v", resp)
+		t.Errorf("the name must be echoed back, got %+v (%s)", resp, w.Body.String())
 	}
 }
 

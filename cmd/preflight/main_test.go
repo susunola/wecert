@@ -429,3 +429,34 @@ func TestFindDomainAcceptsATrailingDot(t *testing.T) {
 		t.Fatalf("found=%v err=%v, want the trailing-dot form of a held domain to match", found, err)
 	}
 }
+
+// A server that ignores Offset turns findDomain's walk into an unbounded loop: both exits in it
+// are answers the server gives (an empty page, or a total that has been covered), so a page that
+// never advances means one API call per iteration, forever, from a preflight check that is meant
+// to finish in seconds.
+//
+// The cap must also NOT be reported as (nil, nil): that is this function's documented answer for
+// "the account genuinely does not hold the domain", and preflight turns it into the "not under
+// DNSPod" diagnosis -- an answer the walk never actually established.
+func TestFindDomainRefusesToLoopForever(t *testing.T) {
+	var calls int
+	stubDescribeDomainList(t, func(int64) *dnspod.DescribeDomainListResponse {
+		calls++
+		// A full page every time, with a total that never gets covered: the worst case.
+		return domainPage(1<<40, "sub.example.com")
+	})
+
+	found, err := findDomain(context.Background(), nil, "example.com")
+	if err == nil {
+		t.Fatalf("a walk that never advances must fail, got found=%v err=nil after %d calls", found, calls)
+	}
+	if found != nil {
+		t.Errorf("found = %v, want nil when the walk is abandoned", found)
+	}
+	if !strings.Contains(err.Error(), "refusing to keep paging") {
+		t.Errorf("the error must say why the search stopped, got: %v", err)
+	}
+	if calls != domainListMaxPages {
+		t.Errorf("calls = %d, want exactly the page cap %d", calls, domainListMaxPages)
+	}
+}

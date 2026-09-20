@@ -1329,6 +1329,47 @@ func TestRevertedWriteDoesNotEscapeTheBudget(t *testing.T) {
 	}
 }
 
+// Commit writes the document first and onboarding's own state file second, so the two paths
+// being the same file ends the round with the state JSON sitting where the desired-state
+// document was. The next round cannot parse it and the whole round is refused -- and by then
+// the document is already gone.
+func TestNewRejectsAStatePathThatIsTheDocument(t *testing.T) {
+	dir := t.TempDir()
+	doc := filepath.Join(dir, "desired-state.yaml")
+
+	// Same spelling, and the two ways of writing the same file that a flag can carry.
+	for _, state := range []string{doc, filepath.Join(dir, ".", "desired-state.yaml"), dir + "//desired-state.yaml"} {
+		ob, err := New(Sources{Declarations: &fakeDeclarations{}}, Options{
+			DocumentPath: doc,
+			StatePath:    state,
+			Generator:    "wecert-onboard/test",
+		}, testLogger())
+		if err == nil {
+			t.Fatalf("StatePath %q is the document; New must refuse it", state)
+		}
+		if ob != nil {
+			t.Error("a refused construction must not hand back an onboarder")
+		}
+	}
+
+	// A different file in the same directory is fine.
+	if _, err := New(Sources{Declarations: &fakeDeclarations{}}, Options{
+		DocumentPath: doc,
+		StatePath:    filepath.Join(dir, "onboard-state.json"),
+		Generator:    "wecert-onboard/test",
+	}, testLogger()); err != nil {
+		t.Errorf("a state file next to the document must be accepted, got %v", err)
+	}
+
+	// No state file at all stays legal: it is an optional output.
+	if _, err := New(Sources{Declarations: &fakeDeclarations{}}, Options{
+		DocumentPath: doc,
+		Generator:    "wecert-onboard/test",
+	}, testLogger()); err != nil {
+		t.Errorf("an empty StatePath must stay legal, got %v", err)
+	}
+}
+
 // With no CLB rule source configured the reference check cannot run at all, so
 // nothing is ever deleted. That is the safe direction -- but the carry reason
 // must say the check could not run, not claim a rule still references the name.
