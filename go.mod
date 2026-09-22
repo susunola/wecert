@@ -8,7 +8,7 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb v1.3.176
-	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.180
+	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.182
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/dnspod v1.3.131
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl v1.3.147
 	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/tat v1.3.107
