@@ -13,6 +13,7 @@
         "ssl:DescribeHostUpdateRecordDetail",
         "ssl:CreateCertificateBindResourceSyncTask",
         "ssl:DescribeCertificateBindResourceTaskResult",
+        "ssl:DescribeCertificateBindResourceTaskDetail",
         "clb:DescribeLoadBalancers",
         "clb:DescribeListeners"
       ],

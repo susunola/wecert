@@ -12,7 +12,8 @@
         "ssl:UpdateCertificateInstance",
         "ssl:DescribeHostUpdateRecordDetail",
         "ssl:CreateCertificateBindResourceSyncTask",
-        "ssl:DescribeCertificateBindResourceTaskResult"
+        "ssl:DescribeCertificateBindResourceTaskResult",
+        "ssl:DescribeCertificateBindResourceTaskDetail"
       ],
       "resource": [
         "*"

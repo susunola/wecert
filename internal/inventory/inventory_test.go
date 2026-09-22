@@ -185,7 +185,7 @@ func TestSortPutsTroubleFirstThenDaysLeft(t *testing.T) {
 		Now: now, Names: []string{"ok-far", "wait", "ok-near"}, ProbeEnabled: false,
 		Certs: map[string]*state.CertState{
 			"wait":    {Name: "wait", NotAfter: now.Add(40 * 24 * time.Hour), DeployedCertID: "c1"},
-			"ok-near": {Name: "ok-near", NotAfter: now.Add(40 * 24 * time.Hour), DeployConfirmed: true},
+			"ok-near": {Name: "ok-near", NotAfter: now.Add(20 * 24 * time.Hour), DeployConfirmed: true},
 			"ok-far":  {Name: "ok-far", NotAfter: now.Add(80 * 24 * time.Hour), DeployConfirmed: true},
 		},
 	})
