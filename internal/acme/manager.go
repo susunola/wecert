@@ -207,6 +207,10 @@ func (m *Manager) setTransientBackoff(certName string, until time.Time) {
 	m.transientMu.Lock()
 	defer m.transientMu.Unlock()
 	m.transientBackoff[certName] = until
+	// Same sweep as the sibling maps: entries for certificates that left the desired
+	// state are never revisited by transientBackoffFor, so without this the map grows
+	// with every name that ever hit a store failure. See cooldownMapLimit.
+	pruneExpired(m.transientBackoff, m.now(), cooldownMapLimit)
 }
 
 // maxOrderFetchFailures is how many consecutive GetOrder failures discard an order.
@@ -309,12 +313,13 @@ func (m *Manager) noteIdentifierFailure(identifier string) {
 	pruneExpired(m.identifierCooldown, now, cooldownMapLimit)
 }
 
-// cooldownMapLimit is when the two time-keyed maps are swept for expired entries.
+// cooldownMapLimit is when the time-keyed maps are swept for expired entries.
 //
-// Both are keyed by a name that can leave the deployment -- an identifier, a certificate -- and
-// entries were only ever deleted when the SAME name came up again: coolingDown deletes an expired
-// identifier it is asked about, and nothing ever deletes a binding check. A deployment that churns
-// names therefore grew both maps forever (the round-11 scale work measured 50 -> 600 entries over 600
+// All three (identifierCooldown, bindingChecked, transientBackoff) are keyed by a name that can
+// leave the deployment -- an identifier, a certificate -- and entries were only ever deleted when
+// the SAME name came up again: coolingDown deletes an expired identifier it is asked about, and
+// nothing ever deleted a binding check or a transient backoff. A deployment that churns names
+// therefore grew the maps forever (the round-11 scale work measured 50 -> 600 entries over 600
 // churned names, and certificate names churn by design). The sweep runs on the write path, which is
 // the only place where growth happens, and the limit is high enough that it is one pass over a small
 // map at most once per batch of failures.

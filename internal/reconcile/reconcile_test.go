@@ -2392,3 +2392,21 @@ func TestAPanicAfterASuccessfulPassDoesNotFailThePass(t *testing.T) {
 			"bug), got %v", got)
 	}
 }
+
+// SetProber used to write r.prober with no synchronization while convergence
+// goroutines read it. The "must be called before the first convergence" contract has
+// no enforcement; a late call is otherwise a data race under -race and a torn read
+// without it.
+func TestSetProberIsSafeAgainstConcurrentReads(t *testing.T) {
+	r := &Reconciler{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			_ = r.getProber()
+		}
+	}()
+	r.SetProber(nil)
+	r.SetProber(nil)
+	<-done
+}

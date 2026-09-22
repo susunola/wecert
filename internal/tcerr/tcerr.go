@@ -109,7 +109,13 @@ func IsPermanent(err error) bool {
 //
 // It is retryable, so it must not be treated as permanent -- but hammering it at the polling
 // interval amplifies the throttling instead of waiting it out.
+//
+// Nil is not throttled. IsPermanent and isNoData already guard nil; this one used to fall
+// through to err.Error() on the right of || and panic on a nil error from a polling loop.
 func IsThrottled(err error) bool {
+	if err == nil {
+		return false
+	}
 	return strings.HasPrefix(Code(err), "RequestLimitExceeded") ||
 		strings.Contains(err.Error(), "RequestLimitExceeded")
 }

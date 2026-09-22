@@ -2,11 +2,52 @@ package webhook
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
 
 var limiterT0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// Concurrent wrong-token requests must not slip past the lockout.
+//
+// auth used to call allowed() and then recordFailure() as two steps: a burst of N concurrent
+// failures all saw failures==0 and all counted, so one burst could place far more than
+// authMaxFailures guesses. fail() checks and counts under one mutex; this is what keeps it
+// that way.
+func TestConcurrentFailuresCannotBypassTheLockout(t *testing.T) {
+	l := newAuthLimiter()
+
+	const n = 200
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	blocked := make([]bool, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			blocked[i], _ = l.fail("1.2.3.4", limiterT0)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	admitted := 0
+	for _, b := range blocked {
+		if !b {
+			admitted++
+		}
+	}
+	// The request that tips the count over the limit is still answered 401 (block engages
+	// for the next one), so exactly authMaxFailures are admitted -- never more.
+	if admitted != authMaxFailures {
+		t.Errorf("a concurrent burst admitted %d failed attempts, want exactly %d", admitted, authMaxFailures)
+	}
+	if ok, _ := l.allowed("1.2.3.4", limiterT0); ok {
+		t.Error("the address must be blocked after the concurrent burst")
+	}
+}
 
 // The lockout must survive continued failures: resetting the failure window
 // while a block is active would also drop blockedUntil, shrinking the

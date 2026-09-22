@@ -862,7 +862,7 @@ func Load(path string) (*Config, error) {
 	// key but says nothing about everything after a stray "---", which a copy-paste or a
 	// template edit produces. Silently ignoring half the file is exactly the "why isn't my
 	// certificate being issued" failure this loader exists to prevent.
-	if err := rejectExtraDocuments(dec, path); err != nil {
+	if err := RejectExtraDocuments(dec, path); err != nil {
 		return nil, err
 	}
 
@@ -902,14 +902,18 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// rejectExtraDocuments fails when the input holds more than one YAML document.
+// RejectExtraDocuments fails when the input holds more than one YAML document.
 //
 // An **empty** trailing document is not a second document: yaml.v3 decodes "---\n" to a nil
-// value with no error, so a config that merely ends with a separator looked like a second
+// value with no error, so a file that merely ends with a separator looked like a second
 // document here and was refused. Load failing means the daemon does not start at all, so that
 // guard was refusing a file whose meaning was never in doubt. Empty documents are skipped and
 // only a document with content in it is rejected.
-func rejectExtraDocuments(dec *yaml.Decoder, path string) error {
+//
+// Exported because the desired-state document uses the same rule and used to carry its own
+// copy -- which fixed this for config only, and left the document path still refusing a
+// trailing "---". One implementation is what keeps them from drifting again.
+func RejectExtraDocuments(dec *yaml.Decoder, path string) error {
 	for {
 		var extra any
 		if err := dec.Decode(&extra); err != nil {
@@ -1016,6 +1020,17 @@ func listenWarnings(field, listen string) []string {
 	}
 	if isLoopbackHost(host) {
 		return nil
+	}
+	// The trigger endpoint carries a bearer token over plaintext HTTP and can spend
+	// real ACME quota. The generic "reachable from beyond this machine" warning is
+	// the right tone for /metrics; for the hook it understates what a same-segment
+	// observer can do with a sniffed token.
+	if field == "webhook.listen" {
+		return []string{fmt.Sprintf(
+			"%s binds %s, which is reachable from beyond this machine (an empty host means "+
+				"every interface). The trigger carries a bearer token over plaintext HTTP and "+
+				"can spend real ACME rate-limit quota: put a TLS terminator in front of it, or "+
+				"bind 127.0.0.1:<port> and reach it through a tunnel", field, listen)}
 	}
 	return []string{fmt.Sprintf(
 		"%s binds %s, which is reachable from beyond this machine (an empty host means every "+

@@ -90,9 +90,18 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 		if err := store.PutAccount(&state.Account{Directory: directory, PrivateKeyPEM: keyPEM}); err != nil {
 			return nil, fmt.Errorf("persist the account key before registering: %w", err)
 		}
+		// A legacy row without a key cannot keep its kid. That kid names an account
+		// registered for a DIFFERENT key: PutAccount just cleared it in the database
+		// (kid = excluded.kid), and pairing the leftover in-memory KID with this new key
+		// would make every JWS fail for the whole pass -- then register a second account
+		// on the next start. Force the re-registration branch below.
+		if acc != nil {
+			acc.KID = ""
+		}
 	}
 
-	// A row with a kid is complete: load it without registering.
+	// A row with a kid is complete: load it without registering. Only when the key that
+	// goes with it is the one already stored -- see the legacy-row branch above.
 	if acc != nil && acc.KID != "" {
 		core, err := api.New(httpClient, userAgent(), directory, acc.KID, key)
 		if err != nil {

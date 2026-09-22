@@ -58,6 +58,30 @@ func TestTimeKeyedMapsAreSwept(t *testing.T) {
 	}
 }
 
+// transientBackoff is the third time-keyed map and shares the same leak shape: a
+// certificate that leaves the desired state is never asked about again, so its
+// unpersisted-backoff entry stayed forever. The write path sweeps it like the other two.
+func TestTransientBackoffIsSwept(t *testing.T) {
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	m, _ := newTestManager(t, nil, nil)
+	m.SetNow(func() time.Time { return now })
+
+	for i := 0; i < cooldownMapLimit; i++ {
+		m.transientBackoff[fmt.Sprintf("gone-cert-%04d", i)] = now.Add(-time.Hour)
+	}
+	m.transientBackoff["live-cert"] = now.Add(time.Minute)
+
+	m.setTransientBackoff("newly-broken-cert", now.Add(30*time.Second))
+
+	if len(m.transientBackoff) > 2 {
+		t.Errorf("transientBackoff still holds %d entries; expired ones must be swept",
+			len(m.transientBackoff))
+	}
+	if _, ok := m.transientBackoff["live-cert"]; !ok {
+		t.Error("the sweep must not drop a backoff that is still in force")
+	}
+}
+
 func TestParseOrderExpiresEmptyUsesFallback(t *testing.T) {
 	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
 	got, err := parseOrderExpires("", now)

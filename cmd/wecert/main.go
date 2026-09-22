@@ -950,6 +950,10 @@ func startWebhookServer(
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
+		// Explicit, matching startMetricsServer: IdleTimeout=0 falls back to
+		// ReadTimeout, so keep-alives would silently inherit whatever that is set to
+		// later instead of the longer idle window the metrics server documents.
+		IdleTimeout: 60 * time.Second,
 	}
 
 	go func() {

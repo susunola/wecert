@@ -31,6 +31,24 @@ func TestDomainNotExistsIsTreatedAsNoDomain(t *testing.T) {
 	}
 }
 
+// IsThrottled used to evaluate err.Error() on the right of || whenever Code returned "",
+// so a nil error from a polling loop panicked. Every sibling classifier already guarded
+// nil; this is the one that did not.
+func TestIsThrottledAcceptsNil(t *testing.T) {
+	if IsThrottled(nil) {
+		t.Error("IsThrottled(nil) must be false, not panic")
+	}
+	if !IsThrottled(tcerrors.NewTencentCloudSDKError("RequestLimitExceeded", "slow down", "req-1")) {
+		t.Error("RequestLimitExceeded must classify as throttled")
+	}
+	if !IsThrottled(errors.New("api said RequestLimitExceeded.RateExceeded")) {
+		t.Error("a plain error carrying the code must classify as throttled")
+	}
+	if IsThrottled(errors.New("connection reset")) {
+		t.Error("an unrelated error must not classify as throttled")
+	}
+}
+
 func TestIsNoDataOfRecord(t *testing.T) {
 	cases := []struct {
 		name string

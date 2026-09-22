@@ -119,10 +119,19 @@ func TestNotifyURLWarnings(t *testing.T) {
 // Binding beyond loopback widens the exposure of /metrics and of the token-guarded
 // trigger endpoint. Sometimes that is exactly what is wanted (a Prometheus scraper on
 // another host), so it warns rather than refuses.
+//
+// The webhook warning is the stronger of the two: the trigger carries a bearer token
+// over plaintext HTTP and can spend real ACME quota, which the generic metrics wording
+// does not say.
 func TestListenWarnings(t *testing.T) {
 	for _, listen := range []string{"0.0.0.0:9800", ":9800", "10.0.0.5:9800"} {
 		if w := listenWarnings("metrics.listen", listen); len(w) != 1 {
 			t.Errorf("%q must warn, got %v", listen, w)
+		}
+		if w := listenWarnings("webhook.listen", listen); len(w) != 1 {
+			t.Errorf("%q must warn, got %v", listen, w)
+		} else if !strings.Contains(w[0], "bearer token") {
+			t.Errorf("the webhook warning must name the token exposure, got %q", w[0])
 		}
 	}
 	for _, listen := range []string{"", "127.0.0.1:9800", "[::1]:9800", "localhost:9800"} {

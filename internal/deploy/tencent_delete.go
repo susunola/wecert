@@ -26,6 +26,11 @@ func (d *TencentCLB) Delete(ctx context.Context, certID string) error {
 	if err != nil {
 		return sdkCallError(ctx, "DeleteCertificate("+certID+")", err)
 	}
+	// The certificate is gone from the account (or the delete is in flight): its
+	// cached BindingSnapshot is dead weight now. Doing this only on success would
+	// keep the snapshot of a refused delete, which is still the right answer for a
+	// later inventory lookup -- so drop it once the API has accepted the delete.
+	defer ForgetBindings(certID)
 	if resp.Response == nil {
 		return fmt.Errorf("DeleteCertificate(%s): the API returned an empty response", certID)
 	}

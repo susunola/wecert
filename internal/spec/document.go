@@ -157,7 +157,7 @@ func LoadDocument(path string) (*Document, error) {
 	if err := dec.Decode(doc); err != nil {
 		return nil, fmt.Errorf("parse desired-state document %s: %w", path, err)
 	}
-	if err := rejectExtraDocuments(dec, path); err != nil {
+	if err := config.RejectExtraDocuments(dec, path); err != nil {
 		return nil, err
 	}
 
@@ -244,18 +244,6 @@ func checkDocumentDir(path string) error {
 			"the directory holding the desired-state document (%s) is group- or world-writable (%04o); "+
 				"anyone who can write it can replace the document, which decides which domains are served",
 			dir, perm)
-	}
-	return nil
-}
-
-// rejectExtraDocuments fails when the input holds more than one YAML document.
-func rejectExtraDocuments(dec *yaml.Decoder, path string) error {
-	var extra any
-	if err := dec.Decode(&extra); err == nil {
-		return fmt.Errorf("%s contains more than one YAML document (a stray '---'?); "+
-			"everything after the first document would be ignored, so it is rejected instead", path)
-	} else if !errors.Is(err, io.EOF) {
-		return fmt.Errorf("parse desired-state document %s: %w", path, err)
 	}
 	return nil
 }

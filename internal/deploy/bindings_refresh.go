@@ -23,29 +23,88 @@ type bindingMemo struct {
 	byID map[string]cachedBindings
 }
 
+// bindingMemoTTL bounds how long a parse is reused without a fresh TaskDetail read.
+// Past it the next lookup misses and the caller re-queries, so a certificate whose
+// bindings were deleted out-of-band does not report a stale answer forever.
+const bindingMemoTTL = 10 * time.Minute
+
+// bindingMemoMaxEntries is the hard ceiling on cached certificate IDs.
+//
+// The cache is keyed by certID and certificates rotate: every renewal uploads a new
+// ID and the old one leaves the deploy path. Without a ceiling a long-lived daemon
+// that renews often keeps one BindingSnapshot (with its Items slice) per certificate
+// it has ever seen -- unbounded, and nothing in the deploy path revisits an old ID
+// to expire it. Evicting a cache entry only costs a re-query.
+const bindingMemoMaxEntries = 4096
+
 var bindingMemoStore = &bindingMemo{byID: map[string]cachedBindings{}}
 
 func rememberBindings(certID string, snap BindingSnapshot) {
 	if certID == "" {
 		return
 	}
+	now := time.Now()
 	bindingMemoStore.mu.Lock()
-	bindingMemoStore.byID[certID] = cachedBindings{snap: snap, at: time.Now()}
+	defer bindingMemoStore.mu.Unlock()
+	// Sweep before insert: the write path is where growth happens, same pattern as
+	// the acme package's cooldown maps.
+	if len(bindingMemoStore.byID) >= bindingMemoMaxEntries {
+		for id, hit := range bindingMemoStore.byID {
+			if now.Sub(hit.at) > bindingMemoTTL {
+				delete(bindingMemoStore.byID, id)
+			}
+		}
+		// Still full of live entries (a burst of new certIDs inside one TTL): drop the
+		// oldest until it fits. Losing a cache entry costs one API re-query.
+		for len(bindingMemoStore.byID) >= bindingMemoMaxEntries {
+			var (
+				oldestID string
+				oldest   time.Time
+				found    bool
+			)
+			for id, hit := range bindingMemoStore.byID {
+				if !found || hit.at.Before(oldest) {
+					oldestID, oldest, found = id, hit.at, true
+				}
+			}
+			if !found {
+				break
+			}
+			delete(bindingMemoStore.byID, oldestID)
+		}
+	}
+	bindingMemoStore.byID[certID] = cachedBindings{snap: snap, at: now}
+}
+
+// ForgetBindings drops the cached parse for a certificate that has been deleted,
+// so the map does not keep its snapshot after the certificate is gone.
+func ForgetBindings(certID string) {
+	if certID == "" {
+		return
+	}
+	bindingMemoStore.mu.Lock()
+	delete(bindingMemoStore.byID, certID)
 	bindingMemoStore.mu.Unlock()
 }
 
 // LookupCachedBindings returns the last TaskDetail parse for certID and the
 // instant it was observed, so the inventory page can timestamp rows that come
 // from the cache instead of the current request. ok is false when this process
-// has never successfully parsed one; at is then the zero time.
+// has never successfully parsed one, or the entry is past its TTL; at is then
+// the zero time.
 func LookupCachedBindings(certID string) (BindingSnapshot, time.Time, bool) {
 	if certID == "" {
 		return BindingSnapshot{}, time.Time{}, false
 	}
+	now := time.Now()
 	bindingMemoStore.mu.Lock()
 	defer bindingMemoStore.mu.Unlock()
 	hit, ok := bindingMemoStore.byID[certID]
 	if !ok {
+		return BindingSnapshot{}, time.Time{}, false
+	}
+	if now.Sub(hit.at) > bindingMemoTTL {
+		delete(bindingMemoStore.byID, certID)
 		return BindingSnapshot{}, time.Time{}, false
 	}
 	return hit.snap, hit.at, true

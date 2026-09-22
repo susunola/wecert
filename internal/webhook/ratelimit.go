@@ -59,9 +59,35 @@ func (l *authLimiter) allowed(addr string, now time.Time) (ok bool, retryAfter t
 	return false, st.blockedUntil.Sub(now)
 }
 
+// fail records a failed authentication and reports the lockout state of the address
+// AFTER that attempt, in one critical section.
+//
+// auth used to call allowed() and then recordFailure() as two separate steps. Concurrent
+// wrong-token requests all passed allowed() while the failure count was still 0, then each
+// counted -- so a single burst could place far more than authMaxFailures guesses before
+// any of them saw the lockout. Checking and counting under one mutex is what makes the
+// limit a limit.
+//
+// The request that tips the count over authMaxFailures is still answered 401 (it failed
+// the token check; the block engages for the next one), matching the sequential semantics.
+func (l *authLimiter) fail(addr string, now time.Time) (blocked bool, retryAfter time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if st := l.byAddr[addr]; st != nil && now.Before(st.blockedUntil) {
+		return true, st.blockedUntil.Sub(now)
+	}
+	l.recordFailureLocked(addr, now)
+	return false, 0
+}
+
 func (l *authLimiter) recordFailure(addr string, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.recordFailureLocked(addr, now)
+}
+
+// recordFailureLocked is recordFailure's body. Callers must hold l.mu.
+func (l *authLimiter) recordFailureLocked(addr string, now time.Time) {
 	l.gc(now)
 	st := l.byAddr[addr]
 	// Reset the window only when no block is active: resetting it mid-block

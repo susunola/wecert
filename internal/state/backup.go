@@ -117,9 +117,13 @@ func (s *Store) Snapshot(dir string, keep int) (string, error) {
 	// left behind a world-readable `.snapshot-*.tmp` that nothing ever revisits (listing matches
 	// only the final `<base>.backup-<stamp>.db` names). The chmod stays as the backstop for a file
 	// that already existed.
+	//
+	// restore is deferred, matching openFiles: umask is process-wide and the umask mutex is held
+	// until restore runs, so a panic between the two calls would leave every later file in the
+	// process at 077 and deadlock Open on the same mutex. The cost of defer here is nil.
 	restoreUmask := restrictiveUmask()
+	defer restoreUmask()
 	_, execErr := s.db.Exec(`VACUUM INTO ?`, tmpName)
-	restoreUmask()
 	snapshotCopied(tmpName)
 	if execErr != nil {
 		return "", fmt.Errorf("snapshot state database: %w", execErr)

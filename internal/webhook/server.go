@@ -135,14 +135,16 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if ok, retryAfter := s.limiter.allowed(addr, s.now()); !ok {
+		// Atomic check-and-count (see authLimiter.fail). The previous allowed() +
+		// recordFailure() pair let a concurrent burst of wrong tokens all pass the
+		// check before any of them counted.
+		if blocked, retryAfter := s.limiter.fail(addr, s.now()); blocked {
 			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
 			writeJSON(w, http.StatusTooManyRequests,
 				map[string]string{"error": "too many failed authentication attempts"})
 			return
 		}
 
-		s.limiter.recordFailure(addr, s.now())
 		s.log.Warn("webhook authentication failed",
 			"remote", r.RemoteAddr, "path", r.URL.Path, "method", r.Method)
 		writeJSON(w, http.StatusUnauthorized,

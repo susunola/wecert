@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 // An oversized document must be refused, not silently truncated.
@@ -35,5 +37,68 @@ func TestAnOversizedDocumentIsRefusedRatherThanTruncated(t *testing.T) {
 			"every certificate that was cut off")
 	} else if !strings.Contains(err.Error(), "larger than") {
 		t.Errorf("the refusal must name the size, got %v", err)
+	}
+}
+
+// A desired-state document that merely ends with a separator is one document, not two.
+//
+// The multi-document guard used to live twice: config's copy skipped a trailing empty
+// "---", and this package's copy refused anything Decode returned without error -- so
+// the same trailing separator that Load accepts made LoadDocument fail, which in enforce
+// mode freezes the document at its old revision. Both now share config.RejectExtraDocuments.
+func TestLoadDocumentAcceptsATrailingDocumentSeparator(t *testing.T) {
+	// WriteDocument produces a revision that matches its certificates; the trailing
+	// separator is the only thing under test, so the envelope has to be valid first.
+	base := writeDoc(t, &Document{
+		APIVersion:  APIVersionV1,
+		Kind:        KindDesiredState,
+		GeneratedAt: time.Now().UTC(),
+		Certificates: []config.Certificate{
+			{Name: "example-com", Domains: []string{"example.com"}},
+		},
+	})
+	raw, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, body := range []string{
+		"---\n",
+		"---",
+		"---\n---\n",
+		"---\n# nothing but a comment\n",
+	} {
+		path := filepath.Join(t.TempDir(), "desired-state.yaml")
+		if err := os.WriteFile(path, append(append([]byte{}, raw...), body...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadDocument(path); err != nil {
+			t.Errorf("a document ending in %q is one document and must load, got %v", body, err)
+		}
+	}
+}
+
+// A second document with content in it is still refused -- the trailing-separator
+// exception must not widen into "any extra document is fine".
+func TestLoadDocumentStillRejectsASecondYAMLDocument(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "desired-state.yaml")
+	src := "apiVersion: wecert/v1\n" +
+		"kind: DesiredState\n" +
+		"generatedAt: " + time.Now().UTC().Format(time.RFC3339) + "\n" +
+		"revision: r1\n" +
+		"certificates:\n" +
+		"  - name: example-com\n" +
+		"    domains: [example.com]\n" +
+		"---\n" +
+		"certificates:\n" +
+		"  - name: other-com\n" +
+		"    domains: [other.com]\n"
+	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadDocument(path); err == nil {
+		t.Fatal("a document with two YAML documents must be rejected, not half-ignored")
+	} else if !strings.Contains(err.Error(), "more than one YAML document") {
+		t.Errorf("the error should explain the cause, got %v", err)
 	}
 }

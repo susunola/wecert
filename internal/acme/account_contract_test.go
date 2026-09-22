@@ -170,6 +170,50 @@ func TestEnsureAccountTreatsAnEmptyKeyAsNoAccount(t *testing.T) {
 	}
 }
 
+// A legacy row that still carries a kid must discard it when its key is replaced.
+//
+// The kid is the account URL for the key that is gone. PutAccount clears it in the database
+// as soon as the replacement key is written, and reusing the leftover in-memory KID with the
+// new key paired a live account URL with a key the CA had never seen -- every JWS failed for
+// the whole pass, and the next start registered a second account.
+func TestEnsureAccountReRegistersWhenALegacyRowHasAKidButNoKey(t *testing.T) {
+	fake, store, cfg := accountFixture(t)
+
+	const legacyKID = "https://acme.test/acct/legacy"
+	if err := store.PutAccountWithoutKey(cfg.ACME.Directory, legacyKID); err != nil {
+		t.Fatalf("build a legacy account row: %v", err)
+	}
+
+	// If the leftover kid were reused, registration would not run and this call would
+	// return early -- so a registration that carries no Location must fail here. That is
+	// the proof the re-registration branch was taken.
+	fake.omitAccountLocation.Store(true)
+	_, err := EnsureAccount(cfg, store, fake.srv.Client())
+	if err == nil {
+		t.Fatal("replacing the key of a legacy row must re-register; " +
+			"returning success here means the leftover kid was reused with the new key")
+	}
+
+	// With a normal registration the new account URL must replace the legacy one.
+	fake.omitAccountLocation.Store(false)
+	if _, err := EnsureAccount(cfg, store, fake.srv.Client()); err != nil {
+		t.Fatalf("re-registration after the failed attempt: %v", err)
+	}
+	stored, err := store.GetAccount(cfg.ACME.Directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.KID == legacyKID {
+		t.Errorf("the legacy kid %q was kept; it names an account for a different key", legacyKID)
+	}
+	if stored.KID == "" {
+		t.Error("the re-registration must backfill the kid")
+	}
+	if !strings.Contains(string(stored.PrivateKeyPEM), "PRIVATE KEY") {
+		t.Errorf("the replacement key must be stored as PEM, got %q", stored.PrivateKeyPEM)
+	}
+}
+
 // A registration response without a Location header carries no kid, so the account cannot
 // be used yet. It must be reported, and no kid may be written -- but the account KEY is
 // persisted anyway: it was generated before the registration call precisely so that a

@@ -165,7 +165,12 @@ type Reconciler struct {
 	// additional observation and should not force every test double to construct
 	// one. The field is an interface so the panic containment around a probe can be
 	// exercised without a live TLS endpoint.
-	prober prober
+	//
+	// Guarded because SetProber is documented as "before the first convergence" but
+	// nothing enforces that: a late call raced the webhook goroutines that read
+	// r.prober during a pass. The contract stays; the data race goes.
+	proberMu sync.RWMutex
+	prober   prober
 
 	// last is the most recently resolved desired state, for read-only diagnostics.
 	// A pointer is required: the diagnostic endpoint reads it from another
@@ -200,12 +205,26 @@ type prober interface {
 // The nil check is not redundant with the interface field: storing a nil
 // *probe.Runner in it would make r.prober != nil, and the probe path would then call
 // Check on a nil runner instead of being skipped.
+//
+// Safe to call concurrently with a running pass (it replaces the pointer under the
+// mutex), but "before the first convergence" is still the intended use: a pass
+// already in flight keeps the prober it started with.
 func (r *Reconciler) SetProber(p *probe.Runner) {
+	r.proberMu.Lock()
+	defer r.proberMu.Unlock()
 	if p == nil {
 		r.prober = nil
 		return
 	}
 	r.prober = p
+}
+
+// getProber returns the attached prober, or nil. Every probe-path read goes
+// through here rather than touching r.prober directly.
+func (r *Reconciler) getProber() prober {
+	r.proberMu.RLock()
+	defer r.proberMu.RUnlock()
+	return r.prober
 }
 
 // New builds a reconciler.
@@ -502,8 +521,8 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string, counted bo
 	if stErr == nil && st != nil {
 		for _, host := range r.orphanProbeHosts(st) {
 			metrics.DeleteProbeSeries(host)
-			if r.prober != nil {
-				r.prober.Forget(host)
+			if p := r.getProber(); p != nil {
+				p.Forget(host)
 			}
 		}
 	}
@@ -876,10 +895,11 @@ func (r *Reconciler) retryRevocations(ctx context.Context) {
 // validation and hash -- plus resolve's metric and log side effects -- for EVERY
 // candidate host of every pass.
 func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
-	if r.prober == nil {
+	p := r.getProber()
+	if p == nil {
 		return
 	}
-	all, ok := r.prober.(interface{ ProbedHosts() []string })
+	all, ok := p.(interface{ ProbedHosts() []string })
 	if !ok {
 		return
 	}
@@ -993,7 +1013,7 @@ func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 		// strands a gauge here -- and only the gauge was being reclaimed, so `last` grew
 		// with every host ever dropped from a certificate, and certificate names churn by
 		// design.
-		r.prober.Forget(h)
+		r.getProber().Forget(h)
 	}
 }
 
@@ -1480,7 +1500,8 @@ func (r *Reconciler) probeCertPanicSafe(ctx context.Context, c *config.Certifica
 // cannot dial out must not make a successful renewal look failed. It only
 // affects metrics and alerts.
 func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
-	if r.prober == nil {
+	p := r.getProber()
+	if p == nil {
 		return
 	}
 
@@ -1548,7 +1569,7 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 			r.probeMu.Lock()
 			r.probedHosts[h] = struct{}{}
 			r.probeMu.Unlock()
-			r.prober.Check(ctx, h, e)
+			p.Check(ctx, h, e)
 		}(host)
 	}
 	wg.Wait()

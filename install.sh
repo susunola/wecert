@@ -78,9 +78,11 @@ fi
 # place in a file that may have crossed a build host, a shared directory or a
 # download.
 #
-# Absent sums file: warn rather than refuse, because copying the single binary to a
-# CVM is a legitimate workflow. Present but mismatched: refuse, because that is the
-# case this check exists for.
+# Absent sums file: refuse. The old warning-and-continue made the supply-chain check
+# optional -- the exact case it exists for is "someone handed me a binary" -- and the
+# binary then runs as root with the CAM credentials. Copying a single binary to a CVM
+# is still a legitimate workflow; it just has to say so with
+# WECERT_INSECURE_SKIP_CHECKSUM=1. Present but mismatched: always refuse.
 verify_checksum() {
 	local artifact="$1"
 	local dir name sums expected actual goarch
@@ -89,10 +91,18 @@ verify_checksum() {
 	sums="${dir}/SHA256SUMS"
 
 	if [[ ! -f "${sums}" ]]; then
-		echo "Warning: no SHA256SUMS beside ${name}, so the artifact cannot be verified." >&2
-		echo "         It will be installed as root and run with the CAM credentials and the" >&2
-		echo "         private-key database. Prefer installing from a 'make release' output." >&2
-		return 0
+		if [[ "${WECERT_INSECURE_SKIP_CHECKSUM:-}" = "1" ]]; then
+			echo "Warning: no SHA256SUMS beside ${name}; installing unverified because" >&2
+			echo "         WECERT_INSECURE_SKIP_CHECKSUM=1. It will be installed as root and" >&2
+			echo "         run with the CAM credentials and the private-key database." >&2
+			return 0
+		fi
+		echo "Error: no SHA256SUMS beside ${name}, so the artifact cannot be verified." >&2
+		echo "       Refusing to install it as root: it would run with the CAM credentials" >&2
+		echo "       and the private-key database. Prefer a 'make release' output (which" >&2
+		echo "       writes SHA256SUMS), or set WECERT_INSECURE_SKIP_CHECKSUM=1 to install" >&2
+		echo "       this binary unverified." >&2
+		exit 1
 	fi
 
 	echo "==> Verifying ${name} against ${sums}"
