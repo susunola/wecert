@@ -300,7 +300,10 @@ rate-limit quota — those resources were consumed when the certificate was issu
 
 **Upgrading.** Migrations are additive and run at startup under the same file lock that keeps a
 second instance out, so a newer binary upgrades an older database in place rather than asking you to
-rebuild it. Rolling *back* to an older binary is not covered by a test yet
+rebuild it. Rolling *back* is covered for the `certificates` table by a test that replays the older
+build's own statements — its `CREATE TABLE IF NOT EXISTS`, its column check, its explicit-column
+`SELECT` and its whole-row upsert — against a database this build migrated
+(`state.TestAnOlderBinaryStillOpensTheNewSchema`), rather than by running a literal pre-change binary
 ([backlog](docs/backlog.md)).
 
 ## How it works

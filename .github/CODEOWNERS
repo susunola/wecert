@@ -1,14 +1,17 @@
-# Who reviews what.
+# Who reviews what: an auto-request convenience, NOT a gate.
 #
-# One maintainer today, so every path lists the same person. The value of the file is not the
-# distribution of work: it is that "who is accountable for this path" has an answer that does not
-# depend on someone being online. Add narrower rules here when a second maintainer takes a subsystem.
+# Reading this file as "these paths cannot be merged without an owner's approval" is wrong. It
+# does one thing: when a pull request touches a path below, GitHub requests the listed account as
+# a reviewer. Nothing blocks the merge on that request being answered.
 #
-# What this file does NOT do by itself: GitHub only consults it when `main` has branch protection
-# with "Require review from Code Owners" enabled. That setting is currently OFF -- checked against the
-# API, `main` reports "Branch not protected" -- so today this file records ownership and nothing
-# more. Turning it on is a repository settings change, which is why the gap is written down here
-# instead of being assumed away.
+# Checked against the API on 2026-09-22: `main` requires the status checks test, install, e2e and
+# fuzz, and reports `required_pull_request_reviews: null` -- a pull request from anyone with write
+# access can merge with zero approvals. Enabling "Require review from Code Owners" is a repository
+# settings change, not an edit to this file; until that change is made, what is recorded here is
+# who knows each subsystem, not an enforced control.
+#
+# One maintainer today, so every path lists the same person. Add narrower rules here when a second
+# maintainer takes a subsystem.
 
 *                       @susunola
 

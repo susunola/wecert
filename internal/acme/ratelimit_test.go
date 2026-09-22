@@ -3,6 +3,7 @@ package acme
 import (
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -212,5 +213,84 @@ func TestIdentifierQuotaSeriesCoverOnlyWhatWasSpent(t *testing.T) {
 	// per identifier set.
 	if !hasScope(series, "example.com") || !hasScope(series, "set-a") {
 		t.Errorf("the bounded families must keep publishing every scope they are given, got %v", series)
+	}
+}
+
+// blockedSeries returns every currently-exported {limit,scope} pair of the blocked gauge.
+func blockedSeries(t *testing.T) []string {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 64)
+	go func() {
+		metrics.RateLimitBlocked.Collect(ch)
+		close(ch)
+	}()
+
+	var out []string
+	for m := range ch {
+		var d dto.Metric
+		if err := m.Write(&d); err != nil {
+			t.Fatalf("reading a metric: %v", err)
+		}
+		var limit, scope string
+		for _, l := range d.GetLabel() {
+			switch l.GetName() {
+			case "limit":
+				limit = l.GetValue()
+			case "scope":
+				scope = l.GetValue()
+			}
+		}
+		out = append(out, limit+"|"+scope)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// A paused identifier must be visible as BLOCKED, and must NOT come with a token count.
+//
+// wecert_ratelimit_remaining_tokens is documented as an upper bound on what may still be spent, and
+// this bucket is filled by the CA's own validators: nothing here spends against it, so any number
+// computed locally would be the limit's bare capacity (1,152) published as if it were an estimate.
+// The blocked gauge is the series that carries the fact, and it has to carry it -- a pause is
+// cleared in the CA's self-service portal rather than by waiting, so a missing series would read as
+// healthy to anyone watching the dashboard, which is the failure mode the per-identifier scope work
+// already fixed once for the budgets.
+func TestAPauseIsPublishedAsBlockedWithoutACount(t *testing.T) {
+	metrics.RateLimitRemaining.Reset()
+	metrics.RateLimitBlocked.Reset()
+
+	_, m, _, _ := newAPITestHarness(t, []string{"paused.example.com"})
+	fixed := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+	limit := ratelimit.ConsecutiveAuthzFailuresPerIdentifier
+	if _, ok := m.quota.NoteDeadline(limit, "paused.example.com", fixed.Add(limit.Refill),
+		"identifier pause floor"); !ok {
+		t.Fatal("the fixture must record the pause deadline")
+	}
+
+	// The scope list for the identifier family comes from the store, so the pause bucket alone is
+	// enough for the series to exist -- no failure budget was ever spent for this name.
+	m.PublishQuota(map[string][]string{
+		"registered-domain":    {"example.com"},
+		"exact-identifier-set": {"paused.example.com"},
+	})
+
+	want := limit.Name + "|paused.example.com"
+	for _, s := range quotaSeries(t) {
+		if s == want {
+			t.Errorf("series %q publishes a token count for a bucket this program never spends "+
+				"against; the only number available is the limit's capacity, which is not an estimate", s)
+		}
+	}
+	var found bool
+	for _, s := range blockedSeries(t) {
+		if s == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a paused identifier has to be exported as blocked; the CA clears the pause only in "+
+			"its self-service portal, so an absent series says 'nothing to see'. Blocked series: %v",
+			blockedSeries(t))
 	}
 }

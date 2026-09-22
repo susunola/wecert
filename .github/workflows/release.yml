@@ -4,8 +4,14 @@ on:
   push:
     tags: ['v*']
 
+# contents: write is what the last step needs -- `gh release create` publishes the Release.
+# id-token and attestations are for the provenance attestation below: the job mints an OIDC token
+# that names this repository, workflow and commit, and the attestation API stores it alongside the
+# artifact digests. Neither grants access to anything the job did not already have.
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -28,6 +34,20 @@ jobs:
 
       - name: build artifacts
         run: make release
+
+      # Provenance for the release binaries. `make repro-check` proves they can be rebuilt
+      # bit-for-bit from this commit, but only for someone who does the rebuilding; this attaches a
+      # signed statement -- built by this workflow, from this commit -- so a download can be
+      # verified with `gh attestation verify dist/wecert_linux_amd64 --repo susunola/wecert`
+      # instead of being trusted on the strength of the transport.
+      #
+      # `dist/*` is exactly what the publish step below uploads, so the Release, its SHA256SUMS and
+      # the attestation cover the same bytes. This runs before the Release is created: an
+      # attestation that cannot be produced should stop the publish, not follow it.
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
 
       # CHANGELOG.md sections are headed "## 0.4.2 - 2026-09-16" (no v prefix); the release notes
       # are the section matching the tag. A tag with no changelog section fails here rather than

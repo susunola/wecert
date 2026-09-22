@@ -120,6 +120,10 @@ func (m *Manager) spendNewOrder() {
 // failure accounting. The answer is also "should this pass retry right now": a refusal that named a
 // deadline must not be followed by the immediate replaces-less retry, which would spend a second
 // request inside the window the CA just named.
+//
+// The FIFTH limit, the paused identifier, is the exception to that rule and is handled in the loop
+// below: it is the one refusal that arrives with no instant at all, so waiting for the CA to name
+// one means waiting forever. See refusedLimits and isPauseRefusal.
 func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) bool {
 	named := refusedLimits(err.Error())
 	if len(named) == 0 {
@@ -142,7 +146,42 @@ func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) bool {
 	for _, l := range named {
 		scope := newOrderRefusalScope(l, c, err.Error())
 		at, ok := m.quota.NoteRetryAfter(l, scope, err.Error())
-		if !ok && headerOK {
+		if l.SpentByCA {
+			// The identifier PAUSE. The pausing limit has no limiter message of its own -- Boulder
+			// pauses the account instead of answering with a reset instant ("There is no case for
+			// FailedAuthorizationsForPausingPerDomainPerAccount because the RA will pause clients who
+			// exceed that ratelimit", ratelimits/limiter.go) -- and the CA's refusal links to its
+			// self-service portal rather than naming a time.
+			//
+			// So the deadline has to come from the published model instead: the ability to incur
+			// these failures refills at ONE PER IDENTIFIER PER DAY, which makes one refill interval
+			// the shortest wait that can possibly free the identifier. That is a FLOOR on our own
+			// wait, NOT a measurement of this pause and NOT a promise: nothing but the portal clears
+			// the pause, so a pass that comes back after the floor may simply be refused again and
+			// re-book it. Booking nothing (the old behaviour, because no instant parsed) was worse in
+			// both directions: the certificate retried at our own 1m..6h backoff against a state the
+			// CA had already refused, and the operator saw ordinary backoff noise instead of the one
+			// line that says the identifier is paused.
+			//
+			// The floor therefore sets the FLOOR of the deadline, and an instant -- from the message
+			// or from the header -- can only push it later. Never earlier: those instants belong to
+			// whichever limiter produced the response, and this bucket is not one of them. A pause
+			// read as a twelve-minute backoff is exactly the retry loop this recognition exists to
+			// stop.
+			floor := m.now().Add(l.Refill)
+			if ok && at.After(floor) {
+				floor = at
+			}
+			if headerOK && headerAt.After(floor) {
+				floor = headerAt
+			}
+			if _, noted := m.quota.NoteDeadline(l, scope, floor,
+				"identifier pause floor: the CA named no instant, so one published refill interval "+
+					"(1 per identifier per day) is the shortest supportable wait"); !noted {
+				continue
+			}
+			at, ok = floor, true
+		} else if !ok && headerOK {
 			// The message had no parsable instant; the header did.
 			m.quota.NoteDeadline(l, scope, headerAt, "retry-after header")
 			at, ok = headerAt, true
@@ -151,6 +190,15 @@ func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) bool {
 			continue
 		}
 		blocked = true
+		if l.SpentByCA {
+			m.log.Error("the CA has PAUSED this identifier after repeated failed authorizations; no "+
+				"order for it is placed before the recorded time, and only the CA's self-service "+
+				"portal lifts the pause -- the CA named no instant, so that time is the shortest wait "+
+				"the published one-refill-per-day rate can justify, not the CA's own answer",
+				"cert", c.Name, "identifier", scope, "limit", l.Name, "until", at,
+				"remaining", at.Sub(m.now()).Round(time.Minute))
+			continue
+		}
 		m.log.Error("the CA refused a new order against a documented rate limit; every request "+
 			"against that limit must wait for the reported instant",
 			"cert", c.Name, "limit", l.Name, "scope", scope, "until", at)
@@ -175,6 +223,13 @@ func (m *Manager) blockedByRecordedDeadline(c *config.Certificate) (time.Time, s
 	}
 	for _, d := range c.Domains {
 		checks = append(checks, check{limit: ratelimit.AuthzFailuresPerIdentifier, scope: strings.ToLower(d)})
+		// The identifier PAUSE is per identifier too, and its deadline is a day or more rather than
+		// minutes: an identifier the CA has paused cannot be ordered at all until the operator clears
+		// it in the CA's portal, so this is the check that turns a refusal into "stop knocking"
+		// instead of "knock again at the next backoff step".
+		checks = append(checks, check{
+			limit: ratelimit.ConsecutiveAuthzFailuresPerIdentifier, scope: strings.ToLower(d),
+		})
 	}
 	for _, ch := range checks {
 		if ch.scope == "" && ch.limit.Scope != "account" {
@@ -228,6 +283,27 @@ func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate, msg string) 
 		if len(c.Domains) > 0 {
 			return strings.ToLower(c.Domains[0])
 		}
+	case ratelimit.ConsecutiveAuthzFailuresPerIdentifier.Name:
+		// The pause names what it paused when it names anything, in one of two forms: the legacy
+		// counter message quotes one identifier (%q, see quotedDomain), and Boulder's current wording
+		// lists them unquoted after "certificates for" (see pausedDomain). The bare "recently" form
+		// names nothing at all, and the certificate's own first domain is then the only handle -- the
+		// same fallback, for the same reason, as the failure budget above.
+		//
+		// The unnamed case is deliberately narrow rather than generous: booking the deadline against
+		// EVERY name of the certificate would gate unrelated certificates that merely share a SAN,
+		// which is the over-blocking the quoted-name rule above exists to stop. The certificate in
+		// front of us is the one the CA just refused, so gating it is the part that is certain; when
+		// the CA names more, each name is booked on the refusal that named it.
+		if named := quotedDomain(msg); named != "" {
+			return named
+		}
+		if named := pausedDomain(msg); named != "" {
+			return named
+		}
+		if len(c.Domains) > 0 {
+			return strings.ToLower(c.Domains[0])
+		}
 	}
 	return ""
 }
@@ -256,6 +332,70 @@ func quotedDomain(msg string) string {
 		return ""
 	}
 	return strings.ToLower(rest[:j])
+}
+
+// pausedDomain extracts the FIRST identifier from Boulder's current pause refusal, or "".
+//
+// The wording is built in wfe2/wfe.go and is the one a paused identifier actually gets today:
+//
+//	Your account is temporarily prevented from requesting certificates for %s and possibly others.
+//	Please visit: <self-service portal link>
+//
+// where %s is strings.Join(pausedValues, ", "). The identifiers are NOT quoted, so quotedDomain
+// cannot see them, and falling through to the certificate's first domain would book the deadline
+// against a name the CA did not mention whenever the certificate's first SAN is not the paused one
+// -- the exact failure the quoted-name rule exists to prevent.
+//
+// Only the first entry is read. That is enough to gate the certificate the CA just refused, and it
+// keeps the parse to a bounded slice of prose: the rest of the list is a comma-separated tail this
+// does not need to enumerate, because the next refusal names its first entry again.
+func pausedDomain(msg string) string {
+	const marker = "temporarily prevented from requesting certificates for "
+	i := indexOfFold(msg, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := msg[i+len(marker):]
+	// Boulder's own suffix ends the list; a comma starts the next name.
+	if j := indexOfFold(rest, " and possibly"); j >= 0 {
+		rest = rest[:j]
+	}
+	if j := strings.IndexByte(rest, ','); j >= 0 {
+		rest = rest[:j]
+	}
+	rest = strings.TrimSpace(rest)
+	if !looksLikeIdentifier(rest) {
+		return ""
+	}
+	return strings.ToLower(rest)
+}
+
+// looksLikeIdentifier reports whether s could be the DNS name this parse is looking for.
+//
+// A refusal is prose, and the field after the marker is followed by a URL and a signed token, so a
+// mis-parse is possible in principle. The guard is deliberately crude and one-directional: anything
+// with a space, a quote, a slash or a bracket in it is not a single name, and for those the caller
+// falls back to the certificate's own first domain.
+func looksLikeIdentifier(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	return !strings.ContainsAny(s, " \t\r\n/\\\"'<>[]()")
+}
+
+// indexOfFold is strings.Index with ASCII case folding, written out rather than done by lowercasing
+// both sides: strings.ToLower is Unicode-aware and can change the BYTE LENGTH of the text in front
+// of the marker, so the offset it returns would then point into the wrong place.
+func indexOfFold(s, sub string) int {
+	if sub == "" {
+		return 0
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if strings.EqualFold(s[i:i+len(sub)], sub) {
+			return i
+		}
+	}
+	return -1
 }
 
 // refusedLimits maps the CA's own wording to the limits it refused.
@@ -295,10 +435,63 @@ func refusedLimits(msg string) []ratelimit.Limit {
 	if strings.Contains(lower, "failed authorizations") {
 		out = append(out, ratelimit.AuthzFailuresPerIdentifier)
 	}
+	// The FIFTH limit, the paused identifier, is the only one with no limiter message of its own:
+	// the CA pauses (account, identifier) instead of answering with a reset instant, and the refusal
+	// points at its self-service portal. See isPauseRefusal for the two wordings and for why the
+	// ABSENCE of an instant is what identifies it.
+	if isPauseRefusal(msg) {
+		out = append(out, ratelimit.ConsecutiveAuthzFailuresPerIdentifier)
+	}
 	if strings.Contains(lower, "new orders") || strings.Contains(lower, "new-orders") {
 		out = append(out, ratelimit.NewOrdersPerAccount)
 	}
 	return out
+}
+
+// isPauseRefusal reports whether a refusal is the CA's answer to a PAUSED identifier -- the fifth
+// published limit -- rather than one of the token-bucket limiters' answers.
+//
+// Two wordings reach an ACME client, and both are quoted here from their source:
+//
+//	too many failed authorizations recently: see https://letsencrypt.org/docs/failed-validation-limit/
+//
+// is Let's Encrypt's own documented error for the failed-validation limit
+// (website content/en/docs/failed-validation-limit.md; the rate-limits page's own section is
+// "Consecutive Authorization Failures per Identifier per Account"), and
+//
+//	Your account is temporarily prevented from requesting certificates for <names> and possibly
+//	others. Please visit: <self-service portal>
+//
+// is what Boulder's WFE sends today for a paused identifier (wfe2/wfe.go, probs.Paused).
+//
+// WHAT IDENTIFIES THE PAUSE IS THE MISSING INSTANT, not the wording alone. Boulder's per-hour
+// failure-budget message is superficially identical --
+//
+//	too many failed authorizations (5) for %q in the last 1h0m0s, retry after <instant>
+//
+// -- but that template ALWAYS carries "retry after" (ratelimits/limiter.go), and the pausing limit
+// deliberately has no case there at all: "There is no case for
+// FailedAuthorizationsForPausingPerDomainPerAccount because the RA will pause clients who exceed
+// that ratelimit". So a "failed authorizations" refusal that names no instant anywhere is the
+// pause, and one that names an instant is the budget. Matching text is not ideal -- the wording is
+// the CA's to choose -- and the only reason it is defensible here is that the two readings lead to
+// opposite actions: treating the pause as routine backoff burns attempts against a state the CA has
+// already refused, while treating the budget as a day-long pause delays a renewal that a
+// twelve-minute refill would have allowed. The instant tells them apart without guessing.
+//
+// The portal wording needs no such test, because nothing else says it: it is a pause whatever else
+// the message carries. (Booking it still cannot shorten the wait -- the pause deadline takes an
+// instant as a floor, never as a ceiling; see noteNewOrderRefusal.)
+func isPauseRefusal(msg string) bool {
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, "temporarily prevented from requesting certificates") {
+		return true
+	}
+	if _, ok := ratelimit.ParseRetryAfter(msg); ok {
+		// An instant in the message: a token bucket's own answer, and the deadline is that instant.
+		return false
+	}
+	return strings.Contains(lower, "failed authorizations")
 }
 
 func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
@@ -371,6 +564,23 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 	// The account-wide limit stops the pass outright; a per-scope one stops only the certificates it
 	// names, because refusing every order because one domain is paused would stall the fleet.
 	if until, limit, scope, blocked := m.blockedByRecordedDeadline(c); blocked {
+		if limit == ratelimit.ConsecutiveAuthzFailuresPerIdentifier.Name {
+			// The pause, said once and in full: what happened, why the recorded time is ours rather
+			// than the CA's, and what actually clears it. An operator reading only "rate limit"
+			// would wait, and waiting is the one thing that cannot lift a pause.
+			m.log.Error("the CA has PAUSED this identifier after repeated failed authorizations; "+
+				"nothing is ordered for it until the recorded floor, and only the CA's self-service "+
+				"portal lifts the pause -- the CA named no instant, so the floor is the published "+
+				"one-refill-per-day rate, not a deadline the CA gave",
+				"cert", c.Name, "limit", limit, "scope", scope, "until", until,
+				"remaining", until.Sub(m.now()).Round(time.Minute))
+			return m.recordFailure(ctx, st, fmt.Errorf(
+				"the CA has paused identifier %s (too many consecutive failed authorizations) and "+
+					"names no instant; no order is placed before %s, our floor from the published "+
+					"one-refill-per-day rate. Clear the pause in the CA's self-service portal: "+
+					"https://letsencrypt.org/docs/rate-limits/#consecutive-authorization-failures-per-identifier-per-account",
+				scope, until.UTC().Format(time.RFC3339)))
+		}
 		m.log.Warn("the CA has refused this limit recently and named when it will listen again; no "+
 			"order is placed before then, because the refusal is the CA's own answer and retrying "+
 			"inside the window cannot change it",

@@ -40,19 +40,27 @@ upgrade step: update the relevant file under `docs/` in the same PR.
 
 ```bash
 make build          # bin/wecert and the tools
-make check          # gofmt, vet, English, race tests, the shell self-tests, the CLI surface, the alert rules
+make check          # gofmt, vet, English, race tests, the shell self-tests, the CLI surface, the alert rules, the coverage floor
+make check-coverage # just the coverage floor
 make test-pebble    # a real ACME lifecycle against a local CA (needs the pebble binary)
 make fuzz           # property and fuzz targets, bounded per target (FUZZTIME=30s default)
 ```
 
 `make check` covers everything CI's `test` job runs except `govulncheck` and `make release`
 (cross-compilation) — CI does `gofmt`, `check-english.py`, `go vet`, `govulncheck`,
-`go test -race`, `make test-tags`, `make check-alerts`, `make check-scripts`, `make build` and
-`make release`. Three CI jobs cover what a local `make check` cannot: `install` (the documented
-`make release` + `sudo ./install.sh` path, as root), `e2e` (pebble, `make test-pebble` and
-`make e2e`, which binds port 53) and `fuzz` (`FUZZTIME=15s make fuzz`). Run `make test-pebble`
-and `make fuzz` locally when your change touches issuance or the rate limiter; the other two need
-Linux and root.
+`go test -race`, `make test-tags`, `make check-coverage`, `make check-alerts`,
+`make check-scripts`, `make build` and `make release`. Three CI jobs cover what a local
+`make check` cannot: `install` (the documented `make release` + `sudo ./install.sh` path, as
+root), `e2e` (pebble, `make test-pebble` and `make e2e`, which binds port 53) and `fuzz`
+(`FUZZTIME=15s make fuzz`). Run `make test-pebble` and `make fuzz` locally when your change
+touches issuance or the rate limiter; the other two need Linux and root.
+
+Coverage has a floor now: `make check-coverage` writes `coverage.out` and
+`scripts/check-coverage.py` fails below **76.0%**, chosen 2026-09-22 against a measured 77.62%
+(the number, the date and the reasoning are in that script, which also carries a self-test). If
+your change legitimately lowers coverage, add the tests or move the floor up — do not lower it
+without saying why in the commit. To watch the gate fail without changing anything:
+`python3 scripts/check-coverage.py --floor 90`.
 
 `make fuzz` arrives with the fuzz-target change (PR #55). On a base that predates it, run a target
 directly: `go test ./internal/ratelimit/ -run XXX -fuzz FuzzParseRetryAfter -fuzztime 30s`.
@@ -86,9 +94,15 @@ git push origin vX.Y.Z
 ```
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`: it re-runs the test gate, builds with
-`make release` (same artifacts and `SHA256SUMS` as a local build), and publishes the GitHub
-Release with the matching changelog section as the notes. A tag without a matching changelog
-section fails the workflow rather than publishing an empty release.
+`make release` (same artifacts and `SHA256SUMS` as a local build), attests the build provenance of
+everything in `dist/` with `actions/attest-build-provenance`, and publishes the GitHub Release with
+the matching changelog section as the notes. A tag without a matching changelog section fails the
+workflow rather than publishing an empty release. Anyone can then check where a downloaded binary
+came from without trusting the download:
+
+```bash
+gh attestation verify dist/wecert_linux_amd64 --repo susunola/wecert
+```
 
 ## Reporting a vulnerability
 

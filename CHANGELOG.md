@@ -12,6 +12,29 @@
 
 ### Fixed
 
+- **A paused identifier stops ordering instead of retrying into the pause.** Let's Encrypt's fifth
+  published limit — consecutive authorization failures per identifier — is the one refusal that
+  names no retry instant: crossing 1,152 consecutive failures pauses the (account, identifier) pair,
+  and only the CA's self-service portal lifts it. No deadline was recorded for it, so the
+  certificate kept re-ordering at the local 1m..6h backoff against a state the CA had already
+  refused. Both published wordings are now recognised (`too many failed authorizations recently: …`
+  and Boulder's "temporarily prevented from requesting certificates for …"), the deadline is booked
+  against the identifier the message names (the certificate's own first name when it names none),
+  and it is a **one-day floor** taken from the published refill rate — 1 per identifier per day —
+  rather than the CA's answer, because waiting does not lift a pause. The journal says that in one
+  line and names the portal, and the blocked gauge carries
+  `consecutive-authz-failures-per-identifier`. A refusal that does carry an instant is still the
+  per-hour failure budget, and an unrecognised refusal still retries on the local backoff.
+- **The orphan teardown is no longer repeated on every pass.** Certificates that left the desired
+  state keep their row by design, and the sweep tore every one of them down again on every pass:
+  measured at 2,999 orphans that was 6.000 SQL statements per orphan — 17,994 per pass, identical
+  on every pass, forever. A new `certificates.orphan_cleaned_at` column records that a name's
+  teardown finished, and the sweep skips the teardown — one query for the whole fleet, no
+  per-orphan read — while still reporting the orphan in the journal and in
+  `wecert_orphaned_certificates`. The mark is cleared when the name comes back into the desired
+  state, and it is never written when the teardown failed or left an order or authorization row
+  behind, so a TXT record that could not be reclaimed is still retried. Measured with
+  `-tags verifycount`: 18,001 statements per pass before, 7 after.
 - **A failed certificate read erased the certificate it failed to read.** `Reconcile` answered
   a `GetCert` error by building an empty `CertState` — a name and nothing else — and passing it
   to `recordFailure`, which persists through the full-column `PutCert` upsert. One bad read (a

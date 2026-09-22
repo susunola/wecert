@@ -279,7 +279,8 @@ groups:
 
       # The CA refused a request and told us when it will listen again. That instant is
       # authoritative -- it accounts for every other account spending the same global bucket, which
-      # the local estimate cannot see.
+      # the local estimate cannot see. The paused-identifier refusal is the one exception: it names
+      # no instant, so what the gauge reports for it is our one-day floor (see the description).
       - alert: WecertRateLimitBlocked
         expr: wecert_ratelimit_blocked == 1
         labels:
@@ -287,9 +288,14 @@ groups:
         annotations:
           summary: "{{ $labels.limit }} is refusing requests until the CA's deadline"
           description: >-
-            Issuance for the affected scope is paused until then. The exact-set limit (5 per 7 days)
-            has no override; the per-account order and per-registered-domain limits can be raised
-            through Let's Encrypt's rate-limit adjustment form, which takes weeks.
+            Issuance for the affected scope is paused until the reported time. The exact-set limit
+            (5 per 7 days) has no override; the per-account order and per-registered-domain limits can
+            be raised through Let's Encrypt's rate-limit adjustment form, which takes weeks. One
+            limit behaves differently: `consecutive-authz-failures-per-identifier` means the CA has
+            PAUSED that identifier after repeated failed authorizations, its refusal names no instant,
+            and the reported time is a one-day floor rather than the CA's answer -- waiting does not
+            lift it, so unpause it in the CA's self-service portal (the journal line for the refusal
+            has the link).
 
       # The threshold is one token, not five: the exact-identifier-set limit (5 per 7 days,
       # refilling one every 34 hours) and the per-identifier failure budget (5 per hour) both have a

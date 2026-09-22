@@ -45,6 +45,11 @@ type fakeManager struct {
 	// cleaned records every CleanupOrphan call, in call order.
 	cleaned []string
 
+	// orphanFailWith makes CleanupOrphan fail for the named certificates, which is how a teardown
+	// that could not reclaim its order or its TXT records is simulated: the name must then stay
+	// unmarked and be retried on the next pass.
+	orphanFailWith map[string]error
+
 	reaped int
 
 	// quotaScopes records every PublishQuota call.
@@ -136,6 +141,7 @@ func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
 	f.mu.Lock()
 	f.cleaned = append(f.cleaned, certName)
 	entered, release := f.orphanEntered, f.orphanRelease
+	failWith := f.orphanFailWith[certName]
 	f.mu.Unlock()
 
 	// Blocking happens outside the mutex: a test holds this call open while it reads the
@@ -146,7 +152,7 @@ func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
 	if release != nil {
 		<-release
 	}
-	return nil
+	return failWith
 }
 
 func (f *fakeManager) ReapRetired(_ context.Context) {
