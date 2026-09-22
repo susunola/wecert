@@ -44,6 +44,7 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 		CertErrors:    map[string]string{},
 		RevokePending: map[string]bool{},
 		ProbeEnabled:  true,
+		UIN:           s.uin,
 	}
 	if dr, ok := s.rec.(DesiredReader); ok {
 		if res := dr.LastResult(); res != nil {

@@ -45,3 +45,24 @@ func TestInventoryRoutesAreMounted(t *testing.T) {
 		t.Fatalf("page missing cert name: %s", page.Body.String())
 	}
 }
+
+func TestInventoryIncludesAccountUIN(t *testing.T) {
+	s, _ := newTestServer(t, &fakeReconciler{names: []string{"example-com"}})
+	s.SetAccountUIN("100012345678")
+
+	w := do(t, s, http.MethodGet, "/api/inventory", "", bearer())
+	if w.Code != http.StatusOK {
+		t.Fatalf("inventory: got %d body %s", w.Code, w.Body.String())
+	}
+	var snap inventory.Snapshot
+	if err := json.Unmarshal(w.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("inventory json: %v", err)
+	}
+	if len(snap.Certificates) != 1 || snap.Certificates[0].UIN != "100012345678" {
+		t.Fatalf("uin %+v", snap.Certificates)
+	}
+	page := do(t, s, http.MethodGet, "/status", "", bearer())
+	if !strings.Contains(page.Body.String(), "100012345678") {
+		t.Fatalf("page missing uin: %s", page.Body.String())
+	}
+}

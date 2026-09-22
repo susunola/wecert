@@ -943,6 +943,7 @@ func startWebhookServer(
 		return fmt.Errorf("failed to initialise the webhook server (the port %s has been released): %w",
 			cfg.Webhook.Listen, err)
 	}
+	api.SetAccountUIN(cfg.Tencent.UIN)
 
 	srv := &http.Server{
 		Handler:           api.Handler(),

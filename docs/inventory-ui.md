@@ -119,6 +119,7 @@ sample has succeeded this process life, use `binding_unknown` rather than
   "certificates": [
     {
       "name": "example-com",
+      "uin": "100012345678",
       "status": "waiting_manual_bind",
       "profile": "classic",
       "keyType": "ecdsa-p256",
@@ -177,18 +178,29 @@ Keep `/hook/status` field names when they overlap (`notAfter`,
 `daysLeft`, `deployConfirmed`, `consecutiveFailures`). New fields go on
 the inventory object only.
 
+`uin` is the Tencent Cloud account id. It comes from `tencent.uin` on
+the daemon, or from a certificate-level `uin` in the desired-state
+document (the latter wins). It is omitted when neither is set. The page
+groups and filters by it so operators running more than one account can
+classify the register without a second tool. It does not change which
+credentials deploy the certificate, and a GET must not call CAM to
+discover it.
+
 ## Page layout (`GET /status`)
 
 One HTML page, no JavaScript framework, no external CDN. A small script
-may refetch `/api/inventory`. Default refresh 30s.
+may filter the already-rendered table. Default refresh is not required.
 
 ```
-wecert inventory                         frozen | 12 certs | 1 waiting bind
-filter: [all] [trouble] [expiring]     q: ________
+Inventory                            Read-only
+wecert · 12 certificates · 2 UINs
 
-name            names              expires    cert id     bindings           443
-example-com     example.com, *.\u2026   89d        cYk1\u2026       waiting bind       \u2014
-api-example     api.example.com    12d        cYk2\u2026       2 CLB / 3 listeners match
+UIN: [All] [100012345678] [100098765432]
+filter: [all] [attention] [expiring]     q: ________
+
+100012345678 · 8 certs
+status          name            names              CLB                     days    443
+Waiting bind    example-com     example.com +1     —                         89      —
 ```
 
 Click a row to expand:

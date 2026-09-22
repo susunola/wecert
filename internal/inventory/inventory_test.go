@@ -197,6 +197,32 @@ func TestSortPutsTroubleFirstThenDaysLeft(t *testing.T) {
 	}
 }
 
+func TestAssembleCopiesUIN(t *testing.T) {
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now: now, Names: []string{"a", "b"}, UIN: "100012345678",
+		Desired: &spec.Result{
+			Certificates: []config.Certificate{
+				{Name: "a", Domains: []string{"a.example"}},
+				{Name: "b", Domains: []string{"b.example"}, UIN: "100098765432"},
+			},
+		},
+	})
+	if len(snap.Certificates) != 2 {
+		t.Fatalf("got %d rows", len(snap.Certificates))
+	}
+	byName := map[string]Certificate{}
+	for _, c := range snap.Certificates {
+		byName[c.Name] = c
+	}
+	if byName["a"].UIN != "100012345678" {
+		t.Fatalf("a uin: got %q", byName["a"].UIN)
+	}
+	if byName["b"].UIN != "100098765432" {
+		t.Fatalf("cert-level uin must win: got %q", byName["b"].UIN)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
