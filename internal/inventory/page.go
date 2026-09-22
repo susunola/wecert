@@ -37,9 +37,23 @@ var pageTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 		if b.Count == 0 {
 			return "none"
 		}
+		if n := countCLB(b); n > 0 {
+			return strconv.Itoa(n) + " CLB / " + strconv.Itoa(b.Count) + " listeners"
+		}
 		return strconv.Itoa(b.Count)
 	},
 }).Parse(pageHTML))
+
+func countCLB(b Bindings) int {
+	seen := map[string]struct{}{}
+	for _, it := range b.Items {
+		if it.LoadBalancerID == "" {
+			continue
+		}
+		seen[it.LoadBalancerID] = struct{}{}
+	}
+	return len(seen)
+}
 
 const pageHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -88,7 +102,16 @@ code{font-size:12px}
 <td>{{join .Domains ", "}}</td>
 <td>{{days .DaysLeft}}</td>
 <td><code>{{.DeployedCertID}}</code></td>
-<td>{{bind .Bindings .Status}}</td>
+<td>
+  {{bind .Bindings .Status}}
+  {{if .Bindings.Items}}
+  <details><summary>where</summary>
+    {{range .Bindings.Items}}
+    <div><code>{{.Region}} {{.LoadBalancerID}} {{.ListenerID}} {{.Protocol}}{{if .SNIDomain}} {{.SNIDomain}}{{end}} {{.Role}}</code></div>
+    {{end}}
+  </details>
+  {{end}}
+</td>
 <td>{{probe .Probe}}</td>
 </tr>
 {{end}}

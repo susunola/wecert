@@ -7,6 +7,13 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
+// BindingReader is an optional cache of bind-resource rows. The inventory page
+// uses it when present and stays store-side when not. It must not call the SSL
+// API on the request path.
+type BindingReader interface {
+	BindingSnapshot(certID string) (inventory.Bindings, bool)
+}
+
 func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
@@ -78,5 +85,21 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 			}
 		}
 	}
-	return inventory.Assemble(in)
+	snap := inventory.Assemble(in)
+	br, ok := s.rec.(BindingReader)
+	if !ok {
+		return snap
+	}
+	for i := range snap.Certificates {
+		row := &snap.Certificates[i]
+		id := row.DeployedCertID
+		if id == "" {
+			continue
+		}
+		live, have := br.BindingSnapshot(id)
+		if have {
+			inventory.ApplyLiveBindings(row, live)
+		}
+	}
+	return snap
 }
