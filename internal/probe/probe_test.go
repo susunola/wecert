@@ -685,3 +685,251 @@ func TestExpectSANNormalisationIsIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// ── The remembered answer ───────────────────────────────────────────────────
+
+// An inventory page reads the last conclusion instead of the last metric, so a matching round
+// has to leave the evidence behind: what was found, whether the chain was trusted, when the
+// served certificate expires, and no problem kind at all.
+func TestAnswerRemembersAMatchingHost(t *testing.T) {
+	const host = "answer-match.example"
+	cert := makeCert(t, []string{host},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+	served := resultFromCert(t, cert, host)
+	// The probe's own verdict about the chain is what gets remembered, and a self-signed fixture
+	// is never trusted on its own -- so this value can only come from the copy.
+	served.Trusted = true
+
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{{Address: "192.0.2.10:443", Result: served}}, nil
+	}
+
+	if a, ok := r.Answer(host); ok {
+		t.Fatalf("a host that was never probed must have no answer, got %+v", a)
+	}
+	if v := r.Check(context.Background(), host,
+		Expectation{Domains: []string{host}, NotAfter: served.NotAfter}); !v.OK {
+		t.Fatalf("the round should pass, got: %s", v.Summary())
+	}
+
+	a, ok := r.Answer(host)
+	if !ok {
+		t.Fatal("a matching round must leave an answer")
+	}
+	if a.Host != host {
+		t.Errorf("answer names host %q, want %q", a.Host, host)
+	}
+	if !a.Match {
+		t.Error("a matching round must record Match=true")
+	}
+	if !a.Trusted {
+		t.Error("Trusted must be copied from the served result")
+	}
+	if !a.NotAfter.Equal(served.NotAfter) {
+		t.Errorf("answer NotAfter is %v, want the served %v", a.NotAfter, served.NotAfter)
+	}
+	if a.ProblemKind != "" {
+		t.Errorf("a match has no problem kind, got %q", a.ProblemKind)
+	}
+}
+
+// A mismatch has to name the problem kind, because "did not match" alone sends the reader to
+// the wrong place: a missing name is a deploy/SNI question, not an expiry one.
+func TestAnswerNamesTheProblemKindOnAMismatch(t *testing.T) {
+	const host = "answer-missing.example"
+	cert := makeCert(t, []string{host},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+	served := resultFromCert(t, cert, host)
+	served.Trusted = true
+
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{{Address: "192.0.2.10:443", Result: served}}, nil
+	}
+
+	// The served certificate covers the dialled name but is missing one that was deployed, and
+	// its expiry matches -- so names_missing is the only problem and must be the one reported.
+	v := r.Check(context.Background(), host, Expectation{
+		Domains:  []string{host, "also-deployed.example"},
+		NotAfter: served.NotAfter,
+	})
+	if v.OK {
+		t.Fatal("a certificate missing a deployed name must not pass")
+	}
+
+	a, ok := r.Answer(host)
+	if !ok {
+		t.Fatal("a mismatching round must still leave an answer")
+	}
+	if a.Match {
+		t.Error("a mismatch must record Match=false")
+	}
+	if a.ProblemKind != string(ProblemNamesMissing) {
+		t.Errorf("problem kind is %q, want %q", a.ProblemKind, ProblemNamesMissing)
+	}
+	// The certificate WAS read, so the evidence it carries is real and has to survive.
+	if !a.NotAfter.Equal(served.NotAfter) {
+		t.Errorf("answer NotAfter is %v, want the served %v", a.NotAfter, served.NotAfter)
+	}
+	if !a.Trusted {
+		t.Error("a served certificate's Trusted must be copied even when the verdict is a mismatch")
+	}
+}
+
+// Every path where the probe could not answer must overwrite the previous answer.
+//
+// The failure this pins is the one the whole change exists to remove: a host that matched and
+// then lost its DNS, its listener or one of its addresses kept Match=true with its old NotAfter,
+// so the page showed a healthy unexpired certificate for an endpoint nobody can dial.
+func TestAnswerGoesUnreachableOnEveryUnreachablePath(t *testing.T) {
+	const host = "answer-unreachable.example"
+	cert := makeCert(t, []string{host},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+	served := resultFromCert(t, cert, host)
+	expectation := Expectation{Domains: []string{host}, NotAfter: served.NotAfter}
+
+	cases := []struct {
+		name  string
+		probe func(context.Context, string, Options) ([]Attempt, error)
+	}{
+		{"probeAll fails", func(context.Context, string, Options) ([]Attempt, error) {
+			return nil, &net.DNSError{Name: host, Err: "no such host", IsNotFound: true}
+		}},
+		{"no address completed a handshake", func(context.Context, string, Options) ([]Attempt, error) {
+			return []Attempt{{Address: "192.0.2.11:443", Err: context.DeadlineExceeded}}, nil
+		}},
+		{"only some addresses were probed", func(context.Context, string, Options) ([]Attempt, error) {
+			return []Attempt{
+				{Address: "192.0.2.10:443", Result: served},
+				{Address: "192.0.2.11:443", Err: context.DeadlineExceeded},
+			}, nil
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewRunner(Options{}, 0, nil)
+
+			// Prime with a clean round, so a surviving stale answer is visible as Match=true.
+			r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+				return []Attempt{{Address: "192.0.2.10:443", Result: served}}, nil
+			}
+			if v := r.Check(context.Background(), host, expectation); !v.OK {
+				t.Fatalf("the priming round should pass, got: %s", v.Summary())
+			}
+			if a, ok := r.Answer(host); !ok || !a.Match {
+				t.Fatalf("the priming round should leave a match, got %+v (ok=%v)", a, ok)
+			}
+
+			r.probeAll = tc.probe
+			if v := r.Check(context.Background(), host, expectation); v.OK {
+				t.Fatal("an unreachable host must not pass")
+			}
+
+			a, ok := r.Answer(host)
+			if !ok {
+				t.Fatal("an unreachable round must still leave an answer")
+			}
+			if a.Match {
+				t.Error("the previous match survived an unreachable round (stale answer)")
+			}
+			if a.ProblemKind != string(ProblemUnreachable) {
+				t.Errorf("problem kind is %q, want %q", a.ProblemKind, ProblemUnreachable)
+			}
+			// No handshake happened, so there is no certificate to report -- the same reason the
+			// notAfter and trusted metrics are cleared on these paths.
+			if a.Trusted {
+				t.Error("Trusted must be false when nothing was read")
+			}
+			if !a.NotAfter.IsZero() {
+				t.Errorf("NotAfter must be zero when nothing was read, got %v", a.NotAfter)
+			}
+		})
+	}
+}
+
+// Forget exists so per-host memory stops growing with every name ever seen; the answer is part
+// of that memory, so it has to go with the transition state.
+func TestForgetDropsTheRememberedAnswer(t *testing.T) {
+	const host = "answer-forget.example"
+	cert := makeCert(t, []string{host},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{{Address: "192.0.2.10:443", Result: resultFromCert(t, cert, host)}}, nil
+	}
+	r.Check(context.Background(), host, Expectation{Domains: []string{host}})
+	if _, ok := r.Answer(host); !ok {
+		t.Fatal("the host should have an answer after a probe")
+	}
+
+	r.Forget(host)
+	if a, ok := r.Answer(host); ok {
+		t.Errorf("Forget should drop the remembered answer, still have %+v", a)
+	}
+}
+
+// Check runs one goroutine per host and an inventory page reads answers while rounds are still
+// landing, so both maps live behind the same mutex. Run with -race, this is what proves it.
+func TestAnswerIsRaceFreeUnderConcurrentChecks(t *testing.T) {
+	const hostCount = 8
+
+	served := make(map[string]*Result, hostCount)
+	expectations := make(map[string]Expectation, hostCount)
+	for i := 0; i < hostCount; i++ {
+		host := fmt.Sprintf("answer-race-%d.example", i)
+		cert := makeCert(t, []string{host},
+			time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+		res := resultFromCert(t, cert, host)
+		served[host] = res
+		expectations[host] = Expectation{Domains: []string{host}, NotAfter: res.NotAfter}
+	}
+
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(_ context.Context, host string, _ Options) ([]Attempt, error) {
+		res, ok := served[host]
+		if !ok {
+			return nil, fmt.Errorf("no fixture for %s", host)
+		}
+		return []Attempt{{Address: "192.0.2.10:443", Result: res}}, nil
+	}
+
+	var wg sync.WaitGroup
+	for host := range served {
+		wg.Add(1)
+		go func(host string) {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				r.Check(context.Background(), host, expectations[host])
+			}
+		}(host)
+	}
+	// Reads deliberately overlap the writes above: Answer must be safe at any moment, not only
+	// once the round has settled.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			for host := range served {
+				r.Answer(host)
+				r.ProbedHosts()
+			}
+		}
+	}()
+	wg.Wait()
+
+	for host, want := range served {
+		a, ok := r.Answer(host)
+		if !ok {
+			t.Fatalf("no answer for %s after concurrent checks", host)
+		}
+		if !a.Match {
+			t.Errorf("%s: want a matching answer, got %+v", host, a)
+		}
+		if !a.NotAfter.Equal(want.NotAfter) {
+			t.Errorf("%s: NotAfter is %v, want %v", host, a.NotAfter, want.NotAfter)
+		}
+	}
+}

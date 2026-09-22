@@ -58,3 +58,50 @@ func TestWritePageHidesUINChipsWhenUnset(t *testing.T) {
 		t.Fatal("UIN chips should stay hidden when no certificate has a uin")
 	}
 }
+
+func TestWritePageShowsTheReasonsBehindTheNewStatuses(t *testing.T) {
+	frozen := true
+	snap := Snapshot{
+		Time:    time.Date(2026, 9, 22, 8, 0, 0, 0, time.UTC).Format(time.RFC3339),
+		Desired: DesiredView{Revision: "rev-9", Frozen: &frozen, FreezeReason: "desired source unread"},
+		Summary: Summary{Certificates: 2, NotIssued: 1},
+		Certificates: []Certificate{
+			{Name: "never", Status: StatusNotIssued, Domains: []string{"never.example"}},
+			{Name: "bound", Status: StatusOK, Domains: []string{"bound.example"},
+				Bindings: Bindings{Count: 1, Freshness: FreshnessStore, Items: []BindingItem{}}},
+		},
+	}
+	var buf bytes.Buffer
+	if err := WritePage(&buf, snap); err != nil {
+		t.Fatal(err)
+	}
+	html := buf.String()
+	for _, want := range []string{
+		"frozen · desired source unread",
+		"Not issued",
+		// A store-side count is a lower bound and must not read as the whole set.
+		"≥1",
+		// not_issued is something to look at, so the Attention filter keeps it.
+		`data-status="not_issued"`,
+		`data-attention="1"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("page missing %q", want)
+		}
+	}
+}
+
+func TestWritePageSaysWhenTheDesiredStateWasNeverRead(t *testing.T) {
+	snap := Snapshot{Certificates: []Certificate{{Name: "a", Status: StatusOK}}}
+	var buf bytes.Buffer
+	if err := WritePage(&buf, snap); err != nil {
+		t.Fatal(err)
+	}
+	html := buf.String()
+	if !strings.Contains(html, "desired state not read") {
+		t.Fatal("a revision that was never read must not render as an empty one")
+	}
+	if strings.Contains(html, "frozen ·") {
+		t.Fatal("an unread document is not a frozen one")
+	}
+}

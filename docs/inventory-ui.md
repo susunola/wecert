@@ -79,23 +79,41 @@ page exists only in daemon mode, same as `/metrics` and the hooks.
 
 ### Status values
 
-Exactly one primary status per certificate, first match wins:
+Exactly one primary status per certificate, first match wins. The list separates
+three things that used to share one wrong word: "no certificate exists yet" is
+not `ok`, "the name could not be dialled" is not `probe_mismatch`, and "the
+probe has not run for this certificate this process life" is not
+`binding_unknown`.
 
 | Status | When |
 | --- | --- |
 | `frozen` | desired-state document is frozen |
 | `rate_limited` | a rate-limit gauge for this cert's scope is blocking |
 | `revoke_pending` | a revoke request row exists for this name |
+| `state_unreadable` | the state row could not be read; `error` carries the message |
+| `not_issued` | no certificate exists for this name: no state row, or no `notAfter` and nothing uploaded |
 | `waiting_manual_bind` | uploaded (`DeployedCertID != ""`) and `DeployConfirmed == false` |
-| `probe_mismatch` | last probe for any sampled host is not a match |
-| `binding_unknown` | binding enumeration is incomplete and count is 0 |
+| `pending_deploy` | issued, deployment enabled, and the first upload has not happened yet |
+| `probe_mismatch` | the probe read a served certificate for some host and it is not the deployed one |
+| `probe_unreachable` | the probe could not read a served certificate for any host (`unreachable`, `no_certificate`) |
+| `binding_unknown` | a live enumeration came back incomplete with `count == 0` |
+| `probe_unknown` | probing is on, the deployment is confirmed, and this process has no answer yet |
 | `failing` | `consecutiveFailures > 0` |
-| `expiring` | `daysLeft` is below the cert's `renewBefore` (or 30 days if unset) |
-| `ok` | issued, confirmed, probe match (or probe disabled), not expiring |
+| `expiring` | the certificate is inside its `renewBefore` window (30 days if unset) |
+| `ok` | issued, deployed as configured, probe match (or probing off), not expiring |
 
-`ok` is not "the API said the switch worked". If probe is enabled and no
-sample has succeeded this process life, use `binding_unknown` rather than
-`ok`.
+Three notes decide whether the page can be believed:
+
+- `ok` is not "the API said the switch worked". With probing enabled, a
+  confirmed certificate that this process has not read a served certificate for
+  is `probe_unknown`.
+- `expiring` compares exact instants, the same test the renewer applies before
+  it orders, while `daysLeft` is rounded up for display. A row can therefore
+  read "Expiring · 30d" when the window is 30 days, and that is not a
+  contradiction.
+- `probe_mismatch` and `probe_unreachable` are the same prober's answers, not a
+  second health check, and they are deliberately different statuses: a wrong
+  certificate and a name that cannot be dialled have different owners.
 
 ## `GET /api/inventory`
 
@@ -104,16 +122,21 @@ sample has succeeded this process life, use `binding_unknown` rather than
   "time": "2026-09-22T06:00:00Z",
   "desired": {
     "revision": "…",
-    "frozen": false,
+    "frozen": null,
     "freezeReason": "",
     "generatedAt": "2026-09-22T05:00:00Z"
   },
   "summary": {
     "certificates": 12,
     "waitingManualBind": 1,
+    "pendingDeploy": 0,
+    "notIssued": 0,
+    "unreadable": 0,
     "failing": 0,
     "expiring": 2,
     "probeMismatch": 0,
+    "probeUnreachable": 0,
+    "probeUnknown": 1,
     "bindingUnknown": 1
   },
   "certificates": [
@@ -156,23 +179,37 @@ sample has succeeded this process life, use `binding_unknown` rather than
 ```
 
 `bindings.freshness` is one of `store`, `cached`, `live`, `unavailable`.
-v1 always uses `store`: count is 1 when `deployConfirmed`, else 0, and
-`complete` is true only when that binary is known. Do not call this a
-live inventory.
+v1 always uses `store`, and a store-side count is a lower bound, never the
+whole set: it is what this program deployed, and an operator can bind the same
+certificate to further listeners while a console bind nobody has confirmed
+stays invisible here. So store rows carry `complete: false` and the page prints
+`≥1`, not `1`.
+
+`bindings.observedAt` is when a live enumeration produced the rows. Store-side
+rows have no observation instant because they were never observed on the cloud.
 
 `probe.ok` is `true` / `false` / `null`. `null` means no sample this
 process life, or probe disabled.
 
 `drift` is a stable list of machine-readable tokens, not free text:
 
+- `state_unreadable`
 - `waiting_for_first_clb_console_bind`
 - `desired_names_not_on_issued_cert`
 - `issued_cert_not_confirmed_on_cloud`
 - `served_cert_not_after_mismatch`
 - `served_names_mismatch`
+- `served_chain_untrusted`
+- `served_validity_below_floor`
 - `binding_enumeration_incomplete`
 - `desired_state_frozen`
 - `consecutive_failures`
+
+Only what the probe actually reported becomes a token. A mismatch with no
+problem kind produces the status and no drift token, because naming a cause
+nobody observed is how "the names differ" gets attached to a chain problem.
+`unreachable` and `no_certificate` produce no token either: the status already
+says the certificate was not read.
 
 Keep `/hook/status` field names when they overlap (`notAfter`,
 `daysLeft`, `deployConfirmed`, `consecutiveFailures`). New fields go on
@@ -255,14 +292,34 @@ That is what `wecert-clbverify` is for when the operator already knows
 the lb id. Inventory should read the bind-resource task result, which is
 certificate-centric.
 
+## What this page still cannot know
+
+Honest limits, so a reader does not take the table for more than it is:
+
+- `rate_limited` is defined and unit-tested but nothing supplies blocked scopes
+  to the page yet, so a running daemon will not show it. The alert on
+  `wecert_ratelimit_blocked` is still the way to learn that the CA is refusing.
+- CLB / listener rows exist only for certificates the reconciler has enumerated.
+  `Bindings()` runs to confirm a first bind, so a confirmed certificate usually
+  shows the store-side lower bound rather than listener ids.
+- Probe answers live in the prober's memory for this process life. A restart
+  empties them and rows read `probe_unknown` until the next pass; v1 stores no
+  probe history.
+- `time` is the reader's clock. The only observation instants in the payload are
+  `desired.generatedAt` and `bindings.observedAt`; there is no per-source
+  staleness for the store yet.
+- `desired.frozen` is `null`, not `false`, when the document has never been
+  read. A `false` there would be an invented answer, and the page says
+  "desired state not read" instead.
+
 ## Implementation sketch
 
-1. `internal/inventory` \u2014 pure assembly. Inputs: desired snapshot,
+1. `internal/inventory` — pure assembly. Inputs: desired snapshot,
    `[]*state.CertState`, last probe results, optional binding snapshot.
    Output: the JSON struct above. No HTTP, no SDK.
-2. `internal/webhook` \u2014 `GET /api/inventory` and `GET /status` next to
+2. `internal/webhook` — `GET /api/inventory` and `GET /status` next to
    `/hook/status`. Same `auth` wrapper.
-3. `internal/deploy` \u2014 v2 only: parse resource IDs from
+3. `internal/deploy` — v2 only: parse resource IDs from
    `DescribeCertificateBindResourceTaskResult` without changing the
    `Bindings() (int, bool, error)` signature used by reconcile.
 4. Tests: assembly table tests for every status token and every drift
@@ -276,18 +333,18 @@ certificate-centric.
 
 ## Phases
 
-### v1 \u2014 assemble what we already know
+### v1 — assemble what we already know
 
 Store + desired + probe metrics. Bindings are count/completeness derived
 from `DeployConfirmed` / `DeployedCertID`. Ships the page operators can
 use tomorrow. Honest about what it cannot see.
 
-### v2 \u2014 name the CLB
+### v2 — name the CLB
 
 Parse bind-resource results. Cache. Show region / lb / listener / SNI.
 Mark incomplete enumerations instead of guessing.
 
-### v3 \u2014 one button
+### v3 — one button
 
 "Reconcile this cert" posts `/hook/reconcile`. Still no issue, upload,
 rebind, revoke, or SAN editor.
@@ -305,7 +362,7 @@ rebind, revoke, or SAN editor.
 
 v1 is done when:
 
-- `curl -H "Authorization: Bearer \u2026" http://127.0.0.1:9801/api/inventory`
+- `curl -H "Authorization: Bearer …" http://127.0.0.1:9801/api/inventory`
   lists every desired-state certificate name
 - a cert that has been uploaded but not console-bound is
   `waiting_manual_bind` and `daysLeft` matches `/hook/status`

@@ -5,6 +5,8 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	"github.com/susunola/wecert/internal/probe"
 )
 
 type pageView struct {
@@ -12,6 +14,12 @@ type pageView struct {
 	Accounts   []accountGroup
 	ShowGroups bool
 	UINCount   int
+	// DesiredKnown is false when the desired-state document has never been read, so
+	// the page can say that instead of presenting an empty revision as a fact.
+	DesiredKnown bool
+	// FrozenLabel is empty unless the document is frozen; a pointer to false must not
+	// render as "frozen".
+	FrozenLabel string
 }
 
 type accountGroup struct {
@@ -38,10 +46,19 @@ var pageTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 		if *p.OK {
 			return "Match"
 		}
+		// "Could not dial it" and "dialled it and got the wrong certificate" are
+		// different problems; the column says which one this is.
+		for _, h := range p.Hosts {
+			switch h.ProblemKind {
+			case string(probe.ProblemUnreachable), string(probe.ProblemNoCertificate):
+				return "Unreachable"
+			}
+		}
 		return "Mismatch"
 	},
 	"bind":      bindLabel,
 	"status":    statusLabel,
+	"class":     statusClass,
 	"names":     namesLine,
 	"clb":       clbLine,
 	"qblob":     queryBlob,
@@ -64,8 +81,18 @@ func statusLabel(status string) string {
 	switch status {
 	case StatusWaitingManualBind:
 		return "Waiting bind"
+	case StatusPendingDeploy:
+		return "Pending deploy"
+	case StatusNotIssued:
+		return "Not issued"
+	case StatusStateUnreadable:
+		return "State unreadable"
 	case StatusProbeMismatch:
 		return "Probe mismatch"
+	case StatusProbeUnreachable:
+		return "Probe unreachable"
+	case StatusProbeUnknown:
+		return "Probe unknown"
 	case StatusFailing:
 		return "Failing"
 	case StatusExpiring:
@@ -85,10 +112,30 @@ func statusLabel(status string) string {
 	}
 }
 
+// statusClass is the colour, which stays secondary to the token itself: an alert or a
+// log line repeats the token, not the colour.
+func statusClass(status string) string {
+	switch status {
+	case StatusOK:
+		return "s-ok"
+	case StatusWaitingManualBind, StatusRateLimited, StatusPendingDeploy,
+		StatusProbeUnknown, StatusFrozen:
+		return "s-wait"
+	case StatusProbeMismatch, StatusProbeUnreachable, StatusFailing,
+		StatusRevokePending, StatusStateUnreadable:
+		return "s-danger"
+	case StatusExpiring, StatusNotIssued:
+		return "s-info"
+	}
+	return ""
+}
+
 func isAttention(status string) bool {
 	switch status {
-	case StatusWaitingManualBind, StatusProbeMismatch, StatusFailing,
-		StatusBindingUnknown, StatusRateLimited, StatusRevokePending:
+	case StatusWaitingManualBind, StatusPendingDeploy, StatusProbeMismatch,
+		StatusProbeUnreachable, StatusProbeUnknown, StatusFailing,
+		StatusBindingUnknown, StatusRateLimited, StatusRevokePending,
+		StatusFrozen, StatusNotIssued, StatusStateUnreadable:
 		return true
 	}
 	return false
@@ -137,16 +184,25 @@ func bindLabel(b Bindings, status string) string {
 	if status == StatusWaitingManualBind {
 		return "waiting bind"
 	}
-	if !b.Complete && b.Count == 0 {
+	if b.Count == 0 {
+		if b.Complete {
+			return "none"
+		}
+		// A zero that is a lower bound, not an answer: the store cannot enumerate at
+		// all, and a live task that finished without a region block did not either.
+		// Both used to be printed as "none", which reads as "bound nowhere".
 		return "unknown"
 	}
-	if b.Count == 0 {
-		return "none"
-	}
+	var line string
 	if n := countCLB(b); n > 0 {
-		return strconv.Itoa(n) + " CLB / " + strconv.Itoa(b.Count) + " listeners"
+		line = strconv.Itoa(n) + " CLB / " + strconv.Itoa(b.Count) + " listeners"
+	} else {
+		line = strconv.Itoa(b.Count)
 	}
-	return strconv.Itoa(b.Count)
+	if !b.Complete {
+		line = "≥" + line
+	}
+	return line
 }
 
 func regionLabel(region string) string {
@@ -252,17 +308,23 @@ tr.row.on td.st{border-left-color:var(--accent)}
   </div>
   <div>
     <div class="stamp">Read-only</div>
-    <div class="mono">{{.Desired.Revision}}</div>
+    <div class="mono">{{if .DesiredKnown}}{{.Desired.Revision}}{{else}}desired state not read{{end}}</div>
+    {{if .FrozenLabel}}<div class="mono">frozen · {{.FrozenLabel}}</div>{{end}}
   </div>
 </div>
 <section class="stats">
   <div class="stat"><div class="n">{{.Summary.Certificates}}</div><div class="l">certificates</div></div>
   <div class="stat"><div class="n">{{.UINCount}}</div><div class="l">UIN</div></div>
   <div class="stat {{if gt .Summary.WaitingManualBind 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.WaitingManualBind}}</div><div class="l">waiting bind</div></div>
+  <div class="stat {{if gt .Summary.PendingDeploy 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.PendingDeploy}}</div><div class="l">pending deploy</div></div>
+  <div class="stat {{if gt .Summary.NotIssued 0}}info{{else}}zero{{end}}"><div class="n">{{.Summary.NotIssued}}</div><div class="l">not issued</div></div>
   <div class="stat {{if gt .Summary.Failing 0}}bad{{else}}zero{{end}}"><div class="n">{{.Summary.Failing}}</div><div class="l">failing</div></div>
   <div class="stat {{if gt .Summary.Expiring 0}}info{{else}}zero{{end}}"><div class="n">{{.Summary.Expiring}}</div><div class="l">expiring</div></div>
   <div class="stat {{if gt .Summary.ProbeMismatch 0}}bad{{else}}zero{{end}}"><div class="n">{{.Summary.ProbeMismatch}}</div><div class="l">probe mismatch</div></div>
-  <div class="stat {{if gt .Summary.BindingUnknown 0}}{{else}}zero{{end}}"><div class="n">{{.Summary.BindingUnknown}}</div><div class="l">binding unknown</div></div>
+  <div class="stat {{if gt .Summary.ProbeUnreachable 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.ProbeUnreachable}}</div><div class="l">probe unreachable</div></div>
+  <div class="stat {{if gt .Summary.ProbeUnknown 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.ProbeUnknown}}</div><div class="l">probe unknown</div></div>
+  <div class="stat {{if gt .Summary.BindingUnknown 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.BindingUnknown}}</div><div class="l">binding unknown</div></div>
+  <div class="stat {{if gt .Summary.Unreadable 0}}bad{{else}}zero{{end}}"><div class="n">{{.Summary.Unreadable}}</div><div class="l">state unreadable</div></div>
 </section>
 {{if .ShowGroups}}
 <div class="chips" id="uins">
@@ -298,7 +360,7 @@ tr.row.on td.st{border-left-color:var(--accent)}
 {{end}}
 {{range .Certificates}}
 <tr class="row" data-row data-uin="{{.UIN}}" data-status="{{.Status}}" data-q="{{qblob .}}" data-attention="{{if attention .Status}}1{{else}}0{{end}}">
-  <td class="st"><span class="{{if eq .Status "ok"}}s-ok{{else if or (eq .Status "waiting_manual_bind") (eq .Status "rate_limited")}}s-wait{{else if or (eq .Status "probe_mismatch") (eq .Status "failing") (eq .Status "revoke_pending")}}s-danger{{else if eq .Status "expiring"}}s-info{{end}}"><span class="dot"></span>{{status .Status}}</span></td>
+  <td class="st"><span class="{{class .Status}}"><span class="dot"></span>{{status .Status}}</span></td>
   <td>{{.Name}}</td>
   <td class="mono">{{names .}}</td>
   <td class="mono">{{clb .}}</td>
@@ -317,8 +379,9 @@ tr.row.on td.st{border-left-color:var(--accent)}
         {{if .Bindings.Items}}
           {{range .Bindings.Items}}<div class="mono">{{region .Region}} {{.LoadBalancerID}} · {{.Protocol}}:{{.Port}}{{if .SNIDomain}} · {{.SNIDomain}}{{end}} · {{.Role}}</div>{{end}}
         {{else}}{{bind .Bindings .Status}}{{end}}
+        <div class="mono">source: {{.Bindings.Freshness}}{{if .Bindings.ObservedAt}} · observed {{.Bindings.ObservedAt}}{{end}}{{if not .Bindings.Complete}} · lower bound, not the whole set{{end}}</div>
       </div>
-      <b>Probe</b><div>{{probe .Probe}}{{range .Probe.Hosts}}<div class="mono">{{.Host}} · {{if .Match}}match{{else}}mismatch{{end}}{{if .ProblemKind}} · {{.ProblemKind}}{{end}}</div>{{end}}</div>
+      <b>Probe</b><div>{{probe .Probe}}{{range .Probe.Hosts}}<div class="mono">{{.Host}} · {{if .Match}}match{{else}}mismatch{{end}}{{if .ProblemKind}} · {{.ProblemKind}}{{end}}{{if .NotAfter}} · served expires {{.NotAfter}}{{if not .Trusted}} · chain not trusted{{end}}{{end}}</div>{{end}}</div>
       {{if .Drift}}<b>Drift</b><div class="mono">{{join .Drift ", "}}</div>{{end}}
       {{if .LastError}}<b>Error</b><div>{{.LastError}}</div>{{end}}
     </div>
@@ -397,6 +460,15 @@ tr.row.on td.st{border-left-color:var(--accent)}
 func WritePage(w io.Writer, snap Snapshot) error {
 	groups := groupByUIN(snap.Certificates)
 	view := pageView{Snapshot: snap, Accounts: groups}
+	// Frozen is a pointer: nil means the document was never read, which is not the
+	// same answer as "not frozen", and it must not render as one.
+	view.DesiredKnown = snap.Desired.Frozen != nil
+	if snap.Desired.Frozen != nil && *snap.Desired.Frozen {
+		view.FrozenLabel = snap.Desired.FreezeReason
+		if view.FrozenLabel == "" {
+			view.FrozenLabel = "no reason given"
+		}
+	}
 	n := 0
 	for _, g := range groups {
 		if g.UIN != "" {

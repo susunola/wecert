@@ -1,14 +1,20 @@
 package reconcile
 
 import (
+	"time"
+
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/inventory"
 )
 
 // BindingSnapshot implements webhook.BindingReader. The rows were cached the
 // last time a Bindings poll finished a bind-resource task.
+//
+// The observation instant travels with them: rows without it are served as if they
+// had just been read, which is how a memo from an hour ago becomes a page that
+// claims to know the current binding set.
 func (r *Reconciler) BindingSnapshot(certID string) (inventory.Bindings, bool) {
-	snap, ok := deploy.LookupCachedBindings(certID)
+	snap, observedAt, ok := deploy.LookupCachedBindings(certID)
 	if !ok {
 		return inventory.Bindings{}, false
 	}
@@ -17,6 +23,9 @@ func (r *Reconciler) BindingSnapshot(certID string) (inventory.Bindings, bool) {
 		Complete:  snap.Complete,
 		Freshness: inventory.FreshnessCached,
 		Items:     make([]inventory.BindingItem, 0, len(snap.Items)),
+	}
+	if !observedAt.IsZero() {
+		out.ObservedAt = observedAt.UTC().Format(time.RFC3339)
 	}
 	for _, row := range snap.Items {
 		out.Items = append(out.Items, inventory.BindingItem{
