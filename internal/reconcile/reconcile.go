@@ -1013,7 +1013,11 @@ func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 		// strands a gauge here -- and only the gauge was being reclaimed, so `last` grew
 		// with every host ever dropped from a certificate, and certificate names churn by
 		// design.
-		r.getProber().Forget(h)
+		//
+		// p, not r.getProber(): the snapshot taken at the top of this function is the one
+		// ProbedHosts() was read from. Re-reading could see nil after a concurrent
+		// SetProber(nil) and panic on the method call.
+		p.Forget(h)
 	}
 }
 

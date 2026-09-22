@@ -43,6 +43,10 @@ func countBindings(
 			return bindingCount{}, false, fmt.Errorf("bind-resource task %s failed: %s", taskID, *r.Error.Message)
 		}
 		if r.Status == nil || *r.Status != bindStatusDone || len(r.BindResourceResult) == 0 {
+			// An empty result with Status=done is NOT "finished, nothing bound": the first
+			// query (before the server-side cache exists) answers with a correct TaskId and
+			// an empty list, and judging that as 0 bindings reports a bound certificate as
+			// unbound. Keep waiting -- see TestCountBindingsEmptyResultIsNotDone.
 			return bindingCount{}, false, nil
 		}
 
