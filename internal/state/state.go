@@ -148,6 +148,22 @@ type CertState struct {
 	// alert sees deployed=1 and assumes everything is fine.
 	DeployConfirmed bool
 
+	// OrphanCleanedAt is when this name's orphan teardown finished; zero means never (or that the
+	// row came back into the desired state since, which clears it).
+	//
+	// It is read here so the two paths that need it already have it: the orphan sweep reads it in
+	// the same query that lists the names (ListOrphanRows), and a certificate being reconciled
+	// reads it in the row it fetches anyway (reconcile.publish), where a non-zero value means the
+	// name came back and the mark has to go.
+	//
+	// PutCert deliberately does NOT write this column, and that is the point rather than an
+	// oversight: PutCert is a whole-row upsert, and the failure path already synthesises a
+	// CertState from a partial read (see RecordFailure), so a full-column write would silently
+	// erase the mark for a name that is still an orphan -- putting the whole fleet's teardown cost
+	// back on every pass, for a reason nothing in the journal would explain. The mark is written
+	// by MarkOrphanCleaned and cleared by ClearOrphanCleaned, and by nothing else.
+	OrphanCleanedAt time.Time
+
 	UpdatedAt time.Time
 }
 
@@ -854,6 +870,18 @@ CREATE TABLE IF NOT EXISTS certificates (
     -- has actually swapped it over; otherwise the first upload is treated as
     -- "deployed" and metrics go green before a human has bound anything.
     deploy_confirmed       INTEGER NOT NULL DEFAULT 0,
+    -- When this name's orphan teardown finished (unix seconds). 0 means never.
+    --
+    -- The row of a certificate that left the desired state is kept on purpose -- that is what
+    -- preserves its history if the name comes back -- so the orphan sweep sees it again on every
+    -- pass. This column is the durable "already torn down" mark that lets the sweep report it
+    -- without paying for its teardown a second time; an in-memory set would be a second map
+    -- growing with churn, and would forget everything on restart, which is exactly when a fleet
+    -- edit is most likely to happen.
+    --
+    -- Written only by MarkOrphanCleaned and cleared only by ClearOrphanCleaned: putCertExec
+    -- deliberately leaves it out of its column list (see CertState.OrphanCleanedAt).
+    orphan_cleaned_at      INTEGER NOT NULL DEFAULT 0,
     updated_at             INTEGER NOT NULL DEFAULT 0
 );
 
@@ -1047,6 +1075,10 @@ var schemaColumns = []struct{ table, column, decl string }{
 	// When the challenge in an authorization row was chosen. Legacy rows keep 0, which reads as
 	// "unknown age" and makes the reclaim probe fall back to its previous behaviour.
 	{"authorizations", "challenge_prepared_at", "INTEGER NOT NULL DEFAULT 0"},
+	// When the orphan teardown for a name finished (see the certificates schema). Legacy rows keep
+	// 0, which reads as "never cleaned" -- the conservative answer: such a name is torn down once
+	// more, and only then marked.
+	{"certificates", "orphan_cleaned_at", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // pendingMigrations reports schema changes this binary would apply, without applying them.
@@ -1243,6 +1275,108 @@ func (s *Store) ListCertNames() ([]string, error) {
 	return out, rows.Err()
 }
 
+// OrphanRow is one certificate as the orphan sweep sees it: the name, the expiry its report line
+// prints, and when its teardown finished (zero: never).
+type OrphanRow struct {
+	Name            string
+	NotAfter        time.Time
+	OrphanCleanedAt time.Time
+}
+
+// ListOrphanRows returns every certificate with the fields the orphan sweep needs, in name order.
+//
+// ONE query for the whole pass, deliberately. The sweep already had to walk every name to find the
+// orphans, so folding the mark -- and the expiry the per-orphan report line carries -- into that
+// same read makes an already-cleaned orphan cost no statement at all. The alternative, a GetCert
+// per name in the loop, is exactly the per-orphan cost the column exists to remove: measured with
+// `-tags verifycount` at 2,999 orphans, one list query plus one GetCert and five CleanupOrphan
+// statements each was 17,995 statements per pass, on every pass, forever.
+//
+// No certificate material is read here on purpose: cert_pem/key_pem are the largest columns in the
+// table, and a sweep that runs every pass must not drag every fleet's private keys through the
+// index for a report line.
+func (s *Store) ListOrphanRows() ([]OrphanRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT name, not_after, orphan_cleaned_at FROM certificates ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("list certificate names for the orphan sweep: %w", err)
+	}
+	defer rows.Close()
+
+	var out []OrphanRow
+	for rows.Next() {
+		var (
+			row            OrphanRow
+			notAfter, mark int64
+		)
+		if err := rows.Scan(&row.Name, &notAfter, &mark); err != nil {
+			return nil, fmt.Errorf("scan certificate row: %w", err)
+		}
+		row.NotAfter = fromUnix(notAfter)
+		row.OrphanCleanedAt = fromUnix(mark)
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// MarkOrphanCleaned records that the orphan teardown for this name finished, and reports whether
+// the mark is set.
+//
+// The guard inside the UPDATE is what "finished" means here: the mark is refused while the name
+// still has an order or an authorization row. Those rows are the residue cleanupOrphanTXT keeps on
+// purpose when a TXT record could not be reclaimed -- or is still inside its propagation window, so
+// the record may yet appear -- and the row carries the only clue for locating that record again. A
+// mark written over that residue would stop the sweep from ever retrying it, stranding a stale
+// _acme-challenge value that poisons every other certificate sharing the TXT name. An unmarked name
+// is simply torn down again next pass, which is the pre-column behaviour and the correct one.
+//
+// One statement rather than a read followed by a write: the condition has to hold at the moment of
+// the write anyway, so splitting it would add a check-then-act window and a round trip for nothing.
+//
+// The bool is "the mark is now set", not "this call changed it", so a caller can tell a completed
+// teardown from one that will be retried.
+func (s *Store) MarkOrphanCleaned(name string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`
+		UPDATE certificates SET orphan_cleaned_at = ?
+		WHERE name = ?
+		  AND NOT EXISTS (SELECT 1 FROM orders         WHERE cert_name = certificates.name)
+		  AND NOT EXISTS (SELECT 1 FROM authorizations WHERE cert_name = certificates.name)`,
+		time.Now().Unix(), name)
+	if err != nil {
+		return false, fmt.Errorf("mark orphan cleaned %s: %w", name, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark orphan cleaned %s: %w", name, err)
+	}
+	return n > 0, nil
+}
+
+// ClearOrphanCleaned drops the mark, so a name that leaves the desired state again is torn down
+// again.
+//
+// Called when the name is back in the desired state (see reconcile.publishOrphans and
+// reconcile.publish). The mark says "left the desired state and was torn down"; leaving it set past
+// the return would let it outlive the condition it describes -- the next departure would be
+// skipped, and the certificate would keep whatever its renewed pass left behind: an order, its TXT
+// records, its per-certificate and per-host metric series.
+//
+// `AND orphan_cleaned_at != 0` keeps a call for an unmarked name from writing a row (and a WAL
+// frame) to say nothing.
+func (s *Store) ClearOrphanCleaned(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(
+		`UPDATE certificates SET orphan_cleaned_at = 0 WHERE name = ? AND orphan_cleaned_at != 0`,
+		name); err != nil {
+		return fmt.Errorf("clear orphan cleaned %s: %w", name, err)
+	}
+	return nil
+}
+
 // UpdateCert applies fn to one certificate's state and writes the result back, all while
 // holding the store lock.
 //
@@ -1281,19 +1415,20 @@ func (s *Store) getCertLocked(name string) (*CertState, error) {
 		SELECT name, not_after, cert_url, cert_pem, key_pem, issued_at,
 		       ari_cert_id, ari_window_start, ari_window_end, ari_checked_at, ari_retry_after_ns,
 		       consecutive_failures, next_attempt_at, last_error, deployed_cert_id,
-		       deploy_confirmed, updated_at
+		       deploy_confirmed, orphan_cleaned_at, updated_at
 		FROM certificates WHERE name = ?`, name)
 
 	c := &CertState{}
 	var notAfter, issuedAt, ariStart, ariEnd, ariChecked, nextAttempt, updatedAt int64
 	var retryAfterNS int64
+	var orphanCleanedAt int64
 	var deployConfirmed bool
 
 	err := row.Scan(
 		&c.Name, &notAfter, &c.CertURL, &c.CertPEM, &c.KeyPEM, &issuedAt,
 		&c.ARICertID, &ariStart, &ariEnd, &ariChecked, &retryAfterNS,
 		&c.ConsecutiveFailures, &nextAttempt, &c.LastError, &c.DeployedCertID,
-		&deployConfirmed, &updatedAt)
+		&deployConfirmed, &orphanCleanedAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1309,6 +1444,7 @@ func (s *Store) getCertLocked(name string) (*CertState, error) {
 	c.ARIRetryAfter = time.Duration(retryAfterNS)
 	c.NextAttemptAt = fromUnix(nextAttempt)
 	c.DeployConfirmed = deployConfirmed
+	c.OrphanCleanedAt = fromUnix(orphanCleanedAt)
 	c.UpdatedAt = fromUnix(updatedAt)
 	return c, nil
 }

@@ -9,11 +9,19 @@ They are ordered by real exposure over effort.
 
 1. **Done: the checks are gates** (closed 2026-09-18)
 
-   CI runs `gofmt`, English, `vet`, `govulncheck`, `test -race`, `test-tags`, `check-alerts`, `check-scripts`, `build`, `release`, plus the gates added the same day: an `install.sh` smoke test on a real Linux runner, `scripts/check-cli-surface.py` (every flag the README documents must exist in that binary), the `e2e-sni.sh` self-test, `make test-pebble` with pebble installed, `make e2e` with the real DNS-01 suite binding 53 as root, `make fuzz`. **`main` is protected**: the `test` check is required (verified against the API; `enforce_admins: false` and no review requirement, so a maintainer can still push in an emergency). What is still not machine-checked: `.github/CODEOWNERS` reads as if reviews were required when they are not — either fill it in or drop it.
+   CI runs `gofmt`, English, `vet`, `govulncheck`, `test -race`, `test-tags`, `check-alerts`, `check-scripts`, `build`, `release`, plus the gates added the same day: an `install.sh` smoke test on a real Linux runner, `scripts/check-cli-surface.py` (every flag the README documents must exist in that binary), the `e2e-sni.sh` self-test, `make test-pebble` with pebble installed, `make e2e` with the real DNS-01 suite binding 53 as root, `make fuzz`. **`main` is protected**: the `test`, `install`, `e2e` and `fuzz` checks are required (verified against the API; `enforce_admins: false` and no review requirement, so a maintainer can still push in an emergency). The CODEOWNERS gap recorded here was closed the honest way (2026-09-22): the file names a real owner, so it stays — as an auto-review-request convenience whose header now says exactly that it is not a gate, since the API reports `required_pull_request_reviews: null`.
 
 2. **Done: private vulnerability reporting is on** (closed 2026-09-18)
 
    Enabled in the repository settings; `SECURITY.md` now leads with the private form and keeps the fallbacks for anyone who cannot see it.
+
+2b. **Done: the fifth CA limit (the paused identifier) is recognised** (closed 2026-09-22)
+
+   The program modelled four of Let's Encrypt's limits and deliberately left the fifth — **consecutive authorization failures per identifier**, where crossing 1,152 pauses that identifier for the account and only the CA's self-service portal unpauses it. Waiting does not clear a pause, so a refusal of this kind was the worst of both worlds: it names no instant, so nothing was booked, and the certificate came back at our own 1m..6h backoff against a state the CA had already refused.
+
+   Now `refusedLimits` recognises both published wordings (the bare `too many failed authorizations recently: …` and Boulder's current *"temporarily prevented from requesting certificates for …"* form), `newOrderRefusalScope` books it against the identifier the message names, and the recorded deadline is a **floor of one day** — the published refill rate, 1 per identifier per day — rather than a measurement, because the CA never says when a pause lifts. Ordering stops for that identifier, the journal says once and clearly that it is paused and that the portal is the only way out, and the blocked gauge carries it: the pause is the one limit this program does not spend against, so no token count is published for it. The per-identifier failure budget is untouched — an instant in the message is what still routes a refusal to it — and a refusal with no instant that is *not* this wording keeps its backoff retry.
+
+   What is still unverified is the CA's **real** message: provoking one needs control of the authoritative DNS answer at the moment the CA validates, which needs a delegated subdomain and a machine serving port 53 on the public internet. See `docs/verification-2026-09-18.md` §4.2 (U21/U44) and §7.3 for the blocker, and the comment on `ConsecutiveAuthzFailuresPerIdentifier` for what is published versus assumed.
 
 3. **Finish off-host snapshots (option A in docs/availability.md)**
 
@@ -25,21 +33,29 @@ They are ordered by real exposure over effort.
 
    The tempting signal is "the file's mtime is much newer than the newest row in it", and it is a false-positive generator: SQLite checkpoints the WAL at open and at close, so a daemon that wrote once and then idled for a week has exactly that signature after an ordinary restart. Ruling that out needs something the file does not carry today — a heartbeat row, or a start/stop ledger — and a warning that also fires on legitimate restarts teaches the reader to ignore the one that matters. Worth doing only once that design is settled; until then the answer is "restore through the command, which records it".
 
-4b. **Make the orphan teardown proportional to what needs cleaning**
+4b. **Done: the orphan teardown is proportional to what needs cleaning** (closed 2026-09-22)
 
-   Certificates that left the desired state keep their row by design, and every pass tears each one
-   down again: measured with a counting driver (round-11 verification pass) at 2,999 orphans, that is
+   Certificates that left the desired state keep their row by design, and every pass tore each one
+   down again: measured with a counting driver (round-11 verification pass) at 2,999 orphans, that was
    6.000 SQL statements per orphan **per pass** -- 5.000 in `CleanupOrphan` plus one `GetCert` -- i.e.
-   **17,994 statements per pass**, identical on every pass. (The earlier figure here, 15,051, was an
-   undercount from the same order of magnitude.) The journal
-   half is fixed (ten lines plus a counted summary). The SQL half needs a durable "already cleaned"
-   mark — a column on `certificates`, cleared when the name comes back — because the row itself is
-   what says there is anything to clean, and an in-memory set would just be another map that grows
-   with churn.
+   **17,994 statements per pass**, identical on every pass.
 
-5. **Sign the release artifacts**
+   Closed by a durable mark rather than an in-memory set (which would be another map growing with
+   churn, and would forget everything on restart): `certificates.orphan_cleaned_at`, written by
+   `Store.MarkOrphanCleaned` once the teardown has actually finished, cleared by
+   `Store.ClearOrphanCleaned` when the name is desired again, and read for the whole fleet in the one
+   query the sweep already ran (`Store.ListOrphanRows`). Re-measured with
+   `go test -tags verifycount -run TestMeasureReconcilerOrphanSweepCostPerPass -v -count=1 ./internal/acme/`:
+   **18,001 statements per pass before** (2,999 x 6.000 plus the sweep query and the pass epilogue),
+   **7 after** -- 21,000 on the one pass that does the work and writes the marks. Two details matter
+   for correctness rather than cost: the mark is refused while an order or authorization row is left
+   behind, so a TXT record that could not be reclaimed (or is still inside its propagation window) is
+   still retried, and a failed teardown is never marked. The journal half stays exactly as it was --
+   ten lines plus a counted summary, every pass -- because the SQL is what had to stop, not the signal.
 
-   `make repro-check` proves the binaries can be rebuilt bit-for-bit from the commit, which makes "this artifact came from that source" *checkable* — but only by someone who does the rebuilding. Nothing signs the release itself, so a download is still trusted on the strength of the transport. `gh attestation` or cosign turns reproducibility into verifiable provenance.
+5. **Done: the release artifacts carry build provenance** (closed 2026-09-22)
+
+   `.github/workflows/release.yml` now attests `dist/*` — the same files the job uploads to the GitHub Release — with `actions/attest-build-provenance@v2`, so the tag build's provenance is recorded through GitHub's OIDC/Sigstore path and `gh attestation verify dist/wecert_linux_amd64 --repo susunola/wecert` answers "which workflow and commit produced this" without a rebuild. This complements `make repro-check` rather than replacing it: reproducibility is checkable only by someone who does the rebuilding, an attestation is checkable from the download alone. The workflow's permissions gained `id-token: write` and `attestations: write`; `contents: write` was already there for `gh release create` and is unchanged. The trigger is `push: tags: ['v*']`, which is the only path that publishes a release, so the attestation cannot go stale — every published artifact is attested by the run that built it.
 
 6. **Settle the config model for challenge types**
 
@@ -52,6 +68,8 @@ They are ordered by real exposure over effort.
 8. **Test downgrade: an older binary opening the new schema**
 
    The revocation work added two tables (`revoke_requests`, `rate_buckets`). Migrations are additive, so an older binary should still work — explicit column lists, new tables simply ignored — but that has never been tested. For a system whose disaster case is losing the state database, which versions can be rolled back to is part of reliability rather than a nicety.
+
+   Partly closed 2026-09-22: `state.TestAnOlderBinaryStillOpensTheNewSchema` replays the pre-`orphan_cleaned_at` build's own statements against the `certificates` table — its `CREATE TABLE IF NOT EXISTS`, its column check, its explicit-column `SELECT` and its whole-row upsert — on a database this build created and migrated, and asserts that the old write lands while the new column survives it. Still not covered: the same replay for the other tables, and running a literal pre-change binary.
 
 9. **Feed the local quota accounting into the change-budget decision**
 

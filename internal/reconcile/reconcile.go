@@ -355,7 +355,7 @@ func (r *Reconciler) publishDesired(res *spec.Result) {
 // net — if something still slips through, at least it is visible before expiry
 // rather than only when a site fails a handshake.
 func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
-	names, err := r.store.ListCertNames()
+	rows, err := r.store.ListOrphanRows()
 	if err != nil {
 		r.log.Warn("cannot list certificate names for the orphan check", "err", err)
 		return
@@ -367,8 +367,27 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 	}
 
 	orphans := 0
-	for _, name := range names {
-		if want[name] {
+	for i := range rows {
+		row := rows[i]
+		if want[row.Name] {
+			// Back in the desired state, so the mark has to go: it says "left the desired state and
+			// was torn down", and leaving it set would let it outlive the condition it describes.
+			// The next departure would then be skipped, and the name would keep whatever the pass
+			// that brought it back left behind -- an order, its TXT records, its metric series.
+			//
+			// One statement per name that actually came back: zero on a normal pass, bounded by the
+			// churn of the document rather than by the size of the fleet. The orphans are the ones
+			// that repeat every pass, so they are the ones whose statements had to stop (see
+			// state.ListOrphanRows).
+			if !row.OrphanCleanedAt.IsZero() {
+				if err := r.store.ClearOrphanCleaned(row.Name); err != nil {
+					// Not fatal, never silent: a mark that stays set is exactly the state that makes
+					// the next departure invisible to the teardown.
+					r.log.Warn("cannot clear the orphan-clean mark of a certificate that is back in "+
+						"the desired state, so it would not be torn down if it left again",
+						"cert", row.Name, "err", err)
+				}
+			}
 			continue
 		}
 		// The gauge answers "present in the store but not in the desired state", so it
@@ -377,6 +396,20 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		// the gauge to 0 during exactly the rounds an orphan existed but could not yet
 		// be reclaimed, contradicting the metric's own help text.
 		orphans++
+
+		// Already torn down, and nothing has happened to the name since: a pass for it would have
+		// cleared the mark (publish does that from the row it reads anyway), so the state the
+		// teardown acted on cannot have changed underneath it.
+		//
+		// The report line below is deliberately KEPT, because nothing else will ever mention that
+		// this certificate stopped being renewed. What stops is the SQL: the teardown, the store
+		// read that fed it and the probe reclamation it triggered all already ran, and repeating
+		// them every pass for a state that cannot change is what made a fleet with thousands of
+		// orphans cost thousands of statements per pass, forever.
+		if !row.OrphanCleanedAt.IsZero() {
+			r.reportOrphan(row.Name, row.NotAfter, orphans > orphanLogLimit)
+			continue
+		}
 
 		// A name can be absent from the desired state while a pass for it is still in
 		// flight -- that is exactly what removing a certificate mid-issuance looks like,
@@ -403,9 +436,9 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		// teardown closes it: a pass that starts meanwhile is refused (and retried by its caller)
 		// rather than run against a name being dismantled. The teardown is not a convergence pass,
 		// so it claims the name only for the length of this block.
-		if !r.acquire(name) {
+		if !r.acquire(row.Name) {
 			r.log.Info("skipping the orphan teardown: a pass for this certificate is still running",
-				"cert", name)
+				"cert", row.Name)
 			continue
 		}
 
@@ -413,7 +446,7 @@ func (r *Reconciler) publishOrphans(ctx context.Context, res *spec.Result) {
 		// acts on, and 500 of these every pass -- which is what a deployment that dropped a whole
 		// generated document looks like -- buries every other line in the journal, forever, because
 		// the row is deliberately kept.
-		r.tearDownOrphan(ctx, name, orphans > orphanLogLimit)
+		r.tearDownOrphan(ctx, row.Name, orphans > orphanLogLimit)
 	}
 	metrics.OrphanedCertificates.Set(float64(orphans))
 	if orphans > orphanLogLimit {
@@ -451,8 +484,9 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string, counted bo
 	// mid-flight: its challenge leases stayed on DNSPod forever, and a stale
 	// TXT value poisons every other certificate that writes the same
 	// _acme-challenge name (a wildcard and its apex always share one).
-	if err := r.manager.CleanupOrphan(ctx, name); err != nil {
-		r.log.Warn("failed to reclaim the orphaned order and its TXT records", "cert", name, "err", err)
+	cleanupErr := r.manager.CleanupOrphan(ctx, name)
+	if cleanupErr != nil {
+		r.log.Warn("failed to reclaim the orphaned order and its TXT records", "cert", name, "err", cleanupErr)
 	}
 
 	// Reclaim the per-certificate series. Nothing else ever revisits a name that
@@ -474,10 +508,58 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string, counted bo
 		}
 	}
 
+	// The expiry comes from the row just read, when that read worked. The rest of the line is the
+	// same one every later pass prints from the sweep's own read (see reportOrphan).
+	var notAfter time.Time
+	if stErr == nil && st != nil {
+		notAfter = st.NotAfter
+	}
+	r.reportOrphan(name, notAfter, counted)
+
+	// Mark the teardown as finished, LAST -- after the order and the TXT records were reclaimed,
+	// after the per-certificate series were dropped and after the probe hosts were forgotten -- so
+	// "marked" can only ever mean "there is nothing left to do for this name". Every later pass
+	// reports the orphan and skips all of it (see publishOrphans).
+	//
+	// A teardown that FAILED is never marked: the order and the TXT records are still out there, and
+	// recording it as finished would drop them for good -- nothing else revisits a name that has
+	// left the desired state. The next pass retries it.
+	//
+	// The store refuses the mark while an order or an authorization row is left behind even when
+	// the manager reported success (a TXT record that could not be reclaimed, or one still inside
+	// its propagation window), which leaves the name unmarked on purpose for the same reason. That
+	// refusal is not logged here -- the manager already said why it kept the row, and repeating it
+	// every pass is the flood orphanLogLimit exists to stop.
+	if cleanupErr != nil {
+		return
+	}
+	marked, err := r.store.MarkOrphanCleaned(name)
+	switch {
+	case err != nil:
+		// Not fatal: an unmarked name is simply torn down again next pass, which is the behaviour
+		// this whole path had before the column existed.
+		r.log.Warn("cannot record that the orphan teardown finished, so it will be repeated on the "+
+			"next pass", "cert", name, "err", err)
+	case !marked:
+		r.log.Debug("the orphan teardown left an order or an authorization row behind, so it will be "+
+			"retried on the next pass", "cert", name)
+	}
+}
+
+// reportOrphan is the per-pass line for a certificate that is not in the desired state.
+//
+// It is shared by the two paths that produce it -- the pass that tears the name down and every
+// later pass that finds it already torn down -- because the operator's signal has to read the same
+// either way. What the durable mark changed is the SQL, deliberately not what the journal says:
+// nothing else will ever mention that this certificate stopped being renewed.
+//
+// A zero notAfter (a row that could not be read, or one that was never issued) drops the expiry
+// attributes rather than printing 1970, the same rule publish follows for the expiry series.
+func (r *Reconciler) reportOrphan(name string, notAfter time.Time, counted bool) {
 	attrs := []any{"cert", name}
-	if stErr == nil && st != nil && !st.NotAfter.IsZero() {
-		attrs = append(attrs, "notAfter", st.NotAfter,
-			"daysLeft", config.DaysUntil(st.NotAfter, time.Now()))
+	if !notAfter.IsZero() {
+		attrs = append(attrs, "notAfter", notAfter,
+			"daysLeft", config.DaysUntil(notAfter, time.Now()))
 	}
 	msg := "this certificate is no longer in the desired state, so it will not be renewed " +
 		"and will expire; if that was not intended, restore its declaration and re-run wecert-onboard"
@@ -1526,6 +1608,25 @@ func (r *Reconciler) publish(c *config.Certificate) {
 	}
 	if st == nil {
 		return
+	}
+
+	// The name is in the desired state -- a pass is running for it right now -- so an orphan-clean
+	// mark on it is stale, and it has to go before the series below are written.
+	//
+	// publishOrphans clears the mark too, and for the whole desired state at once. This second,
+	// per-certificate clear is not redundant: StartCert and StartAll reconcile a name, or the whole
+	// document, WITHOUT running a pass, so the orphan sweep never sees that the name came back. A
+	// mark left behind there is not harmless -- the name would be skipped on its next departure,
+	// keeping the order, the TXT records and the series written just below, forever.
+	//
+	// Free in the common case: the row was already read, and the write happens only when it carries
+	// a mark.
+	if !st.OrphanCleanedAt.IsZero() {
+		if err := r.store.ClearOrphanCleaned(c.Name); err != nil {
+			r.log.Warn("cannot clear the orphan-clean mark of a certificate that is back in the "+
+				"desired state, so it would not be torn down again if it left",
+				"cert", c.Name, "err", err)
+		}
 	}
 
 	// A certificate that was never issued has no expiry, and the series must be ABSENT

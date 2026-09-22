@@ -59,6 +59,17 @@ jobs:
       - name: test (build tags)
         run: make test-tags
 
+      # Coverage floor. `make cover` printed the total and nothing in this workflow or in
+      # `make check` compared it to anything, so the number could regress silently
+      # (docs/test-plan.md P0-3). The floor lives in scripts/check-coverage.py -- 76.0%, measured
+      # 77.62% on 2026-09-22 -- together with a self-test that proves the check fails when it should.
+      #
+      # This runs the suite once more without -race: the ratio of covered statements does not need
+      # the race detector, which the `test` step above already used. `make check` runs the same
+      # target, so a local green covers this step too.
+      - name: coverage floor
+        run: make check-coverage
+
       # The shipped Prometheus rules and the CAM policies are the only thing watching several
       # failures that are silent by construction, and both are checked by a Python script that
       # nothing in CI ran -- so a renamed metric or a policy that no longer covers an API call

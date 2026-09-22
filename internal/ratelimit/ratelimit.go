@@ -54,6 +54,12 @@ type Limit struct {
 	// Source records where the numbers come from, so a future change to the CA's published
 	// limits is traceable to the page it was read from rather than to folklore.
 	Source string
+
+	// SpentByCA marks a bucket this program does not spend against: the CA's own validators fill
+	// it. Nothing here can observe that spend, so a token count computed from our (always zero)
+	// local spend would be the bare capacity wearing the estimate's clothes -- see QuotaReport,
+	// which publishes Blocked but never Remaining for such a limit.
+	SpentByCA bool
 }
 
 // String renders the limit for a log line.
@@ -101,6 +107,33 @@ var (
 		Capacity: 5, Refill: 12 * time.Minute,
 		Source: "letsencrypt.org/docs/rate-limits: 5 authorization failures per identifier per hour, refills 1 per 12m",
 	}
+
+	// ConsecutiveAuthzFailuresPerIdentifier is the FIFTH published limit, and the only one whose
+	// bucket the CA's own validators fill rather than this program.
+	//
+	// "Consecutive Authorization Failures per Identifier per Account"
+	// (https://letsencrypt.org/docs/rate-limits/, read 2026-09-18): up to 1,152 consecutive
+	// authorization failures per identifier are allowed; the ability to incur them refills at 1 per
+	// identifier per DAY and resets to zero when an authorization for that identifier validates.
+	// Crossing it makes Boulder PAUSE (account, identifier): every new order containing that
+	// identifier is refused with a link to the CA's self-service portal, and the docs are explicit
+	// that the portal is how issuance is unpaused for it. The pause is a row in Boulder's database
+	// with no expiry of its own (sa/sa.go, `paused` / `unpausedAt IS NULL`), which is what makes it
+	// a different kind of state from a token bucket: waiting does not clear it, and the CA never
+	// names an instant at which it will.
+	//
+	// So the numbers below are used for two things, and neither is a spend estimate: Capacity and
+	// Refill document the published model, and Refill is the FLOOR a refusal against this limit is
+	// booked with when the CA names no instant (see the acme package's noteNewOrderRefusal). It is
+	// a floor in the sense of "the shortest wait the published model can possibly justify", not a
+	// measurement of any particular pause and not a promise that ordering will succeed then.
+	ConsecutiveAuthzFailuresPerIdentifier = Limit{
+		Name: "consecutive-authz-failures-per-identifier", Scope: "identifier",
+		Capacity: 1152, Refill: 24 * time.Hour,
+		Source: "letsencrypt.org/docs/rate-limits: 1152 consecutive authorization failures per identifier, " +
+			"refills 1 per identifier per day, reset to zero by a successful validation; crossing it pauses the identifier",
+		SpentByCA: true,
+	}
 )
 
 // Spendable returns every limit this program consumes.
@@ -111,6 +144,17 @@ func Spendable() []Limit {
 		CertsPerExactIdentifierSet,
 		AuthzFailuresPerIdentifier,
 	}
+}
+
+// Reportable returns every limit whose CA-reported state belongs in the quota report and its
+// metrics: the spendable four, plus the CA-spent identifier pause.
+//
+// The pause is reportable because a paused identifier is the one state an operator has to ACT on
+// (it is cleared in the CA's portal, not by waiting), while it is not spendable because nothing
+// here spends against it. Reporting it with the spendable four is what makes
+// wecert_ratelimit_blocked carry it; see QuotaReport for why it never carries a token count.
+func Reportable() []Limit {
+	return append(Spendable(), ConsecutiveAuthzFailuresPerIdentifier)
 }
 
 // Snapshot is one bucket's state at a known instant.

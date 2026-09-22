@@ -32,7 +32,7 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # started inside cmd/wecert (see startWebhookServer), so it ships with the first entry.
 CMDS := wecert wecert-onboard
 
-.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-tags test-repeat e2e vet cover clean fmt validate-cloudinit check-english check-scripts check-cli check-alerts fmt-check check diagrams diagrams-check
+.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-tags test-repeat e2e vet cover check-coverage clean fmt validate-cloudinit check-english check-scripts check-cli check-alerts fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
@@ -206,6 +206,19 @@ cover:
 	$(GO) test -coverprofile=coverage.out ./...
 	$(GO) tool cover -func=coverage.out | tail -1
 
+# The floor under `make cover`. `cover` printed the number and no gate read it, so the total was
+# free to fall silently -- docs/test-plan.md recorded that as P0-3. The threshold and the date it
+# was chosen live in scripts/check-coverage.py (76.0%, measured 77.62% on 2026-09-22), which keeps
+# it greppable and gives it a self-test; this target only produces the profile that check reads.
+#
+# The profile run is the cheapest one that can produce the number: no `-race`, because this is a
+# ratio of statements rather than a second concurrency gate, and Go's test cache makes a re-run
+# free until a source file changes.
+check-coverage:
+	python3 scripts/test-check-coverage.py
+	$(GO) test -coverprofile=coverage.out ./...
+	python3 scripts/check-coverage.py
+
 fmt:
 	$(GO) fmt ./...
 
@@ -281,7 +294,7 @@ fuzz:
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzLimitWithDegenerateRefill -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzParseRetryAfter -fuzztime $(FUZZTIME)
 
-check: check-english fmt-check vet test-race test-tags check-scripts check-alerts
+check: check-english fmt-check vet test-race test-tags check-scripts check-alerts check-coverage
 
 clean:
 	rm -rf bin dist coverage.out

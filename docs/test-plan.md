@@ -180,16 +180,34 @@ awk -v t="$total" 'BEGIN{ if (t+0 < 60.0) { print "coverage regressed: "t"% < 60
 
 **判据**：故意删一个测试，CI 必须红。
 
+> **2026-09-22 已关闭（总量下限部分）：** 下限落在 `scripts/check-coverage.py`，阈值与选取依据一起写在
+> 脚本里 —— **76.0%**，选取当天实测 **77.62%**（5643/7270 statements，`go test -coverprofile` 写出的
+> profile；同一天 `make cover` 打印 77.7%，0.1 个点的差来自 `go tool cover -func` 不计函数体之外的块）。
+> 1.62 个点、约 118 条语句的余量：重构可以把有覆盖的代码挪到新分支上而不必同时补测试，但一个包整体失去
+> 测试、或签发主路径被包进新分支这类真实退化仍会被挡住。
+>
+> 为什么是脚本而不是 CI 里的内联 `awk`：阈值可 grep，且可以被单测盯住 ——
+> `scripts/test-check-coverage.py` 断言"低于下限退出 1、恰好等于下限通过、`--floor` 能翻转同一个 profile
+> 的结论、空或损坏的 profile 退出 2 而不是假通过、百分比按语句数而不是按块数加权"。接入两处：
+> `make check-coverage`（生成 profile 后判定，已作为依赖并入 `make check`）与 `ci.yml` 的 `test` 作业。
+> 反例已在真实 profile 上验证：`python3 scripts/check-coverage.py --floor 80` 打印
+> `coverage regressed: 77.62% is 2.38 points below the floor of 80.00%` 并退出 1；这是 `--floor`
+> 覆盖，仓库里没有留下临时阈值。
+>
+> **仍未做**：上面"逐包设下限"（`internal/` 中已 ≥ 60% 的包各设一条）没有实现。总量下限挡不住
+> "高覆盖包替低覆盖包背平均分"，这一半留在 P0-3 名下。
+
 #### P0-4 · 本地门禁 ≠ CI 门禁
 
 **现象**：
 
 ```
 make check   = check-english fmt-check vet test-race test-tags
-               check-scripts（含 check-cli）check-alerts      （7 项目标，ci.yml 未覆盖的见下）
+               check-scripts（含 check-cli）check-alerts
+               check-coverage                                  （8 项目标，ci.yml 未覆盖的见下）
 CI test 作业  = gofmt + check-english + vet + govulncheck
-               + test -race + test-tags + check-alerts
-               + check-scripts + build + cross build           （9 步）
+               + test -race + test-tags + check-coverage + check-alerts
+               + check-scripts + build + cross build           （10 步）
 CI 另外三个作业 = install（make release + sudo ./install.sh 冒烟）
                + e2e（pebble + make test-pebble + make e2e，需要 53 端口）
                + fuzz（FUZZTIME=15s make fuzz）                  （3 个作业）
@@ -205,6 +223,9 @@ CI 的 `gofmt` / English 两步是内联命令，等价于 `make fmt-check` / `m
 的变量拼写让每次安装中止）、缺陷 2（`wecert-clbverify -clb` 在错 FlagSet 上）、缺陷 3（`-raw` 的 JSON
 后面跟着人类报告，`json.load` 报 Extra data）现在各有一条机器门禁。P0-4 本身**未关闭**：上面列出的
 CI-only 项仍在。
+
+2026-09-22 补记：`check-coverage` 已接进 `make check` 与 `test` 作业，且两边跑的是同一条命令 ——
+上表因此从 7 项目标 / 9 步变成 **8 项目标 / 10 步**，差距项（`govulncheck`、`build`、`release`）没有变化。
 
 **怎么补**：让 `make check` 成为 CI 的超集（至少加 `build` 与 `release`；`govulncheck` 可选，因为它要联网拉漏洞库）。
 
@@ -306,7 +327,7 @@ CI-only 项仍在。
 内部可注入层     ████████████████████  已打满（probeRecords / newTXTLeases / CertID / updateInstance 96% …）
 
 验证工具本身     ░░░░░░░░░░░░░░░░░░░░  ← 两个二进制 0%           P0-1 / P0-2
-发布门禁         ░░░░░░░░░░░░░░░░░░░░  ← 无覆盖率下限、make check ≠ CI  P0-3 / P0-4
+发布门禁         ░░░░░░░░░░░░░░░░░░░░  ← make check ≠ CI（覆盖率下限已于 2026-09-22 落地）  P0-4
 
 声明发现层       ░░░░░░░░░░░░░░░░░░░░  ← onboarding/tencent.go 11 个函数 0%   P1-1
 Noop 语义        ░░░░░░░░░░░░░░░░░░░░  ← deploy.enabled=false 时全靠它        P1-2
@@ -365,7 +386,7 @@ spec / 熔断      ██████░░░░░░░░░░░░░░ 
 ### 每个版本发布前，必须满足
 
 - [ ] **L0–L2 全绿**，且 `make check` 已包含 CI 的全部检查（P0-4）
-- [ ] **覆盖率不低于上一版本**（P0-3 落地后自动校验）
+- [x] **覆盖率不低于上一版本**（2026-09-22 起由 `make check-coverage` 自动校验：总量下限 76.0%，逐包下限仍未做，见 P0-3）
 - [ ] **`CHANGELOG.md` 已更新**，且 `Tests` 段落如实反映新增测试
 - [ ] 改动触及**订单状态机 / DNS 挑战 / 清理** → 必须跑 **L3 的 8 条最小 PASS 判据**
 - [ ] 改动触及**部署 / CLB / SNI** → 必须跑 **L4 Stage B 或 B2**；改动触及 **systemd / 安装脚本 /
@@ -458,3 +479,4 @@ make check-cli         # README/checklist 里写的每个 flag 都在对应二�
 | 2026-09-17 | 第 2 节新增两条 L4 行：Stage C（真机 + systemd + CVM 角色）与 SNI 多证书，均**未跑**、人工 / 需要账号；配套 `docs/stage-c-cvm-systemd.md`、`docs/sni-multicert.md`、`scripts/e2e-sni.sh` |
 | 2026-09-18 | P0-4 与附录的命令清单按当前 Makefile / ci.yml 重算：`make check` 已从 4 项长到 7 项（`test-tags`、`check-scripts`、`check-alerts` 已接入），CI 现在是 9 步；结论不变 —— `govulncheck`、`build`、`release` 仍只在 CI 跑。P0-3（CI 无覆盖率下限）复核后仍成立。第 2 节的 **Stage C 两行**从"未跑"更正为"已跑"（2026-09-17 §4.5/§4.9、2026-09-18 §4.7）；3.3 节 A 类接缝补注已覆盖的部分 |
 | 2026-09-18 | 第二轮：`check-cli` 与 `scripts/test-e2e-sni.sh` 接入 `make check-scripts`；`ci.yml` 新增 `install`（`make release` + `sudo ./install.sh` 冒烟，root）、`e2e`（pebble + `make test-pebble` + `make e2e`，断言不 skip）、`fuzz`（`FUZZTIME=15s`）三个作业。P0-4 重算后仍未关闭（`govulncheck`/`build`/`release` 及上述三个作业仍只在 CI）；P0-3 未动，仍成立 |
+| 2026-09-22 | P0-3 **总量下限部分关闭**：`scripts/check-coverage.py`（下限 76.0%，选取时实测 77.62%）+ 自测 `scripts/test-check-coverage.py`，经 `make check-coverage` 接入 `make check` 与 `ci.yml` 的 `test` 作业；反例用 `--floor 80` 在真实 profile 上验证退出 1。逐包下限仍未做。P0-4 按当前状态重算：`make check` 8 项目标、`test` 作业 10 步，CI-only 项不变 |

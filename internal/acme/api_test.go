@@ -408,16 +408,27 @@ func terminalOrder(location, finalize, certURL string) legoacme.ExtendedOrder {
 
 func newAPITestHarness(t *testing.T, domains []string) (*state.Store, *Manager, *fakeAPI, *config.Certificate) {
 	t.Helper()
+	return newAPITestHarnessAt(t, filepath.Join(t.TempDir(), "state.db"), domains,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
 
-	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+// newAPITestHarnessAt is newAPITestHarness with the database path and the logger chosen by the
+// caller. A test that has to REOPEN the store -- a process restart, where the fact under test is
+// that something came back from disk rather than from memory -- or that has to read the journal
+// needs both; every other test wants the private t.TempDir() and the discarded log above.
+func newAPITestHarnessAt(
+	t *testing.T, dbPath string, domains []string, log *slog.Logger,
+) (*state.Store, *Manager, *fakeAPI, *config.Certificate) {
+	t.Helper()
+
+	store, err := state.Open(dbPath)
 	if err != nil {
 		t.Fatalf("open state store: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
 	fake := &fakeAPI{}
-	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := newManager(store, fake, &fakeSolver{}, fakeKeyAuth{}, deploy.Noop{}, log)
 
 	certs := []config.Certificate{{
 		Name:    "site-example-com",

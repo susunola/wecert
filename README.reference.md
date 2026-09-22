@@ -160,11 +160,12 @@ Static release binaries for three platforms:
 make release        # → dist/wecert_{linux_amd64,linux_arm64,darwin_arm64} + SHA256SUMS
 ```
 
-Two things you can check about a release rather than take on trust:
+Three things you can check about a release rather than take on trust:
 
 ```bash
 make repro-check    # rebuilds each platform twice and compares the bytes
 make sbom           # → dist/wecert-sbom.cdx.json (CycloneDX, needs cyclonedx-gomod)
+gh attestation verify dist/wecert_linux_amd64 --repo susunola/wecert   # what built this file, from which commit
 ```
 
 `repro-check` is what makes "this binary was built from that commit" checkable: with `-trimpath`
@@ -174,6 +175,12 @@ this program holds private keys and links two cloud SDKs plus a TLS stack, and t
 not something a reviewer should have to resolve by hand. It deliberately does **not** claim licence
 completeness: that needs every module in the local cache, and the tool responds to a missing one by
 omitting the field with only a warning.
+
+`gh attestation verify` needs no rebuild: the tag workflow attests everything in `dist/` with
+`actions/attest-build-provenance`, so the attestation (signed through GitHub's OIDC identity with a
+Sigstore certificate) names the repository, workflow and commit that produced the exact bytes in
+front of you. Reproducibility and provenance answer different halves of the same question —
+reproducibility survives a compromised signing key, provenance survives not having a build machine.
 
 ### 2. Run the preflight checks
 
@@ -344,6 +351,10 @@ certificates                  -- live state per configured certificate
 ├── last_error           TEXT
 ├── deployed_cert_id     TEXT      -- Tencent Cloud CertId
 ├── deploy_confirmed     INTEGER   -- 1 = confirmed live, not merely uploaded
+├── orphan_cleaned_at    INTEGER   -- when this name's teardown after leaving the desired
+│                                  -- state finished; 0 = never. The row is kept on purpose,
+│                                  -- so this is what stops every pass from tearing it down
+│                                  -- again (cleared when the name comes back)
 └── updated_at           INTEGER
 
 orders                        -- at most ONE in-flight order per certificate
@@ -930,6 +941,15 @@ answered by asking. wecert answers it two ways, and the difference matters:
   authoritative — it accounts for every other spend the estimate cannot see — so it is stored
   and reported until it passes.
 
+  **One refusal names no instant at all**: the *paused identifier*, where 1,152 consecutive
+  authorization failures pause that identifier for the account. Boulder answers with a link to its
+  self-service portal and no time, and only that portal lifts the pause, so the recorded deadline is
+  a **one-day floor** taken from the published refill rate (1 per identifier per day) rather than a
+  measurement of the pause. That refusal is booked against its own limit,
+  `consecutive-authz-failures-per-identifier`, so the gauge says *which* kind of refusal it was; the
+  daemon stops ordering for that identifier, and the journal says the deadline is a floor rather
+  than the CA's answer.
+
 The accounting lives in `internal/ratelimit` (pure arithmetic, no dependencies) and persists one
 row per bucket in `rate_buckets`: the bucket model is its own memory, so no event log is needed.
 
@@ -955,7 +975,7 @@ row per bucket in `rate_buckets`: the bucket model is its own memory, so no even
 | `wecert_desired_state_age_seconds` | Age of the desired-state document. A growing value means `wecert-onboard` stopped running |
 | `wecert_orphaned_certificates` | Certificates in the state store but absent from the desired state. They will not be renewed |
 | `wecert_ratelimit_remaining_tokens{limit,scope}` | Estimated tokens left in a published CA rate limit. **An upper bound**: it counts only what wecert spent, while *certs per registered domain* and *certs per exact set of identifiers* are global across all accounts, so the true remainder can be smaller |
-| `wecert_ratelimit_blocked{limit,scope}` | `1` while the CA has refused a request against this limit and reported when it will accept one again |
+| `wecert_ratelimit_blocked{limit,scope}` | `1` while the CA has refused a request against this limit. The instant is the CA's own `retry after` — except for `limit="consecutive-authz-failures-per-identifier"` (the paused identifier), whose refusal names no instant: there the deadline is a one-day floor from the published refill rate, and the journal says so |
 
 Alert on `not_after`, **not** on "did the renewal job error" — the latter stays silent when the program is quietly broken:
 
@@ -1169,7 +1189,7 @@ The file holds the ACME account key and every certificate's private key. The sys
 ## Development
 
 ```bash
-make check      # the full gate: gofmt + vet + English + test -race + test-tags + shell self-tests + alert rules
+make check      # the full gate: gofmt + vet + English + test -race + test-tags + shell self-tests + alert rules + coverage floor
 make test       # unit tests
 make test-race  # with the race detector (DNS probing and authz polling are concurrent)
 make fmt-check  # check only, no writes
@@ -1178,10 +1198,18 @@ make build      # → bin/wecert
 make release    # cross-compile linux/amd64, linux/arm64, darwin/arm64
 make fuzz       # property/fuzz targets, FUZZTIME per target (from PR #55)
 make test-pebble  # a real ACME lifecycle against a local CA (needs the pebble binary)
-make cover      # coverage
+make cover      # coverage; prints the total and does not judge it
+make check-coverage  # the coverage floor on its own: profile + scripts/check-coverage.py
 ```
 
-CI (`.github/workflows/ci.yml`) has four jobs. `test` runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make test-tags` + `make check-alerts` + `make check-scripts` + `make build` + `make release`; `check-scripts` pulls in `check-cli`, which requires every flag the READMEs and `docs/staging-checklist.md` document to appear in that binary's own `-h`. `install` runs `make release` and then the documented `sudo ./install.sh ./dist/wecert_linux_amd64` as root, asserting the installed files, their modes, and that a second run keeps an edited config. `e2e` installs pebble, runs `make test-pebble` and fails when it skipped, then runs `make e2e` (the first suite binds 53/udp+tcp, so it runs under sudo) and requires all three suites to report `pass`. `fuzz` runs `FUZZTIME=15s make fuzz`. `make check` is the `test` job minus `govulncheck`, `make build` and `make release`: it pulls in `test-tags` (the same tests under `-tags "pebble lego_dns"`, the only gate for two tag-selected production files), `check-scripts` (the shell self-tests, the CLI surface and the CAM policy drift check) and `check-alerts` — so a local green is a green for that job except for those three steps, while the `install`, `e2e` and `fuzz` jobs need root, port 53 or a bounded wall-clock budget and have no local equivalent. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it.
+The coverage floor is 76.0%, recorded — with the measurement it was chosen against (77.62% on
+2026-09-22) — in `scripts/check-coverage.py`, and enforced by `make check` and by the `test` CI
+job. `make cover` still only prints the number; `make check-coverage` is the gate. The checker
+reads the profile itself (stdlib only, no Go toolchain), so it has a self-test
+(`scripts/test-check-coverage.py`) that proves it fails below the floor, passes at it, follows
+`--floor`, and refuses an empty or malformed profile instead of reporting a false pass.
+
+CI (`.github/workflows/ci.yml`) has four jobs. `test` runs `gofmt` + English + `vet` + `govulncheck` + `test -race` + `make test-tags` + `make check-coverage` + `make check-alerts` + `make check-scripts` + `make build` + `make release`; `check-scripts` pulls in `check-cli`, which requires every flag the READMEs and `docs/staging-checklist.md` document to appear in that binary's own `-h`. `install` runs `make release` and then the documented `sudo ./install.sh ./dist/wecert_linux_amd64` as root, asserting the installed files, their modes, and that a second run keeps an edited config. `e2e` installs pebble, runs `make test-pebble` and fails when it skipped, then runs `make e2e` (the first suite binds 53/udp+tcp, so it runs under sudo) and requires all three suites to report `pass`. `fuzz` runs `FUZZTIME=15s make fuzz`. `make check` is the `test` job minus `govulncheck`, `make build` and `make release`: it pulls in `test-tags` (the same tests under `-tags "pebble lego_dns"`, the only gate for two tag-selected production files), `check-coverage` (the statement-coverage floor), `check-scripts` (the shell self-tests, the CLI surface and the CAM policy drift check) and `check-alerts` — so a local green is a green for that job except for those three steps, while the `install`, `e2e` and `fuzz` jobs need root, port 53 or a bounded wall-clock budget and have no local equivalent. Gate `gofmt` separately is necessary because `go vet` does not check formatting; the more concrete reason is that a single type error fails every package that depends on it, the main binary included, and `go vet` and `go test` fail along with it.
 
 ### Test layout
 

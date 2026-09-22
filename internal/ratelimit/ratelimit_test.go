@@ -388,3 +388,68 @@ func TestParseRetryAfterHeaderRejectsAnOverflowingDelay(t *testing.T) {
 		t.Error("the largest delay that fits a time.Duration must still parse")
 	}
 }
+
+// The fifth published limit is the identifier PAUSE, and its numbers are load-bearing: they are what
+// a refusal with no instant is booked against, so a typo here silently changes how long a paused
+// identifier is left alone.
+//
+// Source: https://letsencrypt.org/docs/rate-limits/, "Consecutive Authorization Failures per
+// Identifier per Account" (read 2026-09-18) -- up to 1,152 consecutive failures per identifier,
+// refilling at 1 per identifier per day, reset to zero by a successful validation. Measured nowhere:
+// this repository cannot provoke a real pause (it needs control of the authoritative DNS answer at
+// the moment the CA validates), which is why the comment on the limit says which part is the
+// published number and which part is our reading of it.
+func TestThePauseLimitCarriesItsPublishedNumbers(t *testing.T) {
+	l := ConsecutiveAuthzFailuresPerIdentifier
+	if l.Capacity != 1152 {
+		t.Errorf("capacity = %g, want 1152 (the published consecutive-failure count)", l.Capacity)
+	}
+	if l.Refill != 24*time.Hour {
+		t.Errorf("refill = %s, want 24h: the published rate is 1 per identifier per day, and this "+
+			"interval is the floor a refusal is booked with", l.Refill)
+	}
+	if l.Scope != "identifier" {
+		t.Errorf("scope = %q, want identifier: the pause is per (account, identifier)", l.Scope)
+	}
+	if !l.SpentByCA {
+		t.Error("the pause bucket is filled by the CA's validators, not by this program; without " +
+			"SpentByCA the quota report would publish its capacity as a token estimate")
+	}
+	if l.Source == "" {
+		t.Error("a limit with no source is folklore; the published page is what makes the numbers checkable")
+	}
+}
+
+// The pause is REPORTABLE (its blocked state is what an operator acts on) but not SPENDABLE (nothing
+// here spends against it), and every spendable limit must still be reportable.
+func TestThePauseIsReportableWithoutBeingSpendable(t *testing.T) {
+	var spendable, reportable bool
+	for _, l := range Spendable() {
+		if l.Name == ConsecutiveAuthzFailuresPerIdentifier.Name {
+			spendable = true
+		}
+	}
+	for _, l := range Reportable() {
+		if l.Name == ConsecutiveAuthzFailuresPerIdentifier.Name {
+			reportable = true
+		}
+	}
+	if spendable {
+		t.Error("Spendable lists what this program consumes, and the CA's validators are what fill " +
+			"the pause bucket; listing it there would publish a capacity as a spend estimate")
+	}
+	if !reportable {
+		t.Error("Reportable must include the pause: its refused deadline is the one state an operator " +
+			"has to act on")
+	}
+
+	reportableNames := map[string]bool{}
+	for _, l := range Reportable() {
+		reportableNames[l.Name] = true
+	}
+	for _, l := range Spendable() {
+		if !reportableNames[l.Name] {
+			t.Errorf("%s is spendable but not reportable; Reportable is a superset of Spendable", l.Name)
+		}
+	}
+}
