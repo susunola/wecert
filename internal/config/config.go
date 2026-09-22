@@ -1047,7 +1047,35 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// normalize validates and defaults every section of the configuration.
+//
+// Split by section so each block can be read (and tested) without scrolling past the
+// others: root identity, DNS-01, listeners, Tencent Cloud deploy, the already-structured
+// subsections, and the certificate list. The order is the dependency order -- DNS
+// settings are only meaningful once the provider is chosen, and the certificate checks
+// come last because they consult profile defaults filled in above.
 func (c *Config) normalize() error {
+	if err := c.normalizeRoot(); err != nil {
+		return err
+	}
+	if err := c.normalizeDNS(); err != nil {
+		return err
+	}
+	if err := c.normalizeListeners(); err != nil {
+		return err
+	}
+	if err := c.normalizeTencent(); err != nil {
+		return err
+	}
+	if err := c.normalizeSubsections(); err != nil {
+		return err
+	}
+	return c.normalizeCertificatesBlock()
+}
+
+// normalizeRoot validates the process identity: where state lives and who the CA
+// account is.
+func (c *Config) normalizeRoot() error {
 	if c.StatePath == "" {
 		return fmt.Errorf("statePath is required")
 	}
@@ -1057,10 +1085,12 @@ func (c *Config) normalize() error {
 	if c.ACME.Email == "" {
 		return fmt.Errorf("acme.email is required")
 	}
-	if err := validateContactEmail(c.ACME.Email); err != nil {
-		return err
-	}
+	return validateContactEmail(c.ACME.Email)
+}
 
+// normalizeDNS picks the DNS-01 provider and the propagation knobs. Provider first:
+// every later field is only meaningful relative to which API will write the TXT.
+func (c *Config) normalizeDNS() error {
 	// The DNS provider must be chosen explicitly. Defaulting to dnspod suggests
 	// Tencent Cloud AK/SK would be enough, then fails confusingly at the DNS-01
 	// step.
@@ -1155,7 +1185,12 @@ func (c *Config) normalize() error {
 		}
 		c.DNS.RecursiveNameservers = resolvers
 	}
+	return nil
+}
 
+// normalizeListeners validates the two HTTP listeners. Both default to loopback;
+// binding further is allowed but warned about at load (see listenWarnings).
+func (c *Config) normalizeListeners() error {
 	if c.Metrics.Listen == "" {
 		c.Metrics.Listen = "127.0.0.1:9800"
 	}
@@ -1165,11 +1200,12 @@ func (c *Config) normalize() error {
 	if _, _, err := net.SplitHostPort(c.Metrics.Listen); err != nil {
 		return fmt.Errorf("metrics.listen must be a host:port address, got %q: %w", c.Metrics.Listen, err)
 	}
+	return c.Webhook.normalize()
+}
 
-	if err := c.Webhook.normalize(); err != nil {
-		return err
-	}
-
+// normalizeTencent validates how credentials are obtained and which regions/types
+// the deployer is allowed to touch.
+func (c *Config) normalizeTencent() error {
 	switch c.Tencent.CredentialMode {
 	case "":
 		c.Tencent.CredentialMode = CredentialCVMRole
@@ -1196,13 +1232,19 @@ func (c *Config) normalize() error {
 	// into the onboarding rule enumeration, so a duplicate costs a bigger request and a typo is only
 	// found by the cloud API at deploy time -- the expensive place to learn about one. Every other
 	// list in this file is normalised (domains, recursiveNameservers); these two were the exception.
+	var err error
 	if c.Tencent.Regions, err = normalizeList("tencent.regions", c.Tencent.Regions); err != nil {
 		return err
 	}
 	if c.Tencent.ResourceTypes, err = normalizeList("tencent.resourceTypes", c.Tencent.ResourceTypes); err != nil {
 		return err
 	}
+	return nil
+}
 
+// normalizeSubsections delegates to the typed sections that already own their own
+// rules (backup, desired state, onboarding, probe, fallback).
+func (c *Config) normalizeSubsections() error {
 	if err := c.StateBackup.normalize(); err != nil {
 		return err
 	}
@@ -1215,10 +1257,12 @@ func (c *Config) normalize() error {
 	if err := c.Probe.normalize(); err != nil {
 		return err
 	}
-	if err := c.Fallback.normalize(); err != nil {
-		return err
-	}
+	return c.Fallback.normalize()
+}
 
+// normalizeCertificatesBlock checks the certificate list and the one cross-cutting
+// rule that needs both the list and a profile default filled in above (the probe floor).
+func (c *Config) normalizeCertificatesBlock() error {
 	// Both static and observe converge on certificates, so a non-empty list is a
 	// hard requirement. In enforce mode certificates must be empty (rejected
 	// above); the document is the only source.

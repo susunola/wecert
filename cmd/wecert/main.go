@@ -27,7 +27,6 @@ import (
 	"github.com/susunola/wecert/internal/acme"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
-	"github.com/susunola/wecert/internal/probe"
 	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
@@ -188,73 +187,15 @@ func run() error {
 	}
 	log := newLogger(level)
 
-	cfg, err := config.Load(f.configPath)
-	if err != nil {
-		return err
-	}
-	if f.statePath != "" {
-		cfg.StatePath = f.statePath
-	}
-
-	// Take the cross-process exclusive lock on the state store. "At most one in-flight
-	// order per certificate" used to hold only inside a single process, but running the
-	// daemon and the timer at once means concurrent orders -- and what you hit is the
-	// 7-day, unrecoverable exact-set limit.
-	//
-	// -dry-run is exempt: it almost always runs while the daemon is already running, and
-	// "cannot even validate the config because the daemon is up" pushes people into
-	// blindly editing the config. This path only reads the existing ACME account; no issuance.
-	openStore := state.Open
-	if f.dryRun {
-		// Prefers the lock and falls back when the daemon holds it: see state.OpenForTool. Opening
-		// unlocked unconditionally is what made `-dry-run` fail on a fresh installation.
-		openStore = state.OpenForTool
-	}
-	store, err := openStore(cfg.StatePath)
+	cfg, store, err := openRuntime(f, log)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
 
-	// The first run creates a new ACME account. If it is also the production directory,
-	// say this plainly up front: accounts are a finite resource (at most 10 per IP per
-	// 3 hours) and should not be recreated over and over.
-	firstRun, err := isFirstRun(store, cfg)
+	provider, prober, err := buildDesiredAndProber(cfg, log)
 	if err != nil {
 		return err
-	}
-	logStartup(log, cfg, firstRun)
-
-	// If this database came from a snapshot, say what that costs before the first pass runs: the
-	// rate-limit ledger in it stops at the snapshot, and the refusal that follows days later looks
-	// like an ordinary quota problem. See logRestoreNotice.
-	logRestoreNotice(log, cfg.StatePath, time.Now())
-
-	// The desired-state source is constructed before anything touches the network.
-	//
-	// In enforce mode an unreadable document must blow up at **startup**, not at the
-	// first reconcile: allowing "starts up with no desired state" means wecert quietly
-	// renews nothing, and nobody finds out until every certificate has expired.
-	//
-	// Being this early is also what lets -dry-run answer the question that matters: "if I
-	// switch to this now, will it start?", without first registering an ACME account.
-	provider, err := newProvider(cfg, log)
-	if err != nil {
-		return err
-	}
-
-	// The network-side prober is built here as well: it only reads config and touches no
-	// network, and "is probing on at all, and which port does it dial" is one of the first
-	// things to confirm when switching configuration.
-	//
-	// It is the only evidence that does not trust the cloud control plane, so it is on by
-	// default -- but it may not fit every deployment: on a box that cannot dial the CLB VIP,
-	// probe_errors climbs while probe_match stays flat, so certificates never look broken.
-	var prober *probe.Runner
-	if cfg.Probe.EnabledOr(true) {
-		prober = probe.NewRunner(
-			probe.Options{Port: cfg.Probe.Port, Timeout: cfg.Probe.TimeoutDur},
-			cfg.Probe.MinValidDur, log)
 	}
 
 	httpClient := acme.NewHTTPClient(60 * time.Second)
@@ -264,174 +205,34 @@ func run() error {
 	}
 
 	if f.dryRun {
-		probeState := "off"
-		if prober != nil {
-			probeState = fmt.Sprintf("on (port %d, timeout %s, max %d hosts/cert)",
-				cfg.Probe.Port, cfg.Probe.TimeoutDur,
-				cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert))
-		}
-
-		// Build the two components that READ CREDENTIALS even though nothing is issued or deployed.
-		//
-		// This is what makes the line below true, and it used to be false in the direction that
-		// costs the most: internal/config deliberately leaves the validation of static Tencent
-		// credentials to deploy.NewCredentialSource, so a config with credentialMode=static and no
-		// secretId/secretKey sailed through `-dry-run` with "all fine" and exit 0 -- and then failed
-		// on the first real pass, after a production ACME account had been registered and a whole
-		// interval had gone by. The dry run documented in README.md is the step an operator runs
-		// BEFORE installing the units; "the credentials are usable" is exactly the question it is
-		// asked, and install.sh runs it as its verification step.
-		//
-		// It costs no API call: the DNS provider and the CLB client are constructed, credentials are
-		// read and validated from config or environment, and for the CVM instance role the fetch
-		// stays deferred to first use.
-		if err := buildCredentialBearingComponents(cfg, log); err != nil {
-			return fmt.Errorf("dry run: %w", err)
-		}
-
-		log.Info("dry run finished: the config, the ACME account, the desired-state source, the DNS "+
-			"provider and the deployer are all fine; nothing was issued or deployed",
-			"mode", cfg.DesiredState.Mode,
-			"provider", spec.KindOf(provider),
-			"certificates", certificateCountField(cfg),
-			"probing", probeState)
-		return nil
+		return finishDryRun(cfg, provider, prober, log)
 	}
 
-	solver, err := acme.NewDNSSolver(cfg.DNS, cfg.Tencent, log)
+	reconciler, notifier, err := buildManager(cfg, store, core, provider, prober, log)
 	if err != nil {
 		return err
-	}
-	log.Info("DNS-01 solver ready", "provider", cfg.DNS.Provider, "ttl", cfg.DNS.TTL)
-
-	deployer, err := newDeployer(cfg, log)
-	if err != nil {
-		return err
-	}
-
-	// Note the shape: a nil interface and an interface holding a nil pointer differ, and
-	// stuffing (*webhook.Notifier)(nil) into one defeats the != nil check below.
-	var notifier reconcile.Notifier
-	if n := webhook.NewNotifier(cfg.Webhook.NotifyURL, cfg.Webhook.NotifySecret, log); n != nil {
-		notifier = n
-		// The target is logged redacted: a chat/CI notification URL carries its secret in the path
-		// (Slack, Feishu, DingTalk) or in the query, and the journal has a wider audience than the
-		// daemon's owner. See webhook.RedactNotifyURL.
-		log.Info("renewal results will be pushed out", "target", webhook.RedactNotifyURL(cfg.Webhook.NotifyURL),
-			"signed", cfg.Webhook.NotifySecret != "")
-	}
-
-	manager := acme.NewManager(store, acme.NewAPI(core), solver, deployer, log)
-
-	// Near-expiry degradation: when a few names in a certificate keep failing to issue
-	// while it nears expiry, drop them and issue for the rest. Off by default -- it
-	// changes what the certificate covers, which is a security call for a human.
-	if cfg.Fallback.EnabledOr(false) {
-		manager.SetFallbackPolicy(cfg.Fallback)
-		log.Warn("the failure fallback is ON: if issuance keeps failing near expiry, wecert will drop " +
-			"the names whose authorizations keep failing so the rest stay available; " +
-			"the dropped names lose coverage, which is the whole tradeoff, and it is logged at ERROR when it happens")
-	}
-	reconciler := reconcile.New(cfg, provider, store, manager, notifier, log)
-
-	// Network-side probing: dial a real TLS connection to confirm the served cert is the deployed one.
-	reconciler.SetProber(prober)
-	if prober != nil {
-		cap := cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert)
-		// Reported at startup because it decides what probe_match means: with it on, a listener
-		// serving the deployed certificate without its intermediate is a mismatch, which is a
-		// change from every earlier version. Someone who turns it off for an internal CA should
-		// see that in the log too, next to the rest of the probe configuration.
-		requireTrusted := cfg.Probe.RequireTrustedOr(true)
-		log.Info("network-side certificate probing is on",
-			"port", cfg.Probe.Port, "timeout", cfg.Probe.TimeoutDur,
-			"maxHostsPerCert", cap, "requireTrusted", requireTrusted)
-		if cap <= 0 {
-			// A cap of 0 is "probe nothing", which looks exactly like "probing is on" in every
-			// other line this program prints. Say it once at startup, where the config is being
-			// reported anyway -- otherwise the silence of the probe series reads as "nothing to
-			// report" rather than "nothing was dialled".
-			log.Warn("probe.maxHostsPerCert is 0, so nothing will actually be dialled: the probe "+
-				"series will report no host at all, and a probe_match alert that compares against "+
-				"an absent series stays silent", "maxHostsPerCert", cap)
-		}
-	} else {
-		log.Warn("network-side certificate probing is off: nothing will verify that the " +
-			"certificate the cloud API reports as deployed is the one actually being served")
 	}
 
 	// Evaluate once up front and cache it, so the read-only endpoints (webhook name
 	// resolution, diagnostics) answer correctly before the first reconcile finishes
 	// rather than returning an empty list -- which reads as "the desired state is empty".
 	reconciler.Prime(ctx)
-
-	// In enforce mode the certificate list lives in the document, so this is the first and only
-	// point in the boot sequence that can state the fleet size. "wecert starting ... certificates=0"
-	// over a document that lists ten certificates reads as a document problem and is the number an
-	// operator checks first.
-	if cfg.DesiredState.Mode == config.ModeEnforce {
-		names := reconciler.CertNames()
-		log.Info("the desired-state document declares the certificates to manage",
-			"certificates", len(names), "path", cfg.DesiredState.Path,
-			"provider", spec.KindOf(provider))
-		if len(names) == 0 {
-			log.Warn("the desired-state document declares no certificates: nothing will be renewed " +
-				"while that is true")
-		}
-	}
+	logEnforceFleet(cfg, reconciler, provider, log)
 
 	// Periodic consistent snapshots of state.db. Started here so a snapshot exists before
 	// the first renewal window can lose an order: the file holds the ACME account key and
 	// every in-flight order URL, and losing an order URL means re-placing it into the
 	// exact-set rate limit.
-	// "On by default where it can be useful, off where it cannot" (config.StateBackup) is decided
-	// here, because this is the first point that knows the directory. EnabledOr's argument used to
-	// be a literal true, so a deployment with an unwritable snapshot directory stayed enabled and
-	// logged an ERROR every interval forever -- noise that trains the reader to ignore the one line
-	// that means the recovery posture is gone.
-	backupDir := cfg.StateBackup.Dir
-	if backupDir == "" {
-		backupDir = filepath.Dir(cfg.StatePath)
-	}
-	// The switch and the directory are checked separately. Treating "enabled" as sufficient
-	// (EnabledOr returns the explicit setting whenever it is set) made the unwritable case fall
-	// into the running branch: the loop started, took a snapshot every interval, failed, and
-	// logged an ERROR each time -- while the branch written to say exactly that was unreachable,
-	// because its guard was the same condition the first branch had already consumed.
 	var snapshots *snapshotHealth
+	var stopBackups func()
 	// Registered after `defer store.Close()` above, so it runs BEFORE it: defers are LIFO,
 	// and the snapshot goroutine writes to SQLite on its own schedule.
-	var stopBackups func()
 	defer func() {
 		if stopBackups != nil {
 			stopBackups()
 		}
 	}()
-
-	switch planStateBackups(cfg.StateBackup.Enabled, dirIsWritable(backupDir)) {
-	case backupsRun:
-		snapshots, stopBackups = startStateBackups(ctx, store, cfg, log)
-	case backupsEnabledButUnwritable:
-		log.Error("periodic state database snapshots are ENABLED but the directory is not writable, "+
-			"so none will be taken", "dir", backupDir)
-	default:
-		// Two different situations reach this arm, and they have different fixes: the operator wrote
-		// stateBackup.enabled: false, or the setting is unset (the documented default) and the
-		// directory cannot be written. The message used to assert the first in both cases and carry
-		// no attributes at all, so the operator grepped the config for a line that was not there and
-		// could not see which directory to fix -- while the sibling arm above prints dir=.
-		if cfg.StateBackup.Enabled != nil {
-			log.Warn("periodic state database snapshots are DISABLED in the config " +
-				"(stateBackup.enabled: false): losing state.db means a new ACME account and re-placed " +
-				"orders, and nothing here will be able to restore it")
-		} else {
-			log.Warn("periodic state database snapshots are OFF because this directory is not "+
-				"writable (stateBackup.enabled is unset, and snapshots default to on where they can "+
-				"be taken): losing state.db means a new ACME account and re-placed orders, and "+
-				"nothing here will be able to restore it",
-				"dir", backupDir, "hint", "point stateBackup.dir at a writable path, or make this one writable")
-		}
-	}
+	snapshots, stopBackups = startBackupsIfNeeded(ctx, store, cfg, log)
 
 	// Metrics server. Bind the port synchronously first and exit on failure -- see below.
 	if err := startMetricsServer(ctx, cfg.Metrics.Listen, log); err != nil {
@@ -444,29 +245,7 @@ func run() error {
 	}
 
 	if f.once {
-		// RunDetailed, not a wrapper that drops the report: the one-shot unit is what a systemd
-		// timer runs, and "exited 0 with every certificate failing" is the failure mode this
-		// report exists to prevent -- the timer would report success while the fleet went
-		// unmanaged. A pass that
-		// attempted nothing and skipped everything counts as trouble too, because that is a
-		// desired state that resolved to nothing.
-		rep := reconciler.RunDetailed(ctx)
-		// That pass has finished, but a webhook-triggered one may be running: the listener is
-		// started before this branch, so -once can coexist with an accepted background pass. Both
-		// it and the notifications have to be waited for before the deferred store.Close() runs.
-		drainBackground(reconciler, log)
-		drainNotifier(notifier, log)
-		if err := snapshots.wait(snapshotWait); err != nil {
-			// The pass's own report comes first when there is one: "it converged but there is no
-			// backup" and "it did not converge" are different answers, and onceExit already knows how
-			// to word the second.
-			if passErr := onceExit(rep); passErr != nil {
-				return errors.Join(passErr, fmt.Errorf("and the state snapshot failed: %w", err))
-			}
-			return fmt.Errorf("the pass converged, but the state database could not be snapshotted, so "+
-				"there is no recovery point for it: %w", err)
-		}
-		return onceExit(rep)
+		return runOncePass(ctx, reconciler, notifier, snapshots, log)
 	}
 
 	log.Info("entering daemon mode", "interval", f.interval)
