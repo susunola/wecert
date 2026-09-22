@@ -752,6 +752,10 @@ type Tencent struct {
 	RoleName      string   `yaml:"roleName"`
 	ResourceTypes []string `yaml:"resourceTypes"`
 	Regions       []string `yaml:"regions"`
+	// UIN is the Tencent Cloud account this daemon deploys into. Optional. The
+	// inventory page groups certificates by it; a certificate-level uin in the
+	// desired-state document overrides this when more than one account is in view.
+	UIN string `yaml:"uin,omitempty"`
 }
 
 // Metrics is the Prometheus exposition configuration.
@@ -806,6 +810,10 @@ type Certificate struct {
 	KeyType     string   `yaml:"keyType" json:"keyType"`
 	RenewBefore string   `yaml:"renewBefore,omitempty" json:"renewBefore,omitempty"`
 	Deploy      Deploy   `yaml:"deploy" json:"deploy"`
+	// UIN tags this certificate with a Tencent Cloud account. Empty means inherit
+	// tencent.uin. The inventory uses it only for display and grouping; it does
+	// not change which credentials deploy the certificate.
+	UIN string `yaml:"uin,omitempty" json:"uin,omitempty"`
 
 	// Parsed durations, filled in by normalize.
 	RenewBeforeDur time.Duration `yaml:"-" json:"-"`

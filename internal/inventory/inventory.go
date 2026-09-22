@@ -63,6 +63,9 @@ type Input struct {
 	ProbeEnabled  bool
 	Probes        map[string][]HostSample
 	ResourceTypes []string
+	// UIN is the Tencent Cloud account this process deploys into. Copied onto
+	// every row unless the desired-state certificate sets its own.
+	UIN string
 }
 
 // HostSample is one probe of a concrete name covered by the certificate.
@@ -101,6 +104,7 @@ type Summary struct {
 // Certificate is one row. No PEM, no keys.
 type Certificate struct {
 	Name                string    `json:"name"`
+	UIN                 string    `json:"uin,omitempty"`
 	Status              string    `json:"status"`
 	Profile             string    `json:"profile,omitempty"`
 	KeyType             string    `json:"keyType,omitempty"`
@@ -219,6 +223,7 @@ func collectNames(in Input) []string {
 func assembleOne(in Input, name string, now time.Time) Certificate {
 	row := Certificate{
 		Name: name,
+		UIN:  in.UIN,
 		Bindings: Bindings{
 			ResourceTypes: append([]string(nil), in.ResourceTypes...),
 			Freshness:     FreshnessStore,
@@ -234,6 +239,9 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 		row.Profile = desired.Profile
 		row.KeyType = desired.KeyType
 		row.Domains = append([]string(nil), desired.Domains...)
+		if desired.UIN != "" {
+			row.UIN = desired.UIN
+		}
 	}
 	if errText := in.CertErrors[name]; errText != "" {
 		row.Error = errText

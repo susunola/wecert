@@ -84,6 +84,7 @@ type Server struct {
 	rec     Reconciler
 	store   *state.Store
 	token   string
+	uin     string
 	baseCtx context.Context
 	log     *slog.Logger
 	now     func() time.Time
@@ -169,6 +170,12 @@ func (s *Server) tokenMatches(r *http.Request) bool {
 	// differing character, leaking the token prefix. This endpoint is valuable
 	// enough for someone to probe it bit by bit.
 	return subtle.ConstantTimeCompare([]byte(presented), []byte(s.token)) == 1
+}
+
+// SetAccountUIN records the Tencent Cloud account this process deploys into.
+// Empty is valid: the inventory then omits uin unless a certificate sets its own.
+func (s *Server) SetAccountUIN(uin string) {
+	s.uin = strings.TrimSpace(uin)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {

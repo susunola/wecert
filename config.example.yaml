@@ -126,6 +126,11 @@ tencent:
     - ap-guangzhou
     - ap-shanghai
 
+  # Optional Tencent Cloud account id (UIN). The inventory page groups
+  # certificates by it. A certificate-level `uin` in the desired-state
+  # document overrides this when more than one account is in view.
+  # uin: "100012345678"
+
 metrics:
   listen: 127.0.0.1:9800
 

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **Inventory groups certificates by Tencent Cloud UIN.** `GET /api/inventory`
+  includes `uin` on each row (from `tencent.uin`, or a certificate-level `uin`
+  in the desired-state document). `GET /status` is a read-only register: filter
+  by account, attention and expiry, search, and expand a row for CLB bindings.
+  Empty `uin` is omitted rather than invented.
+
 ### Fixed
 
 - **A failed certificate read erased the certificate it failed to read.** `Reconcile` answered
