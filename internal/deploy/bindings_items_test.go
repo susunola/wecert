@@ -65,11 +65,31 @@ func TestParseCLBBindingItemsRegionErrorIsIncomplete(t *testing.T) {
 	}
 }
 
-func TestParseCLBBindingItemsEmptyCLBIsCompleteZero(t *testing.T) {
+func TestParseCLBBindingItemsMissingRegionIsIncomplete(t *testing.T) {
+	// A finished task with no region entry answered nothing about CLB. It must
+	// stay a lower bound, so the page cannot read the zero as "bound nowhere".
 	resp := decodeDetail(t, `{"Response": {"Status": 1, "CLB": []}}`)
 	snap := ParseCLBBindingItems(resp, "cYk1")
-	if !snap.Complete || snap.Count != 0 {
-		t.Fatalf("empty CLB section on a finished task is an answered zero: %+v", snap)
+	if snap.Complete {
+		t.Fatalf("a done task with no region entry is unanswered, not an answered zero: %+v", snap)
+	}
+	if snap.Count != 0 || len(snap.Items) != 0 {
+		t.Fatalf("count %+v", snap)
+	}
+}
+
+func TestParseCLBBindingItemsRegionZeroIsCompleteZero(t *testing.T) {
+	// The answered zero: one region reported, and it reported no CLB. This is
+	// the only shape that may set Complete with Count == 0.
+	resp := decodeDetail(t, `{
+		"Response": {
+			"Status": 1,
+			"CLB": [{"Region": "ap-guangzhou", "TotalCount": 0, "InstanceList": []}]
+		}
+	}`)
+	snap := ParseCLBBindingItems(resp, "cYk1")
+	if !snap.Complete || snap.Count != 0 || len(snap.Items) != 0 {
+		t.Fatalf("a region entry with an empty CLB list is an answered zero: %+v", snap)
 	}
 }
 

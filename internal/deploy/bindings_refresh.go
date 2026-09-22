@@ -34,19 +34,21 @@ func rememberBindings(certID string, snap BindingSnapshot) {
 	bindingMemoStore.mu.Unlock()
 }
 
-// LookupCachedBindings returns the last TaskDetail parse for certID.
-// ok is false when this process has never successfully parsed one.
-func LookupCachedBindings(certID string) (BindingSnapshot, bool) {
+// LookupCachedBindings returns the last TaskDetail parse for certID and the
+// instant it was observed, so the inventory page can timestamp rows that come
+// from the cache instead of the current request. ok is false when this process
+// has never successfully parsed one; at is then the zero time.
+func LookupCachedBindings(certID string) (BindingSnapshot, time.Time, bool) {
 	if certID == "" {
-		return BindingSnapshot{}, false
+		return BindingSnapshot{}, time.Time{}, false
 	}
 	bindingMemoStore.mu.Lock()
 	defer bindingMemoStore.mu.Unlock()
 	hit, ok := bindingMemoStore.byID[certID]
 	if !ok {
-		return BindingSnapshot{}, false
+		return BindingSnapshot{}, time.Time{}, false
 	}
-	return hit.snap, true
+	return hit.snap, hit.at, true
 }
 
 func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, bool, error) {

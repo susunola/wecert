@@ -77,14 +77,50 @@ func TestStatusTokens(t *testing.T) {
 			status: StatusProbeMismatch, drift: []string{DriftServedNotAfter},
 		},
 		{
-			name: "confirmed but never probed is unknown, not ok",
+			name: "confirmed but never probed is unverified, not ok",
 			in: Input{
 				Now: now, Names: []string{"a"}, ProbeEnabled: true,
 				Certs: map[string]*state.CertState{
 					"a": {Name: "a", NotAfter: notAfterOK, DeployedCertID: "c1", DeployConfirmed: true},
 				},
 			},
-			status: StatusBindingUnknown,
+			// Not binding_unknown: the bindings are known here, the served
+			// certificate has simply not been read yet. Saying "binding unknown" sent
+			// operators to the load-balancer console for a probe that had not run.
+			status: StatusProbeUnknown,
+		},
+		{
+			name: "a host that cannot be dialled is not a probe mismatch",
+			in: Input{
+				Now: now, Names: []string{"a"}, ProbeEnabled: true,
+				Certs: map[string]*state.CertState{
+					"a": {Name: "a", NotAfter: notAfterOK, DeployedCertID: "c1", DeployConfirmed: true},
+				},
+				Probes: map[string][]HostSample{"a": {{Host: "a.example", Match: false, ProblemKind: "unreachable"}}},
+			},
+			status: StatusProbeUnreachable,
+		},
+		{
+			name: "an untrusted chain is drift even though the names match",
+			in: Input{
+				Now: now, Names: []string{"a"}, ProbeEnabled: true,
+				Certs: map[string]*state.CertState{
+					"a": {Name: "a", NotAfter: notAfterOK, DeployedCertID: "c1", DeployConfirmed: true},
+				},
+				Probes: map[string][]HostSample{"a": {{Host: "a.example", Match: false, ProblemKind: "untrusted", NotAfter: &notAfterOK}}},
+			},
+			status: StatusProbeMismatch, drift: []string{DriftServedUntrusted},
+		},
+		{
+			name: "a mismatch with no reported kind invents no drift token",
+			in: Input{
+				Now: now, Names: []string{"a"}, ProbeEnabled: true,
+				Certs: map[string]*state.CertState{
+					"a": {Name: "a", NotAfter: notAfterOK, DeployedCertID: "c1", DeployConfirmed: true},
+				},
+				Probes: map[string][]HostSample{"a": {{Host: "a.example", Match: false}}},
+			},
+			status: StatusProbeMismatch,
 		},
 		{
 			name: "consecutive failures",
@@ -123,7 +159,7 @@ func TestStatusTokens(t *testing.T) {
 				Certs: map[string]*state.CertState{
 					"a": {Name: "a", NotAfter: notAfterOK, DeployedCertID: "c1", DeployConfirmed: true},
 				},
-				Probes: map[string][]HostSample{"a": {{Host: "a.example", Match: true, Trusted: true, NotAfter: notAfterOK}}},
+				Probes: map[string][]HostSample{"a": {{Host: "a.example", Match: true, Trusted: true, NotAfter: &notAfterOK}}},
 			},
 			status: StatusOK,
 		},
@@ -161,7 +197,10 @@ func TestWaitingManualBindUsesStoreBindings(t *testing.T) {
 	if row.Status != StatusWaitingManualBind {
 		t.Fatalf("status %q", row.Status)
 	}
-	if row.Bindings.Freshness != FreshnessStore || row.Bindings.Count != 0 || !row.Bindings.Complete {
+	if row.Bindings.Freshness != FreshnessStore || row.Bindings.Count != 0 || row.Bindings.Complete {
+		// An uploaded certificate that the cloud has not confirmed is a lower bound of
+		// zero, not "bound nowhere": the manual console bind may already exist and this
+		// program cannot see it yet.
 		t.Fatalf("bindings %+v", row.Bindings)
 	}
 	if row.DaysLeft == nil || *row.DaysLeft != 89 {
@@ -233,4 +272,145 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestACertificateThatWasNeverIssuedIsNotHealthy(t *testing.T) {
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now: now, Names: []string{"never"},
+		Desired: &spec.Result{Certificates: []config.Certificate{
+			{Name: "never", Domains: []string{"never.example"}},
+		}},
+	})
+	row := snap.Certificates[0]
+	if row.Status != StatusNotIssued {
+		t.Fatalf("status %q: a certificate with no state row is not healthy", row.Status)
+	}
+	if row.Bindings.Complete {
+		t.Fatalf("bindings %+v: nothing was enumerated, so the count is not the whole set", row.Bindings)
+	}
+	if row.DaysLeft != nil || row.NotAfter != "" {
+		t.Fatalf("expiry invented for a certificate that does not exist: %v %q", row.DaysLeft, row.NotAfter)
+	}
+	if snap.Summary.NotIssued != 1 {
+		t.Fatalf("summary %+v", snap.Summary)
+	}
+}
+
+func TestAStateRowThatCouldNotBeReadIsNotABindingProblem(t *testing.T) {
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now: now, Names: []string{"a"},
+		CertErrors: map[string]string{"a": "sql: database is closed"},
+	})
+	row := snap.Certificates[0]
+	if row.Status != StatusStateUnreadable {
+		t.Fatalf("status %q", row.Status)
+	}
+	if !equalStrings(row.Drift, []string{DriftStateUnreadable}) {
+		t.Fatalf("drift %v", row.Drift)
+	}
+	if row.Error != "sql: database is closed" {
+		t.Fatalf("error %q", row.Error)
+	}
+	if row.Bindings.Complete {
+		t.Fatalf("bindings %+v", row.Bindings)
+	}
+	if snap.Summary.Unreadable != 1 {
+		t.Fatalf("summary %+v", snap.Summary)
+	}
+}
+
+func TestAnIssuedCertificateThatWasNeverUploadedIsPendingDeploy(t *testing.T) {
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	in := Input{
+		Now: now, Names: []string{"a"},
+		Desired: &spec.Result{Certificates: []config.Certificate{
+			{Name: "a", Domains: []string{"a.example"}, Deploy: config.Deploy{Enabled: true}},
+		}},
+		Certs: map[string]*state.CertState{"a": {Name: "a", NotAfter: now.Add(80 * 24 * time.Hour)}},
+	}
+	if got := Assemble(in).Certificates[0].Status; got != StatusPendingDeploy {
+		t.Fatalf("status %q", got)
+	}
+	// A certificate whose deployment is switched off never waits for an upload, so
+	// the same row is healthy there.
+	in.ProbeEnabled = false
+	in.Desired = &spec.Result{Certificates: []config.Certificate{
+		{Name: "a", Domains: []string{"a.example"}, Deploy: config.Deploy{Enabled: false}},
+	}}
+	if got := Assemble(in).Certificates[0].Status; got != StatusOK {
+		t.Fatalf("deploy disabled: status %q", got)
+	}
+}
+
+func TestALiveEnumerationThatCameBackIncompleteIsBindingUnknown(t *testing.T) {
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now: now, Names: []string{"a"}, ProbeEnabled: false,
+		Certs: map[string]*state.CertState{
+			"a": {Name: "a", NotAfter: now.Add(80 * 24 * time.Hour), DeployedCertID: "c1", DeployConfirmed: true},
+		},
+		LiveBindings: map[string]Bindings{"a": {
+			Count: 0, Complete: false, Freshness: FreshnessCached,
+			ObservedAt: "2026-09-22T05:00:00Z", Items: []BindingItem{},
+		}},
+	})
+	row := snap.Certificates[0]
+	if row.Status != StatusBindingUnknown {
+		t.Fatalf("status %q: an incomplete enumeration with no binding is binding_unknown, not healthy", row.Status)
+	}
+	if snap.Summary.BindingUnknown != 1 {
+		t.Fatalf("summary %+v: the live rows must be part of the status, not painted on after it", snap.Summary)
+	}
+	if row.Bindings.ObservedAt != "2026-09-22T05:00:00Z" {
+		t.Fatalf("observedAt %q: stale rows must carry when they were observed", row.Bindings.ObservedAt)
+	}
+	if !equalStrings(row.Drift, []string{DriftBindingIncomplete}) {
+		t.Fatalf("drift %v", row.Drift)
+	}
+}
+
+func TestALiveEnumerationThatAnsweredZeroIsNotUnknown(t *testing.T) {
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now: now, Names: []string{"a"}, ProbeEnabled: false,
+		Certs: map[string]*state.CertState{
+			"a": {Name: "a", NotAfter: now.Add(80 * 24 * time.Hour), DeployedCertID: "c1", DeployConfirmed: true},
+		},
+		LiveBindings: map[string]Bindings{"a": {
+			Count: 0, Complete: true, Freshness: FreshnessCached, Items: []BindingItem{},
+		}},
+	})
+	row := snap.Certificates[0]
+	if row.Status != StatusOK || snap.Summary.BindingUnknown != 0 {
+		t.Fatalf("status %q summary %+v: an answered zero is an answer", row.Status, snap.Summary)
+	}
+	if row.Bindings.Freshness != FreshnessCached {
+		t.Fatalf("freshness %q", row.Bindings.Freshness)
+	}
+}
+
+func TestConfirmedStoreBindingsAreALowerBound(t *testing.T) {
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now: now, Names: []string{"a"}, ProbeEnabled: false,
+		Certs: map[string]*state.CertState{
+			"a": {Name: "a", NotAfter: now.Add(80 * 24 * time.Hour), DeployedCertID: "c1", DeployConfirmed: true},
+		},
+	})
+	b := snap.Certificates[0].Bindings
+	if b.Count != 1 || b.Complete {
+		t.Fatalf("bindings %+v: the store sees what this program deployed, which is a lower bound", b)
+	}
+	if b.Freshness != FreshnessStore {
+		t.Fatalf("freshness %q", b.Freshness)
+	}
+}
+
+func TestAnUnreadDesiredStateDoesNotClaimNotFrozen(t *testing.T) {
+	snap := Assemble(Input{Now: time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC), Names: []string{"a"}})
+	if snap.Desired.Frozen != nil {
+		t.Fatalf("frozen %v: the document was never read, so false is an invented answer", *snap.Desired.Frozen)
+	}
 }

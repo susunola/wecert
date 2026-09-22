@@ -21,6 +21,23 @@ const (
 	stateUnreachable = "unreachable"
 )
 
+// Answer is the last recorded conclusion about one host: what the probe found,
+// and which problem kind it found if it did not match.
+//
+// It exists because the verdict returned by Check is discarded by the reconciler, and a
+// Prometheus gauge is not evidence: the metrics are labelled by host, they drop their
+// answer the moment a probe fails to read a certificate, and an inventory page that reads
+// the last value back cannot tell "matched five minutes ago" from "matched before the DNS
+// record was deleted". The runner already knows the conclusion at the instant it makes it,
+// so it keeps it here for a read-only page to show.
+type Answer struct {
+	Host        string
+	Match       bool
+	Trusted     bool
+	NotAfter    time.Time
+	ProblemKind string // one of the ProblemKind constants, or "" when the probe matched
+}
+
 // Runner handles "probe + judge + record metrics + alert only on state transitions".
 //
 // Why alert only on transitions: this probe runs every round and network jitter is normal.
@@ -41,6 +58,11 @@ type Runner struct {
 
 	mu   sync.Mutex
 	last map[string]string
+
+	// answers is the last conclusion per host, kept beside last under the same mutex:
+	// Check runs one goroutine per host and an inventory read happens at any time, so an
+	// unguarded map here would be a genuine data race.
+	answers map[string]Answer
 }
 
 // NewRunner constructs the prober. A minValidFor of 0 means remaining validity is not
@@ -55,6 +77,7 @@ func NewRunner(opts Options, minValidFor time.Duration, log *slog.Logger) *Runne
 		minValidFor: minValidFor,
 		log:         log,
 		last:        make(map[string]string),
+		answers:     make(map[string]Answer),
 	}
 }
 
@@ -88,6 +111,7 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		// "believing the certificate is broken" is far more serious than "the probe did not run".
 		r.transition(host, stateUnreachable,
 			"cannot reach this name to check which certificate it serves", "err", err)
+		r.recordUnreachable(host)
 		return Verdict{Problems: []Problem{{Kind: ProblemUnreachable, Text: err.Error()}}}
 	}
 
@@ -133,6 +157,7 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		metrics.ClearProbeAnswer(host)
 		r.transition(host, stateUnreachable,
 			"cannot reach this name to check which certificate it serves", "err", msg)
+		r.recordUnreachable(host)
 		return Verdict{Problems: []Problem{{Kind: ProblemUnreachable, Text: msg}}}
 	}
 
@@ -151,6 +176,15 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		r.transition(host, stateMismatch, mismatchMessage(problems),
 			"problems", problemTexts(problems), "servedNotAfter", first.NotAfter,
 			"sans", first.SANs, "issuer", first.Issuer, "remoteAddr", first.RemoteAddr)
+		// The certificate WAS read, so Trusted and NotAfter are real evidence and are kept;
+		// the kind of the first problem is what the page names as the reason it did not match.
+		r.recordAnswer(Answer{
+			Host:        host,
+			Match:       false,
+			Trusted:     first.Trusted,
+			NotAfter:    first.NotAfter,
+			ProblemKind: string(problems[0].Kind),
+		})
 		return Verdict{Problems: problems}
 	}
 
@@ -173,6 +207,7 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		msg := "some resolved addresses could not be probed: " + strings.Join(attemptErrs, " | ")
 		r.transition(host, stateUnreachable,
 			"some addresses could not be reached to check which certificate they serve", "err", msg)
+		r.recordUnreachable(host)
 		return Verdict{Problems: []Problem{{Kind: ProblemUnreachable, Text: msg}}}
 	}
 
@@ -180,6 +215,12 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 	r.transition(host, stateOK, "the certificate being served is the one that was deployed",
 		"notAfter", first.NotAfter, "daysLeft", first.DaysLeft(e.Now), "issuer", first.Issuer,
 		"trusted", first.Trusted, "handshakeMs", first.HandshakeMS)
+	r.recordAnswer(Answer{
+		Host:     host,
+		Match:    true,
+		Trusted:  first.Trusted,
+		NotAfter: first.NotAfter,
+	})
 	return Verdict{OK: true}
 }
 
@@ -236,6 +277,40 @@ func (r *Runner) ProbedHosts() []string {
 	return out
 }
 
+// Answer returns the most recent answer recorded for host.
+//
+// The bool is false when this runner has never concluded anything about the name (or has
+// forgotten it); a zero Answer with true is possible in principle only for a host whose
+// last Check returned before recording, which cannot happen -- every path records.
+func (r *Runner) Answer(host string) (Answer, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.answers[host]
+	return a, ok
+}
+
+// recordAnswer stores the last conclusion for a host.
+//
+// Guarded by the same mutex as last: Check runs concurrently (one goroutine per host) and
+// an inventory page reads the answers while probes are still landing.
+func (r *Runner) recordAnswer(a Answer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.answers[a.Host] = a
+}
+
+// recordUnreachable records "the probe could not answer for this host".
+//
+// Every unreachable path goes through here so that a stale answer cannot survive it: the
+// failure this memory exists to remove is a host that matched last round, stopped resolving
+// or answering, and kept showing the old Match=true (with its old NotAfter) on the inventory
+// page because nothing overwrote it. Trusted stays false and NotAfter stays zero on purpose:
+// no handshake happened, so there is no certificate to report -- the same reason the metrics
+// for it are cleared a few lines above.
+func (r *Runner) recordUnreachable(host string) {
+	r.recordAnswer(Answer{Host: host, ProblemKind: string(ProblemUnreachable)})
+}
+
 // LastState returns the previous state for a name, mainly for diagnostics.
 // An empty string means it has never been probed.
 func (r *Runner) LastState(host string) string {
@@ -244,18 +319,18 @@ func (r *Runner) LastState(host string) string {
 	return r.last[host]
 }
 
-// Forget drops the remembered state for a host that will never be probed again
+// Forget drops the remembered state and answer for a host that will never be probed again
 // (its certificate left the desired state).
 //
-// Without it, last grows with every host ever seen -- and certificate names are
-// derived from domains, which churn by design. The exported metric series have
-// the same problem and are reclaimed separately (metrics.DeleteProbeSeries);
-// both have to happen, or a dropped host leaks memory here and a frozen gauge
-// there.
+// Without it, last and answers grow with every host ever seen -- and certificate names are
+// derived from domains, which churn by design. The exported metric series have the same
+// problem and are reclaimed separately (metrics.DeleteProbeSeries); both have to happen, or
+// a dropped host leaks memory here and a frozen gauge there.
 func (r *Runner) Forget(host string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.last, host)
+	delete(r.answers, host)
 }
 
 func (r *Runner) transition(host, state, msg string, attrs ...any) {

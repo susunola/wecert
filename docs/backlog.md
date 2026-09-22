@@ -79,6 +79,23 @@ They are ordered by real exposure over effort.
 
    Any of lego's ~198 providers can now be selected by name. The dependency cost is already paid: `make build-lego-dns` leaves `go.mod`/`go.sum` untouched (verified 2026-09-18 -- every provider SDK is in the module graph), and the tagged real-DNS-01 e2e passes 7/7 against pebble with `legoProvider: httpreq`, so a third-party provider can be selected, built and issue. What is still missing is narrower: no *credentialed* third-party provider (one that needs a real API token) has been exercised, and the binary-size number (64.3 MB tagged vs 23.5 MB default) is not written down where the tradeoff is decided.
 
+11. **Finish the read-only inventory's missing sources**
+
+   The page now says only what it observed, which makes the remaining gaps visible rather than
+   silent. Three of them need a decision, not just code:
+
+   - `rate_limited` is implemented and unit-tested but nothing feeds blocked scopes to the
+     inventory, so no running daemon shows it. Wiring it means deciding what a blocked scope
+     means for one certificate: the exact-set scope is a joined name list, the registered-domain
+     scope is not a certificate, and a wrong match would invent an alarm.
+   - CLB / listener rows exist only for certificates the reconciler enumerated, and `Bindings()`
+     runs to confirm a *first* bind. A confirmed certificate therefore shows a lower bound, not
+     listener ids. Filling that in means a periodic `CreateCertificateBindResourceSyncTask` per
+     certificate — a real API cost and rate-limit spend, which is why it is not done quietly.
+   - Probe answers live in the prober's memory for one process life, so every restart shows
+     `probe_unknown` until the next pass. Persisting the last verdict per host would fix it;
+     v1 explicitly kept probe history out of SQLite.
+
 ## The rest
 
 A longer list is maintained outside this repository as an interactive capability panorama: 50 entries

@@ -33,6 +33,9 @@ type BindingSnapshot struct {
 //
 // complete is false when any CLB region is missing, errored, or lacks
 // TotalCount. A zero with complete=false must not be read as "bound nowhere".
+// Only complete && count == 0 means the certificate is bound nowhere; a
+// complete=false zero is a lower bound, because a region that was never
+// answered may still hold bindings.
 func ParseCLBBindingItems(resp *ssl.DescribeCertificateBindResourceTaskDetailResponse, certID string) BindingSnapshot {
 	out := BindingSnapshot{Items: []BindingRow{}}
 	if resp == nil || resp.Response == nil {
@@ -45,9 +48,17 @@ func ParseCLBBindingItems(resp *ssl.DescribeCertificateBindResourceTaskDetailRes
 
 	complete := true
 	if len(r.CLB) == 0 {
-		// A successful task with no CLB section is an answered zero for CLB,
-		// not an unanswered region — other resource types may still be present.
-		out.Complete = true
+		// The CLB section is region-shaped: every region that answered gets
+		// its own ClbInstanceList entry, including one that answered zero.
+		// So an empty CLB section means no region answered at all — the same
+		// reading countBindings gives an empty BindResourceRegionResult. It is
+		// not an answered zero: reporting Complete here let a truncated or
+		// partial task detail turn "we could not enumerate any region" into
+		// "this certificate is bound nowhere", which is the one claim the
+		// inventory page acts on (binding_unknown / no fake rows). A genuine
+		// zero arrives as a region entry with an empty InstanceList, and the
+		// loop below keeps that complete.
+		out.Complete = false
 		return out
 	}
 	for _, region := range r.CLB {

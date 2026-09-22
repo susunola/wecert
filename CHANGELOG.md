@@ -35,6 +35,41 @@
   state, and it is never written when the teardown failed or left an order or authorization row
   behind, so a TXT record that could not be reclaimed is still retried. Measured with
   `-tags verifycount`: 18,001 statements per pass before, 7 after.
+- **The inventory page reported healthy certificates as broken and broken ones as healthy.**
+  Three defects shared one cause: the page asserted what nobody had observed. `probe.enabled`
+  was hardcoded true while no probe answer was ever handed to the assembly, so every deployed
+  certificate met the "probing is on and no sample exists" rule and read `binding_unknown` — a
+  status whose own definition is "the binding enumeration is incomplete". A certificate with no
+  state row at all fell through every check to `ok`, and its bindings were published as
+  `count: 0, complete: true`: a confident "bound nowhere" for something that does not exist. The
+  daemon now supplies `ProbeEnabled`, the prober's last answers and the deployment's resource
+  types (`probe.Runner.Answer`, `internal/reconcile/probe_answers.go`); a certificate that was
+  never issued is `not_issued`; an issued certificate whose first upload has not happened is
+  `pending_deploy`; a name that could not be dialled is `probe_unreachable`, not
+  `probe_mismatch`; "probing is on and there is no answer yet" is `probe_unknown`, which leaves
+  `binding_unknown` to the case the word describes; a state row that could not be read is
+  `state_unreadable`; and a store-side count is published as the lower bound it is
+  (`complete: false`), never as the whole set.
+- **The inventory drew live binding rows after it had already decided the status.**
+  `ApplyLiveBindings` ran on the assembled snapshot, so a certificate whose enumeration came
+  back incomplete stayed `ok` in both the row and the summary. Live rows are now an input to the
+  assembly, and `BindingSnapshot` carries `observedAt`, so a cached row says when it was
+  observed instead of passing for current.
+- **The inventory's drift list named causes the probe never reported.** A mismatch with no
+  problem kind was published as `served_names_mismatch`, while an untrusted chain or a served
+  certificate below the validity floor produced no token at all. Tokens now come from the
+  problem kinds — `served_chain_untrusted` and `served_validity_below_floor` join the list — and
+  a mismatch that carries no kind produces no token.
+- **`desired.frozen` was published as `false` when the desired-state document had never been
+  read.** It is `null` in that case now and the page says "desired state not read";
+  `/hook/desired` already answered 503 for the same state.
+- **The inventory and the binding count disagreed about an unanswered enumeration.**
+  `ParseCLBBindingItems` treated a finished task with no region block as a complete zero, so the
+  page could print "bound nowhere" for a certificate whose regions were never answered, while
+  `countBindings` called the same payload incomplete. A region block with an empty instance list
+  is still a genuine zero; a missing one is not.
+- **`docs/inventory-ui.md` carried seven literal escape sequences** (`\u2014`, `\u2026`) where
+  the characters they stand for belong.
 - **A failed certificate read erased the certificate it failed to read.** `Reconcile` answered
   a `GetCert` error by building an empty `CertState` — a name and nothing else — and passing it
   to `recordFailure`, which persists through the full-column `PutCert` upsert. One bad read (a
