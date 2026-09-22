@@ -5,14 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/susunola/wecert/internal/atomicfile"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/susunola/wecert/internal/atomicfile"
 )
 
 // Restoring a snapshot used to be a sequence from docs/recovery.md: stop the daemon, find the

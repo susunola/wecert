@@ -13,14 +13,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	_ "modernc.org/sqlite" // pure Go driver: no CGO, which keeps static builds easy
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	_ "modernc.org/sqlite" // pure Go driver: no CGO, which keeps static builds easy
 )
 
 // maxLastErrorBytes bounds the upstream error text persisted per row.
@@ -1196,28 +1195,6 @@ func fromUnix(v int64) time.Time {
 // ---------- Account ----------
 
 // GetAccount reads the account; returns (nil, nil) when it does not exist.
-func (s *Store) GetAccount(directory string) (*Account, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	row := s.db.QueryRow(
-		`SELECT directory, kid, private_key_pem FROM accounts WHERE directory = ?`, directory)
-	a := &Account{}
-	err := row.Scan(&a.Directory, &a.KID, &a.PrivateKeyPEM)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get account: %w", err)
-	}
-	return a, nil
-}
-
-// PutAccountWithoutKey writes an account row whose private key is empty.
-//
-// Only for tests and for reproducing a legacy row. It cannot be written as NULL --
-// private_key_pem is declared NOT NULL, which is the point of checking the length rather than
-// nil-ness in the loader: a row from a database written before that constraint existed reads
-// back as nil, and an empty blob reads back the same way. Both mean "no usable key".
 func (s *Store) PutAccountWithoutKey(directory, kid string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1255,46 +1232,6 @@ func (s *Store) PutAccount(a *Account) error {
 // Its purpose is the "orphan check": a certificate present in the state database but
 // gone from the desired state will never be renewed again and will quietly expire.
 // Making this set visible is the only backstop for that failure path.
-func (s *Store) ListCertNames() ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT name FROM certificates ORDER BY name`)
-	if err != nil {
-		return nil, fmt.Errorf("list certificate names: %w", err)
-	}
-	defer rows.Close()
-
-	var out []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("scan certificate name: %w", err)
-		}
-		out = append(out, name)
-	}
-	return out, rows.Err()
-}
-
-// OrphanRow is one certificate as the orphan sweep sees it: the name, the expiry its report line
-// prints, and when its teardown finished (zero: never).
-type OrphanRow struct {
-	Name            string
-	NotAfter        time.Time
-	OrphanCleanedAt time.Time
-}
-
-// ListOrphanRows returns every certificate with the fields the orphan sweep needs, in name order.
-//
-// ONE query for the whole pass, deliberately. The sweep already had to walk every name to find the
-// orphans, so folding the mark -- and the expiry the per-orphan report line carries -- into that
-// same read makes an already-cleaned orphan cost no statement at all. The alternative, a GetCert
-// per name in the loop, is exactly the per-orphan cost the column exists to remove: measured with
-// `-tags verifycount` at 2,999 orphans, one list query plus one GetCert and five CleanupOrphan
-// statements each was 17,995 statements per pass, on every pass, forever.
-//
-// No certificate material is read here on purpose: cert_pem/key_pem are the largest columns in the
-// table, and a sweep that runs every pass must not drag every fleet's private keys through the
-// index for a report line.
 func (s *Store) ListOrphanRows() ([]OrphanRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1555,28 +1492,6 @@ func (s *Store) RecordFailure(name, lastErr string, consecutiveFailures int, nex
 // ---------- Order ----------
 
 // GetOrder reads the in-flight order; returns (nil, nil) when it does not exist.
-func (s *Store) GetOrder(certName string) (*Order, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	row := s.db.QueryRow(`
-		SELECT cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers, deployment_cert_id
-		FROM orders WHERE cert_name = ?`, certName)
-
-	o := &Order{}
-	var expiresAt int64
-	err := row.Scan(&o.CertName, &o.OrderURL, &o.FinalizeURL, &o.CertURL, &expiresAt,
-		&o.Status, &o.KeyPEM, &o.Identifiers, &o.DeploymentCertID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get order for %s: %w", certName, err)
-	}
-	o.ExpiresAt = fromUnix(expiresAt)
-	return o, nil
-}
-
-// PutOrder writes the in-flight order.
 func (s *Store) PutOrder(o *Order) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1620,46 +1535,6 @@ func deleteOrderExec(e execer, certName string) error {
 // ---------- Authorization ----------
 
 // ListAuthorizations lists every authorization under a certificate's order.
-func (s *Store) ListAuthorizations(certName string) ([]*Authorization, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`
-		SELECT cert_name, authz_url, identifier, status, challenge_url, challenge_token,
-		       txt_name, txt_value, presented, challenge_sent, challenge_prepared_at
-		FROM authorizations WHERE cert_name = ? ORDER BY authz_url`, certName)
-	if err != nil {
-		return nil, fmt.Errorf("list authorizations for %s: %w", certName, err)
-	}
-	defer rows.Close()
-
-	var out []*Authorization
-	for rows.Next() {
-		a := &Authorization{}
-		var preparedAt int64
-		if err := rows.Scan(&a.CertName, &a.AuthzURL, &a.Identifier, &a.Status,
-			&a.ChallengeURL, &a.ChallengeToken, &a.TxtName, &a.TxtValue,
-			&a.Presented, &a.ChallengeSent, &preparedAt); err != nil {
-			return nil, fmt.Errorf("scan authorization: %w", err)
-		}
-		a.ChallengePreparedAt = fromUnix(preparedAt)
-		out = append(out, a)
-	}
-	return out, rows.Err()
-}
-
-// ExecForTest runs one statement against the open database.
-//
-// For tests that need to inject a fault the public API cannot express -- most often a trigger that
-// refuses a specific write, which is how "the write fails but the read did not" (a full disk, a
-// corrupt page) is reproduced deterministically. The alternative is a fake store, and a fake store
-// would not exercise the real SQL, the real transaction or the real error mapping.
-//
-// Why an exported method compiled into the production binary instead of an export_test.go symbol:
-// its callers live in OTHER packages (internal/acme's fault-injection tests), and Go makes
-// test-only symbols visible only to the package's own tests. A _test.go file here simply cannot
-// reach them, so the seam has to ship. It is one statement against an already-open handle -- the
-// same privilege every other method on this type has -- so the cost of shipping it is a naming
-// convention, not an attack surface.
 func (s *Store) ExecForTest(query string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1792,18 +1667,6 @@ type RetiredCert struct {
 // certPEM and keyPEM may be nil when there is nothing to archive (the orphan path records a
 // certificate wecert never held a copy of). The row is still useful then: the reaper must
 // delete it from the cloud either way.
-func (s *Store) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) error {
-	if certID == "" {
-		// A row with no id is one the reaper can never delete: Delete("") fails every round and the
-		// slot is held forever, which is the opposite of what a reclaim list is for. The only
-		// caller that could produce it guards against an empty id itself; this is the second line.
-		return fmt.Errorf("refusing to queue an empty certificate id for reclaim under %q", certName)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return addRetiredCertExec(s.db, certID, certName, certPEM, keyPEM)
-}
-
 func addRetiredCertExec(e execer, certID, certName string, certPEM, keyPEM []byte) error {
 	_, err := e.Exec(`
 		INSERT INTO retired_certificates (cert_id, cert_name, retired_at, cert_pem, key_pem)

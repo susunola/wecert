@@ -1,10 +1,9 @@
 package reconcile
 
 import (
-	"time"
-
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/inventory"
+	"time"
 )
 
 // BindingSnapshot implements webhook.BindingReader. The rows were cached the

@@ -9,9 +9,8 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"sync/atomic"
-
 	sqlite "modernc.org/sqlite"
+	"sync/atomic"
 )
 
 // CountedStatements counts every statement the store has sent to SQLite, process-wide.

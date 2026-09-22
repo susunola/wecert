@@ -455,7 +455,95 @@ func newManager(
 // Reconcile handles a single certificate. A returned error only means "this round did
 // not succeed": the failure is already persisted and the next attempt is already
 // scheduled.
+//
+// Stages, in order: load the round's durable facts, honour backoff, apply the
+// pre-expiry fallback, continue or drop any order in progress, then decide between
+// first issuance, SAN-drift reissue, and renewal. Each stage is its own method so the
+// invariants stay readable next to the branch that enforces them.
 func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
+	st, rd, err := m.loadRound(ctx, c)
+	if err != nil {
+		return err
+	}
+	if err := m.honourBackoff(st); err != nil {
+		return err
+	}
+
+	// The configured (full) set, captured before applyFallback may reduce it. Only the
+	// count is needed: applyFallback removes names and never adds any, so an unchanged
+	// count means the ordered set is the full one.
+	cfgDomains := c.Domains
+
+	// Pre-expiry degradation: which domain set this round should actually order for.
+	//
+	// It lives here instead of being buried inside issue() because every later use of
+	// c.Domains must see one and the same set -- order matching, SAN drift comparison, the
+	// CSR, the identifier fingerprint. If even one of them used the full configured set,
+	// then during a fallback it would fight with "the order's identifier set disagrees
+	// with the config -> discard and rebuild", turning into a pointless order every round.
+	//
+	// Note what this does NOT mean: using the reduced set here is not a licence to forget
+	// that names were dropped. download keys off the round value below so that a successful
+	// issuance for the subset keeps the failure evidence intact; without it the next pass
+	// sees a "healthy" certificate and immediately re-orders the full set.
+	c, rd = m.applyFallback(c, st, rd)
+	if len(c.Domains) == len(cfgDomains) {
+		// applyFallback only ever removes names, so the counts matching means the full
+		// configured set is what this round would order for.
+		rd.fullSet = true
+	}
+
+	// Invariant 1: with an unexpired order in progress, keep advancing it, never create a
+	// new one.
+	handled, orderDiscarded, err := m.continueOrDropOrder(ctx, c, st, rd)
+	if handled {
+		return err
+	}
+
+	// Reaching here means no order is in progress. If the state store still holds
+	// authorizations that were "written into DNS", they are orphaned now (the order delete
+	// succeeded but the authorization delete failed, or the process was killed). Reclaim
+	// them on the spot rather than leaving them parked on DNSPod forever.
+	//
+	// Skipped when this pass just discarded an order: discardOrder already ran this same
+	// cleanup, and running it again spends a second round of authoritative DNS probes and
+	// provider deletes on the rows it deliberately kept (a record whose fate is unknown is
+	// re-probed every pass until the probe answers).
+	if !orderDiscarded {
+		if err := m.cleanupOrphanTXT(ctx, c.Name); err != nil {
+			m.log.Warn("failed to reclaim a leftover TXT record", "cert", c.Name, "err", err)
+		}
+	}
+
+	// No certificate yet -> first issuance.
+	if st.NotAfter.IsZero() {
+		m.log.Info("first issuance",
+			"cert", c.Name, "names", len(c.Domains), "profile", c.Profile)
+		return m.issue(ctx, c, st, "", rd)
+	}
+
+	m.confirmBindingIfDue(ctx, c, st)
+
+	// Certificate exists -> check whether the domain set is right first, and time second.
+	//
+	// The order must not be reversed: if we relied on the ARI window alone, a domain newly
+	// added to the config would only take effect at the next renewal window, which under
+	// the classic profile is up to a whole validity period. "Domains change at any time" is
+	// exactly this project's use case, and that delay is not acceptable.
+	//
+	// A SAN hold (fallback working, or fallback state unknown) is NOT a stop: it only
+	// declines to reissue for the drift right now. The renewal window below can still
+	// fire, and that is how the full set gets its next attempt.
+	if started, err := m.reissueOnSANDrift(ctx, c, st, rd); started || err != nil {
+		return err
+	}
+
+	return m.renewIfDue(ctx, c, st, rd)
+}
+
+// loadRound reads the certificate state and whether a degradation is in force. Both are
+// durable facts for this pass, read once so every later decision sees the same answer.
+func (m *Manager) loadRound(ctx context.Context, c *config.Certificate) (*state.CertState, round, error) {
 	st, err := m.store.GetCert(c.Name)
 	if err != nil {
 		// recordFailure, not a bare return: the doc comment above promises that a failed decision
@@ -467,7 +555,7 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 		// would persist a synthesised CertState holding only the name, and PutCert's whole-row
 		// upsert would blank the certificate material of the certificate currently in service.
 		// The narrow variant writes only the failure bookkeeping columns.
-		return m.recordFailureUnreadable(ctx, c.Name, fmt.Errorf(
+		return nil, round{}, m.recordFailureUnreadable(ctx, c.Name, fmt.Errorf(
 			"read the certificate state: %w", err))
 	}
 	if st == nil {
@@ -503,207 +591,192 @@ func (m *Manager) Reconcile(ctx context.Context, c *config.Certificate) error {
 			"this pass rather than reissuing the full identifier set",
 			"cert", c.Name, "err", ferr)
 	}
-	// Skip straight through the backoff window. Once a retry is scheduled, stop knocking
-	// on the CA's door.
-	if until, ok := m.transientBackoffFor(c.Name); ok {
+	return st, rd, nil
+}
+
+// honourBackoff returns ErrBackoff when a retry is already scheduled, so the pass does
+// not knock on the CA's door again.
+func (m *Manager) honourBackoff(st *state.CertState) error {
+	if until, ok := m.transientBackoffFor(st.Name); ok {
 		// A backoff that could not be persisted (see transientBackoff). Checking it first
 		// means a failing state store still costs one window instead of one order per pass.
 		// transientBackoffFor drops expired entries on read, so an ok result is always in
 		// the future.
 		m.log.Warn("inside a backoff window that could not be recorded (the state store was failing); skipping",
-			"cert", c.Name, "nextAttemptAt", until)
+			"cert", st.Name, "nextAttemptAt", until)
 		return state.ErrBackoff
 	}
 	if !st.NextAttemptAt.IsZero() && m.now().Before(st.NextAttemptAt) {
-		m.log.Debug("inside the backoff window; skipping", "cert", c.Name, "nextAttemptAt", st.NextAttemptAt)
+		m.log.Debug("inside the backoff window; skipping", "cert", st.Name, "nextAttemptAt", st.NextAttemptAt)
 		return state.ErrBackoff
 	}
+	return nil
+}
 
-	// The configured (full) set, captured before applyFallback may reduce it. Only the
-	// count is needed: applyFallback removes names and never adds any, so an unchanged
-	// count means the ordered set is the full one.
-	cfgDomains := c.Domains
-
-	// Pre-expiry degradation: which domain set this round should actually order for.
-	//
-	// It lives here instead of being buried inside issue() because every later use of
-	// c.Domains must see one and the same set -- order matching, SAN drift comparison, the
-	// CSR, the identifier fingerprint. If even one of them used the full configured set,
-	// then during a fallback it would fight with "the order's identifier set disagrees
-	// with the config -> discard and rebuild", turning into a pointless order every round.
-	//
-	// Note what this does NOT mean: using the reduced set here is not a licence to forget
-	// that names were dropped. download keys off the round value below so that a successful
-	// issuance for the subset keeps the failure evidence intact; without it the next pass
-	// sees a "healthy" certificate and immediately re-orders the full set.
-	c, rd = m.applyFallback(c, st, rd)
-	if len(c.Domains) == len(cfgDomains) {
-		// applyFallback only ever removes names, so the counts matching means the full
-		// configured set is what this round would order for.
-		rd.fullSet = true
-	}
-
-	// Invariant 1: with an unexpired order in progress, keep advancing it, never create a
-	// new one.
-	orderDiscarded := false
-	if o, err := m.store.GetOrder(c.Name); err != nil {
+// continueOrDropOrder enforces "never create a new order while one is in flight".
+//
+// handled is true when Reconcile is finished: either the existing order was advanced, or
+// a decision failed and its retry is already scheduled. orderDiscarded reports that this
+// pass dropped the in-progress order (so the caller must not run orphan-TXT cleanup again).
+func (m *Manager) continueOrDropOrder(
+	ctx context.Context, c *config.Certificate, st *state.CertState, rd round,
+) (handled bool, orderDiscarded bool, err error) {
+	o, err := m.store.GetOrder(c.Name)
+	if err != nil {
 		// recordFailure, not a bare return: the doc comment above promises that a failed decision
 		// schedules the retry, and a bare return skipped the counter, the backoff and the in-memory
 		// transient backoff -- so a state store that fails this read was invisible in
 		// wecert_certificate_consecutive_failures and retried at the pass rate.
-		return m.recordFailure(ctx, st, fmt.Errorf("read the order in progress: %w", err))
-	} else if o != nil {
-		switch {
-		// A zero ExpiresAt means the server gave no expiry: keep advancing and let the CA
-		// declare the order invalid itself.
-		case !o.ExpiresAt.IsZero() && !m.now().Before(o.ExpiresAt):
-			m.log.Warn("order expired; discarding it and deciding again",
-				"cert", c.Name, "order", o.OrderURL, "expiredAt", o.ExpiresAt)
-			if err := m.discardOrder(ctx, c.Name); err != nil {
-				// A store failure here has to schedule the retry, exactly as the sibling call site in
-				// manager_flow.go does: returning the bare error skips the backoff entirely, so the
-				// next pass retries at the pass rate (re-running cleanupOrphanTXT's authoritative DNS
-				// probes and provider deletes each time) and nothing escalates or records why.
-				return m.recordFailure(ctx, st, fmt.Errorf("discard the expired order: %w", err))
-			}
-			orderDiscarded = true
+		return true, false, m.recordFailure(ctx, st, fmt.Errorf("read the order in progress: %w", err))
+	}
+	if o == nil {
+		return false, false, nil
+	}
 
-		case !orderMatchesConfig(o, c):
-			// The configured domains changed. This order's identifier set was fixed the
-			// moment it was placed, so advancing it only gets it rejected by the CA at
-			// finalize over and over until the order expires -- and the "never create a new
-			// order" invariant is exactly what makes that stall so persistent. So discard it
-			// decisively and let the next round rebuild for the new domains.
-			m.log.Warn("the configured domains changed; discarding the old order and rebuilding for the new set",
-				"cert", c.Name,
-				"orderIdentifiers", o.Identifiers,
-				"configIdentifiers", c.DomainKey())
-			if err := m.discardOrder(ctx, c.Name); err != nil {
-				return m.recordFailure(ctx, st, fmt.Errorf("discard the order for the changed domain set: %w", err))
-			}
-			orderDiscarded = true
-
-		default:
-			m.log.Info("resuming the existing order", "cert", c.Name, "order", o.OrderURL, "status", o.Status)
-			return m.advance(ctx, c, st, o, rd)
+	switch {
+	// A zero ExpiresAt means the server gave no expiry: keep advancing and let the CA
+	// declare the order invalid itself.
+	case !o.ExpiresAt.IsZero() && !m.now().Before(o.ExpiresAt):
+		m.log.Warn("order expired; discarding it and deciding again",
+			"cert", c.Name, "order", o.OrderURL, "expiredAt", o.ExpiresAt)
+		if err := m.discardOrder(ctx, c.Name); err != nil {
+			// A store failure here has to schedule the retry, exactly as the sibling call site in
+			// manager_flow.go does: returning the bare error skips the backoff entirely, so the
+			// next pass retries at the pass rate (re-running cleanupOrphanTXT's authoritative DNS
+			// probes and provider deletes each time) and nothing escalates or records why.
+			return true, false, m.recordFailure(ctx, st, fmt.Errorf("discard the expired order: %w", err))
 		}
-	}
+		return false, true, nil
 
-	// Reaching here means no order is in progress. If the state store still holds
-	// authorizations that were "written into DNS", they are orphaned now (the order delete
-	// succeeded but the authorization delete failed, or the process was killed). Reclaim
-	// them on the spot rather than leaving them parked on DNSPod forever.
-	//
-	// Skipped when this pass just discarded an order: discardOrder already ran this same
-	// cleanup, and running it again spends a second round of authoritative DNS probes and
-	// provider deletes on the rows it deliberately kept (a record whose fate is unknown is
-	// re-probed every pass until the probe answers).
-	if !orderDiscarded {
-		if err := m.cleanupOrphanTXT(ctx, c.Name); err != nil {
-			m.log.Warn("failed to reclaim a leftover TXT record", "cert", c.Name, "err", err)
+	case !orderMatchesConfig(o, c):
+		// The configured domains changed. This order's identifier set was fixed the
+		// moment it was placed, so advancing it only gets it rejected by the CA at
+		// finalize over and over until the order expires -- and the "never create a new
+		// order" invariant is exactly what makes that stall so persistent. So discard it
+		// decisively and let the next round rebuild for the new domains.
+		m.log.Warn("the configured domains changed; discarding the old order and rebuilding for the new set",
+			"cert", c.Name,
+			"orderIdentifiers", o.Identifiers,
+			"configIdentifiers", c.DomainKey())
+		if err := m.discardOrder(ctx, c.Name); err != nil {
+			return true, false, m.recordFailure(ctx, st, fmt.Errorf("discard the order for the changed domain set: %w", err))
 		}
-	}
+		return false, true, nil
 
-	// No certificate yet -> first issuance.
-	if st.NotAfter.IsZero() {
-		m.log.Info("first issuance",
-			"cert", c.Name, "names", len(c.Domains), "profile", c.Profile)
-		return m.issue(ctx, c, st, "", rd)
+	default:
+		m.log.Info("resuming the existing order", "cert", c.Name, "order", o.OrderURL, "status", o.Status)
+		return true, false, m.advance(ctx, c, st, o, rd)
 	}
+}
 
-	// Certificate exists, but the binding to a cloud resource is unconfirmed -> do one
-	// read-only confirmation.
-	//
-	// A first issuance only uploads and does not bind (on the Tencent Cloud side there is
-	// no "old certificate -> resource" relation to look up yet), so DeployConfirmed is
-	// false and a human has to bind it once in the console. But until that happens nothing
-	// ever comes back to set the flag -- the deployed metric reports "not deployed" for
-	// the whole certificate lifetime (up to 90 days under the classic profile) while the
-	// certificate is in fact serving normally the entire time.
-	//
-	// It sits before the domain comparison: this is bookkeeping only and does not affect
-	// whether to renew.
-	if c.Deploy.Enabled && st.DeployedCertID != "" && !st.DeployConfirmed && m.bindingCheckDue(c.Name) {
-		if err := m.confirmBinding(ctx, c, st); err != nil {
-			// A lookup failure is not a binding failure. Renewal is the main line here and
-			// must not be dragged down by a confirmation step.
-			m.log.Warn("could not confirm the certificate binding (renewal is unaffected)",
-				"cert", c.Name, "certId", st.DeployedCertID, "err", err)
-		}
+// confirmBindingIfDue does one read-only "is this certificate bound yet?" lookup.
+//
+// A first issuance only uploads and does not bind (on the Tencent Cloud side there is
+// no "old certificate -> resource" relation to look up yet), so DeployConfirmed is
+// false and a human has to bind it once in the console. But until that happens nothing
+// ever comes back to set the flag -- the deployed metric reports "not deployed" for
+// the whole certificate lifetime (up to 90 days under the classic profile) while the
+// certificate is in fact serving normally the entire time.
+//
+// It sits before the domain comparison: this is bookkeeping only and does not affect
+// whether to renew.
+func (m *Manager) confirmBindingIfDue(ctx context.Context, c *config.Certificate, st *state.CertState) {
+	if !(c.Deploy.Enabled && st.DeployedCertID != "" && !st.DeployConfirmed && m.bindingCheckDue(c.Name)) {
+		return
 	}
+	if err := m.confirmBinding(ctx, c, st); err != nil {
+		// A lookup failure is not a binding failure. Renewal is the main line here and
+		// must not be dragged down by a confirmation step.
+		m.log.Warn("could not confirm the certificate binding (renewal is unaffected)",
+			"cert", c.Name, "certId", st.DeployedCertID, "err", err)
+	}
+}
 
-	// Certificate exists -> check whether the domain set is right first, and time second.
-	//
-	// The order must not be reversed: if we relied on the ARI window alone, a domain newly
-	// added to the config would only take effect at the next renewal window, which under
-	// the classic profile is up to a whole validity period. "Domains change at any time" is
-	// exactly this project's use case, and that delay is not acceptable.
-	if leaf, lerr := ParseLeaf(st.CertPEM); lerr != nil {
+// reissueOnSANDrift re-orders when the live certificate's names no longer match the config.
+//
+// started is true only when a reissue was placed. A hold -- the degradation is working, or
+// its state could not be read -- is NOT a stop: it declines the SAN reissue and lets the
+// caller continue to the renewal window, which is where the full set gets its next attempt.
+func (m *Manager) reissueOnSANDrift(
+	ctx context.Context, c *config.Certificate, st *state.CertState, rd round,
+) (started bool, err error) {
+	leaf, lerr := ParseLeaf(st.CertPEM)
+	if lerr != nil {
 		m.log.Warn("could not parse the live certificate; skipping the SAN comparison", "cert", c.Name, "err", lerr)
-	} else if drifted, detail := CoverageDrift(leaf, c.Domains); drifted {
-		if rd.fallbackUnknown {
-			// The degradation state could not be read, so this drift cannot be classified as either
-			// "the fallback working" or "the config changed". Holding is the conservative answer:
-			// reissuing now would order the full set -- the one whose broken identifier caused the
-			// degradation -- and that is the oscillation the fallback exists to stop. Nothing is
-			// dropped this pass either (see fallbackUnknown's field comment).
-			m.log.Warn("cannot read whether a degradation is in force, so this certificate's SAN drift "+
-				"cannot be classified; holding it this pass instead of re-ordering the full set",
-				"cert", c.Name, "detail", detail)
-		} else if rd.fallbackActive && driftIsTheDegradation(leaf, c, m.store, c.Name, m.log) {
-			// A degradation is in force, so the live certificate is *supposed* to be
-			// missing names: this drift is the fallback working, not a config change that
-			// needs converging on.
-			//
-			// Reissuing here is what turned the fallback into an oscillation. Every pass
-			// saw "the SANs do not match the config" and placed a fresh order for the full
-			// set -- the very set whose one broken identifier caused the fallback -- so the
-			// account spent an order per pass on a known-bad identifier set. The reduced
-			// set is already deployed and serving; the full set gets its next attempt at
-			// the renewal window below, and the failure evidence expiring (or an operator
-			// fixing the name) is what ends the fallback, not another immediate order.
-			m.log.Warn("the live certificate is the degraded name set and a fallback is in force; "+
-				"holding it until the renewal window instead of re-ordering the broken full set",
-				"cert", c.Name, "detail", detail,
-				"note", "the degraded set stands until the renewal window, where the full set is tried "+
-					"again; the aged-out failure evidence only stops forcing the reduction, it does not "+
-					"order anything on its own (an hourly full-set order against a known-bad identifier "+
-					"set is what the fallback exists to prevent)")
-		} else {
-			m.log.Warn("the live certificate's SANs no longer match the config; reissuing now",
-				"cert", c.Name, "detail", detail,
-				"note", "this order carries replaces, so it keeps the ARI exemption as long as one identifier is "+
-					"shared with the certificate being replaced; a wholly disjoint set is the case that spends "+
-					"Certificates per Registered Domain (50 per 7 days, shared across accounts)")
-			// `replaces` IS sent here, which reverses an earlier decision.
-			//
-			// It used to be dropped on the premise that "the ARI exemption needs an
-			// identical identifier set, so a changed set is a different bucket anyway".
-			// Let's Encrypt's published rule says otherwise: an ARI order is exempt from
-			// ALL rate limits when it "includes at least one identifier matching the
-			// certificate it intends to replace and the certificate has not been
-			// previously replaced using ARI". The error this comment used to quote --
-			// `identifiers in this order do not match any identifiers in the certificate
-			// being replaced` -- is the NO-overlap case.
-			//
-			// A config change normally keeps most of the set: adding c.example.com to
-			// [a,b] gives [a,b,c], which shares a and b with the certificate being
-			// replaced and therefore qualifies. Omitting `replaces` there spends one of
-			// the 50-certificates-per-registered-domain-per-7-days allowance for nothing.
-			//
-			// The pathological case is a wholly disjoint set (moving a name between
-			// certificates), where the CA may refuse the order. That is no longer a dead
-			// end: issue() retries once without `replaces` on ANY newOrder error, so the
-			// worst outcome is losing the exemption rather than never issuing again.
-			//
-			// The `replaces` value is the certificate actually live now, which is what the
-			// stored ARI certID identifies -- including when the live certificate is the
-			// degraded subset, since the check is for any shared identifier.
-			return m.issue(ctx, c, st, st.ARICertID, rd)
-		}
+		return false, nil
+	}
+	drifted, detail := CoverageDrift(leaf, c.Domains)
+	if !drifted {
+		return false, nil
 	}
 
-	// Certificate exists -> decide whether renewal is due.
+	if rd.fallbackUnknown {
+		// The degradation state could not be read, so this drift cannot be classified as either
+		// "the fallback working" or "the config changed". Holding is the conservative answer:
+		// reissuing now would order the full set -- the one whose broken identifier caused the
+		// degradation -- and that is the oscillation the fallback exists to stop. Nothing is
+		// dropped this pass either (see fallbackUnknown's field comment).
+		m.log.Warn("cannot read whether a degradation is in force, so this certificate's SAN drift "+
+			"cannot be classified; holding it this pass instead of re-ordering the full set",
+			"cert", c.Name, "detail", detail)
+		return false, nil
+	}
+	if rd.fallbackActive && driftIsTheDegradation(leaf, c, m.store, c.Name, m.log) {
+		// A degradation is in force, so the live certificate is *supposed* to be
+		// missing names: this drift is the fallback working, not a config change that
+		// needs converging on.
+		//
+		// Reissuing here is what turned the fallback into an oscillation. Every pass
+		// saw "the SANs do not match the config" and placed a fresh order for the full
+		// set -- the very set whose one broken identifier caused the fallback -- so the
+		// account spent an order per pass on a known-bad identifier set. The reduced
+		// set is already deployed and serving; the full set gets its next attempt at
+		// the renewal window below, and the failure evidence expiring (or an operator
+		// fixing the name) is what ends the fallback, not another immediate order.
+		m.log.Warn("the live certificate is the degraded name set and a fallback is in force; "+
+			"holding it until the renewal window instead of re-ordering the broken full set",
+			"cert", c.Name, "detail", detail,
+			"note", "the degraded set stands until the renewal window, where the full set is tried "+
+				"again; the aged-out failure evidence only stops forcing the reduction, it does not "+
+				"order anything on its own (an hourly full-set order against a known-bad identifier "+
+				"set is what the fallback exists to prevent)")
+		return false, nil
+	}
+
+	m.log.Warn("the live certificate's SANs no longer match the config; reissuing now",
+		"cert", c.Name, "detail", detail,
+		"note", "this order carries replaces, so it keeps the ARI exemption as long as one identifier is "+
+			"shared with the certificate being replaced; a wholly disjoint set is the case that spends "+
+			"Certificates per Registered Domain (50 per 7 days, shared across accounts)")
+	// `replaces` IS sent here, which reverses an earlier decision.
+	//
+	// It used to be dropped on the premise that "the ARI exemption needs an
+	// identical identifier set, so a changed set is a different bucket anyway".
+	// Let's Encrypt's published rule says otherwise: an ARI order is exempt from
+	// ALL rate limits when it "includes at least one identifier matching the
+	// certificate it intends to replace and the certificate has not been
+	// previously replaced using ARI". The error this comment used to quote --
+	// `identifiers in this order do not match any identifiers in the certificate
+	// being replaced` -- is the NO-overlap case.
+	//
+	// A config change normally keeps most of the set: adding c.example.com to
+	// [a,b] gives [a,b,c], which shares a and b with the certificate being
+	// replaced and therefore qualifies. Omitting `replaces` there spends one of
+	// the 50-certificates-per-registered-domain-per-7-days allowance for nothing.
+	//
+	// The pathological case is a wholly disjoint set (moving a name between
+	// certificates), where the CA may refuse the order. That is no longer a dead
+	// end: issue() retries once without `replaces` on ANY newOrder error, so the
+	// worst outcome is losing the exemption rather than never issuing again.
+	//
+	// The `replaces` value is the certificate actually live now, which is what the
+	// stored ARI certID identifies -- including when the live certificate is the
+	// degraded subset, since the check is for any shared identifier.
+	return true, m.issue(ctx, c, st, st.ARICertID, rd)
+}
+
+// renewIfDue asks ARI (or a time threshold) whether renewal is due, and issues if so.
+func (m *Manager) renewIfDue(ctx context.Context, c *config.Certificate, st *state.CertState, rd round) error {
 	renewAt, replaces, ariErr := m.renewalDecision(ctx, c, st)
 	if ariErr != nil && renewAt.IsZero() {
 		// renewalDecision only leaves renewAt zero when the decision itself failed: a

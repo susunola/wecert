@@ -527,68 +527,16 @@ func (m *Manager) ariCheckDue(st *state.CertState, now time.Time) bool {
 
 // issue creates an order. Mind the order of operations: persist the order (including the
 // private key generated here) first, and only then advance it.
+//
+// The two pre-order gates (identifier cooldown, CA-recorded refusal) are separate methods:
+// both only decide "may we spend an order right now", and both end in recordFailure when
+// the answer is no.
 func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.CertState, replaces string, rd round) error {
-	// Do not spend an order on a name that just failed validation.
-	//
-	// The certificate backoff starts at a minute and doubles, so the first hour of a
-	// persistently failing name costs six attempts against "5 authorization failures per
-	// identifier per hour" -- and that budget belongs to the IDENTIFIER, so N certificates
-	// sharing the name attack the same five. At ten certificates the first hour costs sixty
-	// failures, of which at most five could ever have produced a different answer; past the
-	// limit every further order for that name is rejected outright, so the attempts bought
-	// nothing and the consecutive-failure counter (which feeds an account pause needing
-	// manual intervention) kept climbing.
-	//
-	// Checked here, at the point an order would be created, so resuming an order that is
-	// already in flight is unaffected -- that costs no new order and is how a pass that was
-	// interrupted mid-validation finishes.
-	if name, until, cooling := m.coolingDown(c.Name, c.Domains); cooling {
-		m.log.Warn("an identifier's authorizations failed recently, so no new order is placed until its "+
-			"failure budget refills; retrying inside the window cannot succeed and spends the budget "+
-			"that other certificates for this name also depend on",
-			"cert", c.Name, "identifier", name, "cooldownUntil", until,
-			"remaining", until.Sub(m.now()).Round(time.Minute))
-		return m.recordFailure(ctx, st, fmt.Errorf(
-			"identifier %s is in its authorization-failure cooldown until %s; not placing an order",
-			name, until.UTC().Format(time.RFC3339)))
+	if err := m.refuseWhileCoolingDown(ctx, c, st); err != nil {
+		return err
 	}
-
-	// The CA's own deadline wins over our backoff.
-	//
-	// Nothing used to consult a recorded refusal before ordering: the bucket was written, published
-	// as a metric and otherwise ignored, so a "retry after 3h" was followed by new-order attempts at
-	// our own 1m..6h backoff -- eight of them inside one three-hour window in a measured run. Every
-	// one of those is a request the CA has already said cannot succeed, and on the identifier limits
-	// they also count against the budget the whole account shares.
-	//
-	// The account-wide limit stops the pass outright; a per-scope one stops only the certificates it
-	// names, because refusing every order because one domain is paused would stall the fleet.
-	if until, limit, scope, blocked := m.blockedByRecordedDeadline(c); blocked {
-		if limit == ratelimit.ConsecutiveAuthzFailuresPerIdentifier.Name {
-			// The pause, said once and in full: what happened, why the recorded time is ours rather
-			// than the CA's, and what actually clears it. An operator reading only "rate limit"
-			// would wait, and waiting is the one thing that cannot lift a pause.
-			m.log.Error("the CA has PAUSED this identifier after repeated failed authorizations; "+
-				"nothing is ordered for it until the recorded floor, and only the CA's self-service "+
-				"portal lifts the pause -- the CA named no instant, so the floor is the published "+
-				"one-refill-per-day rate, not a deadline the CA gave",
-				"cert", c.Name, "limit", limit, "scope", scope, "until", until,
-				"remaining", until.Sub(m.now()).Round(time.Minute))
-			return m.recordFailure(ctx, st, fmt.Errorf(
-				"the CA has paused identifier %s (too many consecutive failed authorizations) and "+
-					"names no instant; no order is placed before %s, our floor from the published "+
-					"one-refill-per-day rate. Clear the pause in the CA's self-service portal: "+
-					"https://letsencrypt.org/docs/rate-limits/#consecutive-authorization-failures-per-identifier-per-account",
-				scope, until.UTC().Format(time.RFC3339)))
-		}
-		m.log.Warn("the CA has refused this limit recently and named when it will listen again; no "+
-			"order is placed before then, because the refusal is the CA's own answer and retrying "+
-			"inside the window cannot change it",
-			"cert", c.Name, "limit", limit, "scope", scope, "until", until,
-			"remaining", until.Sub(m.now()).Round(time.Minute))
-		return m.recordFailure(ctx, st, fmt.Errorf(
-			"limit %s%s is blocked until %s according to the CA's own Retry-After; not placing an order",
-			limit, scopeLabel(scope), until.UTC().Format(time.RFC3339)))
+	if err := m.refuseWhileCALockedOut(ctx, c, st); err != nil {
+		return err
 	}
 
 	key, err := GenerateKey(c.KeyType)
@@ -600,6 +548,146 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 		return m.recordFailure(ctx, st, err)
 	}
 
+	order, err := m.createOrderWithReplacesRetry(c, replaces)
+	if err != nil {
+		return m.recordFailure(ctx, st, fmt.Errorf("create order: %w", err))
+	}
+	if order.Location == "" {
+		return m.recordFailure(ctx, st, errors.New("create order: the server returned no order URL"))
+	}
+
+	expiresAt, expErr := parseOrderExpires(order.Expires, m.now())
+	if expErr != nil {
+		m.log.Warn("cannot parse the order's expires; using a conservative TTL",
+			"cert", c.Name, "raw", order.Expires, "err", expErr, "ttl", defaultOrderTTL)
+	}
+
+	o := &state.Order{
+		CertName:    c.Name,
+		OrderURL:    order.Location,
+		FinalizeURL: order.Finalize,
+		CertURL:     order.Certificate,
+		ExpiresAt:   expiresAt,
+		Status:      order.Status,
+		KeyPEM:      keyPEM,
+		// Record this order's identifier set. If the configured domains change later, Reconcile
+		// spots it immediately and discards the order, instead of advancing it until it expires.
+		Identifiers: c.DomainKey(),
+	}
+	if err := m.store.PutOrder(o); err != nil {
+		// A bare return here (which is what this used to be) is the worst of both worlds: the
+		// order was created at the CA but not recorded, so the next pass has no order URL to
+		// resume and creates ANOTHER one -- and because recordFailure never ran, no backoff
+		// was scheduled either. The order rate then follows the pass rate instead of the
+		// backoff: at a 1-minute interval that is 1440 orders a day against
+		// "300 new orders per account per 3 hours", and hitting that ceiling blocks EVERY
+		// certificate on the account, not just this one.
+		//
+		// recordFailure is what makes the next attempt wait, so a state-store failure cannot
+		// turn into a rate-limit incident. Note that it also has to be able to record: if the
+		// disk is full enough that PutOrder failed, PutCert may fail too, which is why
+		// recordFailure's own persistence error is logged rather than fatal (see there).
+		//
+		// The order URL is logged because it is the only remaining handle on the order that
+		// now exists at the CA and nowhere else -- an operator reading the log can still
+		// recover it by hand.
+		return m.recordFailure(ctx, st, fmt.Errorf(
+			"record the new order (the CA has it as %s, and it is not in the state store, so the next "+
+				"attempt will create another one): %w", order.Location, err))
+	}
+
+	// "replaces" here is what this program ASKED for, not proof of what went on the wire.
+	//
+	// lego drops the field when the directory does not advertise renewalInfo, so a journal line
+	// reading replaces=true next to an order that carried nothing is not a contradiction -- but it
+	// was written as if it were a statement about the request that reached the CA, which is the one
+	// thing an operator would use it to check. The wire itself is visible in lego's payloads (and
+	// in the CA's own accounting); this line now says which of the two it is.
+	m.log.Info("ACME order created",
+		"cert", c.Name, "status", order.Status, "expiresAt", expiresAt,
+		"names", len(c.Domains), "profile", order.Profile, "replacesRequested", replaces != "")
+	return m.advance(ctx, c, st, o, rd)
+}
+
+// refuseWhileCoolingDown blocks a new order while one of the certificate's names is
+// inside its authorization-failure cooldown.
+//
+// Do not spend an order on a name that just failed validation.
+//
+// The certificate backoff starts at a minute and doubles, so the first hour of a
+// persistently failing name costs six attempts against "5 authorization failures per
+// identifier per hour" -- and that budget belongs to the IDENTIFIER, so N certificates
+// sharing the name attack the same five. At ten certificates the first hour costs sixty
+// failures, of which at most five could ever have produced a different answer; past the
+// limit every further order for that name is rejected outright, so the attempts bought
+// nothing and the consecutive-failure counter (which feeds an account pause needing
+// manual intervention) kept climbing.
+//
+// Checked at the point an order would be created, so resuming an order that is already
+// in flight is unaffected -- that costs no new order and is how a pass that was
+// interrupted mid-validation finishes.
+func (m *Manager) refuseWhileCoolingDown(ctx context.Context, c *config.Certificate, st *state.CertState) error {
+	name, until, cooling := m.coolingDown(c.Name, c.Domains)
+	if !cooling {
+		return nil
+	}
+	m.log.Warn("an identifier's authorizations failed recently, so no new order is placed until its "+
+		"failure budget refills; retrying inside the window cannot succeed and spends the budget "+
+		"that other certificates for this name also depend on",
+		"cert", c.Name, "identifier", name, "cooldownUntil", until,
+		"remaining", until.Sub(m.now()).Round(time.Minute))
+	return m.recordFailure(ctx, st, fmt.Errorf(
+		"identifier %s is in its authorization-failure cooldown until %s; not placing an order",
+		name, until.UTC().Format(time.RFC3339)))
+}
+
+// refuseWhileCALockedOut blocks a new order while a recorded CA refusal is still in force.
+//
+// The CA's own deadline wins over our backoff.
+//
+// Nothing used to consult a recorded refusal before ordering: the bucket was written, published
+// as a metric and otherwise ignored, so a "retry after 3h" was followed by new-order attempts at
+// our own 1m..6h backoff -- eight of them inside one three-hour window in a measured run. Every
+// one of those is a request the CA has already said cannot succeed, and on the identifier limits
+// they also count against the budget the whole account shares.
+//
+// The account-wide limit stops the pass outright; a per-scope one stops only the certificates it
+// names, because refusing every order because one domain is paused would stall the fleet.
+func (m *Manager) refuseWhileCALockedOut(ctx context.Context, c *config.Certificate, st *state.CertState) error {
+	until, limit, scope, blocked := m.blockedByRecordedDeadline(c)
+	if !blocked {
+		return nil
+	}
+	if limit == ratelimit.ConsecutiveAuthzFailuresPerIdentifier.Name {
+		// The pause, said once and in full: what happened, why the recorded time is ours rather
+		// than the CA's, and what actually clears it. An operator reading only "rate limit"
+		// would wait, and waiting is the one thing that cannot lift a pause.
+		m.log.Error("the CA has PAUSED this identifier after repeated failed authorizations; "+
+			"nothing is ordered for it until the recorded floor, and only the CA's self-service "+
+			"portal lifts the pause -- the CA named no instant, so the floor is the published "+
+			"one-refill-per-day rate, not a deadline the CA gave",
+			"cert", c.Name, "limit", limit, "scope", scope, "until", until,
+			"remaining", until.Sub(m.now()).Round(time.Minute))
+		return m.recordFailure(ctx, st, fmt.Errorf(
+			"the CA has paused identifier %s (too many consecutive failed authorizations) and "+
+				"names no instant; no order is placed before %s, our floor from the published "+
+				"one-refill-per-day rate. Clear the pause in the CA's self-service portal: "+
+				"https://letsencrypt.org/docs/rate-limits/#consecutive-authorization-failures-per-identifier-per-account",
+			scope, until.UTC().Format(time.RFC3339)))
+	}
+	m.log.Warn("the CA has refused this limit recently and named when it will listen again; no "+
+		"order is placed before then, because the refusal is the CA's own answer and retrying "+
+		"inside the window cannot change it",
+		"cert", c.Name, "limit", limit, "scope", scope, "until", until,
+		"remaining", until.Sub(m.now()).Round(time.Minute))
+	return m.recordFailure(ctx, st, fmt.Errorf(
+		"limit %s%s is blocked until %s according to the CA's own Retry-After; not placing an order",
+		limit, scopeLabel(scope), until.UTC().Format(time.RFC3339)))
+}
+
+// createOrderWithReplacesRetry places the new-order call, spending quota and honouring a
+// single retry that drops `replaces` when the CA refuses the replacement itself.
+func (m *Manager) createOrderWithReplacesRetry(c *config.Certificate, replaces string) (legoacme.ExtendedOrder, error) {
 	order, err := m.core.NewOrder(c.Domains, &api.OrderOptions{
 		Profile:        c.Profile,
 		ReplacesCertID: replaces,
@@ -666,62 +754,5 @@ func (m *Manager) issue(ctx context.Context, c *config.Certificate, st *state.Ce
 			m.noteNewOrderRefusal(c, err)
 		}
 	}
-	if err != nil {
-		return m.recordFailure(ctx, st, fmt.Errorf("create order: %w", err))
-	}
-	if order.Location == "" {
-		return m.recordFailure(ctx, st, errors.New("create order: the server returned no order URL"))
-	}
-
-	expiresAt, expErr := parseOrderExpires(order.Expires, m.now())
-	if expErr != nil {
-		m.log.Warn("cannot parse the order's expires; using a conservative TTL",
-			"cert", c.Name, "raw", order.Expires, "err", expErr, "ttl", defaultOrderTTL)
-	}
-
-	o := &state.Order{
-		CertName:    c.Name,
-		OrderURL:    order.Location,
-		FinalizeURL: order.Finalize,
-		CertURL:     order.Certificate,
-		ExpiresAt:   expiresAt,
-		Status:      order.Status,
-		KeyPEM:      keyPEM,
-		// Record this order's identifier set. If the configured domains change later, Reconcile
-		// spots it immediately and discards the order, instead of advancing it until it expires.
-		Identifiers: c.DomainKey(),
-	}
-	if err := m.store.PutOrder(o); err != nil {
-		// A bare return here (which is what this used to be) is the worst of both worlds: the
-		// order was created at the CA but not recorded, so the next pass has no order URL to
-		// resume and creates ANOTHER one -- and because recordFailure never ran, no backoff
-		// was scheduled either. The order rate then follows the pass rate instead of the
-		// backoff: at a 1-minute interval that is 1440 orders a day against
-		// "300 new orders per account per 3 hours", and hitting that ceiling blocks EVERY
-		// certificate on the account, not just this one.
-		//
-		// recordFailure is what makes the next attempt wait, so a state-store failure cannot
-		// turn into a rate-limit incident. Note that it also has to be able to record: if the
-		// disk is full enough that PutOrder failed, PutCert may fail too, which is why
-		// recordFailure's own persistence error is logged rather than fatal (see there).
-		//
-		// The order URL is logged because it is the only remaining handle on the order that
-		// now exists at the CA and nowhere else -- an operator reading the log can still
-		// recover it by hand.
-		return m.recordFailure(ctx, st, fmt.Errorf(
-			"record the new order (the CA has it as %s, and it is not in the state store, so the next "+
-				"attempt will create another one): %w", order.Location, err))
-	}
-
-	// "replaces" here is what this program ASKED for, not proof of what went on the wire.
-	//
-	// lego drops the field when the directory does not advertise renewalInfo, so a journal line
-	// reading replaces=true next to an order that carried nothing is not a contradiction -- but it
-	// was written as if it were a statement about the request that reached the CA, which is the one
-	// thing an operator would use it to check. The wire itself is visible in lego's payloads (and
-	// in the CA's own accounting); this line now says which of the two it is.
-	m.log.Info("ACME order created",
-		"cert", c.Name, "status", order.Status, "expiresAt", expiresAt,
-		"names", len(c.Domains), "profile", order.Profile, "replacesRequested", replaces != "")
-	return m.advance(ctx, c, st, o, rd)
+	return order, err
 }
