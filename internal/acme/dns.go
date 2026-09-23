@@ -99,6 +99,14 @@ type nsProbe struct {
 	hasValue      bool
 	authoritative bool
 	err           error // non-nil means this address is unreachable from here, or did not answer
+	// rcode names a response code that is neither NOERROR nor NXDOMAIN -- REFUSED, SERVFAIL,
+	// and friends: the server answered, but not the question. It is kept beside err rather
+	// than folded into it because the two have different owners. "Nothing came back over UDP
+	// or TCP" is a network path; "the server answered REFUSED" is a policy, an interception,
+	// or an authority that will not speak for the zone. Measured on a corporate network whose
+	// middlebox refuses port 53: all eight addresses came back REFUSED and the summary said
+	// "unreachable 8", which sends the operator to the zone instead of to their egress.
+	rcode string
 }
 
 // probeTXT probes every authoritative NS concurrently.

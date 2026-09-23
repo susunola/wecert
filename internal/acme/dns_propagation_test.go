@@ -80,8 +80,16 @@ func TestServerFailureIsNotADenial(t *testing.T) {
 		func(msg *dns.Msg, _ string) (*dns.Msg, error) {
 			return servfail(msg), nil
 		})
-	if !strings.Contains(summary, "unreachable 1") || strings.Contains(summary, "denied 1") {
+	// An inconclusive ANSWER, in its own bucket: "failed" says a response came back that was
+	// neither a confirmation nor a denial, which is not the same as a server that never
+	// answered. Folding the two together is what made an intercepting middlebox look like a
+	// broken zone.
+	if !strings.Contains(summary, "failed 1") || strings.Contains(summary, "denied 1") {
 		t.Errorf("a SERVFAIL must be counted as an inconclusive answer, not as a denial: %s", summary)
+	}
+	if strings.Contains(summary, "unreachable 1") {
+		t.Errorf("a server that answered SERVFAIL is reachable and must not be counted as "+
+			"unreachable: %s", summary)
 	}
 
 	_, summary = probeReadyWithExchange(servers, "_acme-challenge.example.com.", "wanted",
@@ -101,8 +109,16 @@ func TestServerFailureIsNotADenial(t *testing.T) {
 			resp.Rcode = dns.RcodeRefused
 			return resp, nil
 		})
-	if !strings.Contains(summary, "unreachable 1") || strings.Contains(summary, "denied 1") {
+	// REFUSED gets its own bucket because of what it usually means in the field: a network
+	// that intercepts port 53 answers REFUSED on the authority's behalf, so every address of a
+	// perfectly healthy zone comes back refused at once. Reported as "unreachable" -- which is
+	// what this did before -- the operator is sent to look at the zone.
+	if !strings.Contains(summary, "refused 1") || strings.Contains(summary, "denied 1") {
 		t.Errorf("a REFUSED must be inconclusive, not a denial: %s", summary)
+	}
+	if strings.Contains(summary, "unreachable 1") {
+		t.Errorf("a server that answered REFUSED is reachable and must not be counted as "+
+			"unreachable, or an intercepted port 53 reads as a broken zone: %s", summary)
 	}
 }
 

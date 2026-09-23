@@ -17,6 +17,14 @@
 
 ### Fixed
 
+- **A DNS-01 propagation summary no longer calls an intercepted port 53 a broken zone.**
+  Every inconclusive answer was counted as `unreachable`, so a server that answered
+  `REFUSED` -- which is what a middlebox that intercepts DNS says on the authority's
+  behalf -- was reported the same way as a server whose packets are dropped. On a network
+  that does exactly that, a healthy zone read as `unreachable 8 (of 8 addresses)` and sent
+  the operator to look at the zone rather than at their egress. The summary separates them
+  now: `refused` for REFUSED, `failed` for any other inconclusive response code, and
+  `unreachable` only for an address that answered on neither transport.
 - **A DNS-01 propagation check no longer calls a zone unreachable when only UDP is
   blocked.** `exchangeDNS` retried over TCP only for a truncated answer, so on a network
   that drops outbound UDP/53 -- measured: every authoritative address of a zone timed out
