@@ -414,3 +414,38 @@ func TestAnUnreadDesiredStateDoesNotClaimNotFrozen(t *testing.T) {
 		t.Fatalf("frozen %v: the document was never read, so false is an invented answer", *snap.Desired.Frozen)
 	}
 }
+
+func TestRegionsAreTheObservedBindingRegions(t *testing.T) {
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	in := Input{
+		Now: now, Names: []string{"bound", "unseen"}, ProbeEnabled: false,
+		Certs: map[string]*state.CertState{
+			"bound":  {Name: "bound", NotAfter: now.Add(80 * 24 * time.Hour), DeployedCertID: "c1", DeployConfirmed: true},
+			"unseen": {Name: "unseen", NotAfter: now.Add(80 * 24 * time.Hour), DeployedCertID: "c2", DeployConfirmed: true},
+		},
+		LiveBindings: map[string]Bindings{
+			"bound": {
+				Count: 3, Complete: true, Freshness: FreshnessCached, Items: []BindingItem{
+					{Region: "ap-singapore", LoadBalancerID: "lb-2"},
+					{Region: "ap-guangzhou", LoadBalancerID: "lb-1"},
+					{Region: "ap-guangzhou", LoadBalancerID: "lb-3"},
+				},
+			},
+		},
+	}
+	rows := map[string]Certificate{}
+	for _, row := range Assemble(in).Certificates {
+		rows[row.Name] = row
+	}
+	if got := rows["bound"].Regions; !equalStrings(got, []string{"ap-guangzhou", "ap-singapore"}) {
+		t.Fatalf("regions %v, want the distinct observed regions in sorted order", got)
+	}
+	if got := rows["unseen"].Regions; got != nil {
+		// The store cannot enumerate bindings, so a region nobody observed must stay
+		// absent rather than become a guess or a zero.
+		t.Fatalf("regions %v, want unknown for a certificate with no live rows", got)
+	}
+	if got := rows["bound"].Bindings.Items; len(got) != 3 {
+		t.Fatalf("items %v", got)
+	}
+}

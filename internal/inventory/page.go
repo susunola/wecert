@@ -73,6 +73,15 @@ var pageTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 		}
 		return "probe-bad"
 	},
+	"regions": func(list []string) string {
+		if len(list) == 0 {
+			return "—"
+		}
+		if len(list) == 1 {
+			return regionLabel(list[0])
+		}
+		return regionLabel(list[0]) + " +" + strconv.Itoa(len(list)-1)
+	},
 	"bind":      bindLabel,
 	"status":    statusLabel,
 	"class":     statusClass,
@@ -185,7 +194,7 @@ func clbLine(c Certificate) string {
 			continue
 		}
 		have[it.LoadBalancerID] = struct{}{}
-		seen = append(seen, regionLabel(it.Region)+"  "+it.LoadBalancerID)
+		seen = append(seen, it.LoadBalancerID)
 	}
 	if len(seen) == 0 {
 		return bindLabel(c.Bindings, c.Status)
@@ -366,8 +375,9 @@ h1{font-size:19px;font-weight:650;letter-spacing:-.01em;margin:0}
 table{border-collapse:separate;border-spacing:0;width:100%;table-layout:fixed}
 /* Widths live on the header cells: with a fixed layout those are the ones
    the browser reads, and the colspan detail row is left alone. */
-th:nth-child(1){width:176px} th:nth-child(2){width:19%}
-th:nth-child(4){width:25%} th:nth-child(5){width:64px} th:nth-child(6){width:104px}
+th:nth-child(1){width:168px} th:nth-child(2){width:17%}
+th:nth-child(4){width:120px} th:nth-child(5){width:21%}
+th:nth-child(6){width:62px} th:nth-child(7){width:100px}
 th{position:sticky;top:38px;z-index:3;background:var(--panel);text-align:left;white-space:nowrap;
  font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
  padding:6px 12px;border-bottom:1px solid var(--line-strong)}
@@ -496,28 +506,29 @@ ul.tokens li{display:inline-block;margin:0 5px 5px 0;padding:1px 7px;border-radi
   <table>
   <thead>
   <tr>
-    <th scope="col">Status</th><th scope="col">Certificate</th><th scope="col">Names</th><th scope="col">CLB</th><th scope="col" class="num">Days</th><th scope="col" class="wide">Probe</th>
+    <th scope="col">Status</th><th scope="col">Certificate</th><th scope="col">Names</th><th scope="col">Region</th><th scope="col">CLB</th><th scope="col" class="num">Days</th><th scope="col" class="wide">Probe</th>
   </tr>
   </thead>
   <tbody>
   {{if not .Certificates}}
-  <tr><td colspan="6" class="empty">No certificates in this snapshot.</td></tr>
+  <tr><td colspan="7" class="empty">No certificates in this snapshot.</td></tr>
   {{else}}
   {{range .Accounts}}
   {{if $.ShowGroups}}
-  <tr class="group" data-group="{{.UIN}}"><td colspan="6"><b>{{if .UIN}}{{.UIN}}{{else}}unspecified account{{end}}</b> · {{.Count}} certificate{{if ne .Count 1}}s{{end}}</td></tr>
+  <tr class="group" data-group="{{.UIN}}"><td colspan="7"><b>{{if .UIN}}{{.UIN}}{{else}}unspecified account{{end}}</b> · {{.Count}} certificate{{if ne .Count 1}}s{{end}}</td></tr>
   {{end}}
   {{range .Certificates}}
   <tr class="row" data-row tabindex="0" aria-expanded="false" data-uin="{{.UIN}}" data-status="{{.Status}}" data-q="{{qblob .}}" data-attention="{{if attention .Status}}1{{else}}0{{end}}">
     <td><span class="caret" aria-hidden="true"></span><span class="tag {{class .Status}}"><i aria-hidden="true"></i>{{status .Status}}</span></td>
     <td class="name">{{.Name}}</td>
     <td class="mono">{{names .}}</td>
+    <td class="mono" title="{{if .Regions}}{{join .Regions ", "}}{{else}}no binding enumeration has named a region for this certificate{{end}}">{{regions .Regions}}</td>
     <td class="mono">{{clb .}}</td>
     <td class="num {{if eq .Status "expiring"}}days-soon{{end}}">{{days .DaysLeft}}</td>
     <td class="wide {{probeClass .Probe}}">{{probe .Probe}}</td>
   </tr>
   <tr class="detail hidden" data-detail>
-    <td colspan="6">
+    <td colspan="7">
       <div class="dgrid">
         <div class="dsec">
           <h3>Certificate</h3>
@@ -528,6 +539,7 @@ ul.tokens li{display:inline-block;margin:0 5px 5px 0;padding:1px 7px;border-radi
             <dt>Cert id</dt><dd class="mono">{{if .DeployedCertID}}{{.DeployedCertID}}{{else}}not uploaded{{end}}</dd>
             <dt>Profile</dt><dd>{{if .Profile}}{{.Profile}}{{else}}—{{end}}{{if .KeyType}} · {{.KeyType}}{{end}}</dd>
             <dt>Names</dt><dd class="mono">{{if .Domains}}{{join .Domains ", "}}{{else}}—{{end}}</dd>
+            <dt>Regions</dt><dd class="mono">{{if .Regions}}{{join .Regions ", "}}{{else}}unknown — no binding enumeration has named one{{end}}</dd>
             {{if .ARI}}<dt>ARI window</dt><dd class="mono">{{if .ARI.WindowStart}}{{.ARI.WindowStart}}{{else}}—{{end}} → {{if .ARI.WindowEnd}}{{.ARI.WindowEnd}}{{else}}—{{end}}</dd>{{end}}
             <dt>Failures</dt><dd>{{.ConsecutiveFailures}}{{if .NextAttemptAt}} · next <span class="mono nowrap">{{.NextAttemptAt}}</span>{{end}}</dd>
           </dl>

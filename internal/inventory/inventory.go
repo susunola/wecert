@@ -140,12 +140,18 @@ type Summary struct {
 
 // Certificate is one row. No PEM, no keys.
 type Certificate struct {
-	Name                string    `json:"name"`
-	UIN                 string    `json:"uin,omitempty"`
-	Status              string    `json:"status"`
-	Profile             string    `json:"profile,omitempty"`
-	KeyType             string    `json:"keyType,omitempty"`
-	Domains             []string  `json:"domains,omitempty"`
+	Name    string   `json:"name"`
+	UIN     string   `json:"uin,omitempty"`
+	Status  string   `json:"status"`
+	Profile string   `json:"profile,omitempty"`
+	KeyType string   `json:"keyType,omitempty"`
+	Domains []string `json:"domains,omitempty"`
+	// Regions is where this certificate was OBSERVED bound, taken from the live
+	// binding rows. Absent means unknown, which is not the same as "no region": the
+	// store cannot enumerate bindings, and one certificate can be bound in several
+	// regions. A Tencent Cloud SSL certificate is not itself regional -- the regions
+	// are the load balancers it is attached to.
+	Regions             []string  `json:"regions,omitempty"`
 	NotAfter            string    `json:"notAfter,omitempty"`
 	DaysLeft            *int      `json:"daysLeft,omitempty"`
 	IssuedAt            string    `json:"issuedAt,omitempty"`
@@ -337,6 +343,7 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 		issued = namesFromPEM(st.CertPEM)
 	}
 	row.Bindings = bindingsFor(in, name, st)
+	row.Regions = bindingRegions(row.Bindings)
 	samples := in.Probes[name]
 	if samples == nil {
 		samples = []HostSample{}
@@ -562,6 +569,26 @@ func covers(issued []string, name string) bool {
 		}
 	}
 	return false
+}
+
+// bindingRegions is the sorted set of regions the binding rows mention. Empty when
+// nothing was enumerated, so the page can say "unknown" rather than pick a region.
+func bindingRegions(b Bindings) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, it := range b.Items {
+		r := strings.TrimSpace(it.Region)
+		if r == "" {
+			continue
+		}
+		if _, ok := seen[r]; ok {
+			continue
+		}
+		seen[r] = struct{}{}
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func appendUnique(in []string, v string) []string {
