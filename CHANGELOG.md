@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 - 2026-09-23
+
 ### Fixed
 
 - **A `*_file` credential path that is group- or world-readable warns at load time.**
