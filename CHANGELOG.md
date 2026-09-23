@@ -2,6 +2,72 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-09-23
+
+### Fixed
+
+- **`tcerr.IsThrottled(nil)` no longer panics.** The throttle check fell through to
+  `err.Error()` on the right of `||` whenever `Code` returned empty, so a nil error from
+  a polling loop crashed the process. `IsPermanent` and `isNoData` already guarded nil;
+  this was the one that did not.
+- **A legacy account row that still carried a kid is re-registered instead of paired
+  with a new key.** `EnsureAccount` generated a replacement key when the stored row had
+  no key, and `PutAccount` cleared the kid in the database -- but the in-memory `KID`
+  survived into `api.New`, so every JWS failed for the whole pass and the next start
+  registered a second account. The leftover kid is discarded with the key it belonged to.
+- **The webhook auth lockout cannot be burst past.** `allowed()` and `recordFailure()`
+  were two steps: a concurrent burst of wrong tokens all passed the check while the
+  failure count was still 0, then each counted. Checking and counting now happen in one
+  critical section (`authLimiter.fail`), so at most `authMaxFailures` guesses are ever
+  admitted before the address is refused.
+- **A trailing `---` is one YAML document, not two, on the desired-state path.**
+  `config.rejectExtraDocuments` already skipped an empty trailing document; the
+  desired-state copy still refused anything `Decode` returned without error, so the same
+  separator `Load` accepts made `LoadDocument` fail and enforce mode froze on an old
+  revision. Both now share `config.RejectExtraDocuments`.
+- **`SetProber` is no longer a data race against concurrent probe reads.** The field was
+  written without synchronisation while webhook-triggered passes read it; the
+  "before the first convergence" contract had no enforcement. The pointer is guarded and
+  every probe-path read goes through one accessor.
+- **`transientBackoff` is swept like the sibling cooldown maps.** Certificates that left
+  the desired state kept their unpersisted-backoff entry forever; the write path now
+  prunes expired entries at the same `cooldownMapLimit` as `identifierCooldown` and
+  `bindingChecked`.
+- **`reclaimStaleProbeSeries` uses the prober snapshot for `Forget`.** It captured `p` at
+  the top of the function but re-read the field in the loop, so a concurrent
+  `SetProber(nil)` between the nil check and the loop was a nil dereference.
+- **`restrictiveUmask` restores with `defer`.** A panic between the call and the restore
+  left the process umask at 077 and deadlocked `Open` on the umask mutex; `openFiles`
+  already deferred the restore and the snapshot path did not.
+
+### Security
+
+- **`install.sh` refuses an artifact with no `SHA256SUMS` unless
+  `WECERT_INSECURE_SKIP_CHECKSUM=1`.** A missing sums file used to warn and install
+  anyway -- the exact case the check exists for. A mismatch still always refuses.
+- **`webhook.listen` warns when it binds beyond loopback.** The trigger carries a bearer
+  token over plaintext HTTP and can spend real ACME quota; the generic "reachable from
+  beyond this machine" wording understated what a same-segment observer can do with a
+  sniffed token.
+- **The deploy binding memo is bounded (TTL + entry cap) and dropped on delete.** It is
+  keyed by certId and certificates rotate, so a long-lived daemon kept one
+  `BindingSnapshot` per certificate it had ever seen. `Delete` forgets the snapshot once
+  the API has accepted the delete.
+- **`wecert-once.service` is hardened to match `wecert.service`.** The oneshot form runs
+  the same binary with the same credentials and was missing `CapabilityBoundingSet`,
+  `RestrictNamespaces`, `ProtectClock`, `MemoryDenyWriteExecute`, `UMask=0077` and the
+  rest of the hardening section.
+
+### Changed
+
+- **Internal structure only; no behaviour change.** The longest functions and files were
+  split by stage / section / table / concern so one responsibility lives in one place:
+  `Reconcile` and `issue` into named stages, `Config.normalize` by config section,
+  `cmd/wecert` boot into `runtime.go`, `state` by table, `reconcile` by concern, `dns`
+  and `manager_flow` by phase, `onboard` by pipeline step. Unit tests in `group`,
+  `inventory`, `metrics`, `probe`, `ratelimit`, `reconcile`, `spec`, `tcerr` and
+  `webhook` now run with `t.Parallel`; suites that share process-wide fakes stay serial.
+
 ### Added
 
 - **Inventory groups certificates by Tencent Cloud UIN.** `GET /api/inventory`
