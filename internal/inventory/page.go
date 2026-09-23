@@ -56,6 +56,23 @@ var pageTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 		}
 		return "Mismatch"
 	},
+	"probeClass": func(p ProbeView) string {
+		// The column colour follows the same three-way split as the label: an
+		// unreachable name is not a wrong certificate.
+		if !p.Enabled || p.OK == nil {
+			return "probe-off"
+		}
+		if *p.OK {
+			return "probe-ok"
+		}
+		for _, h := range p.Hosts {
+			switch h.ProblemKind {
+			case string(probe.ProblemUnreachable), string(probe.ProblemNoCertificate):
+				return "probe-warn"
+			}
+		}
+		return "probe-bad"
+	},
 	"bind":      bindLabel,
 	"status":    statusLabel,
 	"class":     statusClass,
@@ -127,7 +144,7 @@ func statusClass(status string) string {
 	case StatusExpiring, StatusNotIssued:
 		return "s-info"
 	}
-	return ""
+	return "s-mute"
 }
 
 func isAttention(status string) bool {
@@ -251,207 +268,451 @@ const pageHTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>wecert inventory</title>
 <style>
-:root{--bg:#efece6;--surface:#fffcf7;--elev:#efebe3;--fg:#1b1c1a;--muted:#5c615c;--subtle:#6f746e;--line:#e2ddd4;--accent:#1f2a24;--ok:#2c6a45;--wait:#8a5a16;--danger:#a33b35;--info:#3d4d7a}
+:root{
+ color-scheme:dark;
+ --bg:#0d1117; --panel:#161b22; --raised:#1c2128; --sunken:#010409;
+ --line:#21262d; --line-strong:#30363d;
+ --fg:#e6edf3; --muted:#8b949e; --faint:#6e7681;
+ --accent:#2fbfa8; --accent-fg:#04211d;
+ --ok:63 185 80; --warn:210 153 34; --danger:248 81 73; --info:88 166 255; --neutral:139 148 158;
+ --r:6px; --r-tag:4px;
+}
+:root[data-theme=light]{
+ color-scheme:light;
+ --bg:#fff; --panel:#f6f8fa; --raised:#eaeef2; --sunken:#f6f8fa;
+ --line:#d0d7de; --line-strong:#afb8c1;
+ --fg:#1f2328; --muted:#59636e; --faint:#818b98;
+ --accent:#0f766e; --accent-fg:#fff;
+ --ok:26 127 55; --warn:154 103 0; --danger:207 34 46; --info:9 105 218; --neutral:89 99 110;
+}
 *{box-sizing:border-box}
-body{margin:0;font:14px/1.5 ui-sans-serif,system-ui,sans-serif;background:var(--bg);color:var(--fg)}
-.bar{height:2px;background:var(--accent)}
-.wrap{max-width:1200px;margin:0 auto;padding:24px 20px 40px}
-h1{font-size:28px;font-weight:600;letter-spacing:-.02em;margin:0}
-.meta{color:var(--muted);margin:6px 0 0}
-.head{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:flex-end;margin-bottom:18px}
-.stamp{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
-.stats{display:flex;flex-wrap:wrap;gap:12px 28px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:12px 0;margin-bottom:16px}
-.stat .n{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
-.stat .l{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-top:4px}
-.stat.warn .n{color:var(--wait)} .stat.bad .n{color:var(--danger)} .stat.info .n{color:var(--info)} .stat.zero .n{color:var(--subtle)}
-.chips{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;margin-bottom:10px;align-items:center}
-.chips .lab{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-right:4px;flex:none}
-.chip,.seg button{appearance:none;border:0;background:var(--elev);color:var(--muted);min-height:40px;padding:0 12px;border-radius:4px;font:inherit;cursor:pointer;white-space:nowrap;flex:none}
-.chip.on,.seg button.on{background:var(--surface);color:var(--fg);box-shadow:0 0 0 1px rgb(27 28 26 / .06),0 1px 2px rgb(27 28 26 / .05)}
-.toolbar{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;margin-bottom:14px}
-.seg{display:flex;gap:4px;background:var(--elev);padding:4px;border-radius:8px}
-.search{flex:1;min-width:200px;max-width:320px;height:40px;border:1px solid var(--line);border-radius:4px;padding:0 12px;font:inherit;background:var(--surface);color:var(--fg)}
-.panel{background:var(--surface);border-radius:12px;box-shadow:0 0 0 1px rgb(27 28 26 / .06),0 8px 24px -16px rgb(27 28 26 / .18);overflow:auto}
-table{border-collapse:collapse;width:100%}
-th{text-align:left;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:500;padding:10px 12px;background:var(--elev);border-bottom:1px solid var(--line)}
-td{padding:12px;border-bottom:1px solid var(--line);vertical-align:middle}
-tr.group td{background:var(--elev);font-size:13px;padding:8px 12px}
+body{margin:0;background:var(--bg);color:var(--fg);
+ font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+ -webkit-font-smoothing:antialiased}
+.mono,.num,.statbar b,.plabel,.search,input{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+.num,.statbar b,.plist .n{font-variant-numeric:tabular-nums}
+.nowrap{white-space:nowrap}
+.hidden{display:none!important}
+.vh{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px;border-radius:var(--r-tag)}
+
+.topbar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:14px;
+ padding:8px 16px;background:var(--bg);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:8px;min-width:0}
+.mark{width:8px;height:8px;border-radius:2px;background:var(--accent);flex:none}
+.brand b{font-weight:650;letter-spacing:-.01em}
+.brand span{color:var(--muted);font-size:12px}
+.right{margin-left:auto;display:flex;align-items:center;gap:12px;flex:none}
+.ro{font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+ color:rgb(var(--ok));border:1px solid rgb(var(--ok) / .35);background:rgb(var(--ok) / .1);
+ padding:1px 7px;border-radius:var(--r-tag)}
+.stamp{color:var(--faint);font-size:11.5px}
+.icon{appearance:none;width:26px;height:26px;display:grid;place-items:center;background:transparent;
+ border:1px solid var(--line);border-radius:var(--r-tag);color:var(--muted);cursor:pointer;font-size:13px;line-height:1}
+.icon:hover{color:var(--fg);border-color:var(--line-strong)}
+
+.wrap{max-width:1360px;margin:0 auto;padding:14px 16px 40px}
+.title{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:10px}
+h1{font-size:19px;font-weight:650;letter-spacing:-.01em;margin:0}
+.title .src{margin:0 0 0 auto;display:flex;align-items:baseline;gap:8px;font-size:11.5px;color:var(--faint)}
+.notice{margin:0 0 10px;padding:6px 10px;border-radius:var(--r-tag);font-size:12px;
+ color:rgb(var(--warn));background:rgb(var(--warn) / .1);border:1px solid rgb(var(--warn) / .3)}
+
+.statbar{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 0;padding:7px 0;
+ border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin-bottom:12px;font-size:11.5px;color:var(--muted)}
+.statbar .st{display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap;padding:0 10px}
+.statbar .st:first-child{padding-left:0}
+.statbar .st+.st{border-left:1px solid var(--line)}
+.statbar b{font-size:13px;font-weight:600;color:var(--fg)}
+.statbar .z b{color:var(--faint);font-weight:500}
+.statbar .warn b{color:rgb(var(--warn))} .statbar .bad b{color:rgb(var(--danger))}
+.statbar .info b{color:rgb(var(--info))} .statbar .ok b{color:rgb(var(--ok))}
+
+.controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px}
+.picker{position:relative}
+.pbtn{display:flex;align-items:center;gap:8px;height:28px;padding:0 8px;min-width:236px;
+ background:var(--panel);border:1px solid var(--line);border-radius:var(--r);color:var(--fg);
+ font:inherit;font-size:12px;cursor:pointer;text-align:left}
+.pbtn:hover{border-color:var(--line-strong)}
+.pbtn .pcount{color:var(--faint);margin-left:auto}
+.chev{width:0;height:0;flex:none;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--muted)}
+.pmenu{position:absolute;z-index:20;top:32px;left:0;width:300px;padding:6px;
+ background:var(--panel);border:1px solid var(--line-strong);border-radius:var(--r);box-shadow:0 12px 32px rgb(1 4 9 / .55)}
+.psearch{width:100%;height:26px;margin-bottom:6px;padding:0 8px;font-size:12px;color:var(--fg);
+ background:var(--sunken);border:1px solid var(--line);border-radius:var(--r-tag)}
+.psearch::placeholder{color:var(--faint)}
+.plist{list-style:none;margin:0;padding:0;max-height:300px;overflow-y:auto}
+.plist li{display:flex;align-items:center;gap:10px;padding:4px 8px;border-radius:var(--r-tag);cursor:pointer;font-size:12px}
+.plist li:hover,.plist li.hl{background:var(--raised)}
+.plist li[aria-selected=true]{color:var(--accent)}
+.plist li .n{margin-left:auto;color:var(--faint);font-size:11.5px}
+.pempty{padding:8px;color:var(--faint);font-size:12px}
+
+.seg{display:flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.seg button{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-size:12px;
+ height:28px;padding:0 10px;cursor:pointer}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button:hover{color:var(--fg)}
+.seg button.on{background:var(--raised);color:var(--fg)}
+.search{flex:0 1 260px;min-width:170px;height:28px;margin-left:auto;padding:0 8px;font-size:12px;
+ color:var(--fg);background:var(--panel);border:1px solid var(--line);border-radius:var(--r)}
+.search::placeholder{color:var(--faint)}
+.search:hover{border-color:var(--line-strong)}
+
+/* No overflow here on wide screens: an overflow container becomes the sticky
+   containing block, and the table header then sticks 38px below the panel's own top
+   edge, covering the first row. Narrow screens opt into scrolling below. */
+.panel{background:var(--bg);border:1px solid var(--line);border-radius:var(--r)}
+table{border-collapse:separate;border-spacing:0;width:100%}
+th{position:sticky;top:38px;z-index:3;background:var(--bg);text-align:left;white-space:nowrap;
+ font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
+ padding:6px 12px;border-bottom:1px solid var(--line-strong)}
+td{padding:6px 12px;border-bottom:1px solid var(--line);vertical-align:middle;font-size:13px}
+tbody tr:last-child td{border-bottom:0}
+tr.group td{background:var(--sunken);color:var(--muted);font-size:11.5px;padding:5px 12px}
+tr.group b{color:var(--fg);font-weight:600}
 tr.row{cursor:pointer}
-tr.row:hover{background:var(--elev)}
-tr.row.on{background:var(--elev)}
-td.st{border-left:2px solid transparent;white-space:nowrap}
-tr.row.on td.st{border-left-color:var(--accent)}
-.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;background:var(--subtle);vertical-align:middle}
-.s-ok{color:var(--ok)} .s-ok .dot{background:var(--ok)}
-.s-wait{color:var(--wait)} .s-wait .dot{background:var(--wait)}
-.s-danger{color:var(--danger)} .s-danger .dot{background:var(--danger)}
-.s-info{color:var(--info)} .s-info .dot{background:var(--info)}
-.num{font-variant-numeric:tabular-nums;text-align:right}
-.hidden{display:none !important}
-.detail{background:var(--elev);font-size:13px}
-.detail td{padding:12px 16px 16px 24px}
-.kv{display:grid;grid-template-columns:7rem 1fr;gap:8px 12px;max-width:720px}
-.kv b{font-weight:500;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding-top:2px}
-.foot{margin-top:14px;font-size:12px;color:var(--subtle)}
-.empty{padding:48px 16px;text-align:center;color:var(--muted)}
-@media (max-width:720px){ .wide{display:none} }
+tr.row:hover{background:var(--raised)}
+tr.row.on{background:var(--raised)}
+tr.row.on td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
+.caret{display:inline-block;width:0;height:0;margin-right:8px;vertical-align:middle;
+ border-left:4px solid var(--faint);border-top:4px solid transparent;border-bottom:4px solid transparent;transition:transform .1s ease}
+tr.row.on .caret{transform:rotate(90deg);border-left-color:var(--accent)}
+td.name{font-weight:550}
+.tag{display:inline-flex;align-items:center;gap:6px;padding:1px 6px;border-radius:var(--r-tag);
+ font-size:11.5px;border:1px solid transparent;white-space:nowrap}
+.tag i{width:6px;height:6px;border-radius:1px;background:currentColor;flex:none}
+.s-ok{color:rgb(var(--ok));background:rgb(var(--ok) / .12);border-color:rgb(var(--ok) / .3)}
+.s-wait{color:rgb(var(--warn));background:rgb(var(--warn) / .12);border-color:rgb(var(--warn) / .3)}
+.s-danger{color:rgb(var(--danger));background:rgb(var(--danger) / .12);border-color:rgb(var(--danger) / .3)}
+.s-info{color:rgb(var(--info));background:rgb(var(--info) / .12);border-color:rgb(var(--info) / .3)}
+.s-mute{color:var(--muted);background:var(--raised);border-color:var(--line)}
+.probe-ok{color:rgb(var(--ok))} .probe-bad{color:rgb(var(--danger))}
+.probe-warn{color:rgb(var(--warn))} .probe-off{color:var(--faint)}
+.days-soon{color:rgb(var(--warn))}
+.muted{color:var(--faint)}
+
+tr.detail td{background:var(--sunken);padding:12px 16px 14px}
+.dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px 28px}
+.dsec h3{margin:0 0 6px;font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+.kv{display:grid;grid-template-columns:minmax(90px,auto) minmax(0,1fr);gap:3px 12px;margin:0;font-size:12px}
+.kv dt{color:var(--faint);white-space:nowrap}
+.kv dd{margin:0;overflow-wrap:anywhere}
+.brow{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:3px 0;border-top:1px solid var(--line);font-size:12px}
+.brow:first-child{border-top:0}
+.src{margin:6px 0 0;font-size:11.5px;color:var(--faint)}
+ul.hosts,ul.tokens{list-style:none;margin:0;padding:0}
+ul.hosts li{padding:3px 0;border-top:1px solid var(--line);font-size:12px}
+ul.hosts li:first-child{border-top:0}
+ul.tokens li{display:inline-block;margin:0 5px 5px 0;padding:1px 7px;border-radius:var(--r-tag);
+ background:var(--raised);border:1px solid var(--line);font-size:11.5px;color:var(--muted)}
+.err{margin:6px 0 0;font-size:12px;color:rgb(var(--danger));overflow-wrap:anywhere}
+.empty{padding:40px 16px;text-align:center;color:var(--muted)}
+
+.foot{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-top:12px;font-size:11.5px;color:var(--faint)}
+.legend{margin-top:10px;font-size:12px;color:var(--muted)}
+.legend summary{cursor:pointer;color:var(--faint);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase}
+.legend dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:4px 24px;margin:8px 0 0}
+.legend dt{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;color:var(--fg)}
+.legend dd{margin:0 0 4px;font-size:11.5px}
+@media (max-width:820px){
+ .wide{display:none}
+ .panel{overflow-x:auto}
+ .search{margin-left:0;flex:1 1 100%}
+ .pbtn{min-width:0}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
 <body>
-<div class="bar"></div>
-<div class="wrap">
-<div class="head">
-  <div>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <b>wecert</b>
+    <span>certificate inventory</span>
+  </div>
+  <div class="right">
+    <span class="ro">Read-only</span>
+    <span class="stamp mono">{{.Time}}</span>
+    <button type="button" class="icon" id="theme" aria-label="Switch colour theme" title="Switch colour theme">◐</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="title">
     <h1>Inventory</h1>
-    <p class="meta">wecert · {{.Summary.Certificates}} certificates{{if .UINCount}} · {{.UINCount}} UIN{{if ne .UINCount 1}}s{{end}}{{end}} · {{.Time}}</p>
+    <p class="src">desired state <span class="mono">{{if .DesiredKnown}}{{.Desired.Revision}}{{else}}not read{{end}}</span></p>
   </div>
-  <div>
-    <div class="stamp">Read-only</div>
-    <div class="mono">{{if .DesiredKnown}}{{.Desired.Revision}}{{else}}desired state not read{{end}}</div>
-    {{if .FrozenLabel}}<div class="mono">frozen · {{.FrozenLabel}}</div>{{end}}
+  {{if .FrozenLabel}}<p class="notice">desired state is frozen · {{.FrozenLabel}}</p>{{end}}
+
+  <div class="statbar" aria-label="Summary">
+    <span class="st"><b>{{.Summary.Certificates}}</b> certificates</span>
+    <span class="st"><b>{{.UINCount}}</b> accounts</span>
+    <span class="st {{if gt .Summary.WaitingManualBind 0}}warn{{else}}z{{end}}"><b>{{.Summary.WaitingManualBind}}</b> waiting bind</span>
+    <span class="st {{if gt .Summary.PendingDeploy 0}}warn{{else}}z{{end}}"><b>{{.Summary.PendingDeploy}}</b> pending deploy</span>
+    <span class="st {{if gt .Summary.NotIssued 0}}info{{else}}z{{end}}"><b>{{.Summary.NotIssued}}</b> not issued</span>
+    <span class="st {{if gt .Summary.Failing 0}}bad{{else}}z{{end}}"><b>{{.Summary.Failing}}</b> failing</span>
+    <span class="st {{if gt .Summary.Expiring 0}}info{{else}}z{{end}}"><b>{{.Summary.Expiring}}</b> expiring</span>
+    <span class="st {{if gt .Summary.ProbeMismatch 0}}bad{{else}}z{{end}}"><b>{{.Summary.ProbeMismatch}}</b> probe mismatch</span>
+    <span class="st {{if gt .Summary.ProbeUnreachable 0}}warn{{else}}z{{end}}"><b>{{.Summary.ProbeUnreachable}}</b> unreachable</span>
+    <span class="st {{if gt .Summary.ProbeUnknown 0}}warn{{else}}z{{end}}"><b>{{.Summary.ProbeUnknown}}</b> probe unknown</span>
+    <span class="st {{if gt .Summary.BindingUnknown 0}}warn{{else}}z{{end}}"><b>{{.Summary.BindingUnknown}}</b> binding unknown</span>
+    <span class="st {{if gt .Summary.Unreadable 0}}bad{{else}}z{{end}}"><b>{{.Summary.Unreadable}}</b> state unreadable</span>
   </div>
-</div>
-<section class="stats">
-  <div class="stat"><div class="n">{{.Summary.Certificates}}</div><div class="l">certificates</div></div>
-  <div class="stat"><div class="n">{{.UINCount}}</div><div class="l">UIN</div></div>
-  <div class="stat {{if gt .Summary.WaitingManualBind 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.WaitingManualBind}}</div><div class="l">waiting bind</div></div>
-  <div class="stat {{if gt .Summary.PendingDeploy 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.PendingDeploy}}</div><div class="l">pending deploy</div></div>
-  <div class="stat {{if gt .Summary.NotIssued 0}}info{{else}}zero{{end}}"><div class="n">{{.Summary.NotIssued}}</div><div class="l">not issued</div></div>
-  <div class="stat {{if gt .Summary.Failing 0}}bad{{else}}zero{{end}}"><div class="n">{{.Summary.Failing}}</div><div class="l">failing</div></div>
-  <div class="stat {{if gt .Summary.Expiring 0}}info{{else}}zero{{end}}"><div class="n">{{.Summary.Expiring}}</div><div class="l">expiring</div></div>
-  <div class="stat {{if gt .Summary.ProbeMismatch 0}}bad{{else}}zero{{end}}"><div class="n">{{.Summary.ProbeMismatch}}</div><div class="l">probe mismatch</div></div>
-  <div class="stat {{if gt .Summary.ProbeUnreachable 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.ProbeUnreachable}}</div><div class="l">probe unreachable</div></div>
-  <div class="stat {{if gt .Summary.ProbeUnknown 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.ProbeUnknown}}</div><div class="l">probe unknown</div></div>
-  <div class="stat {{if gt .Summary.BindingUnknown 0}}warn{{else}}zero{{end}}"><div class="n">{{.Summary.BindingUnknown}}</div><div class="l">binding unknown</div></div>
-  <div class="stat {{if gt .Summary.Unreadable 0}}bad{{else}}zero{{end}}"><div class="n">{{.Summary.Unreadable}}</div><div class="l">state unreadable</div></div>
-</section>
-{{if .ShowGroups}}
-<div class="chips" id="uins">
-  <span class="lab">UIN</span>
-  <button type="button" class="chip on" data-uin="">All <span>{{.UINCount}}</span></button>
-  {{range .Accounts}}
-  <button type="button" class="chip" data-uin="{{.UIN}}">{{if .UIN}}{{.UIN}}{{else}}unspecified{{end}} <span>{{.Count}}</span></button>
-  {{end}}
-</div>
-{{end}}
-<div class="toolbar">
-  <div class="seg" id="filters">
-    <button type="button" class="on" data-filter="all">All</button>
-    <button type="button" data-filter="attention">Attention</button>
-    <button type="button" data-filter="expiring">Expiring</button>
-  </div>
-  <input class="search" id="q" type="search" placeholder="Search name, domain, UIN, CLB…" aria-label="Search certificates">
-</div>
-<div class="panel">
-<table>
-<thead>
-<tr>
-  <th>Status</th><th>Certificate</th><th>Names</th><th>CLB</th><th class="num">Days</th><th class="wide">Probe</th>
-</tr>
-</thead>
-<tbody>
-{{if not .Certificates}}
-<tr><td colspan="6" class="empty">No certificates in this snapshot.</td></tr>
-{{else}}
-{{range .Accounts}}
-{{if $.ShowGroups}}
-<tr class="group" data-group="{{.UIN}}"><td colspan="6"><strong>{{if .UIN}}{{.UIN}}{{else}}unspecified{{end}}</strong> · {{.Count}} cert{{if ne .Count 1}}s{{end}}</td></tr>
-{{end}}
-{{range .Certificates}}
-<tr class="row" data-row data-uin="{{.UIN}}" data-status="{{.Status}}" data-q="{{qblob .}}" data-attention="{{if attention .Status}}1{{else}}0{{end}}">
-  <td class="st"><span class="{{class .Status}}"><span class="dot"></span>{{status .Status}}</span></td>
-  <td>{{.Name}}</td>
-  <td class="mono">{{names .}}</td>
-  <td class="mono">{{clb .}}</td>
-  <td class="num">{{days .DaysLeft}}</td>
-  <td class="wide">{{probe .Probe}}</td>
-</tr>
-<tr class="detail hidden" data-detail>
-  <td colspan="6">
-    <div class="kv">
-      <b>UIN</b><div class="mono">{{if .UIN}}{{.UIN}}{{else}}—{{end}}</div>
-      <b>Expires</b><div>{{days .DaysLeft}} · {{.NotAfter}}</div>
-      <b>Issued</b><div>{{if .IssuedAt}}{{.IssuedAt}}{{else}}—{{end}}</div>
-      <b>Cert id</b><div class="mono">{{if .DeployedCertID}}{{.DeployedCertID}}{{else}}not uploaded{{end}}</div>
-      <b>Names</b><div class="mono">{{join .Domains ", "}}</div>
-      <b>CLB</b><div>
-        {{if .Bindings.Items}}
-          {{range .Bindings.Items}}<div class="mono">{{region .Region}} {{.LoadBalancerID}} · {{.Protocol}}:{{.Port}}{{if .SNIDomain}} · {{.SNIDomain}}{{end}} · {{.Role}}</div>{{end}}
-        {{else}}{{bind .Bindings .Status}}{{end}}
-        <div class="mono">source: {{.Bindings.Freshness}}{{if .Bindings.ObservedAt}} · observed {{.Bindings.ObservedAt}}{{end}}{{if not .Bindings.Complete}} · lower bound, not the whole set{{end}}</div>
+
+  <div class="controls">
+    {{if .ShowGroups}}
+    <div class="picker" id="uins">
+      <button type="button" class="pbtn" id="acctBtn" aria-haspopup="listbox" aria-expanded="false" aria-controls="acctMenu">
+        <span class="plabel" id="acctLabel">All accounts</span>
+        <span class="pcount" id="acctCount">{{.Summary.Certificates}}</span>
+        <span class="chev" aria-hidden="true"></span>
+      </button>
+      <div class="pmenu hidden" id="acctMenu">
+        <input class="psearch" id="acctSearch" type="text" placeholder="Filter accounts" aria-label="Filter accounts" autocomplete="off">
+        <ul class="plist" id="acctList" role="listbox" aria-label="Account">
+          <li role="option" data-uin="" aria-selected="true" tabindex="-1"><span class="mono">All accounts</span><span class="n">{{.Summary.Certificates}}</span></li>
+          {{range .Accounts}}
+          <li role="option" data-uin="{{.UIN}}" aria-selected="false" tabindex="-1"><span class="mono">{{if .UIN}}{{.UIN}}{{else}}unspecified{{end}}</span><span class="n">{{.Count}}</span></li>
+          {{end}}
+        </ul>
+        <p class="pempty hidden" id="acctEmpty">no account matches</p>
       </div>
-      <b>Probe</b><div>{{probe .Probe}}{{range .Probe.Hosts}}<div class="mono">{{.Host}} · {{if .Match}}match{{else}}mismatch{{end}}{{if .ProblemKind}} · {{.ProblemKind}}{{end}}{{if .NotAfter}} · served expires {{.NotAfter}}{{if not .Trusted}} · chain not trusted{{end}}{{end}}</div>{{end}}</div>
-      {{if .Drift}}<b>Drift</b><div class="mono">{{join .Drift ", "}}</div>{{end}}
-      {{if .LastError}}<b>Error</b><div>{{.LastError}}</div>{{end}}
     </div>
-  </td>
-</tr>
-{{end}}
-{{end}}
-{{end}}
-</tbody>
-</table>
-</div>
-<p class="foot">Desired-state controller remains the source of truth. This register never issues, rebinds, or edits SAN sets.</p>
-</div>
+    {{end}}
+    <div class="seg" id="filters" role="group" aria-label="Filter certificates">
+      <button type="button" class="on" data-filter="all">All</button>
+      <button type="button" data-filter="attention">Attention</button>
+      <button type="button" data-filter="expiring">Expiring</button>
+    </div>
+    <input class="search" id="q" type="search" placeholder="search name, domain, account, CLB" aria-label="Search certificates">
+  </div>
+
+  <div class="panel">
+  <table>
+  <thead>
+  <tr>
+    <th scope="col">Status</th><th scope="col">Certificate</th><th scope="col">Names</th><th scope="col">CLB</th><th scope="col" class="num">Days</th><th scope="col" class="wide">Probe</th>
+  </tr>
+  </thead>
+  <tbody>
+  {{if not .Certificates}}
+  <tr><td colspan="6" class="empty">No certificates in this snapshot.</td></tr>
+  {{else}}
+  {{range .Accounts}}
+  {{if $.ShowGroups}}
+  <tr class="group" data-group="{{.UIN}}"><td colspan="6"><b>{{if .UIN}}{{.UIN}}{{else}}unspecified account{{end}}</b> · {{.Count}} certificate{{if ne .Count 1}}s{{end}}</td></tr>
+  {{end}}
+  {{range .Certificates}}
+  <tr class="row" data-row tabindex="0" aria-expanded="false" data-uin="{{.UIN}}" data-status="{{.Status}}" data-q="{{qblob .}}" data-attention="{{if attention .Status}}1{{else}}0{{end}}">
+    <td><span class="caret" aria-hidden="true"></span><span class="tag {{class .Status}}"><i aria-hidden="true"></i>{{status .Status}}</span></td>
+    <td class="name">{{.Name}}</td>
+    <td class="mono">{{names .}}</td>
+    <td class="mono">{{clb .}}</td>
+    <td class="num {{if eq .Status "expiring"}}days-soon{{end}}">{{days .DaysLeft}}</td>
+    <td class="wide {{probeClass .Probe}}">{{probe .Probe}}</td>
+  </tr>
+  <tr class="detail hidden" data-detail>
+    <td colspan="6">
+      <div class="dgrid">
+        <div class="dsec">
+          <h3>Certificate</h3>
+          <dl class="kv">
+            <dt>Account</dt><dd class="mono">{{if .UIN}}{{.UIN}}{{else}}—{{end}}</dd>
+            <dt>Expires</dt><dd>{{days .DaysLeft}}{{if .NotAfter}} · <span class="mono nowrap">{{.NotAfter}}</span>{{else}} · no certificate stored{{end}}</dd>
+            <dt>Issued</dt><dd class="mono">{{if .IssuedAt}}{{.IssuedAt}}{{else}}—{{end}}</dd>
+            <dt>Cert id</dt><dd class="mono">{{if .DeployedCertID}}{{.DeployedCertID}}{{else}}not uploaded{{end}}</dd>
+            <dt>Profile</dt><dd>{{if .Profile}}{{.Profile}}{{else}}—{{end}}{{if .KeyType}} · {{.KeyType}}{{end}}</dd>
+            <dt>Names</dt><dd class="mono">{{if .Domains}}{{join .Domains ", "}}{{else}}—{{end}}</dd>
+            {{if .ARI}}<dt>ARI window</dt><dd class="mono">{{if .ARI.WindowStart}}{{.ARI.WindowStart}}{{else}}—{{end}} → {{if .ARI.WindowEnd}}{{.ARI.WindowEnd}}{{else}}—{{end}}</dd>{{end}}
+            <dt>Failures</dt><dd>{{.ConsecutiveFailures}}{{if .NextAttemptAt}} · next <span class="mono nowrap">{{.NextAttemptAt}}</span>{{end}}</dd>
+          </dl>
+        </div>
+        <div class="dsec">
+          <h3>Bindings</h3>
+          {{if .Bindings.Items}}
+            {{range .Bindings.Items}}<div class="brow"><span class="mono">{{region .Region}} {{.LoadBalancerID}}</span><span class="mono">{{.Protocol}}:{{.Port}}</span>{{if .SNIDomain}}<span class="mono">{{.SNIDomain}}</span>{{end}}<span class="muted">{{.Role}}</span></div>{{end}}
+          {{else}}<div class="brow">{{bind .Bindings .Status}}</div>{{end}}
+          <p class="src">source {{.Bindings.Freshness}}{{if .Bindings.ObservedAt}} · observed {{.Bindings.ObservedAt}}{{end}}{{if not .Bindings.Complete}} · lower bound, not the whole set{{end}}{{if .Bindings.ResourceTypes}} · {{join .Bindings.ResourceTypes ", "}}{{end}}</p>
+        </div>
+        <div class="dsec">
+          <h3>Probe</h3>
+          <p class="src">served certificate read over TLS{{if not .Probe.Enabled}} · probing is off in this deployment{{end}}</p>
+          <ul class="hosts">
+          {{range .Probe.Hosts}}<li><span class="mono">{{.Host}}</span> · {{if .Match}}match{{else}}mismatch{{end}}{{if .ProblemKind}} · {{.ProblemKind}}{{end}}{{if .NotAfter}} · served expires <span class="mono nowrap">{{.NotAfter}}</span>{{if not .Trusted}} · chain not trusted{{end}}{{end}}</li>{{end}}
+          {{if not .Probe.Hosts}}<li class="muted">no answer this process life</li>{{end}}
+          </ul>
+        </div>
+        <div class="dsec">
+          <h3>Drift{{if not .Drift}} · none{{end}}</h3>
+          {{if .Drift}}<ul class="tokens">{{range .Drift}}<li>{{.}}</li>{{end}}</ul>{{end}}
+          {{if .LastError}}<p class="err">last error: {{.LastError}}</p>{{end}}
+        </div>
+      </div>
+    </td>
+  </tr>
+  {{end}}
+  {{end}}
+  {{end}}
+  </tbody>
+  </table>
+  </div>
+
+  <details class="legend">
+    <summary>Status tokens</summary>
+    <dl>
+      <dt>ok</dt><dd>issued, deployed as configured, served certificate matches</dd>
+      <dt>expiring</dt><dd>inside the renewal window for this certificate</dd>
+      <dt>waiting_manual_bind</dt><dd>uploaded; the one-time bind in the CLB console has not happened</dd>
+      <dt>pending_deploy</dt><dd>issued; the first upload has not run yet</dd>
+      <dt>not_issued</dt><dd>no certificate stored for this name yet</dd>
+      <dt>probe_mismatch</dt><dd>the name serves a certificate that is not the deployed one</dd>
+      <dt>probe_unreachable</dt><dd>the name could not be dialled; the certificate was not read</dd>
+      <dt>probe_unknown</dt><dd>probing is on and this process has no answer yet</dd>
+      <dt>binding_unknown</dt><dd>a live enumeration came back incomplete with no binding</dd>
+      <dt>failing</dt><dd>the last reconcile attempts failed</dd>
+      <dt>rate_limited</dt><dd>a published CA rate limit is blocking this certificate</dd>
+      <dt>revoke_pending</dt><dd>a revocation request is recorded for this name</dd>
+      <dt>frozen</dt><dd>the desired-state document is frozen</dd>
+      <dt>state_unreadable</dt><dd>the state row could not be read; see the error</dd>
+    </dl>
+  </details>
+
+  <p class="foot">
+    <span>The desired-state controller remains the source of truth. This register never issues, rebinds, or edits SAN sets.</span>
+    <span>Read-only · token required · the only thing kept in this browser is your colour theme</span>
+  </p>
+</main>
 <script>
 (function(){
-  var filter="all", uin="", q="";
+  var root=document.documentElement, filter="all", uin="", q="";
+  try{ var saved=localStorage.getItem("wecert-theme"); if(saved) root.setAttribute("data-theme",saved); }catch(e){}
+  var theme=document.getElementById("theme");
+  if(theme) theme.addEventListener("click",function(){
+    var next=root.getAttribute("data-theme")==="light"?"dark":"light";
+    root.setAttribute("data-theme",next);
+    try{ localStorage.setItem("wecert-theme",next); }catch(e){}
+  });
+
   function norm(s){return (s||"").toLowerCase()}
+  function rows(){return document.querySelectorAll("[data-row]")}
   function apply(){
-    var rows=document.querySelectorAll("[data-row]");
     var vis={};
-    rows.forEach(function(row){
+    rows().forEach(function(row){
       var ok=true;
       if(uin && row.getAttribute("data-uin")!==uin) ok=false;
       var st=row.getAttribute("data-status");
       if(filter==="attention" && row.getAttribute("data-attention")!=="1") ok=false;
       if(filter==="expiring" && st!=="expiring") ok=false;
       if(q && norm(row.getAttribute("data-q")).indexOf(q)===-1) ok=false;
-      row.classList.toggle("hidden", !ok);
+      row.classList.toggle("hidden",!ok);
       var det=row.nextElementSibling;
-      if(det && det.hasAttribute("data-detail") && !ok) det.classList.add("hidden");
+      if(det && det.hasAttribute("data-detail") && !ok){
+        det.classList.add("hidden"); row.setAttribute("aria-expanded","false");
+      }
       if(ok) vis[row.getAttribute("data-uin")]=true;
     });
     document.querySelectorAll("[data-group]").forEach(function(g){
       var id=g.getAttribute("data-group");
       var show=!uin || uin===id;
-      if(show && !(id in vis) && filter!=="all") show=false;
-      if(q && !(id in vis)) show=false;
-      g.classList.toggle("hidden", !show);
+      if(show && !(id in vis) && (filter!=="all" || q)) show=false;
+      g.classList.toggle("hidden",!show);
     });
   }
-  function select(group, attr, val){
+  function select(group,attr,val){
     group.querySelectorAll("button").forEach(function(b){
-      b.classList.toggle("on", (b.getAttribute(attr)||"")===val);
+      b.classList.toggle("on",(b.getAttribute(attr)||"")===val);
     });
   }
-  var f=document.getElementById("filters");
-  if(f) f.addEventListener("click", function(e){
-    var b=e.target.closest("button"); if(!b) return;
-    filter=b.getAttribute("data-filter")||"all";
-    select(f,"data-filter",filter); apply();
-  });
-  var u=document.getElementById("uins");
-  if(u) u.addEventListener("click", function(e){
-    var b=e.target.closest("button"); if(!b) return;
-    uin=b.getAttribute("data-uin")||"";
-    select(u,"data-uin",uin); apply();
-  });
-  var s=document.getElementById("q");
-  if(s) s.addEventListener("input", function(){ q=norm(s.value.trim()); apply(); });
-  document.querySelector("tbody").addEventListener("click", function(e){
-    var row=e.target.closest("[data-row]"); if(!row) return;
+  function toggle(row){
     var det=row.nextElementSibling;
     if(!det || !det.hasAttribute("data-detail")) return;
     var open=!det.classList.contains("hidden");
     document.querySelectorAll("[data-detail]").forEach(function(d){ d.classList.add("hidden"); });
-    document.querySelectorAll("[data-row]").forEach(function(r){ r.classList.remove("on"); });
-    if(!open){ det.classList.remove("hidden"); row.classList.add("on"); }
+    rows().forEach(function(r){ r.classList.remove("on"); r.setAttribute("aria-expanded","false"); });
+    if(!open){ det.classList.remove("hidden"); row.classList.add("on"); row.setAttribute("aria-expanded","true"); }
+  }
+  var f=document.getElementById("filters");
+  if(f) f.addEventListener("click",function(e){
+    var b=e.target.closest("button"); if(!b) return;
+    filter=b.getAttribute("data-filter")||"all";
+    select(f,"data-filter",filter); apply();
   });
+  var s=document.getElementById("q");
+  if(s) s.addEventListener("input",function(){ q=norm(s.value.trim()); apply(); });
+
+  var body=document.querySelector("tbody");
+  body.addEventListener("click",function(e){
+    var row=e.target.closest("[data-row]"); if(!row) return;
+    toggle(row);
+  });
+  body.addEventListener("keydown",function(e){
+    if(e.key!=="Enter" && e.key!==" ") return;
+    var row=e.target.closest("[data-row]"); if(!row) return;
+    e.preventDefault(); toggle(row);
+  });
+
+  var picker=document.getElementById("uins"), btn=document.getElementById("acctBtn"),
+      menu=document.getElementById("acctMenu"), list=document.getElementById("acctList"),
+      search=document.getElementById("acctSearch"), label=document.getElementById("acctLabel"),
+      count=document.getElementById("acctCount"), none=document.getElementById("acctEmpty");
+  function openMenu(open){
+    if(!menu) return;
+    menu.classList.toggle("hidden",!open);
+    btn.setAttribute("aria-expanded",open?"true":"false");
+    if(open){
+      search.value=""; showOptions(""); search.focus();
+    }
+  }
+  function options(){ return list.querySelectorAll("li[role=option]") }
+  function showOptions(needle){
+    var shown=0;
+    options().forEach(function(o){
+      var hit=!needle || norm(o.getAttribute("data-uin")).indexOf(needle)!==-1;
+      o.classList.toggle("hidden",!hit);
+      if(hit) shown++;
+    });
+    none.classList.toggle("hidden",shown>0);
+  }
+  function choose(o){
+    uin=o.getAttribute("data-uin")||"";
+    options().forEach(function(x){ x.setAttribute("aria-selected", x===o ? "true" : "false"); });
+    label.textContent=uin||"All accounts";
+    count.textContent=o.querySelector(".n").textContent;
+    openMenu(false); apply();
+  }
+  if(picker){
+    btn.addEventListener("click",function(){ openMenu(menu.classList.contains("hidden")); });
+    search.addEventListener("input",function(){ showOptions(norm(search.value.trim())) });
+    search.addEventListener("keydown",function(e){
+      if(e.key==="Escape"){ openMenu(false); btn.focus(); return; }
+      if(e.key==="ArrowDown"){ e.preventDefault(); var first=list.querySelector("li[role=option]:not(.hidden)"); if(first) first.focus(); }
+    });
+    list.addEventListener("click",function(e){
+      var o=e.target.closest("li[role=option]"); if(o) choose(o);
+    });
+    list.addEventListener("keydown",function(e){
+      var o=e.target.closest("li[role=option]"); if(!o) return;
+      if(e.key==="Enter" || e.key===" "){ e.preventDefault(); choose(o); btn.focus(); return; }
+      if(e.key==="Escape"){ openMenu(false); btn.focus(); return; }
+      var step=e.key==="ArrowDown"?1:e.key==="ArrowUp"?-1:0;
+      if(!step) return;
+      e.preventDefault();
+      var all=Array.prototype.filter.call(options(),function(x){ return !x.classList.contains("hidden") });
+      var i=all.indexOf(o)+step;
+      if(i>=0 && i<all.length) all[i].focus();
+    });
+    document.addEventListener("click",function(e){
+      if(!menu.classList.contains("hidden") && !picker.contains(e.target)) openMenu(false);
+    });
+    document.addEventListener("keydown",function(e){
+      if(e.key==="Escape" && !menu.classList.contains("hidden")){ openMenu(false); btn.focus(); }
+    });
+  }
 })();
 </script>
+
+
 </body>
 </html>
 `

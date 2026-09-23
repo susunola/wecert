@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -98,10 +99,40 @@ func TestWritePageSaysWhenTheDesiredStateWasNeverRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := buf.String()
-	if !strings.Contains(html, "desired state not read") {
+	// The header renders this as a labelled pair ("Desired state" / "not read"),
+	// which is the same claim the sentence made: the document was never read, so no
+	// revision exists to show.
+	if !strings.Contains(html, "desired state") || !strings.Contains(html, ">not read<") {
 		t.Fatal("a revision that was never read must not render as an empty one")
 	}
 	if strings.Contains(html, "frozen ·") {
 		t.Fatal("an unread document is not a frozen one")
+	}
+}
+
+func TestWritePageOffersEveryAccountInOneControl(t *testing.T) {
+	// An installation can carry hundreds of accounts. They belong in one picker,
+	// not in a row of chips that grows with the fleet.
+	certs := make([]Certificate, 0, 250)
+	for i := 1; i <= 250; i++ {
+		certs = append(certs, Certificate{
+			Name: fmt.Sprintf("svc-%03d", i), UIN: fmt.Sprintf("1000%08d", i),
+			Status: StatusOK, Domains: []string{fmt.Sprintf("svc-%03d.example.com", i)},
+		})
+	}
+	snap := Snapshot{Certificates: certs, Summary: Summary{Certificates: len(certs)}}
+	var buf bytes.Buffer
+	if err := WritePage(&buf, snap); err != nil {
+		t.Fatal(err)
+	}
+	html := buf.String()
+	if got := strings.Count(html, `role="option"`); got != len(certs)+1 {
+		t.Fatalf("account picker has %d options, want %d (every account plus the all-accounts entry)", got, len(certs)+1)
+	}
+	if strings.Contains(html, `class="chip`) {
+		t.Fatal("accounts must not be rendered as a chip row")
+	}
+	if !strings.Contains(html, `aria-haspopup="listbox"`) {
+		t.Fatal("the account control must be a listbox popup, so it can be opened and filtered")
 	}
 }
