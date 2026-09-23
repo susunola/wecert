@@ -2,10 +2,46 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`install.sh` installs its own `make release` output again.** The unit checksum gate looked
+  for a `SHA256SUMS` beside `deploy/systemd/`, where none exists, and refused to continue --
+  so an install from a release layout failed on the units unless
+  `WECERT_INSECURE_SKIP_CHECKSUM=1` was set, which is the opposite of what the gate is for.
+  `make release` copies the units into `dist/systemd/` and lists them in `dist/SHA256SUMS`
+  (`systemd/wecert.service`), so the lookup now consults the release directory the binary came
+  from. The units are verified rather than refused: a tampered, unlisted, or symlinked unit is
+  still rejected, and the unit that gets installed is the one the checksum was computed over.
+- **A reclaim of an already-deleted TXT no longer reports a Cloudflare cleanup failure.** With
+  `dns.provider: cloudflare`, a run whose challenge record had already been deleted could print
+  `failed to reclaim the TXT of an interrupted pass; keeping the row  err="cloudflare: unknown
+  record ID for '_acme-challenge.<name>.'"` followed by `some TXT records could not be reclaimed
+  automatically ... their rows are kept and retried next round`, and the authorization row stayed
+  behind as stuck -- a warning that reads like a DNS cleanup failure for a record that was in fact
+  already gone. Cloudflare's provider deletes only the records whose IDs it created in this
+  process, so a record deleted by the normal cleanup (while a lagging anycast node still served it,
+  which is what made the reclaim probe ask for a second delete at all) can only be answered that
+  way. The reclaim now waits a moment and asks the zone's authoritative nameservers again: if every
+  reachable one denies the record, the cleanup is done -- the row is deleted, its lease released,
+  and the run logs at Info that the provider had already forgotten the record and the servers agree
+  it is gone. If the servers still hold it, the provider genuinely cannot remove it, and the run
+  says so and names the record to delete in the DNS console instead of the generic retry warning.
+  Any other provider error keeps its previous path, and dnspod, tencentcloud and route53 are
+  unaffected: all three look the record up by name and already treat "nothing to delete" as
+  success.
+
 ## 0.6.1 - 2026-09-23
 
 ### Fixed
 
+- **A DNS-01 propagation summary no longer calls an intercepted port 53 a broken zone.**
+  Every inconclusive answer was counted as `unreachable`, so a server that answered
+  `REFUSED` -- which is what a middlebox that intercepts DNS says on the authority's
+  behalf -- was reported the same way as a server whose packets are dropped. On a network
+  that does exactly that, a healthy zone read as `unreachable 8 (of 8 addresses)` and sent
+  the operator to look at the zone rather than at their egress. The summary separates them
+  now: `refused` for REFUSED, `failed` for any other inconclusive response code, and
+  `unreachable` only for an address that answered on neither transport.
 - **A DNS-01 propagation check no longer calls a zone unreachable when only UDP is
   blocked.** `exchangeDNS` retried over TCP only for a truncated answer, so on a network
   that drops outbound UDP/53 -- measured: every authoritative address of a zone timed out

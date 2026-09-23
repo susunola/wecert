@@ -191,7 +191,9 @@ func probeTXTWithExchange(servers []nsServer, fqdn, want string, exchange func(*
 			//     else       Treating that as "the record is not there" is a false denial, and in
 			//                LookupTXT's branch a false denial is what licenses deleting the
 			//                authorization row of a name that is still being validated. It is not
-			//                a confirmation either, so it counts as unreachable: inconclusive.
+			//                a confirmation either, so it stays inconclusive -- but it is
+			//                recorded as a code, not as a transport failure, so the summary can
+			//                say which of the two happened.
 			switch resp.Rcode {
 			case dns.RcodeSuccess:
 			case dns.RcodeNameError:
@@ -199,7 +201,7 @@ func probeTXTWithExchange(servers []nsServer, fqdn, want string, exchange func(*
 				results[i].hasValue = false
 				return
 			default:
-				results[i].err = fmt.Errorf("server answered %s", dns.RcodeToString[resp.Rcode])
+				results[i].rcode = dns.RcodeToString[resp.Rcode]
 				return
 			}
 			// A truncated answer may be missing the very record being looked for, so it can
@@ -261,7 +263,7 @@ func delegatedCount(servers []nsServer) int {
 func probeReadyWithDelegation(servers []nsServer, delegated int, fqdn, want string, exchange func(*dns.Msg, string) (*dns.Msg, error)) (bool, string) {
 	results := probeTXTWithExchange(servers, fqdn, want, exchange)
 
-	var confirmed, missing, nonAuthoritative, unreachable int
+	var confirmed, missing, nonAuthoritative, unreachable, refused, failed int
 	// Counted per NS NAME, not per address: one server answering on both its A and its AAAA
 	// record is one server, and the rule below is about how many independent servers agree.
 	//
@@ -275,6 +277,13 @@ func probeReadyWithDelegation(servers []nsServer, delegated int, fqdn, want stri
 	for _, r := range results {
 		authorities[r.ns] = true
 		switch {
+		case r.rcode == dns.RcodeToString[dns.RcodeRefused]:
+			// The server answered and refused. On a network that intercepts port 53 this is
+			// the signature -- a middlebox refusing on the authority's behalf -- and it is a
+			// different problem from a path that swallows packets.
+			refused++
+		case r.rcode != "":
+			failed++
 		case r.err != nil:
 			unreachable++
 		case !r.authoritative:
@@ -295,8 +304,8 @@ func probeReadyWithDelegation(servers []nsServer, delegated int, fqdn, want stri
 		authorityCount = len(authorities)
 	}
 
-	summary := fmt.Sprintf("confirmed %d/%d server(s) / denied %d / non-authoritative %d / unreachable %d (of %d addresses)",
-		len(confirmingNS), authorityCount, missing, nonAuthoritative, unreachable, len(results))
+	summary := fmt.Sprintf("confirmed %d/%d server(s) / denied %d / non-authoritative %d / refused %d / failed %d / unreachable %d (of %d addresses)",
+		len(confirmingNS), authorityCount, missing, nonAuthoritative, refused, failed, unreachable, len(results))
 
 	// Any reachable server that answers "no such value" -> not propagated yet. Checked per
 	// address on purpose: one address of one authority denying the value is enough to hold the

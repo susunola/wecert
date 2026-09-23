@@ -88,9 +88,22 @@ verify_checksum() {
 	local dir name sums expected actual goarch
 	dir="$(cd "$(dirname "${artifact}")" && pwd)"
 	name="$(basename "${artifact}")"
-	# Prefer a sums file beside the artifact (release layout); fall back to the installer's
-	# own directory so deploy/systemd units and config.example.yaml can be listed there too.
+	# Prefer a sums file beside the artifact; then the release directory the binary came
+	# from, which is where `make release` writes the one file that covers the binary, the
+	# units and the example config together; then the installer's own directory.
+	#
+	# The release-directory step is what the units and the example config need: they live in
+	# subdirectories, so "beside the artifact" never finds dist/SHA256SUMS, and before this
+	# the lookup fell through to a directory that has no sums file in a release layout at
+	# all. The result was install.sh refusing its own `make release` output -- the CI smoke
+	# test caught it on the second run, where the units are the only thing left to install.
 	sums="${dir}/SHA256SUMS"
+	if [[ ! -f "${sums}" && -n "${BINARY:-}" ]]; then
+		release_dir="$(cd "$(dirname "${BINARY}")" && pwd)"
+		if [[ -f "${release_dir}/SHA256SUMS" ]]; then
+			sums="${release_dir}/SHA256SUMS"
+		fi
+	fi
 	if [[ ! -f "${sums}" && -n "${SCRIPT_DIR:-}" && -f "${SCRIPT_DIR}/SHA256SUMS" ]]; then
 		sums="${SCRIPT_DIR}/SHA256SUMS"
 	fi
@@ -119,8 +132,10 @@ verify_checksum() {
 	# The systemd units exec a fixed name (wecert, wecert-onboard), so a release artifact is
 	# commonly renamed before copying: wecert-onboard_linux_amd64 -> wecert-onboard. The checksum
 	# is over the content, so the suffixed entry for this host's architecture verifies the rename.
+	# A release lists the units as `systemd/wecert.service` (sha256sum run from dist/), so a
+	# name counts as listed either bare or under a directory prefix.
 	expected="$(awk -v f="${name}" -v g="${name}_linux_${goarch}" \
-		'$2 == f || (g != "" && $2 == g) { print $1 }' "${sums}")"
+		'$2 == f || (g != "" && $2 == g) || $2 ~ ("(^|/)" f "$") { print $1 }' "${sums}")"
 	if [[ -z "${expected}" ]]; then
 		# Binaries must be listed. Units and the example config are refused too when a sums
 		# file exists but omits them -- except in a source checkout where SHA256SUMS only
@@ -227,16 +242,21 @@ fi
 echo "==> Installing systemd unit"
 units_installed=0
 for unit in wecert.service wecert-once.service wecert-once.timer; do
-	if [[ -L "${SCRIPT_DIR}/deploy/systemd/${unit}" ]]; then
+	# Prefer the copy the release checksum was computed over (`make release` copies
+	# deploy/systemd into dist/systemd and lists it there); fall back to the source tree for a
+	# checkout that has not run it.
+	unit_src="$(dirname "${BINARY}")/systemd/${unit}"
+	[[ -f "${unit_src}" ]] || unit_src="${SCRIPT_DIR}/deploy/systemd/${unit}"
+	if [[ -L "${unit_src}" ]]; then
 		echo "Error: ${unit} is a symlink; refusing to install a unit that can be swapped" >&2
 		echo "       after its content is checked. Copy the regular file from the release." >&2
 		exit 1
 	fi
-	if [[ -f "${SCRIPT_DIR}/deploy/systemd/${unit}" ]]; then
+	if [[ -f "${unit_src}" ]]; then
 		# Units are as trusted as the binary: a swapped unit can point ExecStart anywhere
 		# and the binary checksum would still pass. Verify when SHA256SUMS lists them.
-		verify_checksum "${SCRIPT_DIR}/deploy/systemd/${unit}"
-		install -m 0644 "${SCRIPT_DIR}/deploy/systemd/${unit}" "/etc/systemd/system/${unit}"
+		verify_checksum "${unit_src}"
+		install -m 0644 "${unit_src}" "/etc/systemd/system/${unit}"
 		echo "    ${unit}"
 		units_installed=$((units_installed + 1))
 	fi
