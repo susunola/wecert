@@ -706,7 +706,11 @@ The trigger endpoint performs **real issuance** and consumes Let's Encrypt rate-
 |---|---|---|---|
 | `POST` | `/hook/reconcile` | yes | Trigger convergence |
 | `GET` | `/hook/status` | yes | Per-certificate state, for polling after a trigger |
+| `GET` | `/status` | yes | Read-only inventory console |
+| `GET` | `/api/inventory` | yes | Inventory snapshot as JSON |
 | `GET` | `/healthz` | no | Liveness (leaks nothing, so probes can reach it) |
+
+The [console guide](docs/console.md) covers browser access and the read-only proxy configuration.
 
 Authenticate with either header:
 

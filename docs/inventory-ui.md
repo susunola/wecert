@@ -1,5 +1,7 @@
 # Read-only certificate inventory
 
+For the shipped console, enabling instructions, browser authentication, and screenshots, see [Console guide](console.md). The sections below document the data contract and original design rationale.
+
 wecert already issues, uploads, rebinds and probes. Operators still have to
 join four places to answer a simple question: which certificate is bound to
 which CLB, which names it covers, and when it expires.

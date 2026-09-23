@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -75,6 +76,16 @@ func TestWritePreviewPage(t *testing.T) {
 		{name: "sandbox-web", uin: "100077778888", domains: []string{"sandbox.example.com"}, notAfter: 80, issued: -10, certID: "cYk2C3d4E5f6", confirmed: true},
 
 		{name: "archive-report", uin: "100066667777", domains: []string{"archive.example.com"}, notAfter: 68, issued: -22, certID: "cYk3F4g5H6i7", confirmed: true},
+	}
+	// Optional larger fleet for exercising the native account picker.
+	if os.Getenv("WECERT_PREVIEW_EXTRA_ACCOUNTS") == "1" {
+		for i := 1; i <= 30; i++ {
+			r := rows[0]
+			r.name, r.uin = fmt.Sprintf("svc-%02d", i), fmt.Sprintf("1000%08d", i)
+			r.domains = []string{fmt.Sprintf("svc-%02d.example.com", i)}
+			r.certID = fmt.Sprintf("cYkextra%02d", i)
+			rows = append(rows, r)
+		}
 	}
 	certs := make([]config.Certificate, 0, len(rows))
 	certState := map[string]*state.CertState{}

@@ -296,10 +296,12 @@ metrics:
 #   # something is still partially available.
 #   minNames: 1
 
-# ── event triggering (optional) ─────────────────────────────────────────────
+# ── inventory console and event triggering (optional) ─────────────────────────────────────────────
 # Disabled by default; convergence happens on the timer only. Configure it and
 # external events can drive it, for example CI calling it once after a domain is
-# added, instead of waiting for the next hour.
+# added, instead of waiting for the next hour. This listener also serves the
+# authenticated read-only console at GET /status and JSON at GET /api/inventory.
+# Browser access and token handling: docs/console.md. No separate UI flag.
 #
 # webhook:
 #   listen: 127.0.0.1:9801
