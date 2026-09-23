@@ -105,7 +105,9 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 			if err != nil {
 				return nil, fmt.Errorf("initialise the cloudflare provider: %w", err)
 			}
-			newProvider = func(context.Context) (challenge.Provider, error) { return p, nil }
+			newProvider = func(context.Context) (challenge.Provider, error) {
+				return cloudflareZoneReadHint{p}, nil
+			}
 			break
 		}
 		tokenFile := dnsCfg.Cloudflare.APITokenFile
@@ -113,8 +115,16 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		newProvider = func(context.Context) (challenge.Provider, error) {
 			cfg := *static
 			cfg.AuthToken = rereadSecretFile(tokenFile, cfg.AuthToken)
+			// Wrap inside the cache build so the cached instance *is* the wrapper:
+			// TestCloudflareTokenFileKeepsOneProviderUntilTheTokenChanges compares
+			// provider identity across calls, and a fresh wrapper around the same
+			// inner provider would look like a rebuild.
 			return cache.get(cfg.AuthToken, func() (challenge.Provider, error) {
-				return cloudflare.NewDNSProviderConfig(&cfg)
+				p, err := cloudflare.NewDNSProviderConfig(&cfg)
+				if err != nil {
+					return nil, err
+				}
+				return cloudflareZoneReadHint{p}, nil
 			})
 		}
 
@@ -391,4 +401,36 @@ func (c *tokenFileProviderCache) get(token string, build func() (challenge.Provi
 	}
 	c.provider, c.token = p, token
 	return p, nil
+}
+
+// cloudflareZoneReadHint explains the one Cloudflare failure that reads as something
+// else.
+//
+// lego resolves the zone by LISTING zones and matching the name
+// (providers/dns/cloudflare/wrapper.go: ZonesByName), which needs Zone:Read. A token
+// scoped to DNS:Edit alone authenticates perfectly and then reports "zone could not be
+// found" -- which an operator reads as "my domain is not in this account" and goes
+// looking for the wrong problem. Measured against the live API: a DNS:Edit-only token
+// returns an empty zone list with HTTP 200, while an invalid token returns 403/9109.
+//
+// The wrapper changes no behaviour on the success path and only augments this one
+// message; everything else is passed through untouched.
+type cloudflareZoneReadHint struct {
+	challenge.Provider
+}
+
+func (p cloudflareZoneReadHint) Present(domain, token, keyAuth string) error {
+	return cloudflareZoneHint(p.Provider.Present(domain, token, keyAuth))
+}
+
+func (p cloudflareZoneReadHint) CleanUp(domain, token, keyAuth string) error {
+	return cloudflareZoneHint(p.Provider.CleanUp(domain, token, keyAuth))
+}
+
+func cloudflareZoneHint(err error) error {
+	if err == nil || !strings.Contains(err.Error(), "zone could not be found") {
+		return err
+	}
+	return fmt.Errorf("%w (the token needs Zone:Read as well as DNS:Edit: the zone is "+
+		"resolved by listing zones, and a DNS:Edit-only token authenticates but sees none)", err)
 }

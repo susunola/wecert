@@ -168,6 +168,12 @@ dns:
   # (My Profile -> API Tokens) with Zone:Read and DNS:Edit on the zone(s) that hold the
   # challenge names. The token never expires, so it is read once at startup.
   #
+  # Zone:Read is not optional and not for listing convenience: the zone is resolved by
+  # LISTING zones and matching the name, so a token with DNS:Edit alone authenticates
+  # successfully and then fails with "zone could not be found", which reads like the domain
+  # is not in the account. Measured against the live API: DNS:Edit-only returns an empty
+  # zone list with HTTP 200; an invalid token returns 403/9109.
+  #
   #   apiTokenFile  reads it from a file (0600) instead; the path is environment-expanded, so
   #                 systemd's LoadCredential works the same way as for the DNSPod token:
   #                     [Service]

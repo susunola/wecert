@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -303,5 +304,41 @@ func TestCloudflareTokenFileKeepsOneProviderUntilTheTokenChanges(t *testing.T) {
 	if fourth == third {
 		t.Fatal("the token file went back to the first token and the provider for the rotated one " +
 			"was returned: the instance has to match the credential the file holds")
+	}
+}
+
+// stubProvider is a challenge.Provider whose two calls fail with whatever it is given.
+type stubProvider struct{ err error }
+
+func (s stubProvider) Present(domain, token, keyAuth string) error { return s.err }
+func (s stubProvider) CleanUp(domain, token, keyAuth string) error { return s.err }
+
+func TestCloudflareZoneLookupFailureNamesTheMissingReadScope(t *testing.T) {
+	// Measured against the live API before this was written: a DNS:Edit-only token
+	// authenticates (HTTP 200, empty zone list) and lego then reports "zone could not be
+	// found", which reads as "the domain is not in this account". The wrapper has to keep
+	// the original error and add the scope, and it has to leave every other error alone.
+	original := errors.New("cloudflare: failed to find zone example.com.: zone could not be found")
+
+	err := cloudflareZoneReadHint{stubProvider{err: original}}.Present("example.com", "t", "k")
+	if !errors.Is(err, original) {
+		t.Fatalf("the provider error must stay wrapped, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "Zone:Read") || !strings.Contains(err.Error(), "DNS:Edit") {
+		t.Fatalf("the message must name both scopes, got %v", err)
+	}
+
+	err = cloudflareZoneReadHint{stubProvider{err: original}}.CleanUp("example.com", "t", "k")
+	if !strings.Contains(err.Error(), "Zone:Read") {
+		t.Fatalf("CleanUp must carry the same hint, got %v", err)
+	}
+
+	other := errors.New("cloudflare: record already exists")
+	// Parenthesised: a composite literal cannot open a control clause.
+	if got := (cloudflareZoneReadHint{stubProvider{err: other}}).Present("a.example", "t", "k"); got != other {
+		t.Fatalf("an unrelated failure must pass through untouched, got %v", got)
+	}
+	if got := (cloudflareZoneReadHint{stubProvider{}}).Present("a.example", "t", "k"); got != nil {
+		t.Fatalf("success must stay success, got %v", got)
 	}
 }
