@@ -34,8 +34,11 @@ const (
 type Target struct {
 	Type, Name, Bucket, Prefix, Endpoint, Region                                                    string
 	Host, Username, RemoteDir, PasswordEnv, PrivateKeyFile, PrivateKeyPassphraseEnv, KnownHostsFile string
-	Keep                                                                                            int
-	Timeout                                                                                         time.Duration
+	// SnapshotBase identifies this installation's database filename. It prevents a
+	// restore from selecting another installation's backup in a shared target.
+	SnapshotBase string
+	Keep         int
+	Timeout      time.Duration
 }
 
 // Upload sends src under its base name. S3 PutObject is all-or-nothing; SFTP
@@ -61,6 +64,9 @@ func Upload(ctx context.Context, target Target, src string) error {
 // permissions. The caller owns removing the returned file after state.Restore
 // has verified and staged it.
 func DownloadLatest(ctx context.Context, target Target, dir string) (string, error) {
+	if target.SnapshotBase == "" {
+		return "", fmt.Errorf("remote restore requires a snapshot base name")
+	}
 	if target.Timeout <= 0 {
 		target.Timeout = 5 * time.Minute
 	}
@@ -146,7 +152,7 @@ func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
 	}
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.Contains(e.Name(), ".backup-") {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), t.SnapshotBase+".backup-") {
 			names = append(names, e.Name())
 		}
 	}
@@ -209,7 +215,7 @@ func downloadS3(ctx context.Context, t Target, dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	prefix := strings.Trim(t.Prefix, "/")
+	prefix := path.Join(strings.Trim(t.Prefix, "/"), t.SnapshotBase+".backup-")
 	pager := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: &t.Bucket, Prefix: &prefix})
 	var newest *types.Object
 	for pager.HasMorePages() {
@@ -232,8 +238,9 @@ func downloadS3(ctx context.Context, t Target, dir string) (string, error) {
 		return "", fmt.Errorf("create restore temp file: %w", err)
 	}
 	name := out.Name()
+	ok := false
 	defer func() {
-		if err != nil {
+		if !ok {
 			_ = os.Remove(name)
 		}
 	}()
@@ -258,6 +265,7 @@ func downloadS3(ctx context.Context, t Target, dir string) (string, error) {
 	if fileErr != nil {
 		return "", fileErr
 	}
+	ok = true
 	return name, nil
 }
 
