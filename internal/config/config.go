@@ -326,22 +326,27 @@ func (b *StateBackup) normalize() error {
 
 // BackupTarget is one off-host snapshot destination.
 type BackupTarget struct {
-	Type                    string        `yaml:"type"` // s3, cos, or sftp
-	Name                    string        `yaml:"name"`
-	Bucket                  string        `yaml:"bucket"`
-	Prefix                  string        `yaml:"prefix"`
-	Endpoint                string        `yaml:"endpoint"`
-	Region                  string        `yaml:"region"`
-	Host                    string        `yaml:"host"`
-	Username                string        `yaml:"username"`
-	RemoteDir               string        `yaml:"remoteDir"`
-	PasswordEnv             string        `yaml:"passwordEnv"`
-	PrivateKeyFile          string        `yaml:"privateKeyFile"`
-	PrivateKeyPassphraseEnv string        `yaml:"privateKeyPassphraseEnv"`
-	KnownHostsFile          string        `yaml:"knownHostsFile"`
-	Keep                    int           `yaml:"keep"`
-	Timeout                 string        `yaml:"timeout"`
-	TimeoutDur              time.Duration `yaml:"-"`
+	Type                    string `yaml:"type"` // s3, cos, or sftp
+	Name                    string `yaml:"name"`
+	Bucket                  string `yaml:"bucket"`
+	Prefix                  string `yaml:"prefix"`
+	Endpoint                string `yaml:"endpoint"`
+	Region                  string `yaml:"region"`
+	Host                    string `yaml:"host"`
+	Username                string `yaml:"username"`
+	RemoteDir               string `yaml:"remoteDir"`
+	PasswordEnv             string `yaml:"passwordEnv"`
+	PrivateKeyFile          string `yaml:"privateKeyFile"`
+	PrivateKeyPassphraseEnv string `yaml:"privateKeyPassphraseEnv"`
+	KnownHostsFile          string `yaml:"knownHostsFile"`
+	// SecretIDEnv / SecretKeyEnv are COS credential environment-variable names.
+	// They default to TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY for COS
+	// and are ignored by AWS S3, which keeps using its standard credential chain.
+	SecretIDEnv  string        `yaml:"secretIdEnv"`
+	SecretKeyEnv string        `yaml:"secretKeyEnv"`
+	Keep         int           `yaml:"keep"`
+	Timeout      string        `yaml:"timeout"`
+	TimeoutDur   time.Duration `yaml:"-"`
 }
 
 func (t *BackupTarget) normalize(i int) error {
@@ -354,6 +359,14 @@ func (t *BackupTarget) normalize(i int) error {
 		}
 		if t.Type == "cos" && strings.TrimSpace(t.Endpoint) == "" {
 			return fmt.Errorf("stateBackup.remoteTargets[%d].endpoint is required for cos", i)
+		}
+		if t.Type == "cos" {
+			if t.SecretIDEnv == "" {
+				t.SecretIDEnv = "TENCENTCLOUD_SECRET_ID"
+			}
+			if t.SecretKeyEnv == "" {
+				t.SecretKeyEnv = "TENCENTCLOUD_SECRET_KEY"
+			}
 		}
 	case "sftp":
 		if t.Host == "" || t.Username == "" || t.RemoteDir == "" || t.KnownHostsFile == "" {

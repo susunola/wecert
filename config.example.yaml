@@ -45,6 +45,9 @@ stateBackup:
   #     bucket: wecert-1250000000
   #     endpoint: https://cos.ap-guangzhou.myqcloud.com
   #     region: ap-guangzhou
+  #     # COS reads these by default (custom env variable names are supported).
+  #     # secretIdEnv: TENCENTCLOUD_SECRET_ID
+  #     # secretKeyEnv: TENCENTCLOUD_SECRET_KEY
   #   - name: offsite-sftp
   #     type: sftp
   #     host: backup.example.net:22

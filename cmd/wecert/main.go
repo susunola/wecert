@@ -660,7 +660,7 @@ func takeSnapshots(ctx context.Context, store *state.Store, dirs []string, remot
 	}
 	if uploaded != "" {
 		for _, target := range remote {
-			err := backup.Upload(ctx, backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: target.Prefix, Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: target.RemoteDir, PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, Keep: target.Keep, Timeout: target.TimeoutDur}, uploaded)
+			err := backup.Upload(ctx, backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: target.Prefix, Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: target.RemoteDir, PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, SecretIDEnv: target.SecretIDEnv, SecretKeyEnv: target.SecretKeyEnv, Keep: target.Keep, Timeout: target.TimeoutDur}, uploaded)
 			if err != nil {
 				log.Error("remote state snapshot upload failed", "target", target.Name, "type", target.Type, "err", err)
 				metrics.BackupRemoteErrors.WithLabelValues(target.Name, target.Type).Inc()

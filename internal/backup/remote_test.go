@@ -27,6 +27,8 @@ func TestCOSUploadAndRestore(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "test-access-key")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
 	t.Setenv("AWS_REGION", "test-region")
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "test-cos-id")
+	t.Setenv("TENCENTCLOUD_SECRET_KEY", "test-cos-key")
 	var (
 		mu      sync.Mutex
 		objects = map[string][]byte{}
@@ -45,7 +47,7 @@ func TestCOSUploadAndRestore(t *testing.T) {
 			}
 			objects[key] = body
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
+		case r.Method == http.MethodGet && (key == "" || r.URL.Path == "/bucket"):
 			prefix := r.URL.Query().Get("prefix")
 			var keys []string
 			for name := range objects {

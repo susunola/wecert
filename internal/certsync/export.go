@@ -58,7 +58,7 @@ func Export(ctx context.Context, cfg *config.CertificateExport, cert string, ful
 	}
 	for _, target := range cfg.RemoteTargets {
 		for name := range files {
-			t := backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: filepath.ToSlash(filepath.Join(target.Prefix, cert)), Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: filepath.ToSlash(filepath.Join(target.RemoteDir, cert)), PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, Timeout: target.TimeoutDur}
+			t := backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: filepath.ToSlash(filepath.Join(target.Prefix, cert)), Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: filepath.ToSlash(filepath.Join(target.RemoteDir, cert)), PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, SecretIDEnv: target.SecretIDEnv, SecretKeyEnv: target.SecretKeyEnv, Timeout: target.TimeoutDur}
 			if err := backup.Upload(ctx, t, filepath.Join(dir, name)); err != nil {
 				return fmt.Errorf("export %s to remote target %s: %w", cert, target.Name, err)
 			}

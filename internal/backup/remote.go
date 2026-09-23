@@ -16,6 +16,7 @@ import (
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/pkg/sftp"
@@ -34,6 +35,7 @@ const (
 type Target struct {
 	Type, Name, Bucket, Prefix, Endpoint, Region                                                    string
 	Host, Username, RemoteDir, PasswordEnv, PrivateKeyFile, PrivateKeyPassphraseEnv, KnownHostsFile string
+	SecretIDEnv, SecretKeyEnv                                                                       string
 	// SnapshotBase identifies this installation's database filename. It prevents a
 	// restore from selecting another installation's backup in a shared target.
 	SnapshotBase string
@@ -200,12 +202,23 @@ func objectClient(ctx context.Context, t Target) (*s3.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load object-store credentials: %w", err)
 	}
+	if t.Type == TypeCOS {
+		idEnv, keyEnv := t.SecretIDEnv, t.SecretKeyEnv
+		if idEnv == "" {
+			idEnv = "TENCENTCLOUD_SECRET_ID"
+		}
+		if keyEnv == "" {
+			keyEnv = "TENCENTCLOUD_SECRET_KEY"
+		}
+		id, key := os.Getenv(idEnv), os.Getenv(keyEnv)
+		if id == "" || key == "" {
+			return nil, fmt.Errorf("COS credentials require non-empty %s and %s", idEnv, keyEnv)
+		}
+		cfg.Credentials = credentials.NewStaticCredentialsProvider(id, key, "")
+	}
 	return s3.NewFromConfig(cfg, func(o *s3.Options) {
 		if t.Endpoint != "" {
 			o.BaseEndpoint = &t.Endpoint
-		}
-		if t.Type == TypeCOS {
-			o.UsePathStyle = true
 		}
 	}), nil
 }
@@ -216,18 +229,15 @@ func downloadS3(ctx context.Context, t Target, dir string) (string, error) {
 		return "", err
 	}
 	prefix := path.Join(strings.Trim(t.Prefix, "/"), t.SnapshotBase+".backup-")
-	pager := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: &t.Bucket, Prefix: &prefix})
+	objects, err := listObjects(ctx, client, t, prefix)
+	if err != nil {
+		return "", fmt.Errorf("list remote snapshots: %w", err)
+	}
 	var newest *types.Object
-	for pager.HasMorePages() {
-		page, err := pager.NextPage(ctx)
-		if err != nil {
-			return "", fmt.Errorf("list remote snapshots: %w", err)
-		}
-		for i := range page.Contents {
-			o := &page.Contents[i]
-			if newest == nil || (o.Key != nil && newest.Key != nil && *o.Key > *newest.Key) {
-				newest = o
-			}
+	for i := range objects {
+		o := &objects[i]
+		if newest == nil || (o.Key != nil && newest.Key != nil && *o.Key > *newest.Key) {
+			newest = o
 		}
 	}
 	if newest == nil || newest.Key == nil {
@@ -296,14 +306,9 @@ func uploadS3(ctx context.Context, t Target, src string) error {
 func pruneS3(ctx context.Context, client *s3.Client, t Target, current string) error {
 	base := strings.Split(filepath.Base(current), ".backup-")[0]
 	prefix := path.Join(strings.Trim(t.Prefix, "/"), base+".backup-")
-	pager := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: &t.Bucket, Prefix: &prefix})
-	var objects []types.Object
-	for pager.HasMorePages() {
-		page, err := pager.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("list remote snapshots: %w", err)
-		}
-		objects = append(objects, page.Contents...)
+	objects, err := listObjects(ctx, client, t, prefix)
+	if err != nil {
+		return fmt.Errorf("list remote snapshots: %w", err)
 	}
 	// Snapshot names sort chronologically, and only this deployment's base name is uploaded by one target.
 	if len(objects) <= t.Keep {
@@ -313,11 +318,43 @@ func pruneS3(ctx context.Context, client *s3.Client, t Target, current string) e
 	for _, object := range objects[:len(objects)-t.Keep] {
 		victims = append(victims, types.ObjectIdentifier{Key: object.Key})
 	}
-	_, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: &t.Bucket, Delete: &types.Delete{Objects: victims, Quiet: ptr(true)}})
+	_, err = client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: &t.Bucket, Delete: &types.Delete{Objects: victims, Quiet: ptr(true)}})
 	if err != nil {
 		return fmt.Errorf("prune remote snapshots: %w", err)
 	}
 	return nil
+}
+
+// listObjects uses COS's broadly-supported ListObjects (V1) endpoint. COS is
+// S3-compatible for object I/O but some deployments answer ListObjectsV2 with
+// NoSuchKey, which otherwise makes both restore and retention fail after a
+// successful upload.
+func listObjects(ctx context.Context, client *s3.Client, t Target, prefix string) ([]types.Object, error) {
+	var objects []types.Object
+	if t.Type == TypeCOS {
+		input := &s3.ListObjectsInput{Bucket: &t.Bucket, Prefix: &prefix}
+		for {
+			page, err := client.ListObjects(ctx, input)
+			if err != nil {
+				return nil, err
+			}
+			objects = append(objects, page.Contents...)
+			if page.IsTruncated == nil || !*page.IsTruncated || page.NextMarker == nil {
+				break
+			}
+			input.Marker = page.NextMarker
+		}
+		return objects, nil
+	}
+	pager := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: &t.Bucket, Prefix: &prefix})
+	for pager.HasMorePages() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		objects = append(objects, page.Contents...)
+	}
+	return objects, nil
 }
 
 func ptr[T any](v T) *T { return &v }
