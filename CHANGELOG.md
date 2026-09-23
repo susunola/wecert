@@ -9,6 +9,12 @@
   in the desired-state document). `GET /status` is a read-only register: filter
   by account, attention and expiry, search, and expand a row for CLB bindings.
   Empty `uin` is omitted rather than invented.
+- **The inventory names the region a certificate is bound in.** Each row carries `regions`
+  (and the page a Region column), read from the live binding rows rather than from
+  configuration: a Tencent Cloud SSL certificate is not itself regional, and `tencent.regions`
+  is the deployment's search list, not a property of one certificate. Absent means no
+  enumeration has named one, so an unenumerated certificate shows nothing instead of a guess.
+  The CLB column no longer repeats the region.
 
 ### Fixed
 

@@ -3,6 +3,7 @@ package inventory
 import (
 	"bytes"
 	"fmt"
+	"html"
 	"strings"
 	"testing"
 	"time"
@@ -139,5 +140,36 @@ func TestWritePageOffersEveryAccountInOneControl(t *testing.T) {
 	}
 	if !strings.Contains(html, `aria-haspopup="listbox"`) {
 		t.Fatal("the account control must be a listbox popup, so it can be opened and filtered")
+	}
+}
+
+func TestWritePageNamesTheRegionFromTheBindings(t *testing.T) {
+	snap := Snapshot{
+		Certificates: []Certificate{
+			{Name: "two-regions", Status: StatusOK, Domains: []string{"a.example"},
+				Regions:  []string{"ap-guangzhou", "ap-singapore"},
+				Bindings: Bindings{Count: 2, Complete: true, Freshness: FreshnessCached, Items: []BindingItem{}}},
+			{Name: "unseen", Status: StatusOK, Domains: []string{"b.example"}},
+		},
+	}
+	var buf bytes.Buffer
+	if err := WritePage(&buf, snap); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, ">Region</th>") {
+		t.Fatal("the region column must be named")
+	}
+	// html/template escapes "+" as &#43; -- correct in the response, but read the
+	// decoded text here so the assertion is about what the operator sees.
+	plain := html.UnescapeString(out)
+	if !strings.Contains(plain, "Guangzhou +1") {
+		t.Fatal("two regions must summarise as the first plus a count")
+	}
+	if !strings.Contains(out, `title="ap-guangzhou, ap-singapore"`) {
+		t.Fatal("the full region list belongs in the tooltip")
+	}
+	if strings.Contains(out, `title=""`) {
+		t.Fatal("an unknown region must not carry an empty tooltip")
 	}
 }

@@ -76,6 +76,11 @@ page exists only in daemon mode, same as `/metrics` and the hooks.
   list, same as the probe runner.
 - Clock for `daysLeft` is the process clock already used by
   `config.DaysUntil`.
+- `regions` is observed, not configured: it is the set of regions named by the
+  live binding rows. A Tencent Cloud SSL certificate is not itself regional --
+  the regions are the load balancers it is attached to -- and `tencent.regions`
+  is the deployment's search list, not a property of one certificate. Absent
+  means no enumeration has named one; it is never filled in with a guess.
 
 ### Status values
 
@@ -147,6 +152,7 @@ Three notes decide whether the page can be believed:
       "profile": "classic",
       "keyType": "ecdsa-p256",
       "domains": ["example.com", "*.example.com"],
+      "regions": ["ap-guangzhou"],
       "notAfter": "2026-12-20T00:00:00Z",
       "daysLeft": 89,
       "issuedAt": "2026-09-21T12:00:00Z",
@@ -229,20 +235,27 @@ One HTML page, no JavaScript framework, no external CDN. A small script
 may filter the already-rendered table. Default refresh is not required.
 
 ```
-Inventory                            Read-only
-wecert · 12 certificates · 2 UINs
+wecert  certificate inventory                      Read-only  2026-09-22T16:30:02Z
+Inventory                                    desired state rev-2026-09-22.3
+12 certificates  2 accounts  1 waiting bind  0 failing  2 expiring  ...
 
-UIN: [All] [100012345678] [100098765432]
-filter: [all] [attention] [expiring]     q: ________
+[All accounts ▾]  [All|Attention|Expiring]        search name, domain, account, CLB
 
-100012345678 · 8 certs
-status          name            names              CLB                     days    443
-Waiting bind    example-com     example.com +1     —                         89      —
+100012345678 · 8 certificates
+STATUS         CERTIFICATE   NAMES             REGION       CLB                DAYS  PROBE
+Waiting bind   example-com   example.com +1    —            —                  89    —
+Healthy        cdn-static    static.ex… +2     Guangzhou    lb-8f3k2m1p +1     77    Match
 ```
+
+The account control is a single-select picker, not a row of chips: an
+installation can carry hundreds of accounts, and the picker lists each one with
+its certificate count and filters as you type. The summary bar always reports
+the whole fleet, so a filtered table is never mistaken for the fleet.
 
 Click a row to expand:
 
 - full SAN list
+- the regions the bindings were observed in, and the profile and key type
 - each binding row: region, resource type, load-balancer id, listener id,
   protocol:port, SNI domain, role (`primary` / `ext`)
 - each probe host: match, trusted, served notAfter, problem kind

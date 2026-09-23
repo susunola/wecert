@@ -73,6 +73,15 @@ var pageTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 		}
 		return "probe-bad"
 	},
+	"regions": func(list []string) string {
+		if len(list) == 0 {
+			return "—"
+		}
+		if len(list) == 1 {
+			return regionLabel(list[0])
+		}
+		return regionLabel(list[0]) + " +" + strconv.Itoa(len(list)-1)
+	},
 	"bind":      bindLabel,
 	"status":    statusLabel,
 	"class":     statusClass,
@@ -185,7 +194,7 @@ func clbLine(c Certificate) string {
 			continue
 		}
 		have[it.LoadBalancerID] = struct{}{}
-		seen = append(seen, regionLabel(it.Region)+"  "+it.LoadBalancerID)
+		seen = append(seen, it.LoadBalancerID)
 	}
 	if len(seen) == 0 {
 		return bindLabel(c.Bindings, c.Status)
@@ -270,8 +279,8 @@ const pageHTML = `<!DOCTYPE html>
 <style>
 :root{
  color-scheme:dark;
- --bg:#0d1117; --panel:#161b22; --raised:#1c2128; --sunken:#010409;
- --line:#21262d; --line-strong:#30363d;
+ --bg:#0d1117; --panel:#12171f; --raised:#1a212b; --sunken:#0a0e13;
+ --line:#232b36; --line-strong:#323b47;
  --fg:#e6edf3; --muted:#8b949e; --faint:#6e7681;
  --accent:#2fbfa8; --accent-fg:#04211d;
  --ok:63 185 80; --warn:210 153 34; --danger:248 81 73; --info:88 166 255; --neutral:139 148 158;
@@ -363,14 +372,24 @@ h1{font-size:19px;font-weight:650;letter-spacing:-.01em;margin:0}
    containing block, and the table header then sticks 38px below the panel's own top
    edge, covering the first row. Narrow screens opt into scrolling below. */
 .panel{background:var(--bg);border:1px solid var(--line);border-radius:var(--r)}
-table{border-collapse:separate;border-spacing:0;width:100%}
-th{position:sticky;top:38px;z-index:3;background:var(--bg);text-align:left;white-space:nowrap;
+table{border-collapse:separate;border-spacing:0;width:100%;table-layout:fixed}
+/* Widths live on the header cells: with a fixed layout those are the ones
+   the browser reads, and the colspan detail row is left alone. */
+/* The status cell must never wrap: the caret plus the longest label ("Probe
+   unreachable", 134px + 12px) has to fit inside the column minus its padding, or
+   that one row grows taller than every other row and the table looks misaligned.
+   186px leaves room for a label a little longer than today's longest. */
+th:nth-child(1),td:nth-child(1){width:186px;white-space:nowrap}
+th:nth-child(2){width:16%}
+th:nth-child(4){width:118px} th:nth-child(5){width:20%}
+th:nth-child(6){width:60px} th:nth-child(7){width:98px}
+th{position:sticky;top:38px;z-index:3;background:var(--panel);text-align:left;white-space:nowrap;
  font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
  padding:6px 12px;border-bottom:1px solid var(--line-strong)}
 td{padding:6px 12px;border-bottom:1px solid var(--line);vertical-align:middle;font-size:13px}
 tbody tr:last-child td{border-bottom:0}
-tr.group td{background:var(--sunken);color:var(--muted);font-size:11.5px;padding:5px 12px}
-tr.group b{color:var(--fg);font-weight:600}
+tr.group td{background:var(--raised);color:var(--muted);font-size:11px;letter-spacing:.03em;padding:5px 12px}
+tr.group b{color:var(--fg);font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 tr.row{cursor:pointer}
 tr.row:hover{background:var(--raised)}
 tr.row.on{background:var(--raised)}
@@ -379,8 +398,8 @@ tr.row.on td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
  border-left:4px solid var(--faint);border-top:4px solid transparent;border-bottom:4px solid transparent;transition:transform .1s ease}
 tr.row.on .caret{transform:rotate(90deg);border-left-color:var(--accent)}
 td.name{font-weight:550}
-.tag{display:inline-flex;align-items:center;gap:6px;padding:1px 6px;border-radius:var(--r-tag);
- font-size:11.5px;border:1px solid transparent;white-space:nowrap}
+.tag{display:inline-flex;align-items:center;gap:6px;padding:2px 7px;border-radius:var(--r-tag);
+ font-size:12px;border:1px solid transparent;white-space:nowrap}
 .tag i{width:6px;height:6px;border-radius:1px;background:currentColor;flex:none}
 .s-ok{color:rgb(var(--ok));background:rgb(var(--ok) / .12);border-color:rgb(var(--ok) / .3)}
 .s-wait{color:rgb(var(--warn));background:rgb(var(--warn) / .12);border-color:rgb(var(--warn) / .3)}
@@ -492,28 +511,29 @@ ul.tokens li{display:inline-block;margin:0 5px 5px 0;padding:1px 7px;border-radi
   <table>
   <thead>
   <tr>
-    <th scope="col">Status</th><th scope="col">Certificate</th><th scope="col">Names</th><th scope="col">CLB</th><th scope="col" class="num">Days</th><th scope="col" class="wide">Probe</th>
+    <th scope="col">Status</th><th scope="col">Certificate</th><th scope="col">Names</th><th scope="col">Region</th><th scope="col">CLB</th><th scope="col" class="num">Days</th><th scope="col" class="wide">Probe</th>
   </tr>
   </thead>
   <tbody>
   {{if not .Certificates}}
-  <tr><td colspan="6" class="empty">No certificates in this snapshot.</td></tr>
+  <tr><td colspan="7" class="empty">No certificates in this snapshot.</td></tr>
   {{else}}
   {{range .Accounts}}
   {{if $.ShowGroups}}
-  <tr class="group" data-group="{{.UIN}}"><td colspan="6"><b>{{if .UIN}}{{.UIN}}{{else}}unspecified account{{end}}</b> · {{.Count}} certificate{{if ne .Count 1}}s{{end}}</td></tr>
+  <tr class="group" data-group="{{.UIN}}"><td colspan="7"><b>{{if .UIN}}{{.UIN}}{{else}}unspecified account{{end}}</b> · {{.Count}} certificate{{if ne .Count 1}}s{{end}}</td></tr>
   {{end}}
   {{range .Certificates}}
   <tr class="row" data-row tabindex="0" aria-expanded="false" data-uin="{{.UIN}}" data-status="{{.Status}}" data-q="{{qblob .}}" data-attention="{{if attention .Status}}1{{else}}0{{end}}">
     <td><span class="caret" aria-hidden="true"></span><span class="tag {{class .Status}}"><i aria-hidden="true"></i>{{status .Status}}</span></td>
     <td class="name">{{.Name}}</td>
     <td class="mono">{{names .}}</td>
+    <td class="mono" title="{{if .Regions}}{{join .Regions ", "}}{{else}}no binding enumeration has named a region for this certificate{{end}}">{{regions .Regions}}</td>
     <td class="mono">{{clb .}}</td>
     <td class="num {{if eq .Status "expiring"}}days-soon{{end}}">{{days .DaysLeft}}</td>
     <td class="wide {{probeClass .Probe}}">{{probe .Probe}}</td>
   </tr>
   <tr class="detail hidden" data-detail>
-    <td colspan="6">
+    <td colspan="7">
       <div class="dgrid">
         <div class="dsec">
           <h3>Certificate</h3>
@@ -524,6 +544,7 @@ ul.tokens li{display:inline-block;margin:0 5px 5px 0;padding:1px 7px;border-radi
             <dt>Cert id</dt><dd class="mono">{{if .DeployedCertID}}{{.DeployedCertID}}{{else}}not uploaded{{end}}</dd>
             <dt>Profile</dt><dd>{{if .Profile}}{{.Profile}}{{else}}—{{end}}{{if .KeyType}} · {{.KeyType}}{{end}}</dd>
             <dt>Names</dt><dd class="mono">{{if .Domains}}{{join .Domains ", "}}{{else}}—{{end}}</dd>
+            <dt>Regions</dt><dd class="mono">{{if .Regions}}{{join .Regions ", "}}{{else}}unknown — no binding enumeration has named one{{end}}</dd>
             {{if .ARI}}<dt>ARI window</dt><dd class="mono">{{if .ARI.WindowStart}}{{.ARI.WindowStart}}{{else}}—{{end}} → {{if .ARI.WindowEnd}}{{.ARI.WindowEnd}}{{else}}—{{end}}</dd>{{end}}
             <dt>Failures</dt><dd>{{.ConsecutiveFailures}}{{if .NextAttemptAt}} · next <span class="mono nowrap">{{.NextAttemptAt}}</span>{{end}}</dd>
           </dl>
