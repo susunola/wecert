@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A `*_file` credential path that is group- or world-readable warns at load time.**
+  The field comments promise a 0600 file, but `resolveSecretFiles` only read it -- a 0644
+  `loginTokenFile` / `apiTokenFile` / `secretAccessKeyFile` was accepted silently. The
+  warning names the field and the mode (a systemd `LoadCredential` path is usually already
+  0400 and does not warn). `sessionTokenFile` without a static key pair is refused the same
+  way as the inline `sessionToken`, with a regression test.
+
 ### Added
 
 - **Cloudflare and Route 53 are DNS-01 providers in the default build.** `dns.provider:

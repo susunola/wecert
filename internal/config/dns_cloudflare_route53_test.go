@@ -546,3 +546,66 @@ dns:
 		t.Errorf("the cloudflare floor must not be applied to dnspod: %v", err)
 	}
 }
+
+// A session token FILE without a static pair must be refused, the same as the inline field.
+//
+// The inline case is in TestRoute53StaticKeysMustBePaired; this is the file variant. resolve()
+// fills SessionToken from the file first, so the pair check sees a value and refuses -- but that
+// path is easy to break by checking the file field instead of the resolved one.
+func TestSessionTokenFileWithoutAStaticPairIsRefused(t *testing.T) {
+	clearDNSProviderEnv(t)
+
+	secret := filepath.Join(t.TempDir(), "session")
+	if err := os.WriteFile(secret, []byte("fake-session\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(writeConfig(t, minimalWithDNS+`
+dns:
+  provider: route53
+  route53:
+    region: us-east-1
+    sessionTokenFile: `+secret+`
+`))
+	if err == nil {
+		t.Fatal("sessionTokenFile without a static key pair must be refused at load time")
+	}
+	if !strings.Contains(err.Error(), "dns.route53.sessionToken") {
+		t.Errorf("the refusal must name dns.route53.sessionToken, got %q", err)
+	}
+}
+
+// The *_file credential paths are documented as 0600. A wider file is a warning, not a
+// refusal -- the same call configPermWarnings makes for an inline secret in a 0644 config.
+func TestSecretFilePermissionsAreWarnedAbout(t *testing.T) {
+	// Pure helper, like configPermWarnings: wording is the contract.
+	if w := secretFilePermWarnings("dns.loginToken", "/etc/wecert/tok", 0o600); len(w) != 0 {
+		t.Errorf("0600 must not warn, got %v", w)
+	}
+	if w := secretFilePermWarnings("dns.loginToken", "/etc/wecert/tok", 0o400); len(w) != 0 {
+		t.Errorf("0400 (systemd LoadCredential) must not warn, got %v", w)
+	}
+	if w := secretFilePermWarnings("dns.cloudflare.apiToken", "/etc/wecert/cf", 0o644); len(w) != 1 {
+		t.Fatalf("0644 must warn, got %v", w)
+	} else if !strings.Contains(w[0], "dns.cloudflare.apiToken") || !strings.Contains(w[0], "0644") {
+		t.Errorf("the warning must name the field and the mode, got %q", w[0])
+	}
+	if w := secretFilePermWarnings("dns.route53.secretAccessKey", "/run/cred/sk", 0o640); len(w) != 1 {
+		t.Errorf("0640 must warn (group-readable), got %v", w)
+	}
+
+	// End to end: Load surfaces the warning for a wide secret file (it still loads).
+	clearDNSProviderEnv(t)
+	wide := filepath.Join(t.TempDir(), "cf-token")
+	if err := os.WriteFile(wide, []byte("fake-cloudflare-token\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(writeConfig(t, minimalWithDNS+`
+dns:
+  provider: cloudflare
+  cloudflare:
+    apiTokenFile: `+wide+`
+`)); err != nil {
+		t.Fatalf("a wide secret file must still load (warn, not refuse): %v", err)
+	}
+}

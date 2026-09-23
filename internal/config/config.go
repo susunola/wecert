@@ -907,7 +907,8 @@ var profileValidity = map[string]time.Duration{
 // people to ignore logs. A quarter of the validity is early enough to act on and late
 // enough to mean something. The metrics remain the primary expiry signal; this is a
 // secondary log line.
-func (c *Config) resolveSecretFiles() error {
+func (c *Config) resolveSecretFiles() ([]string, error) {
+	var warns []string
 	resolve := func(field, value, file string, envs []string, target *string) error {
 		if value != "" && file != "" {
 			return fmt.Errorf("%s and its file variant are both set; keep one of them so it is "+
@@ -924,6 +925,9 @@ func (c *Config) resolveSecretFiles() error {
 			if err != nil {
 				return fmt.Errorf("read %s from %s: %w (the path is environment-expanded, so "+
 					"${CREDENTIALS_DIRECTORY} is only set when systemd runs this)", field, path, err)
+			}
+			if fi, statErr := os.Stat(path); statErr == nil {
+				warns = append(warns, secretFilePermWarnings(field, path, fi.Mode().Perm())...)
 			}
 			secret := strings.TrimSpace(string(raw))
 			if secret == "" {
@@ -944,7 +948,7 @@ func (c *Config) resolveSecretFiles() error {
 
 	if err := resolve("dns.loginToken", c.DNS.LoginToken, c.DNS.LoginTokenFile,
 		[]string{EnvDNSPodLoginToken}, &c.DNS.LoginToken); err != nil {
-		return err
+		return warns, err
 	}
 
 	// The two provider blocks below are resolved only when their provider is the selected one.
@@ -960,7 +964,7 @@ func (c *Config) resolveSecretFiles() error {
 			c.DNS.Cloudflare.APITokenFile,
 			[]string{EnvCloudflareAPIToken, EnvCloudflareAPITokenAlt},
 			&c.DNS.Cloudflare.APIToken); err != nil {
-			return err
+			return warns, err
 		}
 	}
 	if c.DNS.Provider == DNSProviderRoute53 {
@@ -981,23 +985,40 @@ func (c *Config) resolveSecretFiles() error {
 		// field would instead build a static provider out of half of a pair.
 		if err := resolve("dns.route53.secretAccessKey", c.DNS.Route53.SecretAccessKey,
 			c.DNS.Route53.SecretAccessKeyFile, nil, &c.DNS.Route53.SecretAccessKey); err != nil {
-			return err
+			return warns, err
 		}
 		if err := resolve("dns.route53.sessionToken", c.DNS.Route53.SessionToken,
 			c.DNS.Route53.SessionTokenFile, nil, &c.DNS.Route53.SessionToken); err != nil {
-			return err
+			return warns, err
 		}
 	}
 
 	if err := resolve("tencent.secretId", c.Tencent.SecretID, c.Tencent.SecretIDFile,
 		[]string{"TENCENTCLOUD_SECRET_ID"}, &c.Tencent.SecretID); err != nil {
-		return err
+		return warns, err
 	}
 	if err := resolve("tencent.secretKey", c.Tencent.SecretKey, c.Tencent.SecretKeyFile,
 		[]string{"TENCENTCLOUD_SECRET_KEY"}, &c.Tencent.SecretKey); err != nil {
-		return err
+		return warns, err
 	}
-	return nil
+	return warns, nil
+}
+
+// secretFilePermWarnings warns when a *_file credential path is readable by group or
+// other. Pure like configPermWarnings so the wording is testable without capturing
+// stderr. The file's own mode is the check: the config may live anywhere, and a
+// systemd LoadCredential directory is already 0400. A warning rather than a refusal,
+// matching configPermWarnings: refusing would push operators toward copying the secret
+// back into config.yaml.
+func secretFilePermWarnings(field, path string, perm os.FileMode) []string {
+	if perm&0o077 == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"the credential file for %s (%s) is readable by group or other (%04o). "+
+			"A secret in a wide file is in every backup and every archive of that path; "+
+			"chmod 0600 it (a systemd LoadCredential path is usually already 0400)",
+		field, path, perm)}
 }
 
 // EnvDNSPodLoginToken is the environment variable read when neither dns.loginToken nor

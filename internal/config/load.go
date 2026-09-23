@@ -51,7 +51,8 @@ func Load(path string) (*Config, error) {
 
 	// Resolve file- and environment-backed secrets before validation, so the validation rules see
 	// the credential that will actually be used rather than the field the operator left empty.
-	if err := cfg.resolveSecretFiles(); err != nil {
+	secretFileWarns, err := cfg.resolveSecretFiles()
+	if err != nil {
 		return nil, err
 	}
 
@@ -65,6 +66,7 @@ func Load(path string) (*Config, error) {
 	// plainly and left to the operator. See the helpers below; they are pure so the
 	// wording is testable without capturing stderr.
 	var warns []string
+	warns = append(warns, secretFileWarns...)
 	warns = append(warns, notifyURLWarnings(cfg.Webhook.NotifyURL)...)
 	warns = append(warns, listenWarnings("metrics.listen", cfg.Metrics.Listen)...)
 	warns = append(warns, listenWarnings("webhook.listen", cfg.Webhook.Listen)...)
