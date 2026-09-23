@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`install.sh` installs its own `make release` output again.** The unit checksum gate looked
+  for a `SHA256SUMS` beside `deploy/systemd/`, where none exists, and refused to continue --
+  so an install from a release layout failed on the units unless
+  `WECERT_INSECURE_SKIP_CHECKSUM=1` was set, which is the opposite of what the gate is for.
+  `make release` copies the units into `dist/systemd/` and lists them in `dist/SHA256SUMS`
+  (`systemd/wecert.service`), so the lookup now consults the release directory the binary came
+  from. The units are verified rather than refused: a tampered, unlisted, or symlinked unit is
+  still rejected, and the unit that gets installed is the one the checksum was computed over.
+
 ## 0.6.1 - 2026-09-23
 
 ### Fixed
