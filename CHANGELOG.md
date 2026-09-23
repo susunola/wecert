@@ -26,6 +26,20 @@
   A build in `-mod=readonly`, which is what CI runs, stopped at `go: updates to go.mod needed`
   and took the `test` and `install` jobs with it -- including the Linux release build. `go mod
   tidy` restores the list; no module version changes.
+- **A single dropped DNS packet no longer costs an authoritative server its whole propagation
+  round.** Every address of a zone is probed once per round, and an exchange that came back with no
+  answer at all put that address in the `unreachable` bucket for the rest of the round. On a flaky
+  path that can decide the verdict: on this machine the same zone reported different addresses
+  reachable in consecutive rounds (IPv6 addresses have no route here at all), and rounds that ended
+  the five-minute budget with a single independent nameserver confirming failed the propagation
+  check, which requires two independent servers to agree. `probeTXTWithExchange` now asks an
+  address that produced no answer twice, 250ms apart, before the round records it as unreachable.
+  Addresses are probed concurrently, so a round grows by that delay (250ms of a 300000ms budget,
+  under 0.1%) and not by delay times addresses. No verdict rule was relaxed: UDP stays first with
+  the TCP fallback on no answer, an answer of any kind is never re-asked (a `REFUSED` or `SERVFAIL`
+  is an answer, and re-asking would burn the budget and blur the `refused` / `failed` /
+  `unreachable` buckets), the evidence stays authoritative-only, and two independent servers must
+  still agree, with a single-authority zone still exempt.
 - **`install.sh` installs its own `make release` output again.** The unit checksum gate looked
   for a `SHA256SUMS` beside `deploy/systemd/`, where none exists, and refused to continue --
   so an install from a release layout failed on the units unless
