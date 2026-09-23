@@ -17,6 +17,7 @@ import (
 // DNSPod in this account" -- was unreachable, and the operator was told to check a permission that
 // was fine.
 func TestDomainNotExistsIsTreatedAsNoDomain(t *testing.T) {
+	t.Parallel()
 	err := tcerrors.NewTencentCloudSDKError(CodeDomainNotExists, "Domain not exist.", "req-1")
 	if !IsNoDataOfDomain(err) {
 		t.Errorf("%s must classify as \"no such domain\": it is what the live API returns", CodeDomainNotExists)
@@ -35,6 +36,7 @@ func TestDomainNotExistsIsTreatedAsNoDomain(t *testing.T) {
 // so a nil error from a polling loop panicked. Every sibling classifier already guarded
 // nil; this is the one that did not.
 func TestIsThrottledAcceptsNil(t *testing.T) {
+	t.Parallel()
 	if IsThrottled(nil) {
 		t.Error("IsThrottled(nil) must be false, not panic")
 	}
@@ -50,6 +52,7 @@ func TestIsThrottledAcceptsNil(t *testing.T) {
 }
 
 func TestIsNoDataOfRecord(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		err  error

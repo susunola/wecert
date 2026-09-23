@@ -9,6 +9,7 @@ import (
 )
 
 func TestRemainingStartsFull(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	// Nothing ever spent: the bucket is full. Reporting 0 here would tell an operator they
 	// have no quota on a fresh install.
@@ -18,6 +19,7 @@ func TestRemainingStartsFull(t *testing.T) {
 }
 
 func TestSpendThenRefill(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	l := NewOrdersPerAccount
 
@@ -41,6 +43,7 @@ func TestSpendThenRefill(t *testing.T) {
 }
 
 func TestRefillIsCappedAtCapacity(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	l := CertsPerExactIdentifierSet
 
@@ -65,6 +68,7 @@ func TestRefillIsCappedAtCapacity(t *testing.T) {
 }
 
 func TestOverSpendIsNotForgiven(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	l := CertsPerExactIdentifierSet
 
@@ -87,6 +91,7 @@ func TestOverSpendIsNotForgiven(t *testing.T) {
 }
 
 func TestBackwardClockDoesNotCreateTokens(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	l := NewOrdersPerAccount
 	s := Spend(Snapshot{}, l, 10, now)
@@ -106,6 +111,7 @@ func TestBackwardClockDoesNotCreateTokens(t *testing.T) {
 // refilled twice and the estimate reported quota the CA would refuse. The anchor therefore only
 // moves forward, and an already-credited interval can never be credited again.
 func TestASpendOnABackwardClockDoesNotReAnchorTheSnapshot(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	l := NewOrdersPerAccount
 
@@ -127,6 +133,7 @@ func TestASpendOnABackwardClockDoesNotReAnchorTheSnapshot(t *testing.T) {
 }
 
 func TestParseRetryAfter(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		msg  string
@@ -183,6 +190,7 @@ func TestParseRetryAfter(t *testing.T) {
 // consumed". Treating it as credit would mean a sign error in a caller *increases* the reported
 // allowance -- the direction that leads to issue attempts the CA then refuses.
 func TestNegativeCostDoesNotCreditTheBucket(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	l := NewOrdersPerAccount
 
@@ -203,6 +211,7 @@ func TestNegativeCostDoesNotCreditTheBucket(t *testing.T) {
 // Remaining divides by the interval, so this was `integer divide by zero`. Every Limit currently
 // comes from the table in this file, but Remaining takes one, so the function has to be total.
 func TestZeroRefillIntervalIsHandledNotPanicked(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	l := Limit{Name: "no-refill", Capacity: 5, Refill: 0}
 
@@ -228,6 +237,7 @@ func TestZeroRefillIntervalIsHandledNotPanicked(t *testing.T) {
 // time", i.e. not blocked, while looking like a successful parse -- so a malformed instant would
 // silently disable the block that protects the rate-limit budget.
 func TestZeroInstantIsNotADeadline(t *testing.T) {
+	t.Parallel()
 	if at, ok := ParseRetryAfter("retry after 0001-01-01 00:00:00 UTC"); ok {
 		t.Errorf("the zero instant means no deadline, not a parsed one; got %v with ok=true", at)
 	}
@@ -244,6 +254,7 @@ func TestZeroInstantIsNotADeadline(t *testing.T) {
 // package's own contract is the opposite ("an over-spend is not silently forgiven"), and the
 // existing over-spend test only ever READS the bucket afterwards, so it never saw this.
 func TestSpendingWhileInDebtCarriesTheDebt(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	l := AuthzFailuresPerIdentifier // capacity 5, one token back every 12m
 
@@ -288,6 +299,7 @@ func TestSpendingWhileInDebtCarriesTheDebt(t *testing.T) {
 // that watches it -- the estimate was wrong in the optimistic direction, which is the one this
 // package promises never to be wrong in (see the package comment's "lower bound").
 func TestSpendingAnIdleBucketStoresNoMoreThanCapacity(t *testing.T) {
+	t.Parallel()
 	l := Limit{Name: "certs-per-exact-identifier-set", Capacity: 5, Refill: 34 * time.Hour}
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	full := Snapshot{Tokens: l.Capacity, At: start}
@@ -325,6 +337,7 @@ func TestSpendingAnIdleBucketStoresNoMoreThanCapacity(t *testing.T) {
 // ever marked blocked, and the CRITICAL WecertRateLimitBlocked alert could not fire. The existing
 // test passed because it used a fabricated message with no suffix.
 func TestParseRetryAfterAcceptsTheRealMessage(t *testing.T) {
+	t.Parallel()
 	const want = "2026-09-18 12:34:56 UTC"
 	cases := []string{
 		"acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: too many new orders recently, " +
@@ -349,6 +362,7 @@ func TestParseRetryAfterAcceptsTheRealMessage(t *testing.T) {
 // The header form is the protocol's own answer and a CA may send it without repeating the
 // instant in the error message, so it must parse on its own.
 func TestParseRetryAfterHeader(t *testing.T) {
+	t.Parallel()
 	before := time.Now()
 	at, ok := ParseRetryAfterHeader("120")
 	if !ok {
@@ -377,6 +391,7 @@ func TestParseRetryAfterHeader(t *testing.T) {
 // which reads as "not blocked" for the response asking us to wait longest. The value fits an
 // int (so Atoi accepts it), which is exactly why the bound has to be checked separately.
 func TestParseRetryAfterHeaderRejectsAnOverflowingDelay(t *testing.T) {
+	t.Parallel()
 	// One above the largest delay that fits a time.Duration.
 	overflow := strconv.FormatInt(math.MaxInt64/int64(time.Second)+1, 10)
 	if at, ok := ParseRetryAfterHeader(overflow); ok {
@@ -400,6 +415,7 @@ func TestParseRetryAfterHeaderRejectsAnOverflowingDelay(t *testing.T) {
 // the moment the CA validates), which is why the comment on the limit says which part is the
 // published number and which part is our reading of it.
 func TestThePauseLimitCarriesItsPublishedNumbers(t *testing.T) {
+	t.Parallel()
 	l := ConsecutiveAuthzFailuresPerIdentifier
 	if l.Capacity != 1152 {
 		t.Errorf("capacity = %g, want 1152 (the published consecutive-failure count)", l.Capacity)
@@ -423,6 +439,7 @@ func TestThePauseLimitCarriesItsPublishedNumbers(t *testing.T) {
 // The pause is REPORTABLE (its blocked state is what an operator acts on) but not SPENDABLE (nothing
 // here spends against it), and every spendable limit must still be reportable.
 func TestThePauseIsReportableWithoutBeingSpendable(t *testing.T) {
+	t.Parallel()
 	var spendable, reportable bool
 	for _, l := range Spendable() {
 		if l.Name == ConsecutiveAuthzFailuresPerIdentifier.Name {

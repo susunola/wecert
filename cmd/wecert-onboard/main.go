@@ -163,40 +163,12 @@ Flags:
 	}
 
 	// Config provides the baseline; explicit flags override it.
-	zoneList := cfg.Onboarding.Zones
-	if explicit["zones"] {
-		zoneList = splitList(*zones)
-	}
-	if explicit["require-clb"] {
-		opts.RequireRule = *requireCLB
-	}
-	if explicit["allow"] {
-		opts.Allowlist = splitList(*allow)
-	}
-	if explicit["max-names"] {
-		opts.MaxNames = *maxNames
-	}
-	if explicit["profile"] {
-		opts.Profile = *profile
-	}
-	if explicit["keytype"] {
-		opts.KeyType = *keyType
-	}
-	if explicit["deploy"] {
-		opts.Deploy = *deploy
-	}
-	if explicit["grace"] {
-		opts.GracePeriod = *grace
-	}
-	if explicit["budget"] {
-		opts.Budget = *budget
-	}
-	if explicit["budget-window"] {
-		opts.BudgetWindow = *budgetWindow
-	}
-	if explicit["drop-threshold"] {
-		opts.DropThreshold = *drop
-	}
+	zoneList := applyExplicitFlags(explicit, &opts, flagValues{
+		zones: *zones, requireCLB: *requireCLB, allow: *allow,
+		maxNames: *maxNames, profile: *profile, keyType: *keyType,
+		deploy: *deploy, grace: *grace, budget: *budget,
+		budgetWindow: *budgetWindow, drop: *drop,
+	}, cfg.Onboarding.Zones)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -268,6 +240,60 @@ Flags:
 		return exitFrozen, nil
 	}
 	return exitOK, nil
+}
+
+// flagValues is the raw CLI values applyExplicitFlags consults.
+type flagValues struct {
+	zones               string
+	requireCLB          bool
+	allow               string
+	maxNames            int
+	profile, keyType    string
+	deploy              bool
+	grace, budgetWindow time.Duration
+	budget              int
+	drop                float64
+}
+
+// applyExplicitFlags overlays only the flags the operator actually set onto opts.
+// fs.Visit, not zero-value comparison: that cannot tell "-require-clb=false" from
+// "flag not passed".
+func applyExplicitFlags(explicit map[string]bool, opts *onboarding.Options, f flagValues, defaultZones []string) []string {
+	zoneList := defaultZones
+	if explicit["zones"] {
+		zoneList = splitList(f.zones)
+	}
+	if explicit["require-clb"] {
+		opts.RequireRule = f.requireCLB
+	}
+	if explicit["allow"] {
+		opts.Allowlist = splitList(f.allow)
+	}
+	if explicit["max-names"] {
+		opts.MaxNames = f.maxNames
+	}
+	if explicit["profile"] {
+		opts.Profile = f.profile
+	}
+	if explicit["keytype"] {
+		opts.KeyType = f.keyType
+	}
+	if explicit["deploy"] {
+		opts.Deploy = f.deploy
+	}
+	if explicit["grace"] {
+		opts.GracePeriod = f.grace
+	}
+	if explicit["budget"] {
+		opts.Budget = f.budget
+	}
+	if explicit["budget-window"] {
+		opts.BudgetWindow = f.budgetWindow
+	}
+	if explicit["drop-threshold"] {
+		opts.DropThreshold = f.drop
+	}
+	return zoneList
 }
 
 func printSummary(w io.Writer, rep *onboarding.Report, out string, dryRun, quiet bool) {

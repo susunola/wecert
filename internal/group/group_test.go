@@ -7,6 +7,7 @@ import (
 )
 
 func TestRegisteredDomainUsesThePublicSuffixList(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"example.com":            "example.com",
 		"api.example.com":        "example.com",
@@ -31,6 +32,7 @@ func TestRegisteredDomainUsesThePublicSuffixList(t *testing.T) {
 // co.uk, bundling a whole swathe of unrelated sites into one certificate -- and
 // LE counts quota by the PSL too, so both sides must use the same ruler.
 func TestRegisteredDomainDoesNotJustTakeTwoLabels(t *testing.T) {
+	t.Parallel()
 	if got := RegisteredDomain("a.b.example.co.uk"); got == "co.uk" {
 		t.Fatalf("must use the PSL rather than taking two labels, got %q", got)
 	}
@@ -39,6 +41,7 @@ func TestRegisteredDomainDoesNotJustTakeTwoLabels(t *testing.T) {
 // *.example.com covers exactly one label. This is the most common misunderstanding
 // and the top cause of "I added a domain but it never entered the certificate".
 func TestWildcardCoversExactlyOneLabel(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		wc, host string
 		want     bool
@@ -62,6 +65,7 @@ func TestWildcardCoversExactlyOneLabel(t *testing.T) {
 // declared, adding foo.example.com does not touch the SAN set, i.e. 0 issuances.
 // Without it, bulk-importing 50 subdomains is 50 re-issues = quota blown.
 func TestCoveredNamesDoNotEnterTheSANSet(t *testing.T) {
+	t.Parallel()
 	g := Group{
 		Registered: "example.com",
 		Name:       "example-com",
@@ -90,6 +94,7 @@ func TestCoveredNamesDoNotEnterTheSANSet(t *testing.T) {
 
 // With no wildcard, every name has to enter the SAN set on its own.
 func TestWithoutWildcardsEveryNameEntersTheSANSet(t *testing.T) {
+	t.Parallel()
 	g := Group{
 		Registered: "example.com",
 		Name:       "example-com",
@@ -109,6 +114,7 @@ func TestWithoutWildcardsEveryNameEntersTheSANSet(t *testing.T) {
 // It must never invent a wildcard: that lets the certificate handshake for any
 // subdomain, which is privilege expansion and must be an explicit declaration.
 func TestCoverNeverInventsAWildcard(t *testing.T) {
+	t.Parallel()
 	g := Group{
 		Registered: "example.com",
 		Name:       "example-com",
@@ -131,6 +137,7 @@ func TestCoverNeverInventsAWildcard(t *testing.T) {
 // Once that breaks, adding one domain conjures a new record in the state store
 // and the old record's order URL, ARI certID and deployed CertID all become orphans.
 func TestCertNameIsStableAsDomainsChange(t *testing.T) {
+	t.Parallel()
 	before, err := GroupBy([]string{"example.com"})
 	if err != nil {
 		t.Fatal(err)
@@ -160,6 +167,7 @@ func TestCertNameIsStableAsDomainsChange(t *testing.T) {
 // duplicated" on every round, -force does not help, and no certificate is ever
 // updated again.
 func TestCertNameIsInjective(t *testing.T) {
+	t.Parallel()
 	pairs := [][2]string{
 		{"a.co.uk", "a-co.uk"},       // multi-label public suffix
 		{"foo.com.au", "foo-com.au"}, // same shape, different suffix
@@ -178,6 +186,7 @@ func TestCertNameIsInjective(t *testing.T) {
 // The end-to-end consequence: declaring two colliding registered domains has to
 // yield two groups with distinct names.
 func TestGroupByGivesCollidingRegisteredDomainsDistinctNames(t *testing.T) {
+	t.Parallel()
 	groups, err := GroupBy([]string{"a.co.uk", "a-co.uk"})
 	if err != nil {
 		t.Fatal(err)
@@ -195,6 +204,7 @@ func TestGroupByGivesCollidingRegisteredDomainsDistinctNames(t *testing.T) {
 // mapping, and only once: everything else has to stay byte-for-byte the same, or
 // existing deployments get a spurious new certificate.
 func TestCertNameKeepsHyphenFreeNamesUnchanged(t *testing.T) {
+	t.Parallel()
 	unchanged := map[string]string{
 		"example.com": "example-com",
 		"a.co.uk":     "a-co-uk",
@@ -222,6 +232,7 @@ func TestCertNameKeepsHyphenFreeNamesUnchanged(t *testing.T) {
 // Identical input must yield byte-for-byte identical output, in the same order;
 // otherwise every generated document diffs all over and reviewability is zero.
 func TestGroupByIsIdempotent(t *testing.T) {
+	t.Parallel()
 	in := []string{"b.example.com", "a.example.com", "*.example.com", "example.com", "A.EXAMPLE.COM"}
 	first, err := GroupBy(in)
 	if err != nil {
@@ -243,6 +254,7 @@ func TestGroupByIsIdempotent(t *testing.T) {
 }
 
 func TestGroupBySplitsByRegisteredDomain(t *testing.T) {
+	t.Parallel()
 	got, err := GroupBy([]string{"a.example.com", "b.example.net", "c.example.com"})
 	if err != nil {
 		t.Fatal(err)
@@ -259,6 +271,7 @@ func TestGroupBySplitsByRegisteredDomain(t *testing.T) {
 // Exceeding the SAN limit returns a recognizable error so callers keep the
 // previous revision instead of dropping the whole group.
 func TestCoverRejectsOversizedGroups(t *testing.T) {
+	t.Parallel()
 	var names []string
 	for _, p := range []string{"a", "b", "c", "d"} {
 		names = append(names, p+".example.com")
@@ -274,6 +287,7 @@ func TestCoverRejectsOversizedGroups(t *testing.T) {
 }
 
 func TestNormalizeRejectsInvalidNames(t *testing.T) {
+	t.Parallel()
 	for _, bad := range []string{"", " ", "a..example.com", "-bad.example.com", "a.*.example.com"} {
 		if _, err := Normalize(bad); err == nil {
 			t.Errorf("Normalize(%q) must fail", bad)
