@@ -70,10 +70,119 @@ func DownloadLatest(ctx context.Context, target Target, dir string) (string, err
 	case TypeS3, TypeCOS:
 		return downloadS3(ctx, target, dir)
 	case TypeSFTP:
-		return "", fmt.Errorf("SFTP restore download is not wired yet")
+		return downloadSFTP(ctx, target, dir)
 	default:
 		return "", fmt.Errorf("unknown backup target type %q", target.Type)
 	}
+}
+
+type sftpSession struct {
+	client *sftp.Client
+	conn   *ssh.Client
+}
+
+func (s *sftpSession) Close() { _ = s.client.Close(); _ = s.conn.Close() }
+
+// openSFTP centralizes the credential and host-key checks shared by upload and restore.
+func openSFTP(ctx context.Context, t Target) (*sftpSession, error) {
+	callback, err := knownhosts.New(t.KnownHostsFile)
+	if err != nil {
+		return nil, fmt.Errorf("load SFTP known_hosts: %w", err)
+	}
+	var auth ssh.AuthMethod
+	if t.PrivateKeyFile != "" {
+		key, err := os.ReadFile(t.PrivateKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("read SFTP private key: %w", err)
+		}
+		var signer ssh.Signer
+		if t.PrivateKeyPassphraseEnv != "" {
+			signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(os.Getenv(t.PrivateKeyPassphraseEnv)))
+		} else {
+			signer, err = ssh.ParsePrivateKey(key)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse SFTP private key: %w", err)
+		}
+		auth = ssh.PublicKeys(signer)
+	} else {
+		password := os.Getenv(t.PasswordEnv)
+		if password == "" {
+			return nil, fmt.Errorf("SFTP password environment variable %q is empty", t.PasswordEnv)
+		}
+		auth = ssh.Password(password)
+	}
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", t.Host)
+	if err != nil {
+		return nil, fmt.Errorf("connect SFTP %s: %w", t.Host, err)
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = raw.SetDeadline(deadline)
+	}
+	cc, channels, requests, err := ssh.NewClientConn(raw, t.Host, &ssh.ClientConfig{User: t.Username, Auth: []ssh.AuthMethod{auth}, HostKeyCallback: callback})
+	if err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("connect SFTP %s: %w", t.Host, err)
+	}
+	_ = raw.SetDeadline(time.Time{})
+	conn := ssh.NewClient(cc, channels, requests)
+	client, err := sftp.NewClient(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("start SFTP: %w", err)
+	}
+	return &sftpSession{client: client, conn: conn}, nil
+}
+
+func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
+	session, err := openSFTP(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	defer session.Close()
+	entries, err := session.client.ReadDir(t.RemoteDir)
+	if err != nil {
+		return "", fmt.Errorf("list SFTP snapshots: %w", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.Contains(e.Name(), ".backup-") {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("no SFTP snapshots in %s", t.RemoteDir)
+	}
+	sort.Strings(names)
+	in, err := session.client.Open(path.Join(t.RemoteDir, names[len(names)-1]))
+	if err != nil {
+		return "", fmt.Errorf("open SFTP snapshot: %w", err)
+	}
+	defer in.Close()
+	out, err := os.CreateTemp(dir, ".wecert-remote-restore-*")
+	if err != nil {
+		return "", err
+	}
+	name := out.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(name)
+		}
+	}()
+	if err := out.Chmod(0o600); err != nil {
+		_ = out.Close()
+		return "", err
+	}
+	if _, err = io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return "", fmt.Errorf("download SFTP snapshot: %w", err)
+	}
+	if err = out.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return name, nil
 }
 
 func objectClient(ctx context.Context, t Target) (*s3.Client, error) {
