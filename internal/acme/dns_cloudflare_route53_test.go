@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -215,5 +216,79 @@ func TestCloudflareAndRoute53ConfigsKeepTheirSettings(t *testing.T) {
 	chain := route53Config(chainCfg)
 	if chain.AccessKeyID != "" || chain.SecretAccessKey != "" || chain.SessionToken != "" {
 		t.Errorf("no static credential is configured, so none may be invented: got %+v", chain)
+	}
+}
+
+// A token-file Cloudflare provider must outlive the call that created the record, and must still
+// be rebuilt when the file changes.
+//
+// lego's cloudflare provider deletes a record by the ID it remembered when it created it, keyed by
+// the challenge token (providers/dns/cloudflare/cloudflare.go: Present stores d.recordIDs[token],
+// CleanUp looks it up and answers "cloudflare: unknown record ID" when the key is gone). A provider
+// built between Present and CleanUp has an empty map, so CleanUp fails and the TXT record stays in
+// the zone. Staging runs showed exactly that: every issuance left one _acme-challenge TXT behind,
+// and a leftover is what a later validation can be answered from -- "During secondary validation:
+// Incorrect TXT record ... found".
+//
+// The other half is the reason the provider was rebuilt on every call in the first place, so it has
+// to be pinned too: a rotated token file must produce a new provider without a restart, or every
+// Present fails 401/403 until the daemon is restarted.
+func TestCloudflareTokenFileKeepsOneProviderUntilTheTokenChanges(t *testing.T) {
+	clearProviderEnv(t)
+
+	tokenFile := filepath.Join(t.TempDir(), "cloudflare.token")
+	if err := os.WriteFile(tokenFile, []byte(fakeCloudflareToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := writeSolverConfig(t, `  provider: cloudflare
+  cloudflare:
+    apiTokenFile: `+tokenFile+`
+`)
+	solver, err := NewDNSSolver(cfg.DNS, cfg.Tencent, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	assertNotARebuildHint(t, config.DNSProviderCloudflare, err)
+
+	first, err := solver.newProvider(context.Background())
+	if err != nil {
+		t.Fatalf("building the cloudflare provider from the token file: %v", err)
+	}
+	second, err := solver.newProvider(context.Background())
+	if err != nil {
+		t.Fatalf("building the cloudflare provider a second time: %v", err)
+	}
+	if first != second {
+		t.Fatal("two calls with an unchanged token file returned different cloudflare providers.\n" +
+			"lego's provider deletes a record by the ID it remembered at Present, keyed by the " +
+			"challenge token, so a provider rebuilt between Present and CleanUp cannot delete the " +
+			"record it created: CleanUp fails with \"cloudflare: unknown record ID\" and the TXT " +
+			"stays in the operator's zone.")
+	}
+
+	// A rotated or revoked token must take effect without a restart.
+	const rotated = "fake-cloudflare-scoped-token-rotated"
+	if err := os.WriteFile(tokenFile, []byte(rotated+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	third, err := solver.newProvider(context.Background())
+	if err != nil {
+		t.Fatalf("building the cloudflare provider after a token rotation: %v", err)
+	}
+	if third == first {
+		t.Fatal("the token file changed and the same cloudflare provider came back: a rotated " +
+			"token would never take effect, every Present would fail 401/403 until the daemon " +
+			"restarts, and consecutive failures walk the identifier budget toward a CA pause")
+	}
+
+	// The cache is per token, not "the last one that was built": going back to the previous token
+	// must build again rather than hand out the provider that no longer matches the file.
+	if err := os.WriteFile(tokenFile, []byte(fakeCloudflareToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fourth, err := solver.newProvider(context.Background())
+	if err != nil {
+		t.Fatalf("building the cloudflare provider after the token was restored: %v", err)
+	}
+	if fourth == third {
+		t.Fatal("the token file went back to the first token and the provider for the rotated one " +
+			"was returned: the instance has to match the credential the file holds")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-acme/lego/v4/challenge"
@@ -76,7 +77,7 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 
 	case config.DNSProviderCloudflare:
 		// A scoped Cloudflare API token is revoked rather than refreshed, so -- like dnspod's --
-		// one built instance is reused for the process's lifetime.
+		// one built instance is reused for as long as the token stays the same.
 		//
 		// No LEGO_DEBUG_DNS_API_HTTP_CLIENT warning here, unlike the dnspod case above: that
 		// variable makes lego wrap the client in its request dumper, but in lego v4.35.2 the
@@ -85,11 +86,18 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		// is set, and the clientdebug.Wrap call is at line 65). Re-check that when the lego
 		// dependency is bumped: a token-authenticated client that started dumping requests would
 		// put this token in the journal, which is the hazard the dnspod warning exists for.
-		// Rebuild on every use when the token lives in a file: a rotated or revoked token
-		// must take effect without restarting the daemon. Cached once, every subsequent
-		// Present fails 401/403 until restart -- and consecutive failures walk the
-		// identifier budget toward a CA pause. A static apiToken in the config cannot
-		// change without a reload anyway, so that path keeps the one built instance.
+		//
+		// When the token lives in a file, the file is re-read on every use so a rotated or revoked
+		// token takes effect without restarting the daemon -- but the instance is kept while its
+		// content is unchanged. Rebuilding on every call is not the harmless extra API client it
+		// looks like: lego's cloudflare provider deletes a record by the ID it remembered when it
+		// created that record, keyed by the challenge token
+		// (providers/dns/cloudflare/cloudflare.go: Present stores d.recordIDs[token], CleanUp
+		// looks it up and answers "cloudflare: unknown record ID" when it is missing). A provider
+		// built between Present and CleanUp has an empty map, so CleanUp fails and the TXT record
+		// stays in the zone -- observed on every issuance in the staging runs, one stale
+		// _acme-challenge TXT per certificate per renewal, and a stale value is what a later
+		// validation can be answered from.
 		static := cloudflareConfig(dnsCfg)
 		if dnsCfg.Cloudflare.APITokenFile == "" {
 			p, err := cloudflare.NewDNSProviderConfig(static)
@@ -100,14 +108,13 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 			break
 		}
 		tokenFile := dnsCfg.Cloudflare.APITokenFile
+		var cache tokenFileProviderCache
 		newProvider = func(context.Context) (challenge.Provider, error) {
 			cfg := *static
 			cfg.AuthToken = rereadSecretFile(tokenFile, cfg.AuthToken)
-			p, err := cloudflare.NewDNSProviderConfig(&cfg)
-			if err != nil {
-				return nil, fmt.Errorf("initialise the cloudflare provider: %w", err)
-			}
-			return p, nil
+			return cache.get(cfg.AuthToken, func() (challenge.Provider, error) {
+				return cloudflare.NewDNSProviderConfig(&cfg)
+			})
 		}
 
 	case config.DNSProviderRoute53:
@@ -249,4 +256,42 @@ func rereadSecretFile(path, fallback string) string {
 		return s
 	}
 	return fallback
+}
+
+// tokenFileProviderCache keeps a credential-file provider alive while the file still holds the
+// same secret, and rebuilds it the moment that changes.
+//
+// The two halves are both load-bearing, which is why this is not simply "build once":
+//
+//   - Keeping the instance is what makes lego's token-keyed record bookkeeping work. See the
+//     Cloudflare case in NewDNSSolver: a provider rebuilt between Present and CleanUp cannot
+//     delete the record Present created, and the record stays in the operator's zone.
+//   - Rebuilding on change is what makes a rotated token take effect without a restart. Caching
+//     the first instance forever means every Present fails 401/403 until the daemon restarts, and
+//     consecutive failures walk the identifier budget toward a CA pause.
+//
+// The zero value is ready to use. It is safe for concurrent use: Present and CleanUp for different
+// certificates can run at the same time.
+type tokenFileProviderCache struct {
+	mu       sync.Mutex
+	token    string
+	provider challenge.Provider
+}
+
+// get returns the cached provider when it was built from this token, and otherwise builds one.
+//
+// build is called with the cache locked so two callers cannot race into two instances for the same
+// token, and only the first of them can become the cached one whose record IDs CleanUp needs.
+func (c *tokenFileProviderCache) get(token string, build func() (challenge.Provider, error)) (challenge.Provider, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.provider != nil && c.token == token {
+		return c.provider, nil
+	}
+	p, err := build()
+	if err != nil {
+		return nil, err
+	}
+	c.provider, c.token = p, token
+	return p, nil
 }
