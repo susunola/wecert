@@ -240,8 +240,11 @@ func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, 
 	for i := range res.Certificates {
 		if err := r.startCert(ctx, res, &res.Certificates[i]); err != nil {
 			if errors.Is(err, ErrShuttingDown) {
-				// Drain began between the check above and this start: stop the walk and say so.
-				return nil, nil, ErrShuttingDown
+				// Drain began between the check above and this start. The names already in
+				// `accepted` WERE started and Drain will wait for them, so they go back to the
+				// caller along with the error -- the same contract as StartNamed. Discarding
+				// them would tell the webhook "nothing started" while passes are in flight.
+				return accepted, skipped, ErrShuttingDown
 			}
 			skipped = append(skipped, res.Certificates[i].Name)
 		} else {

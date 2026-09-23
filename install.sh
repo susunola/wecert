@@ -88,7 +88,12 @@ verify_checksum() {
 	local dir name sums expected actual goarch
 	dir="$(cd "$(dirname "${artifact}")" && pwd)"
 	name="$(basename "${artifact}")"
+	# Prefer a sums file beside the artifact (release layout); fall back to the installer's
+	# own directory so deploy/systemd units and config.example.yaml can be listed there too.
 	sums="${dir}/SHA256SUMS"
+	if [[ ! -f "${sums}" && -n "${SCRIPT_DIR:-}" && -f "${SCRIPT_DIR}/SHA256SUMS" ]]; then
+		sums="${SCRIPT_DIR}/SHA256SUMS"
+	fi
 
 	if [[ ! -f "${sums}" ]]; then
 		if [[ "${WECERT_INSECURE_SKIP_CHECKSUM:-}" = "1" ]]; then
@@ -117,8 +122,17 @@ verify_checksum() {
 	expected="$(awk -v f="${name}" -v g="${name}_linux_${goarch}" \
 		'$2 == f || (g != "" && $2 == g) { print $1 }' "${sums}")"
 	if [[ -z "${expected}" ]]; then
-		echo "Error: ${name} is not listed in ${sums}. Refusing to install an unlisted artifact." >&2
-		exit 1
+		# Binaries must be listed. Units and the example config are refused too when a sums
+		# file exists but omits them -- except in a source checkout where SHA256SUMS only
+		# covers dist/ binaries: there, skip with a warning unless the operator demands it.
+		if [[ "${WECERT_REQUIRE_ASSET_CHECKSUM:-}" = "1" ]] || [[ "${name}" == wecert* ]]; then
+			echo "Error: ${name} is not listed in ${sums}. Refusing to install an unlisted artifact." >&2
+			exit 1
+		fi
+		echo "Warning: ${name} is not listed in ${sums}; installing it unverified." >&2
+		echo "         Set WECERT_REQUIRE_ASSET_CHECKSUM=1 to refuse instead, or add it to the" >&2
+		echo "         sums file (make release does this for deploy/systemd and config.example.yaml)." >&2
+		return 0
 	fi
 	if command -v sha256sum >/dev/null 2>&1; then
 		actual="$(sha256sum -- "${artifact}" | awk '{ print $1 }')"
@@ -213,7 +227,15 @@ fi
 echo "==> Installing systemd unit"
 units_installed=0
 for unit in wecert.service wecert-once.service wecert-once.timer; do
+	if [[ -L "${SCRIPT_DIR}/deploy/systemd/${unit}" ]]; then
+		echo "Error: ${unit} is a symlink; refusing to install a unit that can be swapped" >&2
+		echo "       after its content is checked. Copy the regular file from the release." >&2
+		exit 1
+	fi
 	if [[ -f "${SCRIPT_DIR}/deploy/systemd/${unit}" ]]; then
+		# Units are as trusted as the binary: a swapped unit can point ExecStart anywhere
+		# and the binary checksum would still pass. Verify when SHA256SUMS lists them.
+		verify_checksum "${SCRIPT_DIR}/deploy/systemd/${unit}"
 		install -m 0644 "${SCRIPT_DIR}/deploy/systemd/${unit}" "/etc/systemd/system/${unit}"
 		echo "    ${unit}"
 		units_installed=$((units_installed + 1))

@@ -18,7 +18,7 @@ import (
 // the documented way to pause probing -- showed every deployed certificate as
 // unverified and counted them under a status that claims the bindings are unknown.
 func (r *Reconciler) ProbeEnabled() bool {
-	if r.prober == nil {
+	if r.getProber() == nil {
 		return false
 	}
 	return r.cfg.Probe.MaxHostsPerCertOr(config.DefaultMaxHostsPerCert) > 0
@@ -35,7 +35,7 @@ func (r *Reconciler) ProbeAnswers(name string) []probe.Answer {
 	if !r.ProbeEnabled() {
 		return nil
 	}
-	answers, ok := r.prober.(interface {
+	answers, ok := r.getProber().(interface {
 		Answer(host string) (probe.Answer, bool)
 	})
 	if !ok {

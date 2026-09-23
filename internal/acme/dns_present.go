@@ -11,6 +11,35 @@ import (
 
 // Split out so one concern lives in one file. Same package.
 
+// callProviderBounded runs one lego Present/CleanUp under a wall-clock deadline.
+//
+// challenge.Provider takes no context, so a hung AWS/HTTP call cannot be cancelled.
+// The deadline is what bounds how long the per-name TXT lease mutex is held: without
+// it a single wedged Route 53 request (half-open TCP, a black-holed STS endpoint)
+// blocks every certificate that shares the _acme-challenge name until process restart,
+// and the leftover TXT burns identifier budget toward a CA pause.
+//
+// On timeout the underlying call may still complete in the background; its result is
+// discarded and the caller releases the lease lock. That is a residual write race at
+// this one name, which is strictly better than wedging the whole shared name forever.
+func callProviderBounded(what string, fn func() error) error {
+	return callWithTimeout(what, dnsAPITimeout, fn)
+}
+
+func callWithTimeout(what string, timeout time.Duration, fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		go func() { <-done }() // let the goroutine exit once the call returns
+		return fmt.Errorf("%s timed out after %s (lego's provider call cannot be cancelled and may "+
+			"still land; the per-name lease is released so other challenges sharing this TXT name "+
+			"are not wedged)", what, timeout)
+	}
+}
+
 func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) (DNSRecord, error) {
 	provider, err := s.newProvider(ctx)
 	if err != nil {
@@ -42,7 +71,9 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
 	}
 
-	if err := provider.Present(domain, token, keyAuth); err != nil {
+	if err := callProviderBounded("present TXT", func() error {
+		return provider.Present(domain, token, keyAuth)
+	}); err != nil {
 		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
 	}
 	challengeLeases.add(rec.FQDN, rec.Value)

@@ -69,5 +69,10 @@ SystemCallArchitectures=native
 # directory, this covers files the database driver makes inside it.
 UMask=0077
 
+# No core dumps: a crash would write the ACME account key and every certificate
+# private key into a world-readable crash file. (MemoryDenyWriteExecute does not
+# stop the kernel from dumping.)
+LimitCORE=0
+
 [Install]
 WantedBy=multi-user.target

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v4/challenge"
@@ -84,11 +85,30 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 		// is set, and the clientdebug.Wrap call is at line 65). Re-check that when the lego
 		// dependency is bumped: a token-authenticated client that started dumping requests would
 		// put this token in the journal, which is the hazard the dnspod warning exists for.
-		p, err := cloudflare.NewDNSProviderConfig(cloudflareConfig(dnsCfg))
-		if err != nil {
-			return nil, fmt.Errorf("initialise the cloudflare provider: %w", err)
+		// Rebuild on every use when the token lives in a file: a rotated or revoked token
+		// must take effect without restarting the daemon. Cached once, every subsequent
+		// Present fails 401/403 until restart -- and consecutive failures walk the
+		// identifier budget toward a CA pause. A static apiToken in the config cannot
+		// change without a reload anyway, so that path keeps the one built instance.
+		static := cloudflareConfig(dnsCfg)
+		if dnsCfg.Cloudflare.APITokenFile == "" {
+			p, err := cloudflare.NewDNSProviderConfig(static)
+			if err != nil {
+				return nil, fmt.Errorf("initialise the cloudflare provider: %w", err)
+			}
+			newProvider = func(context.Context) (challenge.Provider, error) { return p, nil }
+			break
 		}
-		newProvider = func(context.Context) (challenge.Provider, error) { return p, nil }
+		tokenFile := dnsCfg.Cloudflare.APITokenFile
+		newProvider = func(context.Context) (challenge.Provider, error) {
+			cfg := *static
+			cfg.AuthToken = rereadSecretFile(tokenFile, cfg.AuthToken)
+			p, err := cloudflare.NewDNSProviderConfig(&cfg)
+			if err != nil {
+				return nil, fmt.Errorf("initialise the cloudflare provider: %w", err)
+			}
+			return p, nil
+		}
 
 	case config.DNSProviderRoute53:
 		// Built once as well, and the contrast with tencentcloud above is the point: what expires
@@ -216,3 +236,17 @@ func route53Config(dnsCfg config.DNS) *route53.Config {
 func (s *DNSSolver) PropagationTimeout() time.Duration { return s.timeout }
 
 // DNSRecord is one _acme-challenge TXT record that is to be written or verified.
+
+// rereadSecretFile re-reads a credential file, falling back to fallback when the read
+// fails (so a transient I/O error does not tear down a working provider). The path is
+// environment-expanded, matching config.resolveSecretFiles.
+func rereadSecretFile(path, fallback string) string {
+	raw, err := os.ReadFile(os.ExpandEnv(path))
+	if err != nil {
+		return fallback
+	}
+	if s := strings.TrimSpace(string(raw)); s != "" {
+		return s
+	}
+	return fallback
+}

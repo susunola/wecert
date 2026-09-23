@@ -110,7 +110,11 @@ release:
 		CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -tags lego_dns \
 			-ldflags "-s -w -X main.version=$(VERSION)" -o dist/wecert_linux_amd64-lego-dns ./cmd/wecert || exit 1; \
 		printf '%s\n' "ok"
-	@cd dist && (command -v sha256sum >/dev/null 2>&1 && sha256sum wecert* || shasum -a 256 wecert*) > SHA256SUMS
+	@# Units and the example config are installed as root alongside the binaries; they are
+	@# in the same trust decision, so they ship in the same sums file. install.sh verifies
+	@# anything it installs against SHA256SUMS when the file lists it.
+	@cp -R deploy/systemd config.example.yaml dist/ 2>/dev/null || true
+	@cd dist && (command -v sha256sum >/dev/null 2>&1 && sha256sum wecert* systemd/* config.example.yaml 2>/dev/null || shasum -a 256 wecert* systemd/* config.example.yaml 2>/dev/null) > SHA256SUMS
 	@echo && echo "=== artifacts ===" && ls -lh dist/ && echo && cat dist/SHA256SUMS
 
 # A CycloneDX SBOM for the release, generated from the module graph.

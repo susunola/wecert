@@ -73,7 +73,10 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	if err != nil {
 		return fmt.Errorf("get the DNS provider: %w", err)
 	}
-	return provider.CleanUp(domain, token, keyAuth)
+	// Same bound as Present: this call holds the per-name lease mutex. See callProviderBounded.
+	return callProviderBounded("cleanup TXT", func() error {
+		return provider.CleanUp(domain, token, keyAuth)
+	})
 }
 
 // LookupTXT asks the zone's **authoritative** nameservers whether this challenge's TXT

@@ -338,7 +338,19 @@ func (m *Manager) solveChallenges(
 				"them are in the failure ledger, which is what the degraded-set decision reads",
 				"cert", c.Name, "identifiers", strings.Join(invalid, ","))
 		}
-		return false, m.recordFailure(ctx, st, invalidErr)
+		// Discard the order, exactly like a closed authorization above. Leaving it makes the
+		// next pass advance the SAME order: solveChallenges books another identifier failure
+		// per pass against the name that is already invalid (the "5 per identifier per hour"
+		// budget and the fallback's MinIdentifierFailures both read that counter as real
+		// validation attempts), while the still-pending authorizations never get an
+		// AcceptChallenge and hang until the CA's order TTL. A fresh order is the only way to
+		// get fresh authorizations for the healthy names.
+		if derr := m.discardOrder(ctx, c.Name); derr != nil {
+			return false, m.recordFailure(ctx, st, fmt.Errorf(
+				"%w (and discarding the order failed: %v)", invalidErr, derr))
+		}
+		return false, m.recordFailure(ctx, st, fmt.Errorf(
+			"%w; the order is discarded so the next pass places a fresh one", invalidErr))
 	}
 
 	if len(pending) == 0 {
@@ -539,7 +551,18 @@ func (m *Manager) awaitAuthorizations(ctx context.Context, authzs []*state.Autho
 					"failure ledger, which is what the degraded-set decision reads",
 					"identifiers", strings.Join(invalid, ","))
 			}
-			return invalidErr
+			// Same exit as solveChallenges' already-invalid path: keep the order and the next
+			// pass re-books the same identifiers as another failure without ever re-trying a
+			// validation. Discard so the next pass can place a fresh order (and so the TXT
+			// records this pass wrote are reclaimed instead of parked on the challenge name).
+			orderCert := ""
+			if len(authzs) > 0 {
+				orderCert = authzs[0].CertName
+			}
+			if derr := m.discardOrder(ctx, orderCert); derr != nil {
+				return fmt.Errorf("%w (and discarding the order failed: %v)", invalidErr, derr)
+			}
+			return fmt.Errorf("%w; the order is discarded so the next pass places a fresh one", invalidErr)
 		}
 		if len(pending) == 0 {
 			return nil
