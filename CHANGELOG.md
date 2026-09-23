@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **The `lego_dns` build -- `make release` and `make test-tags` -- compiles from a clean
+  checkout again.** `go.mod` had no requirement for `github.com/exoscale/egoscale/v3`, which
+  that build needs because lego's DNS registry imports every provider it ships, exoscale
+  included, and four modules the program imports directly were still listed as `// indirect`.
+  A build in `-mod=readonly`, which is what CI runs, stopped at `go: updates to go.mod needed`
+  and took the `test` and `install` jobs with it -- including the Linux release build. `go mod
+  tidy` restores the list; no module version changes.
 - **`install.sh` installs its own `make release` output again.** The unit checksum gate looked
   for a `SHA256SUMS` beside `deploy/systemd/`, where none exists, and refused to continue --
   so an install from a release layout failed on the units unless
