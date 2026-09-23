@@ -133,10 +133,13 @@ Two further deliberate choices:
   fixes the standard-library vulnerabilities listed by `govulncheck`).
 - **A domain hosted on DNSPod** — either the DNSPod product (`dnspod.cn`) or Tencent Cloud DNSPod.
 - **A Tencent Cloud account** with the CLB resources you want the certificate on.
-- **Credentials**, one of:
+- **Credentials**, for the credential-bearing pieces you use:
   - a CVM instance role (recommended — temporary credentials, nothing on disk), or
   - a DNSPod API token (if `dns.provider: dnspod`), or
-  - a Tencent Cloud CAM key pair (local debugging only).
+  - a Tencent Cloud CAM key pair (local debugging only), or
+  - for the other two native DNS providers: a scoped Cloudflare API token
+    (`dns.provider: cloudflare`), or AWS credentials for Route 53
+    (`dns.provider: route53`) — an EC2 instance role works there too, with no key at all.
 - **`_acme-challenge` CNAME delegation** is strongly recommended; see [Configuration reference](#configuration-reference).
 
 Optional: `terraform` and `sqlite3` for the end-to-end harness under `testenv/` and `scripts/`.
@@ -617,16 +620,24 @@ Deletion is deliberately an order of magnitude more conservative than addition: 
 
 ### DNS providers
 
-Two providers are built in, and they cover the deployment this program exists for:
+Four providers are built into every binary, and they cover the deployments this program exists
+for. The other ~198 in lego's registry need `-tags lego_dns`:
 
 | `dns.provider` | Credentials | Notes |
 |---|---|---|
 | `dnspod` | `dns.loginToken` (a DNSPod API token, not a CAM key) | The original path; the token never expires |
 | `tencentcloud` | Tencent Cloud CAM (`tencent.*`), including a CVM role | Rebuilds the client per call, so it never uses expired credentials |
+| `cloudflare` | `dns.cloudflare.apiToken` (a scoped API token), its file variant, or `CLOUDFLARE_DNS_API_TOKEN` / `CF_DNS_API_TOKEN` | Built once and reused: the token is revoked rather than refreshed. No build tag |
+| `route53` | `dns.route53.accessKeyId` + secret key (field or `secretAccessKeyFile`), or the AWS SDK's default chain — environment, shared config, instance role | With no static keys the chain is used, so an EC2 instance role needs nothing on disk. No build tag |
 
-**Any of lego's ~198 DNS providers is available behind a build tag.** Set `dns.provider: lego`
-and `dns.legoProvider: <name>` (e.g. `cloudflare`, `route53`, `alidns`); the provider then reads
-its own credentials from the environment using lego's documented variable names, which is why no
+`dns.provider: cloudflare` and `dns.provider: route53` are the native forms of what used to be
+reachable only as `dns.provider: lego` + `dns.legoProvider: <name>` behind the `lego_dns` tag;
+they are validated at load time (missing token, missing region, half a static key pair) instead of
+failing at provider construction.
+
+**Any of lego's other ~196 DNS providers is available behind a build tag.** Set `dns.provider: lego`
+and `dns.legoProvider: <name>` (e.g. `alidns`, `azure`, `gandi`); the provider then reads its own
+credentials from the environment using lego's documented variable names, which is why no
 per-provider configuration exists here — a generic credential map would have to mirror 198
 different schemas that lego already defines.
 
@@ -654,17 +665,33 @@ instruction, not later when the solver is constructed.
 
 ### `dns`
 
-The two providers use completely different credentials. Don't mix them up.
+The providers use completely different credentials. Don't mix them up.
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `provider` | no | `dnspod` | `dnspod` uses DNSPod's own API token (dnsapi.cn). `tencentcloud` uses Tencent Cloud CAM credentials (dnspod.tencentcloudapi.com) — recommended, because it shares credentials with deployment and supports `SessionToken` for instance roles. |
+| `provider` | no | `dnspod` | `dnspod` uses DNSPod's own API token (dnsapi.cn). `tencentcloud` uses Tencent Cloud CAM credentials (dnspod.tencentcloudapi.com) — recommended, because it shares credentials with deployment and supports `SessionToken` for instance roles. `cloudflare` uses a scoped Cloudflare API token, and `route53` uses AWS credentials; both are built into every binary and need no build tag. |
 | `loginToken` | when `provider: dnspod` | — | DNSPod's own API token, shaped `12345,abcdef…`. **Not** a Tencent Cloud SecretId/SecretKey. |
 | `loginTokenFile` | alternative to `loginToken` | — | Reads the token from a file instead, so it never appears in `config.yaml` — and therefore not in its backups, its diffs, or anyone's scrollback. The path is **environment-expanded**, which is what makes systemd's `LoadCredential` work: `LoadCredential=dnspod-token:/etc/wecert/dnspod.token` exposes the file at `$CREDENTIALS_DIRECTORY/dnspod-token`, and the config says `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token`. `DNSPOD_LOGIN_TOKEN` in the environment is also accepted when neither is set. Setting both `loginToken` and `loginTokenFile` is refused rather than guessed at. |
-| `ttl` | no | `600` | TTL for the `_acme-challenge` TXT record. **600 is the floor on DNSPod's free tier** — configuring 60 is rejected with `LimitExceeded.RecordTtlLimit`. Paid tiers can go lower to speed up propagation and cleanup. |
+| `cloudflare.apiToken` | when `provider: cloudflare` | — | A scoped Cloudflare API token with Zone:Read + DNS:Edit on the zone(s) holding the challenge names — not the legacy global API key. |
+| `cloudflare.apiTokenFile` | alternative to `cloudflare.apiToken` | — | Reads the token from a 0600 file instead, environment-expanded exactly like `loginTokenFile`, so `LoadCredential=cloudflare-token:/etc/wecert/cloudflare.token` plus `apiTokenFile: ${CREDENTIALS_DIRECTORY}/cloudflare-token` works. `CLOUDFLARE_DNS_API_TOKEN` (lego's documented variable) and its alias `CF_DNS_API_TOKEN` are accepted from the environment when neither is set. Setting both is refused. |
+| `route53.region` | when `provider: route53` | — | Region the AWS SDK signs for. Route 53 is global, but the SDK refuses to build a client without one; `AWS_REGION` or `AWS_DEFAULT_REGION` in the environment is accepted instead. |
+| `route53.hostedZoneId` | no | — | Pins the hosted zone the challenge records go into. Empty means the public zone is looked up from the challenge FQDN; `AWS_HOSTED_ZONE_ID` is still honoured as lego's own fallback. |
+| `route53.accessKeyId` + `route53.secretAccessKey` | no | — | An explicit static AWS pair, used only when configured; then it replaces the SDK's credential chain. `secretAccessKeyFile` is the 0600, environment-expanded file variant of the secret. The key id is not a secret and has no file variant. |
+| `route53.sessionToken` / `sessionTokenFile` | no | — | The temporary token belonging to a static pair (STS, or an assumed role). Leave unset with the default chain: the SDK fetches its own. Configured without the pair, it is refused at load time. |
+| `ttl` | no | `600` | TTL for the `_acme-challenge` TXT record. **600 is the floor on DNSPod's free tier** — configuring 60 is rejected with `LimitExceeded.RecordTtlLimit`. Paid tiers can go lower to speed up propagation and cleanup. Cloudflare's own floor is 120 and is enforced at load time. |
 | `propagationTimeout` | no | `5m` | Upper bound on waiting for all authoritative nameservers to see the record |
 | `pollingInterval` | no | `5s` | Interval between propagation probes |
 | `recursiveNameservers` | no | `/etc/resolv.conf` | Trusted recursive resolver IPs, optionally with ports, used consistently for CNAME, SOA and NS discovery. The TXT check itself still queries the discovered authoritative NS directly and requires an authoritative (`AA`) response. Set this in split-horizon/VPN environments to avoid mixing resolver views. |
+
+Each provider block is read only when its provider is the selected one: a `cloudflare:` or
+`route53:` block left behind under another provider is refused at load time, naming both, rather
+than silently ignored — the same rule `legoProvider` already follows.
+
+**Route 53 without static keys** uses the AWS SDK's default chain, in its documented order: the
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` environment, the shared
+credentials and config files, then the instance role. On an EC2 instance with a role attached this
+is the whole configuration — no key on disk, nothing to rotate, and no field to fill in beyond
+`region`.
 
 #### Strongly recommended: `_acme-challenge` CNAME delegation
 

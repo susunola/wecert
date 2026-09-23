@@ -10,7 +10,9 @@ import (
 
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/challenge/dns01"
+	"github.com/go-acme/lego/v4/providers/dns/cloudflare"
 	"github.com/go-acme/lego/v4/providers/dns/dnspod"
+	"github.com/go-acme/lego/v4/providers/dns/route53"
 	"github.com/go-acme/lego/v4/providers/dns/tencentcloud"
 
 	"github.com/susunola/wecert/internal/config"
@@ -71,6 +73,35 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 				cred.GetSecretId(), cred.GetSecretKey(), cred.GetToken(), dnsCfg))
 		}
 
+	case config.DNSProviderCloudflare:
+		// A scoped Cloudflare API token is revoked rather than refreshed, so -- like dnspod's --
+		// one built instance is reused for the process's lifetime.
+		//
+		// No LEGO_DEBUG_DNS_API_HTTP_CLIENT warning here, unlike the dnspod case above: that
+		// variable makes lego wrap the client in its request dumper, but in lego v4.35.2 the
+		// dumper is only installed on the email + global-key path
+		// (providers/dns/cloudflare/internal/client.go: NewClient returns at line 53 when a token
+		// is set, and the clientdebug.Wrap call is at line 65). Re-check that when the lego
+		// dependency is bumped: a token-authenticated client that started dumping requests would
+		// put this token in the journal, which is the hazard the dnspod warning exists for.
+		p, err := cloudflare.NewDNSProviderConfig(cloudflareConfig(dnsCfg))
+		if err != nil {
+			return nil, fmt.Errorf("initialise the cloudflare provider: %w", err)
+		}
+		newProvider = func(context.Context) (challenge.Provider, error) { return p, nil }
+
+	case config.DNSProviderRoute53:
+		// Built once as well, and the contrast with tencentcloud above is the point: what expires
+		// here is not the provider but the credentials inside it, and those are re-fetched by the
+		// AWS SDK's credential chain on the client it already holds (an instance role's temporary
+		// credentials included). Rebuilding would buy nothing and would re-resolve the whole AWS
+		// config on every Present and CleanUp.
+		p, err := route53.NewDNSProviderConfig(route53Config(dnsCfg))
+		if err != nil {
+			return nil, fmt.Errorf("initialise the route53 provider: %w", err)
+		}
+		newProvider = func(context.Context) (challenge.Provider, error) { return p, nil }
+
 	case config.DNSProviderLego:
 		// Any provider from lego's registry, by name, with its credentials taken from the
 		// environment in lego's own variable names. See the build-tag files for why this is
@@ -127,6 +158,58 @@ func dnspodConfig(dnsCfg config.DNS) *dnspod.Config {
 		PollingInterval:    dnsCfg.Polling,
 		HTTPClient:         &http.Client{Timeout: dnsAPITimeout},
 	}
+}
+
+// cloudflareConfig builds the Cloudflare provider's config.
+//
+// Unlike the two above it starts from lego's NewDefaultConfig instead of a literal, because that is
+// where the provider's own guard rails live (the 30s HTTP client, the BaseURL default). Everything
+// this program owns is then written over the top; what is NOT taken from the environment is the
+// credential -- dns.cloudflare.apiToken is resolved in internal/config, from the config, a file or
+// the two variables lego documents, and putting it here is the only way it reaches the provider.
+func cloudflareConfig(dnsCfg config.DNS) *cloudflare.Config {
+	cfg := cloudflare.NewDefaultConfig()
+	cfg.AuthToken = dnsCfg.Cloudflare.APIToken
+	cfg.TTL = dnsCfg.TTL
+	cfg.PropagationTimeout = dnsCfg.Propagation
+	cfg.PollingInterval = dnsCfg.Polling
+	// Same bound as the other providers (see dnsAPITimeout): the provider's HTTPClient is used for
+	// both the zone lookup and the record write, and Present/CleanUp hold the per-name TXT lease
+	// mutex across that call, so an unbounded request would wedge every certificate sharing the
+	// challenge FQDN.
+	cfg.HTTPClient = &http.Client{Timeout: dnsAPITimeout}
+	return cfg
+}
+
+// route53Config builds the Route 53 provider's config.
+//
+// NewDefaultConfig is the starting point on purpose here, because the fields a literal would leave
+// at their zero values are real behaviour rather than formatting: MaxRetries (5, since Route 53
+// throttles at 5 requests/second per account), WaitForRecordSetsChanged (true -- the API call
+// returns before the change is INSYNC) and the AWS_HOSTED_ZONE_ID fallback for a deployment that
+// pinned its zone that way under the old `dns.provider: lego` path.
+//
+// The credential fields are copied verbatim, empty included: an empty AccessKeyID/SecretAccessKey
+// pair is what tells lego to load the AWS default chain (environment, shared config, instance
+// role), and filling either one from anywhere else here would replace that chain with a static
+// provider built from half a pair.
+func route53Config(dnsCfg config.DNS) *route53.Config {
+	cfg := route53.NewDefaultConfig()
+	cfg.Region = dnsCfg.Route53.Region
+	// Only overridden when the config sets it, so lego's own AWS_HOSTED_ZONE_ID fallback survives.
+	if dnsCfg.Route53.HostedZoneID != "" {
+		cfg.HostedZoneID = dnsCfg.Route53.HostedZoneID
+	}
+	cfg.AccessKeyID = dnsCfg.Route53.AccessKeyID
+	cfg.SecretAccessKey = dnsCfg.Route53.SecretAccessKey
+	cfg.SessionToken = dnsCfg.Route53.SessionToken
+	cfg.TTL = dnsCfg.TTL
+	cfg.PropagationTimeout = dnsCfg.Propagation
+	cfg.PollingInterval = dnsCfg.Polling
+	// No HTTP-timeout knob exists on this config in lego v4.35.2: the request goes through the AWS
+	// SDK's own transport, bounded by its dial/TLS timeouts and the retryer above rather than by one
+	// overall deadline. Re-check for such a field when the lego dependency is bumped.
+	return cfg
 }
 
 // PropagationTimeout reports the budget WaitAll waits for a record to appear.

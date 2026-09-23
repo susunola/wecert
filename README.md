@@ -31,6 +31,7 @@ calls.
 | | |
 |---|---|
 | **Issues and renews** | Let's Encrypt over DNS-01, with ARI (RFC 9773) so renewals are coordinated with the CA and exempt from its rate limits |
+| **DNS providers** | **DNSPod**, **Tencent Cloud DNS**, **Cloudflare** and **Route 53** are built into every binary; any of lego's other ~198 providers can be compiled in with `-tags lego_dns` |
 | **Deploys** | Uploads to Tencent Cloud SSL and rebinds the CLB listener — no listener inventory to maintain, and other certificates on the same listener are untouched |
 | **Verifies** | Dials 443 and reads back the certificate actually served, because "the API said it worked" and "it is serving" are different claims |
 | **Handles multi-domain** | Wildcard-first grouping, up to 100 names per certificate, and a per-name failure ledger that drops one name that keeps failing instead of losing the whole certificate |
@@ -70,9 +71,10 @@ More on both in [Why this exists](README.reference.md#why-this-exists).
 - **A Tencent Cloud account** with a CLB (layer-7 listener) and the CAM permissions in
   [`deploy/cam-policy-runtime.json`](deploy/README.md): SSL upload/describe/delete plus DNSPod
   record writes. Credentials come from a CVM role, the environment, or the config file.
-- **A DNS zone you control**, hosted in **DNSPod** (API token) or **Tencent Cloud DNS** (the same
-  CAM credentials). Let's Encrypt validates over DNS-01, so the zone has to be reachable by API and
-  correctly delegated.
+- **A DNS zone you control**, hosted in **DNSPod** (API token), **Tencent Cloud DNS** (the same CAM
+  credentials), **Cloudflare** (a scoped API token) or **Route 53** (AWS credentials — an EC2
+  instance role needs no key at all). Let's Encrypt validates over DNS-01, so the zone has to be
+  reachable by API and correctly delegated.
 - **A host to run on** — any CVM that can reach the Tencent Cloud API. It does not have to be
   reachable from the internet.
 - **Go 1.26+**, only if you build from source. Release binaries are static for linux/amd64,
@@ -126,7 +128,8 @@ The minimum you have to edit:
 acme:
   email: ops@example.com                 # ⚠️ MUST be a mailbox you control -- see below
 dns:
-  provider: tencentcloud                 # or dnspod + loginToken
+  provider: tencentcloud                 # or dnspod + loginToken, cloudflare + apiToken,
+                                         # or route53 + region (an instance role needs no key)
 certificates:
   - name: example-com
     domains: [example.com, "*.example.com"]

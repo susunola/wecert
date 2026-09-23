@@ -58,7 +58,7 @@ func (c *Config) normalizeDNS() error {
 	switch c.DNS.Provider {
 	case "":
 		c.DNS.Provider = DNSProviderDNSPod
-	case DNSProviderDNSPod, DNSProviderTencentCloud:
+	case DNSProviderDNSPod, DNSProviderTencentCloud, DNSProviderCloudflare, DNSProviderRoute53:
 	case DNSProviderLego:
 		if c.DNS.LegoProvider == "" {
 			return fmt.Errorf("dns.provider=%q requires dns.legoProvider to name one of lego's DNS "+
@@ -68,12 +68,14 @@ func (c *Config) normalizeDNS() error {
 		}
 		if !acmeSupportsLegoProviders {
 			return fmt.Errorf("dns.provider=%q needs a binary built with -tags lego_dns: the default "+
-				"build carries only the native dnspod and tencentcloud providers, because lego's "+
-				"registry pulls in hundreds of third-party SDKs", DNSProviderLego)
+				"build carries only the native dnspod, tencentcloud, cloudflare and route53 "+
+				"providers, because lego's registry pulls in hundreds of third-party SDKs -- "+
+				"cloudflare and route53 are native, so they need no tag", DNSProviderLego)
 		}
 	default:
-		return fmt.Errorf("dns.provider must be %q, %q or %q, got %q",
-			DNSProviderDNSPod, DNSProviderTencentCloud, DNSProviderLego, c.DNS.Provider)
+		return fmt.Errorf("dns.provider must be %q, %q, %q, %q or %q, got %q",
+			DNSProviderDNSPod, DNSProviderTencentCloud, DNSProviderCloudflare, DNSProviderRoute53,
+			DNSProviderLego, c.DNS.Provider)
 	}
 	// legoProvider is read only when provider is "lego". Leaving it set next to a native
 	// provider means the operator believes challenges go through, say, Cloudflare while they
@@ -85,11 +87,59 @@ func (c *Config) normalizeDNS() error {
 			"dns.provider to %q if lego's registry is what you meant",
 			c.DNS.Provider, DNSProviderLego, DNSProviderLego)
 	}
+	// The same rule for the two provider blocks added here: their fields are read only when their
+	// provider is the selected one, so under any other provider the operator would be configuring a
+	// Cloudflare token (or an AWS key) that nothing reads, while believing the challenges go
+	// through it -- they would actually go through the selected provider.
+	if c.DNS.Provider != DNSProviderCloudflare && c.DNS.Cloudflare.configured() {
+		return fmt.Errorf("dns.cloudflare is set but dns.provider is %q: the block is only read "+
+			"when dns.provider=%q, so the token in it would be silently ignored -- remove it, or "+
+			"set dns.provider to %q if Cloudflare is what you meant",
+			c.DNS.Provider, DNSProviderCloudflare, DNSProviderCloudflare)
+	}
+	if c.DNS.Provider != DNSProviderRoute53 && c.DNS.Route53.configured() {
+		return fmt.Errorf("dns.route53 is set but dns.provider is %q: the block is only read when "+
+			"dns.provider=%q, so the credentials and hosted zone in it would be silently ignored "+
+			"-- remove it, or set dns.provider to %q if Route 53 is what you meant",
+			c.DNS.Provider, DNSProviderRoute53, DNSProviderRoute53)
+	}
 	if c.DNS.Provider == DNSProviderDNSPod && c.DNS.LoginToken == "" {
 		return fmt.Errorf("dns.provider=dnspod requires dns.loginToken, dns.loginTokenFile or " +
 			"$" + EnvDNSPodLoginToken + " " +
 			"(a DNSPod API token, not a Tencent Cloud SecretId/SecretKey;" +
 			"to use Tencent Cloud CAM credentials instead, set dns.provider=tencentcloud)")
+	}
+	if c.DNS.Provider == DNSProviderCloudflare && c.DNS.Cloudflare.APIToken == "" {
+		return fmt.Errorf("dns.provider=cloudflare requires dns.cloudflare.apiToken, "+
+			"dns.cloudflare.apiTokenFile or $%s (or its alias $%s): a scoped API token with "+
+			"Zone:Read and DNS:Edit on the zone that holds the challenge names",
+			EnvCloudflareAPIToken, EnvCloudflareAPITokenAlt)
+	}
+	if c.DNS.Provider == DNSProviderRoute53 {
+		if c.DNS.Route53.Region == "" {
+			return fmt.Errorf("dns.provider=route53 requires dns.route53.region or $%s (or $%s): "+
+				"the AWS SDK refuses to sign a request without a region, so the challenge would "+
+				"fail only after an order had already been placed",
+				EnvAWSRegion, EnvAWSDefaultRegion)
+		}
+		// The static pair is all-or-nothing. lego refuses half a pair as well, but only when the
+		// solver is built -- after config load, and in its own words ("AccessKeyID and
+		// SecretAccessKey must be supplied together"), which name neither setting.
+		switch {
+		case c.DNS.Route53.AccessKeyID != "" && c.DNS.Route53.SecretAccessKey == "":
+			return fmt.Errorf("dns.route53.accessKeyId is set but the secret key is missing: add " +
+				"dns.route53.secretAccessKey or dns.route53.secretAccessKeyFile, or remove " +
+				"accessKeyId to use the AWS default chain (environment, shared config, or the " +
+				"instance role)")
+		case c.DNS.Route53.AccessKeyID == "" && c.DNS.Route53.SecretAccessKey != "":
+			return fmt.Errorf("dns.route53.secretAccessKey is set but dns.route53.accessKeyId is " +
+				"missing: add the key id, or remove the secret key to use the AWS default chain " +
+				"(environment, shared config, or the instance role)")
+		case c.DNS.Route53.SessionToken != "" && c.DNS.Route53.AccessKeyID == "":
+			return fmt.Errorf("dns.route53.sessionToken is set without a static key pair: the " +
+				"token only belongs to dns.route53.accessKeyId + dns.route53.secretAccessKey, and " +
+				"with the AWS default chain the SDK fetches its own -- remove it, or add the pair")
+		}
 	}
 
 	var err error
@@ -138,6 +188,15 @@ func (c *Config) normalizeDNS() error {
 	// silently replacing it with the default would throw away the number the operator wrote.
 	if c.DNS.TTL < 0 {
 		return fmt.Errorf("dns.ttl must not be negative, got %d (0 means \"use the default\")", c.DNS.TTL)
+	}
+	// Cloudflare's API refuses a TXT TTL below 120 seconds, and lego enforces the same floor when
+	// the provider is built. The default of 600 is above it, so this only meets an operator who
+	// lowered dns.ttl to speed up propagation -- catching it here names the field, where the
+	// startup failure names neither it nor the provider's own floor.
+	if c.DNS.Provider == DNSProviderCloudflare && c.DNS.TTL < cloudflareMinTTL {
+		return fmt.Errorf("dns.ttl is %d, which is below Cloudflare's %d-second floor: the API "+
+			"rejects a shorter TXT TTL, so lowering dns.ttl for a faster propagation round is not "+
+			"available on this provider", c.DNS.TTL, cloudflareMinTTL)
 	}
 	if len(c.DNS.RecursiveNameservers) > 0 {
 		resolvers, err := normalizeRecursiveNameservers(c.DNS.RecursiveNameservers)

@@ -28,6 +28,7 @@
 | | |
 |---|---|
 | **签发与续期** | 走 DNS-01 从 Let's Encrypt 签发，并带 ARI（RFC 9773），因此续期与 CA 协调、豁免其速率限制 |
+| **DNS provider** | **DNSPod**、**腾讯云 DNS**、**Cloudflare**、**Route 53** 四种内建在每个二进制里；lego 注册表里另外约 198 个 provider 可以用 `-tags lego_dns` 自行编译进来 |
 | **部署** | 上传到腾讯云 SSL 并换绑 CLB 监听器 —— 不需要维护监听器清单，同一监听器上的其他证书也不受影响 |
 | **验证** | 真实拨通 443 并读回实际在服务的证书，因为"API 说成功了"和"确实在服务"是两个不同的断言 |
 | **多域名** | 通配符优先分组，单张证书最多 100 个名字，外加一份逐名字的失败账本：一直失败的那个名字会被摘掉，而不是丢掉整张证书 |
@@ -52,7 +53,7 @@ Let's Encrypt 的证书不花钱，代价是有效期很短 —— 目前是 90 
 ## 前置条件
 
 - **一个腾讯云账号**，账号下有 CLB（七层监听器），并具备 [`deploy/cam-policy-runtime.json`](deploy/README.md) 里的 CAM 权限：SSL 上传 / 查询 / 删除，以及 DNSPod 记录写入。凭证来自 CVM 角色、环境变量或配置文件。
-- **一个你掌控的 DNS zone**，托管在 **DNSPod**（API token）或**腾讯云 DNS**（同一套 CAM 凭证）上。Let's Encrypt 走 DNS-01 验证，所以这个 zone 必须能通过 API 访问，并且委派正确。
+- **一个你掌控的 DNS zone**，托管在 **DNSPod**（API token）、**腾讯云 DNS**（同一套 CAM 凭证）、**Cloudflare**（受限 API token）或 **Route 53**（AWS 凭证，EC2 实例角色即可）上。Let's Encrypt 走 DNS-01 验证，所以这个 zone 必须能通过 API 访问，并且委派正确。
 - **一台运行的机器** —— 任意能访问腾讯云 API 的 CVM 都行。它不需要能从公网访问。
 - **Go 1.26+**，只在从源码编译时才需要。Release 二进制是静态的，覆盖 linux/amd64、linux/arm64 与 darwin/arm64。
 
@@ -98,7 +99,8 @@ export TENCENTCLOUD_SECRET_KEY="<secret-key>"
 acme:
   email: ops@example.com                 # ⚠️ 必须换成你能收信的邮箱，见下
 dns:
-  provider: tencentcloud                 # 或者 dnspod + loginToken
+  provider: tencentcloud                 # 或者 dnspod + loginToken、cloudflare + apiToken，
+                                         # 或者 route53 + region（走实例角色时不需要任何密钥）
 certificates:
   - name: example-com
     domains: [example.com, "*.example.com"]

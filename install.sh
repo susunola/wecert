@@ -6,8 +6,8 @@
 #
 # What it does: create the system user, install the binary, prepare the config
 # directory, install the systemd unit.
-# It does not start the service, and it does not fill in the DNSPod token for you
-# — both of those steps need your explicit confirmation.
+# It does not start the service, and it does not fill in your DNS provider
+# credentials for you — both of those steps need your explicit confirmation.
 set -euo pipefail
 
 BINARY="${1:-}"
@@ -190,7 +190,7 @@ chmod 0750 "${CONFIG_DIR}"
 #
 # systemd's StateDirectory=wecert creates /var/lib/wecert, but only when the service
 # starts -- and the validation step printed below has to run BEFORE that, as the wecert
-# user (the config carries the DNSPod token, so it is 0640 root:wecert). Without this the
+# user (the config carries a DNS provider credential, so it is 0640 root:wecert). Without this the
 # prescribed command fails with "create state dir /var/lib/wecert: permission denied".
 # The obvious workaround is worse than the failure: running it under sudo pre-creates
 # state.db as root:root 0600, and StateDirectory= only fixes the directory it owns, not
@@ -254,8 +254,9 @@ cat <<EOF
 
 Three steps remain:
 
-1) Edit the config (fill in the DNSPod token; when Tencent Cloud runs with a CVM
-   role, no secret key is needed)
+1) Edit the config (pick your dns.provider and fill in its credentials -- the
+   DNSPod token, a Cloudflare API token, or a Route 53 region; when Tencent Cloud
+   runs with a CVM role, no Tencent secret key is needed)
      sudo vi ${CONFIG_FILE}
 
    acme.directory already defaults to Let's Encrypt staging, so the whole flow

@@ -51,7 +51,7 @@ acme:
   email: ops@example.com
 
 dns:
-  # ── pick one; the two use completely different credential systems, do not mix them up ──
+  # ── pick one; each uses its own credential system, do not mix them up ──
   #
   #   tencentcloud  uses Tencent Cloud CAM credentials (the tencent section
   #                 below) and calls dnspod.tencentcloudapi.com. Recommended: it
@@ -61,6 +61,15 @@ dns:
   #   dnspod        uses DNSPod's own API Token (dnspod.cn -> key management) and
   #                 calls dnsapi.cn. Note this is **not** a Tencent Cloud
   #                 SecretId/SecretKey.
+  #
+  #   cloudflare    uses a scoped Cloudflare API token and calls api.cloudflare.com.
+  #                 Built into every binary: no -tags lego_dns rebuild, and no
+  #                 `legoProvider` indirection.
+  #
+  #   route53       uses AWS credentials and calls Route 53. Built in as well. With
+  #                 no static keys configured it uses the AWS SDK's default
+  #                 credential chain, so an EC2 instance role needs nothing on
+  #                 disk.
   provider: tencentcloud
 
   # Required when provider=dnspod. Looks like "12345,abcdef0123456789..."
@@ -81,9 +90,61 @@ dns:
   # loginToken: ""
   # loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token
 
+  # ── cloudflare (provider: cloudflare) ───────────────────────────────────────────────
+  #
+  # A scoped API token, not the legacy global API key: create one in the Cloudflare dashboard
+  # (My Profile -> API Tokens) with Zone:Read and DNS:Edit on the zone(s) that hold the
+  # challenge names. The token never expires, so it is read once at startup.
+  #
+  #   apiTokenFile  reads it from a file (0600) instead; the path is environment-expanded, so
+  #                 systemd's LoadCredential works the same way as for the DNSPod token:
+  #                     [Service]
+  #                     LoadCredential=cloudflare-token:/etc/wecert/cloudflare.token
+  #                 with `apiTokenFile: ${CREDENTIALS_DIRECTORY}/cloudflare-token` here.
+  #
+  #   CLOUDFLARE_DNS_API_TOKEN is also accepted when neither is set, and CF_DNS_API_TOKEN (the
+  #   short alias lego also documents) as well.
+  #
+  # Setting both apiToken and apiTokenFile is refused rather than guessed at.
+  #
+  # cloudflare:
+  #   apiToken: ""
+  #   apiTokenFile: ${CREDENTIALS_DIRECTORY}/cloudflare-token
+
+  # ── route53 (provider: route53) ─────────────────────────────────────────────────────
+  #
+  # region is required: Route 53 is a global service, but the AWS SDK refuses to sign a request
+  # without a region. AWS_REGION (or AWS_DEFAULT_REGION) in the environment is accepted instead.
+  #
+  # hostedZoneId is optional. Empty means the public hosted zone is looked up from the challenge
+  # name, which is what a wildcard + SAN certificate wants; set it to pin one zone, or leave
+  # AWS_HOSTED_ZONE_ID in the environment (still honoured) if that is how the zone was pinned
+  # before.
+  #
+  # Credentials, two shapes:
+  #
+  #   no static keys   the AWS SDK's default chain is used: AWS_ACCESS_KEY_ID /
+  #                    AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN, then ~/.aws/credentials and
+  #                    ~/.aws/config, then the instance role. This is the shape to use on an EC2
+  #                    instance with a role attached -- nothing on disk, nothing to rotate.
+  #
+  #   accessKeyId +    an explicit static pair, which then replaces the chain. secretAccessKeyFile
+  #   secretAccessKey  reads the secret from a 0600 file (environment-expanded). sessionToken /
+  #                    sessionTokenFile belong to a pair that came from STS or an assumed role;
+  #                    with the default chain the SDK fetches its own, so a token without the
+  #                    pair is refused at load time.
+  #
+  # route53:
+  #   region: us-east-1
+  #   # hostedZoneId: Z0123456789ABCDEFGHIJ       # empty: look the zone up from the FQDN
+  #   # accessKeyId: "AKIA..."
+  #   # secretAccessKeyFile: ${CREDENTIALS_DIRECTORY}/aws-secret
+  #   # sessionToken: ""
+
   # TTL of the TXT record.
   # ⚠️ The DNSPod free tier has a TTL floor of 600; a value of 60 is rejected by
   #    the API (LimitExceeded.RecordTtlLimit). Paid tiers can go lower.
+  #    Cloudflare's own floor is 120 and is enforced at load time.
   ttl: 600
   # Upper bound on waiting for the TXT to become visible on every authoritative
   # NS after it is written. LE validates from multiple vantage points and only
