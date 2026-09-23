@@ -31,6 +31,7 @@ calls.
 | | |
 |---|---|
 | **Issues and renews** | Let's Encrypt over DNS-01, with ARI (RFC 9773) so renewals are coordinated with the CA and exempt from its rate limits |
+| **DNS providers** | **DNSPod**, **Tencent Cloud DNS**, **Cloudflare** and **Route 53** are built into every binary; any of lego's other ~198 providers can be compiled in with `-tags lego_dns` |
 | **Deploys** | Uploads to Tencent Cloud SSL and rebinds the CLB listener — no listener inventory to maintain, and other certificates on the same listener are untouched |
 | **Verifies** | Dials 443 and reads back the certificate actually served, because "the API said it worked" and "it is serving" are different claims |
 | **Handles multi-domain** | Wildcard-first grouping, up to 100 names per certificate, and a per-name failure ledger that drops one name that keeps failing instead of losing the whole certificate |

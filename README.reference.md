@@ -621,7 +621,7 @@ Deletion is deliberately an order of magnitude more conservative than addition: 
 ### DNS providers
 
 Four providers are built into every binary, and they cover the deployments this program exists
-for:
+for. The other ~198 in lego's registry need `-tags lego_dns`:
 
 | `dns.provider` | Credentials | Notes |
 |---|---|---|
