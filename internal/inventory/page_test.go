@@ -2,174 +2,191 @@ package inventory
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
-	"html"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
-	"time"
+
+	"golang.org/x/net/html"
 )
 
-func TestWritePageGroupsByUIN(t *testing.T) {
-	t.Parallel()
-	now := time.Date(2026, 9, 22, 7, 45, 0, 0, time.UTC)
-	d := 12
-	snap := Snapshot{
-		Time:    now.UTC().Format(time.RFC3339),
-		Summary: Summary{Certificates: 2, Expiring: 1},
-		Certificates: []Certificate{
-			{Name: "cdn-static", UIN: "100055501234", Status: StatusExpiring, Domains: []string{"static.example.com"}, DaysLeft: &d},
-			{Name: "shop-example", UIN: "100098765432", Status: StatusFailing, Domains: []string{"shop.example.com"}, LastError: "DNS-01 timeout"},
-		},
-	}
+func renderPage(t *testing.T, snap Snapshot) (string, *html.Node) {
+	t.Helper()
 	var buf bytes.Buffer
 	if err := WritePage(&buf, snap); err != nil {
 		t.Fatal(err)
 	}
-	html := buf.String()
-	if strings.Contains(html, "https://") && strings.Contains(html, "fonts.") {
-		t.Fatal("page must not load an external font")
+	doc, err := html.Parse(strings.NewReader(buf.String()))
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, want := range []string{
-		"cdn-static",
-		"shop-example",
-		"100055501234",
-		"100098765432",
-		`data-uin="100055501234"`,
-		`data-filter="attention"`,
-		"DNS-01 timeout",
-	} {
-		if !strings.Contains(html, want) {
-			t.Fatalf("page missing %q", want)
+	return buf.String(), doc
+}
+
+func walkPage(n *html.Node, visit func(*html.Node)) {
+	visit(n)
+	for child := n.FirstChild; child != nil; child = child.NextSibling {
+		walkPage(child, visit)
+	}
+}
+
+func pageSnapshot(t *testing.T, doc *html.Node) Snapshot {
+	t.Helper()
+	var data string
+	walkPage(doc, func(n *html.Node) {
+		for _, a := range n.Attr {
+			if a.Key == "id" && a.Val == "inventory-data" && n.FirstChild != nil {
+				data = n.FirstChild.Data
+			}
 		}
+	})
+	var snap Snapshot
+	if err := json.Unmarshal([]byte(data), &snap); err != nil {
+		t.Fatalf("embedded snapshot is not JSON: %v", err)
 	}
-	if strings.Contains(html, "BEGIN CERTIFICATE") {
-		t.Fatal("page must not contain PEM")
+	return snap
+}
+
+func TestWritePagePreservesInventoryEvidence(t *testing.T) {
+	t.Parallel()
+	frozen, failed, days := true, false, 12
+	snap := Snapshot{
+		Time:    "2026-09-22T16:30:00Z",
+		Desired: DesiredView{Revision: "rev-9", Frozen: &frozen, FreezeReason: "source unavailable"},
+		Certificates: []Certificate{{
+			Name: "cdn-static", UIN: "100055501234", Status: StatusProbeMismatch,
+			Domains: []string{"static.example.com"}, DaysLeft: &days,
+			Regions:   []string{"ap-guangzhou", "ap-singapore"},
+			Bindings:  Bindings{Count: 1, Complete: false, Freshness: FreshnessStore},
+			Probe:     ProbeView{Enabled: true, OK: &failed, Hosts: []HostSample{{Host: "static.example.com", ProblemKind: "untrusted"}}},
+			LastError: "DNS-01 timeout", Drift: []string{DriftServedUntrusted},
+			ARI: &ARIView{WindowStart: "2026-09-23T00:00:00Z", WindowEnd: "2026-09-24T00:00:00Z"},
+		}},
+	}
+	_, doc := renderPage(t, snap)
+	if got := pageSnapshot(t, doc); !reflect.DeepEqual(got, snap) {
+		t.Fatalf("page lost inventory evidence: got %+v, want %+v", got, snap)
 	}
 }
 
-func TestWritePageHidesUINChipsWhenUnset(t *testing.T) {
+func TestWritePagePreservesUnknownRatherThanInventingHealthyValues(t *testing.T) {
 	t.Parallel()
-	snap := Snapshot{
-		Certificates: []Certificate{
-			{Name: "only", Status: StatusOK, Domains: []string{"only.example"}},
-		},
+	_, doc := renderPage(t, Snapshot{Certificates: []Certificate{{Name: "unreadable", Status: StatusStateUnreadable}}})
+	got := pageSnapshot(t, doc)
+	if got.Desired.Frozen != nil || got.Certificates[0].DaysLeft != nil || got.Certificates[0].Probe.OK != nil {
+		t.Fatal("unknown freeze, expiry and probe results must remain absent")
 	}
-	var buf bytes.Buffer
-	if err := WritePage(&buf, snap); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(buf.String(), `id="uins"`) {
-		t.Fatal("UIN chips should stay hidden when no certificate has a uin")
+	if got.Certificates[0].Bindings.Complete || got.Certificates[0].Probe.Enabled {
+		t.Fatal("the renderer must not invent complete bindings or enabled probing")
 	}
 }
 
-func TestWritePageShowsTheReasonsBehindTheNewStatuses(t *testing.T) {
+func TestWritePageEscapesUntrustedValuesInDataAndAccountOptions(t *testing.T) {
 	t.Parallel()
-	frozen := true
-	snap := Snapshot{
-		Time:    time.Date(2026, 9, 22, 8, 0, 0, 0, time.UTC).Format(time.RFC3339),
-		Desired: DesiredView{Revision: "rev-9", Frozen: &frozen, FreezeReason: "desired source unread"},
-		Summary: Summary{Certificates: 2, NotIssued: 1},
-		Certificates: []Certificate{
-			{Name: "never", Status: StatusNotIssued, Domains: []string{"never.example"}},
-			{Name: "bound", Status: StatusOK, Domains: []string{"bound.example"},
-				Bindings: Bindings{Count: 1, Freshness: FreshnessStore, Items: []BindingItem{}}},
-		},
+	attack := `</script><img src=x onerror="alert(1)"><script>alert(2)</script>`
+	snap := Snapshot{Desired: DesiredView{Revision: attack}, Certificates: []Certificate{{Name: attack, UIN: attack, Domains: []string{attack}, LastError: attack}}}
+	page, doc := renderPage(t, snap)
+	if strings.Contains(page, attack) {
+		t.Fatal("untrusted text escaped its HTML or JSON context")
 	}
-	var buf bytes.Buffer
-	if err := WritePage(&buf, snap); err != nil {
-		t.Fatal(err)
+	if got := pageSnapshot(t, doc); !reflect.DeepEqual(got, snap) {
+		t.Fatal("escaping must preserve the text for safe client-side display")
 	}
-	html := buf.String()
-	for _, want := range []string{
-		"frozen · desired source unread",
-		"Not issued",
-		// A store-side count is a lower bound and must not read as the whole set.
-		"≥1",
-		// not_issued is something to look at, so the Attention filter keeps it.
-		`data-status="not_issued"`,
-		`data-attention="1"`,
-	} {
-		if !strings.Contains(html, want) {
-			t.Fatalf("page missing %q", want)
+	scripts := 0
+	walkPage(doc, func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "script" {
+			scripts++
 		}
+		for _, a := range n.Attr {
+			if strings.HasPrefix(a.Key, "on") {
+				t.Fatalf("injected event handler %s", a.Key)
+			}
+		}
+	})
+	if scripts != 3 {
+		t.Fatalf("got %d script elements, want only the direct-open redirect, JSON data, and embedded app", scripts)
 	}
 }
 
-func TestWritePageSaysWhenTheDesiredStateWasNeverRead(t *testing.T) {
+func TestWritePageOffersEveryAccountInOneNativeControl(t *testing.T) {
 	t.Parallel()
-	snap := Snapshot{Certificates: []Certificate{{Name: "a", Status: StatusOK}}}
-	var buf bytes.Buffer
-	if err := WritePage(&buf, snap); err != nil {
-		t.Fatal(err)
+	certs := make([]Certificate, 250)
+	for i := range certs {
+		certs[i] = Certificate{Name: fmt.Sprintf("svc-%03d", i), UIN: fmt.Sprintf("1000%08d", i), Status: StatusOK}
 	}
-	html := buf.String()
-	// The header renders this as a labelled pair ("Desired state" / "not read"),
-	// which is the same claim the sentence made: the document was never read, so no
-	// revision exists to show.
-	if !strings.Contains(html, "desired state") || !strings.Contains(html, ">not read<") {
-		t.Fatal("a revision that was never read must not render as an empty one")
-	}
-	if strings.Contains(html, "frozen ·") {
-		t.Fatal("an unread document is not a frozen one")
+	certs = append(certs, certs[0]) // Multiple certificates do not duplicate an account.
+	_, doc := renderPage(t, Snapshot{Certificates: certs})
+	options := 0
+	walkPage(doc, func(n *html.Node) {
+		for _, a := range n.Attr {
+			if a.Key == "id" && a.Val == "account" {
+				if n.Data != "select" {
+					t.Fatal("account selection must use one native control")
+				}
+				walkPage(n, func(option *html.Node) {
+					if option.Type == html.ElementNode && option.Data == "option" {
+						options++
+					}
+				})
+			}
+		}
+	})
+	if options != 251 {
+		t.Fatalf("got %d options, want 250 accounts plus All accounts", options)
 	}
 }
 
-func TestWritePageOffersEveryAccountInOneControl(t *testing.T) {
+func TestWritePageEmbedsAssetsAndHasNoWriteControls(t *testing.T) {
 	t.Parallel()
-	// An installation can carry hundreds of accounts. They belong in one picker,
-	// not in a row of chips that grows with the fleet.
-	certs := make([]Certificate, 0, 250)
-	for i := 1; i <= 250; i++ {
-		certs = append(certs, Certificate{
-			Name: fmt.Sprintf("svc-%03d", i), UIN: fmt.Sprintf("1000%08d", i),
-			Status: StatusOK, Domains: []string{fmt.Sprintf("svc-%03d.example.com", i)},
-		})
-	}
-	snap := Snapshot{Certificates: certs, Summary: Summary{Certificates: len(certs)}}
-	var buf bytes.Buffer
-	if err := WritePage(&buf, snap); err != nil {
-		t.Fatal(err)
-	}
-	html := buf.String()
-	if got := strings.Count(html, `role="option"`); got != len(certs)+1 {
-		t.Fatalf("account picker has %d options, want %d (every account plus the all-accounts entry)", got, len(certs)+1)
-	}
-	if strings.Contains(html, `class="chip`) {
-		t.Fatal("accounts must not be rendered as a chip row")
-	}
-	if !strings.Contains(html, `aria-haspopup="listbox"`) {
-		t.Fatal("the account control must be a listbox popup, so it can be opened and filtered")
-	}
+	_, doc := renderPage(t, Snapshot{})
+	walkPage(doc, func(n *html.Node) {
+		if n.Type != html.ElementNode {
+			return
+		}
+		if n.Data == "form" {
+			t.Fatal("the inventory must not expose a mutation form")
+		}
+		for _, a := range n.Attr {
+			if a.Key == "src" && (n.Data == "script" || n.Data == "img") && !strings.HasPrefix(a.Val, "data:") {
+				t.Fatalf("asset requires a second request: %s", a.Val)
+			}
+			if n.Data == "link" && a.Key == "href" && !strings.HasPrefix(a.Val, "data:") {
+				t.Fatalf("external stylesheet or icon: %s", a.Val)
+			}
+		}
+	})
 }
 
-func TestWritePageNamesTheRegionFromTheBindings(t *testing.T) {
-	snap := Snapshot{
-		Certificates: []Certificate{
-			{Name: "two-regions", Status: StatusOK, Domains: []string{"a.example"},
-				Regions:  []string{"ap-guangzhou", "ap-singapore"},
-				Bindings: Bindings{Count: 2, Complete: true, Freshness: FreshnessCached, Items: []BindingItem{}}},
-			{Name: "unseen", Status: StatusOK, Domains: []string{"b.example"}},
-		},
+// Optional browser fixture for empty/unknown/error states and hostile strings.
+func TestWriteConsoleEdgePreview(t *testing.T) {
+	out := os.Getenv("WECERT_EDGE_PREVIEW")
+	if out == "" {
+		t.Skip("set WECERT_EDGE_PREVIEW to inspect edge states in a browser")
 	}
+	frozen, failed, days := true, false, -2
+	attack := `</script><img src=x onerror="alert(1)">`
+	snap := Snapshot{Time: "2026-09-22T16:30:00Z", Desired: DesiredView{Frozen: &frozen, FreezeReason: attack}}
+	for _, status := range []string{StatusFrozen, StatusRateLimited, StatusRevokePending, StatusStateUnreadable, StatusNotIssued, StatusWaitingManualBind, StatusPendingDeploy, StatusProbeMismatch, StatusProbeUnreachable, StatusBindingUnknown, StatusProbeUnknown, StatusFailing, StatusExpiring, StatusOK} {
+		snap.Certificates = append(snap.Certificates, Certificate{Name: status, Status: status})
+	}
+	snap.Certificates = append(snap.Certificates, Certificate{
+		Name: attack, UIN: "unknown-account", Status: StatusProbeMismatch,
+		Domains: []string{attack}, DaysLeft: &days, LastError: attack, Error: attack,
+		NotAfter: "2026-09-20T16:30:00Z", NextAttemptAt: "2026-09-23T16:30:00Z", ConsecutiveFailures: 3,
+		Bindings: Bindings{Complete: true, Count: 0, Freshness: FreshnessCached},
+		Probe: ProbeView{Enabled: true, OK: &failed, Hosts: []HostSample{
+			{Host: "unreachable.example.com", ProblemKind: "unreachable"},
+			{Host: "wrong.example.com", ProblemKind: "names_missing"},
+		}},
+		ARI: &ARIView{WindowStart: "2026-09-18T16:30:00Z", WindowEnd: "2026-09-19T16:30:00Z"},
+	})
 	var buf bytes.Buffer
 	if err := WritePage(&buf, snap); err != nil {
 		t.Fatal(err)
 	}
-	out := buf.String()
-	if !strings.Contains(out, ">Region</th>") {
-		t.Fatal("the region column must be named")
-	}
-	// html/template escapes "+" as &#43; -- correct in the response, but read the
-	// decoded text here so the assertion is about what the operator sees.
-	plain := html.UnescapeString(out)
-	if !strings.Contains(plain, "Guangzhou +1") {
-		t.Fatal("two regions must summarise as the first plus a count")
-	}
-	if !strings.Contains(out, `title="ap-guangzhou, ap-singapore"`) {
-		t.Fatal("the full region list belongs in the tooltip")
-	}
-	if strings.Contains(out, `title=""`) {
-		t.Fatal("an unknown region must not carry an empty tooltip")
+	if err := os.WriteFile(out, buf.Bytes(), 0600); err != nil {
+		t.Fatal(err)
 	}
 }

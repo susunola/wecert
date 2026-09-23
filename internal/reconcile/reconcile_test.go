@@ -26,6 +26,7 @@ import (
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/probe"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
@@ -73,6 +74,8 @@ type fakeManager struct {
 	orphanEntered chan struct{}
 	orphanRelease chan struct{}
 }
+
+func (f *fakeManager) QuotaStatus(map[string][]string) []ratelimit.QuotaReport { return nil }
 
 func (f *fakeManager) Reconcile(_ context.Context, c *config.Certificate) error {
 	f.mu.Lock()

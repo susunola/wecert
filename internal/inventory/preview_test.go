@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -76,6 +77,16 @@ func TestWritePreviewPage(t *testing.T) {
 
 		{name: "archive-report", uin: "100066667777", domains: []string{"archive.example.com"}, notAfter: 68, issued: -22, certID: "cYk3F4g5H6i7", confirmed: true},
 	}
+	// Optional larger fleet for exercising the native account picker.
+	if os.Getenv("WECERT_PREVIEW_EXTRA_ACCOUNTS") == "1" {
+		for i := 1; i <= 30; i++ {
+			r := rows[0]
+			r.name, r.uin = fmt.Sprintf("svc-%02d", i), fmt.Sprintf("1000%08d", i)
+			r.domains = []string{fmt.Sprintf("svc-%02d.example.com", i)}
+			r.certID = fmt.Sprintf("cYkextra%02d", i)
+			rows = append(rows, r)
+		}
+	}
 	certs := make([]config.Certificate, 0, len(rows))
 	certState := map[string]*state.CertState{}
 	names := make([]string, 0, len(rows))
@@ -147,6 +158,14 @@ func TestWritePreviewPage(t *testing.T) {
 				ObservedAt: now.Add(-52 * time.Minute).Format(time.RFC3339), Items: []BindingItem{}},
 		},
 	})
+	// Preview the three issuance limits shown by the console. The registered
+	// domain row is intentionally near the policy threshold so the warning state
+	// remains visible in the checked-in screenshot.
+	snap.Quotas = []Quota{
+		{Limit: "new-orders", Scope: "", Capacity: 300, RefillSecs: 36, Remaining: 284},
+		{Limit: "certs-per-registered-domain", Scope: "example.com", Capacity: 50, RefillSecs: 202 * 60, Remaining: 8},
+		{Limit: "certs-per-exact-identifier-set", Scope: "*.cdn.example.com,cdn.example.com,img.example.com", Capacity: 5, RefillSecs: 34 * 60 * 60, Remaining: 3},
+	}
 
 	f, err := os.Create(out)
 	if err != nil {

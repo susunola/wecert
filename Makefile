@@ -170,6 +170,12 @@ validate-cloudinit:
 check-english:
 	python3 scripts/check-english.py
 
+# Write a browser-ready inventory Console preview. console.html itself is an
+# embedded Go template, so opening that source file directly cannot render it.
+console-preview:
+	WECERT_PREVIEW=/tmp/wecert-console.html $(GO) test ./internal/inventory -run '^TestWritePreviewPage$$' -count=1
+	@echo "Open file:///tmp/wecert-console.html"
+
 test:
 	$(GO) test ./...
 

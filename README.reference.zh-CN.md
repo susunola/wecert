@@ -644,6 +644,8 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 |---|---|---|---|
 | `POST` | `/hook/reconcile` | 是 | 触发收敛 |
 | `GET` | `/hook/status` | 是 | 每张证书的状态，供触发后轮询 |
+| `GET` | `/status` | 是 | 只读证书库存 Console |
+| `GET` | `/api/inventory` | 是 | JSON 格式的库存快照 |
 | `GET` | `/healthz` | 否 | 探活（不泄漏任何信息，所以放开） |
 
 鉴权支持两种头：

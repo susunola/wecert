@@ -168,6 +168,38 @@ staging 端到端全绿之后，把 `acme.directory` 指向 `https://acme-v02.ap
 
 > **上不了手?** 三个常见原因，按顺序：NS 委派还没生效（跑 `wecert-preflight -domain`）；在本该用腾讯云 CAM 凭证的地方用了 DNSPod token（两者是不同的凭证体系，配置里写明了所选 provider 需要哪一种）；以及速率限制 —— `wecert_ratelimit_blocked` 会告诉你被哪条限额拒了，而对账号级的 new-order 配额，daemon 会打出 CA 重新接受请求的确切时刻。
 
+## 只读 Console
+
+集中查看证书、云端绑定、到期时间与 TLS 验证结果，支持按账号和状态筛选、搜索域名或 CLB ID，以及点击证书查看部署记录和探测证据。提供浅色、深色主题与手机布局，资源全部内嵌，无需单独构建或部署前端。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/console-dark.png">
+  <img src="docs/console-overview.png" alt="只读证书库存 Console" width="1200">
+</picture>
+
+*截图使用示例数据，由正式 Console 的渲染代码生成。*
+
+在现有配置中增加以下内容，将 token 替换为 `openssl rand -hex 32` 生成的随机密钥，然后重启 daemon：
+
+```yaml
+webhook:
+  listen: 127.0.0.1:9801
+  token: "REPLACE_WITH_A_LONG_RANDOM_SECRET"
+```
+
+已安装 systemd 服务时，执行 `sudo systemctl restart wecert`。页面入口为该端口上的 **`GET /status`**，JSON 接口为 **`GET /api/inventory`**。两者均沿用 webhook 的 Bearer token；普通浏览器直接访问而未携带鉴权头时，会返回 `401`。
+
+快速查看：将 `WECERT_TOKEN` 设置为配置中的 token，获取一份可交互的本地快照：
+
+```bash
+umask 077
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${WECERT_TOKEN}" \
+  http://127.0.0.1:9801/status -o console.html
+```
+
+用浏览器打开 `console.html`，即可搜索、筛选和查看详情。它是静态快照，更新数据需重新获取。需要在线刷新时，按[回环代理与 SSH 隧道示例](docs/console.md#live-browser-access)配置浏览器入口，或使用已有的鉴权 HTTPS 网关。页面依赖持续运行的 daemon；每小时执行一次的 `-once` timer 不会维持监听。完整开启步骤与状态含义见 [Console 使用说明](docs/console.md)。
+
 ## 日常运维
 
 **状态放在哪里。** `statePath`（**必填，没有默认值**），例如 `/var/lib/wecert/state.db`（0600，所在目录 0700）。它装着 ACME 账号密钥、每一张证书的私钥、在飞订单的 order URL，以及 ARI certID —— 而丢掉一个 order URL 就要拿一次签发去补，直接算在 5 / 7 天这条限额上。所以它也会被自动快照：`stateBackup` 默认开启，每 24 小时做一次一致的 `VACUUM INTO`，保留 7 份。恢复用一条命令 `wecert -restore latest`（也可以给快照文件或快照目录），代价与步骤见 [docs/recovery.md](docs/recovery.md)。

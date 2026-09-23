@@ -109,6 +109,22 @@ type Snapshot struct {
 	Desired      DesiredView   `json:"desired"`
 	Summary      Summary       `json:"summary"`
 	Certificates []Certificate `json:"certificates"`
+	Quotas       []Quota       `json:"quotas,omitempty"`
+}
+
+// Quota is a read-only view of a locally tracked Let's Encrypt rate-limit
+// bucket. Remaining is an upper bound for shared limits: other accounts or
+// tooling can consume a shared bucket without this daemon seeing it.
+type Quota struct {
+	Limit        string  `json:"limit"`
+	Scope        string  `json:"scope"`
+	Capacity     float64 `json:"capacity"`
+	RefillSecs   int64   `json:"refillSeconds"`
+	Remaining    float64 `json:"remaining"`
+	Blocked      bool    `json:"blocked"`
+	BlockedUntil string  `json:"blockedUntil,omitempty"`
+	Unreadable   bool    `json:"unreadable"`
+	SpentByCA    bool    `json:"spentByCA"`
 }
 
 // DesiredView describes the desired-state document.

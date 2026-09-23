@@ -3,7 +3,6 @@ package acme
 import (
 	"maps"
 	"sort"
-	"time"
 
 	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/ratelimit"
@@ -57,30 +56,6 @@ func (a rateBucketAdapter) UpdateRateBucket(limitName, scopeID string, fn func(*
 	})
 }
 
-// QuotaReport is one limit's state, for metrics, logs and diagnostics.
-type QuotaReport struct {
-	Limit        string
-	Scope        string
-	Remaining    float64
-	Blocked      bool
-	BlockedUntil time.Time
-
-	// Unreadable means the stored bucket could not be read, so Remaining is NOT an answer.
-	//
-	// It used to be published as zero, which is the strongest possible claim ("no quota left") made
-	// on the strength of a failed read: one SQLITE_BUSY made wecert_ratelimit_remaining_tokens read
-	// 0 for every limit and fired the "nearly exhausted" alert until the next successful pass. The
-	// revocation gauge in this same package already declines to touch itself when its read fails;
-	// this is the same rule.
-	Unreadable bool
-
-	// SpentByCA means this limit's bucket is filled by the CA's own validators, not by this program
-	// (see ratelimit.Limit.SpentByCA). Blocked is then the only field that means anything:
-	// Remaining stays zero because a count of what this program spent against a bucket it never
-	// spends against would be the limit's bare capacity, published as if it were an estimate.
-	SpentByCA bool
-}
-
 // QuotaStatus reports every reportable limit for the given per-scope buckets.
 //
 // The map is limit family -> every scope the caller manages in that family (the registered domains
@@ -91,8 +66,8 @@ type QuotaReport struct {
 //
 // Reportable, not Spendable: the CA-spent identifier pause has no token count to publish but its
 // refused deadline is exactly what an operator needs to see.
-func (m *Manager) QuotaStatus(scopes map[string][]string) []QuotaReport {
-	var out []QuotaReport
+func (m *Manager) QuotaStatus(scopes map[string][]string) []ratelimit.QuotaReport {
+	var out []ratelimit.QuotaReport
 	for _, l := range ratelimit.Reportable() {
 		if l.Scope == "account" {
 			out = append(out, m.quotaReport(l, ""))
@@ -109,8 +84,8 @@ func (m *Manager) QuotaStatus(scopes map[string][]string) []QuotaReport {
 }
 
 // quotaReport answers one (limit, scope) pair. Unreadable is NOT zero: see QuotaReport.
-func (m *Manager) quotaReport(l ratelimit.Limit, scopeID string) QuotaReport {
-	rep := QuotaReport{Limit: l.Name, Scope: scopeID, SpentByCA: l.SpentByCA}
+func (m *Manager) quotaReport(l ratelimit.Limit, scopeID string) ratelimit.QuotaReport {
+	rep := ratelimit.QuotaReport{Limit: l.Name, Scope: scopeID, SpentByCA: l.SpentByCA}
 	if at, _, blocked := m.quota.BlockedUntil(l, scopeID); blocked {
 		rep.Blocked = true
 		rep.BlockedUntil = at
