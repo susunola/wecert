@@ -270,8 +270,8 @@ const pageHTML = `<!DOCTYPE html>
 <style>
 :root{
  color-scheme:dark;
- --bg:#0d1117; --panel:#161b22; --raised:#1c2128; --sunken:#010409;
- --line:#21262d; --line-strong:#30363d;
+ --bg:#0d1117; --panel:#12171f; --raised:#1a212b; --sunken:#0a0e13;
+ --line:#232b36; --line-strong:#323b47;
  --fg:#e6edf3; --muted:#8b949e; --faint:#6e7681;
  --accent:#2fbfa8; --accent-fg:#04211d;
  --ok:63 185 80; --warn:210 153 34; --danger:248 81 73; --info:88 166 255; --neutral:139 148 158;
@@ -363,14 +363,18 @@ h1{font-size:19px;font-weight:650;letter-spacing:-.01em;margin:0}
    containing block, and the table header then sticks 38px below the panel's own top
    edge, covering the first row. Narrow screens opt into scrolling below. */
 .panel{background:var(--bg);border:1px solid var(--line);border-radius:var(--r)}
-table{border-collapse:separate;border-spacing:0;width:100%}
-th{position:sticky;top:38px;z-index:3;background:var(--bg);text-align:left;white-space:nowrap;
+table{border-collapse:separate;border-spacing:0;width:100%;table-layout:fixed}
+/* Widths live on the header cells: with a fixed layout those are the ones
+   the browser reads, and the colspan detail row is left alone. */
+th:nth-child(1){width:176px} th:nth-child(2){width:19%}
+th:nth-child(4){width:25%} th:nth-child(5){width:64px} th:nth-child(6){width:104px}
+th{position:sticky;top:38px;z-index:3;background:var(--panel);text-align:left;white-space:nowrap;
  font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
  padding:6px 12px;border-bottom:1px solid var(--line-strong)}
 td{padding:6px 12px;border-bottom:1px solid var(--line);vertical-align:middle;font-size:13px}
 tbody tr:last-child td{border-bottom:0}
-tr.group td{background:var(--sunken);color:var(--muted);font-size:11.5px;padding:5px 12px}
-tr.group b{color:var(--fg);font-weight:600}
+tr.group td{background:var(--raised);color:var(--muted);font-size:11px;letter-spacing:.03em;padding:5px 12px}
+tr.group b{color:var(--fg);font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 tr.row{cursor:pointer}
 tr.row:hover{background:var(--raised)}
 tr.row.on{background:var(--raised)}
@@ -379,8 +383,8 @@ tr.row.on td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
  border-left:4px solid var(--faint);border-top:4px solid transparent;border-bottom:4px solid transparent;transition:transform .1s ease}
 tr.row.on .caret{transform:rotate(90deg);border-left-color:var(--accent)}
 td.name{font-weight:550}
-.tag{display:inline-flex;align-items:center;gap:6px;padding:1px 6px;border-radius:var(--r-tag);
- font-size:11.5px;border:1px solid transparent;white-space:nowrap}
+.tag{display:inline-flex;align-items:center;gap:6px;padding:2px 7px;border-radius:var(--r-tag);
+ font-size:12px;border:1px solid transparent;white-space:nowrap}
 .tag i{width:6px;height:6px;border-radius:1px;background:currentColor;flex:none}
 .s-ok{color:rgb(var(--ok));background:rgb(var(--ok) / .12);border-color:rgb(var(--ok) / .3)}
 .s-wait{color:rgb(var(--warn));background:rgb(var(--warn) / .12);border-color:rgb(var(--warn) / .3)}
