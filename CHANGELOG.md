@@ -19,6 +19,16 @@
 
 ### Fixed
 
+- **A Cloudflare issuance no longer leaves its challenge TXT record in the zone.** With
+  `dns.provider: cloudflare` and the token in a file (`cloudflare.apiTokenFile`), a fresh provider
+  was built for every call, and lego's Cloudflare provider deletes a record by the ID it
+  remembered when it created that record -- keyed by the challenge token. A provider built between
+  `Present` and `CleanUp` has an empty map, so every cleanup answered `cloudflare: unknown record
+  ID for '_acme-challenge.<name>.'` and the record stayed: one stale `_acme-challenge` TXT per
+  certificate per renewal, and a stale value is what a later validation can be answered from
+  (observed as `During secondary validation: Incorrect TXT record ... found`). The token file is
+  still re-read on every use, so a rotated token keeps taking effect without a restart; what is
+  kept is the provider instance, and only while the file holds the same token.
 - **The `lego_dns` build -- `make release` and `make test-tags` -- compiles from a clean
   checkout again.** `go.mod` had no requirement for `github.com/exoscale/egoscale/v3`, which
   that build needs because lego's DNS registry imports every provider it ships, exoscale
