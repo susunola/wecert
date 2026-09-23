@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/susunola/wecert/internal/backup"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/state"
 )
@@ -34,10 +37,11 @@ func runRestore(configPath, statePathOverride, arg string) error {
 // restoreState is runRestore with the config already in hand, so the whole path -- including which
 // snapshot "latest" resolves to and what the operator is told -- is testable without a YAML file.
 func restoreState(cfg *config.Config, arg string) error {
-	source, err := resolveSnapshot(cfg, arg)
+	source, cleanup, err := resolveRestoreSnapshot(cfg, arg)
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 
 	res, err := state.Restore(cfg.StatePath, source)
 	if err != nil {
@@ -62,6 +66,25 @@ func restoreState(cfg *config.Config, arg string) error {
 		res.RestoredAt.Add(state.RestoreCaveatWindow).Local().Format(time.RFC3339))
 	fmt.Printf("Start wecert again when you are ready.\n")
 	return nil
+}
+
+func resolveRestoreSnapshot(cfg *config.Config, arg string) (string, func(), error) {
+	if !strings.HasPrefix(arg, "remote:") {
+		source, err := resolveSnapshot(cfg, arg)
+		return source, func() {}, err
+	}
+	name := strings.TrimPrefix(arg, "remote:")
+	for _, t := range cfg.StateBackup.RemoteTargets {
+		if t.Name != name {
+			continue
+		}
+		source, err := backup.DownloadLatest(context.Background(), backup.Target{Type: t.Type, Name: t.Name, Bucket: t.Bucket, Prefix: t.Prefix, Endpoint: t.Endpoint, Region: t.Region, Timeout: t.TimeoutDur}, filepath.Dir(cfg.StatePath))
+		if err != nil {
+			return "", func() {}, err
+		}
+		return source, func() { _ = os.Remove(source) }, nil
+	}
+	return "", func() {}, fmt.Errorf("restore: no remote backup target named %q", name)
 }
 
 func accountPhrase(hasAccount bool) string {

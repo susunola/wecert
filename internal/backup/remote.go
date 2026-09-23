@@ -57,29 +57,111 @@ func Upload(ctx context.Context, target Target, src string) error {
 	}
 }
 
-func uploadS3(ctx context.Context, t Target, src string) error {
-	f, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("open snapshot: %w", err)
+// DownloadLatest retrieves the newest snapshot for target into dir with 0600
+// permissions. The caller owns removing the returned file after state.Restore
+// has verified and staged it.
+func DownloadLatest(ctx context.Context, target Target, dir string) (string, error) {
+	if target.Timeout <= 0 {
+		target.Timeout = 5 * time.Minute
 	}
-	defer f.Close()
+	ctx, cancel := context.WithTimeout(ctx, target.Timeout)
+	defer cancel()
+	switch target.Type {
+	case TypeS3, TypeCOS:
+		return downloadS3(ctx, target, dir)
+	case TypeSFTP:
+		return "", fmt.Errorf("SFTP restore download is not wired yet")
+	default:
+		return "", fmt.Errorf("unknown backup target type %q", target.Type)
+	}
+}
+
+func objectClient(ctx context.Context, t Target) (*s3.Client, error) {
 	opts := []func(*awsconfig.LoadOptions) error{}
 	if t.Region != "" {
 		opts = append(opts, awsconfig.WithRegion(t.Region))
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return fmt.Errorf("load object-store credentials: %w", err)
+		return nil, fmt.Errorf("load object-store credentials: %w", err)
 	}
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+	return s3.NewFromConfig(cfg, func(o *s3.Options) {
 		if t.Endpoint != "" {
 			o.BaseEndpoint = &t.Endpoint
 		}
-		// COS and most self-hosted S3 endpoints require path-style addressing.
 		if t.Type == TypeCOS {
 			o.UsePathStyle = true
 		}
-	})
+	}), nil
+}
+
+func downloadS3(ctx context.Context, t Target, dir string) (string, error) {
+	client, err := objectClient(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	prefix := strings.Trim(t.Prefix, "/")
+	pager := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: &t.Bucket, Prefix: &prefix})
+	var newest *types.Object
+	for pager.HasMorePages() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return "", fmt.Errorf("list remote snapshots: %w", err)
+		}
+		for i := range page.Contents {
+			o := &page.Contents[i]
+			if newest == nil || (o.Key != nil && newest.Key != nil && *o.Key > *newest.Key) {
+				newest = o
+			}
+		}
+	}
+	if newest == nil || newest.Key == nil {
+		return "", fmt.Errorf("no snapshots found in %s://%s/%s", t.Type, t.Bucket, prefix)
+	}
+	out, err := os.CreateTemp(dir, ".wecert-remote-restore-*")
+	if err != nil {
+		return "", fmt.Errorf("create restore temp file: %w", err)
+	}
+	name := out.Name()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(name)
+		}
+	}()
+	if err := out.Chmod(0o600); err != nil {
+		_ = out.Close()
+		return "", err
+	}
+	obj, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: &t.Bucket, Key: newest.Key})
+	if err != nil {
+		_ = out.Close()
+		return "", fmt.Errorf("download remote snapshot: %w", err)
+	}
+	_, copyErr := io.Copy(out, obj.Body)
+	closeErr := obj.Body.Close()
+	fileErr := out.Close()
+	if copyErr != nil {
+		return "", copyErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if fileErr != nil {
+		return "", fileErr
+	}
+	return name, nil
+}
+
+func uploadS3(ctx context.Context, t Target, src string) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open snapshot: %w", err)
+	}
+	defer f.Close()
+	client, err := objectClient(ctx, t)
+	if err != nil {
+		return err
+	}
 	key := path.Join(strings.Trim(t.Prefix, "/"), filepath.Base(src))
 	_, err = client.PutObject(ctx, &s3.PutObjectInput{Bucket: &t.Bucket, Key: &key, Body: f,
 		ServerSideEncryption: "AES256"})
