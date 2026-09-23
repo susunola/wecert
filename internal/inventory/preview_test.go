@@ -21,6 +21,7 @@ import (
 // /status, which makes a layout change hard to look at. This calls the same
 // WritePage the handler calls, so what it writes is what the daemon serves.
 func TestWritePreviewPage(t *testing.T) {
+	t.Parallel()
 	out := os.Getenv("WECERT_PREVIEW")
 	if out == "" {
 		t.Skip("set WECERT_PREVIEW=<file> to write a demo page")

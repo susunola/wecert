@@ -154,6 +154,7 @@ func bearer() map[string]string {
 // This endpoint triggers real issuance and burns rate-limit quota; running it
 // unauthenticated is unacceptable.
 func TestAuthIsRequired(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
@@ -180,6 +181,7 @@ func TestAuthIsRequired(t *testing.T) {
 // An empty configured token must be rejected at construction: "Bearer " would
 // otherwise compare equal to it.
 func TestNewRejectsEmptyToken(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -192,6 +194,7 @@ func TestNewRejectsEmptyToken(t *testing.T) {
 }
 
 func TestAuthAcceptsBothHeaderForms(t *testing.T) {
+	t.Parallel()
 	for name, headers := range map[string]map[string]string{
 		"Bearer": bearer(),
 		"X-Wecert-Token": {
@@ -210,6 +213,7 @@ func TestAuthAcceptsBothHeaderForms(t *testing.T) {
 
 // Health checks must not require auth, or liveness probes cannot work.
 func TestHealthzNeedsNoAuth(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, &fakeReconciler{})
 
 	w := do(t, s, http.MethodGet, "/healthz", "", nil)
@@ -230,6 +234,7 @@ func TestHealthzNeedsNoAuth(t *testing.T) {
 // took the trigger (and the read-only status endpoint) away from the operator for a renewable 15
 // minutes. A caller holding the token is not the threat this limiter exists for.
 func TestAuthLockoutAfterFailures(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
@@ -267,6 +272,7 @@ func TestAuthLockoutAfterFailures(t *testing.T) {
 // A good token decays the failure counter (see recordSuccess): one success
 // after a few failures must keep the address well clear of the lockout.
 func TestAuthSuccessForgivesFailures(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
@@ -288,6 +294,7 @@ func TestAuthSuccessForgivesFailures(t *testing.T) {
 // ── Triggering ────────────────────────────────────────────────────────────────────
 
 func TestTriggerAllWhenBodyEmpty(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a", "b"}}
 	s, _ := newTestServer(t, rec)
 
@@ -306,6 +313,7 @@ func TestTriggerAllWhenBodyEmpty(t *testing.T) {
 }
 
 func TestTriggerSingleCert(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a", "b", "c"}}
 	s, _ := newTestServer(t, rec)
 
@@ -319,6 +327,7 @@ func TestTriggerSingleCert(t *testing.T) {
 }
 
 func TestTriggerMultipleCerts(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a", "b", "c"}}
 	s, _ := newTestServer(t, rec)
 
@@ -332,6 +341,7 @@ func TestTriggerMultipleCerts(t *testing.T) {
 // An unknown name must not sink the names beside it: the ones that ARE managed still converge,
 // and the caller is told which ones were not recognised.
 func TestTriggerUnknownCertIsReportedNotFatal(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
@@ -359,6 +369,7 @@ func TestTriggerUnknownCertIsReportedNotFatal(t *testing.T) {
 // which is the failure this whole project exists to prevent. The names are echoed back in the
 // same shape as the 202, so one parser reads both answers.
 func TestTriggerAllNamesUnknownIsNotFound(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
@@ -386,6 +397,7 @@ func TestTriggerAllNamesUnknownIsNotFound(t *testing.T) {
 // dishonestly as accepted — the caller uses that to judge whether the trigger
 // actually did anything.
 func TestTriggerBusyCertIsSkipped(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{
 		names:   []string{"busy"},
 		failFor: map[string]error{"busy": reconcile.ErrAlreadyRunning},
@@ -405,6 +417,7 @@ func TestTriggerBusyCertIsSkipped(t *testing.T) {
 }
 
 func TestTriggerRejectsBothForms(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, &fakeReconciler{names: []string{"a"}})
 
 	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a","certs":["a"]}`, bearer())
@@ -414,6 +427,7 @@ func TestTriggerRejectsBothForms(t *testing.T) {
 }
 
 func TestTriggerRejectsBadJSON(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, &fakeReconciler{names: []string{"a"}})
 
 	w := do(t, s, http.MethodPost, "/hook/reconcile", `{not json`, bearer())
@@ -425,6 +439,7 @@ func TestTriggerRejectsBadJSON(t *testing.T) {
 // An explicit "certs": [] asks for nothing; silently widening it into a full
 // convergence would burn issuance quota the caller never asked for.
 func TestTriggerRejectsEmptyCerts(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
@@ -441,6 +456,7 @@ func TestTriggerRejectsEmptyCerts(t *testing.T) {
 // certificates just like an empty list, so it must not be read as an absent body —
 // that reading turns a targeted trigger into a full-fleet convergence.
 func TestTriggerRejectsNullCerts(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
@@ -461,6 +477,7 @@ func TestTriggerRejectsNullCerts(t *testing.T) {
 // convergence is not a theoretical concern: it burns issuance quota on every
 // certificate the caller never asked about.
 func TestTriggerRejectsEmptyCert(t *testing.T) {
+	t.Parallel()
 	for _, body := range []string{`{"cert":""}`, `{"cert":null}`} {
 		t.Run(body, func(t *testing.T) {
 			rec := &fakeReconciler{names: []string{"a", "b"}}
@@ -481,6 +498,7 @@ func TestTriggerRejectsEmptyCert(t *testing.T) {
 // Control for the two tests above: an absent body still means "everything", so the
 // rejection cannot be implemented by simply refusing all empty-looking requests.
 func TestTriggerWithNoBodyStillProcessesEverything(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a", "b"}}
 	s, _ := newTestServer(t, rec)
 
@@ -494,6 +512,7 @@ func TestTriggerWithNoBodyStillProcessesEverything(t *testing.T) {
 }
 
 func TestTriggerRejectsGET(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, &fakeReconciler{names: []string{"a"}})
 
 	w := do(t, s, http.MethodGet, "/hook/reconcile", "", bearer())
@@ -508,6 +527,7 @@ func TestTriggerRejectsGET(t *testing.T) {
 // ── Status ────────────────────────────────────────────────────────────────────
 
 func TestStatusReportsCertificates(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"cert-a", "cert-b"}}
 	s, store := newTestServer(t, rec)
 
@@ -550,6 +570,7 @@ func TestStatusReportsCertificates(t *testing.T) {
 }
 
 func TestStatusRequiresAuth(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, &fakeReconciler{names: []string{"a"}})
 
 	w := do(t, s, http.MethodGet, "/hook/status", "", nil)
@@ -561,6 +582,7 @@ func TestStatusRequiresAuth(t *testing.T) {
 // ── Outbound notification ────────────────────────────────────────────────────────────────
 
 func TestNotifierPostsEvent(t *testing.T) {
+	t.Parallel()
 	got := make(chan RenewalEvent, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var ev RenewalEvent
@@ -587,6 +609,7 @@ func TestNotifierPostsEvent(t *testing.T) {
 }
 
 func TestNotifierReportsErrorResult(t *testing.T) {
+	t.Parallel()
 	got := make(chan RenewalEvent, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var ev RenewalEvent
@@ -612,6 +635,7 @@ func TestNotifierReportsErrorResult(t *testing.T) {
 // A dead notification target must not affect convergence: Renewal must return
 // immediately (it is asynchronous).
 func TestNotifierDoesNotBlockOnDeadEndpoint(t *testing.T) {
+	t.Parallel()
 	n := NewNotifier("http://127.0.0.1:1/nowhere", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	start := time.Now()
@@ -622,6 +646,7 @@ func TestNotifierDoesNotBlockOnDeadEndpoint(t *testing.T) {
 }
 
 func TestNewNotifierDisabledWhenURLEmpty(t *testing.T) {
+	t.Parallel()
 	if n := NewNotifier("", "", slog.New(slog.NewTextHandler(io.Discard, nil))); n != nil {
 		t.Error("an empty url should return nil")
 	}
@@ -631,6 +656,7 @@ func TestNewNotifierDisabledWhenURLEmpty(t *testing.T) {
 // answer must be 503 -- never 202 with every certificate "accepted" (from the
 // last good cache) for a convergence that will never happen.
 func TestTriggerAllDesiredStateUnavailable(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{
 		names:       []string{"a", "b"},
 		startAllErr: reconcile.ErrDesiredStateUnavailable,
@@ -650,6 +676,7 @@ func TestTriggerAllDesiredStateUnavailable(t *testing.T) {
 // string and would silently widen into a full trigger -- the same problem as
 // "certs": [], so it gets the same answer.
 func TestTriggerRejectsEmptyCertString(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
@@ -666,6 +693,7 @@ func TestTriggerRejectsEmptyCertString(t *testing.T) {
 // transient internal problem, not "not managed": reporting it in unknown tells
 // the caller to give up on a certificate that may well exist.
 func TestTriggerCertResolveFailureIs503(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{
 		names:   []string{"a"},
 		failFor: map[string]error{"a": reconcile.ErrDesiredStateUnavailable},
@@ -682,6 +710,7 @@ func TestTriggerCertResolveFailureIs503(t *testing.T) {
 // it lands in the unknown bucket, NOT in the 503 branch (a transient resolve failure) and not
 // among the started. Kept beside a name that does resolve, so the 202 path is exercised too.
 func TestTriggerUnknownCertSentinelIsReportedUnknown(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{
 		names:   []string{"a", "b"},
 		failFor: map[string]error{"a": reconcile.ErrUnknownCert},
@@ -706,6 +735,7 @@ func TestTriggerUnknownCertSentinelIsReportedUnknown(t *testing.T) {
 // The sentinel alone -- every name unknown -- is the same caller error as a typo, and must not
 // be softened into a 202 just because it arrived as a sentinel rather than a missing name.
 func TestTriggerUnknownCertSentinelAloneIsNotFound(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{
 		names:   []string{"a"},
 		failFor: map[string]error{"a": reconcile.ErrUnknownCert},
@@ -727,6 +757,7 @@ func TestTriggerUnknownCertSentinelAloneIsNotFound(t *testing.T) {
 // A duplicated name would otherwise be started twice: the second start reports
 // "already running", and one certificate shows up as both accepted and skipped.
 func TestTriggerDeduplicatesRepeatedNames(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a", "b"}}
 	s, _ := newTestServer(t, rec)
 
@@ -748,6 +779,7 @@ func TestTriggerDeduplicatesRepeatedNames(t *testing.T) {
 // An empty certificate list must serialize as [], not null -- clients that
 // iterate the field read null as "no answer".
 func TestStatusEmptyCertificatesSerializesAsEmptyArray(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, &fakeReconciler{})
 
 	w := do(t, s, http.MethodGet, "/hook/status", "", bearer())
@@ -763,6 +795,7 @@ func TestStatusEmptyCertificatesSerializesAsEmptyArray(t *testing.T) {
 // genuine renewal event from anything else that can reach its URL. The signature covers
 // the raw body, so it must be computed over the bytes actually sent.
 func TestNotifierSignsTheBodyWhenASecretIsSet(t *testing.T) {
+	t.Parallel()
 	const secret = "0123456789abcdef0123456789abcdef"
 
 	body := make(chan []byte, 1)
@@ -794,6 +827,7 @@ func TestNotifierSignsTheBodyWhenASecretIsSet(t *testing.T) {
 // Without a secret the header must be absent, not an empty or truncated value: a receiver
 // that only checks "is the header present" would otherwise accept unsigned traffic.
 func TestNotifierOmitsSignatureWithoutASecret(t *testing.T) {
+	t.Parallel()
 	sig := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sig <- r.Header.Get("X-Wecert-Signature")
@@ -820,6 +854,7 @@ func TestNotifierOmitsSignatureWithoutASecret(t *testing.T) {
 // document hash -- and the webhook's loop used to call it per name, synchronously inside
 // a request with a 15s write timeout. The full-trigger path already had this fixed.
 func TestMultiCertTriggerResolvesTheDesiredStateOnce(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a", "b", "c", "d", "e"}}
 	s, _ := newTestServer(t, rec)
 
@@ -860,6 +895,7 @@ func newDesiredServer(t *testing.T, last *spec.Result) *Server {
 // an empty certificate list: an empty list means "nothing should be issued", which is a
 // completely different message.
 func TestDesiredWithoutAReadStateIs503(t *testing.T) {
+	t.Parallel()
 	s := newDesiredServer(t, nil)
 
 	w := do(t, s, http.MethodGet, "/hook/desired", "", bearer())
@@ -874,6 +910,7 @@ func TestDesiredWithoutAReadStateIs503(t *testing.T) {
 // The endpoint must be authenticated like the others: it exposes certificate names, domains and
 // error text.
 func TestDesiredRequiresAuth(t *testing.T) {
+	t.Parallel()
 	s := newDesiredServer(t, &spec.Result{})
 
 	w := do(t, s, http.MethodGet, "/hook/desired", "", nil)
@@ -883,6 +920,7 @@ func TestDesiredRequiresAuth(t *testing.T) {
 }
 
 func TestDesiredRejectsNonGET(t *testing.T) {
+	t.Parallel()
 	s := newDesiredServer(t, &spec.Result{})
 
 	w := do(t, s, http.MethodPost, "/hook/desired", "", bearer())
@@ -897,6 +935,7 @@ func TestDesiredRejectsNonGET(t *testing.T) {
 // The payload must put what is desired next to whether it exists, and mark issued certificates
 // with their expiry -- that pairing is what makes the endpoint answer "is my domain live?".
 func TestDesiredReportsIssuedStateAndDaysLeft(t *testing.T) {
+	t.Parallel()
 	last := &spec.Result{
 		Revision:    "sha256:abc",
 		GeneratedAt: time.Now().Add(-time.Hour),
@@ -945,6 +984,7 @@ func TestDesiredReportsIssuedStateAndDaysLeft(t *testing.T) {
 // An issued certificate must report its expiry and remaining days, rounded up: a caller that
 // treats 0 as expired would read a healthy certificate as down.
 func TestDesiredReportsDaysLeftForAnIssuedCertificate(t *testing.T) {
+	t.Parallel()
 	notAfter := time.Now().Add(36 * time.Hour)
 	last := &spec.Result{
 		Certificates: []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}},
@@ -983,6 +1023,7 @@ func TestDesiredReportsDaysLeftForAnIssuedCertificate(t *testing.T) {
 // A frozen desired state must be visible in the payload: it means the source is unreadable and
 // nothing new will be picked up, which is exactly what an operator needs to see.
 func TestDesiredSurfacesAFrozenState(t *testing.T) {
+	t.Parallel()
 	last := &spec.Result{
 		Revision:     "sha256:abc",
 		Frozen:       true,
@@ -1009,6 +1050,7 @@ func TestDesiredSurfacesAFrozenState(t *testing.T) {
 // The lockout is keyed by client IP, so a RemoteAddr that does not split must fall back to the
 // raw value rather than an empty string -- which would put every such caller in one bucket.
 func TestClientIPFallsBackToRemoteAddr(t *testing.T) {
+	t.Parallel()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "not-a-host-port"
 	if got := clientIP(req); got != "not-a-host-port" {
@@ -1035,6 +1077,7 @@ func TestClientIPFallsBackToRemoteAddr(t *testing.T) {
 // was wrong whenever the two reads disagreed: a certificate could be reported accepted
 // even though it was never processed.
 func TestFullTriggerReportsWhatTheReconcilerStarted(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a", "b", "c"}}
 	srv, _ := newTestServer(t, rec)
 
@@ -1074,6 +1117,7 @@ func TestFullTriggerReportsWhatTheReconcilerStarted(t *testing.T) {
 // exit with the POST in flight and lose it -- including the "result":"error" one, which is
 // the notification an operator most needs. Drain is what the daemon calls before returning.
 func TestDrainWaitsForAnInFlightNotification(t *testing.T) {
+	t.Parallel()
 	received := make(chan struct{})
 	release := make(chan struct{})
 
@@ -1123,6 +1167,7 @@ func TestDrainWaitsForAnInFlightNotification(t *testing.T) {
 // A notification offered after Drain must be refused rather than accepted: nothing is left
 // to wait for it, so taking it is the same as dropping it later, only less visibly.
 func TestDrainRefusesNewNotifications(t *testing.T) {
+	t.Parallel()
 	var got int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&got, 1)
@@ -1151,6 +1196,7 @@ func TestDrainRefusesNewNotifications(t *testing.T) {
 // pre-filter had already emptied the target list, handed StartNamed nothing to resolve. The caller
 // was told the certificate is not in the configuration, and issuance waited for the next pass.
 func TestTriggerStartsACertificateTheCacheHasNotSeen(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}, fresh: []string{"a", "new-one"}}
 	s, _ := newTestServer(t, rec)
 
@@ -1177,6 +1223,7 @@ func TestTriggerStartsACertificateTheCacheHasNotSeen(t *testing.T) {
 // that iterate the field read null as "no answer", which is the one thing the initialisation was
 // there to prevent. (The named-trigger branch appends, which is why only this path regressed.)
 func TestFullTriggerWithNothingAcceptedSerializesAsEmptyArray(t *testing.T) {
+	t.Parallel()
 	// A pass already holds every claim, so StartAll accepts none of them -- and answers with a
 	// nil accepted slice, exactly like the real reconciler.
 	rec := &fakeReconciler{names: []string{"busy"}, allBusy: true}
@@ -1205,6 +1252,7 @@ func TestFullTriggerWithNothingAcceptedSerializesAsEmptyArray(t *testing.T) {
 // cut happened to land on a JSON boundary, and reported as "invalid JSON" otherwise, which sends
 // the caller to inspect their JSON rather than their payload size.
 func TestAnOversizedTriggerBodyIsRefused(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, &fakeReconciler{names: []string{"a"}})
 
 	// A valid JSON document with a long (ignored) field, so the truncation point cannot be reasoned
@@ -1226,6 +1274,7 @@ func TestAnOversizedTriggerBodyIsRefused(t *testing.T) {
 // certStatus a certificate with no recorded state produces: the caller could not tell an unreadable
 // store from "nothing has happened".
 func TestStatusReportsAnUnreadableCertificateState(t *testing.T) {
+	t.Parallel()
 	s, store := newTestServer(t, &fakeReconciler{names: []string{"a"}})
 	if err := store.PutCert(&state.CertState{Name: "a"}); err != nil {
 		t.Fatal(err)
@@ -1253,6 +1302,7 @@ func TestStatusReportsAnUnreadableCertificateState(t *testing.T) {
 // would be worse than the refusal: "skipped" means "already running, poll for the result", and
 // there is no pass to poll for.
 func TestTriggerAllWhileShuttingDownIs503(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{
 		names:       []string{"a", "b"},
 		startAllErr: reconcile.ErrShuttingDown,
@@ -1274,6 +1324,7 @@ func TestTriggerAllWhileShuttingDownIs503(t *testing.T) {
 
 // The same refusal behind a named trigger.
 func TestTriggerCertWhileShuttingDownIs503(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{
 		names:   []string{"a"},
 		failFor: map[string]error{"a": reconcile.ErrShuttingDown},
@@ -1298,6 +1349,7 @@ func TestTriggerCertWhileShuttingDownIs503(t *testing.T) {
 // happened. Brute force is still bounded: a wrong token is counted, and the address is refused once
 // the budget is spent.
 func TestACorrectTokenIsNotLockedOutByFailuresFromTheSameAddress(t *testing.T) {
+	t.Parallel()
 	rec := &fakeReconciler{names: []string{"a"}}
 	s, _ := newTestServer(t, rec)
 
@@ -1327,6 +1379,7 @@ func TestACorrectTokenIsNotLockedOutByFailuresFromTheSameAddress(t *testing.T) {
 // decoded into a request with no targets, and no targets is a FULL trigger: the typo burned a
 // whole fleet's issuance quota on Let's Encrypt.
 func TestTriggerRejectsUnknownFields(t *testing.T) {
+	t.Parallel()
 	for _, body := range []string{
 		`{"certificate":"a"}`,            // the typo the fix exists for
 		`{"cert":"a","certificate":"b"}`, // a valid key must not excuse an unknown one
@@ -1359,6 +1412,7 @@ func TestTriggerRejectsUnknownFields(t *testing.T) {
 // issued=false -- that is the same entry "desired but not issued yet" produces, on the
 // endpoint whose job is to answer whether the desired certificate actually exists.
 func TestDesiredReportsAnUnreadableCertificateState(t *testing.T) {
+	t.Parallel()
 	last := &spec.Result{
 		Certificates: []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}},
 	}

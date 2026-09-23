@@ -38,6 +38,7 @@ func testDoc(t *testing.T) *Document {
 // identical, and accepting the latter strips every domain from every certificate.
 // The risk is far too asymmetric.
 func TestValidateRejectsEmptyCertificates(t *testing.T) {
+	t.Parallel()
 	doc := testDoc(t)
 	doc.Certificates = nil
 
@@ -47,6 +48,7 @@ func TestValidateRejectsEmptyCertificates(t *testing.T) {
 }
 
 func TestValidateRequiresEnvelope(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		mutate func(*Document)
@@ -73,6 +75,7 @@ func TestValidateRequiresEnvelope(t *testing.T) {
 // follows the domain set" -- by the time wecert reads it, the orphan state
 // already exists.
 func TestValidateRejectsNameThatFollowsTheDomainSet(t *testing.T) {
+	t.Parallel()
 	doc := testDoc(t)
 	doc.Certificates = []config.Certificate{{
 		// The registered domain is example.com, so the name must be example-com.
@@ -87,6 +90,7 @@ func TestValidateRejectsNameThatFollowsTheDomainSet(t *testing.T) {
 }
 
 func TestValidateRejectsCrossRegisteredDomain(t *testing.T) {
+	t.Parallel()
 	doc := testDoc(t)
 	doc.Certificates = []config.Certificate{{
 		Name:    "example-com",
@@ -103,6 +107,7 @@ func TestValidateRejectsCrossRegisteredDomain(t *testing.T) {
 // Otherwise it would change on every onboarding run and "did the desired state
 // actually change?" could not be answered.
 func TestRevisionIgnoresOrderAndTimestamps(t *testing.T) {
+	t.Parallel()
 	a := []config.Certificate{{Name: "example-com", Domains: []string{"example.com", "*.example.com"}}}
 	b := []config.Certificate{{Name: "example-com", Domains: []string{"*.example.com", "example.com"}}}
 
@@ -115,6 +120,7 @@ func TestRevisionIgnoresOrderAndTimestamps(t *testing.T) {
 }
 
 func TestRevisionRejectsATamperedDocument(t *testing.T) {
+	t.Parallel()
 	doc := testDoc(t)
 	if err := doc.Validate(); err != nil {
 		t.Fatal(err)
@@ -129,6 +135,7 @@ func TestRevisionRejectsATamperedDocument(t *testing.T) {
 }
 
 func TestWriteAndLoadRoundTrip(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "desired-state.yaml")
 
 	doc := testDoc(t)
@@ -166,6 +173,7 @@ func TestWriteAndLoadRoundTrip(t *testing.T) {
 // nothing until every certificate expires -- the worst kind of failure: silent,
 // with all the consequences in production.
 func TestNewFileFailsWhenTheDocumentIsMissing(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "nope.yaml")
 	if _, err := NewFile(path, testLogger()); err == nil {
 		t.Fatal("NewFile must fail when the document is missing")
@@ -180,6 +188,7 @@ func TestNewFileFailsWhenTheDocumentIsMissing(t *testing.T) {
 // The correct reaction is to freeze on the last usable revision and keep
 // converging on it.
 func TestFileProviderFreezesOnUnreadableDocument(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "desired-state.yaml")
 	if err := WriteDocument(path, testDoc(t)); err != nil {
 		t.Fatal(err)
@@ -223,6 +232,7 @@ func TestFileProviderFreezesOnUnreadableDocument(t *testing.T) {
 }
 
 func TestDiffReportsAddRemoveAndChange(t *testing.T) {
+	t.Parallel()
 	enforced := &Result{Certificates: []config.Certificate{
 		{Name: "example-com", Domains: []string{"example.com", "old.example.com"}},
 		{Name: "gone-net", Domains: []string{"gone.net"}},
@@ -261,6 +271,7 @@ func TestDiffReportsAddRemoveAndChange(t *testing.T) {
 }
 
 func TestDiffIsEmptyWhenNothingChanged(t *testing.T) {
+	t.Parallel()
 	certs := []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}}
 	got := Diff(&Result{Certificates: certs}, &Result{Certificates: certs})
 	if !got.Empty() {
@@ -276,6 +287,7 @@ func TestDiffIsEmptyWhenNothingChanged(t *testing.T) {
 // Readability is deliberately not checked -- the file is written 0644 so an operator can
 // read it, and only the write bits can change what it says.
 func TestLoadDocumentRefusesASymlinkOrAWritableFile(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.yaml")
 	body := "apiVersion: wecert/v1\nkind: DesiredState\ngeneratedAt: " +
@@ -323,6 +335,7 @@ func TestLoadDocumentRefusesASymlinkOrAWritableFile(t *testing.T) {
 // alone trips no other check. It is the one signal this architecture has for "the
 // generator died and no new name will ever be picked up".
 func TestValidateRejectsAFutureGeneratedAt(t *testing.T) {
+	t.Parallel()
 	doc := testDoc(t)
 	doc.GeneratedAt = time.Now().Add(24 * time.Hour)
 	if err := doc.Validate(); err == nil {
@@ -341,6 +354,7 @@ func TestValidateRejectsAFutureGeneratedAt(t *testing.T) {
 // itself is 0644: WriteDocument installs the file by rename, so the directory's
 // permissions -- not the file's -- decide who can replace its contents.
 func TestLoadDocumentRefusesAWorldWritableDirectory(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	inner := filepath.Join(dir, "docs")
 	if err := os.Mkdir(inner, 0o777); err != nil {
@@ -370,6 +384,7 @@ func TestLoadDocumentRefusesAWorldWritableDirectory(t *testing.T) {
 // provider that aliases it would let a later mutation change the desired state underneath
 // convergence.
 func TestStaticCopiesTheCertificateSlice(t *testing.T) {
+	t.Parallel()
 	certs := []config.Certificate{{Name: "a", Domains: []string{"a.example.com"}}}
 	st := NewStatic(certs)
 
@@ -389,6 +404,7 @@ func TestStaticCopiesTheCertificateSlice(t *testing.T) {
 // The static result must carry a revision and per-name decisions, because the diagnostic
 // endpoint and the shadow report both read them.
 func TestStaticReportsRevisionAndDecisions(t *testing.T) {
+	t.Parallel()
 	st := NewStatic([]config.Certificate{{Name: "a", Domains: []string{"a.example.com"}}})
 	res, err := st.DesiredWithReasons(context.Background())
 	if err != nil {
@@ -408,6 +424,7 @@ func TestStaticReportsRevisionAndDecisions(t *testing.T) {
 // The File provider must satisfy the same interface as Static, so switching desiredState.mode
 // needs no change to the convergence loop.
 func TestFileProviderServesTheDocument(t *testing.T) {
+	t.Parallel()
 	doc := testDoc(t)
 	path := writeDoc(t, doc)
 
@@ -443,6 +460,7 @@ func TestFileProviderServesTheDocument(t *testing.T) {
 // never an empty set. An empty desired state would strip every SAN from every certificate, so
 // the failure has to degrade to "carry on with what we had".
 func TestFileProviderFreezesOnAnUnreadableDocument(t *testing.T) {
+	t.Parallel()
 	doc := testDoc(t)
 	path := writeDoc(t, doc)
 
@@ -488,6 +506,7 @@ func TestFileProviderFreezesOnAnUnreadableDocument(t *testing.T) {
 // A document that is unreadable at startup must be an error, not a freeze: there is no last
 // good revision, and starting with no desired state means renewing nothing.
 func TestNewFileFailsWhenThereIsNothingToFallBackTo(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "missing.yaml")
 	if _, err := NewFile(path, testLogger()); err == nil {
 		t.Fatal("NewFile on a missing document must fail, or enforce mode starts with no state")
@@ -500,6 +519,7 @@ func TestNewFileFailsWhenThereIsNothingToFallBackTo(t *testing.T) {
 // ever won, switching to observe would change what is issued -- which is the one thing it
 // promises not to do.
 func TestObserverConvergesOnThePrimary(t *testing.T) {
+	t.Parallel()
 	primary := NewStatic([]config.Certificate{{Name: "primary", Domains: []string{"p.example.com"}}})
 	shadowDoc := testDoc(t)
 	shadow := NewStatic(shadowDoc.Certificates)
@@ -538,6 +558,7 @@ func TestObserverConvergesOnThePrimary(t *testing.T) {
 // An unreadable shadow must not fail the pass: during observation the document is often absent
 // because generation has not started yet, and convergence has to carry on.
 func TestObserverSurvivesAnUnreadableShadow(t *testing.T) {
+	t.Parallel()
 	primary := NewStatic([]config.Certificate{{Name: "primary", Domains: []string{"p.example.com"}}})
 	// NewFile refuses to construct without a document, so the unreadable shadow is a provider
 	// that reports the failure instead -- which is what a document that disappears mid-run
@@ -575,6 +596,7 @@ func (failingProvider) DesiredWithReasons(context.Context) (*Result, error) {
 // spec.Desired must prefer the reporting path when a provider implements it, so callers get
 // decisions and revisions rather than a bare certificate list.
 func TestDesiredUsesTheReportingPathWhenAvailable(t *testing.T) {
+	t.Parallel()
 	withReasons := NewStatic([]config.Certificate{{Name: "a", Domains: []string{"a.example.com"}}})
 	res, err := Desired(context.Background(), withReasons)
 	if err != nil {
@@ -605,6 +627,7 @@ func (b *bareProvider) Desired(context.Context) ([]config.Certificate, error) { 
 
 // KindOf must not panic on a provider that does not implement Named.
 func TestKindOfFallsBackForAnUnnamedProvider(t *testing.T) {
+	t.Parallel()
 	if got := KindOf(&bareProvider{}); got != "unknown" {
 		t.Errorf("KindOf = %q, want unknown", got)
 	}
@@ -629,6 +652,7 @@ func writeDoc(t *testing.T, doc *Document) string {
 // shadow_last_read, and both would look healthy while the document nobody can read is what the
 // shadow is actually made of.
 func TestObserverReportsAFrozenShadowAsNoComparison(t *testing.T) {
+	t.Parallel()
 	primary := NewStatic([]config.Certificate{{Name: "primary", Domains: []string{"p.example.com"}}})
 	// A provider that answers with a frozen result and no error, which is exactly what File does
 	// after its first successful read.

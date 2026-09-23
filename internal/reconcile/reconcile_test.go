@@ -203,6 +203,7 @@ func (f *fakeNotifier) Renewal(_ context.Context, certName string, err error) {
 }
 
 func TestNotifierReceivesRenewalResult(t *testing.T) {
+	t.Parallel()
 	const name = "notify-ok"
 	mgr := &fakeManager{}
 	notifier := newFakeNotifier()
@@ -229,6 +230,7 @@ func TestNotifierReceivesRenewalResult(t *testing.T) {
 }
 
 func TestNotifierReceivesFailure(t *testing.T) {
+	t.Parallel()
 	const name = "notify-fail"
 	mgr := &fakeManager{failWith: map[string]error{name: errors.New("boom")}}
 	notifier := newFakeNotifier()
@@ -257,6 +259,7 @@ func TestNotifierReceivesFailure(t *testing.T) {
 // ── Event triggering ────────────────────────────────────────────────────────────
 
 func TestRunCertUnknownName(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"a"}, mgr)
 
@@ -269,6 +272,7 @@ func TestRunCertUnknownName(t *testing.T) {
 }
 
 func TestRunCertProcessesOnlyThatCert(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"a", "b", "c"}, mgr)
 
@@ -284,6 +288,7 @@ func TestRunCertProcessesOnlyThatCert(t *testing.T) {
 // event-triggered convergence landing on one certificate together means two
 // orders that run into "5 certificates per exact set of identifiers / 7 days".
 func TestConcurrentRunCertIsRejected(t *testing.T) {
+	t.Parallel()
 	const name = "busy"
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -309,6 +314,7 @@ func TestConcurrentRunCertIsRejected(t *testing.T) {
 // caller gets "accepted", the same certificate could already have been started
 // again elsewhere.
 func TestStartCertReservesSlotSynchronously(t *testing.T) {
+	t.Parallel()
 	const name = "async"
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -336,6 +342,7 @@ func TestStartCertReservesSlotSynchronously(t *testing.T) {
 }
 
 func TestStartAllSkipsBusyCerts(t *testing.T) {
+	t.Parallel()
 	const busy = "busy-one"
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -370,6 +377,7 @@ func TestStartAllSkipsBusyCerts(t *testing.T) {
 }
 
 func TestAPassSkipsBusyCerts(t *testing.T) {
+	t.Parallel()
 	const busy = "busy-runall"
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -393,6 +401,7 @@ func TestAPassSkipsBusyCerts(t *testing.T) {
 }
 
 func TestCertNamesPreservesConfigOrder(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"z", "a", "m"}, mgr)
 
@@ -419,6 +428,7 @@ func TestCertNamesPreservesConfigOrder(t *testing.T) {
 // stall the others' renewals. The most dangerous thing in automation is that
 // coupling — one mistyped domain and no certificate on the site renews.
 func TestAPassContinuesAfterOneCertFails(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{failWith: map[string]error{
 		"b": errors.New("boom"),
 	}}
@@ -439,6 +449,7 @@ func TestAPassContinuesAfterOneCertFails(t *testing.T) {
 }
 
 func TestAPassReapsRetiredCerts(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"only"}, mgr)
 
@@ -451,6 +462,7 @@ func TestAPassReapsRetiredCerts(t *testing.T) {
 
 // After a stop signal, no further certificates should be processed.
 func TestAPassStopsOnContextCancel(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -465,6 +477,7 @@ func TestAPassStopsOnContextCancel(t *testing.T) {
 }
 
 func TestPublishExportsNotAfter(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	r, store := newTestReconciler(t, []string{"pub-notafter"}, mgr)
 
@@ -484,6 +497,7 @@ func TestPublishExportsNotAfter(t *testing.T) {
 // The first upload still needs a manual bind, and "deployed" must not go green
 // before then — or the expiry alert will think everything is fine.
 func TestPublishDeployedRequiresConfirmation(t *testing.T) {
+	t.Parallel()
 	const name = "pub-deployed"
 	mgr := &fakeManager{}
 	r, store := newTestReconciler(t, []string{name}, mgr)
@@ -515,6 +529,7 @@ func TestPublishDeployedRequiresConfirmation(t *testing.T) {
 // A certificate missing from the state store must not panic or write any
 // metric.
 func TestPublishMissingCertIsNoop(t *testing.T) {
+	t.Parallel()
 	const name = "pub-missing"
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{name}, mgr)
@@ -528,6 +543,7 @@ func TestPublishMissingCertIsNoop(t *testing.T) {
 }
 
 func TestAPassCountsFailuresInMetrics(t *testing.T) {
+	t.Parallel()
 	const name = "pub-failcount"
 	mgr := &fakeManager{failWith: map[string]error{name: errors.New("boom")}}
 	r, store := newTestReconciler(t, []string{name}, mgr)
@@ -564,6 +580,7 @@ func (f failingProvider) Desired(context.Context) ([]config.Certificate, error) 
 // semantics) and here: a contract boundary cannot assume the upstream got it
 // right.
 func TestUnreadableSourceSkipsThePassEntirely(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -598,6 +615,7 @@ func TestUnreadableSourceSkipsThePassEntirely(t *testing.T) {
 // if something still slips through, it should at least be visible before
 // expiry.
 func TestOrphanedCertificatesAreReported(t *testing.T) {
+	t.Parallel()
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -627,6 +645,7 @@ func TestOrphanedCertificatesAreReported(t *testing.T) {
 // pass and 12,000 per day from one deployment, which is how a journal stops being read. The first few
 // keep their own line; the rest are counted, and every one of them is still reachable at Debug.
 func TestHundredsOfOrphansDoNotFloodTheJournal(t *testing.T) {
+	t.Parallel()
 	const orphans = orphanLogLimit + 5
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -697,6 +716,7 @@ func (c *countingProvider) Desired(ctx context.Context) ([]config.Certificate, e
 // every StartCert: N+1 file reads, YAML decodes, full validations and document
 // hashes, plus an O(n^2) Find over a slice it was already holding.
 func TestStartAllResolvesTheDesiredStateOnce(t *testing.T) {
+	t.Parallel()
 	const n = 12
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -746,6 +766,7 @@ func TestStartAllResolvesTheDesiredStateOnce(t *testing.T) {
 // statements and 0.234 s for the same fleet's scheduled pass. The last pass of a batch publishes for
 // the whole batch, so the numbers still include every spend the batch made.
 func TestAFullTriggerPublishesQuotaOnce(t *testing.T) {
+	t.Parallel()
 	const n = 12
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -794,6 +815,7 @@ func TestAFullTriggerPublishesQuotaOnce(t *testing.T) {
 // fired that many concurrent ACME orders, DNS writes and cloud calls from a single
 // HTTP request. The timer path walks the same certificates strictly one at a time.
 func TestFullTriggerBoundsConcurrentReconciles(t *testing.T) {
+	t.Parallel()
 	const n = 40
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -890,6 +912,7 @@ func hasCertSeries(t *testing.T, name string) bool {
 // expiry rule -- (not_after - now) < 21 days -- permanently, for a certificate that
 // no longer exists, and the vecs grow without bound as domains churn.
 func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
+	t.Parallel()
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("opening the state store: %v", err)
@@ -936,6 +959,7 @@ func TestRemovedCertificateSeriesAreReclaimed(t *testing.T) {
 // trigger look healthy when it was not. A pass deliberately stays
 // fire-and-forget: one failing certificate must not stall the others.
 func TestRunCertPropagatesTheReconcileError(t *testing.T) {
+	t.Parallel()
 	boom := errors.New("boom")
 	mgr := &fakeManager{failWith: map[string]error{"b": boom}}
 	r, _ := newTestReconciler(t, []string{"a", "b"}, mgr)
@@ -953,6 +977,7 @@ func TestRunCertPropagatesTheReconcileError(t *testing.T) {
 // good cache) while not a single pass had started -- a convergence that will
 // never happen, reported as scheduled.
 func TestStartAllFailsWhenDesiredStateIsUnreadable(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -981,6 +1006,7 @@ func TestStartAllFailsWhenDesiredStateIsUnreadable(t *testing.T) {
 // from, and together with skipped it must partition the desired state -- a name
 // in both, or in neither, means the trigger report lies about what happened.
 func TestStartAllAcceptedAndSkippedPartitionTheDesiredState(t *testing.T) {
+	t.Parallel()
 	const busy = "busy-partition"
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
@@ -1020,6 +1046,7 @@ func TestStartAllAcceptedAndSkippedPartitionTheDesiredState(t *testing.T) {
 // goroutine: one bad certificate took down every certificate's renewals. The
 // pass must surface as an error to its caller and the fleet must carry on.
 func TestReconcileOneRecoversPanics(t *testing.T) {
+	t.Parallel()
 	const bad = "panic-cert"
 	mgr := &fakeManager{panicWith: map[string]string{bad: "nil pointer in the order flow"}}
 	r, _ := newTestReconciler(t, []string{"a", bad, "c"}, mgr)
@@ -1103,6 +1130,7 @@ func hasProbeSeries(t *testing.T, host string) bool {
 // sharing the TXT name), and its probe series plus the prober's transition
 // memory stayed behind for good. The orphan path must tear all of it down.
 func TestOrphanCleanupIsWired(t *testing.T) {
+	t.Parallel()
 	const (
 		gone = "orphan-wired"
 		kept = "kept-wired"
@@ -1213,6 +1241,7 @@ func (h *recordLogHandler) containsAtLevel(sub string, lvl slog.Level) bool {
 // running, even though the caller was told "accepted". That must leave a trace
 // -- silently, the 202 is indistinguishable from a pass that started and failed.
 func TestParkedStartLogsAtShutdown(t *testing.T) {
+	t.Parallel()
 	release := make(chan struct{})
 	entered := make(chan struct{}, maxConcurrentStarts)
 	mgr := &fakeManager{onReconcile: func(string) {
@@ -1275,6 +1304,7 @@ func TestParkedStartLogsAtShutdown(t *testing.T) {
 // being renewed because one of them hit a nil map. The panic must also be counted, since
 // wecert_reconcile_panics_total is documented as "any nonzero value is a bug".
 func TestPanicInOneCertificateIsContainedAndCounted(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{onReconcile: func(name string) {
 		if name == "boom" {
 			panic("simulated nil map write")
@@ -1305,6 +1335,7 @@ func TestPanicInOneCertificateIsContainedAndCounted(t *testing.T) {
 // The probe is best-effort evidence, so a panic in it must not reach the process either.
 // It runs one goroutine per host, where a panic is unrecoverable by the parent.
 func TestPanicInTheProbeIsContained(t *testing.T) {
+	t.Parallel()
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1358,6 +1389,7 @@ func (panickingProber) Forget(string) {}
 // The claim is held here directly rather than by racing a real pass, so the assertion is
 // deterministic: publishOrphans runs at the top of a pass, before the loop that claims.
 func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
+	t.Parallel()
 	const (
 		gone = "in-flight-cert"
 		kept = "kept-cert"
@@ -1425,6 +1457,7 @@ func TestOrphanTeardownSkipsACertificateWithAPassInFlight(t *testing.T) {
 // "every renewal ATTEMPT emits" -- a skip is the absence of an attempt, so emitting
 // result:"ok" for it asserts a renewal that never ran.
 func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
+	t.Parallel()
 	const name = "backing-off"
 
 	mgr := &fakeManager{failWith: map[string]error{name: state.ErrBackoff}}
@@ -1480,6 +1513,7 @@ func TestBackoffSkippedPassIsNotReportedAsSuccess(t *testing.T) {
 // well as on Trouble() itself keeps the two halves -- what the pass records, and what the exit code
 // reads -- from drifting apart again.
 func TestAPassInBackoffIsRecordedAsTrouble(t *testing.T) {
+	t.Parallel()
 	names := []string{"backing-off-one", "backing-off-two"}
 
 	mgr := &fakeManager{failWith: map[string]error{
@@ -1530,6 +1564,7 @@ func reconcileCounts(t *testing.T, name string) map[string]float64 {
 // The control: a genuine failure still counts as an error and still notifies, so the fix
 // cannot be satisfied by never notifying or never counting.
 func TestGenuineFailureStillCountsAndNotifies(t *testing.T) {
+	t.Parallel()
 	const name = "really-failing"
 
 	mgr := &fakeManager{failWith: map[string]error{name: errors.New("boom")}}
@@ -1600,6 +1635,7 @@ func counterValue(t *testing.T, metric string, labels map[string]string) float64
 // attempted until the CA accepts it, across restarts and CA outages. The gate exists because
 // this runs on every pass and almost every deployment has nothing outstanding.
 func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
+	t.Parallel()
 	prov := &mutableProvider{}
 	prov.set(config.Certificate{Name: "kept"})
 
@@ -1694,6 +1730,7 @@ func TestOutstandingRevocationsAreRetriedEachPass(t *testing.T) {
 // "Is this daemon converging at all?" has to be answerable from outside the process, and it has to
 // be answerable in a way that a wedged pass cannot fake.
 func TestOnlyAFullPassStampsLastReconcile(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"one"}, mgr)
 
@@ -1734,6 +1771,7 @@ func TestOnlyAFullPassStampsLastReconcile(t *testing.T) {
 // blocked, which is the whole window it describes: WecertRateLimitBlocked could not fire for it.
 // The publish also has to come *after* the pass, or the spend it just made is not in the number.
 func TestAWebhookTriggeredPassPublishesQuotaWhenItFinishes(t *testing.T) {
+	t.Parallel()
 	started := make(chan struct{}, 4)
 	hold := make(chan struct{})
 	mgr := &fakeManager{onReconcile: func(string) {
@@ -1775,6 +1813,7 @@ func TestAWebhookTriggeredPassPublishesQuotaWhenItFinishes(t *testing.T) {
 // (once by the pass that sees the name as an orphan, once by the webhook after the declaration was
 // restored), and a document revision can land in between.
 func TestTheOrphanTeardownHoldsTheClaimWhileItRuns(t *testing.T) {
+	t.Parallel()
 	const orphan = "orphan-cert"
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -1822,6 +1861,7 @@ func TestTheOrphanTeardownHoldsTheClaimWhileItRuns(t *testing.T) {
 // unreachable while the stack unwinds: the pass was counted as an error and logged, but the
 // operator's channel heard nothing -- and a panic is precisely the failure that must not go quiet.
 func TestAPanickingPassStillNotifies(t *testing.T) {
+	t.Parallel()
 	const name = "boom"
 	mgr := &fakeManager{onReconcile: func(n string) {
 		if n == name {
@@ -1866,6 +1906,7 @@ func TestAPanickingPassStillNotifies(t *testing.T) {
 // returning an id and PutOrder recording it leaves a cloud certificate in neither table, billed and
 // never reclaimed.
 func TestDrainWaitsForABackgroundPass(t *testing.T) {
+	t.Parallel()
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
 
@@ -1906,6 +1947,7 @@ func TestDrainWaitsForABackgroundPass(t *testing.T) {
 // lego's low-level API is context-free, so a pass inside a CA call cannot be cancelled; the caller
 // bounds the wait and says what a timeout means.
 func TestDrainIsBounded(t *testing.T) {
+	t.Parallel()
 	hold := make(chan struct{})
 	entered := make(chan struct{}, 1)
 	defer close(hold)
@@ -1938,6 +1980,7 @@ func TestDrainIsBounded(t *testing.T) {
 // "sync: WaitGroup is reused before previous Wait has returned". The webhook's HTTP shutdown is
 // asynchronous, so a trigger arriving during shutdown reaches exactly this path.
 func TestAPassStartedAfterDrainIsRefused(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"a", "b"}, mgr)
 
@@ -1968,6 +2011,7 @@ func TestAPassStartedAfterDrainIsRefused(t *testing.T) {
 // answering ErrAlreadyRunning for a shutdown would tell the caller to poll for a pass that will
 // never happen.
 func TestAShutdownRefusalIsNotReportedAsAlreadyRunning(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"a"}, mgr)
 	if err := r.Drain(context.Background()); err != nil {
@@ -1991,6 +2035,7 @@ func TestAShutdownRefusalIsNotReportedAsAlreadyRunning(t *testing.T) {
 // reused before previous Wait has returned" panic, and -race reports the Add/Wait pair as a data
 // race. Each iteration builds its own reconciler because draining is terminal by design.
 func TestStartingAPassDoesNotRaceWithDrain(t *testing.T) {
+	t.Parallel()
 	for i := 0; i < 40; i++ {
 		mgr := &fakeManager{}
 		r, _ := newTestReconciler(t, []string{"a", "b", "c", "d"}, mgr)
@@ -2028,6 +2073,7 @@ func TestStartingAPassDoesNotRaceWithDrain(t *testing.T) {
 // pass must say what the real cause is. It must not refuse to renew: the document may change between
 // passes, and a monitoring misconfiguration is not a reason to stop issuing.
 func TestAProbeFloorTheDocumentCannotSatisfyIsReported(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	provider := &mutableProvider{}
 	provider.set(config.Certificate{
@@ -2066,6 +2112,7 @@ func TestAProbeFloorTheDocumentCannotSatisfyIsReported(t *testing.T) {
 // the resolved desired state actually spends against, deduplicated (a wildcard and its apex share a
 // registered domain; a multi-name certificate appears once).
 func TestQuotaPublishingCoversEveryManagedScope(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	r, _ := newTestReconciler(t, []string{"a-example-com", "b-example-com"}, mgr)
 
@@ -2119,6 +2166,7 @@ func TestQuotaPublishingCoversEveryManagedScope(t *testing.T) {
 // run one) -- so a pass in which every certificate sat inside its window used to
 // report Attempted == 0 with empty Skipped and exit 0 over a fleet making no progress.
 func TestTroubleTreatsAFullyBackedOffPassAsTrouble(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		rep  RunReport
@@ -2165,6 +2213,7 @@ func (p *panicNotifier) Renewal(context.Context, string, error) {
 // recover: a pass that had already succeeded was rewritten to a reported failure and
 // the recover block then fired a second, contradictory notification.
 func TestAPanickingNotifierDoesNotRewriteASuccessfulPass(t *testing.T) {
+	t.Parallel()
 	const name = "notify-panics"
 	mgr := &fakeManager{}
 	notifier := &panicNotifier{}
@@ -2231,6 +2280,7 @@ func hasNotAfterSeries(t *testing.T, cert, profile string) bool {
 // not_after series: nothing ever writes it again, so it freezes at its last value and
 // the per-profile expiry alert keeps comparing a stale timestamp.
 func TestPublishDropsTheSeriesOfAPreviousProfile(t *testing.T) {
+	t.Parallel()
 	const name = "profile-switch-cert"
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -2286,6 +2336,7 @@ func (p *signalOnResolveProvider) Desired(ctx context.Context) ([]config.Certifi
 // accepted: those passes were registered and Drain waits for them, so reporting them as
 // refused would tell the caller to give up on passes that are in fact running.
 func TestStartNamedReturnsTheAcceptedPrefixWhenShutdownBeginsMidWalk(t *testing.T) {
+	t.Parallel()
 	certs := []config.Certificate{{Name: "a"}, {Name: "b"}}
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -2360,6 +2411,7 @@ func TestStartNamedReturnsTheAcceptedPrefixWhenShutdownBeginsMidWalk(t *testing.
 // report said Failed) and `-once` exited non-zero for a certificate that was fine. That is a
 // false alarm on the one channel whose whole point is to be believed.
 func TestAPanicAfterASuccessfulPassDoesNotFailThePass(t *testing.T) {
+	t.Parallel()
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -2398,6 +2450,7 @@ func TestAPanicAfterASuccessfulPassDoesNotFailThePass(t *testing.T) {
 // no enforcement; a late call is otherwise a data race under -race and a torn read
 // without it.
 func TestSetProberIsSafeAgainstConcurrentReads(t *testing.T) {
+	t.Parallel()
 	r := &Reconciler{}
 	done := make(chan struct{})
 	go func() {

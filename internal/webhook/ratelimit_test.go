@@ -16,6 +16,7 @@ var limiterT0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 // authMaxFailures guesses. fail() checks and counts under one mutex; this is what keeps it
 // that way.
 func TestConcurrentFailuresCannotBypassTheLockout(t *testing.T) {
+	t.Parallel()
 	l := newAuthLimiter()
 
 	const n = 200
@@ -53,6 +54,7 @@ func TestConcurrentFailuresCannotBypassTheLockout(t *testing.T) {
 // while a block is active would also drop blockedUntil, shrinking the
 // 15-minute lockout to the 5-minute window under a sustained attack.
 func TestRecordFailureDoesNotResetDuringBlock(t *testing.T) {
+	t.Parallel()
 	l := newAuthLimiter()
 
 	for i := 0; i < authMaxFailures; i++ {
@@ -78,6 +80,7 @@ func TestRecordFailureDoesNotResetDuringBlock(t *testing.T) {
 
 // Once both the block and the window are over, the address starts clean.
 func TestRecordFailureResetsAfterBlockExpires(t *testing.T) {
+	t.Parallel()
 	l := newAuthLimiter()
 
 	for i := 0; i < authMaxFailures; i++ {
@@ -94,6 +97,7 @@ func TestRecordFailureResetsAfterBlockExpires(t *testing.T) {
 // A success decays the failure count instead of wiping it: one interleaved
 // legit call must not forgive a shared-egress-IP attacker outright.
 func TestRecordSuccessDecaysFailures(t *testing.T) {
+	t.Parallel()
 	l := newAuthLimiter()
 
 	// 8 failures -> success halves to 4 -> 5 more failures reach 9, still below
@@ -121,6 +125,7 @@ func TestRecordSuccessDecaysFailures(t *testing.T) {
 // success after every burst: each success only halves the count, so bursts
 // larger than the residual keep accumulating.
 func TestSustainedBruteForceLocksOutDespiteSuccesses(t *testing.T) {
+	t.Parallel()
 	l := newAuthLimiter()
 
 	// First burst: one below the limit, then a legit success (halves to 4).
@@ -144,6 +149,7 @@ func TestSustainedBruteForceLocksOutDespiteSuccesses(t *testing.T) {
 // Below the forgive floor the residue is noise (a typo or two), so a success
 // clears it entirely -- a legit caller is not permanently dogged by old slips.
 func TestRecordSuccessForgivesBelowTheFloor(t *testing.T) {
+	t.Parallel()
 	l := newAuthLimiter()
 
 	for i := 0; i < 3; i++ {
@@ -165,6 +171,7 @@ func TestRecordSuccessForgivesBelowTheFloor(t *testing.T) {
 // each of many source addresses, and every failure scans the whole map. The sweep is
 // therefore rate-limited by time, not only by size.
 func TestGcIsAmortizedOnceTheMapIsLarge(t *testing.T) {
+	t.Parallel()
 	l := newAuthLimiter()
 
 	// A map well past the threshold, every entry long expired.
@@ -198,6 +205,7 @@ func TestGcIsAmortizedOnceTheMapIsLarge(t *testing.T) {
 // recordSuccess did not call it either. A client with an IPv6 /64 can produce unbounded
 // distinct source addresses, so the map is not bounded by "the number of attackers".
 func TestSuccessSweepsExpiredLimiterState(t *testing.T) {
+	t.Parallel()
 	l := newAuthLimiter()
 
 	// Fill past the sweep threshold with entries that are already outside the window.
@@ -219,6 +227,7 @@ func TestSuccessSweepsExpiredLimiterState(t *testing.T) {
 // The hard cap bounds the map even while every entry is still inside the window, which
 // is the state a flood produces (the time-based sweep deliberately keeps those).
 func TestLimiterMapIsCapped(t *testing.T) {
+	t.Parallel()
 	l := newAuthLimiter()
 	for i := 0; i < authLimiterMaxEntries+100; i++ {
 		addr := fmt.Sprintf("2001:db8::%x", i)

@@ -42,6 +42,7 @@ const orphanTeardownFleet = 2999
 // is the design -- must not call CleanupOrphan again. Deleting the skip in publishOrphans puts pass
 // 2 back at pass 1's statement count and fails both of them.
 func TestMeasureOrphanTeardownCostPerPass(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("a measurement, not a test")
 	}
@@ -131,6 +132,7 @@ func TestMeasureOrphanTeardownCostPerPass(t *testing.T) {
 // TestOrphanTeardownCostScalesWithTheFleet is the small control: same shape, one orphan and ten, so
 // a reader can see the marginal statement count per orphan rather than a single aggregate.
 func TestOrphanTeardownCostScalesWithTheFleet(t *testing.T) {
+	t.Parallel()
 	for _, n := range []int{0, 1, 10} {
 		store, err := state.OpenCounted(filepath.Join(t.TempDir(), "state.db"))
 		if err != nil {

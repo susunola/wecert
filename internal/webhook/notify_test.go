@@ -18,6 +18,7 @@ import (
 // redirect names. Refusing the redirect surfaces the real problem: the target moved, and the
 // operator's notification channel is silently dead.
 func TestANotifyRedirectIsNotADelivery(t *testing.T) {
+	t.Parallel()
 	var target string
 	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target, http.StatusFound)
@@ -62,6 +63,7 @@ func TestANotifyRedirectIsNotADelivery(t *testing.T) {
 // delivery failure logs the target on every attempt, so an unredacted URL here is a credential in
 // the log forever -- and the transport error embeds it a second time.
 func TestANotificationTargetIsNotLoggedVerbatim(t *testing.T) {
+	t.Parallel()
 	const secret = "T000/B000/SUPERSECRETVALUE"
 	var logs bytes.Buffer
 
@@ -81,6 +83,7 @@ func TestANotificationTargetIsNotLoggedVerbatim(t *testing.T) {
 
 // The redactor keeps the host, withholds path and query, and never prints an unparseable URL.
 func TestRedactNotifyURL(t *testing.T) {
+	t.Parallel()
 	cases := []struct{ in, want string }{
 		{"https://hooks.slack.com/services/T00/B00/SECRET", "https://hooks.slack.com/...(path withheld)"},
 		{"https://example.com/hook?token=SECRET", "https://example.com/...(path withheld)?..."},

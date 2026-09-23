@@ -110,6 +110,7 @@ func probeLocalhost(t *testing.T, port int) *Result {
 // ── The probe itself ────────────────────────────────────────────────────────
 
 func TestProbeReadsTheServedCertificate(t *testing.T) {
+	t.Parallel()
 	notAfter := time.Now().Add(60 * 24 * time.Hour).Truncate(time.Second)
 	port := startServer(t, makeCert(t, []string{"localhost", "www.example.com"},
 		time.Now().Add(-time.Hour), notAfter))
@@ -143,6 +144,7 @@ func TestProbeReadsTheServedCertificate(t *testing.T) {
 // at the CA, a wrong certificate means looking at DNS and CLB rules. Merging them sends
 // people the wrong way.
 func TestProbeSeparatesTrustFromCorrectness(t *testing.T) {
+	t.Parallel()
 	port := startServer(t, makeCert(t, []string{"localhost"},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
 
@@ -169,6 +171,7 @@ func TestProbeSeparatesTrustFromCorrectness(t *testing.T) {
 // intermediate (the most common CLB certificate mistake) came back OK with probe_match=1
 // while every real client failed the handshake. Trusted was only ever exported as a metric.
 func TestVerifyReportsAnUntrustedChainWhenTrustIsRequired(t *testing.T) {
+	t.Parallel()
 	port := startServer(t, makeCert(t, []string{"localhost"},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
 	res := probeLocalhost(t, port)
@@ -194,6 +197,7 @@ func TestVerifyReportsAnUntrustedChainWhenTrustIsRequired(t *testing.T) {
 // and "is not the certificate I deployed" are different faults, and an internal CA makes the
 // first one permanent.
 func TestVerifyKeepsTrustOutOfTheVerdictByDefault(t *testing.T) {
+	t.Parallel()
 	port := startServer(t, makeCert(t, []string{"localhost"},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
 	res := probeLocalhost(t, port)
@@ -212,6 +216,7 @@ func TestVerifyKeepsTrustOutOfTheVerdictByDefault(t *testing.T) {
 // A trusted chain that matches is still a pass, so the new check does not turn into a
 // permanent mismatch once the deployment is right.
 func TestVerifyAcceptsATrustedMatchingChain(t *testing.T) {
+	t.Parallel()
 	port := startServer(t, makeCert(t, []string{"localhost"},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
 	res := probeLocalhost(t, port)
@@ -225,6 +230,7 @@ func TestVerifyAcceptsATrustedMatchingChain(t *testing.T) {
 }
 
 func TestProbeReportsAWrongCertificate(t *testing.T) {
+	t.Parallel()
 	// Someone else's certificate is being served.
 	port := startServer(t, makeCert(t, []string{"other.example"},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
@@ -251,6 +257,7 @@ func TestProbeReportsAWrongCertificate(t *testing.T) {
 // the old certificate is still hanging on the CLB. Checking only "can it handshake" would
 // miss this entirely.
 func TestProbeDetectsAStaleCertificate(t *testing.T) {
+	t.Parallel()
 	servedNotAfter := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
 	port := startServer(t, makeCert(t, []string{"localhost"},
 		time.Now().Add(-time.Hour), servedNotAfter))
@@ -269,6 +276,7 @@ func TestProbeDetectsAStaleCertificate(t *testing.T) {
 }
 
 func TestProbeDetectsMissingAndExtraNames(t *testing.T) {
+	t.Parallel()
 	port := startServer(t, makeCert(t, []string{"localhost", "old.example.com"},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
 
@@ -292,6 +300,7 @@ func TestProbeDetectsMissingAndExtraNames(t *testing.T) {
 // The comparison must be insensitive to order, case, duplicates and trailing dots --
 // otherwise every single probe would report a spurious difference.
 func TestProbeIgnoresOrderCaseAndDuplicates(t *testing.T) {
+	t.Parallel()
 	port := startServer(t, makeCert(t, []string{"localhost", "WWW.Example.COM"},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour)))
 
@@ -306,6 +315,7 @@ func TestProbeIgnoresOrderCaseAndDuplicates(t *testing.T) {
 }
 
 func TestProbeDetectsExpiry(t *testing.T) {
+	t.Parallel()
 	port := startServer(t, makeCert(t, []string{"localhost"},
 		time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)))
 
@@ -325,6 +335,7 @@ func TestProbeDetectsExpiry(t *testing.T) {
 // A wildcard has no address of its own to dial. Say so plainly instead of letting DNS
 // resolution produce an incomprehensible "no such host".
 func TestProbeRejectsAWildcard(t *testing.T) {
+	t.Parallel()
 	_, err := Probe(context.Background(), "*.example.com", Options{})
 	if err == nil || !strings.Contains(err.Error(), "wildcard") {
 		t.Fatalf("a wildcard should be rejected explicitly, got: %v", err)
@@ -332,6 +343,7 @@ func TestProbeRejectsAWildcard(t *testing.T) {
 }
 
 func TestProbeRejectsAnEmptyHost(t *testing.T) {
+	t.Parallel()
 	if _, err := Probe(context.Background(), "  ", Options{}); err == nil {
 		t.Fatal("an empty name should be rejected")
 	}
@@ -339,6 +351,7 @@ func TestProbeRejectsAnEmptyHost(t *testing.T) {
 
 // A probe must not stall the reconcile loop: context cancellation must return immediately.
 func TestProbeHonorsContextCancellation(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -352,6 +365,7 @@ func TestProbeHonorsContextCancellation(t *testing.T) {
 }
 
 func TestProbeErrorsWhenNothingIsListening(t *testing.T) {
+	t.Parallel()
 	// Nothing is realistically listening on port 1.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -370,6 +384,7 @@ func TestProbeErrorsWhenNothingIsListening(t *testing.T) {
 // can accept connections yet send no TLS bytes; timeout must include that handshake
 // or the entire reconciliation pass can block until the process exits.
 func TestProbeTimesOutAStalledTLSHandshake(t *testing.T) {
+	t.Parallel()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -406,6 +421,7 @@ func TestProbeTimesOutAStalledTLSHandshake(t *testing.T) {
 // Runner must verify every address. Treating an updated first node as success
 // would hide the critical case where a later node still serves an old certificate.
 func TestRunnerDetectsAMismatchOnAnyResolvedAddress(t *testing.T) {
+	t.Parallel()
 	goodCert := makeCert(t, []string{"service.example"},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
 	badCert := makeCert(t, []string{"old.example"},
@@ -456,6 +472,7 @@ func TestRunnerDetectsAMismatchOnAnyResolvedAddress(t *testing.T) {
 // stretches by minutes. This pins the concurrency by timing, with a margin wide
 // enough not to flake on a loaded machine.
 func TestProbeIPsDialsAddressesConcurrently(t *testing.T) {
+	t.Parallel()
 	// A listener that accepts and then stays silent, so each dial burns its whole
 	// budget instead of failing fast.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -537,6 +554,7 @@ func resultFromCert(t *testing.T, cert tls.Certificate, host string) *Result {
 // certificate is the deployed one" is unproven. Leaving probe_match at its
 // previous value would keep reporting a stale 1 while the verdict is non-OK.
 func TestPartialUnreachableMarksProbeMatchZero(t *testing.T) {
+	t.Parallel()
 	const host = "partial-unreachable.example"
 	cert := makeCert(t, []string{host},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
@@ -576,6 +594,7 @@ func TestPartialUnreachableMarksProbeMatchZero(t *testing.T) {
 // transition memory must be forgettable, or last grows with every host ever
 // seen -- and certificate names are derived from domains, which churn.
 func TestForgetDropsTheRememberedState(t *testing.T) {
+	t.Parallel()
 	const host = "forget.example"
 	cert := makeCert(t, []string{host},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
@@ -603,6 +622,7 @@ func TestForgetDropsTheRememberedState(t *testing.T) {
 // probe_match == 0 -- the one signal that says "traffic is being served by something else" -- could
 // never fire for the host that had actually stopped resolving.
 func TestResolveFailureMarksProbeMatchZero(t *testing.T) {
+	t.Parallel()
 	const host = "no-longer-resolves.example"
 	cert := makeCert(t, []string{host},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
@@ -639,6 +659,7 @@ func TestResolveFailureMarksProbeMatchZero(t *testing.T) {
 // clean verdict. The cap exists so one name cannot spend an unbounded slice of a pass: the cost of
 // probing is len(addresses) dials of up to Timeout each, inside that certificate's own pass claim.
 func TestTooManyAddressesIsRefusedRatherThanSampled(t *testing.T) {
+	t.Parallel()
 	ips := make([]string, 0, maxProbeAddresses+1)
 	for i := 0; i <= maxProbeAddresses; i++ {
 		ips = append(ips, fmt.Sprintf("192.0.2.%d", i%256))
@@ -671,6 +692,7 @@ func TestTooManyAddressesIsRefusedRatherThanSampled(t *testing.T) {
 // two normalized sets, so the same name landed in both "missing names that were deployed" and "has
 // names that were not deployed" -- one typo, a self-contradictory verdict and exit code 2.
 func TestExpectSANNormalisationIsIdempotent(t *testing.T) {
+	t.Parallel()
 	for _, spelling := range []string{"www.example.com", "WWW.Example.com ", "www.example.com.", "www.example.com..", " www.example.com ."} {
 		first := normalizeSet([]string{spelling})
 		for name := range first {
@@ -692,6 +714,7 @@ func TestExpectSANNormalisationIsIdempotent(t *testing.T) {
 // has to leave the evidence behind: what was found, whether the chain was trusted, when the
 // served certificate expires, and no problem kind at all.
 func TestAnswerRemembersAMatchingHost(t *testing.T) {
+	t.Parallel()
 	const host = "answer-match.example"
 	cert := makeCert(t, []string{host},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
@@ -737,6 +760,7 @@ func TestAnswerRemembersAMatchingHost(t *testing.T) {
 // A mismatch has to name the problem kind, because "did not match" alone sends the reader to
 // the wrong place: a missing name is a deploy/SNI question, not an expiry one.
 func TestAnswerNamesTheProblemKindOnAMismatch(t *testing.T) {
+	t.Parallel()
 	const host = "answer-missing.example"
 	cert := makeCert(t, []string{host},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
@@ -783,6 +807,7 @@ func TestAnswerNamesTheProblemKindOnAMismatch(t *testing.T) {
 // then lost its DNS, its listener or one of its addresses kept Match=true with its old NotAfter,
 // so the page showed a healthy unexpired certificate for an endpoint nobody can dial.
 func TestAnswerGoesUnreachableOnEveryUnreachablePath(t *testing.T) {
+	t.Parallel()
 	const host = "answer-unreachable.example"
 	cert := makeCert(t, []string{host},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
@@ -852,6 +877,7 @@ func TestAnswerGoesUnreachableOnEveryUnreachablePath(t *testing.T) {
 // Forget exists so per-host memory stops growing with every name ever seen; the answer is part
 // of that memory, so it has to go with the transition state.
 func TestForgetDropsTheRememberedAnswer(t *testing.T) {
+	t.Parallel()
 	const host = "answer-forget.example"
 	cert := makeCert(t, []string{host},
 		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
@@ -874,6 +900,7 @@ func TestForgetDropsTheRememberedAnswer(t *testing.T) {
 // Check runs one goroutine per host and an inventory page reads answers while rounds are still
 // landing, so both maps live behind the same mutex. Run with -race, this is what proves it.
 func TestAnswerIsRaceFreeUnderConcurrentChecks(t *testing.T) {
+	t.Parallel()
 	const hostCount = 8
 
 	served := make(map[string]*Result, hostCount)

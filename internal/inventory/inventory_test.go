@@ -10,6 +10,7 @@ import (
 )
 
 func TestStatusTokens(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	notAfterOK := now.Add(80 * 24 * time.Hour)
 	notAfterSoon := now.Add(10 * 24 * time.Hour)
@@ -186,6 +187,7 @@ func TestStatusTokens(t *testing.T) {
 }
 
 func TestWaitingManualBindUsesStoreBindings(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	snap := Assemble(Input{
 		Now: now, Names: []string{"example-com"}, ResourceTypes: []string{"clb"},
@@ -212,6 +214,7 @@ func TestWaitingManualBindUsesStoreBindings(t *testing.T) {
 }
 
 func TestEmptyInventorySerializesAsEmptySlice(t *testing.T) {
+	t.Parallel()
 	snap := Assemble(Input{Now: time.Unix(0, 0).UTC()})
 	if snap.Certificates == nil || len(snap.Certificates) != 0 {
 		t.Fatalf("%v", snap.Certificates)
@@ -219,6 +222,7 @@ func TestEmptyInventorySerializesAsEmptySlice(t *testing.T) {
 }
 
 func TestSortPutsTroubleFirstThenDaysLeft(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	snap := Assemble(Input{
 		Now: now, Names: []string{"ok-far", "wait", "ok-near"}, ProbeEnabled: false,
@@ -237,6 +241,7 @@ func TestSortPutsTroubleFirstThenDaysLeft(t *testing.T) {
 }
 
 func TestAssembleCopiesUIN(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	snap := Assemble(Input{
 		Now: now, Names: []string{"a", "b"}, UIN: "100012345678",
@@ -275,6 +280,7 @@ func equalStrings(a, b []string) bool {
 }
 
 func TestACertificateThatWasNeverIssuedIsNotHealthy(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	snap := Assemble(Input{
 		Now: now, Names: []string{"never"},
@@ -298,6 +304,7 @@ func TestACertificateThatWasNeverIssuedIsNotHealthy(t *testing.T) {
 }
 
 func TestAStateRowThatCouldNotBeReadIsNotABindingProblem(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	snap := Assemble(Input{
 		Now: now, Names: []string{"a"},
@@ -322,6 +329,7 @@ func TestAStateRowThatCouldNotBeReadIsNotABindingProblem(t *testing.T) {
 }
 
 func TestAnIssuedCertificateThatWasNeverUploadedIsPendingDeploy(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	in := Input{
 		Now: now, Names: []string{"a"},
@@ -345,6 +353,7 @@ func TestAnIssuedCertificateThatWasNeverUploadedIsPendingDeploy(t *testing.T) {
 }
 
 func TestALiveEnumerationThatCameBackIncompleteIsBindingUnknown(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	snap := Assemble(Input{
 		Now: now, Names: []string{"a"}, ProbeEnabled: false,
@@ -372,6 +381,7 @@ func TestALiveEnumerationThatCameBackIncompleteIsBindingUnknown(t *testing.T) {
 }
 
 func TestALiveEnumerationThatAnsweredZeroIsNotUnknown(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	snap := Assemble(Input{
 		Now: now, Names: []string{"a"}, ProbeEnabled: false,
@@ -392,6 +402,7 @@ func TestALiveEnumerationThatAnsweredZeroIsNotUnknown(t *testing.T) {
 }
 
 func TestConfirmedStoreBindingsAreALowerBound(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
 	snap := Assemble(Input{
 		Now: now, Names: []string{"a"}, ProbeEnabled: false,
@@ -409,6 +420,7 @@ func TestConfirmedStoreBindingsAreALowerBound(t *testing.T) {
 }
 
 func TestAnUnreadDesiredStateDoesNotClaimNotFrozen(t *testing.T) {
+	t.Parallel()
 	snap := Assemble(Input{Now: time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC), Names: []string{"a"}})
 	if snap.Desired.Frozen != nil {
 		t.Fatalf("frozen %v: the document was never read, so false is an invented answer", *snap.Desired.Frozen)

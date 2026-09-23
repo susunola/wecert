@@ -18,6 +18,7 @@ import (
 // measured with 114,909 of 200,000 certificates accepted as the desired state. The reader now takes
 // one byte past the cap and refuses the read.
 func TestAnOversizedDocumentIsRefusedRatherThanTruncated(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "desired-state.yaml")
 
@@ -47,6 +48,7 @@ func TestAnOversizedDocumentIsRefusedRatherThanTruncated(t *testing.T) {
 // the same trailing separator that Load accepts made LoadDocument fail, which in enforce
 // mode freezes the document at its old revision. Both now share config.RejectExtraDocuments.
 func TestLoadDocumentAcceptsATrailingDocumentSeparator(t *testing.T) {
+	t.Parallel()
 	// WriteDocument produces a revision that matches its certificates; the trailing
 	// separator is the only thing under test, so the envelope has to be valid first.
 	base := writeDoc(t, &Document{
@@ -81,6 +83,7 @@ func TestLoadDocumentAcceptsATrailingDocumentSeparator(t *testing.T) {
 // A second document with content in it is still refused -- the trailing-separator
 // exception must not widen into "any extra document is fine".
 func TestLoadDocumentStillRejectsASecondYAMLDocument(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "desired-state.yaml")
 	src := "apiVersion: wecert/v1\n" +
 		"kind: DesiredState\n" +

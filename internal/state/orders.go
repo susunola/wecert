@@ -13,7 +13,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	_ "modernc.org/sqlite" // pure Go driver: no CGO, which keeps static builds easy
+	_ "modernc.org/sqlite"
+	"time"
 )
 
 // Per-table CRUD, split out of state.go so one table lives in one file.
@@ -41,3 +42,47 @@ func (s *Store) GetOrder(certName string) (*Order, error) {
 }
 
 // PutOrder writes the in-flight order.
+
+func (s *Store) PutOrder(o *Order) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`
+		INSERT INTO orders (
+			cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers, deployment_cert_id, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(cert_name) DO UPDATE SET
+			order_url    = excluded.order_url,
+			finalize_url = excluded.finalize_url,
+			cert_url     = excluded.cert_url,
+			expires_at   = excluded.expires_at,
+			status       = excluded.status,
+			key_pem      = excluded.key_pem,
+			identifiers  = excluded.identifiers,
+			deployment_cert_id = excluded.deployment_cert_id,
+			updated_at   = excluded.updated_at`,
+		o.CertName, o.OrderURL, o.FinalizeURL, o.CertURL, toUnix(o.ExpiresAt), o.Status,
+		o.KeyPEM, o.Identifiers, o.DeploymentCertID, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("put order for %s: %w", o.CertName, err)
+	}
+	return nil
+}
+
+// DeleteOrder discards the current order (it expired or was abandoned).
+func (s *Store) DeleteOrder(certName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return deleteOrderExec(s.db, certName)
+}
+
+func deleteOrderExec(e execer, certName string) error {
+	if _, err := e.Exec(`DELETE FROM orders WHERE cert_name = ?`, certName); err != nil {
+		return fmt.Errorf("delete order for %s: %w", certName, err)
+	}
+	return nil
+}
+
+// ---------- Authorization ----------
+
+// ListAuthorizations lists every authorization under a certificate's order.

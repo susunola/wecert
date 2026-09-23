@@ -77,6 +77,7 @@ func testTracker(t *testing.T, st bucketStore, now time.Time) *Tracker {
 }
 
 func TestTrackerAccumulatesSpendAcrossRestarts(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	store := newFakeStore()
 
@@ -97,6 +98,7 @@ func TestTrackerAccumulatesSpendAcrossRestarts(t *testing.T) {
 }
 
 func TestTrackerRemainingIsFullBeforeAnythingIsSpent(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	left, ok := testTracker(t, newFakeStore(), now).Remaining(NewOrdersPerAccount, "")
 	if !ok {
@@ -108,6 +110,7 @@ func TestTrackerRemainingIsFullBeforeAnythingIsSpent(t *testing.T) {
 }
 
 func TestTrackerNotesTheCAsOwnDeadline(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	store := newFakeStore()
 	tr := testTracker(t, store, now)
@@ -144,6 +147,7 @@ func TestTrackerNotesTheCAsOwnDeadline(t *testing.T) {
 }
 
 func TestTrackerDeadlineDoesNotEraseTheEstimate(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	store := newFakeStore()
 	tr := testTracker(t, store, now)
@@ -167,6 +171,7 @@ func TestTrackerDeadlineDoesNotEraseTheEstimate(t *testing.T) {
 }
 
 func TestTrackerAccountingFailuresAreNotFatal(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 
 	// A store that cannot read or write must not make Spend panic or block a renewal:
@@ -183,6 +188,7 @@ func TestTrackerAccountingFailuresAreNotFatal(t *testing.T) {
 }
 
 func TestNilTrackerIsInert(t *testing.T) {
+	t.Parallel()
 	// Callers that have no store (diagnostics binaries, tests) must not need special cases.
 	var tr *Tracker
 	tr.Spend(NewOrdersPerAccount, "", 1)
@@ -202,6 +208,7 @@ func TestNilTrackerIsInert(t *testing.T) {
 // cycles landed as 3") and fixed it with UpdateCert -- and the local estimate is what keeps the
 // fleet under the CA's limits, including the one with no override path.
 func TestConcurrentSpendsOnOneBucketAllCount(t *testing.T) {
+	t.Parallel()
 	store := newFakeStore()
 	tr := testTracker(t, store, time.Now())
 
@@ -236,6 +243,7 @@ func TestConcurrentSpendsOnOneBucketAllCount(t *testing.T) {
 // unconditionally rolled the recorded deadline BACK to the earlier instant, and Remaining and
 // BlockedUntil then unblocked issuance inside the window the CA had most recently named.
 func TestTrackerKeepsTheLaterDeadline(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	earlier := now.Add(time.Hour)
 	later := now.Add(3 * time.Hour)

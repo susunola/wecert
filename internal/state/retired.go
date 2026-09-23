@@ -11,7 +11,8 @@ package state
 
 import (
 	"fmt"
-	_ "modernc.org/sqlite" // pure Go driver: no CGO, which keeps static builds easy
+	_ "modernc.org/sqlite"
+	"time"
 )
 
 // Per-table CRUD, split out of state.go so one table lives in one file.
@@ -27,4 +28,104 @@ func (s *Store) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return addRetiredCertExec(s.db, certID, certName, certPEM, keyPEM)
+}
+
+func addRetiredCertExec(e execer, certID, certName string, certPEM, keyPEM []byte) error {
+	_, err := e.Exec(`
+		INSERT INTO retired_certificates (cert_id, cert_name, retired_at, cert_pem, key_pem)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(cert_id) DO UPDATE SET
+		    -- The first writer may have had nothing to archive. The orphan path records a
+		    -- certificate it merely uploaded, with NULL material; the retirement path records the
+		    -- one that was actually serving, with the fullchain and key. DO NOTHING let whichever
+		    -- arrived first win, so a row could keep two NULLs and the documented manual rollback
+		    -- (docs/recovery.md) had nothing to restore. COALESCE keeps real material from being
+		    -- overwritten by a later empty write, and lets it be filled in when the empty write
+		    -- came first.
+		    cert_pem = COALESCE(EXCLUDED.cert_pem, retired_certificates.cert_pem),
+		    key_pem  = COALESCE(EXCLUDED.key_pem,  retired_certificates.key_pem),
+		    -- The clock restarts on the write that actually retires the certificate. Without
+		    -- this a row first written by the orphan path (which records a certificate it merely
+		    -- uploaded, with no material) kept the ORPHAN's timestamp when the same cert_id was
+		    -- later retired with the fullchain and key: ReapRetired, which reaps on retired_at,
+		    -- would then delete the cloud copy and the freshly archived rollback material on the
+		    -- earlier clock -- and before the rebind it asks to delete a certificate that may
+		    -- still be serving, refused only by the cloud-side binding check.
+		    retired_at = EXCLUDED.retired_at`,
+		certID, certName, time.Now().Unix(), certPEM, keyPEM)
+	if err != nil {
+		return fmt.Errorf("add retired cert %s: %w", certID, err)
+	}
+	return nil
+}
+
+// ListRetiredCertsBefore lists certificates retired before cutoff, for reclamation.
+func (s *Store) ListRetiredCertsBefore(cutoff time.Time) ([]*RetiredCert, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`
+		SELECT cert_id, cert_name, retired_at, cert_pem, key_pem
+		FROM retired_certificates WHERE retired_at < ?`,
+		cutoff.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("list retired certs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*RetiredCert
+	for rows.Next() {
+		r := &RetiredCert{}
+		var retiredAt int64
+		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt, &r.CertPEM, &r.KeyPEM); err != nil {
+			return nil, fmt.Errorf("scan retired cert: %w", err)
+		}
+		r.RetiredAt = fromUnix(retiredAt)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListRetiredCertMaterial returns the archived certificate material of every retired certificate
+// recorded under one name, newest first.
+//
+// Rows without material are skipped: the orphan path records a certificate wecert merely uploaded
+// and never held a copy of, and an empty blob would look like a usable (empty) certificate. What
+// this answers is "is the certificate the operator asked to revoke still here somewhere", which is
+// how a revocation request that outlives its renewal can still be honoured.
+func (s *Store) ListRetiredCertMaterial(certName string) ([]*RetiredCert, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`
+		SELECT cert_id, cert_name, retired_at, cert_pem, key_pem
+		FROM retired_certificates
+		WHERE cert_name = ? AND cert_pem IS NOT NULL
+		ORDER BY retired_at DESC`, certName)
+	if err != nil {
+		return nil, fmt.Errorf("list archived material for %s: %w", certName, err)
+	}
+	defer rows.Close()
+
+	var out []*RetiredCert
+	for rows.Next() {
+		r := &RetiredCert{}
+		var retiredAt int64
+		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt, &r.CertPEM, &r.KeyPEM); err != nil {
+			return nil, fmt.Errorf("scan archived material for %s: %w", certName, err)
+		}
+		r.RetiredAt = fromUnix(retiredAt)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteRetiredCert removes an entry from the reclamation list (called after the
+// cloud-side delete succeeds).
+func (s *Store) DeleteRetiredCert(certID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM retired_certificates WHERE cert_id = ?`, certID)
+	if err != nil {
+		return fmt.Errorf("delete retired cert %s: %w", certID, err)
+	}
+	return nil
 }

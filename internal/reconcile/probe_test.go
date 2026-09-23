@@ -28,6 +28,7 @@ import (
 // was reported as a successful deployment. Strict is the default; an internal CA opts out
 // because its certificates never verify against the system roots.
 func TestProbeExpectationRequiresATrustedChainByDefault(t *testing.T) {
+	t.Parallel()
 	no, yes := false, true
 
 	cases := []struct {
@@ -63,6 +64,7 @@ func TestProbeExpectationRequiresATrustedChainByDefault(t *testing.T) {
 // declaration order puts the registered domain first, and that is usually the
 // name most worth verifying.
 func TestProbeHostsSkipsWildcardsInOrder(t *testing.T) {
+	t.Parallel()
 	got := probeHosts([]string{"example.com", "*.example.com", "www.example.com", "api.example.com"}, 3)
 	want := []string{"example.com", "www.example.com", "api.example.com"}
 	if !reflect.DeepEqual(got, want) {
@@ -73,6 +75,7 @@ func TestProbeHostsSkipsWildcardsInOrder(t *testing.T) {
 // Not exhaustive: a 25-name certificate would mean 25 handshakes per pass,
 // with diminishing returns and linear cost.
 func TestProbeHostsRespectsTheCap(t *testing.T) {
+	t.Parallel()
 	domains := []string{"a.example.com", "b.example.com", "c.example.com", "d.example.com"}
 	got := probeHosts(domains, 2)
 	if len(got) != 2 || got[0] != "a.example.com" || got[1] != "b.example.com" {
@@ -83,6 +86,7 @@ func TestProbeHostsRespectsTheCap(t *testing.T) {
 // A certificate of nothing but wildcards has no dialable names — that should
 // not error, there is simply nothing to verify.
 func TestProbeHostsReturnsNothingForAWildcardOnlyCert(t *testing.T) {
+	t.Parallel()
 	if got := probeHosts([]string{"*.example.com", "*.api.example.com"}, 3); len(got) != 0 {
 		t.Errorf("wildcards should not be dialed, got %v", got)
 	}
@@ -91,6 +95,7 @@ func TestProbeHostsReturnsNothingForAWildcardOnlyCert(t *testing.T) {
 // A cap of 0 means "off", to pause probing temporarily during an
 // investigation.
 func TestProbeHostsHandlesAZeroCap(t *testing.T) {
+	t.Parallel()
 	if got := probeHosts([]string{"example.com"}, 0); got != nil {
 		t.Errorf("with a cap of 0 nothing should be dialed, got %v", got)
 	}
@@ -104,6 +109,7 @@ func TestProbeHostsHandlesAZeroCap(t *testing.T) {
 // documented alert on that being 0 then fires permanently for a host that is not even
 // part of the desired state.
 func TestStaleProbeSeriesAreReclaimed(t *testing.T) {
+	t.Parallel()
 	// A live host and a stale one both have series from previous passes.
 	metrics.CertificateProbeMatch.WithLabelValues("live.example.com").Set(1)
 	metrics.CertificateProbeMatch.WithLabelValues("gone.example.com").Set(0)
@@ -133,6 +139,7 @@ func TestStaleProbeSeriesAreReclaimed(t *testing.T) {
 
 // A prober that cannot enumerate its hosts is skipped rather than panicking.
 func TestReclaimSkipsAProberWithoutHostEnumeration(t *testing.T) {
+	t.Parallel()
 	r := &Reconciler{probedHosts: map[string]struct{}{}, prober: &opaqueProber{}}
 	r.reclaimStaleProbeSeries(nil) // must not panic
 }
@@ -218,6 +225,7 @@ func (p *recordingProber) expected(host string) (probe.Expectation, bool) {
 // wecert_certificate_probe_match to 0 -- the gauge documented as the actionable "the rebind
 // did not take effect" alert -- and made the prober dial names whose DNS is known broken.
 func TestProbeExpectationFollowsTheDeployedSubsetNotTheConfig(t *testing.T) {
+	t.Parallel()
 	const certName = "degraded-cert"
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -276,6 +284,7 @@ func TestProbeExpectationFollowsTheDeployedSubsetNotTheConfig(t *testing.T) {
 // flicker reclaimStaleProbeSeries exists to avoid, and a false alert for anything paging on
 // wecert_certificate_probe_match.
 func TestReclaimStaleProbeSeriesKeepsHostsOfAClaimedCertificate(t *testing.T) {
+	t.Parallel()
 	const (
 		certName = "in-flight-cert"
 		host     = "live.example.com"
@@ -344,6 +353,7 @@ func TestReclaimStaleProbeSeriesKeepsHostsOfAClaimedCertificate(t *testing.T) {
 // fleetSize) -- the shape an ordinary fleet edit produces, since removing certificates or names is
 // what leaves hosts behind.
 func TestReclaimingManyStaleHostsResolvesOnce(t *testing.T) {
+	t.Parallel()
 	const certs = 40
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -410,6 +420,7 @@ func TestReclaimingManyStaleHostsResolvesOnce(t *testing.T) {
 //
 // Absent is the honest answer: a certificate with no expiry has nothing to compare.
 func TestNeverIssuedCertificateExportsNoExpirySeries(t *testing.T) {
+	t.Parallel()
 	const certName = "brand-new-cert"
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -443,6 +454,7 @@ func TestNeverIssuedCertificateExportsNoExpirySeries(t *testing.T) {
 // The control: an issued certificate must export its expiry, so the fix cannot be satisfied
 // by simply never publishing the series.
 func TestIssuedCertificateExportsItsExpiry(t *testing.T) {
+	t.Parallel()
 	const certName = "issued-cert"
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -510,6 +522,7 @@ func gaugeValue(t *testing.T, metric, label string) (float64, bool) {
 // `probe_match == 0` alert fires on were gone: the documented alert stayed silent for the failure it
 // exists to catch.
 func TestAnUnconfirmedDeploymentKeepsItsProbeSeries(t *testing.T) {
+	t.Parallel()
 	mgr := &fakeManager{}
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -552,6 +565,7 @@ func TestAnUnconfirmedDeploymentKeepsItsProbeSeries(t *testing.T) {
 // validation and hash -- plus resolve's metric and log side effects -- for EVERY
 // candidate of EVERY pass.
 func TestStaleProbeSweepUsesThePasssOwnResolution(t *testing.T) {
+	t.Parallel()
 	certs := []config.Certificate{{Name: "kept", Domains: []string{"kept.example.com"}}}
 
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -587,6 +601,7 @@ func TestStaleProbeSweepUsesThePasssOwnResolution(t *testing.T) {
 // blame wildcards for both, sending the diagnosis in the wrong direction when probing
 // was paused by configuration.
 func TestProbeCertLogDistinguishesAZeroCapFromAllWildcards(t *testing.T) {
+	t.Parallel()
 	newProbingReconciler := func(t *testing.T, maxHosts int, domains ...string) (*Reconciler, *config.Certificate, *recordLogHandler) {
 		t.Helper()
 		store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -640,6 +655,7 @@ func intPtr(v int) *int { return &v }
 // unreadable document turned a whole round of probe evidence into deletions, which is the
 // opposite of what the branch exists to do.
 func TestAnUnreadableDesiredStateKeepsTheProbeRecord(t *testing.T) {
+	t.Parallel()
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -689,6 +705,7 @@ func TestAnUnreadableDesiredStateKeepsTheProbeRecord(t *testing.T) {
 // alert this function exists to remove. Only the host's own certificate being mid-pass
 // justifies waiting.
 func TestAnUnrelatedPassInFlightDoesNotSuspendReclamation(t *testing.T) {
+	t.Parallel()
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -718,6 +735,7 @@ func TestAnUnrelatedPassInFlightDoesNotSuspendReclamation(t *testing.T) {
 // up. This is the narrow case the old global guard was protecting; the difference is that it no
 // longer applies to hosts whose own certificate is simply busy.
 func TestAnOrphanedPassStillHoldsUpReclamation(t *testing.T) {
+	t.Parallel()
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)

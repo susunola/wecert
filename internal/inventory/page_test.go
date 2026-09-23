@@ -9,6 +9,7 @@ import (
 )
 
 func TestWritePageGroupsByUIN(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 9, 22, 7, 45, 0, 0, time.UTC)
 	d := 12
 	snap := Snapshot{
@@ -46,6 +47,7 @@ func TestWritePageGroupsByUIN(t *testing.T) {
 }
 
 func TestWritePageHidesUINChipsWhenUnset(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{
 		Certificates: []Certificate{
 			{Name: "only", Status: StatusOK, Domains: []string{"only.example"}},
@@ -61,6 +63,7 @@ func TestWritePageHidesUINChipsWhenUnset(t *testing.T) {
 }
 
 func TestWritePageShowsTheReasonsBehindTheNewStatuses(t *testing.T) {
+	t.Parallel()
 	frozen := true
 	snap := Snapshot{
 		Time:    time.Date(2026, 9, 22, 8, 0, 0, 0, time.UTC).Format(time.RFC3339),
@@ -93,6 +96,7 @@ func TestWritePageShowsTheReasonsBehindTheNewStatuses(t *testing.T) {
 }
 
 func TestWritePageSaysWhenTheDesiredStateWasNeverRead(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{Certificates: []Certificate{{Name: "a", Status: StatusOK}}}
 	var buf bytes.Buffer
 	if err := WritePage(&buf, snap); err != nil {
@@ -111,6 +115,7 @@ func TestWritePageSaysWhenTheDesiredStateWasNeverRead(t *testing.T) {
 }
 
 func TestWritePageOffersEveryAccountInOneControl(t *testing.T) {
+	t.Parallel()
 	// An installation can carry hundreds of accounts. They belong in one picker,
 	// not in a row of chips that grows with the fleet.
 	certs := make([]Certificate, 0, 250)

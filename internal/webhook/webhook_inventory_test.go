@@ -67,6 +67,7 @@ func rowNamed(t *testing.T, snap inventory.Snapshot, name string) inventory.Cert
 }
 
 func TestInventoryCarriesTheProbeAnswersTheDaemonRecorded(t *testing.T) {
+	t.Parallel()
 	now := time.Now().UTC()
 	served := now.Add(40 * 24 * time.Hour)
 	srv, store := newTestServer(t, &daemonFake{
@@ -100,6 +101,7 @@ func TestInventoryCarriesTheProbeAnswersTheDaemonRecorded(t *testing.T) {
 }
 
 func TestInventoryWithoutTheProbeCapabilityClaimsNothing(t *testing.T) {
+	t.Parallel()
 	now := time.Now().UTC()
 	srv, store := newTestServer(t, &fakeReconciler{names: []string{"example-com"}})
 	snap := inventorySnapshot(t, srv, store, &state.CertState{
@@ -116,6 +118,7 @@ func TestInventoryWithoutTheProbeCapabilityClaimsNothing(t *testing.T) {
 }
 
 func TestInventoryAppliesCachedBindingsBeforeTheStatus(t *testing.T) {
+	t.Parallel()
 	now := time.Now().UTC()
 	srv, store := newTestServer(t, &daemonFake{
 		fakeReconciler: &fakeReconciler{names: []string{"example-com"}},
@@ -143,6 +146,7 @@ func TestInventoryAppliesCachedBindingsBeforeTheStatus(t *testing.T) {
 }
 
 func TestInventoryRoutesAreMounted(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, &fakeReconciler{names: []string{"example-com"}})
 
 	if w := do(t, s, http.MethodGet, "/api/inventory", "", nil); w.Code != http.StatusUnauthorized {
@@ -180,6 +184,7 @@ func TestInventoryRoutesAreMounted(t *testing.T) {
 }
 
 func TestInventoryIncludesAccountUIN(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, &fakeReconciler{names: []string{"example-com"}})
 	s.SetAccountUIN("100012345678")
 

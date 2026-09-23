@@ -43,6 +43,7 @@ func labelValues(t *testing.T, c prometheus.Collector, label string) map[string]
 // forever (a frozen not_after is a permanent expiry alert). Just as important,
 // the delete must not take any other certificate's series with it.
 func TestDeleteCertSeries(t *testing.T) {
+	t.Parallel()
 	const (
 		gone  = "gone"
 		stays = "stays"
@@ -88,6 +89,7 @@ func TestDeleteCertSeries(t *testing.T) {
 // Probe series have the same reclamation rule per host: a dropped host's series
 // must go, every other host's series must survive.
 func TestDeleteProbeSeries(t *testing.T) {
+	t.Parallel()
 	const (
 		gone  = "gone.example.com"
 		stays = "stays.example.com"

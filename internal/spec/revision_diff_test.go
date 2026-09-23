@@ -10,6 +10,7 @@ import (
 // different order is the same desired state, and Revision must answer "did the
 // desired state actually change?", so neither kind of ordering may disturb it.
 func TestRevisionIgnoresCertificateOrder(t *testing.T) {
+	t.Parallel()
 	a := []config.Certificate{
 		{Name: "example-com", Domains: []string{"example.com", "www.example.com"}},
 		{Name: "other-net", Domains: []string{"other.net"}},
@@ -33,6 +34,7 @@ func TestRevisionIgnoresCertificateOrder(t *testing.T) {
 // on the other are the SAME 30 days on the classic profile -- a string comparison
 // reported that as a change against the observe-mode gate.
 func TestDiffDoesNotFlagEquivalentRenewBefore(t *testing.T) {
+	t.Parallel()
 	cur := []config.Certificate{{
 		Name: "example-com", Domains: []string{"example.com"}, RenewBefore: "720h",
 	}}
@@ -56,6 +58,7 @@ func TestDiffDoesNotFlagEquivalentRenewBefore(t *testing.T) {
 // so without the diff entry two revisions would differ with an empty diff -- and an
 // empty diff is the documented gate for switching to enforce.
 func TestDiffFlagsARealRenewBeforeChange(t *testing.T) {
+	t.Parallel()
 	cur := []config.Certificate{{
 		Name: "example-com", Domains: []string{"example.com"}, RenewBefore: "720h",
 	}}

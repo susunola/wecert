@@ -110,6 +110,7 @@ func (h *orphanMarkHarness) orphanLines() (errs, debug int) {
 }
 
 func TestAnOrphanIsTornDownOnceAndThenOnlyReported(t *testing.T) {
+	t.Parallel()
 	const name = "left-behind"
 	h := newOrphanMarkHarness(t)
 	h.seedOrphan(t, name)
@@ -143,6 +144,7 @@ func TestAnOrphanIsTornDownOnceAndThenOnlyReported(t *testing.T) {
 // dropped is exactly the case with thousands of marked rows, so the SECOND and later passes are now
 // the ones that must not flood the journal.
 func TestTheBoundedOrphanLogStillHoldsOnceTheOrphansAreMarked(t *testing.T) {
+	t.Parallel()
 	const orphans = orphanLogLimit + 5
 	h := newOrphanMarkHarness(t)
 	for i := 0; i < orphans; i++ {
@@ -180,6 +182,7 @@ func TestTheBoundedOrphanLogStillHoldsOnceTheOrphansAreMarked(t *testing.T) {
 }
 
 func TestAnOrphanThatComesBackAndLeavesIsTornDownAgain(t *testing.T) {
+	t.Parallel()
 	const name = "returns"
 	h := newOrphanMarkHarness(t)
 	h.seedOrphan(t, name)
@@ -220,6 +223,7 @@ func TestAnOrphanThatComesBackAndLeavesIsTornDownAgain(t *testing.T) {
 // hand would keep a stale mark: the next departure would be skipped, leaving behind the order, the
 // TXT records and the metric series the pass that restored it wrote.
 func TestANamedPassClearsTheOrphanMarkToo(t *testing.T) {
+	t.Parallel()
 	const name = "webhooked"
 	h := newOrphanMarkHarness(t)
 	h.seedOrphan(t, name)
@@ -248,6 +252,7 @@ func TestANamedPassClearsTheOrphanMarkToo(t *testing.T) {
 // name another pass is already holding. Without it, a certificate restored while a webhook-triggered
 // pass was mid-flight would keep its stale mark, and the next departure would be skipped.
 func TestAPassClearsTheMarkOfACertificateAnotherPassIsHolding(t *testing.T) {
+	t.Parallel()
 	const name = "held-by-another-pass"
 	h := newOrphanMarkHarness(t)
 	h.seedOrphan(t, name)
@@ -278,6 +283,7 @@ func TestAPassClearsTheMarkOfACertificateAnotherPassIsHolding(t *testing.T) {
 }
 
 func TestAFailedOrphanTeardownIsNotMarkedAndIsRetried(t *testing.T) {
+	t.Parallel()
 	const name = "stubborn"
 	h := newOrphanMarkHarness(t)
 	h.seedOrphan(t, name)
@@ -314,6 +320,7 @@ func TestAFailedOrphanTeardownIsNotMarkedAndIsRetried(t *testing.T) {
 // that record again. Marking the name anyway would stop the sweep from ever retrying it, stranding
 // a stale _acme-challenge value that poisons every other certificate sharing the TXT name.
 func TestALeftoverAuthorizationRowKeepsTheTeardownRetried(t *testing.T) {
+	t.Parallel()
 	const name = "leaky-order"
 	h := newOrphanMarkHarness(t)
 	h.seedOrphan(t, name)

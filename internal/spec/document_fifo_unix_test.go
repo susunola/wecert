@@ -20,6 +20,7 @@ import (
 // it. Unix-only: syscall.Mkfifo does not exist elsewhere, and neither does the O_NONBLOCK dance
 // the test exercises.
 func TestAFIFOAtTheDocumentPathIsRefusedNotOpened(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "desired-state.yaml")
 	if err := syscall.Mkfifo(path, 0o600); err != nil {
@@ -46,6 +47,7 @@ func TestAFIFOAtTheDocumentPathIsRefusedNotOpened(t *testing.T) {
 // os.O_RDONLY alone is not the unix contract: without O_NOFOLLOW the symlink refusal is a
 // check-then-open race, and without O_NONBLOCK the FIFO test above would hang instead of fail.
 func TestDocumentOpenFlags(t *testing.T) {
+	t.Parallel()
 	if documentOpenFlags&syscall.O_NOFOLLOW == 0 {
 		t.Error("documentOpenFlags must include O_NOFOLLOW on unix")
 	}
