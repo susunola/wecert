@@ -44,7 +44,10 @@ the result is a single self-contained database with no sidecars to keep in step.
 They are written `0600`. They contain the account key and every certificate private key.
 
 **Snapshots are not a substitute for off-host backup.** They sit next to the file they
-protect: a lost disk, a dropped directory or a bad `rm` takes both. Copy them somewhere else:
+protect: a lost disk, a dropped directory or a bad `rm` takes both. Configure
+`stateBackup.remoteTargets` for S3, COS or SFTP; successful remote uploads expose
+`wecert_backup_remote_last_success_timestamp_seconds` and failures increment
+`wecert_backup_remote_errors_total`. Alert when a configured target has no recent success.
 
 ```sh
 # Anywhere off the host. The files are small (a few hundred KB).
@@ -64,6 +67,16 @@ systemctl stop wecert          # the restore refuses while the daemon holds the 
 wecert -restore latest         # newest snapshot of this state.db, found from stateBackup.dir
 systemctl start wecert
 ```
+
+For a configured off-host target, restore its newest snapshot with the target name:
+
+```sh
+wecert -config /etc/wecert/config.yaml -restore remote:production-s3
+wecert -config /etc/wecert/config.yaml -restore remote:offsite-sftp
+```
+
+The remote file is downloaded to a private temporary file, verified as a wecert SQLite
+snapshot, and only then installed by the same restore transaction as a local snapshot.
 
 `-restore` takes a snapshot **file**, a **directory** (the newest snapshot of *this* state database
 in it), or `latest` (the directory `stateBackup.dir` points at — the form that does not require
