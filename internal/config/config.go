@@ -326,18 +326,22 @@ func (b *StateBackup) normalize() error {
 
 // BackupTarget is one off-host snapshot destination.
 type BackupTarget struct {
-	Type           string `yaml:"type"` // s3, cos, or sftp
-	Name           string `yaml:"name"`
-	Bucket         string `yaml:"bucket"`
-	Prefix         string `yaml:"prefix"`
-	Endpoint       string `yaml:"endpoint"`
-	Region         string `yaml:"region"`
-	Host           string `yaml:"host"`
-	Username       string `yaml:"username"`
-	RemoteDir      string `yaml:"remoteDir"`
-	PasswordEnv    string `yaml:"passwordEnv"`
-	PrivateKeyFile string `yaml:"privateKeyFile"`
-	KnownHostsFile string `yaml:"knownHostsFile"`
+	Type                    string        `yaml:"type"` // s3, cos, or sftp
+	Name                    string        `yaml:"name"`
+	Bucket                  string        `yaml:"bucket"`
+	Prefix                  string        `yaml:"prefix"`
+	Endpoint                string        `yaml:"endpoint"`
+	Region                  string        `yaml:"region"`
+	Host                    string        `yaml:"host"`
+	Username                string        `yaml:"username"`
+	RemoteDir               string        `yaml:"remoteDir"`
+	PasswordEnv             string        `yaml:"passwordEnv"`
+	PrivateKeyFile          string        `yaml:"privateKeyFile"`
+	PrivateKeyPassphraseEnv string        `yaml:"privateKeyPassphraseEnv"`
+	KnownHostsFile          string        `yaml:"knownHostsFile"`
+	Keep                    int           `yaml:"keep"`
+	Timeout                 string        `yaml:"timeout"`
+	TimeoutDur              time.Duration `yaml:"-"`
 }
 
 func (t *BackupTarget) normalize(i int) error {
@@ -347,6 +351,9 @@ func (t *BackupTarget) normalize(i int) error {
 	case "s3", "cos":
 		if t.Bucket == "" {
 			return fmt.Errorf("stateBackup.remoteTargets[%d].bucket is required for %s", i, t.Type)
+		}
+		if t.Type == "cos" && strings.TrimSpace(t.Endpoint) == "" {
+			return fmt.Errorf("stateBackup.remoteTargets[%d].endpoint is required for cos", i)
 		}
 	case "sftp":
 		if t.Host == "" || t.Username == "" || t.RemoteDir == "" || t.KnownHostsFile == "" {
@@ -360,6 +367,16 @@ func (t *BackupTarget) normalize(i int) error {
 	}
 	if t.Name == "" {
 		t.Name = fmt.Sprintf("%s-%d", t.Type, i+1)
+	}
+	if t.Keep == 0 {
+		t.Keep = DefaultBackupKeep
+	}
+	if t.Keep < 1 {
+		return fmt.Errorf("stateBackup.remoteTargets[%d].keep must be at least 1", i)
+	}
+	var err error
+	if t.TimeoutDur, err = parseDuration(t.Timeout, 5*time.Minute, fmt.Sprintf("stateBackup.remoteTargets[%d].timeout", i)); err != nil {
+		return err
 	}
 	return nil
 }

@@ -38,6 +38,8 @@ stateBackup:
   #     bucket: wecert-backups
   #     prefix: production
   #     region: ap-southeast-1
+  #     keep: 7
+  #     timeout: 5m
   #   - name: tencent-cos
   #     type: cos
   #     bucket: wecert-1250000000
@@ -49,6 +51,7 @@ stateBackup:
   #     username: wecert
   #     remoteDir: /srv/wecert
   #     privateKeyFile: /etc/wecert/backup_ed25519
+  #     # privateKeyPassphraseEnv: WECERT_SFTP_KEY_PASSPHRASE
   #     knownHostsFile: /etc/wecert/backup_known_hosts
 
 acme:
