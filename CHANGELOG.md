@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- **Cloudflare and Route 53 are DNS-01 providers in the default build.** `dns.provider:
+  cloudflare` takes a scoped API token — `dns.cloudflare.apiToken`, a 0600 environment-expanded
+  `dns.cloudflare.apiTokenFile` (so `LoadCredential` works), or `CLOUDFLARE_DNS_API_TOKEN` /
+  `CF_DNS_API_TOKEN` — and `dns.provider: route53` takes `dns.route53.region` plus an optional
+  `dns.route53.hostedZoneId`, with credentials from either an explicit static pair
+  (`accessKeyId` + `secretAccessKey`/`secretAccessKeyFile`, optional session token and file) or,
+  when no pair is configured, the AWS SDK's default chain: environment, shared config, instance
+  role. An EC2 instance role therefore needs nothing on disk and nothing in the config beyond the
+  region. Until now either provider meant `dns.provider: lego` + `dns.legoProvider: <name>`, which
+  a default binary refuses with the "rebuild with -tags lego_dns" instruction — compiling all ~198
+  lego providers and their hundreds of SDKs into the binary — so the two most-requested providers
+  were the two an operator could not use as shipped. Both are now validated at load time, where the
+  operator can act on it: a missing token names the field and both environment variables, a missing
+  region names `dns.route53.region` and `AWS_REGION`, half a static key pair is refused, a
+  `cloudflare:`/`route53:` block left under another provider is refused naming both, and a `dns.ttl`
+  below Cloudflare's 120-second floor is refused before the provider would reject it at startup.
+  The `dns.provider: lego` path is unchanged, and the other ~196 providers stay behind the tag.
+  Cost: the default binary now links the AWS SDK — measured with `-trimpath -ldflags "-s -w"`,
+  20.1 MB → 25.5 MB (+5.4 MB, +26.9%); the tagged build is unchanged in kind.
+
 ## 0.5.0 - 2026-09-23
 
 ### Fixed

@@ -25,14 +25,16 @@ const legoProviderAvailable = false
 // Azure and AWS SDKs, the Huawei, Yandex, Oracle and Akamai SDKs, and so on). Compiling them in
 // takes the binary from ~18 MB to far more and, more importantly, makes all of that code part
 // of the supply chain of a program whose job is holding private keys. The default build
-// therefore keeps its two native providers -- DNSPod and Tencent Cloud DNS, which is what the
-// deployment this exists for uses -- and the rest are one flag away for anyone who needs them.
+// therefore keeps its four native providers -- DNSPod, Tencent Cloud DNS, Cloudflare and
+// Route 53, which are what the deployments this exists for use -- and the rest are one flag away
+// for anyone who needs them.
 func newLegoProvider(name string) func(context.Context) (challenge.Provider, error) {
 	return func(context.Context) (challenge.Provider, error) {
 		return nil, fmt.Errorf(
 			"dns.provider \"lego\" needs a build that includes lego's provider registry, which this "+
 				"binary is not: rebuild with -tags lego_dns to get all ~198 lego DNS providers "+
-				"(requested: %q). The default build carries only the native dnspod and tencentcloud "+
-				"providers because the registry pulls in hundreds of third-party SDKs", name)
+				"(requested: %q). The default build carries only the native dnspod, tencentcloud, "+
+				"cloudflare and route53 providers because the registry pulls in hundreds of "+
+				"third-party SDKs", name)
 	}
 }

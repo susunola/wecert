@@ -37,10 +37,14 @@ type DNSSolver struct {
 
 // NewDNSSolver picks an implementation from dns.provider.
 //
-// The two implementations use completely different credential systems:
+// The implementations use completely different credential systems:
 //   - dnspod       uses a DNSPod-native API token (never expires, build once, reuse)
 //   - tencentcloud uses Tencent Cloud CAM credentials, shared with certificate
 //     deployment (supports temporary credentials from a CVM role)
+//   - cloudflare   uses a scoped Cloudflare API token (never expires, build once, reuse)
+//   - route53      uses AWS credentials: its own static pair when one is configured, and
+//     otherwise the AWS SDK's default chain, which is what lets an EC2 instance
+//     role work with no key on disk
 const dnsAPITimeout = 60 * time.Second
 
 // tencentDNSConfig builds the tencentcloud provider's config, timeout included.

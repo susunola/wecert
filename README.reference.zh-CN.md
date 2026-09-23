@@ -143,7 +143,10 @@ Let's Encrypt 的速率限制里，最要命的不是那 100 个 SAN 上限，�
 - **凭证**，三者之一：
   - CVM 实例角色（推荐 —— 临时凭证，密钥不落盘）；
   - DNSPod API Token（当 `dns.provider: dnspod` 时）；
-  - 腾讯云 CAM 密钥对（仅建议本地调试）。
+  - 腾讯云 CAM 密钥对（仅建议本地调试）；或
+  - 另外两个内建 DNS provider 之一的凭证：Cloudflare 的受限 API Token
+    （`dns.provider: cloudflare`），或 Route 53 的 AWS 凭证
+    （`dns.provider: route53`）—— 后者用 EC2 实例角色时同样不需要任何密钥落盘。
 - **强烈建议配置 `_acme-challenge` CNAME 委派**，见[配置参考](#配置参考)。
 
 可选：`terraform` 和 `sqlite3`，用于 `testenv/` 与 `scripts/` 下的端到端测试环境。
@@ -596,9 +599,15 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 
 | 字段 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `provider` | 否 | `dnspod` | `dnspod` 用 DNSPod 自有 API Token（调 dnsapi.cn）。`tencentcloud` 用腾讯云 CAM 凭证（调 dnspod.tencentcloudapi.com）—— 推荐，因为能和证书部署共用一套凭证，且支持实例角色的 `SessionToken`。 |
+| `provider` | 否 | `dnspod` | `dnspod` 用 DNSPod 自有 API Token（调 dnsapi.cn）。`tencentcloud` 用腾讯云 CAM 凭证（调 dnspod.tencentcloudapi.com）—— 推荐，因为能和证书部署共用一套凭证，且支持实例角色的 `SessionToken`。`cloudflare` 用受限的 Cloudflare API Token，`route53` 用 AWS 凭证；两者都编进每个二进制，不需要任何构建标签。 |
 | `loginToken` | 当 `provider: dnspod` | — | DNSPod 自有 API Token，形如 `12345,abcdef…`。**不是**腾讯云 SecretId/SecretKey。 |
 | `loginTokenFile` | 替代 `loginToken` | — | 改成从文件读取 Token，于是它不会出现在 `config.yaml` 里 —— 也就不会出现在它的备份、diff 和任何人的终端回滚里。路径会做**环境变量展开**，这正是 systemd `LoadCredential` 能用的原因：`LoadCredential=dnspod-token:/etc/wecert/dnspod.token` 把文件放到 `$CREDENTIALS_DIRECTORY/dnspod-token`，配置里写 `loginTokenFile: ${CREDENTIALS_DIRECTORY}/dnspod-token` 即可。两者都没设时也接受环境变量 `DNSPOD_LOGIN_TOKEN`。同时设置 `loginToken` 与 `loginTokenFile` 会被拒绝，而不是替你猜一个。 |
+| `cloudflare.apiToken` | 当 `provider: cloudflare` | — | 受限的 Cloudflare API Token，需要对承载验证记录的那个（些）zone 有 Zone:Read + DNS:Edit 权限 —— 不是旧的全局 API Key。 |
+| `cloudflare.apiTokenFile` | 替代 `cloudflare.apiToken` | — | 改成从 0600 文件读取，环境变量展开规则与 `loginTokenFile` 完全相同，所以 `LoadCredential=cloudflare-token:/etc/wecert/cloudflare.token` 配合 `apiTokenFile: ${CREDENTIALS_DIRECTORY}/cloudflare-token` 即可。两者都没设时也接受环境变量 `CLOUDFLARE_DNS_API_TOKEN`（lego 文档里的变量名）及其别名 `CF_DNS_API_TOKEN`。同时设置会被拒绝。 |
+| `route53.region` | 当 `provider: route53` | — | AWS SDK 签名所用的 region。Route 53 本身是全球服务，但 SDK 没有 region 就拒绝构造客户端；环境变量 `AWS_REGION` / `AWS_DEFAULT_REGION` 同样接受。 |
+| `route53.hostedZoneId` | 否 | — | 指定验证记录写进哪个托管区。留空表示按验证 FQDN 查公共托管区；`AWS_HOSTED_ZONE_ID` 作为 lego 自己的回退仍然生效。 |
+| `route53.accessKeyId` + `route53.secretAccessKey` | 否 | — | 显式静态 AWS 密钥对，只在配置了的时候使用，此时它取代 SDK 的凭证链。`secretAccessKeyFile` 是密钥的 0600 文件变体，同样做环境变量展开。Key ID 不是机密，没有文件变体。 |
+| `route53.sessionToken` / `sessionTokenFile` | 否 | — | 静态密钥对配套的临时令牌（STS，或 assume 出来的角色）。走默认链时不要设：SDK 会自己取。只配令牌不配密钥对会在加载期被拒绝。 |
 | `ttl` | 否 | `600` | `_acme-challenge` TXT 记录的 TTL。**600 是 DNSPod 免费套餐的下限** —— 配 60 会被 `LimitExceeded.RecordTtlLimit` 拒绝。付费套餐可以调低以加快传播与清理。 |
 | `propagationTimeout` | 否 | `5m` | 等待全部权威 NS 可见该记录的上限 |
 | `pollingInterval` | 否 | `5s` | 传播探测的间隔 |

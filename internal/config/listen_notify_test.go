@@ -173,11 +173,15 @@ func TestLoadWarnsButAcceptsALooseConfigWithInlineSecrets(t *testing.T) {
 
 	// The field list the warning is built from.
 	fields := inlineSecretFields(&Config{
-		DNS:     DNS{LoginToken: "t"},
+		DNS: DNS{
+			LoginToken: "t",
+			Cloudflare: Cloudflare{APIToken: "c"},
+			Route53:    Route53{SecretAccessKey: "a"},
+		},
 		Tencent: Tencent{SecretID: "i", SecretKey: "k"},
 		Webhook: Webhook{Token: "w", NotifySecret: "n"},
 	})
-	if got := strings.Join(fields, ","); got != "dns.loginToken,tencent.secretId,tencent.secretKey,webhook.token,webhook.notifySecret" {
+	if got := strings.Join(fields, ","); got != "dns.loginToken,dns.cloudflare.apiToken,dns.route53.secretAccessKey,tencent.secretId,tencent.secretKey,webhook.token,webhook.notifySecret" {
 		t.Errorf("inlineSecretFields = %q", got)
 	}
 }

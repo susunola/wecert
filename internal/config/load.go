@@ -125,6 +125,16 @@ func inlineSecretFields(c *Config) []string {
 	if c.DNS.LoginToken != "" {
 		out = append(out, "dns.loginToken")
 	}
+	// The two providers added next to dnspod carry the same kind of long-lived secret, and a
+	// credential in a 0644 config is in every backup of it whether or not the warning knows the
+	// field's name. dns.route53.sessionToken is deliberately absent: it is temporary, and it is
+	// only read together with the static pair that the secretAccessKey entry already covers.
+	if c.DNS.Cloudflare.APIToken != "" {
+		out = append(out, "dns.cloudflare.apiToken")
+	}
+	if c.DNS.Route53.SecretAccessKey != "" {
+		out = append(out, "dns.route53.secretAccessKey")
+	}
 	if c.Tencent.SecretID != "" {
 		out = append(out, "tencent.secretId")
 	}

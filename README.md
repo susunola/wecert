@@ -126,7 +126,8 @@ The minimum you have to edit:
 acme:
   email: ops@example.com                 # ⚠️ MUST be a mailbox you control -- see below
 dns:
-  provider: tencentcloud                 # or dnspod + loginToken
+  provider: tencentcloud                 # or dnspod + loginToken, cloudflare + apiToken,
+                                         # or route53 + region (an instance role needs no key)
 certificates:
   - name: example-com
     domains: [example.com, "*.example.com"]
