@@ -788,6 +788,26 @@ func startWebhookServer(
 }
 
 func newDeployer(cfg *config.Config, log *slog.Logger) (deploy.Deployer, error) {
+	// nginx is a local directory + reload: no cloud credentials, no regions.
+	// Selected before the enforce/static split because the desired-state document
+	// still names certificates the same way -- the backend is process-wide
+	// (config.Deploy.Target), and enforce mode only changes *where the list comes
+	// from*, not where the files land.
+	if cfg.Deploy.Target == config.DeployTargetNginx {
+		d, err := deploy.NewNginxFromConfig(*cfg, log)
+		if err != nil {
+			return nil, err
+		}
+		opts := d.Options()
+		log.Info("nginx deploy enabled",
+			"dirTemplate", opts.DirTemplate,
+			"certFile", opts.CertFile,
+			"keyFile", opts.KeyFile,
+			"reload", opts.Reload,
+			"overrides", len(opts.Overrides))
+		return d, nil
+	}
+
 	// Enforce is driven by a document that may change while this process is
 	// running. Its config-level certificate list is deliberately empty, so
 	// scanning it would permanently select Noop even when the document enables

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 	if err := c.normalizeTencent(); err != nil {
+		return err
+	}
+	if err := c.normalizeDeployTarget(); err != nil {
 		return err
 	}
 	if err := c.normalizeSubsections(); err != nil {
@@ -258,6 +262,98 @@ func (c *Config) normalizeTencent() error {
 	}
 	if c.Tencent.ResourceTypes, err = normalizeList("tencent.resourceTypes", c.Tencent.ResourceTypes); err != nil {
 		return err
+	}
+	return nil
+}
+
+// normalizeDeployTarget validates the deploy backend and the nginx layout.
+//
+// The backend is process-wide (one Deployer); a per-certificate Target can only
+// select nginx or inherit. Mixing CLB and nginx in one process is deliberately
+// not supported here -- two Deployer halves with two id spaces and two delete
+// policies is how a retire/reap loop starts deleting the wrong kind of object.
+func (c *Config) normalizeDeployTarget() error {
+	if c.Deploy.Target == "" {
+		c.Deploy.Target = DeployTargetTencent
+	}
+	switch c.Deploy.Target {
+	case DeployTargetTencent, DeployTargetNginx:
+	default:
+		return fmt.Errorf("deploy.target must be %q or %q, got %q",
+			DeployTargetTencent, DeployTargetNginx, c.Deploy.Target)
+	}
+	if c.Deploy.Target == DeployTargetNginx || c.nginxMentioned() {
+		if err := c.normalizeNginx(); err != nil {
+			return err
+		}
+	}
+	for i := range c.Certificates {
+		cert := &c.Certificates[i]
+		t := cert.Deploy.Target
+		if t == "" {
+			continue
+		}
+		if t != DeployTargetTencent && t != DeployTargetNginx {
+			return fmt.Errorf("certificate %q: deploy.target must be %q or %q, got %q",
+				cert.Name, DeployTargetTencent, DeployTargetNginx, t)
+		}
+		if t != c.Deploy.Target {
+			return fmt.Errorf("certificate %q: deploy.target=%q disagrees with the process "+
+				"deploy.target=%q; one process deploys to one backend (split the fleet across two "+
+				"configs if both are needed)", cert.Name, t, c.Deploy.Target)
+		}
+		if cert.Deploy.Nginx != nil && cert.Deploy.Nginx.Dir != "" && t != DeployTargetNginx {
+			return fmt.Errorf("certificate %q: deploy.nginx.dir is set but deploy.target is %q; "+
+				"the block is only read when deploying to nginx", cert.Name, t)
+		}
+	}
+	// An nginx block with deploy.target=tencent is the same silent-ignore trap as
+	// dns.cloudflare under dnspod: the operator believes files will be written.
+	if c.Deploy.Target != DeployTargetNginx && c.nginxMentioned() {
+		return fmt.Errorf("nginx: is set but deploy.target is %q: the block is only read when "+
+			"deploy.target=%q, so the paths and reload command would be silently ignored -- "+
+			"remove it, or set deploy.target to %q if nginx is what you meant",
+			c.Deploy.Target, DeployTargetNginx, DeployTargetNginx)
+	}
+	return nil
+}
+
+func (c *Config) nginxMentioned() bool {
+	return c.Nginx.DirTemplate != "" || c.Nginx.CertFile != "" || c.Nginx.KeyFile != "" ||
+		len(c.Nginx.Reload) > 0
+}
+
+func (c *Config) normalizeNginx() error {
+	if c.Nginx.DirTemplate == "" {
+		c.Nginx.DirTemplate = "/etc/nginx/ssl/%s"
+	}
+	if c.Nginx.CertFile == "" {
+		c.Nginx.CertFile = "fullchain.pem"
+	}
+	if c.Nginx.KeyFile == "" {
+		c.Nginx.KeyFile = "privkey.pem"
+	}
+	if len(c.Nginx.Reload) == 0 {
+		// Default rather than "no reload": forgetting to reload is how a renewed
+		// certificate sits on disk while nginx keeps serving the old one until the
+		// next restart -- and the process cannot see that. An operator who manages
+		// reloads elsewhere sets reload: [] explicitly.
+		c.Nginx.Reload = []string{"systemctl", "reload", "nginx"}
+	}
+	if c.Nginx.CertFile == c.Nginx.KeyFile {
+		return fmt.Errorf("nginx.certFile and nginx.keyFile must differ, got %q for both",
+			c.Nginx.CertFile)
+	}
+	if !strings.Contains(c.Nginx.DirTemplate, "%s") {
+		return fmt.Errorf("nginx.dirTemplate %q must contain %%s (the certificate name); "+
+			"without it every certificate would share one directory and overwrite the others",
+			c.Nginx.DirTemplate)
+	}
+	for i := range c.Nginx.Reload {
+		if strings.TrimSpace(c.Nginx.Reload[i]) == "" {
+			return fmt.Errorf("nginx.reload[%d] is empty; reload is an argv slice, not a shell string",
+				i)
+		}
 	}
 	return nil
 }
