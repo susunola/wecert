@@ -103,11 +103,15 @@ var profileRenewBefore = map[string]time.Duration{
 
 // Config is the whole configuration.
 type Config struct {
-	StatePath    string          `yaml:"statePath"`
-	StateBackup  StateBackup     `yaml:"stateBackup"`
-	ACME         ACME            `yaml:"acme"`
-	DNS          DNS             `yaml:"dns"`
-	Tencent      Tencent         `yaml:"tencent"`
+	StatePath   string      `yaml:"statePath"`
+	StateBackup StateBackup `yaml:"stateBackup"`
+	ACME        ACME        `yaml:"acme"`
+	DNS         DNS         `yaml:"dns"`
+	Tencent     Tencent     `yaml:"tencent"`
+	// Deploy picks where issued certificates go: the Tencent Cloud CLB path (default,
+	// the shape this program was built for) or a local nginx directory + reload.
+	Deploy       DeploySettings  `yaml:"deploy"`
+	Nginx        NginxTarget     `yaml:"nginx"`
 	Metrics      Metrics         `yaml:"metrics"`
 	Webhook      Webhook         `yaml:"webhook"`
 	DesiredState DesiredState    `yaml:"desiredState"`
@@ -115,6 +119,63 @@ type Config struct {
 	Probe        Probe           `yaml:"probe"`
 	Fallback     FailureFallback `yaml:"failureFallback"`
 	Certificates []Certificate   `yaml:"certificates"`
+}
+
+// Deploy target names for DeploySettings.Target and Certificate.Deploy.Target.
+const (
+	DeployTargetTencent = "tencent"
+	DeployTargetNginx   = "nginx"
+)
+
+// DeploySettings is the process-wide deploy backend choice.
+//
+// Per-certificate deploy.enabled still decides whether anything is pushed at all;
+// this field only says *where* a pushed certificate lands. Keeping the two apart
+// is what lets a fleet mix "local state only", "CLB" and "nginx" certificates in
+// one config without inventing a third flag that means "enabled but where?".
+type DeploySettings struct {
+	// Target is DeployTargetTencent (default) or DeployTargetNginx.
+	Target string `yaml:"target,omitempty"`
+}
+
+// NginxTarget describes the local nginx certificate directory layout and the
+// command that makes nginx pick up a new file set.
+//
+// This is for the deployment where TLS does **not** terminate at a cloud LB:
+// wecert writes fullchain.pem + privkey.pem on disk and reloads nginx. There is
+// no cloud certificate id and no console bind -- the "binding" is the pair of
+// files nginx's config already points at.
+type NginxTarget struct {
+	// DirTemplate is the directory per certificate. "%s" is replaced with the
+	// certificate name. Default: /etc/nginx/ssl/%s
+	//
+	// A template rather than one shared directory: nginx server blocks usually
+	// name their ssl_certificate paths, and one directory per certificate keeps
+	// a name's key out of every other certificate's directory.
+	DirTemplate string `yaml:"dirTemplate,omitempty"`
+
+	// CertFile is the leaf+chain file name inside the directory. Default fullchain.pem.
+	// nginx's ssl_certificate should point at this file.
+	CertFile string `yaml:"certFile,omitempty"`
+
+	// KeyFile is the private key file name inside the directory. Default privkey.pem.
+	// Written 0600: the key is the credential that makes the certificate worth anything.
+	KeyFile string `yaml:"keyFile,omitempty"`
+
+	// Reload is the command run after the files land. Default: systemctl reload nginx.
+	//
+	// An argv slice, not a shell string: quoting rules and PATH lookups are exactly
+	// how a deploy path becomes a root command-injection story. Empty means "write
+	// the files and do not reload", which is only honest for an operator who reloads
+	// on a schedule and knows it.
+	Reload []string `yaml:"reload,omitempty"`
+}
+
+// NginxCert lets one certificate override the directory only. File names and the
+// reload command stay global -- a fleet that needs two reload commands is two
+// processes, not one config fighting itself.
+type NginxCert struct {
+	Dir string `yaml:"dir,omitempty"`
 }
 
 // FailureFallback configures the "issue a subset before expiry" degradation.
@@ -971,11 +1032,17 @@ type CertificateExport struct {
 }
 
 // Deploy describes where the issued certificate should be deployed.
-// On first issuance there is no binding on the Tencent Cloud side yet, so a
-// manual bind is needed once; after that every 90/45-day renewal is swapped in
-// automatically by UpdateCertificateInstance.
+//
+// On Tencent Cloud, first issuance only uploads: there is no binding on that side
+// yet, so a human binds once in the console and later renewals are swapped by
+// UpdateCertificateInstance. On nginx there is no console step -- writing the
+// files and reloading *is* the bind.
 type Deploy struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Target overrides DeploySettings.Target for this certificate only.
+	Target string `yaml:"target,omitempty" json:"target,omitempty"`
+	// Nginx is read only when this certificate's target is nginx.
+	Nginx *NginxCert `yaml:"nginx,omitempty" json:"nginx,omitempty"`
 }
 
 // ProfileMaxNames returns the identifier cap a profile allows, or 0 for an unknown profile.

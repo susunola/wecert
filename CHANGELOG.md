@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- **Deploy certificates to local nginx.** `deploy.target: nginx` writes
+  `fullchain.pem` + `privkey.pem` into `nginx.dirTemplate` (`%s` is the
+  certificate name; default `/etc/nginx/ssl/%s`) and runs `nginx.reload`
+  (default `systemctl reload nginx`, an argv slice — never a shell string).
+  There is no cloud certificate id and no console bind: the file pair is the
+  deployment, so a successful write is a confirmed deploy. The process-wide
+  id space is `nginx:<dir>`; `Delete` removes those two files, and a reload
+  failure still returns that id so the next pass resumes the same directory
+  (see the `Deployer` contract). Per-certificate `deploy.nginx.dir` overrides
+  the directory. One process deploys to one backend — mixing CLB and nginx in
+  one config is refused at load time. The unit still runs as `wecert`, so
+  reloading nginx needs a sudoers rule, a helper, or `reload: []`.
+
 ### Fixed
 
 - **`install.sh` installs its own `make release` output again.** The unit checksum gate looked

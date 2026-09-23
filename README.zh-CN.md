@@ -202,6 +202,27 @@ curl --fail --silent --show-error \
 
 用浏览器打开 `console.html`，即可搜索、筛选和查看详情。它是静态快照，更新数据需重新获取。需要在线刷新时，按[回环代理与 SSH 隧道示例](docs/console.md#live-browser-access)配置浏览器入口，或使用已有的鉴权 HTTPS 网关。页面依赖持续运行的 daemon；每小时执行一次的 `-once` timer 不会维持监听。完整开启步骤与状态含义见 [Console 使用说明](docs/console.md)。
 
+## 部署到本机 nginx
+
+默认后端是腾讯云 CLB（上传 + 一次控制台绑定 + 一键换绑）。当 TLS 在**与 wecert 同一台机器**
+上的 nginx 终结时，设置：
+
+```yaml
+deploy:
+  target: nginx
+nginx:
+  dirTemplate: /etc/nginx/ssl/%s   # %s 是证书名
+  reload: [systemctl, reload, nginx]
+```
+
+wecert 以原子 rename 写入 `fullchain.pem`（0644）和 `privkey.pem`（0600），再执行 reload
+（argv 形式，不会进 shell）。这两份文件本身就是部署结果：没有云证书 id，也没有控制台绑定，
+写入成功即视为已确认。把 server 块里的 `ssl_certificate` / `ssl_certificate_key` 指到它们即可。
+
+一个进程只对接一个后端（`deploy.target: tencent` 或 `nginx`），同一配置里混用会在加载时被拒绝。
+服务以用户 `wecert` 运行，默认无法 reload nginx——请用 sudoers 放行这一条命令、放 helper 脚本，
+或设 `reload: []` 自己调度重载。完整示例见 `config.example.yaml`。
+
 ## 日常运维
 
 **状态放在哪里。** `statePath`（**必填，没有默认值**），例如 `/var/lib/wecert/state.db`（0600，所在目录 0700）。它装着 ACME 账号密钥、每一张证书的私钥、在飞订单的 order URL，以及 ARI certID —— 而丢掉一个 order URL 就要拿一次签发去补，直接算在 5 / 7 天这条限额上。所以它也会被自动快照：`stateBackup` 默认开启，每 24 小时做一次一致的 `VACUUM INTO`，保留 7 份。恢复用一条命令 `wecert -restore latest`（也可以给快照文件或快照目录），代价与步骤见 [docs/recovery.md](docs/recovery.md)。

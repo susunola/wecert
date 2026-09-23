@@ -185,6 +185,36 @@ dns:
   # local DNS view (VPN / split-horizon / captive resolver).
   # recursiveNameservers: ["1.1.1.1", "8.8.8.8"]
 
+# ---------------------------------------------------------------------------
+# Where issued certificates are deployed.
+#
+# tencent (default): upload to Tencent Cloud and rebind the CLB listener. First
+#   issuance needs a one-time manual bind in the console; renewals are automatic.
+# nginx: write fullchain.pem + privkey.pem on disk and reload nginx. There is no
+#   cloud certificate and no console step -- the files nginx's ssl_certificate
+#   points at *are* the deployment. Use this when TLS terminates on the same
+#   machine as wecert (a VM running nginx), not at a cloud LB.
+#
+# One process, one backend: split the fleet across two configs if you need both.
+#deploy:
+#  target: nginx
+
+# nginx layout (read only when deploy.target is nginx).
+#nginx:
+#  # %s is the certificate name (not the first domain -- names can contain '*').
+#  dirTemplate: /etc/nginx/ssl/%s
+#  certFile: fullchain.pem
+#  keyFile: privkey.pem
+#  # argv, never a shell string. Empty list = write files and do not reload.
+#  reload:
+#    - systemctl
+#    - reload
+#    - nginx
+#
+#   The wecert systemd unit runs as user wecert and cannot reload nginx by
+#   itself. Either a sudoers rule for exactly that command, a helper script, or
+#   reload: [] and a cron/systemd path of your own.
+
 tencent:
   # cvm-role: fetch temporary credentials from the instance metadata service
   #           (recommended; no key ever touches disk)

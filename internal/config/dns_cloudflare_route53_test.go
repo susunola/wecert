@@ -609,3 +609,60 @@ dns:
 		t.Fatalf("a wide secret file must still load (warn, not refuse): %v", err)
 	}
 }
+
+// deploy.target selects the backend; the nginx block is only read for nginx.
+func TestDeployTargetNginxAndTencent(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantErr []string
+	}{
+		{
+			name: "default is tencent",
+			body: minimalPrefix + "certificates:\n  - name: c\n    domains: [example.com]\n    deploy:\n      enabled: true\n",
+		},
+		{
+			name: "nginx with defaults",
+			body: minimalPrefix + "deploy:\n  target: nginx\ncertificates:\n  - name: c\n    domains: [example.com]\n    deploy:\n      enabled: true\n",
+		},
+		{
+			name:    "nginx block under tencent is refused",
+			body:    minimalPrefix + "nginx:\n  dirTemplate: /etc/nginx/ssl/%s\ncertificates:\n  - name: c\n    domains: [example.com]\n",
+			wantErr: []string{"nginx", DeployTargetNginx},
+		},
+		{
+			name:    "dirTemplate without %s is refused",
+			body:    minimalPrefix + "deploy:\n  target: nginx\nnginx:\n  dirTemplate: /etc/nginx/ssl\ncertificates:\n  - name: c\n    domains: [example.com]\n",
+			wantErr: []string{"%s"},
+		},
+		{
+			name:    "per-cert target must match process target",
+			body:    minimalPrefix + "deploy:\n  target: nginx\ncertificates:\n  - name: c\n    domains: [example.com]\n    deploy:\n      enabled: true\n      target: tencent\n",
+			wantErr: []string{"disagrees"},
+		},
+		{
+			name:    "unknown target",
+			body:    minimalPrefix + "deploy:\n  target: albs\ncertificates:\n  - name: c\n    domains: [example.com]\n",
+			wantErr: []string{"deploy.target"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.body))
+			if len(tc.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("must load: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("must be refused")
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err %q must contain %q", err, want)
+				}
+			}
+		})
+	}
+}

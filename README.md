@@ -232,6 +232,29 @@ start the timer that keeps the desired state fresh.
 > needs), and a rate limit — `wecert_ratelimit_blocked` says which limit is refusing, and for the
 > account's new-order quota the daemon logs the exact instant the CA will listen again.
 
+## Deploy to local nginx
+
+The default backend is Tencent Cloud CLB (upload + one-time console bind + one-click rebind).
+When TLS terminates on the **same machine** as wecert — a VM running nginx — set:
+
+```yaml
+deploy:
+  target: nginx
+nginx:
+  dirTemplate: /etc/nginx/ssl/%s   # %s is the certificate name
+  reload: [systemctl, reload, nginx]
+```
+
+wecert writes `fullchain.pem` (0644) and `privkey.pem` (0600) with an atomic rename and then
+runs the reload argv (never a shell string). The file pair *is* the deployment: there is no
+cloud certificate id and no console bind, so a successful write counts as confirmed. Point
+`ssl_certificate` / `ssl_certificate_key` in the server block at those two files.
+
+One process deploys to one backend (`deploy.target: tencent` or `nginx`); mixing CLB and
+nginx in one config is refused at load time. The unit runs as user `wecert`, which cannot
+reload nginx by itself — allow exactly that command in sudoers, use a helper script, or set
+`reload: []` and reload on your own schedule. See `config.example.yaml` for the full block.
+
 ## Read-only console
 
 Inspect certificates, cloud bindings, expiration, and TLS verification in one
