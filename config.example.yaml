@@ -434,6 +434,29 @@ certificates:
       - "*.example.com"
     deploy:
       enabled: true
+    # Optional private-key export. Each certificate gets an isolated directory
+    # containing fullchain.pem and privkey.pem, both written atomically as 0600.
+    # Remote targets use the same credential references and host-key checking as
+    # stateBackup.remoteTargets; their object/directory path gains /example-com.
+    # export:
+    #   localDir: /var/lib/wecert/export
+    #   remoteTargets:
+    #     - name: cert-archive
+    #       type: s3
+    #       bucket: wecert-certificates
+    #       prefix: production
+    #       region: ap-southeast-1
+    #     - name: offsite-sftp
+    #       type: sftp
+    #       host: backup.example.net:22
+    #       username: wecert
+    #       remoteDir: /srv/wecert/certificates
+    #       privateKeyFile: /etc/wecert/export_ed25519
+    #       knownHostsFile: /etc/wecert/backup_known_hosts
+    # A certificate can also override the global failureFallback policy; an
+    # explicit false protects a critical certificate from subset issuance.
+    # failureFallback:
+    #   enabled: false
 
   # A wildcard covers exactly one label: *.example.com does not include
   # a.b.example.com. Multi-level naming requires a separate certificate per
