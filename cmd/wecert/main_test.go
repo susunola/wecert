@@ -318,7 +318,7 @@ func TestTakeSnapshotsWritesEveryLocalDestination(t *testing.T) {
 		t.Fatalf("PutCert: %v", err)
 	}
 	first, second := filepath.Join(dir, "disk-a"), filepath.Join(dir, "disk-b")
-	if err := takeSnapshots(store, []string{first, second}, 3, time.Hour, slog.Default()); err != nil {
+	if err := takeSnapshots(context.Background(), store, []string{first, second}, nil, 3, time.Hour, slog.Default()); err != nil {
 		t.Fatalf("takeSnapshots: %v", err)
 	}
 	for _, destination := range []string{first, second} {

@@ -30,6 +30,26 @@ stateBackup:
   # Each receives its own SQLite-consistent snapshot and retention set.
   # localDirs:
   #   - /mnt/backup-disk/wecert
+  # Off-host destinations. S3 credentials use the standard AWS environment/profile chain;
+  # COS uses its S3-compatible endpoint and the same credential chain.
+  # remoteTargets:
+  #   - name: production-s3
+  #     type: s3
+  #     bucket: wecert-backups
+  #     prefix: production
+  #     region: ap-southeast-1
+  #   - name: tencent-cos
+  #     type: cos
+  #     bucket: wecert-1250000000
+  #     endpoint: https://cos.ap-guangzhou.myqcloud.com
+  #     region: ap-guangzhou
+  #   - name: offsite-sftp
+  #     type: sftp
+  #     host: backup.example.net:22
+  #     username: wecert
+  #     remoteDir: /srv/wecert
+  #     privateKeyFile: /etc/wecert/backup_ed25519
+  #     knownHostsFile: /etc/wecert/backup_known_hosts
 
 acme:
   # ⚠️ Defaults to staging. install.sh installs this very file as

@@ -260,6 +260,11 @@ type StateBackup struct {
 	// SQLite-consistent snapshot; state.db itself is never copied.
 	LocalDirs []string `yaml:"localDirs"`
 
+	// RemoteTargets deliver the consistent local snapshot to S3-compatible
+	// storage (including COS) or SFTP. Credentials are deliberately references,
+	// never YAML values.
+	RemoteTargets []BackupTarget `yaml:"remoteTargets"`
+
 	// Parsed, filled in by normalize.
 	IntervalDur time.Duration `yaml:"-"`
 }
@@ -310,6 +315,51 @@ func (b *StateBackup) normalize() error {
 		}
 		seen[clean] = true
 		b.LocalDirs[i] = clean
+	}
+	for i := range b.RemoteTargets {
+		if err := b.RemoteTargets[i].normalize(i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BackupTarget is one off-host snapshot destination.
+type BackupTarget struct {
+	Type           string `yaml:"type"` // s3, cos, or sftp
+	Name           string `yaml:"name"`
+	Bucket         string `yaml:"bucket"`
+	Prefix         string `yaml:"prefix"`
+	Endpoint       string `yaml:"endpoint"`
+	Region         string `yaml:"region"`
+	Host           string `yaml:"host"`
+	Username       string `yaml:"username"`
+	RemoteDir      string `yaml:"remoteDir"`
+	PasswordEnv    string `yaml:"passwordEnv"`
+	PrivateKeyFile string `yaml:"privateKeyFile"`
+	KnownHostsFile string `yaml:"knownHostsFile"`
+}
+
+func (t *BackupTarget) normalize(i int) error {
+	t.Type = strings.ToLower(strings.TrimSpace(t.Type))
+	t.Name = strings.TrimSpace(t.Name)
+	switch t.Type {
+	case "s3", "cos":
+		if t.Bucket == "" {
+			return fmt.Errorf("stateBackup.remoteTargets[%d].bucket is required for %s", i, t.Type)
+		}
+	case "sftp":
+		if t.Host == "" || t.Username == "" || t.RemoteDir == "" || t.KnownHostsFile == "" {
+			return fmt.Errorf("stateBackup.remoteTargets[%d] sftp requires host, username, remoteDir and knownHostsFile", i)
+		}
+		if t.PrivateKeyFile == "" && t.PasswordEnv == "" {
+			return fmt.Errorf("stateBackup.remoteTargets[%d] sftp requires privateKeyFile or passwordEnv", i)
+		}
+	default:
+		return fmt.Errorf("stateBackup.remoteTargets[%d].type must be s3, cos or sftp, got %q", i, t.Type)
+	}
+	if t.Name == "" {
+		t.Name = fmt.Sprintf("%s-%d", t.Type, i+1)
 	}
 	return nil
 }

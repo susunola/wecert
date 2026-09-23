@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/susunola/wecert/internal/acme"
+	"github.com/susunola/wecert/internal/backup"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/reconcile"
@@ -491,7 +492,7 @@ func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Conf
 	dirs := stateBackupDirs(cfg)
 
 	snapshot := func() error {
-		return takeSnapshots(store, dirs, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log)
+		return takeSnapshots(ctx, store, dirs, cfg.StateBackup.RemoteTargets, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log)
 	}
 
 	// first records the outcome of the immediate snapshot: the one-shot run reads it to decide
@@ -610,13 +611,13 @@ const snapshotDrainTimeout = 15 * time.Second
 // snapshots before anyone looked at the directory. Rate buckets and failure counters do not count
 // as recoverable state: losing them costs rate-limit knowledge, not a certificate.
 func takeSnapshot(store *state.Store, dir string, keep int, interval time.Duration, log *slog.Logger) error {
-	return takeSnapshots(store, []string{dir}, keep, interval, log)
+	return takeSnapshots(context.Background(), store, []string{dir}, nil, keep, interval, log)
 }
 
 // takeSnapshots writes a fully consistent SQLite snapshot to every configured
 // local destination. Each call to Store.Snapshot uses VACUUM INTO; copying
 // state.db (especially while WAL is enabled) is never used as a shortcut.
-func takeSnapshots(store *state.Store, dirs []string, keep int, interval time.Duration, log *slog.Logger) error {
+func takeSnapshots(ctx context.Context, store *state.Store, dirs []string, remote []config.BackupTarget, keep int, interval time.Duration, log *slog.Logger) error {
 	has, err := store.HasRecoverableState()
 	if err != nil {
 		log.Error("cannot tell whether the state database holds anything worth snapshotting", "err", err)
@@ -632,6 +633,7 @@ func takeSnapshots(store *state.Store, dirs []string, keep int, interval time.Du
 	}
 
 	var errs []error
+	var uploaded string
 	for _, dir := range dirs {
 		path, err := store.Snapshot(dir, keep)
 		if err != nil {
@@ -645,6 +647,20 @@ func takeSnapshots(store *state.Store, dirs []string, keep int, interval time.Du
 			continue
 		}
 		log.Info("state database snapshotted", "path", path, "interval", interval, "keep", keep)
+		if uploaded == "" {
+			uploaded = path
+		}
+	}
+	if uploaded != "" {
+		for _, target := range remote {
+			err := backup.Upload(ctx, backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: target.Prefix, Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: target.RemoteDir, PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, KnownHostsFile: target.KnownHostsFile}, uploaded)
+			if err != nil {
+				log.Error("remote state snapshot upload failed", "target", target.Name, "type", target.Type, "err", err)
+				errs = append(errs, fmt.Errorf("remote target %s: %w", target.Name, err))
+			} else {
+				log.Info("state snapshot uploaded", "target", target.Name, "type", target.Type, "path", uploaded)
+			}
+		}
 	}
 	return errors.Join(errs...)
 }
