@@ -1,9 +1,16 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="light" data-rendered="{{.Snapshot.Time}}">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>wecert · Certificate inventory</title>
+    <script>
+      // This file is an embedded Go template. When it is opened directly,
+      // none of its CSS, JavaScript, or snapshot substitutions exist.
+      if (document.documentElement.dataset.rendered.startsWith("{" + "{")) {
+        location.replace("file:///tmp/wecert-console.html");
+      }
+    </script>
     <link rel="icon" type="image/png" href="{{.Logo}}" />
     <style>
       {{.CSS}}
