@@ -158,6 +158,14 @@ func TestWritePreviewPage(t *testing.T) {
 				ObservedAt: now.Add(-52 * time.Minute).Format(time.RFC3339), Items: []BindingItem{}},
 		},
 	})
+	// Preview the three issuance limits shown by the console. The registered
+	// domain row is intentionally near the policy threshold so the warning state
+	// remains visible in the checked-in screenshot.
+	snap.Quotas = []Quota{
+		{Limit: "new-orders", Scope: "", Capacity: 300, RefillSecs: 36, Remaining: 284},
+		{Limit: "certs-per-registered-domain", Scope: "example.com", Capacity: 50, RefillSecs: 202 * 60, Remaining: 8},
+		{Limit: "certs-per-exact-identifier-set", Scope: "*.cdn.example.com,cdn.example.com,img.example.com", Capacity: 5, RefillSecs: 34 * 60 * 60, Remaining: 3},
+	}
 
 	f, err := os.Create(out)
 	if err != nil {

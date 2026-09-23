@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/probe"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -77,6 +80,7 @@ type CertManager interface {
 	// no quota accounting simply reports nothing -- but part of the interface because every
 	// production manager has one.
 	PublishQuota(scopes map[string][]string)
+	QuotaStatus(scopes map[string][]string) []ratelimit.QuotaReport
 
 	// RetryPendingRevocations re-attempts every revocation the CA has not accepted yet.
 	RetryPendingRevocations(ctx context.Context)
@@ -304,6 +308,36 @@ func (r *Reconciler) CertNames() []string {
 		return nil
 	}
 	return res.CertNames()
+}
+
+// QuotaStatus returns the locally observed CA quota buckets for the most
+// recently resolved desired state. It never resolves desired state on an HTTP
+// request path; an unavailable cache simply yields no quota rows.
+func (r *Reconciler) QuotaStatus() []ratelimit.QuotaReport {
+	res := r.last.Load()
+	if res == nil {
+		return nil
+	}
+	registered := map[string]bool{}
+	identifiers := map[string]bool{}
+	sets := map[string]bool{}
+	for i := range res.Certificates {
+		c := &res.Certificates[i]
+		for _, d := range c.Domains {
+			if rd := group.RegisteredDomain(d); rd != "" {
+				registered[rd] = true
+			}
+			identifiers[strings.ToLower(d)] = true
+		}
+		if key := c.DomainKey(); key != "" {
+			sets[key] = true
+		}
+	}
+	return r.manager.QuotaStatus(map[string][]string{
+		"registered-domain":    sortedKeys(registered),
+		"exact-identifier-set": sortedKeys(sets),
+		"identifier":           sortedKeys(identifiers),
+	})
 }
 
 // publishDesired mirrors desired-state health into metrics and logs.

@@ -66,6 +66,21 @@ keys or certificate PEM, but does contain inventory metadata.
 
 The same authenticated request to `http://127.0.0.1:9801/api/inventory` returns JSON.
 
+## Let’s Encrypt quota signals
+
+When the daemon has resolved desired state, the Console shows an **Issuance
+quota** strip above the certificate list. It reports the tightest local bucket
+for account orders, certificates per registered domain (50, refilling one token
+every 202 minutes), and certificates per exact identifier set (5, refilling one
+token every 34 hours). A value under 20% is amber; a request refused by the CA
+is red and includes the CA-provided retry time when one is available.
+
+These are deliberately labelled **local issuance estimates**. Let's Encrypt
+does not offer a remaining-quota API, and the registered-domain and exact-set
+limits are shared across accounts. Activity outside this daemon can only make
+the real remainder smaller. Use the existing `wecert_ratelimit_blocked` metric
+and alert for the CA's authoritative refusal signal.
+
 ## Live browser access
 
 Use an authenticated TLS reverse proxy that inserts the upstream token, or a

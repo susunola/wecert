@@ -354,6 +354,149 @@ h1 {
   margin-left: 4px;
   color: var(--quiet);
 }
+.quota-panel {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 10px;
+  margin: 0 0 24px;
+  overflow: hidden;
+  box-shadow: 0 2px 3px #163b3102;
+}
+.quota-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 22px 12px;
+}
+.quota-heading h2 {
+  margin: 2px 0 0;
+  font-size: 15px;
+  letter-spacing: -0.2px;
+}
+.eyebrow {
+  color: var(--quiet);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.quota-state {
+  font-size: 11px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.quota-state.warn {
+  color: var(--amber);
+}
+.quota-state.bad {
+  color: var(--red);
+}
+.quota-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid var(--line);
+}
+.quota-item {
+  min-width: 0;
+  padding: 14px 22px 15px;
+  border-right: 1px solid var(--line);
+}
+.quota-item:last-child {
+  border: 0;
+}
+.quota-label {
+  color: var(--muted);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.quota-label .scope {
+  color: var(--quiet);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quota-value {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  margin-top: 6px;
+}
+.quota-value strong {
+  color: var(--text);
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.7px;
+  font-variant-numeric: tabular-nums;
+}
+.quota-value span {
+  color: var(--quiet);
+  font-size: 11px;
+}
+.quota-item.warn .quota-value strong {
+  color: var(--amber);
+}
+.quota-item.bad .quota-value strong {
+  color: var(--red);
+}
+.quota-meter {
+  height: 3px;
+  background: var(--soft);
+  border-radius: 2px;
+  margin: 10px 0 7px;
+  overflow: hidden;
+}
+.quota-meter span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+.quota-item.warn .quota-meter span {
+  background: var(--amber);
+}
+.quota-item.bad .quota-meter span {
+  background: var(--red);
+}
+.quota-note {
+  color: var(--quiet);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.quota-footnote {
+  border-top: 1px solid var(--line);
+  margin: 0;
+  padding: 10px 22px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--quiet);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.quota-footnote .icon {
+  flex: none;
+  width: 13px;
+  height: 13px;
+}
+.quota-footnote a {
+  color: var(--accent);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.quota-footnote a .icon {
+  width: 11px;
+  height: 11px;
+}
 .inventory {
   border: 1px solid var(--line);
   background: var(--surface);

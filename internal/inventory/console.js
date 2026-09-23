@@ -15,6 +15,7 @@ const records = (snapshot.certificates || []).map((r, index) => ({
   },
   probe: { ...r.probe, hosts: r.probe.hosts || [] },
 }));
+const quotas = snapshot.quotas || [];
 const $ = (id) => document.getElementById(id);
 const esc = (value) =>
   String(value ?? "").replace(
@@ -154,6 +155,69 @@ const shortTime = (value) =>
         hourCycle: "h23",
         timeZone: "UTC",
       }).format(new Date(value)) + " UTC";
+const quotaNames = {
+  "new-orders": "New orders",
+  "certs-per-registered-domain": "Certificates per registered domain",
+  "certs-per-exact-identifier-set": "Certificates per exact identifier set",
+};
+const quotaOrder = Object.keys(quotaNames);
+const quotaRecovery = (seconds) => {
+  if (seconds < 60) return `Recovers 1 every ${seconds}s`;
+  if (seconds < 3600) return `Recovers 1 every ${Math.round(seconds / 60)}m`;
+  return `Recovers 1 every ${Math.round(seconds / 3600)}h`;
+};
+function quotaClass(q) {
+  if (q.blocked) return "bad";
+  if (q.unreadable || q.spentByCA) return "";
+  return q.remaining <= Math.max(1, q.capacity * 0.2) ? "warn" : "";
+}
+function quotaNote(q) {
+  if (q.blocked)
+    return q.blockedUntil
+      ? `CA blocked until ${formatDate(q.blockedUntil, true)}`
+      : "CA has blocked this request type";
+  if (q.unreadable) return "Local quota state could not be read";
+  if (q.spentByCA) return "Only CA refusals can confirm this state";
+  return quotaRecovery(q.refillSeconds);
+}
+function renderQuotas() {
+  const panel = $("quota-panel");
+  const relevant = quotaOrder
+    .map((limit) => quotas.filter((q) => q.limit === limit))
+    .filter((rows) => rows.length)
+    .map((rows) =>
+      rows.reduce(
+        (worst, row) =>
+          !worst || row.blocked || row.remaining < worst.remaining
+            ? row
+            : worst,
+        null,
+      ),
+    );
+  if (!relevant.length) return;
+  panel.hidden = false;
+  const blocked = relevant.filter((q) => q.blocked).length;
+  const warning = relevant.filter((q) => quotaClass(q) === "warn").length;
+  $("quota-state").className =
+    `quota-state ${blocked ? "bad" : warning ? "warn" : ""}`;
+  $("quota-state").innerHTML = blocked
+    ? `${icon("warning-circle")}${blocked} blocked by CA`
+    : warning
+      ? `${icon("warning-circle")}${warning} near limit`
+      : `${icon("check-circle")}Within local estimate`;
+  $("quota-grid").innerHTML = relevant
+    .map((q) => {
+      const cls = quotaClass(q);
+      const percent =
+        q.unreadable || q.spentByCA
+          ? 0
+          : Math.max(0, Math.min(100, (q.remaining / q.capacity) * 100));
+      const value = q.unreadable || q.spentByCA ? "—" : Math.floor(q.remaining);
+      const scope = q.scope || "This account";
+      return `<article class="quota-item ${cls}"><div class="quota-label"><span>${esc(quotaNames[q.limit] || q.limit)}</span><span class="scope mono" title="${esc(scope)}">${esc(scope)}</span></div><div class="quota-value"><strong>${value}</strong><span>of ${q.capacity} available</span></div><div class="quota-meter" aria-hidden="true"><span style="width:${percent}%"></span></div><div class="quota-note">${esc(quotaNote(q))}</div></article>`;
+    })
+    .join("");
+}
 const unread = (kind) => ["unreachable", "no_certificate"].includes(kind);
 function probeResult(probe) {
   if (!probe.enabled) return ["Disabled", "unknown", "info"];
@@ -260,6 +324,7 @@ function compareRecords(a, b) {
   );
 }
 function render() {
+  renderQuotas();
   const context = matchingContext();
   const counts = {
     all: context.length,

@@ -2,9 +2,11 @@ package webhook
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/susunola/wecert/internal/inventory"
 	"github.com/susunola/wecert/internal/probe"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -27,6 +29,12 @@ type DaemonFacts interface {
 	ProbeEnabled() bool
 	ProbeAnswers(certName string) []probe.Answer
 	ResourceTypes() []string
+}
+
+// QuotaReader is the optional, cached rate-limit diagnostic surface supplied
+// by the reconciler. It must not call Let's Encrypt from an inventory request.
+type QuotaReader interface {
+	QuotaStatus() []ratelimit.QuotaReport
 }
 
 func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
@@ -131,7 +139,39 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 			in.Probes[name] = hostSamples(answers)
 		}
 	}
-	return inventory.Assemble(in)
+	snap := inventory.Assemble(in)
+	if qr, ok := s.rec.(QuotaReader); ok {
+		snap.Quotas = quotaViews(qr.QuotaStatus())
+	}
+	return snap
+}
+
+func quotaViews(reports []ratelimit.QuotaReport) []inventory.Quota {
+	if len(reports) == 0 {
+		return nil
+	}
+	limits := map[string]ratelimit.Limit{}
+	for _, limit := range ratelimit.Reportable() {
+		limits[limit.Name] = limit
+	}
+	out := make([]inventory.Quota, 0, len(reports))
+	for _, report := range reports {
+		limit, ok := limits[report.Limit]
+		if !ok {
+			continue
+		}
+		row := inventory.Quota{
+			Limit: report.Limit, Scope: report.Scope,
+			Capacity: limit.Capacity, RefillSecs: int64(limit.Refill.Seconds()),
+			Remaining: report.Remaining, Blocked: report.Blocked,
+			Unreadable: report.Unreadable, SpentByCA: report.SpentByCA,
+		}
+		if !report.BlockedUntil.IsZero() {
+			row.BlockedUntil = report.BlockedUntil.UTC().Format(time.RFC3339)
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 // hostSamples converts probe answers into the page's sample rows. The served notAfter

@@ -62,6 +62,21 @@ type Limit struct {
 	SpentByCA bool
 }
 
+// QuotaReport is one limit bucket's locally observed state. It deliberately
+// carries no claim that a shared Let's Encrypt limit is globally queryable:
+// Remaining counts this daemon's own spending and is therefore an upper bound.
+// It lives beside Limit so read-only consumers can expose the diagnostic data
+// without depending on the ACME implementation.
+type QuotaReport struct {
+	Limit        string
+	Scope        string
+	Remaining    float64
+	Blocked      bool
+	BlockedUntil time.Time
+	Unreadable   bool
+	SpentByCA    bool
+}
+
 // String renders the limit for a log line.
 func (l Limit) String() string {
 	return fmt.Sprintf("%s (%s): %g per %s", l.Name, l.Scope, l.Capacity, l.Refill)
