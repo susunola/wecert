@@ -375,9 +375,14 @@ h1{font-size:19px;font-weight:650;letter-spacing:-.01em;margin:0}
 table{border-collapse:separate;border-spacing:0;width:100%;table-layout:fixed}
 /* Widths live on the header cells: with a fixed layout those are the ones
    the browser reads, and the colspan detail row is left alone. */
-th:nth-child(1){width:168px} th:nth-child(2){width:17%}
-th:nth-child(4){width:120px} th:nth-child(5){width:21%}
-th:nth-child(6){width:62px} th:nth-child(7){width:100px}
+/* The status cell must never wrap: the caret plus the longest label ("Probe
+   unreachable", 134px + 12px) has to fit inside the column minus its padding, or
+   that one row grows taller than every other row and the table looks misaligned.
+   186px leaves room for a label a little longer than today's longest. */
+th:nth-child(1),td:nth-child(1){width:186px;white-space:nowrap}
+th:nth-child(2){width:16%}
+th:nth-child(4){width:118px} th:nth-child(5){width:20%}
+th:nth-child(6){width:60px} th:nth-child(7){width:98px}
 th{position:sticky;top:38px;z-index:3;background:var(--panel);text-align:left;white-space:nowrap;
  font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
  padding:6px 12px;border-bottom:1px solid var(--line-strong)}
