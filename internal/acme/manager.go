@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/susunola/wecert/internal/certsync"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
 	"github.com/susunola/wecert/internal/ratelimit"
@@ -86,6 +87,7 @@ type Manager struct {
 	dns      challengeSolver
 	keyAuth  keyAuthProvider
 	deployer deploy.Deployer
+	exporter certsync.Publisher
 	log      *slog.Logger
 
 	ariInterval time.Duration
@@ -435,6 +437,7 @@ func newManager(
 		dns:                dns,
 		keyAuth:            keyAuth,
 		deployer:           deployer,
+		exporter:           certsync.DefaultPublisher{},
 		log:                log,
 		ariInterval:        6 * time.Hour,
 		retention:          7 * 24 * time.Hour,
@@ -451,6 +454,10 @@ func newManager(
 		now: time.Now,
 	}
 }
+
+// SetCertificatePublisher replaces the post-promotion export hook. Passing nil
+// disables exports, primarily for focused tests.
+func (m *Manager) SetCertificatePublisher(p certsync.Publisher) { m.exporter = p }
 
 // Reconcile handles a single certificate. A returned error only means "this round did
 // not succeed": the failure is already persisted and the next attempt is already

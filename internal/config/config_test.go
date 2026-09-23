@@ -133,6 +133,28 @@ certificates:
 	}
 }
 
+func TestCertificateExportAcceptsRemoteTarget(t *testing.T) {
+	cfg, err := Load(writeConfig(t, minimalPrefix+`
+certificates:
+  - name: example-com
+    domains: [example.com]
+    export:
+      localDir: /var/lib/wecert/export
+      remoteTargets:
+        - type: cos
+          name: archive
+          bucket: cert-archive
+          endpoint: https://cos.example.invalid
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	export := cfg.Certificates[0].Export
+	if export == nil || len(export.RemoteTargets) != 1 || export.RemoteTargets[0].TimeoutDur != 5*time.Minute {
+		t.Fatalf("export target = %#v, want normalized remote target", export)
+	}
+}
+
 func TestRecursiveNameserversAreNormalized(t *testing.T) {
 	body := strings.Replace(minimalPrefix, "  loginToken: token\n", "  loginToken: token\n  recursiveNameservers: [\"1.1.1.1\", \"[2606:4700:4700::1111]:5353\", \"1.1.1.1:53\"]\n", 1)
 	cfg, err := Load(writeConfig(t, body+`

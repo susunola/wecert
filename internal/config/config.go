@@ -951,6 +951,9 @@ type Certificate struct {
 	// certificate only. A non-nil block with enabled: false explicitly opts this
 	// certificate out while other certificates may still degrade near expiry.
 	FailureFallback *FailureFallback `yaml:"failureFallback,omitempty" json:"failureFallback,omitempty"`
+	// Export writes the issued full chain and private key to operator-selected
+	// local and/or remote destinations after a successful promotion.
+	Export *CertificateExport `yaml:"export,omitempty" json:"export,omitempty"`
 	// UIN tags this certificate with a Tencent Cloud account. Empty means inherit
 	// tencent.uin. The inventory uses it only for display and grouping; it does
 	// not change which credentials deploy the certificate.
@@ -958,6 +961,13 @@ type Certificate struct {
 
 	// Parsed durations, filled in by normalize.
 	RenewBeforeDur time.Duration `yaml:"-" json:"-"`
+}
+
+// CertificateExport is an opt-in private-key distribution target. RemoteTargets
+// use the same credential-reference-only shape as state backups.
+type CertificateExport struct {
+	LocalDir      string         `yaml:"localDir,omitempty" json:"localDir,omitempty"`
+	RemoteTargets []BackupTarget `yaml:"remoteTargets,omitempty" json:"remoteTargets,omitempty"`
 }
 
 // Deploy describes where the issued certificate should be deployed.

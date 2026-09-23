@@ -500,6 +500,16 @@ func (m *Manager) download(
 		m.log.Info("the certificate uploaded during the failed deploy has been recorded for reclaim "+
 			"and will be deleted later", "cert", c.Name, "certId", orphanID)
 	}
+	if c.Export != nil && m.exporter != nil {
+		if err := m.exporter.Publish(ctx, c, fullchain, o.KeyPEM); err != nil {
+			// The state promotion is durable and the certificate may already be live;
+			// failing it here would cause a fresh ACME order on the next pass. Keep the
+			// primary lifecycle safe and make the export failure explicit instead.
+			m.log.Error("certificate was issued but export failed", "cert", c.Name, "err", err)
+		} else {
+			m.log.Info("certificate exported", "cert", c.Name)
+		}
+	}
 
 	if !c.Deploy.Enabled {
 		m.log.Info("certificate issued and recorded locally (cloud deploy is off)",

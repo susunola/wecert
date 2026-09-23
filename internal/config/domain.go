@@ -110,6 +110,17 @@ func (c *Certificate) normalize(seen map[string]bool) error {
 			return fmt.Errorf("certificate %q failureFallback: %w", c.Name, err)
 		}
 	}
+	if c.Export != nil {
+		c.Export.LocalDir = strings.TrimSpace(c.Export.LocalDir)
+		if c.Export.LocalDir == "" && len(c.Export.RemoteTargets) == 0 {
+			return fmt.Errorf("certificate %q export needs localDir and/or remoteTargets", c.Name)
+		}
+		for i := range c.Export.RemoteTargets {
+			if err := c.Export.RemoteTargets[i].normalize(i); err != nil {
+				return fmt.Errorf("certificate %q export: %w", c.Name, err)
+			}
+		}
+	}
 	return nil
 }
 
