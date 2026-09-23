@@ -25,7 +25,9 @@ They are ordered by real exposure over effort.
 
 3. **Finish off-host snapshots (option A in docs/availability.md)**
 
-   The real availability exposure. Process death is already covered by `Restart=on-failure` plus resumable orders, and host loss is bounded by `state.db` living on local disk — so a second wecert process on the same host shares its fate and duplicates what systemd already does. The snapshot machinery (`VACUUM INTO`, retention) already exists, and **restore is now one command**: `wecert -restore latest` keeps the database it replaced, moves the `-wal`/`-shm` with it, verifies the snapshot before touching anything, and records the rate-limit caveat for the next start. What is still missing is getting the file off the host automatically. Needs a decision that is not mine to make: where the snapshots go, and what RTO is being bought.
+   The real availability exposure. Process death is already covered by `Restart=on-failure` plus resumable orders, and host loss is bounded by `state.db` living on local disk — so a second wecert process on the same host shares its fate and duplicates what systemd already does. The snapshot machinery (`VACUUM INTO`, retention) already exists, and **restore is now one command**: `wecert -restore latest` keeps the database it replaced, moves the `-wal`/`-shm` with it, verifies the snapshot before touching anything, and records the rate-limit caveat for the next start.
+
+   Partly closed 2026-09-23: `stateBackup.localDirs` now writes independently retained, SQLite-consistent snapshots to additional local destinations (for example another physical disk or mounted backup volume). What remains is a real object-store/SFTP transport with credential, encryption, retry and integration verification; it must not be represented by copying the live WAL database or by shelling out to an unverified client.
 
 4. **Notice a state database that was restored without `wecert -restore`**
 
@@ -61,9 +63,9 @@ They are ordered by real exposure over effort.
 
    If HTTP-01 is ever added, where it is configured has to be decided first. Challenge type is a per-certificate concept, but it would land in the `dns` section (or at the top level), while `state.Authorization`'s `TxtName`/`TxtValue`/`Presented` are TXT-shaped. The boundary is written down in [challenge-types](challenge-types.md); the config structure was deliberately left alone, because deciding the model is cheaper before the code than after.
 
-7. **Refuse to start with state.db on a network filesystem**
+7. **Done: refuse to start with state.db on a network filesystem** (closed 2026-09-23)
 
-   [availability](availability.md) now says that `flock` over network filesystems is unreliable and SQLite's NFS locking is a known corruption source, but no code checks it. An operator can configure it and be accepted, then find out as a corrupt state database. Detecting it at startup is far cheaper than diagnosing it afterwards.
+   Startup now detects NFS, CIFS/SMB and FUSE on Linux and refuses to open the state database there. The backup destination is intentionally separate: a mounted backup volume may be a valid copy target, but the live SQLite database must have local locking semantics.
 
 8. **Test downgrade: an older binary opening the new schema**
 
@@ -73,7 +75,7 @@ They are ordered by real exposure over effort.
 
 9. **Feed the local quota accounting into the change-budget decision**
 
-   `onboarding.budget` counts changed *rounds*, while the question an operator actually asks — how much issuance quota is left — is a token count. Both models now exist and the budget one is coarser. The token-bucket accounting added for `wecert_ratelimit_remaining_tokens` is the more accurate input and should drive the freeze decision.
+   Partly closed 2026-09-23: onboarding now reads authoritative CA-provided registered-domain retry deadlines from the state store and freezes a changed desired state that would issue into a known block. Local token accounting still remains an upper bound (other accounts can spend shared quota), so turning it into an automatic allow decision would be unsound; it can only tighten the budget conservatively after an explicit policy for that uncertainty is chosen.
 
 10. **Finish the go.sum story for `-tags lego_dns`**
 
@@ -84,10 +86,9 @@ They are ordered by real exposure over effort.
    The page now says only what it observed, which makes the remaining gaps visible rather than
    silent. Three of them need a decision, not just code:
 
-   - `rate_limited` is implemented and unit-tested but nothing feeds blocked scopes to the
-     inventory, so no running daemon shows it. Wiring it means deciding what a blocked scope
-     means for one certificate: the exact-set scope is a joined name list, the registered-domain
-     scope is not a certificate, and a wrong match would invent an alarm.
+   - `rate_limited` is implemented, unit-tested and wired into the inventory. Exact-set,
+     registered-domain, account-wide and per-identifier blocks are mapped to the certificates
+     they can prevent, without claiming an unrelated certificate is blocked.
    - CLB / listener rows exist only for certificates the reconciler enumerated, and `Bindings()`
      runs to confirm a *first* bind. A confirmed certificate therefore shows a lower bound, not
      listener ids. Filling that in means a periodic `CreateCertificateBindResourceSyncTask` per
