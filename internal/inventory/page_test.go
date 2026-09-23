@@ -105,8 +105,8 @@ func TestWritePageEscapesUntrustedValuesInDataAndAccountOptions(t *testing.T) {
 			}
 		}
 	})
-	if scripts != 2 {
-		t.Fatalf("got %d script elements, want only the JSON data and embedded app", scripts)
+	if scripts != 3 {
+		t.Fatalf("got %d script elements, want only the direct-open redirect, JSON data, and embedded app", scripts)
 	}
 }
 
