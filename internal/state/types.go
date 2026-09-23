@@ -12,10 +12,10 @@ package state
 import (
 	"database/sql"
 	"errors"
-	"time"
+	_ "modernc.org/sqlite"
 	"os"
 	"sync"
-	_ "modernc.org/sqlite"
+	"time"
 )
 
 // Split out so one concern lives in one file. Same package.

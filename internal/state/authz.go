@@ -169,4 +169,3 @@ func (s *Store) DeleteAuthorization(certName, authzURL string) error {
 	}
 	return nil
 }
-
