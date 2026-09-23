@@ -287,3 +287,51 @@ func TestWaitAllDoesNotBlameAZoneItNeverHadTimeFor(t *testing.T) {
 			"than implying the zone was polled and failed: %v", err)
 	}
 }
+
+// A network that drops outbound UDP/53 must not make a whole zone look unreachable.
+//
+// Measured on a machine whose egress policy blocks UDP/53 and allows TCP/53: every one of
+// the zone's eight authoritative addresses timed out, the propagation wait burned its full
+// five-minute budget and reported "unreachable 8 (of 8 addresses)", and the issuance never
+// reached the CA -- which would have validated the record fine from its own network. TCP is
+// an equally authoritative transport (RFC 7766), so a server that answers over it has
+// answered.
+func TestExchangeDNSFallsBackToTCPWhenUDPIsSilent(t *testing.T) {
+	addr := startTCPOnlyAnswering(t, "wanted")
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("_acme-challenge.example.com.", dns.TypeTXT)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	resp, err := exchangeDNS(ctx, msg, addr)
+	if err != nil {
+		t.Fatalf("the server answers over TCP, so the UDP failure must not be returned: %v", err)
+	}
+	if resp == nil || !responseHasTXT(resp, "wanted") {
+		t.Fatalf("the TCP answer must come back, got %v", resp)
+	}
+	if !resp.Authoritative {
+		t.Error("the answer must stay authoritative: the caller uses that to decide whether the " +
+			"server is speaking for the zone at all")
+	}
+}
+
+// startTCPOnlyAnswering listens on TCP only, so the UDP attempt fails on the spot and the
+// fallback is what makes the query succeed. Returns the address to dial.
+func startTCPOnlyAnswering(t *testing.T, value string) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	srv := &dns.Server{Listener: ln, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		_ = w.WriteMsg(authoritativeTXT(r, value))
+	})}
+	go func() { _ = srv.ActivateAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown() })
+
+	return ln.Addr().String()
+}

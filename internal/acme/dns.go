@@ -206,17 +206,32 @@ func (l *txtLeases) remove(fqdn, value string) (othersLive bool) {
 func exchangeDNS(ctx context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
 	client := &dns.Client{Timeout: 3 * time.Second}
 	resp, _, err := client.ExchangeContext(ctx, msg, server)
-	if err != nil || resp == nil || !resp.Truncated {
-		return resp, err
+	if err == nil && resp != nil && !resp.Truncated {
+		return resp, nil
 	}
 
+	// TCP is tried in two cases, and the second one is why this is not just the classic
+	// truncation retry: a network that drops outbound UDP/53 -- measured on a machine
+	// where all eight authoritative addresses for a zone timed out over UDP while TCP/53
+	// answered in 60 ms -- makes every authoritative query fail, so the propagation wait
+	// reports the whole zone unreachable while the CA, querying from its own network,
+	// would have validated the record fine. The operator sees "unreachable 8 (of 8
+	// addresses)" and goes looking at the nameservers instead of at their egress policy.
+	//
+	// RFC 7766 is explicit that TCP is an equally authoritative transport, so this changes
+	// no verdict: a server that answers over TCP is a server that answered.
 	tcp := &dns.Client{Net: "tcp", Timeout: 3 * time.Second}
 	tcpResp, _, tcpErr := tcp.ExchangeContext(ctx, msg, server)
-	if tcpErr != nil || tcpResp == nil {
+	if tcpErr == nil && tcpResp != nil {
+		return tcpResp, nil
+	}
+	if resp != nil {
 		// Keep the UDP answer. It is incomplete, and Truncated says so.
 		return resp, nil
 	}
-	return tcpResp, nil
+	// Neither transport produced anything: report the UDP failure, which is the one the
+	// caller words as "unreachable".
+	return nil, err
 }
 
 func domainSequence(fqdn string) []string {
