@@ -70,9 +70,10 @@ More on both in [Why this exists](README.reference.md#why-this-exists).
 - **A Tencent Cloud account** with a CLB (layer-7 listener) and the CAM permissions in
   [`deploy/cam-policy-runtime.json`](deploy/README.md): SSL upload/describe/delete plus DNSPod
   record writes. Credentials come from a CVM role, the environment, or the config file.
-- **A DNS zone you control**, hosted in **DNSPod** (API token) or **Tencent Cloud DNS** (the same
-  CAM credentials). Let's Encrypt validates over DNS-01, so the zone has to be reachable by API and
-  correctly delegated.
+- **A DNS zone you control**, hosted in **DNSPod** (API token), **Tencent Cloud DNS** (the same CAM
+  credentials), **Cloudflare** (a scoped API token) or **Route 53** (AWS credentials — an EC2
+  instance role needs no key at all). Let's Encrypt validates over DNS-01, so the zone has to be
+  reachable by API and correctly delegated.
 - **A host to run on** — any CVM that can reach the Tencent Cloud API. It does not have to be
   reachable from the internet.
 - **Go 1.26+**, only if you build from source. Release binaries are static for linux/amd64,

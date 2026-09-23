@@ -354,9 +354,12 @@ case config.CredentialCVMRole:
 - `credentialMode` 只接受 `static` / `cvm-role`，空值默认 `cvm-role`；
 - `cvm-role` 且 `roleName` 为空 → 配置加载直接失败：`tencent.credentialMode=cvm-role requires roleName`。
 
-另外：**这里说"没有静态密钥"，指的是 CAM 凭据。** 如果你把 `dns.provider` 写成 `dnspod`，那
-`dns.loginToken` 仍然是一个长期有效的 DNSPod token，躺在 `0640 root:wecert` 的文件里。
-要做到"文件里一个长期密钥都没有"，就得保持 `dns.provider: tencentcloud`（默认值）。
+另外：**这里说"没有静态密钥"，指的是 CAM 凭据。** 换成别的 provider 就会引入一份静态凭证：
+`dnspod` 的 `dns.loginToken` 是长期有效的 DNSPod token，`cloudflare` 的 `dns.cloudflare.apiToken`
+是受限但同样长期有效的 token，两者都躺在 `0640 root:wecert` 的文件里或 systemd credential 里。
+Route 53 是唯一例外：留空静态密钥时它走 AWS SDK 默认链，在 EC2 上就是实例角色，同样不落盘。
+要做到"文件里一个长期密钥都没有"，就得保持 `dns.provider: tencentcloud`（默认值）或
+`dns.provider: route53` + 实例角色。
 
 改完权限要对（`install.sh` 已经设好，手改过就重设一次）：
 
