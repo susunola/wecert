@@ -27,6 +27,7 @@ import (
 	"github.com/susunola/wecert/internal/backup"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
@@ -656,9 +657,11 @@ func takeSnapshots(ctx context.Context, store *state.Store, dirs []string, remot
 			err := backup.Upload(ctx, backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: target.Prefix, Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: target.RemoteDir, PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, Keep: target.Keep, Timeout: target.TimeoutDur}, uploaded)
 			if err != nil {
 				log.Error("remote state snapshot upload failed", "target", target.Name, "type", target.Type, "err", err)
+				metrics.BackupRemoteErrors.WithLabelValues(target.Name, target.Type).Inc()
 				errs = append(errs, fmt.Errorf("remote target %s: %w", target.Name, err))
 			} else {
 				log.Info("state snapshot uploaded", "target", target.Name, "type", target.Type, "path", uploaded)
+				metrics.BackupRemoteLastSuccess.WithLabelValues(target.Name, target.Type).Set(float64(time.Now().Unix()))
 			}
 		}
 	}

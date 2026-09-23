@@ -129,6 +129,16 @@ var (
 		Help: "Age of the desired-state document in seconds. A growing value means the onboarding component stopped refreshing it.",
 	})
 
+	BackupRemoteLastSuccess = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_backup_remote_last_success_timestamp_seconds",
+		Help: "Unix time of the latest successful upload to a configured remote backup target; absent means none has succeeded since process start.",
+	}, []string{"target", "type"})
+
+	BackupRemoteErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "wecert_backup_remote_errors_total",
+		Help: "Remote state snapshot uploads that failed, by configured target and transport type.",
+	}, []string{"target", "type"})
+
 	DesiredStateShadowDiff = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "wecert_desired_state_shadow_diff",
 		Help: "In observe mode, the number of certificate-level differences between what is enforced and what the shadow source asks for. Should stay at 0 before switching to enforce. Only meaningful while wecert_desired_state_shadow_errors_total is not increasing and _last_read is recent.",
