@@ -182,18 +182,16 @@ function quotaNote(q) {
 }
 function renderQuotas() {
   const panel = $("quota-panel");
-  const relevant = quotaOrder
+  const families = quotaOrder
     .map((limit) => quotas.filter((q) => q.limit === limit))
-    .filter((rows) => rows.length)
-    .map((rows) =>
-      rows.reduce(
-        (worst, row) =>
-          !worst || row.blocked || row.remaining < worst.remaining
-            ? row
-            : worst,
-        null,
-      ),
-    );
+    .filter((rows) => rows.length);
+  const relevant = families.map((rows) =>
+    rows.reduce(
+      (worst, row) =>
+        !worst || row.blocked || row.remaining < worst.remaining ? row : worst,
+      null,
+    ),
+  );
   if (!relevant.length) return;
   panel.hidden = false;
   const blocked = relevant.filter((q) => q.blocked).length;
@@ -206,7 +204,7 @@ function renderQuotas() {
       ? `${icon("warning-circle")}${warning} near limit`
       : `${icon("check-circle")}Within local estimate`;
   $("quota-grid").innerHTML = relevant
-    .map((q) => {
+    .map((q, index) => {
       const cls = quotaClass(q);
       const percent =
         q.unreadable || q.spentByCA
@@ -214,7 +212,28 @@ function renderQuotas() {
           : Math.max(0, Math.min(100, (q.remaining / q.capacity) * 100));
       const value = q.unreadable || q.spentByCA ? "—" : Math.floor(q.remaining);
       const scope = q.scope || "This account";
-      return `<article class="quota-item ${cls}"><div class="quota-label"><span>${esc(quotaNames[q.limit] || q.limit)}</span><span class="scope mono" title="${esc(scope)}">${esc(scope)}</span></div><div class="quota-value"><strong>${value}</strong><span>of ${q.capacity} available</span></div><div class="quota-meter" aria-hidden="true"><span style="width:${percent}%"></span></div><div class="quota-note">${esc(quotaNote(q))}</div></article>`;
+      const count = families[index].length;
+      return `<article class="quota-item ${cls}"><div class="quota-label"><span>${esc(quotaNames[q.limit] || q.limit)}</span><span class="scope mono" title="${esc(scope)}">${count > 1 ? `Worst of ${count} scopes` : esc(scope)}</span></div><div class="quota-value"><strong>${value}</strong><span>of ${q.capacity} available</span></div><div class="quota-meter" aria-hidden="true"><span style="width:${percent}%"></span></div><div class="quota-note">${esc(quotaNote(q))}</div></article>`;
+    })
+    .join("");
+  const detailRows = families
+    .flat()
+    .sort(
+      (a, b) =>
+        Number(b.blocked) - Number(a.blocked) ||
+        a.remaining - b.remaining ||
+        a.scope.localeCompare(b.scope),
+    );
+  $("quota-details-summary").textContent =
+    `View ${detailRows.length} tracked quota scopes, ordered by available capacity`;
+  $("quota-rows").innerHTML = detailRows
+    .map((q) => {
+      const cls = quotaClass(q);
+      const available =
+        q.unreadable || q.spentByCA
+          ? "Unavailable"
+          : `${Math.floor(q.remaining)} of ${q.capacity}`;
+      return `<tr><td>${esc(quotaNames[q.limit] || q.limit)}</td><td class="mono" title="${esc(q.scope || "This account")}">${esc(q.scope || "This account")}</td><td class="quota-number ${cls}">${esc(available)}</td><td>${esc(quotaNote(q))}</td></tr>`;
     })
     .join("");
 }

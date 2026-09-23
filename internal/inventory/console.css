@@ -497,6 +497,77 @@ h1 {
   width: 11px;
   height: 11px;
 }
+.quota-details {
+  border-top: 1px solid var(--line);
+}
+.quota-details summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 11px 22px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 560;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.quota-details summary::-webkit-details-marker {
+  display: none;
+}
+.quota-details summary::before {
+  content: "›";
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 10px;
+  transition: transform 0.15s ease;
+}
+.quota-details[open] summary::before {
+  transform: rotate(90deg);
+}
+.quota-table-wrap {
+  max-height: 310px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+.quota-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.quota-table th {
+  position: static;
+  background: var(--soft);
+  color: var(--quiet);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-align: left;
+  text-transform: uppercase;
+}
+.quota-table th,
+.quota-table td {
+  padding: 9px 22px;
+  border-bottom: 1px solid var(--line);
+}
+.quota-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.quota-table td:nth-child(2) {
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quota-table .quota-number {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.quota-table .warn {
+  color: var(--amber);
+}
+.quota-table .bad {
+  color: var(--red);
+}
 .inventory {
   border: 1px solid var(--line);
   background: var(--surface);
