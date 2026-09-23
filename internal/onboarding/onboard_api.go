@@ -160,6 +160,13 @@ type Options struct {
 	BudgetWindow time.Duration
 	Budget       int
 
+	// BlockedRegisteredDomains contains authoritative retry deadlines previously
+	// returned by the CA. A changed desired state that would issue for one of
+	// these domains freezes before it can spend another request on a known block.
+	// The map is optional so library users that cannot read wecert's state store
+	// retain the existing local change-budget behaviour.
+	BlockedRegisteredDomains map[string]time.Time
+
 	// Force skips the abrupt-change fuse, the quota budget, the deletion grace period
 	// AND the "is a CLB rule still referencing this name?" check, writing exactly what
 	// this round computed. The reference check is the last thing standing between this

@@ -557,6 +557,26 @@ func TestAllowlistLimitsWhichRegisteredDomainsMayBeIssuedFor(t *testing.T) {
 	}
 }
 
+func TestKnownCARateLimitFreezesAChangedDomain(t *testing.T) {
+	now := newClock().t
+	h := newHarness(t, Options{BlockedRegisteredDomains: map[string]time.Time{
+		"example.com": now.Add(time.Hour),
+	}})
+	h.decls.raw = []RawDeclaration{decl("example.com")}
+	h.rules.domains = []string{"example.com"}
+
+	rep, err := h.ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !rep.Frozen() {
+		t.Fatalf("a CA-blocked domain must freeze a changed desired state: %+v", rep)
+	}
+	if len(rep.FreezeReasons) != 1 || !strings.Contains(rep.FreezeReasons[0], "rate-limited") {
+		t.Fatalf("freeze reason must identify the CA block, got %+v", rep.FreezeReasons)
+	}
+}
+
 // The allowlist is matched with a binary search, so it has to be sorted -- and
 // normalising each entry to its registered domain can *reorder* it, so sorting the
 // caller's input is not enough and sorting must happen inside New.

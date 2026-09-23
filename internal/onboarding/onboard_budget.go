@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/susunola/wecert/internal/atomicfile"
+	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/spec"
 )
 
@@ -74,6 +75,11 @@ func (r *run) budget() {
 		r.st.RecordChange(r.now)
 		return
 	}
+	if domain, until, blocked := r.blockedDomain(); blocked {
+		r.freeze(fmt.Sprintf("the CA has rate-limited registered domain %q until %s; refusing to publish a changed desired state that would issue there",
+			domain, until.UTC().Format(time.RFC3339)))
+		return
+	}
 
 	used := r.st.ChangesWithin(r.o.opts.BudgetWindow, r.now)
 	if used >= r.o.opts.Budget {
@@ -86,6 +92,23 @@ func (r *run) budget() {
 	}
 
 	r.st.RecordChange(r.now)
+}
+
+// blockedDomain returns a candidate certificate's registered domain with an
+// unexpired CA-provided deadline. This is deliberately a freeze, not a local
+// token estimate: the deadline is the one piece of quota information the CA
+// itself has made authoritative.
+func (r *run) blockedDomain() (string, time.Time, bool) {
+	for _, cert := range r.certs {
+		for _, name := range cert.Domains {
+			domain := group.RegisteredDomain(name)
+			until, ok := r.o.opts.BlockedRegisteredDomains[domain]
+			if ok && until.After(r.now) {
+				return domain, until, true
+			}
+		}
+	}
+	return "", time.Time{}, false
 }
 
 // declaredNames returns this round's expanded declaration set -- what DNS actually

@@ -28,6 +28,7 @@ import (
 	"github.com/susunola/wecert/internal/atomicfile"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/onboarding"
+	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
@@ -154,10 +155,11 @@ Flags:
 		RequireRule: cfg.Onboarding.RequireCLBRuleOr(true),
 		Allowlist:   cfg.Onboarding.Allowlist,
 
-		GracePeriod:   cfg.Onboarding.GraceDur,
-		BudgetWindow:  cfg.Onboarding.BudgetDur,
-		Budget:        cfg.Onboarding.Budget,
-		DropThreshold: cfg.Onboarding.DropThreshold,
+		GracePeriod:              cfg.Onboarding.GraceDur,
+		BudgetWindow:             cfg.Onboarding.BudgetDur,
+		Budget:                   cfg.Onboarding.Budget,
+		DropThreshold:            cfg.Onboarding.DropThreshold,
+		BlockedRegisteredDomains: blockedRegisteredDomains(cfg.StatePath, time.Now()),
 
 		Force: *force,
 	}
@@ -240,6 +242,36 @@ Flags:
 		return exitFrozen, nil
 	}
 	return exitOK, nil
+}
+
+// blockedRegisteredDomains reads only CA-provided retry deadlines from the
+// daemon's state. Missing or unavailable state is intentionally non-fatal: the
+// normal onboarding budget remains the safe fallback, while a known deadline
+// must prevent publishing a change that would immediately be refused.
+func blockedRegisteredDomains(statePath string, now time.Time) map[string]time.Time {
+	if statePath == "" {
+		return nil
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		return nil
+	}
+	store, err := state.OpenForTool(statePath)
+	if err != nil {
+		return nil
+	}
+	defer store.Close()
+	scopes, err := store.ListRateBucketScopes(ratelimit.CertsPerRegisteredDomain.Name)
+	if err != nil {
+		return nil
+	}
+	blocked := map[string]time.Time{}
+	for _, scope := range scopes {
+		bucket, err := store.GetRateBucket(ratelimit.CertsPerRegisteredDomain.Name, scope)
+		if err == nil && bucket.ResetAt.After(now) {
+			blocked[scope] = bucket.ResetAt
+		}
+	}
+	return blocked
 }
 
 // flagValues is the raw CLI values applyExplicitFlags consults.
