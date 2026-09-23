@@ -827,6 +827,42 @@ certificates:
 	}
 }
 
+func TestRemoteBackupTargetsValidateTransportRequirements(t *testing.T) {
+	bad := writeConfig(t, minimalPrefix+`
+stateBackup:
+  remoteTargets:
+    - type: cos
+      bucket: backups
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)
+	if _, err := Load(bad); err == nil || !strings.Contains(err.Error(), "endpoint") {
+		t.Fatalf("COS without endpoint must be rejected, got %v", err)
+	}
+	good := writeConfig(t, minimalPrefix+`
+stateBackup:
+  remoteTargets:
+    - name: remote
+      type: sftp
+      host: backup.example:22
+      username: wecert
+      remoteDir: /srv/wecert
+      knownHostsFile: /etc/wecert/known_hosts
+      passwordEnv: WECERT_BACKUP_PASSWORD
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)
+	cfg, err := Load(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.StateBackup.RemoteTargets[0].TimeoutDur; got != 5*time.Minute {
+		t.Errorf("timeout = %s, want 5m", got)
+	}
+}
+
 const minimalWithDNS = `
 statePath: /tmp/wecert-test.db
 acme:
