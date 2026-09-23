@@ -148,12 +148,15 @@ loopback proxy on a public interface.
 The preview test renders the production page with reserved example domains and
 synthetic IDs; it does not need cloud credentials or issue certificates:
 
+> Do not open `internal/inventory/console.html` directly. It is a Go template;
+> `/status` and the preview command inject its CSS, JavaScript, logos, and
+> inventory snapshot during rendering.
+
 ```bash
-WECERT_PREVIEW=/tmp/wecert-console.html \
-  go test ./internal/inventory -run '^TestWritePreviewPage$' -count=1
+make console-preview
 ```
 
-Open that file in a browser. For account-picker stress testing, also set
+Open `/tmp/wecert-console.html` in a browser. For account-picker stress testing, also set
 `WECERT_PREVIEW_EXTRA_ACCOUNTS=1`. For edge states and hostile-text escaping, set
 `WECERT_EDGE_PREVIEW=/tmp/wecert-console-edge.html` and run
 `go test ./internal/inventory -run '^TestWriteConsoleEdgePreview$' -count=1`.
