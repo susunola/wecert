@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -1658,4 +1659,240 @@ func failAuthorizationWrites(t *testing.T, path string) {
 		BEGIN SELECT RAISE(ABORT, 'disk full'); END`); err != nil {
 		t.Fatalf("create the fault trigger: %v", err)
 	}
+}
+
+// ---------- "the provider forgot the record": the round-12 production defect ----------
+
+// providerForgotRecordErr is the error lego's Cloudflare provider returns when it does not know the
+// record, taken verbatim from providers/dns/cloudflare/cloudflare.go:215 in lego v4.35.2.
+func providerForgotRecordErr(fqdn string) error {
+	return fmt.Errorf("cloudflare: unknown record ID for '%s'", fqdn)
+}
+
+// A reclaim that fails with "unknown record ID" while the authorities deny the record is DONE, not
+// a failure.
+//
+// This is the round-12 production defect, end to end: the record had already been deleted by the
+// normal cleanup, one anycast node still served it from its cache, so this path probed, found it and
+// asked the provider for a second delete. The provider deletes only the IDs it created in this
+// process, so it answered "cloudflare: unknown record ID for '_acme-challenge...'", the row stayed
+// stuck and the run printed "some TXT records could not be reclaimed automatically" -- a warning
+// that reads like a DNS cleanup failure for a record that was already gone.
+//
+// The re-probe is what settles it: every reachable authoritative server denies the record, so the
+// provider was right about its own bookkeeping. The row goes (it is the thing that keeps the
+// certificate's state stuck) and the lease this call registered is released -- leaving it would make
+// "another challenge is still live here" true forever, so the provider's delete-all would never fire
+// at this name again for the life of the process.
+func TestAProviderThatForgotAnAlreadyDeletedRecordIsNotAFailure(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	// The value the row's token hashes to under the harness's key authorization: the probe searches
+	// for this one, so the authority's answer is about this record and not about the harness's own
+	// unrelated fixture value.
+	value := dns01.GetChallengeInfo("example.com", "keyauth(tok-1)").Value
+
+	// First the record is visible -- the stale anycast node that made the reclaim path probe and
+	// ask for the delete at all -- and after the provider call the authority denies it: the
+	// deletion had already happened and the node has caught up.
+	probeRounds := 0
+	solver, rec, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			probeRounds++
+			if probeRounds == 1 {
+				return authTXT(msg, value), nil
+			}
+			resp := dnsReply(msg)
+			resp.Rcode = dns.RcodeNameError
+			resp.Authoritative = true
+			return resp, nil
+		})
+	// The provider this path wires in for cloudflare: it remembers the IDs it created in this
+	// process, the record is not one of them, and its CleanUp has nothing to delete.
+	providerCalls := 0
+	solver.newProvider = func(context.Context) (challenge.Provider, error) {
+		return providerCleanUpFunc(func(domain, _, keyAuth string) error {
+			providerCalls++
+			return providerForgotRecordErr(dns01.GetChallengeInfo(domain, keyAuth).EffectiveFQDN)
+		}), nil
+	}
+
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+		ChallengeToken: "tok-1", TxtName: rec.FQDN, TxtValue: value, Presented: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// What the interrupted Present left behind in this process.
+	challengeLeases.add(rec.FQDN, value)
+
+	var logs bytes.Buffer
+	m.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+
+	// The behaviour first, so a regression is reported as what it is rather than as a fixture
+	// complaint: with the branch removed the fixture stops before these, and the messages below are
+	// what a reviewer needs to see.
+	if as, _ := store.ListAuthorizations("c"); len(as) != 0 {
+		t.Errorf("the row must be deleted: the provider was right, every authoritative server "+
+			"denies the record, and keeping the row leaves the certificate stuck (rows now: %d)", len(as))
+	}
+	if hasTXTLease(rec.FQDN, value) {
+		t.Error("the lease of a record the authorities deny must be released even when the " +
+			"provider's delete failed: while it is held every later cleanup at this name defers the " +
+			"provider's delete-all, so no record written here is ever collected again")
+	}
+	if strings.Contains(logs.String(), "could not be reclaimed automatically") {
+		t.Errorf("nothing failed here: the record was already deleted and the servers agree:\n%s",
+			logs.String())
+	}
+	if strings.Contains(logs.String(), "level=WARN") {
+		t.Errorf("a record that is already gone must not be reported as a warning:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "authoritative servers agree it is gone") {
+		t.Errorf("the resolution must be explained at Info level, not left silent:\n%s", logs.String())
+	}
+
+	// And the fixture must have walked the branch that was just asserted: the record was found, the
+	// provider was asked and answered "unknown record ID", and the re-probe settled it.
+	if !strings.Contains(logs.String(), "found the TXT of an interrupted pass") {
+		t.Fatalf("the fixture never reached the reclaim of a found record, so nothing above was "+
+			"exercised:\n%s", logs.String())
+	}
+	if providerCalls != 1 {
+		t.Fatalf("the fixture must reach the provider exactly once, got %d", providerCalls)
+	}
+	if probeRounds < 2 {
+		t.Fatalf("the branch under test re-probes after the provider says it forgot the record: "+
+			"only %d authoritative probe round(s) ran", probeRounds)
+	}
+}
+
+// The same provider error with the record genuinely still up must say what to do about it.
+//
+// The provider cannot delete a record it did not create in this process, so no retry will ever
+// clear this one: the row stays (it carries the name), and both the error and the summary have to
+// name the record and send the operator to the DNS console instead of printing the generic
+// "could not be reclaimed automatically", which reads like a cleanup failure that will heal itself.
+func TestAProviderThatForgotALiveRecordNamesTheDNSConsole(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	// The record the probe searches for.
+	value := dns01.GetChallengeInfo("example.com", "keyauth(tok-1)").Value
+
+	// The authority holds it -- the shape the production run saw, with a node still serving it --
+	// both before the provider call and after it.
+	solver, rec, _ := cachedNXDOMAINHarness(t,
+		func(msg *dns.Msg, _, _ string) (*dns.Msg, error) {
+			return authTXT(msg, value), nil
+		})
+	solver.newProvider = func(context.Context) (challenge.Provider, error) {
+		return providerCleanUpFunc(func(domain, _, keyAuth string) error {
+			return providerForgotRecordErr(dns01.GetChallengeInfo(domain, keyAuth).EffectiveFQDN)
+		}), nil
+	}
+
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+		ChallengeToken: "tok-1", TxtName: rec.FQDN, TxtValue: value, Presented: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	challengeLeases.add(rec.FQDN, value)
+
+	var logs bytes.Buffer
+	m.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+
+	if as, _ := store.ListAuthorizations("c"); len(as) != 1 {
+		t.Fatalf("the record is still in DNS and only a human can delete it, so its row must be "+
+			"kept (rows now: %d)", len(as))
+	}
+	// The wording reaches the caller's summary through errProviderLostRecord, so it is asserted
+	// where the operator reads it. "cannot delete" is the specific wording: the generic WARN's own
+	// hint also mentions the console, so that word alone does not tell the two summaries apart.
+	out := logs.String()
+	if !strings.Contains(out, "cannot delete") {
+		t.Errorf("the summary must say why the provider cannot do it (it only deletes records it "+
+			"created in this process):\n%s", out)
+	}
+	if !strings.Contains(out, rec.FQDN) {
+		t.Errorf("the summary must name the record that has to be deleted by hand (%s):\n%s",
+			rec.FQDN, out)
+	}
+	if strings.Contains(out, "could not be reclaimed automatically") {
+		t.Errorf("this is not the generic case: the record is known and the provider cannot remove "+
+			"it, which is a different instruction:\n%s", out)
+	}
+}
+
+// Any other provider failure keeps the old path: the row stays, nothing is re-probed and the error
+// is the one the provider gave.
+//
+// A timeout says nothing about whether the record is there, so treating it as "the provider forgot
+// it" would authorise a re-probe-driven row deletion on no evidence -- the same class of mistake
+// LookupTXT's own comments describe for a cached negative answer.
+func TestAnUnrelatedProviderFailureStillKeepsTheRow(t *testing.T) {
+	privateLeaseRegistry(t)
+
+	providerErr := errors.New("dnspod: API call failed: context deadline exceeded")
+	solver := &fakeSolver{lookupFound: true, cleanErr: providerErr}
+	m, store := newTestManager(t, solver, fakeKeyAuth{})
+
+	if err := store.PutAuthorization(&state.Authorization{
+		CertName: "c", AuthzURL: "authz-1", Identifier: "example.com",
+		ChallengeToken: "tok-1", TxtName: "_acme-challenge.example.com.", Presented: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	m.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	if err := m.cleanupOrphanTXT(context.Background(), "c"); err != nil {
+		t.Fatalf("cleanupOrphanTXT: %v", err)
+	}
+
+	if solver.cleanCount() != 0 {
+		t.Errorf("the provider refused the delete, so no cleanup may be recorded as done: %d", solver.cleanCount())
+	}
+	if len(solver.lookups) != 1 {
+		t.Errorf("only the reclaim probe may run: a timeout is no evidence about the record, so it "+
+			"must not be re-probed and probed away (lookups=%v)", solver.lookups)
+	}
+	as, err := store.ListAuthorizations("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(as) != 1 {
+		t.Fatalf("the row must be kept while the cleanup failed for an unrelated reason, %d remain", len(as))
+	}
+	if !strings.Contains(logs.String(), "could not be reclaimed automatically") {
+		t.Errorf("an unrecognised provider failure keeps the generic 'could not be reclaimed' wording:\n%s",
+			logs.String())
+	}
+	if strings.Contains(logs.String(), "cannot delete") {
+		t.Errorf("a timeout is not the provider telling us it forgot the record, so the wording that "+
+			"sends the operator to the DNS console does not belong here:\n%s", logs.String())
+	}
+}
+
+// providerCleanUpFunc is a challenge.Provider whose CleanUp is scripted, so a test can return the
+// exact error a provider emits. Present and Timeout are never reached by the cleanup paths.
+type providerCleanUpFunc func(domain, token, keyAuth string) error
+
+func (f providerCleanUpFunc) Present(string, string, string) error { return nil }
+func (f providerCleanUpFunc) CleanUp(domain, token, keyAuth string) error {
+	return f(domain, token, keyAuth)
+}
+func (f providerCleanUpFunc) Timeout() (time.Duration, time.Duration) {
+	return time.Second, time.Second
 }

@@ -2,7 +2,9 @@ package acme
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v4/challenge/dns01"
@@ -11,6 +13,62 @@ import (
 )
 
 // Split out so one concern lives in one file. Same package.
+
+// providerForgotRecord is what "CleanUp failed because this provider does not know that record"
+// looks like from the manager's side. The phrasing each provider uses is listed here once, with the
+// spot it comes from, because the match is a string one and the operator-facing behaviour hangs on
+// it: only this outcome is allowed to be probed away and then be treated as done.
+//
+//   - "cloudflare: unknown record ID for '_acme-challenge.example.com.'" -- lego v4.35.2,
+//     providers/dns/cloudflare/cloudflare.go:215, the wording observed in production. Cloudflare's
+//     provider keeps the record IDs it created in a map keyed by the challenge token and deletes by
+//     ID, so once the process that created the record is gone (or that record is already deleted),
+//     this is all its CleanUp can say.
+//   - "unknown record ID for '%s' '%s'" (no provider prefix: providers/dns/internal/westcn),
+//     "unknown record ID or zone ID for '%s' '%s'" (providers/dns/internal/tecnocratica/provider.go)
+//     and "unknown recordID for %q" (providers/dns/auroradns, cloudru, yandex360) -- the variants in
+//     the rest of lego's ~198 providers, which `dns.provider: lego` can wire in by name. All of them
+//     are matched by the same substring (see providerForgotRecordError); everything outside it keeps
+//     the old behaviour, because a wrong "it is gone" would be acted on.
+//
+// The providers wired without the build tag do NOT belong in this list, and the contrast is why it
+// is worth writing down: dnspod's CleanUp (providers/dns/dnspod/dnspod.go:119) and tencentcloud's
+// (providers/dns/tencentcloud/tencentcloud.go:151) look the record up by name, delete what they find
+// and return nil when there is nothing to delete, and route53's upserts a record set with an empty
+// value list -- so for all three an already-deleted record is already a success and never reaches
+// this branch.
+const providerForgotRecord = "unknown record ID"
+
+// providerLostRecordWait is how long the reclaim path waits before re-probing after the provider
+// reported that it does not know the record.
+//
+// The wait exists because the usual reason the provider forgot the record is that the record was
+// deleted a moment ago -- Cloudflare's provider drops the ID from its map after a successful
+// delete, and this path is asking for a second delete. The re-probe asks the authoritative servers
+// again, and right after the API call an anycast node can still answer from its own cache, so a
+// probe with no gap at all would report a record that is on its way out. Bounded and short on
+// purpose: a false "still there" keeps a row for one more round, while a long wait delays every
+// cleanup that hits this.
+const providerLostRecordWait = 2 * time.Second
+
+// errProviderLostRecord marks a cleanup that failed only because the provider no longer knows the
+// record. The caller words its summary from this: what the operator has to do about it (delete the
+// record in the DNS console) is different from what a timeout or an API failure asks for.
+var errProviderLostRecord = errors.New("the DNS provider does not know this record")
+
+// providerForgotRecordError reports whether a CleanUp error is one of the "this provider does not
+// know that record" phrasings above.
+func providerForgotRecordError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), providerForgotRecord)
+}
+
+// providerLostRecordMessage is the operator-facing wording of that situation, used both as the
+// returned error and as the WARN: the provider cannot delete a record it did not create in this
+// process, so the record has to come out of the DNS console.
+func providerLostRecordMessage(record string) string {
+	return fmt.Sprintf("the DNS provider cannot delete %s: it only removes records it created in "+
+		"this process and has already forgotten this one, so delete it in the DNS console", record)
+}
 
 func (m *Manager) registerRecoveredLeases() {
 	rows, err := m.store.ListPresentedAuthorizations()
@@ -198,7 +256,7 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 		return err
 	}
 
-	var cleaned, stuck, deferred int
+	var cleaned, stuck, deferred, lostByProvider int
 	for _, a := range authzs {
 		if !a.Presented {
 			// A row carrying a token may still have its record up: the pass that wrote
@@ -206,7 +264,7 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 			// reclaim before deleting the row -- deleting it blind would orphan that TXT
 			// for good, because the row is the only clue to the record's value.
 			if a.ChallengeToken != "" {
-				switch m.reclaimUnpresentedTXT(ctx, a) {
+				switch outcome, err := m.reclaimUnpresentedTXT(ctx, a); outcome {
 				case txtReclaimKeptPropagating:
 					// Deliberately kept, not stuck: the record was denied but the challenge is
 					// younger than the propagation window, so the row is the safety net for a record
@@ -216,7 +274,15 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 					deferred++
 					continue
 				case txtReclaimFailed:
-					stuck++
+					// Worded from what actually failed. A provider that cannot delete a record it
+					// did not create in this process leaves a record the operator has to remove by
+					// hand, and the generic "could not be reclaimed automatically" reads like a
+					// DNS cleanup failure rather than like that instruction.
+					if errors.Is(err, errProviderLostRecord) {
+						lostByProvider++
+					} else {
+						stuck++
+					}
 					continue
 				}
 			}
@@ -259,6 +325,15 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 			"cert", certName, "count", stuck,
 			"hint", "if this persists, clean the records up in the DNS console; the kept rows carry their names")
 	}
+	if lostByProvider > 0 {
+		// Deliberately not folded into the generic line above. Nothing failed on this side: the
+		// provider only deletes records it created in this process, so the record left behind is
+		// one the operator has to delete, and saying so is the whole point of the branch.
+		m.log.Warn("some TXT records are still in DNS and the DNS provider cannot delete them: it "+
+			"only removes records it created in this process and has already forgotten these; delete "+
+			"them in the DNS console -- the kept rows carry their names",
+			"cert", certName, "count", lostByProvider)
+	}
 	return nil
 }
 
@@ -269,18 +344,23 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 // challenge is younger than the propagation window, so the row is the safety net for a write that may
 // still land) and the other is a failure to find out. The caller counts them separately, and only the
 // second is worth a WARN.
-func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorization) txtReclaim {
+//
+// The error is returned beside it only for txtReclaimFailed, and only so the caller can word its
+// summary from what actually failed -- an unrecognised provider error and a record the provider
+// cannot delete at all ask the operator for different things (see errProviderLostRecord). It is
+// deliberately not a channel for the ordinary keep-the-row cases: those are decisions, not errors.
+func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorization) (txtReclaim, error) {
 	keyAuth, err := m.keyAuth.GetKeyAuthorization(a.ChallengeToken)
 	if err != nil {
 		m.log.Warn("cannot compute the key authorization for an unpresented row; keeping it",
 			"cert", a.CertName, "identifier", a.Identifier, "err", err)
-		return txtReclaimFailed
+		return txtReclaimFailed, err
 	}
 	rec, found, err := m.dns.LookupTXT(ctx, a.Identifier, keyAuth)
 	if err != nil {
 		m.log.Warn("could not probe for the TXT of an interrupted pass; keeping the row",
 			"cert", a.CertName, "identifier", a.Identifier, "err", err)
-		return txtReclaimFailed
+		return txtReclaimFailed, err
 	}
 	if !found {
 		// A denial is only evidence once the write would have had time to appear.
@@ -302,7 +382,7 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 				"cert", a.CertName, "identifier", a.Identifier, "name", a.TxtName,
 				"preparedAgo", age.Round(time.Second),
 				"window", m.dns.PropagationTimeout())
-			return txtReclaimKeptPropagating
+			return txtReclaimKeptPropagating, nil
 		}
 
 		// Every reachable authoritative nameserver denied this value, which is the
@@ -318,7 +398,7 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 		// absence is what makes dropping it safe: nothing can depend on a record that is not
 		// there, and the probe is the same evidence the row deletion rests on.
 		m.releaseStaleLease(rec.FQDN, rec.Value)
-		return txtReclaimDone
+		return txtReclaimDone, nil
 	}
 	m.log.Info("found the TXT of an interrupted pass; reclaiming it before deleting the row",
 		"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN)
@@ -331,9 +411,56 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 	// its lease would block the delete-all for the rest of the process. See releaseRowStaleLease.
 	m.releaseRowStaleLease(a, keyAuth)
 	if err := m.dns.CleanUp(ctx, a.Identifier, a.ChallengeToken, keyAuth); err != nil {
+		if providerForgotRecordError(err) {
+			// The provider deletes only what it created in this process -- Cloudflare keeps the
+			// record IDs in a map keyed by the challenge token -- so a record that is already gone
+			// (the normal cleanup deleted it, or the process that wrote it is not this one) comes
+			// back as an error that says nothing about DNS.
+			//
+			// The record was still visible on an anycast node a moment ago, which is why this path
+			// probed and asked for the delete at all, so re-probe rather than trust either side:
+			// the authoritative servers are the only party that can say whether the record is
+			// really gone. A short bounded wait comes first, because the node that answered is the
+			// one most likely to have just lost the record -- see providerLostRecordWait.
+			select {
+			case <-ctx.Done():
+			case <-time.After(providerLostRecordWait):
+			}
+			_, stillThere, probeErr := m.dns.LookupTXT(ctx, a.Identifier, keyAuth)
+			switch {
+			case probeErr != nil:
+				// Not confirmed absent, so this is not the "done" branch. The row is kept with the
+				// error that says why the provider could not do it, and the next round retries.
+				m.log.Warn("failed to reclaim the TXT of an interrupted pass; keeping the row",
+					"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN, "err", err)
+				return txtReclaimFailed, fmt.Errorf("%w: %s", errProviderLostRecord, err)
+			case !stillThere:
+				// Every reachable authoritative server now denies the record: it is gone, and the
+				// provider's "unknown record ID" was the truth about its own bookkeeping rather
+				// than a cleanup failure. Done, exactly as the confirmed-absent branch above is:
+				// the row goes, and the lease this call registered is released -- leave it behind
+				// and the registry keeps reporting a challenge that is not there, so the
+				// provider's delete-all never fires again at this name (see releaseStaleLease).
+				m.log.Info("the DNS provider had already forgotten the TXT record of an interrupted "+
+					"pass and the authoritative servers agree it is gone; reclaiming it as done",
+					"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN, "err", err)
+				m.releaseStaleLease(rec.FQDN, rec.Value)
+				return txtReclaimDone, nil
+			default:
+				// The servers still hold the record and the provider cannot remove it: a real
+				// leftover, and only a human can take it out. The row stays for the record's
+				// name -- and so does the record's wording, which reaches the caller's summary
+				// through errProviderLostRecord.
+				m.log.Warn("the TXT record of an interrupted pass is still in DNS and the provider "+
+					"cannot delete it; keeping the row",
+					"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN,
+					"hint", providerLostRecordMessage(rec.FQDN))
+				return txtReclaimFailed, fmt.Errorf("%w: %s", errProviderLostRecord, providerLostRecordMessage(rec.FQDN))
+			}
+		}
 		m.log.Warn("failed to reclaim the TXT of an interrupted pass; keeping the row",
 			"cert", a.CertName, "identifier", a.Identifier, "name", rec.FQDN, "err", err)
-		return txtReclaimFailed
+		return txtReclaimFailed, err
 	}
-	return txtReclaimDone
+	return txtReclaimDone, nil
 }
