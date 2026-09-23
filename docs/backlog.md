@@ -23,11 +23,11 @@ They are ordered by real exposure over effort.
 
    What is still unverified is the CA's **real** message: provoking one needs control of the authoritative DNS answer at the moment the CA validates, which needs a delegated subdomain and a machine serving port 53 on the public internet. See `docs/verification-2026-09-18.md` §4.2 (U21/U44) and §7.3 for the blocker, and the comment on `ConsecutiveAuthzFailuresPerIdentifier` for what is published versus assumed.
 
-3. **Finish off-host snapshots (option A in docs/availability.md)**
+3. **Done: off-host snapshots (option A in docs/availability.md)** (closed 2026-09-24)
 
    The real availability exposure. Process death is already covered by `Restart=on-failure` plus resumable orders, and host loss is bounded by `state.db` living on local disk — so a second wecert process on the same host shares its fate and duplicates what systemd already does. The snapshot machinery (`VACUUM INTO`, retention) already exists, and **restore is now one command**: `wecert -restore latest` keeps the database it replaced, moves the `-wal`/`-shm` with it, verifies the snapshot before touching anything, and records the rate-limit caveat for the next start.
 
-   Partly closed 2026-09-23: `stateBackup.localDirs` now writes independently retained, SQLite-consistent snapshots to additional local destinations (for example another physical disk or mounted backup volume). What remains is a real object-store/SFTP transport with credential, encryption, retry and integration verification; it must not be represented by copying the live WAL database or by shelling out to an unverified client.
+   `stateBackup.localDirs` writes independently retained, SQLite-consistent snapshots to additional local destinations (for example another physical disk or mounted backup volume). `stateBackup.remoteTargets` adds S3, Tencent COS (S3-compatible) and SFTP transports: S3/COS use the AWS credential chain and S3 server-side encryption; SFTP verifies `known_hosts` and supports an SSH key or password environment variable. Uploads have deadlines, atomic SFTP publish and retention; each periodic snapshot retries on the next interval. Recovery is `wecert -restore remote:<target>` and downloads only the current state database's snapshot name, so a shared bucket or SFTP directory cannot restore another instance's data. Protocol-level tests exercise both transports against local S3-compatible HTTP and SSH/SFTP servers.
 
 4. **Notice a state database that was restored without `wecert -restore`**
 

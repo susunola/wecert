@@ -131,12 +131,25 @@ var (
 
 	BackupRemoteLastSuccess = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "wecert_backup_remote_last_success_timestamp_seconds",
-		Help: "Unix time of the latest successful upload to a configured remote backup target; absent means none has succeeded since process start.",
+		Help: "Unix time of the latest successful upload to a configured remote backup target; 0 means none has succeeded since process start.",
 	}, []string{"target", "type"})
 
 	BackupRemoteErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "wecert_backup_remote_errors_total",
 		Help: "Remote state snapshot uploads that failed, by configured target and transport type.",
+	}, []string{"target", "type"})
+
+	// BackupRemoteConfiguredAt anchors the first-success alert. A target has no
+	// success timestamp until its first upload, so comparing that timestamp with
+	// time() alone would page immediately at process start.
+	BackupRemoteConfiguredAt = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_backup_remote_configured_timestamp_seconds",
+		Help: "Unix time this process configured a remote backup target.",
+	}, []string{"target", "type"})
+
+	BackupRemoteInterval = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_backup_remote_interval_seconds",
+		Help: "Expected interval between remote state snapshot uploads, in seconds.",
 	}, []string{"target", "type"})
 
 	DesiredStateShadowDiff = promauto.NewGauge(prometheus.GaugeOpts{

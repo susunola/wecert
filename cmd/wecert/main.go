@@ -491,6 +491,12 @@ func jitter(d time.Duration) time.Duration {
 // the process could exit holding the lock out from under a half-written snapshot file.
 func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Config, log *slog.Logger) (*snapshotHealth, func()) {
 	dirs := stateBackupDirs(cfg)
+	configuredAt := float64(time.Now().Unix())
+	for _, target := range cfg.StateBackup.RemoteTargets {
+		metrics.BackupRemoteLastSuccess.WithLabelValues(target.Name, target.Type).Set(0)
+		metrics.BackupRemoteConfiguredAt.WithLabelValues(target.Name, target.Type).Set(configuredAt)
+		metrics.BackupRemoteInterval.WithLabelValues(target.Name, target.Type).Set(cfg.StateBackup.IntervalDur.Seconds())
+	}
 
 	snapshot := func() error {
 		return takeSnapshots(ctx, store, dirs, cfg.StateBackup.RemoteTargets, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log)

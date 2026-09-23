@@ -253,6 +253,30 @@ groups:
 
   - name: wecert.integrity
     rules:
+      # The target labels are created as soon as backup starts, not only after the
+      # first success. Therefore a target whose credentials are wrong from the
+      # outset is visible after two configured intervals instead of remaining an
+      # absent time series forever. The configured-at branch is specifically for
+      # that first-upload case; once a success exists, freshness is measured from
+      # the success timestamp.
+      - alert: WecertRemoteBackupIsStale
+        expr: |
+          ((wecert_backup_remote_last_success_timestamp_seconds > 0)
+           and (time() - wecert_backup_remote_last_success_timestamp_seconds > 2 * wecert_backup_remote_interval_seconds))
+          or
+          ((wecert_backup_remote_last_success_timestamp_seconds == 0)
+           and (time() - wecert_backup_remote_configured_timestamp_seconds > 2 * wecert_backup_remote_interval_seconds))
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "remote backup target {{ $labels.target }} has not succeeded for two intervals"
+          description: >-
+            The target was configured but has either never accepted a snapshot or its last successful
+            upload is older than twice its configured interval. Check the daemon log, credentials and
+            reachability; use `wecert_backup_remote_errors_total` to distinguish repeated transport
+            failures from a stopped snapshot loop.
+
       # A recovered panic is always a bug, never routine churn. The pass survived, which is the
       # design working, but something in the state machine is wrong.
       - alert: WecertReconcilePanicked

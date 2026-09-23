@@ -46,7 +46,7 @@ They are written `0600`. They contain the account key and every certificate priv
 **Snapshots are not a substitute for off-host backup.** They sit next to the file they
 protect: a lost disk, a dropped directory or a bad `rm` takes both. Configure
 `stateBackup.remoteTargets` for S3, COS or SFTP; successful remote uploads expose
-`wecert_backup_remote_last_success_timestamp_seconds` and failures increment
+`wecert_backup_remote_last_success_timestamp_seconds` (0 until the first successful upload) and failures increment
 `wecert_backup_remote_errors_total`. Alert when a configured target has no recent success.
 
 ```sh

@@ -9,14 +9,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/deploy"
+	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/state"
-	"sync/atomic"
-	"time"
 )
 
 // Enforce forbids certificates in the config, and its document can enable
@@ -410,5 +412,37 @@ func TestStartStateBackupsReturnsAWorkingStop(t *testing.T) {
 	// that stop() returns at all -- without the cancel it would block forever.
 	if !strings.Contains(logs.String(), "periodic state database snapshots are on") {
 		t.Errorf("starting the loop must be logged, got:\n%s", logs.String())
+	}
+}
+
+func TestStartStateBackupsPublishesRemoteBackupExpectations(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	cfg := &config.Config{
+		StatePath: filepath.Join(dir, "state.db"),
+		StateBackup: config.StateBackup{
+			Dir:         filepath.Join(dir, "backups"),
+			Keep:        3,
+			IntervalDur: 7 * time.Minute,
+			RemoteTargets: []config.BackupTarget{{
+				Name: "metric-test-remote", Type: "s3",
+			}},
+		},
+	}
+	_, stop := startStateBackups(context.Background(), store, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer stop()
+	labels := []string{"metric-test-remote", "s3"}
+	if got := testutil.ToFloat64(metrics.BackupRemoteLastSuccess.WithLabelValues(labels...)); got != 0 {
+		t.Errorf("initial remote last-success metric = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(metrics.BackupRemoteInterval.WithLabelValues(labels...)); got != (7 * time.Minute).Seconds() {
+		t.Errorf("remote backup interval metric = %v, want %v", got, (7 * time.Minute).Seconds())
+	}
+	if got := testutil.ToFloat64(metrics.BackupRemoteConfiguredAt.WithLabelValues(labels...)); got <= 0 {
+		t.Errorf("remote backup configured metric = %v, want a Unix timestamp", got)
 	}
 }
