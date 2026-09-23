@@ -97,6 +97,19 @@ func open(path string, exclusive bool) (*Store, error) {
 			return nil, fmt.Errorf("create state dir %s: %w", dir, err)
 		}
 	}
+	// The database itself commonly does not exist on a first start, so inspect
+	// its containing directory rather than the eventual file.
+	filesystemPath := dir
+	if filesystemPath == "" || filesystemPath == "." {
+		filesystemPath = "."
+	}
+	if filesystem, err := unsafeFilesystem(filesystemPath); err != nil {
+		return nil, err
+	} else if filesystem != "" {
+		return nil, fmt.Errorf(
+			"refusing state database %s on %s: SQLite and flock cannot guarantee one writer on a network filesystem; move statePath to local storage and restore a snapshot there",
+			path, filesystem)
+	}
 
 	// Both of these are warnings, not refusals, and the difference is deliberate.
 	//
