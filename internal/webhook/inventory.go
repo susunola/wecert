@@ -2,11 +2,14 @@ package webhook
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/inventory"
 	"github.com/susunola/wecert/internal/probe"
 	"github.com/susunola/wecert/internal/ratelimit"
+	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -139,11 +142,56 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 			in.Probes[name] = hostSamples(answers)
 		}
 	}
-	snap := inventory.Assemble(in)
+	var quotas []ratelimit.QuotaReport
 	if qr, ok := s.rec.(QuotaReader); ok {
-		snap.Quotas = quotaViews(qr.QuotaStatus())
+		quotas = qr.QuotaStatus()
+		in.RateLimited = blockedCertificates(in.Desired, quotas)
 	}
+	snap := inventory.Assemble(in)
+	snap.Quotas = quotaViews(quotas)
 	return snap
+}
+
+// blockedCertificates maps a CA refusal scope back to the certificate rows it
+// can actually block.  A scope that cannot be mapped is deliberately omitted:
+// showing a red certificate row on an inference would be worse than leaving the
+// quota table to report the scope verbatim.
+func blockedCertificates(desired *spec.Result, reports []ratelimit.QuotaReport) map[string]bool {
+	if desired == nil || len(reports) == 0 {
+		return nil
+	}
+	blocked := make(map[string]bool)
+	for _, report := range reports {
+		if !report.Blocked {
+			continue
+		}
+		for i := range desired.Certificates {
+			cert := &desired.Certificates[i]
+			switch report.Limit {
+			case "new-orders":
+				blocked[cert.Name] = true
+			case "certs-per-exact-identifier-set":
+				if cert.DomainKey() == report.Scope {
+					blocked[cert.Name] = true
+				}
+			case "certs-per-registered-domain":
+				for _, domain := range cert.Domains {
+					if group.RegisteredDomain(domain) == report.Scope {
+						blocked[cert.Name] = true
+						break
+					}
+				}
+			case "authz-failures-per-identifier", "consecutive-authz-failures-per-identifier":
+				for _, domain := range cert.Domains {
+					if strings.EqualFold(domain, report.Scope) {
+						blocked[cert.Name] = true
+						break
+					}
+				}
+			}
+		}
+	}
+	return blocked
 }
 
 func quotaViews(reports []ratelimit.QuotaReport) []inventory.Quota {
