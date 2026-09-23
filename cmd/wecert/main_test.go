@@ -307,6 +307,31 @@ func TestAnEmptyDatabaseIsNotSnapshotted(t *testing.T) {
 	}
 }
 
+func TestTakeSnapshotsWritesEveryLocalDestination(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.PutCert(&state.CertState{Name: "example-com", KeyPEM: []byte("PRIVATE KEY")}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	first, second := filepath.Join(dir, "disk-a"), filepath.Join(dir, "disk-b")
+	if err := takeSnapshots(store, []string{first, second}, 3, time.Hour, slog.Default()); err != nil {
+		t.Fatalf("takeSnapshots: %v", err)
+	}
+	for _, destination := range []string{first, second} {
+		snaps, err := store.Snapshots(destination)
+		if err != nil {
+			t.Fatalf("Snapshots(%s): %v", destination, err)
+		}
+		if len(snaps) != 1 {
+			t.Errorf("Snapshots(%s) = %v, want one coherent backup", destination, snaps)
+		}
+	}
+}
+
 // TestStoppingTheSnapshotLoopWaitsForAnInFlightSnapshot covers the race the stop function
 // exists for: the snapshot goroutine writes to SQLite on its own schedule, and nothing waited
 // for it, so a pass that returned as the ticker fired let the deferred store.Close() run

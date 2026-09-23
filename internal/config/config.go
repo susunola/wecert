@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -254,6 +255,11 @@ type StateBackup struct {
 	// are cheap and atomic).
 	Dir string `yaml:"dir"`
 
+	// LocalDirs are additional local snapshot destinations, for example another
+	// physical disk or a separately mounted backup volume. Each receives a
+	// SQLite-consistent snapshot; state.db itself is never copied.
+	LocalDirs []string `yaml:"localDirs"`
+
 	// Parsed, filled in by normalize.
 	IntervalDur time.Duration `yaml:"-"`
 }
@@ -288,6 +294,22 @@ func (b *StateBackup) normalize() error {
 	if b.Keep > 365 {
 		return fmt.Errorf("stateBackup.keep is %d, which would retain more than a year of snapshots "+
 			"of a file holding private keys; keep at most 365", b.Keep)
+	}
+	seen := map[string]bool{}
+	if b.Dir != "" {
+		seen[filepath.Clean(b.Dir)] = true
+	}
+	for i, dir := range b.LocalDirs {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			return fmt.Errorf("stateBackup.localDirs[%d] is empty", i)
+		}
+		clean := filepath.Clean(dir)
+		if seen[clean] {
+			return fmt.Errorf("stateBackup.localDirs[%d] duplicates another snapshot destination %q", i, clean)
+		}
+		seen[clean] = true
+		b.LocalDirs[i] = clean
 	}
 	return nil
 }

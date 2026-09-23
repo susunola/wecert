@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -489,13 +488,10 @@ func jitter(d time.Duration) time.Duration {
 // ticker fired raced the deferred store.Close() against store.Snapshot's VACUUM INTO, so
 // the process could exit holding the lock out from under a half-written snapshot file.
 func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Config, log *slog.Logger) (*snapshotHealth, func()) {
-	dir := cfg.StateBackup.Dir
-	if dir == "" {
-		dir = filepath.Dir(cfg.StatePath)
-	}
+	dirs := stateBackupDirs(cfg)
 
 	snapshot := func() error {
-		return takeSnapshot(store, dir, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log)
+		return takeSnapshots(store, dirs, cfg.StateBackup.Keep, cfg.StateBackup.IntervalDur, log)
 	}
 
 	// first records the outcome of the immediate snapshot: the one-shot run reads it to decide
@@ -523,7 +519,7 @@ func startStateBackups(ctx context.Context, store *state.Store, cfg *config.Conf
 	}, done)
 
 	log.Info("periodic state database snapshots are on",
-		"dir", dir, "interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
+		"dirs", dirs, "interval", cfg.StateBackup.IntervalDur, "keep", cfg.StateBackup.Keep)
 
 	return health, func() { stopSnapshotLoop(cancel, done, log) }
 }
@@ -614,6 +610,13 @@ const snapshotDrainTimeout = 15 * time.Second
 // snapshots before anyone looked at the directory. Rate buckets and failure counters do not count
 // as recoverable state: losing them costs rate-limit knowledge, not a certificate.
 func takeSnapshot(store *state.Store, dir string, keep int, interval time.Duration, log *slog.Logger) error {
+	return takeSnapshots(store, []string{dir}, keep, interval, log)
+}
+
+// takeSnapshots writes a fully consistent SQLite snapshot to every configured
+// local destination. Each call to Store.Snapshot uses VACUUM INTO; copying
+// state.db (especially while WAL is enabled) is never used as a shortcut.
+func takeSnapshots(store *state.Store, dirs []string, keep int, interval time.Duration, log *slog.Logger) error {
 	has, err := store.HasRecoverableState()
 	if err != nil {
 		log.Error("cannot tell whether the state database holds anything worth snapshotting", "err", err)
@@ -624,22 +627,26 @@ func takeSnapshot(store *state.Store, dir string, keep int, interval time.Durati
 		log.Warn("skipping this snapshot: the state database holds no account, certificate, order "+
 			"or revocation request yet, so a copy of it is not a recovery point -- and retention "+
 			"would count it as one and evict a snapshot that is",
-			"dir", dir, "keep", keep)
+			"dirs", dirs, "keep", keep)
 		return nil
 	}
 
-	path, err := store.Snapshot(dir, keep)
-	if err != nil {
-		// A partial failure still writes the file; say which, so a successful snapshot with a
-		// failed prune is not read as "no backup exists".
-		log.Error("state database snapshot failed", "dir", dir, "err", err)
-		if path != "" {
-			log.Info("a snapshot was written despite the error", "path", path)
+	var errs []error
+	for _, dir := range dirs {
+		path, err := store.Snapshot(dir, keep)
+		if err != nil {
+			// A partial failure still writes the file; say which, so a successful snapshot with a
+			// failed prune is not read as "no backup exists".
+			log.Error("state database snapshot failed", "dir", dir, "err", err)
+			if path != "" {
+				log.Info("a snapshot was written despite the error", "path", path)
+			}
+			errs = append(errs, fmt.Errorf("%s: %w", dir, err))
+			continue
 		}
-		return err
+		log.Info("state database snapshotted", "path", path, "interval", interval, "keep", keep)
 	}
-	log.Info("state database snapshotted", "path", path, "interval", interval, "keep", keep)
-	return nil
+	return errors.Join(errs...)
 }
 
 func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) error {

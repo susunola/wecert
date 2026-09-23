@@ -24,9 +24,12 @@ stateBackup:
   # How many snapshots to keep, newest first. Each is a full copy of the database.
   keep: 7
   # Defaults to the directory holding state.db (already 0700). Point it elsewhere if you
-  # want the copies on separate storage, but note they must be renamed atomically, so a
-  # different filesystem means the rename is a copy.
+  # want the primary copy on separate storage.
   # dir: /var/backups/wecert
+  # Additional independent local destinations, such as another physical disk or backup volume.
+  # Each receives its own SQLite-consistent snapshot and retention set.
+  # localDirs:
+  #   - /mnt/backup-disk/wecert
 
 acme:
   # ⚠️ Defaults to staging. install.sh installs this very file as

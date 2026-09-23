@@ -233,16 +233,22 @@ func logEnforceFleet(cfg *config.Config, reconciler *reconcile.Reconciler, provi
 func startBackupsIfNeeded(ctx context.Context, store *state.Store, cfg *config.Config, log *slog.Logger) (
 	snapshots *snapshotHealth, stop func(),
 ) {
-	backupDir := cfg.StateBackup.Dir
-	if backupDir == "" {
-		backupDir = filepath.Dir(cfg.StatePath)
+	backupDirs := stateBackupDirs(cfg)
+	backupDir := backupDirs[0]
+	writable := true
+	for _, dir := range backupDirs {
+		if !dirIsWritable(dir) {
+			writable = false
+			backupDir = dir
+			break
+		}
 	}
 	// The switch and the directory are checked separately. Treating "enabled" as sufficient
 	// (EnabledOr returns the explicit setting whenever it is set) made the unwritable case fall
 	// into the running branch: the loop started, took a snapshot every interval, failed, and
 	// logged an ERROR each time -- while the branch written to say exactly that was unreachable,
 	// because its guard was the same condition the first branch had already consumed.
-	switch planStateBackups(cfg.StateBackup.Enabled, dirIsWritable(backupDir)) {
+	switch planStateBackups(cfg.StateBackup.Enabled, writable) {
 	case backupsRun:
 		return startStateBackups(ctx, store, cfg, log)
 	case backupsEnabledButUnwritable:
@@ -267,6 +273,17 @@ func startBackupsIfNeeded(ctx context.Context, store *state.Store, cfg *config.C
 		}
 	}
 	return nil, nil
+}
+
+// stateBackupDirs returns the primary snapshot destination followed by
+// independently retained local copies. Future remote backends use this same
+// snapshot loop rather than copying the live SQLite file.
+func stateBackupDirs(cfg *config.Config) []string {
+	primary := cfg.StateBackup.Dir
+	if primary == "" {
+		primary = filepath.Dir(cfg.StatePath)
+	}
+	return append([]string{primary}, cfg.StateBackup.LocalDirs...)
 }
 
 // runOncePass runs the single convergence pass -once is named for, then drains.

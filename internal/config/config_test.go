@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -790,6 +791,39 @@ certificates:
 		if _, err := Load(path); err == nil {
 			t.Errorf("keep: %s must be rejected", keep)
 		}
+	}
+}
+
+func TestStateBackupLocalDirsAreNormalizedAndUnique(t *testing.T) {
+	path := writeConfig(t, minimalPrefix+`
+stateBackup:
+  dir: /var/backups/wecert
+  localDirs:
+    - " /mnt/backup-a/wecert/ "
+    - /mnt/backup-b/wecert
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"/mnt/backup-a/wecert", "/mnt/backup-b/wecert"}
+	if !reflect.DeepEqual(cfg.StateBackup.LocalDirs, want) {
+		t.Errorf("localDirs = %#v, want %#v", cfg.StateBackup.LocalDirs, want)
+	}
+
+	duplicate := writeConfig(t, minimalPrefix+`
+stateBackup:
+  dir: /var/backups/wecert
+  localDirs: [/var/backups/wecert/]
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`)
+	if _, err := Load(duplicate); err == nil || !strings.Contains(err.Error(), "duplicates") {
+		t.Errorf("duplicate local backup destination must be rejected, got %v", err)
 	}
 }
 
