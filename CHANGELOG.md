@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.6.1 - 2026-09-23
+
+### Fixed
+
+- **A DNS-01 propagation check no longer calls a zone unreachable when only UDP is
+  blocked.** `exchangeDNS` retried over TCP only for a truncated answer, so on a network
+  that drops outbound UDP/53 -- measured: every authoritative address of a zone timed out
+  over UDP while the same query over TCP answered in 60 ms -- every authoritative query
+  failed and the wait reported `unreachable N (of N addresses)` after spending its whole
+  budget, without the CA ever being asked. TCP is an equally authoritative transport
+  (RFC 7766), so a server that answers over it has answered; the truncated-answer
+  behaviour is unchanged.
+
 ## 0.6.0 - 2026-09-23
 
 ### Fixed
