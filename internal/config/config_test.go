@@ -114,6 +114,25 @@ certificates:
 	}
 }
 
+func TestCertificateFailureFallbackIsNormalized(t *testing.T) {
+	cfg, err := Load(writeConfig(t, minimalPrefix+`
+certificates:
+  - name: example-com
+    domains: [example.com]
+    failureFallback:
+      enabled: true
+      beforeExpiry: 48h
+      failureWindow: 6h
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Certificates[0].FailureFallback
+	if got == nil || !got.EnabledOr(false) || got.BeforeExpiryDur != 48*time.Hour || got.FailureWindowDur != 6*time.Hour {
+		t.Fatalf("certificate fallback = %#v, want normalized per-certificate policy", got)
+	}
+}
+
 func TestRecursiveNameserversAreNormalized(t *testing.T) {
 	body := strings.Replace(minimalPrefix, "  loginToken: token\n", "  loginToken: token\n  recursiveNameservers: [\"1.1.1.1\", \"[2606:4700:4700::1111]:5353\", \"1.1.1.1:53\"]\n", 1)
 	cfg, err := Load(writeConfig(t, body+`

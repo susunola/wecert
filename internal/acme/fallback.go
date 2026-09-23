@@ -65,7 +65,7 @@ func (m *Manager) applyFallback(c *config.Certificate, st *state.CertState, rd r
 		// in the certificate, so their authorizations will never be attempted again and
 		// can never earn the "success" that would clear them.
 		if perr := m.store.PruneIdentifierFailures(c.Name, m.now(),
-			m.fallbackWindow()); perr != nil {
+			m.fallbackWindow(c)); perr != nil {
 			m.log.Warn("cannot prune the identifier failure ledger", "cert", c.Name, "err", perr)
 		}
 		return c, rd
@@ -236,7 +236,7 @@ func entriesOfNotIn(want, have []string) []string {
 // week. The cost of that rule is the other direction: after an operator repairs the name,
 // recovery still waits for the renewal window rather than happening on the next pass.
 func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState, held bool) (kept, dropped []string, reason string) {
-	p := m.fallback
+	p := m.fallbackPolicy(c)
 	if p == nil || !p.EnabledOr(false) {
 		return c.Domains, nil, ""
 	}
@@ -269,7 +269,7 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState, he
 	// name stops being dropped; the full set is then tried again at the renewal window (see
 	// the SAN-drift branch), not on the next pass.
 	minFailures := p.MinIdentifierFailuresOr(defaultFallbackMinIdentFail)
-	cutoff := m.now().Add(-m.fallbackWindow())
+	cutoff := m.now().Add(-m.fallbackWindow(c))
 
 	bad := make(map[string]*state.IdentifierFailure)
 	for _, f := range failures {
@@ -320,9 +320,16 @@ func (m *Manager) fallbackDomains(c *config.Certificate, st *state.CertState, he
 		st.ConsecutiveFailures, expiry)
 }
 
-func (m *Manager) fallbackWindow() time.Duration {
-	if m.fallback != nil && m.fallback.FailureWindowDur > 0 {
-		return m.fallback.FailureWindowDur
+func (m *Manager) fallbackPolicy(c *config.Certificate) *config.FailureFallback {
+	if c.FailureFallback != nil {
+		return c.FailureFallback
+	}
+	return m.fallback
+}
+
+func (m *Manager) fallbackWindow(c *config.Certificate) time.Duration {
+	if p := m.fallbackPolicy(c); p != nil && p.FailureWindowDur > 0 {
+		return p.FailureWindowDur
 	}
 	return defaultFallbackFailureWindow
 }

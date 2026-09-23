@@ -947,6 +947,10 @@ type Certificate struct {
 	KeyType     string   `yaml:"keyType" json:"keyType"`
 	RenewBefore string   `yaml:"renewBefore,omitempty" json:"renewBefore,omitempty"`
 	Deploy      Deploy   `yaml:"deploy" json:"deploy"`
+	// FailureFallback overrides the global failureFallback policy for this
+	// certificate only. A non-nil block with enabled: false explicitly opts this
+	// certificate out while other certificates may still degrade near expiry.
+	FailureFallback *FailureFallback `yaml:"failureFallback,omitempty" json:"failureFallback,omitempty"`
 	// UIN tags this certificate with a Tencent Cloud account. Empty means inherit
 	// tencent.uin. The inventory uses it only for display and grouping; it does
 	// not change which credentials deploy the certificate.

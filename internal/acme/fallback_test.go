@@ -68,6 +68,21 @@ func TestFallbackIsOffByDefault(t *testing.T) {
 	}
 }
 
+func TestCertificateFallbackCanOptOutOfGlobalPolicy(t *testing.T) {
+	store, m, cert, now := fallbackFixture(t, fallbackPolicyPtr())
+	off := false
+	cert.FailureFallback = &config.FailureFallback{Enabled: &off}
+	for i := 0; i < 5; i++ {
+		if err := store.RecordIdentifierFailure(cert.Name, "b.example.com", "dns says no", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := &state.CertState{Name: cert.Name, NotAfter: now.Add(time.Hour), ConsecutiveFailures: 9}
+	if got, _ := m.applyFallback(cert, st, round{}); len(got.Domains) != len(cert.Domains) {
+		t.Fatalf("certificate opt-out must override global fallback, got %v", got.Domains)
+	}
+}
+
 // Below the failure threshold nothing moves: falling back deliberately gives up coverage,
 // so it must not fire just because "this pass did not issue" -- that hits almost every certificate.
 func TestFallbackWaitsForEnoughConsecutiveFailures(t *testing.T) {

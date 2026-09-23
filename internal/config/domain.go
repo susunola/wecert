@@ -105,6 +105,11 @@ func (c *Certificate) normalize(seen map[string]bool) error {
 				"whenever ARI is unavailable); use less than %s",
 			c.Name, c.RenewBeforeDur, c.Profile, v, v)
 	}
+	if c.FailureFallback != nil {
+		if err := c.FailureFallback.normalize(); err != nil {
+			return fmt.Errorf("certificate %q failureFallback: %w", c.Name, err)
+		}
+	}
 	return nil
 }
 
