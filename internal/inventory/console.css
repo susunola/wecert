@@ -568,6 +568,67 @@ h1 {
 .quota-table .bad {
   color: var(--red);
 }
+/* Keep quota as an operational signal, not a second dashboard. */
+.quota-panel {
+  margin-bottom: 18px;
+}
+.quota-heading {
+  min-height: 42px;
+  padding: 10px 22px;
+}
+.quota-heading h2 {
+  display: inline;
+  font-size: 13px;
+}
+.eyebrow {
+  display: none;
+}
+.quota-grid {
+  border-top: 1px solid var(--line);
+}
+.quota-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 22px;
+}
+.quota-label {
+  display: block;
+  flex: 1;
+  font-size: 11px;
+  line-height: 1.25;
+}
+.quota-label .scope {
+  display: block;
+  margin-top: 2px;
+  overflow: visible;
+  white-space: normal;
+}
+.quota-value {
+  align-items: baseline;
+  margin: 0;
+  gap: 3px;
+  white-space: nowrap;
+}
+.quota-value strong {
+  font-size: 18px;
+  letter-spacing: -0.4px;
+}
+.quota-value span {
+  font-size: 10px;
+}
+.quota-meter {
+  display: none;
+}
+.quota-note {
+  display: none;
+}
+.quota-details summary {
+  padding: 8px 22px;
+}
+.quota-footnote {
+  display: none;
+}
 .inventory {
   border: 1px solid var(--line);
   background: var(--surface);

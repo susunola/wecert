@@ -211,9 +211,8 @@ function renderQuotas() {
           ? 0
           : Math.max(0, Math.min(100, (q.remaining / q.capacity) * 100));
       const value = q.unreadable || q.spentByCA ? "—" : Math.floor(q.remaining);
-      const scope = q.scope || "This account";
       const count = families[index].length;
-      return `<article class="quota-item ${cls}"><div class="quota-label"><span>${esc(quotaNames[q.limit] || q.limit)}</span><span class="scope mono" title="${esc(scope)}">${count > 1 ? `Worst of ${count} scopes` : esc(scope)}</span></div><div class="quota-value"><strong>${value}</strong><span>of ${q.capacity} available</span></div><div class="quota-meter" aria-hidden="true"><span style="width:${percent}%"></span></div><div class="quota-note">${esc(quotaNote(q))}</div></article>`;
+      return `<article class="quota-item ${cls}"><div class="quota-label"><span>${esc(quotaNames[q.limit] || q.limit)}</span><span class="scope">${count} scope${count === 1 ? "" : "s"}</span></div><div class="quota-value"><strong>${value}</strong><span>of ${q.capacity}</span></div><div class="quota-meter" aria-hidden="true"><span style="width:${percent}%"></span></div><div class="quota-note">${esc(quotaNote(q))}</div></article>`;
     })
     .join("");
   const detailRows = families
