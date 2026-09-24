@@ -318,6 +318,19 @@ func pruneS3(ctx context.Context, client *s3.Client, t Target, current string) e
 	for _, object := range objects[:len(objects)-t.Keep] {
 		victims = append(victims, types.ObjectIdentifier{Key: object.Key})
 	}
+	if t.Type == TypeCOS {
+		// COS requires Content-MD5 for the S3 multi-object delete payload. The AWS
+		// SDK does not add it for this operation, while COS accepts ordinary single
+		// object deletes without that header. Retention runs infrequently and has at
+		// most Keep-1 victims, so prefer the portable operation over hand-rolling a
+		// signed XML request.
+		for _, victim := range victims {
+			if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &t.Bucket, Key: victim.Key}); err != nil {
+				return fmt.Errorf("prune remote snapshots: %w", err)
+			}
+		}
+		return nil
+	}
 	_, err = client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: &t.Bucket, Delete: &types.Delete{Objects: victims, Quiet: ptr(true)}})
 	if err != nil {
 		return fmt.Errorf("prune remote snapshots: %w", err)
