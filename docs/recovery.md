@@ -65,8 +65,9 @@ If `stateBackup.enabled: false`, wecert logs a warning at startup saying so.
 ### The short way: one command
 
 ```sh
-systemctl stop wecert          # the restore refuses while the daemon holds the lock
-wecert -restore latest         # newest snapshot of this state.db, found from stateBackup.dir
+systemctl stop wecert                # the restore refuses while the daemon holds the lock
+wecert -restore latest               # type RESTORE to confirm replacement
+# automation only: wecert -restore latest -yes
 systemctl start wecert
 ```
 
@@ -85,6 +86,9 @@ in it), or `latest` (the directory `stateBackup.dir` points at — the form that
 knowing a path during an incident).
 
 It does the file work as one transaction, and it is deliberately careful about the order:
+
+`-restore` is protected because it replaces live credential and rate-limit state. It asks for
+the literal confirmation `RESTORE`; non-interactive recovery must opt in with `-yes`.
 
 - **Refuses while another wecert process holds the lock.** Restoring underneath a running daemon
   does not fail loudly: the daemon keeps writing to the inode it already opened, so everything it

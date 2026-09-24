@@ -830,7 +830,11 @@ var reservedContactTLDs = map[string]bool{
 // validateContactEmail refuses an address a CA will not accept, before it reaches the CA.
 type ACME struct {
 	Directory string `yaml:"directory"`
-	Email     string `yaml:"email"`
+	// FallbackDirectories are used only when the primary ACME directory is
+	// unavailable at transport level (or explicitly rejects new orders for the
+	// account). They are not a retry for DNS or authorization failures.
+	FallbackDirectories []string `yaml:"fallbackDirectories,omitempty"`
+	Email               string   `yaml:"email"`
 }
 
 // DNS is the DNS-01 solver configuration.

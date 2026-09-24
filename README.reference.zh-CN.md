@@ -954,7 +954,7 @@ ssl:DescribeCertificateBindResourceTaskResult
 | `-revoke` | — | 请求 CA 吊销这张证书后退出（先把决定写进状态库，CA 暂时失败时由守护进程重试） |
 | `-revoke-reason` | `unspecified` | `unspecified` \| `keyCompromise` \| `affiliationChanged` \| `superseded` \| `cessationOfOperation` |
 | `-yes` | `false` | 配合 `-revoke`：跳过交互确认（否则要求手输证书名） |
-| `-restore` | — | 恢复状态快照后退出：快照文件、快照目录，或 `latest`（见 **docs/recovery.md**）。守护进程持锁时拒绝执行；被替换掉的数据库保留在 `state.db.replaced-<stamp>` |
+| `-restore` | — | 恢复状态快照后退出：快照文件、快照目录，或 `latest`（见 **docs/recovery.md**）。默认须输入 `RESTORE` 确认；自动化场景显式配合 `-yes`。守护进程持锁时拒绝执行；被替换掉的数据库保留在 `state.db.replaced-<stamp>` |
 | `-version` | `false` | 打印版本后退出 |
 
 ### `wecert-onboard`（期望状态生成器）

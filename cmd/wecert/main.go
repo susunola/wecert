@@ -109,7 +109,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 		"restore a state snapshot and exit: a snapshot file, a directory of snapshots, or \"latest\"")
 	fs.StringVar(&f.revokeWhy, "revoke-reason", "unspecified",
 		"revocation reason: unspecified|keyCompromise|affiliationChanged|superseded|cessationOfOperation")
-	fs.BoolVar(&f.yesFlag, "yes", false, "with -revoke: skip the interactive confirmation")
+	fs.BoolVar(&f.yesFlag, "yes", false, "with -revoke or -restore: skip the interactive confirmation")
 	return fs
 }
 
@@ -165,7 +165,7 @@ func run() error {
 		if f.once || f.dryRun || f.revokeCert != "" {
 			return errRestoreConflict
 		}
-		return runRestore(f.configPath, f.statePath, f.restoreFrom)
+		return runRestore(f.configPath, f.statePath, f.restoreFrom, f.yesFlag)
 	}
 
 	// Install signal handling before anything touches the network (config load, EnsureAccount,
@@ -200,7 +200,7 @@ func run() error {
 	}
 
 	httpClient := acme.NewHTTPClient(60 * time.Second)
-	core, err := acme.EnsureAccount(cfg, store, httpClient)
+	core, err := acme.EnsureFailoverAPI(cfg, store, httpClient)
 	if err != nil {
 		return err
 	}

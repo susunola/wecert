@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
@@ -23,13 +24,20 @@ import (
 // order may then be refused by the CA, which is exactly the "why is my renewal failing" question
 // nobody can answer from the logs. Restoring through this command leaves a record behind, and the
 // next start warns from it (see logRestoreNotice).
-func runRestore(configPath, statePathOverride, arg string) error {
+func runRestore(configPath, statePathOverride, arg string, assumeYes bool) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 	if statePathOverride != "" {
 		cfg.StatePath = statePathOverride
+	}
+	if !assumeYes {
+		fmt.Fprintf(os.Stderr, "Restore snapshot %q over %s?\nThis replaces the active state database; its old copy is retained, but its rate-limit ledger is older.\nType RESTORE to confirm: ", arg, cfg.StatePath)
+		answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		if strings.TrimSpace(answer) != "RESTORE" {
+			return fmt.Errorf("not confirmed; nothing was restored")
+		}
 	}
 	return restoreState(cfg, arg)
 }

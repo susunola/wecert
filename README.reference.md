@@ -330,7 +330,7 @@ The ACME order state machine is in [Order state machine](#4-order-state-machine)
 
 ### State schema
 
-A single SQLite file. Losing it means re-ordering, which collides with the rate limits — so it is the one thing to back up. wecert snapshots it on an interval by default (`stateBackup`, using `VACUUM INTO` so the copy is consistent despite WAL) and keeps the newest `keep` of them beside it; snapshots are not off-host backup. Restoring one is `wecert -restore latest` (a file, a directory, or `latest`); **docs/recovery.md** is the procedure and the caveat that comes with it.
+A single SQLite file. Losing it means re-ordering, which collides with the rate limits — so it is the one thing to back up. wecert snapshots it on an interval by default (`stateBackup`, using `VACUUM INTO` so the copy is consistent despite WAL) and keeps the newest `keep` of them beside it; snapshots are not off-host backup. Restoring one is `wecert -restore latest` (a file, a directory, or `latest`), which asks for `RESTORE` unless automation explicitly supplies `-yes`; **docs/recovery.md** is the procedure and the caveat that comes with it.
 
 ```
 accounts                      -- one ACME account per directory URL
@@ -1085,8 +1085,8 @@ is still bound (status 4) keeps the certificate on the reclaim list for the next
 | `-dry-run` | `false` | Validate config, initialise the ACME account, and build the DNS provider and deployer (so a bad static credential fails here); sign and deploy nothing |
 | `-revoke` | — | Ask the CA to revoke this certificate and exit (writes the decision to state first, so a transient CA failure is retried by the daemon) |
 | `-revoke-reason` | `unspecified` | `unspecified` \| `keyCompromise` \| `affiliationChanged` \| `superseded` \| `cessationOfOperation` |
-| `-yes` | `false` | With `-revoke`: skip the interactive confirmation (you must otherwise type the certificate name) |
-| `-restore` | — | Restore a state snapshot and exit: a snapshot file, a directory of snapshots, or `latest` (see **docs/recovery.md**). Refuses while the daemon holds the lock; keeps the database it replaces at `state.db.replaced-<stamp>` |
+| `-yes` | `false` | With `-revoke` or `-restore`: skip the interactive confirmation |
+| `-restore` | — | Restore a state snapshot and exit: a snapshot file, a directory of snapshots, or `latest` (see **docs/recovery.md**). Requires typing `RESTORE` unless `-yes` is explicit; refuses while the daemon holds the lock; keeps the database it replaces at `state.db.replaced-<stamp>` |
 | `-version` | `false` | Print version and exit |
 
 ### `wecert-preflight` (diagnostic; `-prune-certs` deletes)

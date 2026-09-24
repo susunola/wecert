@@ -133,7 +133,7 @@ func (c *runtimeController) reload(ctx context.Context, f *flags, log *slog.Logg
 	if err != nil {
 		return nil, err
 	}
-	core, err := acme.EnsureAccount(candidate, c.store, acme.NewHTTPClient(60*time.Second))
+	core, err := acme.EnsureFailoverAPI(candidate, c.store, acme.NewHTTPClient(60*time.Second))
 	if err != nil {
 		return nil, err
 	}

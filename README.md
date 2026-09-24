@@ -321,6 +321,15 @@ unchanged; the journal says why. Send HUP again after an in-flight pass complete
 `statePath`, `acme.directory`, listener addresses and `stateBackup` identify
 long-lived resources and still require a normal service restart.
 
+### Optional standby ACME CA
+
+`acme.fallbackDirectories` accepts tested standby ACME directories. A standby is
+used only when the primary directory has a transport/server outage or refuses the
+account-wide new-order quota; DNS, authorization and domain-policy errors remain
+on the primary because another CA cannot fix them. Standby accounts are created
+lazily and use the same account key, while each order URL stays routed to the CA
+that created it. Test every configured CA against staging before relying on it.
+
 ## Day-2 operations
 
 **Where state lives.** `statePath`, e.g. `/var/lib/wecert/state.db` (0600, directory 0700). It is

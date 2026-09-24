@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	legoacme "github.com/go-acme/lego/v4/acme"
@@ -142,6 +143,134 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 	}
 
 	return core, nil
+}
+
+// EnsureFailoverAPI initialises the primary account and every configured standby.
+// A standby receives a copy of the primary account key only when it has no account
+// yet. ACME accounts remain separate per CA directory, while the shared key keeps
+// DNS-01 key authorization valid after a transport failover.
+func EnsureFailoverAPI(cfg *config.Config, store *state.Store, httpClient *http.Client) (API, error) {
+	primary, err := EnsureAccount(cfg, store, httpClient)
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.ACME.FallbackDirectories) == 0 {
+		return NewAPI(primary), nil
+	}
+	account, err := store.GetAccount(cfg.ACME.Directory)
+	if err != nil {
+		return nil, err
+	}
+	if account == nil || len(account.PrivateKeyPEM) == 0 {
+		return nil, fmt.Errorf("primary ACME account has no persisted key")
+	}
+	standbys := make([]API, 0, len(cfg.ACME.FallbackDirectories))
+	for _, directory := range cfg.ACME.FallbackDirectories {
+		// A backup CA may be unavailable for months without making the healthy
+		// primary renewal path unavailable. Its account is registered lazily only
+		// after a qualifying primary failure.
+		standbys = append(standbys, &lazyFallbackAPI{cfg: cfg, directory: directory, store: store, client: httpClient, keyPEM: account.PrivateKeyPEM})
+	}
+	return NewFailoverAPI(NewAPI(primary), cfg.ACME.Directory, standbys, cfg.ACME.FallbackDirectories)
+}
+
+type lazyFallbackAPI struct {
+	cfg       *config.Config
+	directory string
+	store     *state.Store
+	client    *http.Client
+	keyPEM    []byte
+	mu        sync.Mutex
+	api       API
+}
+
+func (l *lazyFallbackAPI) get() (API, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.api != nil {
+		return l.api, nil
+	}
+	a, err := l.store.GetAccount(l.directory)
+	if err != nil {
+		return nil, err
+	}
+	if a == nil || len(a.PrivateKeyPEM) == 0 {
+		if err := l.store.PutAccount(&state.Account{Directory: l.directory, PrivateKeyPEM: l.keyPEM}); err != nil {
+			return nil, err
+		}
+	}
+	c := *l.cfg
+	c.ACME.Directory = l.directory
+	core, err := EnsureAccount(&c, l.store, l.client)
+	if err != nil {
+		return nil, err
+	}
+	l.api = NewAPI(core)
+	return l.api, nil
+}
+
+func (l *lazyFallbackAPI) NewOrder(d []string, o *api.OrderOptions) (legoacme.ExtendedOrder, error) {
+	a, e := l.get()
+	if e != nil {
+		return legoacme.ExtendedOrder{}, e
+	}
+	return a.NewOrder(d, o)
+}
+func (l *lazyFallbackAPI) GetOrder(u string) (legoacme.ExtendedOrder, error) {
+	a, e := l.get()
+	if e != nil {
+		return legoacme.ExtendedOrder{}, e
+	}
+	return a.GetOrder(u)
+}
+func (l *lazyFallbackAPI) UpdateOrderForCSR(u string, c []byte) (legoacme.ExtendedOrder, error) {
+	a, e := l.get()
+	if e != nil {
+		return legoacme.ExtendedOrder{}, e
+	}
+	return a.UpdateOrderForCSR(u, c)
+}
+func (l *lazyFallbackAPI) GetAuthorization(u string) (legoacme.Authorization, error) {
+	a, e := l.get()
+	if e != nil {
+		return legoacme.Authorization{}, e
+	}
+	return a.GetAuthorization(u)
+}
+func (l *lazyFallbackAPI) AcceptChallenge(u string) error {
+	a, e := l.get()
+	if e != nil {
+		return e
+	}
+	return a.AcceptChallenge(u)
+}
+func (l *lazyFallbackAPI) GetCertificate(u string, b bool) ([]byte, []byte, error) {
+	a, e := l.get()
+	if e != nil {
+		return nil, nil, e
+	}
+	return a.GetCertificate(u, b)
+}
+func (l *lazyFallbackAPI) RevokeCertificate(d []byte, r int) error {
+	a, e := l.get()
+	if e != nil {
+		return e
+	}
+	return a.RevokeCertificate(d, r)
+}
+func (l *lazyFallbackAPI) GetRenewalInfo(id string) (*http.Response, error) {
+	a, e := l.get()
+	if e != nil {
+		return nil, e
+	}
+	return a.GetRenewalInfo(id)
+}
+func (l *lazyFallbackAPI) GetKeyAuthorization(t string) (string, error) {
+	a, e := l.get()
+	if e != nil {
+		return "", e
+	}
+	return a.GetKeyAuthorization(t)
 }
 
 // Compile-time assertion: the ECDSA private key used to register accounts must

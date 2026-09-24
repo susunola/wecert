@@ -47,6 +47,22 @@ func (c *Config) normalizeRoot() error {
 	if c.ACME.Directory == "" {
 		return fmt.Errorf("acme.directory is required")
 	}
+	seenDirectories := map[string]bool{c.ACME.Directory: true}
+	for i, directory := range c.ACME.FallbackDirectories {
+		directory = strings.TrimSpace(directory)
+		if directory == "" {
+			return fmt.Errorf("acme.fallbackDirectories[%d] is empty", i)
+		}
+		u, err := url.Parse(directory)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("acme.fallbackDirectories[%d] must be an absolute https URL, got %q", i, directory)
+		}
+		if seenDirectories[directory] {
+			return fmt.Errorf("acme.fallbackDirectories[%d] duplicates %q", i, directory)
+		}
+		seenDirectories[directory] = true
+		c.ACME.FallbackDirectories[i] = directory
+	}
 	if c.ACME.Email == "" {
 		return fmt.Errorf("acme.email is required")
 	}

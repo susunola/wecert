@@ -212,6 +212,10 @@ sudo systemctl kill -s HUP wecert
 
 wecert 会完整解析、校验新配置并构建依赖组件，只有当前没有证书签发/部署任务时才原子切换。配置错误或仍有在途任务时，旧运行时保持不变，journal 会给出原因；待任务结束后再次发送 HUP 即可。`statePath`、`acme.directory`、监听地址和 `stateBackup` 属于长期资源标识，修改它们仍需正常重启服务。
 
+### 可选备用 ACME CA
+
+`acme.fallbackDirectories` 可配置已验证过的备用 ACME directory。只有主 CA directory 网络不可达、服务端故障，或拒绝该账号的新订单配额时才会尝试备用 CA；DNS、授权与域名策略错误仍留在主 CA，因为换 CA 无法修复它们。备用账号延迟创建并复用同一账号密钥，而订单 URL 始终回到创建它的 CA。依赖此能力前，应先对每个备用 CA 跑完整 staging 流程。
+
 ## 部署到本机 nginx
 
 默认后端是腾讯云 CLB（上传 + 一次控制台绑定 + 一键换绑）。当 TLS 在**与 wecert 同一台机器**
@@ -235,7 +239,7 @@ wecert 以原子 rename 写入 `fullchain.pem`（0644）和 `privkey.pem`（0600
 
 ## 日常运维
 
-**状态放在哪里。** `statePath`（**必填，没有默认值**），例如 `/var/lib/wecert/state.db`（0600，所在目录 0700）。它装着 ACME 账号密钥、每一张证书的私钥、在飞订单的 order URL，以及 ARI certID —— 而丢掉一个 order URL 就要拿一次签发去补，直接算在 5 / 7 天这条限额上。所以它也会被自动快照：`stateBackup` 默认开启，每 24 小时做一次一致的 `VACUUM INTO`，保留 7 份。恢复用一条命令 `wecert -restore latest`（也可以给快照文件或快照目录），代价与步骤见 [docs/recovery.md](docs/recovery.md)。
+**状态放在哪里。** `statePath`（**必填，没有默认值**），例如 `/var/lib/wecert/state.db`（0600，所在目录 0700）。它装着 ACME 账号密钥、每一张证书的私钥、在飞订单的 order URL，以及 ARI certID —— 而丢掉一个 order URL 就要拿一次签发去补，直接算在 5 / 7 天这条限额上。所以它也会被自动快照：`stateBackup` 默认开启，每 24 小时做一次一致的 `VACUUM INTO`，保留 7 份。恢复用 `wecert -restore latest`（也可以给快照文件或快照目录）；它默认要求输入 `RESTORE` 确认，自动化场景显式加 `-yes`，代价与步骤见 [docs/recovery.md](docs/recovery.md)。
 
 **健康与告警。** `/metrics` 默认监听 `127.0.0.1:9800`，并附一份[可直接加载的规则文件](deploy/prometheus/wecert-alerts.yml)：17 条告警，覆盖按 profile 的到期、收敛与完整性 —— CA 还没接受的吊销、两小时没跑完的一轮、正在服务的不是部署的那张证书。该监听端口不做任何鉴权，所以请让它留在 localhost 或私有网卡上。
 

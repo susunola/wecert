@@ -70,6 +70,15 @@ acme:
   #      https://acme-v02.api.letsencrypt.org/directory
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
 
+  # Optional standby ACME directories. They are tried only when the primary
+  # directory cannot be reached, returns a server-side outage, or refuses the
+  # account's new-order quota -- never for DNS / authorization failures, where
+  # another CA cannot help. Each standby gets a distinct CA account but shares
+  # the primary account key so DNS-01 key authorization stays correct. Leave
+  # empty unless you have tested the complete flow against that CA.
+  # fallbackDirectories:
+  #   - https://acme.example.net/directory
+
   # ⚠️ Replace this with a mailbox you can read. It is where the CA sends expiry and
   #    revocation notices, and Let's Encrypt REFUSES the reserved documentation domains
   #    (example.com, example.net, example.org, ...) when it registers the account: the

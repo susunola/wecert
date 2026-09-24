@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"time"
 
-	legoapi "github.com/go-acme/lego/v4/acme/api"
-
 	"github.com/susunola/wecert/internal/acme"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/probe"
@@ -139,7 +137,7 @@ func finishDryRun(cfg *config.Config, provider spec.Provider, prober *probe.Runn
 // buildManager wires the ACME manager and the reconciler, including the optional
 // failure fallback and the network prober.
 func buildManager(
-	cfg *config.Config, store *state.Store, core *legoapi.Core,
+	cfg *config.Config, store *state.Store, core acme.API,
 	provider spec.Provider, prober *probe.Runner, log *slog.Logger,
 ) (*reconcile.Reconciler, reconcile.Notifier, error) {
 	solver, err := acme.NewDNSSolver(cfg.DNS, cfg.Tencent, log)
@@ -165,7 +163,7 @@ func buildManager(
 			"signed", cfg.Webhook.NotifySecret != "")
 	}
 
-	manager := acme.NewManager(store, acme.NewAPI(core), solver, deployer, log)
+	manager := acme.NewManager(store, core, solver, deployer, log)
 
 	// Near-expiry degradation: when a few names in a certificate keep failing to issue
 	// while it nears expiry, drop them and issue for the rest. Off by default -- it
