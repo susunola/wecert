@@ -287,6 +287,63 @@ func TestCleanUpDefersDeleteAllWhileAnotherValueIsLive(t *testing.T) {
 	}
 }
 
+// The deferral above is only sound for a provider whose CleanUp deletes every value at the name.
+// Route 53's and Cloudflare's delete only the record they were called for, so a deferred value
+// there is never removed by the last leaver: it stays in DNS with no row and no lease pointing at
+// it. Those providers must be cleaned up per value, immediately.
+func TestValueScopedProviderCleansUpEveryValue(t *testing.T) {
+	t.Setenv("LEGO_DISABLE_CNAME_SUPPORT", "true")
+	privateLeaseRegistry(t)
+
+	p := &recordingProvider{}
+	solver := &DNSSolver{
+		newProvider:        func(context.Context) (challenge.Provider, error) { return p, nil },
+		log:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		providerResolvers:  []string{"192.0.2.53:53"},
+		valueScopedCleanup: true,
+	}
+	ctx := context.Background()
+
+	// Two values live at one name: the wildcard + apex shape, where both challenges hash to
+	// different TXT values at the same _acme-challenge name.
+	valueA := dns01.GetChallengeInfo("shared.example.com", "keyauth-a").Value
+	valueB := dns01.GetChallengeInfo("shared.example.com", "keyauth-b").Value
+	challengeLeases.add("_acme-challenge.shared.example.com.", valueA)
+	challengeLeases.add("_acme-challenge.shared.example.com.", valueB)
+
+	if err := solver.CleanUp(ctx, "shared.example.com", "tok-a", "keyauth-a"); err != nil {
+		t.Fatalf("CleanUp A: %v", err)
+	}
+	if len(p.cleanups) != 1 {
+		t.Fatalf("a value-scoped provider must clean up this value even while another is live, got %v", p.cleanups)
+	}
+
+	if err := solver.CleanUp(ctx, "shared.example.com", "tok-b", "keyauth-b"); err != nil {
+		t.Fatalf("CleanUp B: %v", err)
+	}
+	if len(p.cleanups) != 2 {
+		t.Fatalf("both values must be cleaned up, got %v", p.cleanups)
+	}
+}
+
+// The two providers are the reason valueScopedCleanup exists; everything else keeps the deferral.
+func TestCleanupIsValueScopedOnlyForTheTwoNativeValueScopedProviders(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		want     bool
+	}{
+		{config.DNSProviderRoute53, true},
+		{config.DNSProviderCloudflare, true},
+		{config.DNSProviderDNSPod, false},
+		{config.DNSProviderTencentCloud, false},
+		{config.DNSProviderLego, false},
+	} {
+		if got := cleanupIsValueScoped(tc.provider); got != tc.want {
+			t.Errorf("cleanupIsValueScoped(%q) = %v, want %v", tc.provider, got, tc.want)
+		}
+	}
+}
+
 // A typo'd domain (exmaple.com) has no SOA of its own, so the walk climbs to the TLD's SOA.
 // Accepting "com." as the zone burns the whole propagation budget querying TLD nameservers
 // for a record that can never exist -- findZone must fail fast instead.
