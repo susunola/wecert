@@ -119,10 +119,13 @@ func EnsureAccount(cfg *config.Config, store *state.Store, httpClient *http.Clie
 		return nil, fmt.Errorf("initialise the ACME client: %w", err)
 	}
 
-	reg, err := core.Accounts.New(legoacme.Account{
-		Contact:              []string{"mailto:" + cfg.ACME.Email},
-		TermsOfServiceAgreed: true,
-	})
+	account := legoacme.Account{Contact: []string{"mailto:" + cfg.ACME.Email}, TermsOfServiceAgreed: true}
+	var reg legoacme.ExtendedAccount
+	if cfg.ACME.EAB.KID != "" {
+		reg, err = core.Accounts.NewEAB(account, cfg.ACME.EAB.KID, cfg.ACME.EAB.HMAC)
+	} else {
+		reg, err = core.Accounts.New(account)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("register the ACME account: %w", err)
 	}

@@ -835,6 +835,16 @@ type ACME struct {
 	// account). They are not a retry for DNS or authorization failures.
 	FallbackDirectories []string `yaml:"fallbackDirectories,omitempty"`
 	Email               string   `yaml:"email"`
+	// EAB supplies the External Account Binding credentials required by some
+	// commercial and private ACME directories. HMACFile keeps the binding secret
+	// out of config.yaml and works with systemd LoadCredential.
+	EAB ACMEExternalAccountBinding `yaml:"eab,omitempty"`
+}
+
+type ACMEExternalAccountBinding struct {
+	KID      string `yaml:"kid,omitempty"`
+	HMAC     string `yaml:"hmac,omitempty"`
+	HMACFile string `yaml:"hmacFile,omitempty"`
 }
 
 // DNS is the DNS-01 solver configuration.
@@ -1148,6 +1158,10 @@ func (c *Config) resolveSecretFiles() ([]string, error) {
 
 	if err := resolve("dns.loginToken", c.DNS.LoginToken, c.DNS.LoginTokenFile,
 		[]string{EnvDNSPodLoginToken}, &c.DNS.LoginToken); err != nil {
+		return warns, err
+	}
+	if err := resolve("acme.eab.hmac", c.ACME.EAB.HMAC, c.ACME.EAB.HMACFile,
+		[]string{"WECERT_ACME_EAB_HMAC"}, &c.ACME.EAB.HMAC); err != nil {
 		return warns, err
 	}
 

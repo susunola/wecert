@@ -389,6 +389,52 @@ certificates:
 	}
 }
 
+func TestACMEEABRequiresBothPartsAndSupportsCredentialFile(t *testing.T) {
+	base := `
+statePath: /tmp/wecert-test.db
+acme:
+  directory: https://acme-staging-v02.api.letsencrypt.org/directory
+  email: ops@atomwangnus.com
+`
+	common := `
+dns:
+  provider: dnspod
+  loginToken: token
+tencent:
+  credentialMode: static
+  secretId: id
+  secretKey: key
+  regions: [ap-guangzhou]
+`
+	for _, eab := range []string{
+		"  eab:\n    kid: account-1\n",
+		"  eab:\n    hmac: abc\n",
+	} {
+		if _, err := Load(writeConfig(t, base+eab+common+`certificates:
+  - name: c
+    domains: [example.com]
+`)); err == nil {
+			t.Fatalf("incomplete EAB must be rejected: %q", eab)
+		}
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "eab-hmac")
+	if err := os.WriteFile(path, []byte("base64url-hmac\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(writeConfig(t, base+`  eab:
+    kid: account-1
+    hmacFile: `+path+`
+`+common+`
+certificates:
+  - name: c
+    domains: [example.com]
+`))
+	if err != nil || cfg.ACME.EAB.HMAC != "base64url-hmac" {
+		t.Fatalf("file-backed EAB = %+v, %v", cfg.ACME.EAB, err)
+	}
+}
+
 func quoteAll(in []string) []string {
 	out := make([]string, len(in))
 	for i, s := range in {

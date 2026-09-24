@@ -66,6 +66,9 @@ func (c *Config) normalizeRoot() error {
 	if c.ACME.Email == "" {
 		return fmt.Errorf("acme.email is required")
 	}
+	if (c.ACME.EAB.KID == "") != (c.ACME.EAB.HMAC == "") {
+		return fmt.Errorf("acme.eab.kid and acme.eab.hmac (or hmacFile) must be set together")
+	}
 	return validateContactEmail(c.ACME.Email)
 }
 

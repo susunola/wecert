@@ -124,6 +124,9 @@ func RejectExtraDocuments(dec *yaml.Decoder, path string) error {
 // files and the environment and make the inline ones indistinguishable.
 func inlineSecretFields(c *Config) []string {
 	var out []string
+	if c.ACME.EAB.HMAC != "" {
+		out = append(out, "acme.eab.hmac")
+	}
 	if c.DNS.LoginToken != "" {
 		out = append(out, "dns.loginToken")
 	}
