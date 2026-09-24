@@ -47,6 +47,24 @@ func OpenSealed(path string, master []byte) (*Store, error) {
 	return s, nil
 }
 
+func OpenSealedForTool(path string, master []byte) (*Store, error) {
+	s, err := OpenSealed(path, master)
+	if err == nil || !errors.Is(err, ErrLocked) {
+		return s, err
+	}
+	s, err = OpenUnlocked(path)
+	if err != nil {
+		return nil, err
+	}
+	seal, err := newSealer(master)
+	if err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	s.sealer = seal
+	return s, nil
+}
+
 // OpenUnlocked opens the state database but does **not** take the exclusive lock.
 //
 // For the tools that have to work while the daemon holds it -- `-dry-run`, `-revoke`,

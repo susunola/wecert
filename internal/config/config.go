@@ -103,11 +103,12 @@ var profileRenewBefore = map[string]time.Duration{
 
 // Config is the whole configuration.
 type Config struct {
-	StatePath   string      `yaml:"statePath"`
-	StateBackup StateBackup `yaml:"stateBackup"`
-	ACME        ACME        `yaml:"acme"`
-	DNS         DNS         `yaml:"dns"`
-	Tencent     Tencent     `yaml:"tencent"`
+	StatePath       string          `yaml:"statePath"`
+	StateBackup     StateBackup     `yaml:"stateBackup"`
+	StateEncryption StateEncryption `yaml:"stateEncryption"`
+	ACME            ACME            `yaml:"acme"`
+	DNS             DNS             `yaml:"dns"`
+	Tencent         Tencent         `yaml:"tencent"`
 	// Deploy picks where issued certificates go: the Tencent Cloud CLB path (default,
 	// the shape this program was built for) or a local nginx directory + reload.
 	Deploy       DeploySettings  `yaml:"deploy"`
@@ -119,6 +120,13 @@ type Config struct {
 	Probe        Probe           `yaml:"probe"`
 	Fallback     FailureFallback `yaml:"failureFallback"`
 	Certificates []Certificate   `yaml:"certificates"`
+}
+
+// StateEncryption protects private material stored in state.db. KeyFile is
+// environment-expanded, so systemd LoadCredential can supply it without YAML.
+type StateEncryption struct {
+	KeyFile string `yaml:"keyFile,omitempty"`
+	Key     string `yaml:"-"`
 }
 
 // Deploy target names for DeploySettings.Target and Certificate.Deploy.Target.
@@ -1163,6 +1171,17 @@ func (c *Config) resolveSecretFiles() ([]string, error) {
 	if err := resolve("acme.eab.hmac", c.ACME.EAB.HMAC, c.ACME.EAB.HMACFile,
 		[]string{"WECERT_ACME_EAB_HMAC"}, &c.ACME.EAB.HMAC); err != nil {
 		return warns, err
+	}
+	if c.StateEncryption.KeyFile != "" {
+		path := os.ExpandEnv(c.StateEncryption.KeyFile)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return warns, fmt.Errorf("read stateEncryption.keyFile %s: %w", path, err)
+		}
+		c.StateEncryption.Key = strings.TrimSpace(string(raw))
+		if c.StateEncryption.Key == "" {
+			return warns, fmt.Errorf("stateEncryption.keyFile %s is empty", path)
+		}
 	}
 
 	// The two provider blocks below are resolved only when their provider is the selected one.

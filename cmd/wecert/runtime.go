@@ -42,10 +42,21 @@ func openRuntime(f *flags, log *slog.Logger) (*config.Config, *state.Store, erro
 	}
 
 	openStore := state.Open
+	if cfg.StateEncryption.Key != "" {
+		openStore = func(path string) (*state.Store, error) {
+			return state.OpenSealed(path, []byte(cfg.StateEncryption.Key))
+		}
+	}
 	if f.dryRun {
 		// Prefers the lock and falls back when the daemon holds it: see state.OpenForTool. Opening
 		// unlocked unconditionally is what made `-dry-run` fail on a fresh installation.
-		openStore = state.OpenForTool
+		if cfg.StateEncryption.Key != "" {
+			openStore = func(path string) (*state.Store, error) {
+				return state.OpenSealedForTool(path, []byte(cfg.StateEncryption.Key))
+			}
+		} else {
+			openStore = state.OpenForTool
+		}
 	}
 	store, err := openStore(cfg.StatePath)
 	if err != nil {
