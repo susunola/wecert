@@ -212,6 +212,22 @@ func (s *Store) getCertLocked(name string) (*CertState, error) {
 	c.DeployConfirmed = deployConfirmed
 	c.OrphanCleanedAt = fromUnix(orphanCleanedAt)
 	c.UpdatedAt = fromUnix(updatedAt)
+	if s.sealer != nil {
+		if len(c.CertPEM) > 0 {
+			plain, err := s.sealer.open(c.CertPEM, []byte("certificates/cert_pem/"+c.Name))
+			if err != nil {
+				return nil, fmt.Errorf("get cert %s: %w", name, err)
+			}
+			c.CertPEM = plain
+		}
+		if len(c.KeyPEM) > 0 {
+			plain, err := s.sealer.open(c.KeyPEM, []byte("certificates/key_pem/"+c.Name))
+			if err != nil {
+				return nil, fmt.Errorf("get cert %s: %w", name, err)
+			}
+			c.KeyPEM = plain
+		}
+	}
 	return c, nil
 }
 
@@ -222,7 +238,27 @@ func (s *Store) PutCert(c *CertState) error {
 	return s.putCertLocked(c)
 }
 
-func (s *Store) putCertLocked(c *CertState) error { return putCertExec(s.db, c) }
+func (s *Store) putCertLocked(c *CertState) error {
+	if s.sealer == nil {
+		return putCertExec(s.db, c)
+	}
+	copy := *c
+	if len(copy.CertPEM) > 0 {
+		sealed, err := s.sealer.seal(copy.CertPEM, []byte("certificates/cert_pem/"+copy.Name))
+		if err != nil {
+			return fmt.Errorf("seal certificate material for %s: %w", copy.Name, err)
+		}
+		copy.CertPEM = sealed
+	}
+	if len(copy.KeyPEM) > 0 {
+		sealed, err := s.sealer.seal(copy.KeyPEM, []byte("certificates/key_pem/"+copy.Name))
+		if err != nil {
+			return fmt.Errorf("seal certificate key for %s: %w", copy.Name, err)
+		}
+		copy.KeyPEM = sealed
+	}
+	return putCertExec(s.db, &copy)
+}
 
 func putCertExec(e execer, c *CertState) error {
 	_, err := e.Exec(`

@@ -35,7 +35,8 @@ import (
 // Its methods are the writes the renewal epilogue needs. They deliberately do not lock: WithTx
 // holds the store's mutex for the whole transaction, and taking it again here would deadlock.
 type Tx struct {
-	tx *sql.Tx
+	tx     *sql.Tx
+	sealer *sealer
 }
 
 // WithTx runs fn inside a single transaction.
@@ -70,7 +71,7 @@ func (s *Store) WithTx(ctx context.Context, fn func(*Tx) error) error {
 	// Rollback after a successful Commit returns sql.ErrTxDone, which is expected and ignored.
 	defer func() { _ = tx.Rollback() }()
 
-	if err := fn(&Tx{tx: tx}); err != nil {
+	if err := fn(&Tx{tx: tx, sealer: s.sealer}); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -80,7 +81,27 @@ func (s *Store) WithTx(ctx context.Context, fn func(*Tx) error) error {
 }
 
 // PutCert writes the certificate row inside the transaction.
-func (t *Tx) PutCert(c *CertState) error { return putCertExec(t.tx, c) }
+func (t *Tx) PutCert(c *CertState) error {
+	if t.sealer == nil {
+		return putCertExec(t.tx, c)
+	}
+	copy := *c
+	if len(copy.CertPEM) > 0 {
+		sealed, err := t.sealer.seal(copy.CertPEM, []byte("certificates/cert_pem/"+copy.Name))
+		if err != nil {
+			return err
+		}
+		copy.CertPEM = sealed
+	}
+	if len(copy.KeyPEM) > 0 {
+		sealed, err := t.sealer.seal(copy.KeyPEM, []byte("certificates/key_pem/"+copy.Name))
+		if err != nil {
+			return err
+		}
+		copy.KeyPEM = sealed
+	}
+	return putCertExec(t.tx, &copy)
+}
 
 // AddRetiredCert records a certificate for reclamation inside the transaction.
 //

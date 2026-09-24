@@ -37,6 +37,13 @@ func (s *Store) GetOrder(certName string) (*Order, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get order for %s: %w", certName, err)
 	}
+	if s.sealer != nil && len(o.KeyPEM) > 0 {
+		plain, err := s.sealer.open(o.KeyPEM, []byte("orders/key_pem/"+o.CertName))
+		if err != nil {
+			return nil, fmt.Errorf("get order for %s: %w", certName, err)
+		}
+		o.KeyPEM = plain
+	}
 	o.ExpiresAt = fromUnix(expiresAt)
 	return o, nil
 }
@@ -46,6 +53,14 @@ func (s *Store) GetOrder(certName string) (*Order, error) {
 func (s *Store) PutOrder(o *Order) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := o.KeyPEM
+	if s.sealer != nil && len(key) > 0 {
+		var err error
+		key, err = s.sealer.seal(key, []byte("orders/key_pem/"+o.CertName))
+		if err != nil {
+			return fmt.Errorf("seal order key for %s: %w", o.CertName, err)
+		}
+	}
 	_, err := s.db.Exec(`
 		INSERT INTO orders (
 			cert_name, order_url, finalize_url, cert_url, expires_at, status, key_pem, identifiers, deployment_cert_id, updated_at
@@ -62,7 +77,7 @@ func (s *Store) PutOrder(o *Order) error {
 			deployment_cert_id = excluded.deployment_cert_id,
 			updated_at   = excluded.updated_at`,
 		o.CertName, o.OrderURL, o.FinalizeURL, o.CertURL, toUnix(o.ExpiresAt), o.Status,
-		o.KeyPEM, o.Identifiers, o.DeploymentCertID, time.Now().Unix())
+		key, o.Identifiers, o.DeploymentCertID, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("put order for %s: %w", o.CertName, err)
 	}
