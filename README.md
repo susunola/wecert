@@ -250,6 +250,11 @@ runs the reload argv (never a shell string). The file pair *is* the deployment: 
 cloud certificate id and no console bind, so a successful write counts as confirmed. Point
 `ssl_certificate` / `ssl_certificate_key` in the server block at those two files.
 
+
+If you only need the material **copied somewhere** (another host, a backup bucket) without
+making this machine serve it, use `certificates[].export` instead of `deploy.target: nginx`.
+Export is distribution; deploy is putting the certificate into service. Both can be on.
+
 One process deploys to one backend (`deploy.target: tencent` or `nginx`); mixing CLB and
 nginx in one config is refused at load time. The unit runs as user `wecert`, which cannot
 reload nginx by itself — allow exactly that command in sudoers, use a helper script, or set
