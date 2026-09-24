@@ -68,15 +68,16 @@ More on both in [Why this exists](README.reference.md#why-this-exists).
 
 ## Requirements
 
-- **A Tencent Cloud account** with a CLB (layer-7 listener) and the CAM permissions in
-  [`deploy/cam-policy-runtime.json`](deploy/README.md): SSL upload/describe/delete plus DNSPod
-  record writes. Credentials come from a CVM role, the environment, or the config file.
+- **A Tencent Cloud account** with a CLB (layer-7 listener) and the SSL/CLB CAM permissions in
+  [`deploy/cam-policy-runtime.json`](deploy/README.md). Add DNSPod CAM permissions only when
+  `dns.provider: tencentcloud`; Cloudflare and Route 53 use their own scoped credentials.
+  Credentials come from a CVM role, the environment, or the config file.
 - **A DNS zone you control**, hosted in **DNSPod** (API token), **Tencent Cloud DNS** (the same CAM
   credentials), **Cloudflare** (a scoped API token) or **Route 53** (AWS credentials — an EC2
   instance role needs no key at all). Let's Encrypt validates over DNS-01, so the zone has to be
   reachable by API and correctly delegated.
-- **A host to run on** — any CVM that can reach the Tencent Cloud API. It does not have to be
-  reachable from the internet.
+- **A host to run on** — any CVM that can reach Tencent Cloud, the selected DNS provider, the ACME
+  directory, and DNS resolvers. It does not have to accept inbound internet traffic.
 - **Go 1.26+**, only if you build from source. Release binaries are static for linux/amd64,
   linux/arm64 and darwin/arm64.
 
@@ -486,6 +487,7 @@ Deletion is deliberately an order of magnitude more conservative than addition, 
 - [Configuration reference](README.reference.md#configuration-reference) · [Operations](README.reference.md#operations) · [Metrics and alerting](README.reference.md#metrics-and-alerting).
 - [Alert rules](deploy/prometheus/wecert-alerts.yml) — load straight into Prometheus; each threshold says where the number came from.
 - [Recovery](docs/recovery.md) — what is in `state.db`, what each loss costs, and how to restore a snapshot and verify it before starting.
+- [Real staging E2E record (2026-09-24)](docs/e2e-run-2026-09-24.md) — two independent Cloudflare, S3, COS and CLB runs, including restore evidence and their scope.
 - [Availability](docs/availability.md) — what a restart already survives, why a second process on the same host would be redundant, and the three real options with what each costs.
 - [Backlog](docs/backlog.md) — what is worth doing next, ordered by real exposure over effort.
 

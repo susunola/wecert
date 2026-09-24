@@ -52,9 +52,9 @@ Let's Encrypt 的证书不花钱，代价是有效期很短 —— 目前是 90 
 
 ## 前置条件
 
-- **一个腾讯云账号**，账号下有 CLB（七层监听器），并具备 [`deploy/cam-policy-runtime.json`](deploy/README.md) 里的 CAM 权限：SSL 上传 / 查询 / 删除，以及 DNSPod 记录写入。凭证来自 CVM 角色、环境变量或配置文件。
+- **一个腾讯云账号**，账号下有 CLB（七层监听器），并具备 [`deploy/cam-policy-runtime.json`](deploy/README.md) 里的 SSL/CLB CAM 权限。仅在 `dns.provider: tencentcloud` 时才需要 DNSPod CAM 权限；Cloudflare 与 Route 53 使用各自受限凭证。凭证来自 CVM 角色、环境变量或配置文件。
 - **一个你掌控的 DNS zone**，托管在 **DNSPod**（API token）、**腾讯云 DNS**（同一套 CAM 凭证）、**Cloudflare**（受限 API token）或 **Route 53**（AWS 凭证，EC2 实例角色即可）上。Let's Encrypt 走 DNS-01 验证，所以这个 zone 必须能通过 API 访问，并且委派正确。
-- **一台运行的机器** —— 任意能访问腾讯云 API 的 CVM 都行。它不需要能从公网访问。
+- **一台运行的机器** —— 需要能访问腾讯云、所选 DNS provider、ACME directory 和 DNS resolver；不需要接受公网入站连接。
 - **Go 1.26+**，只在从源码编译时才需要。Release 二进制是静态的，覆盖 linux/amd64、linux/arm64 与 darwin/arm64。
 
 开始之前需要知道一件事：**首次签发需要人工在 CLB 控制台绑定一次。** 此时腾讯云侧还没有"旧证书"可供反查监听器，所以 wecert 只会上传然后停下，由你去绑一次。之后的每一次续期都是全自动的。
@@ -349,6 +349,7 @@ CA/Browser Forum 已排期 **2027-03-15 起 ≤100 天、2029-03-15 起 ≤47 �
 - [配置参考](README.reference.zh-CN.md#配置参考) · [运维](README.reference.zh-CN.md#运维) · [监控与告警](README.reference.zh-CN.md#监控与告警)。
 - [告警规则](deploy/prometheus/wecert-alerts.yml) —— 可以直接加载进 Prometheus；每条阈值都写明了这个数字是怎么来的。
 - [恢复](docs/recovery.md) —— `state.db` 里有什么、每种丢失的代价，以及怎么恢复一份快照并在启动前验证它。
+- [真实 staging E2E 记录（2026-09-24）](docs/e2e-run-2026-09-24.md) —— 两轮 Cloudflare、S3、COS 与 CLB 实跑，含恢复证据与覆盖范围。
 - [可用性](docs/availability.md) —— 重启已经能扛住什么、为什么同一台机器上的第二个进程是多余的，以及三个真实可选方案各自的代价。
 - [backlog](docs/backlog.md) —— 接下来值得做什么，按"真实暴露面 / 工作量"排序。
 
