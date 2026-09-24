@@ -79,6 +79,13 @@ acme:
   # fallbackDirectories:
   #   - https://acme.example.net/directory
 
+  # Optional External Account Binding for an ACME CA that requires it. Keep the
+  # HMAC out of this file: hmacFile is environment-expanded, so systemd
+  # LoadCredential works. Both kid and HMAC are required together.
+  # eab:
+  #   kid: account-binding-id
+  #   hmacFile: ${CREDENTIALS_DIRECTORY}/acme-eab-hmac
+
   # ⚠️ Replace this with a mailbox you can read. It is where the CA sends expiry and
   #    revocation notices, and Let's Encrypt REFUSES the reserved documentation domains
   #    (example.com, example.net, example.org, ...) when it registers the account: the

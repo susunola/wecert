@@ -662,6 +662,7 @@ instruction, not later when the solver is constructed.
 |---|---|---|
 | `directory` | yes | ACME directory URL. Staging: `https://acme-staging-v02.api.letsencrypt.org/directory`. Production: `https://acme-v02.api.letsencrypt.org/directory` |
 | `email` | yes | Contact address for the ACME account |
+| `eab.kid` + `eab.hmac` | together, when the selected CA requires EAB | — | External Account Binding identifier and base64url HMAC. Prefer `eab.hmacFile` or `WECERT_ACME_EAB_HMAC`; both values are required together. The binding is used only while registering an account, never emitted in logs. |
 
 ### `dns`
 
