@@ -33,6 +33,13 @@ func (s *Store) GetAccount(directory string) (*Account, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get account: %w", err)
 	}
+	if s.sealer != nil && len(a.PrivateKeyPEM) > 0 {
+		plain, err := s.sealer.open(a.PrivateKeyPEM, []byte("accounts/private_key_pem/"+a.Directory))
+		if err != nil {
+			return nil, fmt.Errorf("get account: %w", err)
+		}
+		a.PrivateKeyPEM = plain
+	}
 	return a, nil
 }
 
@@ -59,6 +66,14 @@ func (s *Store) PutAccountWithoutKey(directory, kid string) error {
 func (s *Store) PutAccount(a *Account) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := a.PrivateKeyPEM
+	if s.sealer != nil && len(key) > 0 {
+		var err error
+		key, err = s.sealer.seal(key, []byte("accounts/private_key_pem/"+a.Directory))
+		if err != nil {
+			return fmt.Errorf("seal account key: %w", err)
+		}
+	}
 	_, err := s.db.Exec(`
 		INSERT INTO accounts (directory, kid, private_key_pem, updated_at)
 		VALUES (?, ?, ?, ?)
@@ -66,7 +81,7 @@ func (s *Store) PutAccount(a *Account) error {
 			kid = excluded.kid,
 			private_key_pem = excluded.private_key_pem,
 			updated_at = excluded.updated_at`,
-		a.Directory, a.KID, a.PrivateKeyPEM, time.Now().Unix())
+		a.Directory, a.KID, key, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("put account: %w", err)
 	}

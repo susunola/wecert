@@ -25,6 +25,24 @@ import (
 
 func Open(path string) (*Store, error) { return open(path, true) }
 
+// OpenSealed opens a state store whose private-key columns are authenticated and
+// encrypted with master. It deliberately has a separate entry point: silently
+// deriving a key from an ambient environment variable would turn a typo into an
+// unreadable database on the next restart.
+func OpenSealed(path string, master []byte) (*Store, error) {
+	s, err := open(path, true)
+	if err != nil {
+		return nil, err
+	}
+	seal, err := newSealer(master)
+	if err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+	s.sealer = seal
+	return s, nil
+}
+
 // OpenUnlocked opens the state database but does **not** take the exclusive lock.
 //
 // For the tools that have to work while the daemon holds it -- `-dry-run`, `-revoke`,

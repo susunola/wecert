@@ -32,6 +32,9 @@ type execer interface {
 
 type Store struct {
 	db *sql.DB
+	// sealer is optional so existing plaintext state databases remain readable
+	// until an explicit, atomic migration enables at-rest key encryption.
+	sealer *sealer
 
 	// mu serialises whole operations, not individual statements.
 	//
