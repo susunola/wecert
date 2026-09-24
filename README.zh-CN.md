@@ -202,6 +202,8 @@ curl --fail --silent --show-error \
 
 用浏览器打开 `console.html`，即可搜索、筛选和查看详情。它是静态快照，更新数据需重新获取。需要在线刷新时，按[回环代理与 SSH 隧道示例](docs/console.md#live-browser-access)配置浏览器入口，或使用已有的鉴权 HTTPS 网关。页面依赖持续运行的 daemon；每小时执行一次的 `-once` timer 不会维持监听。完整开启步骤与状态含义见 [Console 使用说明](docs/console.md)。
 
+事故处理中可使用带鉴权、明确只读的 `POST /diagnostics/desired-state`：它刷新声明/期望状态缓存并返回 revision 与证书名，绝不会触发签发、部署或恢复。
+
 ### 热加载配置与凭据
 
 daemon 模式下，修改策略、证书声明、DNS 或云凭据、通知配置或 webhook token 后，可发送 `SIGHUP`：

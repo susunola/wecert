@@ -305,6 +305,11 @@ or your existing authenticated TLS gateway. The console needs a running daemon;
 an hourly `-once` timer does not keep the listener available. See the
 [console guide](docs/console.md) for access setup and status definitions.
 
+For an authenticated, explicitly read-only incident check, call
+`POST /diagnostics/desired-state`. It refreshes the declaration/desired-state
+cache and returns its revision and certificate names; it never starts issuance,
+deployment, or restore.
+
 ### Reloading configuration and credentials
 
 In daemon mode, send `SIGHUP` after changing policy, certificates, DNS or cloud

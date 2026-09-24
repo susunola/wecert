@@ -18,6 +18,9 @@ func (s *Server) Handler() http.Handler {
 	if dr, ok := s.rec.(DesiredReader); ok {
 		mux.HandleFunc("/hook/desired", s.auth(s.handleDesired(dr)))
 	}
+	if dr, ok := s.rec.(DesiredRefresher); ok {
+		mux.HandleFunc("/diagnostics/desired-state", s.auth(s.handleDesiredDiagnostic(dr)))
+	}
 
 	return mux
 }

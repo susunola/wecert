@@ -68,6 +68,11 @@ func (c *runtimeController) LastResult() *spec.Result {
 	defer c.mu.RUnlock()
 	return c.rec.LastResult()
 }
+func (c *runtimeController) Prime(ctx context.Context) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	c.rec.Prime(ctx)
+}
 func (c *runtimeController) ProbeEnabled() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

@@ -76,6 +76,14 @@ type DesiredReader interface {
 	LastResult() *spec.Result
 }
 
+// DesiredRefresher is the deliberately read-only diagnostic capability. It
+// refreshes the desired-state cache (which may read DNS/CLB declarations) but
+// never starts reconciliation, places an ACME order or changes cloud resources.
+type DesiredRefresher interface {
+	DesiredReader
+	Prime(context.Context)
+}
+
 // Server provides the trigger and status endpoints.
 //
 // baseCtx is a **process-level** context, not a request's. The background

@@ -4,6 +4,10 @@
 
 ### Added
 
+- **Read-only desired-state diagnostic.** Authenticated
+  `POST /diagnostics/desired-state` refreshes and reports declarations without
+  starting issuance, deployment or recovery.
+
 - **Standby ACME directories.** `acme.fallbackDirectories` supplies lazily
   initialised standby CAs. They are used only for a primary directory transport
   or server outage, or an account-wide new-order refusal; order URLs are routed
