@@ -48,10 +48,25 @@ func (s *Store) migrateSealedMaterial() error {
 				rows.Close()
 				return err
 			}
-			if bytes.HasPrefix(blob, sealedPrefix) {
+			if bytes.HasPrefix(blob, sealedPrefixV2) {
 				continue
 			}
-			sealed, err := s.sealer.seal(blob, []byte(spec.aad+id))
+			// Plaintext or v1: seal (or re-seal) with the current KDF.
+			//
+			// A v1 blob must be OPENED first. Sealing its ciphertext would store
+			// v2(v1(plain)) and the next open would peel only the v2 layer, handing
+			// the caller a second AEAD blob instead of the private key -- a silent
+			// brick that unit tests of seal/open alone cannot see.
+			plain := blob
+			if isSealedV1(blob) {
+				opened, err := s.sealer.open(blob, []byte(spec.aad+id))
+				if err != nil {
+					rows.Close()
+					return fmt.Errorf("open v1-sealed %s.%s %q for re-seal: %w", spec.table, spec.column, id, err)
+				}
+				plain = opened
+			}
+			sealed, err := s.sealer.seal(plain, []byte(spec.aad+id))
 			if err != nil {
 				rows.Close()
 				return err

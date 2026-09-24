@@ -97,7 +97,3 @@ func (n *Notifier) pagerdutyPayload(ev RenewalEvent) ([]byte, error) {
 	}
 	return json.Marshal(payload)
 }
-
-// errSkipPagerDutySuccess means "not an incident": send() logs at Debug and
-// returns without treating it as a delivery failure.
-var errSkipPagerDutySuccess = fmt.Errorf("pagerduty: success renewals do not page")

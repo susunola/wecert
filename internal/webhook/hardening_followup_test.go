@@ -81,3 +81,16 @@ func TestRedactSecretsStripsURLCredentials(t *testing.T) {
 		t.Errorf("secret-bearing URL must be redacted, got %q", got)
 	}
 }
+
+func TestRedactSecretsStripsBearerAKIDAndPEM(t *testing.T) {
+	got := redactSecrets("auth Bearer AbcDef1234567890 key AKIA0123456789ABCDEF " +
+		"block -----BEGIN PRIVATE KEY-----\nMII...\n-----END PRIVATE KEY----- token=supersecret99")
+	for _, leak := range []string{"AbcDef1234567890", "AKIA0123456789ABCDEF", "MII...", "supersecret99"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("redactSecrets leaked %q in %q", leak, got)
+		}
+	}
+	if !strings.Contains(got, "Bearer") {
+		t.Errorf("the scheme should stay so the operator sees a token was there, got %q", got)
+	}
+}

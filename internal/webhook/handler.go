@@ -28,7 +28,10 @@ func (s *Server) Handler() http.Handler {
 	// Guarded admin surface. Mounted only when an admin token is configured: a
 	// read-only token (Token) cannot reach these routes, and without AdminToken the
 	// process stays read-only over the network.
-	if s.adminToken != "" {
+	//
+	// adminEnabled, not a bare field read: SetAdminToken rotates the secret under
+	// tokenMu, and reading s.adminToken here while SIGHUP does that is a data race.
+	if s.adminEnabled() {
 		mux.HandleFunc("/admin/backup-health", s.adminAuth(s.handleAdminBackupHealth()))
 		mux.HandleFunc("/admin/recovery-plan", s.adminAuth(s.handleAdminRecoveryPlan()))
 		mux.HandleFunc("/admin/recovery-drill", s.adminAuth(s.handleAdminRecoveryDrill()))

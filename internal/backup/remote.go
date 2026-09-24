@@ -34,6 +34,10 @@ const (
 // Target contains no secret value. S3/COS use the AWS credential chain; SFTP
 // reads a password from PasswordEnv or a private key from PrivateKeyFile.
 type Target struct {
+	// HMACKey, when non-empty, makes Upload write a <object>.hmac sidecar and
+	// DownloadLatest refuse an object whose sidecar is missing or does not match.
+	// It is NOT the state-encryption master key.
+	HMACKey                                                                                         []byte
 	Type, Name, Bucket, Prefix, Endpoint, Region                                                    string
 	Host, Username, RemoteDir, PasswordEnv, PrivateKeyFile, PrivateKeyPassphraseEnv, KnownHostsFile string
 	SecretIDEnv, SecretKeyEnv                                                                       string
@@ -47,6 +51,33 @@ type Target struct {
 // Upload sends src under its base name. S3 PutObject is all-or-nothing; SFTP
 // writes a sibling temporary name and renames it only after Close succeeds.
 func Upload(ctx context.Context, target Target, src string) error {
+	return uploadWithSignature(ctx, target, src)
+}
+
+// uploadWithSignature is Upload plus the optional HMAC sidecar. The sidecar is the
+// only thing that later proves "this object came from us" -- without it a writable
+// backup prefix is a restore source for an attacker.
+func uploadWithSignature(ctx context.Context, target Target, src string) error {
+	if len(target.HMACKey) == 0 {
+		return uploadOnce(ctx, target, src)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("read snapshot to sign: %w", err)
+	}
+	sig := SignSnapshot(target.HMACKey, data)
+	if err := uploadOnce(ctx, target, src); err != nil {
+		return err
+	}
+	tmp := src + ".hmac"
+	if err := os.WriteFile(tmp, []byte(sig+"\n"), 0o600); err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	return uploadOnce(ctx, target, tmp)
+}
+
+func uploadOnce(ctx context.Context, target Target, src string) error {
 	if target.Timeout <= 0 {
 		target.Timeout = 5 * time.Minute
 	}
@@ -134,14 +165,22 @@ func DownloadLatest(ctx context.Context, target Target, dir string) (string, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, target.Timeout)
 	defer cancel()
+	var (
+		src string
+		err error
+	)
 	switch target.Type {
 	case TypeS3, TypeCOS:
-		return downloadS3(ctx, target, dir)
+		src, err = downloadS3(ctx, target, dir)
 	case TypeSFTP:
-		return downloadSFTP(ctx, target, dir)
+		src, err = downloadSFTP(ctx, target, dir)
 	default:
 		return "", fmt.Errorf("unknown backup target type %q", target.Type)
 	}
+	if err != nil {
+		return "", err
+	}
+	return src, nil
 }
 
 type sftpSession struct {
@@ -203,6 +242,51 @@ func openSFTP(ctx context.Context, t Target) (*sftpSession, error) {
 }
 
 func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
+	src, err := downloadSFTPFile(ctx, t, dir)
+	if err != nil {
+		return "", err
+	}
+	if len(t.HMACKey) > 0 {
+		if err := verifySFTPSignature(t, src); err != nil {
+			_ = os.Remove(src)
+			return "", err
+		}
+	}
+	return src, nil
+}
+
+func verifySFTPSignature(t Target, src string) error {
+	sess, err := openSFTP(context.Background(), t)
+	if err != nil {
+		return fmt.Errorf("snapshot signature: %w", err)
+	}
+	defer sess.Close()
+	name := filepath.Base(src)
+	// The remote sidecar is the snapshot's own name + .hmac; the local temp name
+	// differs. Read the remote key left beside the download.
+	keyBytes, err := os.ReadFile(src + ".remotekey")
+	if err != nil {
+		return fmt.Errorf("snapshot signature: %w", err)
+	}
+	remoteName := strings.TrimSpace(string(keyBytes))
+	f, err := sess.client.Open(filepath.Join(t.RemoteDir, remoteName+".hmac"))
+	if err != nil {
+		return fmt.Errorf("snapshot signature missing (%s.hmac): %w", remoteName, err)
+	}
+	defer f.Close()
+	sig, err := io.ReadAll(io.LimitReader(f, 4096))
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	_ = name
+	return VerifySnapshot(t.HMACKey, data, string(sig))
+}
+
+func downloadSFTPFile(ctx context.Context, t Target, dir string) (string, error) {
 	session, err := openSFTP(ctx, t)
 	if err != nil {
 		return "", err
@@ -214,7 +298,7 @@ func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
 	}
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasPrefix(e.Name(), t.SnapshotBase+".backup-") {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), t.SnapshotBase+".backup-") && !strings.HasSuffix(e.Name(), ".hmac") {
 			names = append(names, e.Name())
 		}
 	}
@@ -222,7 +306,8 @@ func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
 		return "", fmt.Errorf("no SFTP snapshots in %s", t.RemoteDir)
 	}
 	sort.Strings(names)
-	in, err := session.client.Open(path.Join(t.RemoteDir, names[len(names)-1]))
+	remoteName := names[len(names)-1]
+	in, err := session.client.Open(path.Join(t.RemoteDir, remoteName))
 	if err != nil {
 		return "", fmt.Errorf("open SFTP snapshot: %w", err)
 	}
@@ -249,6 +334,8 @@ func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
 	if err = out.Close(); err != nil {
 		return "", err
 	}
+	// See downloadS3Object: the sidecar is named after the remote file.
+	_ = os.WriteFile(name+".remotekey", []byte(remoteName), 0o600)
 	ok = true
 	return name, nil
 }
@@ -284,6 +371,43 @@ func objectClient(ctx context.Context, t Target) (*s3.Client, error) {
 }
 
 func downloadS3(ctx context.Context, t Target, dir string) (string, error) {
+	src, err := downloadS3Object(ctx, t, dir)
+	if err != nil {
+		return "", err
+	}
+	if err := verifyAgainstSidecar(ctx, t, src); err != nil {
+		_ = os.Remove(src)
+		return "", err
+	}
+	return src, nil
+}
+
+// verifyAgainstSidecar checks the downloaded snapshot against its remote .hmac.
+// Fail closed when a signing key is configured: a writable backup prefix is not a
+// trusted restore source.
+func verifyAgainstSidecar(ctx context.Context, t Target, src string) error {
+	if len(t.HMACKey) == 0 {
+		return nil
+	}
+	// The sidecar name is the remote object key + ".hmac"; downloadS3Object leaves
+	// the remote key in a sidecar file src+".remotekey".
+	keyBytes, err := os.ReadFile(src + ".remotekey")
+	if err != nil {
+		return fmt.Errorf("snapshot signature: %w", err)
+	}
+	remoteKey := strings.TrimSpace(string(keyBytes))
+	sig, err := downloadS3Bytes(ctx, t, remoteKey+".hmac")
+	if err != nil {
+		return fmt.Errorf("snapshot signature missing or unreadable (%s.hmac): %w", remoteKey, err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("read downloaded snapshot: %w", err)
+	}
+	return VerifySnapshot(t.HMACKey, data, string(sig))
+}
+
+func downloadS3Object(ctx context.Context, t Target, dir string) (string, error) {
 	client, err := objectClient(ctx, t)
 	if err != nil {
 		return "", err
@@ -296,6 +420,11 @@ func downloadS3(ctx context.Context, t Target, dir string) (string, error) {
 	var newest *types.Object
 	for i := range objects {
 		o := &objects[i]
+		// Sidecars are not snapshots. A ".hmac" sibling sorts after its object in
+		// lexicographic order, so "newest" would otherwise always be the signature.
+		if o.Key != nil && strings.HasSuffix(*o.Key, ".hmac") {
+			continue
+		}
 		if newest == nil || (o.Key != nil && newest.Key != nil && *o.Key > *newest.Key) {
 			newest = o
 		}
@@ -334,6 +463,11 @@ func downloadS3(ctx context.Context, t Target, dir string) (string, error) {
 	}
 	if fileErr != nil {
 		return "", fileErr
+	}
+	// Remember which remote object this temp file came from: the .hmac sidecar is
+	// named after the remote key, not the random local temp name.
+	if newest.Key != nil {
+		_ = os.WriteFile(name+".remotekey", []byte(*newest.Key), 0o600)
 	}
 	ok = true
 	return name, nil
@@ -375,13 +509,30 @@ func pruneS3(ctx context.Context, client *s3.Client, t Target, current string) e
 	if err != nil {
 		return fmt.Errorf("list remote snapshots: %w", err)
 	}
+	// Only real snapshots count against Keep. A ".hmac" sidecar is not a recovery
+	// point: counting it made keep=1 with one snapshot + one sidecar delete the
+	// snapshot and leave the signature orphaned.
+	var snapshots []types.Object
+	for _, object := range objects {
+		if object.Key != nil && strings.HasSuffix(*object.Key, ".hmac") {
+			continue
+		}
+		snapshots = append(snapshots, object)
+	}
 	// Snapshot names sort chronologically, and only this deployment's base name is uploaded by one target.
-	if len(objects) <= t.Keep {
+	if len(snapshots) <= t.Keep {
 		return nil
 	}
 	var victims []types.ObjectIdentifier
-	for _, object := range objects[:len(objects)-t.Keep] {
+	for _, object := range snapshots[:len(snapshots)-t.Keep] {
 		victims = append(victims, types.ObjectIdentifier{Key: object.Key})
+		// Drop the sidecar with its snapshot. Leaving it behind makes the prefix
+		// look signed for an object that is gone, and a later restore that picks
+		// a still-present sibling would see a stale signature name in listings.
+		if object.Key != nil {
+			sidecar := *object.Key + ".hmac"
+			victims = append(victims, types.ObjectIdentifier{Key: &sidecar})
+		}
 	}
 	if t.Type == TypeCOS {
 		// COS requires Content-MD5 for the S3 multi-object delete payload. The AWS
@@ -532,8 +683,12 @@ func pruneSFTP(client *sftp.Client, t Target, current string) error {
 	base := strings.Split(current, ".backup-")[0] + ".backup-"
 	var names []string
 	for _, entry := range entries {
-		if !entry.IsDir() && entry.Name() != current && strings.HasPrefix(entry.Name(), base) {
-			names = append(names, entry.Name())
+		name := entry.Name()
+		if entry.IsDir() || name == current || strings.HasSuffix(name, ".hmac") {
+			continue
+		}
+		if strings.HasPrefix(name, base) {
+			names = append(names, name)
 		}
 	}
 	if len(names) < t.Keep {
@@ -544,6 +699,9 @@ func pruneSFTP(client *sftp.Client, t Target, current string) error {
 		if err := client.Remove(path.Join(t.RemoteDir, name)); err != nil {
 			return fmt.Errorf("prune SFTP snapshot %s: %w", name, err)
 		}
+		// Sidecar goes with its snapshot; a missing one is fine (older uploads
+		// were unsigned).
+		_ = client.Remove(path.Join(t.RemoteDir, name+".hmac"))
 	}
 	return nil
 }
@@ -563,4 +721,18 @@ func (e errUploadedPruneFailed) Unwrap() error { return e.err }
 func IsUploaded(err error) bool {
 	var p errUploadedPruneFailed
 	return errors.As(err, &p)
+}
+
+// downloadS3Bytes fetches one object body (used for the .hmac sidecar).
+func downloadS3Bytes(ctx context.Context, t Target, key string) ([]byte, error) {
+	client, err := objectClient(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	obj, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: &t.Bucket, Key: &key})
+	if err != nil {
+		return nil, err
+	}
+	defer obj.Body.Close()
+	return io.ReadAll(io.LimitReader(obj.Body, 4096))
 }

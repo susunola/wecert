@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -25,11 +26,19 @@ type AdminOps struct {
 	// BackupHealth reports local + remote snapshot posture (ages, last verify).
 	BackupHealth func(ctx context.Context) (any, error)
 	// RecoveryPlan is the non-destructive "what would a restore do" report.
-	RecoveryPlan func(ctx context.Context) (any, error)
+	RecoveryPlan func(ctx context.Context, source string) (any, error)
 	// RecoveryDrill downloads/opens a snapshot without touching live state.
-	RecoveryDrill func(ctx context.Context) (any, error)
+	RecoveryDrill func(ctx context.Context, source string) (any, error)
 	// Restore actually replaces the state database. Requires a confirm challenge.
 	Restore func(ctx context.Context, source string) (any, error)
+}
+
+// confirmGrant is a one-shot restore ticket. Source, when non-empty, is the only
+// snapshot the token may restore: minting a token for "latest" must not also
+// authorise some other path the caller slips in later.
+type confirmGrant struct {
+	expires time.Time
+	source  string
 }
 
 // AdminTokenMinLen is re-exported for the config comment; see config.WebhookAdminTokenMinLen.
@@ -119,8 +128,15 @@ func (s *Server) handleAdminRecoveryPlan() http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "recovery plan is not wired"})
 			return
 		}
-		s.audit(r, "admin_recovery_plan", nil)
-		out, err := s.ops.RecoveryPlan(r.Context())
+		var body struct {
+			Source string `json:"source"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Source == "" {
+			body.Source = "latest"
+		}
+		s.audit(r, "admin_recovery_plan", map[string]any{"source": body.Source})
+		out, err := s.ops.RecoveryPlan(r.Context(), body.Source)
 		if err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
@@ -141,8 +157,15 @@ func (s *Server) handleAdminRecoveryDrill() http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "recovery drill is not wired"})
 			return
 		}
-		s.audit(r, "admin_recovery_drill", nil)
-		out, err := s.ops.RecoveryDrill(r.Context())
+		var body struct {
+			Source string `json:"source"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Source == "" {
+			body.Source = "latest"
+		}
+		s.audit(r, "admin_recovery_drill", map[string]any{"source": body.Source})
+		out, err := s.ops.RecoveryDrill(r.Context(), body.Source)
 		if err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
@@ -170,42 +193,84 @@ func (s *Server) handleAdminChallenge() http.HandlerFunc {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "cannot issue a confirm token"})
 			return
 		}
+		var body struct {
+			Source string `json:"source"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be JSON with source"})
+			return
+		}
+		if strings.TrimSpace(body.Source) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "source is required: the confirm token is bound to one restore source (latest, a snapshot path, or remote:<name>)",
+			})
+			return
+		}
+
 		s.confirmMu.Lock()
 		if s.confirms == nil {
-			s.confirms = map[string]time.Time{}
+			s.confirms = map[string]confirmGrant{}
 		}
 		// Drop expired while we are here; the map is small but it is unbounded otherwise.
 		now := s.now()
-		for k, exp := range s.confirms {
-			if now.After(exp) {
+		for k, g := range s.confirms {
+			if now.After(g.expires) {
 				delete(s.confirms, k)
 			}
 		}
 		exp := now.Add(adminConfirmTTL)
-		s.confirms[tok] = exp
+		s.confirms[tok] = confirmGrant{expires: exp, source: body.Source}
 		s.confirmMu.Unlock()
-		s.audit(r, "admin_challenge_issued", map[string]any{"ttlSeconds": int(adminConfirmTTL.Seconds())})
+		s.audit(r, "admin_challenge_issued", map[string]any{"ttlSeconds": int(adminConfirmTTL.Seconds()), "source": body.Source})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"confirmToken": tok,
 			"expiresAt":    exp.UTC().Format(time.RFC3339),
 			"action":       "restore",
+			"source":       body.Source,
 			"hint":         "POST /admin/restore with this token in confirmToken. It expires; issue a new one if it does.",
 		})
 	}
 }
 
-func (s *Server) consumeConfirmToken(tok string) bool {
+// confirmReject is why a restore confirm token was refused. The audit line and
+// the 403 body must say which one: "missing or expired" for a source mismatch
+// trains operators to re-issue the same token forever.
+type confirmReject string
+
+const (
+	confirmOK             confirmReject = ""
+	confirmMissing        confirmReject = "missing"
+	confirmExpired        confirmReject = "expired"
+	confirmSourceMismatch confirmReject = "source_mismatch"
+	confirmWildcardToken  confirmReject = "wildcard_token"
+)
+
+// consumeConfirmToken burns a one-shot restore ticket. Empty return means the
+// ticket is good for exactly this source.
+func (s *Server) consumeConfirmToken(tok, source string) confirmReject {
 	if tok == "" {
-		return false
+		return confirmMissing
 	}
 	s.confirmMu.Lock()
 	defer s.confirmMu.Unlock()
-	exp, ok := s.confirms[tok]
+	g, ok := s.confirms[tok]
 	if !ok {
-		return false
+		return confirmMissing
 	}
 	delete(s.confirms, tok) // one-shot
-	return s.now().Before(exp)
+	if !s.now().Before(g.expires) {
+		return confirmExpired
+	}
+	// A token minted for a source restores only that source. An empty grant source
+	// must not happen any more (challenge requires it) -- refuse rather than honour
+	// a wildcard, and say so in the audit line.
+	if g.source == "" {
+		return confirmWildcardToken
+	}
+	if g.source != source {
+		return confirmSourceMismatch
+	}
+	return confirmOK
 }
 
 // handleAdminRestore is the only destructive route. It needs BOTH the admin token
@@ -233,11 +298,17 @@ func (s *Server) handleAdminRestore() http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source is required (snapshot path, directory, or \"latest\")"})
 			return
 		}
-		if !s.consumeConfirmToken(body.ConfirmToken) {
-			s.audit(r, "admin_restore_refused", map[string]any{"source": body.Source, "reason": "missing or expired confirmToken"})
-			writeJSON(w, http.StatusForbidden, map[string]string{
-				"error": "a short-lived confirm token is required: POST /admin/challenge first, then retry with confirmToken",
-			})
+		if reason := s.consumeConfirmToken(body.ConfirmToken, body.Source); reason != confirmOK {
+			s.audit(r, "admin_restore_refused", map[string]any{"source": body.Source, "reason": string(reason)})
+			msg := "a short-lived confirm token is required: POST /admin/challenge first, then retry with confirmToken"
+			if reason == confirmSourceMismatch {
+				msg = "the confirm token is bound to another restore source; issue a new challenge for this source"
+			} else if reason == confirmExpired {
+				msg = "the confirm token has expired; issue a new challenge"
+			} else if reason == confirmWildcardToken {
+				msg = "the confirm token is not bound to a source and is refused; issue a new challenge with source"
+			}
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": msg})
 			return
 		}
 		s.audit(r, "admin_restore_started", map[string]any{"source": body.Source})

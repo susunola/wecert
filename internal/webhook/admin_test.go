@@ -63,7 +63,7 @@ func TestAdminSurfaceRequiresTheAdminToken(t *testing.T) {
 	}
 }
 
-// Restore needs a one-shot confirm token from /admin/challenge.
+// Restore needs a one-shot confirm token from /admin/challenge, bound to one source.
 func TestAdminRestoreRequiresAConfirmChallenge(t *testing.T) {
 	restored := 0
 	s := adminServer(t, AdminOps{
@@ -80,8 +80,14 @@ func TestAdminRestoreRequiresAConfirmChallenge(t *testing.T) {
 		t.Fatalf("restore without challenge = %d restored=%d", w.Code, restored)
 	}
 
-	// Issue a challenge, then restore.
-	w = do(t, s, http.MethodPost, "/admin/challenge", "", auth)
+	// Challenge without source is refused: the token is bound to one restore source.
+	w = do(t, s, http.MethodPost, "/admin/challenge", `{}`, auth)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("challenge without source = %d, want 400", w.Code)
+	}
+
+	// Issue a challenge for "latest", then restore that source.
+	w = do(t, s, http.MethodPost, "/admin/challenge", `{"source":"latest"}`, auth)
 	if w.Code != http.StatusOK {
 		t.Fatalf("challenge = %d %s", w.Code, w.Body.String())
 	}
@@ -101,6 +107,43 @@ func TestAdminRestoreRequiresAConfirmChallenge(t *testing.T) {
 	w = do(t, s, http.MethodPost, "/admin/restore", body, auth)
 	if w.Code != http.StatusForbidden || restored != 1 {
 		t.Fatalf("second restore with the same token = %d restored=%d", w.Code, restored)
+	}
+}
+
+// A confirm token minted for one source must not restore another.
+func TestAdminConfirmTokenIsBoundToItsSource(t *testing.T) {
+	restored := 0
+	s := adminServer(t, AdminOps{
+		Restore: func(_ context.Context, src string) (any, error) {
+			restored++
+			return map[string]any{"source": src}, nil
+		},
+	})
+	auth := map[string]string{"Authorization": "Bearer " + adminTok}
+	w := do(t, s, http.MethodPost, "/admin/challenge", `{"source":"latest"}`, auth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("challenge = %d %s", w.Code, w.Body.String())
+	}
+	var ch struct {
+		ConfirmToken string `json:"confirmToken"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &ch); err != nil {
+		t.Fatal(err)
+	}
+	// Same token, different source: refused, and the token is already burned.
+	w = do(t, s, http.MethodPost, "/admin/restore",
+		`{"source":"other.db.backup-20260101T000000.000Z.db","confirmToken":"`+ch.ConfirmToken+`"}`, auth)
+	if w.Code != http.StatusForbidden || restored != 0 {
+		t.Fatalf("source mismatch = %d restored=%d body %s", w.Code, restored, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "bound to another restore source") {
+		t.Errorf("403 must name source_mismatch, got %s", w.Body.String())
+	}
+	// Even the matching source is now refused (one-shot).
+	w = do(t, s, http.MethodPost, "/admin/restore",
+		`{"source":"latest","confirmToken":"`+ch.ConfirmToken+`"}`, auth)
+	if w.Code != http.StatusForbidden || restored != 0 {
+		t.Fatalf("burned token accepted = %d restored=%d", w.Code, restored)
 	}
 }
 

@@ -395,6 +395,10 @@ func (b *StateBackup) normalize() error {
 
 // BackupTarget is one off-host snapshot destination.
 type BackupTarget struct {
+	// HMACKeyFile holds a key used to sign uploaded snapshots (HMAC-SHA256 sidecar).
+	// Without it a writable backup bucket is a trusted restore source. Prefer a
+	// file over an inline value; the key is NOT the stateEncryption master.
+	HMACKeyFile             string `yaml:"hmacKeyFile,omitempty"`
 	Type                    string `yaml:"type"` // s3, cos, or sftp
 	Name                    string `yaml:"name"`
 	Bucket                  string `yaml:"bucket"`

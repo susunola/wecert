@@ -167,5 +167,13 @@ func reloadImmutable(old, next *config.Config) error {
 	if !reflect.DeepEqual(old.StateBackup, next.StateBackup) {
 		return fmt.Errorf("stateBackup changed; restart is required")
 	}
+	// StateEncryption decides how every private key in state.db is opened. The
+	// sealer is built once at Open; swapping the master (or turning sealing on or
+	// off) under a live store would leave half the rows in one KDF and half in
+	// another -- and a reload that appeared to succeed would surface only as
+	// "not encrypted with this format" on the next read of a key.
+	if !reflect.DeepEqual(old.StateEncryption, next.StateEncryption) {
+		return fmt.Errorf("stateEncryption changed; restart is required")
+	}
 	return nil
 }

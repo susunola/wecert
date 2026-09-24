@@ -706,7 +706,17 @@ func takeSnapshots(ctx context.Context, store *state.Store, dirs []string, remot
 	}
 	if uploaded != "" {
 		for _, target := range remote {
-			remoteTarget := backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: target.Prefix, Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: target.RemoteDir, PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, SecretIDEnv: target.SecretIDEnv, SecretKeyEnv: target.SecretKeyEnv, Keep: target.Keep, Timeout: target.TimeoutDur}
+			hmacKey, herr := hmacKeyFrom(target.HMACKeyFile)
+			if herr != nil {
+				// A configured signing key that cannot be loaded must not fall back
+				// to an unsigned upload: the operator would believe the bucket is
+				// signed while every object in it is not.
+				log.Error("remote state snapshot skipped: HMAC key file is not usable",
+					"target", target.Name, "err", herr)
+				errs = append(errs, fmt.Errorf("remote target %s hmac: %w", target.Name, herr))
+				continue
+			}
+			remoteTarget := backup.Target{HMACKey: hmacKey, Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: target.Prefix, Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: target.RemoteDir, PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, SecretIDEnv: target.SecretIDEnv, SecretKeyEnv: target.SecretKeyEnv, Keep: target.Keep, Timeout: target.TimeoutDur}
 			err := backup.Upload(ctx, remoteTarget, uploaded)
 			// A retention prune failure is not an upload failure: the object is on the
 			// remote and must still be verified. Reporting a red backup here lied about

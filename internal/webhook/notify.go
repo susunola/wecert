@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -176,10 +177,6 @@ func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
 	}
 	body, err := n.notifyPayload(ev)
 	if err != nil {
-		if errors.Is(err, errSkipPagerDutySuccess) {
-			n.log.Debug("pagerduty: success renewal does not page", "cert", ev.Cert)
-			return
-		}
 		n.log.Warn("failed to serialise the notification event", "cert", ev.Cert, "err", err)
 		return
 	}
@@ -217,8 +214,8 @@ func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
 // nothing waited for it. That is fine while the daemon keeps running, but a one-shot run
 // (-once) or a shutdown can exit with the POST still in flight, and the notification is
 // then simply lost -- including the "result":"error" one, which is the notification an
-// operator most needs. The 10s per-send timeout means the wait is bounded even if the
-// receiver never answers.
+// operator most needs. The per-send timeout (10s generic, 15s Jira) means the wait is
+// bounded even if the receiver never answers.
 //
 // The wait is expressed through the semaphore rather than a WaitGroup because the
 // semaphore already exists and is held for exactly the duration of a send: filling it means
@@ -234,7 +231,11 @@ func (n *Notifier) Drain(ctx context.Context) {
 	// Wait for every accepted send to finish. The old "fill the semaphore" barrier
 	// raced the accept path: a send that had passed the draining check but not yet
 	// taken a slot would start after Drain returned.
-	deadline := time.Now().Add(20 * time.Second)
+	//
+	// 40s, not 20s: Jira's worst case is find-open (15s) plus create-or-comment
+	// (15s) per event, and a one-shot run that drains too early ships the
+	// "result: error" ticket nowhere.
+	deadline := time.Now().Add(40 * time.Second)
 	for {
 		n.mu.Lock()
 		left := n.inFlight
@@ -289,16 +290,29 @@ func withoutURL(err error) error {
 	return err
 }
 
-// redactSecrets strips URL credentials and query strings from outbound event text.
-// withoutURL only protected the delivery-failure *log*; the event body itself was
-// shipped to Jira / PagerDuty / a chat robot with the raw error, which can carry a
-// signed URL or a request id that should stay on the host.
+// redactSecrets strips credentials from outbound event text before it is shipped
+// to Jira / PagerDuty / a chat robot. withoutURL only protected the
+// delivery-failure *log*; the event body itself still carried the raw error.
+//
+// Beyond URLs: an error string can embed a Bearer token, an AWS access key id, or
+// a PEM block that fell out of a failed parse. Each is a credential that must not
+// leave the host just because a renewal failed.
 func redactSecrets(s string) string {
-	// withoutURL only unwraps a *url.Error; a plain error string can still embed a
-	// signed URL. Rewrite every URL-looking substring through the same redactor the
-	// delivery log uses.
 	s = urlRegexp.ReplaceAllStringFunc(s, func(u string) string {
 		return RedactNotifyURL(u)
+	})
+	s = bearerRegexp.ReplaceAllString(s, "$1[redacted]")
+	s = accessKeyRegexp.ReplaceAllString(s, "[redacted-access-key]")
+	s = pemRegexp.ReplaceAllString(s, "[redacted-pem]")
+	s = keyValSecretRegexp.ReplaceAllStringFunc(s, func(m string) string {
+		i := strings.IndexByte(m, '=')
+		if i < 0 {
+			i = strings.IndexByte(m, ':')
+		}
+		if i < 0 {
+			return "[redacted]"
+		}
+		return m[:i+1] + "[redacted]"
 	})
 	if len(s) > 512 {
 		s = s[:512] + "…"
@@ -306,6 +320,17 @@ func redactSecrets(s string) string {
 	return s
 }
 
-// urlRegexp matches an absolute http(s) URL in free text. Deliberately simple: the
-// goal is to drop userinfo, path and query, not to parse RFC 3986 perfectly.
-var urlRegexp = regexp.MustCompile(`https?://[^\s]+`)
+var (
+	// urlRegexp matches an absolute http(s) URL in free text. Deliberately simple: the
+	// goal is to drop userinfo, path and query, not to parse RFC 3986 perfectly.
+	urlRegexp = regexp.MustCompile(`https?://[^\s]+`)
+	// bearerRegexp keeps the scheme so the operator can see a token was there.
+	bearerRegexp = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._\-+/=]{8,}`)
+	// accessKeyRegexp covers the AWS / Tencent CAM access-key-id shapes that show up
+	// in SDK error strings.
+	accessKeyRegexp = regexp.MustCompile(`\b(?:AKIA|ASIA|AKID)[0-9A-Za-z]{12,}\b`)
+	// pemRegexp collapses a whole PEM block: the body is the secret.
+	pemRegexp = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----`)
+	// keyValSecretRegexp covers `token=...`, `secretKey: ...` and friends in free text.
+	keyValSecretRegexp = regexp.MustCompile(`(?i)\b(?:secret[_-]?key|access[_-]?key|api[_-]?token|api[_-]?key|password|token|authorization)["']?\s*[:=]\s*["']?[A-Za-z0-9._\-+/=]{8,}`)
+)

@@ -108,7 +108,7 @@ type Server struct {
 	auditPath string
 	// confirms holds one-shot restore confirm tokens with their expiry.
 	confirmMu sync.Mutex
-	confirms  map[string]time.Time
+	confirms  map[string]confirmGrant
 }
 
 // New builds the webhook server.

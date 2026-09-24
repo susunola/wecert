@@ -650,12 +650,16 @@ func ApplyPendingRestore(dest string) (RestoreResult, bool, error) {
 		return res, true, err
 	}
 	res, err = restoreLocked(res, dest, realDest, pending)
-	// The pending file is one-shot whatever happened: a failed apply must not silently
-	// retry on every start with the same broken bytes. The error names the pending path.
-	_ = os.Remove(pending)
 	if err != nil {
+		// Keep the pending file unless its own bytes are bad. A transient I/O
+		// failure (disk full, brief error) must not destroy the only verified copy
+		// -- especially after adminRestore already deleted the remote download.
+		if _, ierr := inspectSnapshot(pending); ierr != nil {
+			_ = os.Remove(pending)
+		}
 		return res, true, fmt.Errorf("apply pending restore from %s: %w", pending, err)
 	}
+	_ = os.Remove(pending)
 	res.Source = pending
 	return res, true, nil
 }

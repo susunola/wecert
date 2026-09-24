@@ -181,11 +181,17 @@ func (n *Nginx) DeployUploaded(ctx context.Context, certName, _, uploadedID stri
 			certName, n.certFile, n.keyFile, dir)
 	}
 	if len(n.reload) == 0 {
+		// Files are on disk but nothing told nginx. Claiming success here made
+		// manager_done set DeployConfirmed, and the deployed metric said "serving
+		// the new certificate" while nginx may still hold the old one in memory.
+		// ErrSwitchUnverified is the existing "cloud says done, independent check
+		// did not confirm" outcome -- same honesty, same handling.
 		if n.log != nil {
 			n.log.Warn("nginx reload command is empty; files are on disk but nginx has not been told",
 				"cert", certName, "dir", dir)
 		}
-		return id, nil
+		return id, fmt.Errorf("%w: nginx reload is disabled (nginx.reload is empty), so nothing "+
+			"confirmed the new files are being served", ErrSwitchUnverified)
 	}
 	if err := n.runReload(ctx, certName, dir); err != nil {
 		return id, err
@@ -235,6 +241,13 @@ func (n *Nginx) Bindings(_ context.Context, certID string) (int, bool, error) {
 	}
 	dir, ok := dirFromID(certID)
 	if !ok {
+		return 0, true, nil
+	}
+	// reload: [] means the files are on disk but nothing told nginx. Reporting
+	// Bindings=1 made confirmBinding set DeployConfirmed, and the deployed metric
+	// claimed "serving the new certificate" while nginx may still hold the old one
+	// in memory. Files present is NOT "being served" here.
+	if len(n.reload) == 0 {
 		return 0, true, nil
 	}
 	if n.filesPresent(dir) {

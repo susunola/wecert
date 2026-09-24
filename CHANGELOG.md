@@ -4,6 +4,23 @@
 
 ### Fixed
 
+- **Sealed-state KDF migration no longer double-encrypts.** `migrateSealedMaterial`
+  used to re-seal a v1 blob without opening it, storing `v2(v1(plain))`. The next
+  open peeled only the v2 layer and handed back a second AEAD blob instead of the
+  private key -- a silent brick on every upgrade from the SHA-256 KDF. v1 rows are
+  now opened first, re-sealed as v2, and a regression test plants a real v1 blob.
+- **Remote retention counts snapshots, not `.hmac` sidecars.** `keep: 1` with one
+  signed pair used to delete the snapshot and leave the signature. Sidecars are
+  deleted with their object and no longer occupy Keep slots.
+- **A configured backup `hmacKeyFile` that cannot be loaded fails closed.** Upload
+  and remote restore no longer fall back to unsigned when the key file is missing
+  or empty. certsync export signs remote material under the same rule.
+- **`/admin/recovery-plan` and `/admin/recovery-drill` honour `source`** (same
+  whitelist as restore) and echo `requestedSource` + `resolvedSource`. They used
+  to ignore the requested source and answer as if `latest` had been asked for.
+- **Admin restore rejects symlink escapes and foreign filenames.** Sources are
+  resolved with `EvalSymlinks` and must match this store's
+  `<base>.backup-<stamp>.db` pattern before they are staged.
 - **A pending restore is no longer applied by an unlocked open.** `OpenForTool` /
   `OpenUnlocked` (dry-run, revoke, preflight while the daemon holds the lock) used
   to call `ApplyPendingRestore`, which renames the live `state.db` out from under
@@ -16,12 +33,25 @@
   in force -- and the operator believed the rotation had landed.
 - **Notification send/Drain no longer drop accepted events.** The slot is taken
   under the same mutex as the draining check; Drain waits for in-flight sends
-  instead of filling the semaphore (which raced the accept path).
+  instead of filling the semaphore (which raced the accept path). Drain's budget
+  is 40s so a Jira find-open + create/comment cannot be cut off mid-ticket.
 - **A retention prune failure is not a failed backup upload.** The object is on the
   remote and is still verified; the caller used to skip verification and report a
   red backup while a usable snapshot sat in the bucket.
 - **`/admin/restore` audit says `admin_restore_staged`** (with `restartRequired`),
   not `admin_restore_done` -- the swap happens on the next start.
+- **Confirm-token refusals name the real reason** (`missing` / `expired` /
+  `source_mismatch` / `wildcard_token`) in both the 403 body and the audit line.
+  "missing or expired" for a source mismatch trained operators to re-issue the
+  same wrong token forever. Challenge requires a non-empty `source` and the ticket
+  is bound to it.
+- **`nginx` with `reload: []` is honest again.** Files on disk are not "being
+  served": `Bindings` reports 0 and `DeployUploaded` returns
+  `ErrSwitchUnverified` so `confirmBinding` cannot mark the deployment confirmed.
+- **SIGHUP refuses `stateEncryption` changes.** The sealer is built at Open;
+  swapping the master under a live store leaves rows in two KDFs.
+- **`Handler()` reads `adminEnabled` under `tokenMu`**, so a SIGHUP that rotates
+  the admin token is no longer a data race with route mounting.
 
 ### Security
 
@@ -29,10 +59,12 @@
 - **inline secret warnings cover `webhook.adminToken`, `webhook.jira.apiToken` and
   `webhook.pagerduty.routingKey`** -- a 0644 config carrying the restore credential
   is no longer silent.
-- **Outbound notify text is URL-redacted** (userinfo, path, query) before it reaches
-  Jira / PagerDuty / a chat robot.
-- **Admin restore sources are limited** to `latest`, files under `stateBackup.dir`
-  (or `localDirs`), and configured `remote:<name>` targets.
+- **Outbound notify text is URL-, Bearer-, AKID- and PEM-redacted** before it
+  reaches Jira / PagerDuty / a chat robot. A renewal error that embeds a token or
+  a private key no longer ships that credential off the host.
+- **Admin restore sources are limited** to `latest`, snapshot-named files under
+  `stateBackup.dir` (or `localDirs`), and configured `remote:<name>` targets --
+  with symlinks resolved first.
 - **Confirm tokens fail hard without a CSPRNG** (no timestamp fallback) and share one
   clock for `expiresAt`.
 - **PagerDuty resolves on success** (`dedup_key=wecert/<cert>`); **Jira comments
@@ -43,6 +75,10 @@
   `privkey.pem` named but empty.
 - **failover treats only true transport-level "directory unreachable" as
   unavailable** -- a lost `NewOrder` response no longer double-spends on standby.
+- **Remote snapshots can be signed (`stateBackup.remoteTargets[].hmacKeyFile`).**
+  Upload writes a `.hmac` sidecar; download filters sidecars out of "latest" and
+  refuses a missing or mismatched signature when a key is configured. The key is
+  separate from the state-encryption master.
 
 - **Jira notifications.** `webhook.notifyFormat: jira` opens (or comments on) a Jira
   issue for a failed renewal. `webhook.jira` names the instance and the issue

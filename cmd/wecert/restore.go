@@ -86,7 +86,13 @@ func resolveRestoreSnapshot(cfg *config.Config, arg string) (string, func(), err
 		if t.Name != name {
 			continue
 		}
-		source, err := backup.DownloadLatest(context.Background(), backup.Target{Type: t.Type, Name: t.Name, Bucket: t.Bucket, Prefix: t.Prefix, Endpoint: t.Endpoint, Region: t.Region, Host: t.Host, Username: t.Username, RemoteDir: t.RemoteDir, PasswordEnv: t.PasswordEnv, PrivateKeyFile: t.PrivateKeyFile, PrivateKeyPassphraseEnv: t.PrivateKeyPassphraseEnv, KnownHostsFile: t.KnownHostsFile, SecretIDEnv: t.SecretIDEnv, SecretKeyEnv: t.SecretKeyEnv, SnapshotBase: filepath.Base(cfg.StatePath), Timeout: t.TimeoutDur}, filepath.Dir(cfg.StatePath))
+		// Fail closed on the signing key: a configured hmacKeyFile that cannot be
+		// read must not silently restore an unsigned (or attacker-signed) object.
+		hmacKey, err := hmacKeyFrom(t.HMACKeyFile)
+		if err != nil {
+			return "", func() {}, err
+		}
+		source, err := backup.DownloadLatest(context.Background(), backup.Target{HMACKey: hmacKey, Type: t.Type, Name: t.Name, Bucket: t.Bucket, Prefix: t.Prefix, Endpoint: t.Endpoint, Region: t.Region, Host: t.Host, Username: t.Username, RemoteDir: t.RemoteDir, PasswordEnv: t.PasswordEnv, PrivateKeyFile: t.PrivateKeyFile, PrivateKeyPassphraseEnv: t.PrivateKeyPassphraseEnv, KnownHostsFile: t.KnownHostsFile, SecretIDEnv: t.SecretIDEnv, SecretKeyEnv: t.SecretKeyEnv, SnapshotBase: filepath.Base(cfg.StatePath), Timeout: t.TimeoutDur}, filepath.Dir(cfg.StatePath))
 		if err != nil {
 			return "", func() {}, err
 		}

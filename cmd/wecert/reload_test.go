@@ -23,6 +23,7 @@ func TestReloadImmutableRejectsResourceIdentityChanges(t *testing.T) {
 		{"directory", func(c *config.Config) { c.ACME.Directory = "https://other/directory" }, "acme.directory"},
 		{"metrics", func(c *config.Config) { c.Metrics.Listen = "127.0.0.1:9900" }, "metrics.listen"},
 		{"webhook", func(c *config.Config) { c.Webhook.Listen = "127.0.0.1:9901" }, "webhook.listen"},
+		{"stateEncryption", func(c *config.Config) { c.StateEncryption.KeyFile = "/other/master.key" }, "stateEncryption"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

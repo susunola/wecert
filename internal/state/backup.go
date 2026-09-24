@@ -354,6 +354,16 @@ func (s *Store) snapshotStampOf(name string) (string, bool) {
 	return rest, true
 }
 
+// IsSnapshotName reports whether name looks like a snapshot of the store whose
+// database file is named stateBase. The matcher is the same strict one retention
+// uses (snapshotStampOf), so a hand-made `state.backup-before-upgrade.db` is
+// refused rather than treated as a recovery point.
+func IsSnapshotName(name, stateBase string) bool {
+	s := &Store{base: stateBase}
+	_, ok := s.snapshotStampOf(name)
+	return ok
+}
+
 // listSnapshots returns this store's snapshot files in dir, oldest first.
 func (s *Store) listSnapshots(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)

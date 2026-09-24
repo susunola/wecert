@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/susunola/wecert/internal/acme"
+	"github.com/susunola/wecert/internal/backup"
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/probe"
 	"github.com/susunola/wecert/internal/reconcile"
@@ -345,11 +346,11 @@ func adminOps(cfg *config.Config, log *slog.Logger) webhook.AdminOps {
 		BackupHealth: func(ctx context.Context) (any, error) {
 			return backupHealth(cfg)
 		},
-		RecoveryPlan: func(ctx context.Context) (any, error) {
-			return recoveryPlan(cfg)
+		RecoveryPlan: func(ctx context.Context, source string) (any, error) {
+			return recoveryPlan(cfg, source)
 		},
-		RecoveryDrill: func(ctx context.Context) (any, error) {
-			return recoveryDrill(cfg)
+		RecoveryDrill: func(ctx context.Context, source string) (any, error) {
+			return recoveryDrill(cfg, source)
 		},
 		Restore: func(ctx context.Context, source string) (any, error) {
 			return adminRestore(cfg, source, log)
@@ -372,57 +373,48 @@ func backupHealth(cfg *config.Config) (any, error) {
 	if err == nil && notice != nil {
 		out["lastRestoreAt"] = notice.RestoredAt.UTC().Format(time.RFC3339)
 	}
+	// Pending restore: the one thing that means "the live database is not what you
+	// will get after a restart". Missing from this view is how an operator decided
+	// a staged restore had already landed.
+	if fi, err := os.Stat(cfg.StatePath + ".restore-pending"); err == nil {
+		out["pendingRestore"] = map[string]any{
+			"present":            true,
+			"bytes":              fi.Size(),
+			"stagedAgeSeconds":   int(time.Since(fi.ModTime()).Seconds()),
+			"appliedOnNextStart": true,
+		}
+	} else {
+		out["pendingRestore"] = map[string]any{"present": false}
+	}
+
+	// Local snapshot posture: count and the newest age. This is the number that
+	// answers "is there a recovery point at all?".
+	dir := cfg.StateBackup.Dir
+	if dir == "" {
+		dir = filepath.Dir(cfg.StatePath)
+	}
+	if snaps, err := state.SnapshotsIn(dir, cfg.StatePath); err == nil {
+		summary := map[string]any{"count": len(snaps)}
+		if len(snaps) > 0 {
+			newest := snaps[len(snaps)-1]
+			if fi, err := os.Stat(newest); err == nil {
+				summary["newest"] = newest
+				summary["newestAgeSeconds"] = int(time.Since(fi.ModTime()).Seconds())
+			}
+		}
+		out["localSnapshots"] = summary
+	}
+
+	remotes := make([]map[string]any, 0, len(cfg.StateBackup.RemoteTargets))
+	for _, t := range cfg.StateBackup.RemoteTargets {
+		remotes = append(remotes, map[string]any{
+			"name": t.Name, "type": t.Type, "keep": t.Keep,
+			"note": "last-success lives in wecert_backup_remote_last_success_timestamp_seconds; " +
+				"use POST /admin/recovery-drill with source=remote:<name> to prove it restores",
+		})
+	}
+	out["remoteTargets"] = remotes
 	return out, nil
-}
-
-// recoveryPlan is non-destructive: what would `latest` restore.
-func recoveryPlan(cfg *config.Config) (any, error) {
-	src, cleanup, err := resolveRestoreSnapshot(cfg, "latest")
-	if err != nil {
-		return nil, err
-	}
-	defer cleanup()
-	info, err := state.InspectSnapshot(src)
-	if err != nil {
-		return nil, err
-	}
-	fi, err := os.Stat(src)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{
-		"source":        src,
-		"snapshotAge":   time.Since(fi.ModTime()).Round(time.Second).String(),
-		"certificates":  info.Certificates,
-		"account":       info.Account,
-		"liveStatePath": cfg.StatePath,
-		"note":          "read-only; POST /admin/recovery-drill to test the snapshot, or /admin/challenge then /admin/restore to apply it (applied on next start if the daemon holds the lock)",
-	}, nil
-}
-
-// recoveryDrill opens and checks a snapshot without touching live state.
-func recoveryDrill(cfg *config.Config) (any, error) {
-	src, cleanup, err := resolveRestoreSnapshot(cfg, "latest")
-	if err != nil {
-		return nil, err
-	}
-	defer cleanup()
-	info, err := state.InspectSnapshot(src)
-	if err != nil {
-		return nil, err
-	}
-	fi, err := os.Stat(src)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{
-		"source":       src,
-		"snapshotAge":  time.Since(fi.ModTime()).Round(time.Second).String(),
-		"certificates": info.Certificates,
-		"account":      info.Account,
-		"passed":       true,
-		"note":         "no live state was changed",
-	}, nil
 }
 
 // adminRestore applies (or stages) a snapshot. If the daemon holds the state lock --
@@ -458,6 +450,11 @@ func adminRestore(cfg *config.Config, source string, log *slog.Logger) (any, err
 // and the configured remote targets. The CLI can restore any path an operator
 // types; an HTTP client holding the admin token must not be able to point the
 // pending restore at /tmp/evil.db just because the process can read it.
+//
+// EvalSymlinks after the directory check: a symlink under stateBackup.dir that
+// points at /etc/shadow must not pass because its name lives in an allowed
+// directory. The filename must also look like one of our snapshots -- a planted
+// `state.db.backup-not-a-stamp.db` is refused rather than staged.
 func adminRestoreSourceAllowed(cfg *config.Config, source string) error {
 	if source == "latest" {
 		return nil
@@ -498,10 +495,93 @@ func adminRestoreSourceAllowed(cfg *config.Config, source string) error {
 	if err != nil {
 		return err
 	}
+	// Resolve symlinks before the directory check and the name check: a link
+	// under an allowed directory must not smuggle in bytes from anywhere else.
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = real
+	}
 	parent := filepath.Dir(abs)
 	if !allowed[parent] {
 		return fmt.Errorf("admin restore source %s is outside the snapshot directories; "+
 			"use latest, a file under stateBackup.dir, or remote:<name>", source)
 	}
+	if !state.IsSnapshotName(filepath.Base(abs), filepath.Base(cfg.StatePath)) {
+		return fmt.Errorf("admin restore source %s is not a wecert snapshot name "+
+			"(%s.backup-<stamp>.db); pick a file this deployment wrote", source, filepath.Base(cfg.StatePath))
+	}
 	return nil
+}
+
+// hmacKeyFrom reads the optional HMAC signing key for a backup target. Empty
+// path means "do not sign". A configured but unreadable key is an error: the
+// callers that restore must fail closed, and an upload that silently skipped
+// signing would leave the operator believing the bucket is signed.
+func hmacKeyFrom(file string) ([]byte, error) {
+	return backup.LoadHMACKey(file)
+}
+
+// recoveryPlan is non-destructive: what would `latest` restore.
+func recoveryPlan(cfg *config.Config, source string) (any, error) {
+	if source == "" {
+		source = "latest"
+	}
+	if err := adminRestoreSourceAllowed(cfg, source); err != nil {
+		return nil, err
+	}
+	src, cleanup, err := resolveRestoreSnapshot(cfg, source)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	info, err := state.InspectSnapshot(src)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := os.Stat(src)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"requestedSource": source,
+		"resolvedSource":  src,
+		"source":          src,
+		"snapshotAge":     time.Since(fi.ModTime()).Round(time.Second).String(),
+		"certificates":    info.Certificates,
+		"account":         info.Account,
+		"liveStatePath":   cfg.StatePath,
+		"note":            "read-only; POST /admin/recovery-drill to test the snapshot, or /admin/challenge then /admin/restore to apply it (applied on next start if the daemon holds the lock)",
+	}, nil
+}
+
+// recoveryDrill opens and checks a snapshot without touching live state.
+func recoveryDrill(cfg *config.Config, source string) (any, error) {
+	if source == "" {
+		source = "latest"
+	}
+	if err := adminRestoreSourceAllowed(cfg, source); err != nil {
+		return nil, err
+	}
+	src, cleanup, err := resolveRestoreSnapshot(cfg, source)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	info, err := state.InspectSnapshot(src)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := os.Stat(src)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"requestedSource": source,
+		"resolvedSource":  src,
+		"source":          src,
+		"snapshotAge":     time.Since(fi.ModTime()).Round(time.Second).String(),
+		"certificates":    info.Certificates,
+		"account":         info.Account,
+		"passed":          true,
+		"note":            "no live state was changed",
+	}, nil
 }
