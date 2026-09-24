@@ -55,6 +55,21 @@ func TestOpenSealedEncryptsTransactionalCertificateWrite(t *testing.T) {
 	_ = s.Close()
 }
 
+func TestOpenSealedRoundTripsRetiredCertificateMaterial(t *testing.T) {
+	s, err := OpenSealed(filepath.Join(t.TempDir(), "state.db"), []byte("master"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.AddRetiredCert("old-id", "www", []byte("OLD CERT"), []byte("OLD KEY")); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ListRetiredCertMaterial("www")
+	if err != nil || len(rows) != 1 || string(rows[0].CertPEM) != "OLD CERT" || string(rows[0].KeyPEM) != "OLD KEY" {
+		t.Fatalf("retired = %#v, %v", rows, err)
+	}
+}
+
 func TestOpenSealedRoundTripsOrderAndCertificateMaterial(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	s, err := OpenSealed(path, []byte("master"))

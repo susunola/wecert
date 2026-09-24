@@ -27,6 +27,21 @@ func (s *Store) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.sealer != nil {
+		var err error
+		if len(certPEM) > 0 {
+			certPEM, err = s.sealer.seal(certPEM, []byte("retired_certificates/cert_pem/"+certID))
+			if err != nil {
+				return fmt.Errorf("seal retired certificate material: %w", err)
+			}
+		}
+		if len(keyPEM) > 0 {
+			keyPEM, err = s.sealer.seal(keyPEM, []byte("retired_certificates/key_pem/"+certID))
+			if err != nil {
+				return fmt.Errorf("seal retired certificate key: %w", err)
+			}
+		}
+	}
 	return addRetiredCertExec(s.db, certID, certName, certPEM, keyPEM)
 }
 
@@ -79,6 +94,9 @@ func (s *Store) ListRetiredCertsBefore(cutoff time.Time) ([]*RetiredCert, error)
 		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt, &r.CertPEM, &r.KeyPEM); err != nil {
 			return nil, fmt.Errorf("scan retired cert: %w", err)
 		}
+		if err := s.openRetiredMaterial(r); err != nil {
+			return nil, err
+		}
 		r.RetiredAt = fromUnix(retiredAt)
 		out = append(out, r)
 	}
@@ -112,10 +130,34 @@ func (s *Store) ListRetiredCertMaterial(certName string) ([]*RetiredCert, error)
 		if err := rows.Scan(&r.CertID, &r.CertName, &retiredAt, &r.CertPEM, &r.KeyPEM); err != nil {
 			return nil, fmt.Errorf("scan archived material for %s: %w", certName, err)
 		}
+		if err := s.openRetiredMaterial(r); err != nil {
+			return nil, err
+		}
 		r.RetiredAt = fromUnix(retiredAt)
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) openRetiredMaterial(r *RetiredCert) error {
+	if s.sealer == nil {
+		return nil
+	}
+	if len(r.CertPEM) > 0 {
+		plain, err := s.sealer.open(r.CertPEM, []byte("retired_certificates/cert_pem/"+r.CertID))
+		if err != nil {
+			return fmt.Errorf("decrypt retired certificate %s: %w", r.CertID, err)
+		}
+		r.CertPEM = plain
+	}
+	if len(r.KeyPEM) > 0 {
+		plain, err := s.sealer.open(r.KeyPEM, []byte("retired_certificates/key_pem/"+r.CertID))
+		if err != nil {
+			return fmt.Errorf("decrypt retired certificate %s key: %w", r.CertID, err)
+		}
+		r.KeyPEM = plain
+	}
+	return nil
 }
 
 // DeleteRetiredCert removes an entry from the reclamation list (called after the

@@ -114,6 +114,21 @@ func (t *Tx) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) err
 	if certID == "" {
 		return fmt.Errorf("refusing to queue an empty certificate id for reclaim under %q", certName)
 	}
+	if t.sealer != nil {
+		var err error
+		if len(certPEM) > 0 {
+			certPEM, err = t.sealer.seal(certPEM, []byte("retired_certificates/cert_pem/"+certID))
+			if err != nil {
+				return err
+			}
+		}
+		if len(keyPEM) > 0 {
+			keyPEM, err = t.sealer.seal(keyPEM, []byte("retired_certificates/key_pem/"+certID))
+			if err != nil {
+				return err
+			}
+		}
+	}
 	return addRetiredCertExec(t.tx, certID, certName, certPEM, keyPEM)
 }
 
