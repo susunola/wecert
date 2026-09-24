@@ -1586,6 +1586,7 @@ func TestReleasingTheLastLeaseLeavesNoLeaverToFireTheDeleteAll(t *testing.T) {
 		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		// Present resolves the zone before handing the write to the provider.
 		recursiveNameservers: []string{"192.0.2.53:53"},
+		providerResolvers:    []string{"192.0.2.53:53"},
 		exchange: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
 			return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{
 				Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}}), nil
