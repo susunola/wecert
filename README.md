@@ -350,6 +350,13 @@ recoverable backup.
 Use `wecert -config /etc/wecert/config.yaml -backup-drill remote:<target>` for a scheduled,
 non-destructive download and SQLite integrity drill.
 
+**Optional state-key encryption.** Set `stateEncryption.keyFile` to a root- or
+service-owned credential file (for systemd, `${CREDENTIALS_DIRECTORY}/wecert-state-key`).
+wecert then encrypts ACME account keys, in-flight order keys, current certificate material and
+retired rollback material in `state.db` with authenticated encryption. The first sealed open
+atomically migrates an existing plaintext database; keep the same key with every backup and
+restore, because a snapshot without its key is intentionally unreadable.
+
 **Health and alerting.** `/metrics` on `127.0.0.1:9800` by default, with a
 [ready-to-load rule file](deploy/prometheus/wecert-alerts.yml): 17 alerts covering expiry per
 profile, convergence, and integrity — a revocation the CA has not accepted, a pass that has not

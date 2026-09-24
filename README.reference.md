@@ -664,6 +664,12 @@ instruction, not later when the solver is constructed.
 | `email` | yes | Contact address for the ACME account |
 | `eab.kid` + `eab.hmac` | together, when the selected CA requires EAB | — | External Account Binding identifier and base64url HMAC. Prefer `eab.hmacFile` or `WECERT_ACME_EAB_HMAC`; both values are required together. The binding is used only while registering an account, never emitted in logs. |
 
+### `stateEncryption`
+
+| Field | Required | Description |
+|---|---|---|
+| `keyFile` | no | Environment-expanded file holding the state master key. When set, existing private material is atomically migrated to authenticated encryption on first open. Store this key independently from `state.db` and every snapshot; a wrong or missing key refuses private-key reads rather than issuing against a new account. |
+
 ### `dns`
 
 The providers use completely different credentials. Don't mix them up.

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.8.0 - 2026-09-24
+
+### Added
+
+- **Sealed state storage.** Optional `stateEncryption.keyFile` enables authenticated encryption
+  for ACME account keys, in-flight order keys, live certificate material and retired rollback
+  material. Existing plaintext state is migrated atomically on first sealed open; systemd
+  `LoadCredential` paths are supported.
+- **ACME External Account Binding.** `acme.eab.kid` plus a file-backed or environment-backed HMAC
+  supports commercial and private ACME directories that require EAB.
+- **Persistent TLS probe evidence.** The inventory retains the last host verdict, served expiry,
+  trust result and observation time across daemon restarts.
+
 ### Added
 
 - **Guarded web admin surface.** `webhook.adminToken` (separate from the read-only

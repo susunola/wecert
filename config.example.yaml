@@ -7,6 +7,13 @@
 
 statePath: /var/lib/wecert/state.db
 
+# Optional authenticated encryption for private material in state.db. Generate a
+# random key once, store it separately from state.db, and supply it through a
+# systemd credential or another 0600 file. Losing this key makes encrypted
+# backups intentionally unrecoverable.
+# stateEncryption:
+#   keyFile: ${CREDENTIALS_DIRECTORY}/wecert-state-key
+
 # Periodic consistent snapshots of state.db, written beside it.
 #
 # Why this is on by default: state.db holds the ACME account key and every in-flight order
