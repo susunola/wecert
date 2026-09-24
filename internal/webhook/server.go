@@ -222,6 +222,15 @@ func (s *Server) SetToken(token string) {
 	s.tokenMu.Unlock()
 }
 
+// SetAdminToken rotates the admin token without rebinding the listener, matching
+// SetToken. Without it a SIGHUP after editing webhook.adminToken left the old
+// token in force -- the operator believed the rotation had landed.
+func (s *Server) SetAdminToken(token string) {
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	s.adminToken = token
+}
+
 // SetAccountUIN records the Tencent Cloud account this process deploys into.
 // Empty is valid: the inventory then omits uin unless a certificate sets its own.
 func (s *Server) SetAccountUIN(uin string) {

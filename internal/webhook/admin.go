@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -37,16 +39,26 @@ const adminConfirmTTL = 10 * time.Minute
 // reach these routes.
 func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.adminToken == "" {
+		if !s.adminEnabled() {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "admin surface is not configured"})
 			return
 		}
-		if !s.adminTokenMatches(r) {
-			s.audit(r, "admin_auth_failed", map[string]any{"path": r.URL.Path})
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid admin token"})
+		if s.adminTokenMatches(r) {
+			s.limiter.recordSuccess(clientIP(r), s.now())
+			next(w, r)
 			return
 		}
-		next(w, r)
+		// Same lockout as /hook/*: the admin token can restore state.db, so online
+		// guessing must be as expensive there as on the read-only surface.
+		addr := clientIP(r)
+		if blocked, retryAfter := s.limiter.fail(addr, s.now()); blocked {
+			s.audit(r, "admin_auth_blocked", map[string]any{"path": r.URL.Path})
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed authentication attempts"})
+			return
+		}
+		s.audit(r, "admin_auth_failed", map[string]any{"path": r.URL.Path})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid admin token"})
 	}
 }
 
@@ -57,7 +69,20 @@ func (s *Server) adminTokenMatches(r *http.Request) bool {
 	} else if h := r.Header.Get("X-Wecert-Admin-Token"); h != "" {
 		presented = h
 	}
-	return subtle.ConstantTimeCompare([]byte(presented), []byte(s.adminToken)) == 1
+	s.tokenMu.RLock()
+	token := s.adminToken
+	s.tokenMu.RUnlock()
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1
+}
+
+// adminEnabled reports whether the admin surface is mounted (read under tokenMu
+// so SIGHUP can enable it without a data race on handler registration... the
+// routes themselves are registered at construction; SetAdminToken only rotates
+// the secret. Mounting a new surface still needs a restart -- see handler.go).
+func (s *Server) adminEnabled() bool {
+	s.tokenMu.RLock()
+	defer s.tokenMu.RUnlock()
+	return s.adminToken != ""
 }
 
 // handleAdminBackupHealth is read-only.
@@ -138,7 +163,13 @@ func (s *Server) handleAdminChallenge() http.HandlerFunc {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "use POST"})
 			return
 		}
-		tok := newConfirmToken()
+		tok, err := newConfirmToken()
+		if err != nil {
+			s.log.Error("refusing to issue a restore confirm token", "err", err)
+			s.audit(r, "admin_challenge_refused", map[string]any{"err": err.Error()})
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "cannot issue a confirm token"})
+			return
+		}
 		s.confirmMu.Lock()
 		if s.confirms == nil {
 			s.confirms = map[string]time.Time{}
@@ -150,12 +181,13 @@ func (s *Server) handleAdminChallenge() http.HandlerFunc {
 				delete(s.confirms, k)
 			}
 		}
-		s.confirms[tok] = now.Add(adminConfirmTTL)
+		exp := now.Add(adminConfirmTTL)
+		s.confirms[tok] = exp
 		s.confirmMu.Unlock()
 		s.audit(r, "admin_challenge_issued", map[string]any{"ttlSeconds": int(adminConfirmTTL.Seconds())})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"confirmToken": tok,
-			"expiresAt":    s.now().Add(adminConfirmTTL).UTC().Format(time.RFC3339),
+			"expiresAt":    exp.UTC().Format(time.RFC3339),
 			"action":       "restore",
 			"hint":         "POST /admin/restore with this token in confirmToken. It expires; issue a new one if it does.",
 		})
@@ -215,7 +247,7 @@ func (s *Server) handleAdminRestore() http.HandlerFunc {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
-		s.audit(r, "admin_restore_done", map[string]any{"source": body.Source})
+		s.audit(r, "admin_restore_staged", map[string]any{"source": body.Source, "restartRequired": true})
 		writeJSON(w, http.StatusOK, map[string]any{"result": out})
 	}
 }
@@ -251,14 +283,14 @@ func (s *Server) audit(r *http.Request, action string, fields map[string]any) {
 	}
 }
 
-func newConfirmToken() string {
+func newConfirmToken() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// Fall back to a time-based token only if the CSPRNG is broken -- the audit
-		// trail still records the challenge, and restore stays two-step.
-		return hex.EncodeToString([]byte(time.Now().Format(time.RFC3339Nano)))
+		// Never fall back to a timestamp: the confirm token is the only thing between
+		// an admin poller and a restore of state.db.
+		return "", fmt.Errorf("cannot mint a confirm token: %w", err)
 	}
-	return hex.EncodeToString(b[:])
+	return hex.EncodeToString(b[:]), nil
 }
 
 // ErrAdminDisabled is returned when an admin op is attempted without a token.

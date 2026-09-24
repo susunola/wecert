@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -38,6 +39,9 @@ type Notifier struct {
 	// draining stops new notifications from being accepted, so Drain has a fixed set of
 	// in-flight sends to wait for instead of racing a moving target.
 	draining bool
+	// inFlight counts accepted sends that have not finished. Drain waits for this
+	// rather than only filling the semaphore -- filling it races the accept path.
+	inFlight int
 }
 
 type RenewalEvent struct {
@@ -128,26 +132,36 @@ func (n *Notifier) Renewal(ctx context.Context, certName string, reconcileErr er
 	}
 	if reconcileErr != nil {
 		ev.Result = "error"
-		ev.Error = reconcileErr.Error()
+		ev.Error = redactSecrets(reconcileErr.Error())
 	}
+	// Acquire the slot while still holding mu: the check-then-act window between
+	// "not draining" and "slot taken" used to drop events and let Drain return while
+	// a send was still about to start.
 	n.mu.Lock()
 	if n.draining {
 		n.mu.Unlock()
 		n.log.Warn("dropping a renewal notification; the notifier is shutting down", "cert", ev.Cert)
 		return
 	}
-	n.mu.Unlock()
-
-	ctx = context.WithoutCancel(ctx)
 	select {
 	case n.sem <- struct{}{}:
 	default:
+		n.mu.Unlock()
 		n.log.Warn("dropping a renewal notification; too many already in flight",
 			"cert", ev.Cert, "limit", maxNotifyInFlight)
 		return
 	}
+	n.inFlight++
+	n.mu.Unlock()
+
+	ctx = context.WithoutCancel(ctx)
 	go func() {
-		defer func() { <-n.sem }()
+		defer func() {
+			<-n.sem
+			n.mu.Lock()
+			n.inFlight--
+			n.mu.Unlock()
+		}()
 		n.send(ctx, ev)
 	}()
 }
@@ -217,15 +231,21 @@ func (n *Notifier) Drain(ctx context.Context) {
 	n.draining = true
 	n.mu.Unlock()
 
-	// Filling the buffer means every holder released. The first acquisition cannot block
-	// for long even when nothing is in flight (a free slot is taken immediately); the loop
-	// is what makes it a barrier rather than a single probe.
-	for i := 0; i < maxNotifyInFlight; i++ {
-		select {
-		case n.sem <- struct{}{}:
-		case <-ctx.Done():
+	// Wait for every accepted send to finish. The old "fill the semaphore" barrier
+	// raced the accept path: a send that had passed the draining check but not yet
+	// taken a slot would start after Drain returned.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		n.mu.Lock()
+		left := n.inFlight
+		n.mu.Unlock()
+		if left == 0 {
 			return
 		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -268,3 +288,24 @@ func withoutURL(err error) error {
 	}
 	return err
 }
+
+// redactSecrets strips URL credentials and query strings from outbound event text.
+// withoutURL only protected the delivery-failure *log*; the event body itself was
+// shipped to Jira / PagerDuty / a chat robot with the raw error, which can carry a
+// signed URL or a request id that should stay on the host.
+func redactSecrets(s string) string {
+	// withoutURL only unwraps a *url.Error; a plain error string can still embed a
+	// signed URL. Rewrite every URL-looking substring through the same redactor the
+	// delivery log uses.
+	s = urlRegexp.ReplaceAllStringFunc(s, func(u string) string {
+		return RedactNotifyURL(u)
+	})
+	if len(s) > 512 {
+		s = s[:512] + "…"
+	}
+	return s
+}
+
+// urlRegexp matches an absolute http(s) URL in free text. Deliberately simple: the
+// goal is to drop userinfo, path and query, not to parse RFC 3986 perfectly.
+var urlRegexp = regexp.MustCompile(`https?://[^\s]+`)

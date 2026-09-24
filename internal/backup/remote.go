@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -356,7 +357,12 @@ func uploadS3(ctx context.Context, t Target, src string) error {
 	}
 	if t.Keep > 0 {
 		if err := pruneS3(ctx, client, t, key); err != nil {
-			return err
+			// The object is already on the remote: retention failing is not "the upload
+			// failed". Returning an error here made the caller skip VerifyUpload and
+			// report a red backup while a usable snapshot sat in the bucket.
+			// Prune is reported in the returned error only after verify has a chance to
+			// run -- see Upload's contract: (uploaded, pruneErr).
+			return errUploadedPruneFailed{err}
 		}
 	}
 	return nil
@@ -512,7 +518,7 @@ func uploadSFTP(ctx context.Context, t Target, src string) error {
 	}
 	if t.Keep > 0 {
 		if err := pruneSFTP(client, t, filepath.Base(src)); err != nil {
-			return err
+			return errUploadedPruneFailed{err}
 		}
 	}
 	return nil
@@ -540,4 +546,21 @@ func pruneSFTP(client *sftp.Client, t Target, current string) error {
 		}
 	}
 	return nil
+}
+
+// errUploadedPruneFailed marks "the object is on the remote but retention prune
+// failed". Callers must still verify the upload; treating this as a failed Upload
+// lies about the recovery posture.
+type errUploadedPruneFailed struct{ err error }
+
+func (e errUploadedPruneFailed) Error() string {
+	return "uploaded but retention prune failed: " + e.err.Error()
+}
+func (e errUploadedPruneFailed) Unwrap() error { return e.err }
+
+// IsUploaded reports whether the object landed even though the overall Upload
+// returned an error (retention only).
+func IsUploaded(err error) bool {
+	var p errUploadedPruneFailed
+	return errors.As(err, &p)
 }

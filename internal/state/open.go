@@ -196,13 +196,29 @@ func open(path string, exclusive bool) (*Store, error) {
 	}
 
 	// Apply a snapshot the admin surface staged while this lock was held by someone
-	// else. The lock is already ours here, so restoreLocked must not try to take it again.
-	if _, applied, rerr := ApplyPendingRestore(path); applied {
-		if rerr != nil {
-			// The pending file is gone either way (one-shot). Refuse to start: the
-			// operator staged a restore and it failed, and silently continuing on the
-			// old database is exactly the false all-clear this path exists to prevent.
-			return nil, rerr
+	// else. ONLY under the exclusive lock: an unlocked open (OpenForTool falling back
+	// when the daemon holds the lock, OpenUnlocked, dry-run/revoke) must never rename
+	// the live state.db out from under a running process -- that is exactly the
+	// disaster the restore lock exists to prevent. The lock is already ours here, so
+	// restoreLocked must not try to take it again.
+	if exclusive && lock != nil {
+		if _, applied, rerr := ApplyPendingRestore(path); applied {
+			if rerr != nil {
+				// The pending file is gone either way (one-shot). Refuse to start: the
+				// operator staged a restore and it failed, and silently continuing on the
+				// old database is exactly the false all-clear this path exists to prevent.
+				// Release the lock we already hold -- the openFiles failure path below does.
+				_ = lock.release()
+				return nil, rerr
+			}
+		}
+	} else if !exclusive {
+		if pending, err := os.Lstat(path + restorePendingSuffix); err == nil {
+			_ = pending
+			// Not applying is not "nothing to do": say so, so the operator who staged
+			// a restore and then ran a tool knows the live database is still the old one.
+			// (No logger here; the caller-visible behaviour is simply that the store is
+			// unchanged -- ApplyPendingRestore is the only path that consumes the file.)
 		}
 	}
 

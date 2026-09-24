@@ -108,12 +108,13 @@ func (f *FailoverAPI) GetKeyAuthorization(token string) (string, error) {
 // domain-specific and switching CAs cannot fix them; only transport failures and
 // the account-wide new-order refusal qualify for a standby attempt.
 func directoryUnavailable(err error) bool {
+	// Only a transport-level "could not reach the directory" counts. An arbitrary
+	// *url.Error (or any other error that wraps one) is NOT proof the CA is down:
+	// a NewOrder that was sent and then lost mid-response may well have created the
+	// order on the server, and retrying on standby spends a second exact-set quota.
 	var ne net.Error
-	if errors.As(err, &ne) {
-		return true
-	}
-	var ue *url.Error
-	if errors.As(err, &ue) {
+	if errors.As(err, &ne) && (ne.Timeout() || ne.Temporary() || strings.Contains(ne.Error(), "connection refused") ||
+		strings.Contains(ne.Error(), "no such host")) {
 		return true
 	}
 	s := strings.ToLower(err.Error())

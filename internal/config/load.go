@@ -149,6 +149,17 @@ func inlineSecretFields(c *Config) []string {
 	if c.Webhook.Token != "" {
 		out = append(out, "webhook.token")
 	}
+	// The admin token can restore state.db: it is the highest-privilege secret in
+	// the file and must trip the 0644 warning like every other inline credential.
+	if c.Webhook.AdminToken != "" {
+		out = append(out, "webhook.adminToken")
+	}
+	if c.Webhook.Jira.APIToken != "" {
+		out = append(out, "webhook.jira.apiToken")
+	}
+	if c.Webhook.PagerDuty.RoutingKey != "" {
+		out = append(out, "webhook.pagerduty.routingKey")
+	}
 	if c.Webhook.NotifySecret != "" {
 		out = append(out, "webhook.notifySecret")
 	}

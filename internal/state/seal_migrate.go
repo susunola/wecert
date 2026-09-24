@@ -32,6 +32,15 @@ func (s *Store) migrateSealedMaterial() error {
 		if err != nil {
 			return fmt.Errorf("read %s.%s for sealing: %w", spec.table, spec.column, err)
 		}
+		// Collect first, then UPDATE after rows.Close(): SQLite does not promise that
+		// a cursor visits a row exactly once when the same table is written while it
+		// is open. A skipped row is a private key that stays plaintext and then
+		// becomes unreadable under sealed open -- "not encrypted with this format".
+		type pending struct {
+			id     string
+			sealed []byte
+		}
+		var todo []pending
 		for rows.Next() {
 			var id string
 			var blob []byte
@@ -47,16 +56,18 @@ func (s *Store) migrateSealedMaterial() error {
 				rows.Close()
 				return err
 			}
-			if _, err := tx.Exec("UPDATE "+spec.table+" SET "+spec.column+" = ? WHERE "+spec.id+" = ?", sealed, id); err != nil {
-				rows.Close()
-				return err
-			}
+			todo = append(todo, pending{id: id, sealed: sealed})
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
 			return err
 		}
 		rows.Close()
+		for _, item := range todo {
+			if _, err := tx.Exec("UPDATE "+spec.table+" SET "+spec.column+" = ? WHERE "+spec.id+" = ?", item.sealed, item.id); err != nil {
+				return err
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit state key sealing migration: %w", err)

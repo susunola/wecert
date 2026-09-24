@@ -65,10 +65,18 @@ func (n *Notifier) pagerdutyPayload(ev RenewalEvent) ([]byte, error) {
 	source := ev.Cert
 	summary := fmt.Sprintf("wecert: %s renewal failed", ev.Cert)
 	if ev.Result != "error" {
-		// resolve is sent only when we can name the incident we opened; a green
-		// renewal that never triggered does not resolve anything. Use trigger=error
-		// only, and leave success silent on PagerDuty (chat formats still get it).
-		return nil, errSkipPagerDutySuccess
+		// Resolve the open incident for this certificate (dedup_key). A success that
+		// never triggered is a no-op resolve -- PagerDuty accepts it and it does not
+		// page. Without this, fail->ok left the on-call incident open forever.
+		return json.Marshal(map[string]any{
+			"routing_key":  n.pdRoutingKey,
+			"event_action": "resolve",
+			"dedup_key":    "wecert/" + ev.Cert,
+			"payload": map[string]any{
+				"summary": fmt.Sprintf("wecert: %s renewed", ev.Cert),
+				"source":  ev.Cert,
+			},
+		})
 	}
 	payload := map[string]any{
 		"routing_key":  n.pdRoutingKey,

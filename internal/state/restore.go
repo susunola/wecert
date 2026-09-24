@@ -207,7 +207,14 @@ func Restore(dest, source string) (RestoreResult, error) {
 		return res, err
 	}
 	defer func() { _ = lock.release() }()
-	return restoreLocked(res, dest, realDest, source)
+	res, rerr := restoreLocked(res, dest, realDest, source)
+	// A successful manual restore wins over anything the admin surface staged earlier:
+	// the next Open must not roll this back with a stale .restore-pending. On failure
+	// the pending file is left alone -- it is still the only recovery path.
+	if rerr == nil {
+		_ = os.Remove(dest + restorePendingSuffix)
+	}
+	return res, rerr
 }
 
 // restoreLocked is Restore's body once the state lock is held. Called from Restore
@@ -631,7 +638,12 @@ func ApplyPendingRestore(dest string) (RestoreResult, bool, error) {
 	var res RestoreResult
 	pending := dest + restorePendingSuffix
 	if _, err := os.Lstat(pending); err != nil {
-		return res, false, nil
+		if os.IsNotExist(err) {
+			return res, false, nil
+		}
+		// A permission or I/O error is NOT "nothing pending": the staged snapshot is
+		// still on disk and the next start would silently skip it. Refuse to start.
+		return res, true, fmt.Errorf("apply pending restore: read %s: %w", pending, err)
 	}
 	realDest, err := resolveStateTarget(dest)
 	if err != nil {

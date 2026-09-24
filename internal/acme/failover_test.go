@@ -9,7 +9,10 @@ import (
 )
 
 func TestFailoverAPIUsesStandbyOnlyForDirectoryOutageAndRoutesOrderURLs(t *testing.T) {
-	primary := &fakeAPI{newOrderErr: &url.Error{Op: "Post", URL: "https://primary.test/new-order", Err: errors.New("down")}}
+	// A transport-level "connection refused" is the only thing that counts as a
+	// directory outage: a lost response after the request was sent is NOT (the order
+	// may exist on the server).
+	primary := &fakeAPI{newOrderErr: &url.Error{Op: "Post", URL: "https://primary.test/new-order", Err: errors.New("dial tcp: connection refused")}}
 	standbyOrder := legoacme.ExtendedOrder{Order: legoacme.Order{Status: "pending"}, Location: "https://standby.test/order/1"}
 	standby := &fakeAPI{orders: []legoacme.ExtendedOrder{standbyOrder}}
 	a, err := NewFailoverAPI(primary, "https://primary.test/directory", []API{standby}, []string{"https://standby.test/directory"})

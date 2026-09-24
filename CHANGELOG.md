@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A pending restore is no longer applied by an unlocked open.** `OpenForTool` /
+  `OpenUnlocked` (dry-run, revoke, preflight while the daemon holds the lock) used
+  to call `ApplyPendingRestore`, which renames the live `state.db` out from under
+  the running process. Only the exclusive-lock path applies it now. A failed apply
+  releases the state lock; `Lstat` errors other than "not found" refuse to start
+  instead of looking like "nothing pending"; a successful CLI `-restore` clears any
+  staged `*.restore-pending` so the next start cannot roll it back.
+- **`webhook.adminToken` rotates on SIGHUP** (`SetAdminToken`), matching
+  `webhook.token`. Before, editing the admin token and reloading left the old one
+  in force -- and the operator believed the rotation had landed.
+- **Notification send/Drain no longer drop accepted events.** The slot is taken
+  under the same mutex as the draining check; Drain waits for in-flight sends
+  instead of filling the semaphore (which raced the accept path).
+- **A retention prune failure is not a failed backup upload.** The object is on the
+  remote and is still verified; the caller used to skip verification and report a
+  red backup while a usable snapshot sat in the bucket.
+- **`/admin/restore` audit says `admin_restore_staged`** (with `restartRequired`),
+  not `admin_restore_done` -- the swap happens on the next start.
+
+### Security
+
+- **`/admin/*` is rate-limited like `/hook/*`** (10 failures / 5 min -> 15 min lockout).
+- **inline secret warnings cover `webhook.adminToken`, `webhook.jira.apiToken` and
+  `webhook.pagerduty.routingKey`** -- a 0644 config carrying the restore credential
+  is no longer silent.
+- **Outbound notify text is URL-redacted** (userinfo, path, query) before it reaches
+  Jira / PagerDuty / a chat robot.
+- **Admin restore sources are limited** to `latest`, files under `stateBackup.dir`
+  (or `localDirs`), and configured `remote:<name>` targets.
+- **Confirm tokens fail hard without a CSPRNG** (no timestamp fallback) and share one
+  clock for `expiresAt`.
+- **PagerDuty resolves on success** (`dedup_key=wecert/<cert>`); **Jira comments
+  "renewed OK"** on the open issue. Fail->ok no longer leaves an incident open.
+- **Sealed-state migration collects rows before UPDATE** (SQLite does not promise a
+  cursor sees each row once when the same table is written while it is open).
+- **certsync `writeAtomic` fsyncs before rename** -- a crash can no longer leave
+  `privkey.pem` named but empty.
+- **failover treats only true transport-level "directory unreachable" as
+  unavailable** -- a lost `NewOrder` response no longer double-spends on standby.
+
 - **Jira notifications.** `webhook.notifyFormat: jira` opens (or comments on) a Jira
   issue for a failed renewal. `webhook.jira` names the instance and the issue
   (`baseURL`, `projectKey`, `issueType`), authenticates with Cloud basic

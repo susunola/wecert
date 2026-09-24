@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/susunola/wecert/internal/acme"
@@ -430,6 +431,9 @@ func recoveryDrill(cfg *config.Config) (any, error) {
 // this process has the database open: swapping the file underneath us would leave
 // every write going to an unlinked inode.
 func adminRestore(cfg *config.Config, source string, log *slog.Logger) (any, error) {
+	if err := adminRestoreSourceAllowed(cfg, source); err != nil {
+		return nil, err
+	}
 	src, cleanup, err := resolveRestoreSnapshot(cfg, source)
 	if err != nil {
 		return nil, err
@@ -448,4 +452,56 @@ func adminRestore(cfg *config.Config, source string, log *slog.Logger) (any, err
 		"source":             src,
 		"note":               "the live database is still open in this process; restart wecert to apply. The previous database is kept as state.db.replaced-<stamp> when the pending restore runs.",
 	}, nil
+}
+
+// adminRestoreSourceAllowed keeps the web restore inside the snapshot directories
+// and the configured remote targets. The CLI can restore any path an operator
+// types; an HTTP client holding the admin token must not be able to point the
+// pending restore at /tmp/evil.db just because the process can read it.
+func adminRestoreSourceAllowed(cfg *config.Config, source string) error {
+	if source == "latest" {
+		return nil
+	}
+	if strings.HasPrefix(source, "remote:") {
+		name := strings.TrimPrefix(source, "remote:")
+		for _, t := range cfg.StateBackup.RemoteTargets {
+			if t.Name == name {
+				return nil
+			}
+		}
+		return fmt.Errorf("remote target %q is not in stateBackup.remoteTargets", name)
+	}
+	dir := cfg.StateBackup.Dir
+	if dir == "" {
+		dir = filepath.Dir(cfg.StatePath)
+	}
+	allowed := map[string]bool{}
+	for _, d := range []string{dir, filepath.Dir(cfg.StatePath)} {
+		if d == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(d); err == nil {
+			allowed[abs] = true
+		}
+	}
+	for _, t := range cfg.StateBackup.LocalDirs {
+		if abs, err := filepath.Abs(t); err == nil {
+			allowed[abs] = true
+		}
+	}
+	if fi, err := os.Stat(source); err == nil && fi.IsDir() {
+		if abs, err := filepath.Abs(source); err == nil && allowed[abs] {
+			return nil
+		}
+	}
+	abs, err := filepath.Abs(source)
+	if err != nil {
+		return err
+	}
+	parent := filepath.Dir(abs)
+	if !allowed[parent] {
+		return fmt.Errorf("admin restore source %s is outside the snapshot directories; "+
+			"use latest, a file under stateBackup.dir, or remote:<name>", source)
+	}
+	return nil
 }

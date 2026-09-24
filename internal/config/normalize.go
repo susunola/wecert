@@ -530,9 +530,9 @@ func (w *Webhook) normalize() error {
 	case NotifyFormatGeneric, NotifyFormatPagerDuty, NotifyFormatFeishu,
 		NotifyFormatWeCom, NotifyFormatDingTalk, NotifyFormatSlack, NotifyFormatJira:
 	default:
-		return fmt.Errorf("webhook.notifyFormat must be %q, %q, %q, %q, %q or %q, got %q",
+		return fmt.Errorf("webhook.notifyFormat must be %q, %q, %q, %q, %q, %q or %q, got %q",
 			NotifyFormatGeneric, NotifyFormatPagerDuty, NotifyFormatFeishu,
-			NotifyFormatWeCom, NotifyFormatDingTalk, NotifyFormatSlack, w.NotifyFormat)
+			NotifyFormatWeCom, NotifyFormatDingTalk, NotifyFormatSlack, NotifyFormatJira, w.NotifyFormat)
 	}
 	if w.NotifyFormat == NotifyFormatPagerDuty && w.PagerDuty.RoutingKey == "" &&
 		w.PagerDuty.RoutingKeyFile == "" {

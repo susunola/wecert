@@ -56,8 +56,15 @@ func TestNotifyPayloadShapes(t *testing.T) {
 		t.Error("routing key must be in the body")
 	}
 
-	// success is not a page
-	if _, err := formatNotifier(config.NotifyFormatPagerDuty, "R0").notifyPayload(ok); err == nil {
-		t.Fatal("pagerduty success must be skipped, not sent")
+	// success resolves the open incident (it does not page)
+	b, err = formatNotifier(config.NotifyFormatPagerDuty, "R0").notifyPayload(ok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &pd); err != nil {
+		t.Fatal(err)
+	}
+	if pd["event_action"] != "resolve" {
+		t.Fatalf("success must resolve, got %s", b)
 	}
 }

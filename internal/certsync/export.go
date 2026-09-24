@@ -87,6 +87,13 @@ func writeAtomic(dst string, data []byte) error {
 		_ = tmp.Close()
 		return err
 	}
+	// fsync before rename: this writes privkey.pem. Without it a crash can leave the
+	// name in place and the bytes empty -- a deployment that then loads the key is
+	// worse off than one with no export at all.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}

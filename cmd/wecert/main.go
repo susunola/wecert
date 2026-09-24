@@ -271,6 +271,7 @@ func run() error {
 		}
 		if web != nil {
 			web.SetToken(next.Webhook.Token)
+			web.SetAdminToken(next.Webhook.AdminToken)
 			web.SetAccountUIN(next.Tencent.UIN)
 		}
 		log.Info("configuration reloaded", "config", f.configPath, "certificates", certificateCountField(next))
@@ -707,11 +708,21 @@ func takeSnapshots(ctx context.Context, store *state.Store, dirs []string, remot
 		for _, target := range remote {
 			remoteTarget := backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: target.Prefix, Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: target.RemoteDir, PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, SecretIDEnv: target.SecretIDEnv, SecretKeyEnv: target.SecretKeyEnv, Keep: target.Keep, Timeout: target.TimeoutDur}
 			err := backup.Upload(ctx, remoteTarget, uploaded)
-			if err != nil {
+			// A retention prune failure is not an upload failure: the object is on the
+			// remote and must still be verified. Reporting a red backup here lied about
+			// the recovery posture (see backup.IsUploaded).
+			if err != nil && !backup.IsUploaded(err) {
 				log.Error("remote state snapshot upload failed", "target", target.Name, "type", target.Type, "err", err)
 				metrics.BackupRemoteErrors.WithLabelValues(target.Name, target.Type).Inc()
 				errs = append(errs, fmt.Errorf("remote target %s: %w", target.Name, err))
-			} else if err := backup.VerifyUpload(ctx, remoteTarget, uploaded); err != nil {
+				continue
+			}
+			if err != nil {
+				log.Warn("remote state snapshot uploaded but retention prune failed",
+					"target", target.Name, "type", target.Type, "err", err)
+				errs = append(errs, fmt.Errorf("remote target %s prune: %w", target.Name, err))
+			}
+			if err := backup.VerifyUpload(ctx, remoteTarget, uploaded); err != nil {
 				log.Error("remote state snapshot verification failed", "target", target.Name, "type", target.Type, "err", err)
 				metrics.BackupRemoteErrors.WithLabelValues(target.Name, target.Type).Inc()
 				errs = append(errs, fmt.Errorf("remote target %s verification: %w", target.Name, err))

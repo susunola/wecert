@@ -32,9 +32,18 @@ func (n *Notifier) deliverJira(ctx context.Context, ev RenewalEvent) error {
 	defer cancel()
 
 	if ev.Result != "error" {
-		// Same policy as PagerDuty: a green renewal is not a ticket. The chat
-		// formats still carry success; Jira is for work that needs an owner.
-		return nil
+		// Close the loop: comment on the open issue (if any) that this certificate
+		// recovered. Without it the ticket stays open after the fix, like PagerDuty
+		// never resolving. No issue is created for a green renewal.
+		if !n.jira.ReuseOpenIssue {
+			return nil
+		}
+		labels := jiraLabels(n.jira.Labels, ev.Cert)
+		key, err := n.jiraFindOpen(ctx, labels)
+		if err != nil || key == "" {
+			return err
+		}
+		return n.jiraComment(ctx, key, "wecert: "+ev.Cert+" renewed OK at "+ev.Timestamp+".")
 	}
 
 	labels := jiraLabels(n.jira.Labels, ev.Cert)
