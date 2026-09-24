@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Cloudflare and constrained DNS egress.** DNS lookups now retry over TCP when UDP returns
+  `REFUSED`; lego's provider-side zone discovery stays on the host resolver while wecert's
+  propagation verification can use its configured recursive resolvers. This keeps DNS-01 usable
+  on networks that block public UDP/53 but permit TCP/53.
+- **COS remote-backup retention.** Tencent COS requires `Content-MD5` for S3 multi-object delete,
+  so COS retention deletes expired snapshots one at a time while ordinary S3 keeps batched delete.
+
 ## 0.7.0 - 2026-09-23
 
 ### Added
