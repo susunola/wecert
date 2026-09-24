@@ -378,3 +378,22 @@ groups:
         annotations:
           summary: "A leftover _acme-challenge TXT has been stuck for over a day"
           description: "The DNS cleanup guardian is still retrying {{ $value | humanizeDuration }}. GET /diagnostics/txt-reclaims (auth) for the names; if a record is stuck for hours the provider cannot delete it -- remove it in the DNS console."
+
+  - name: wecert-binding-patrol
+    rules:
+      - alert: WecertBindingPatrolDrift
+        expr: sum(wecert_binding_patrol_findings{kind=~"drift|orphan_upload|unmanaged"}) > 0
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cloud bindings disagree with the state store"
+          description: "The full-binding patrol reported drift / orphan uploads / unmanaged certificates for 2h. Console shows confirmed / incomplete / drift; a manual console change is expected until the next deploy, and orphan_upload means an upload lost its resume anchor."
+      - alert: WecertBindingPatrolStale
+        expr: (time() - wecert_binding_patrol_last_run_timestamp_seconds) > 86400
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The binding patrol has not finished in over a day"
+          description: "we cert_binding_patrol_last_run_timestamp_seconds is stale, so the findings gauge may be lying."

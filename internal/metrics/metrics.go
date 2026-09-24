@@ -190,6 +190,21 @@ var (
 		Help: "Age in seconds of the oldest stuck TXT reclaim. 0 when the queue is empty. This is the number to alert on: wecert_txt_reclaim_stuck > 0 for one pass is noise (a flaky NS), the same oldest age climbing for hours means the record will not go away on its own.",
 	})
 
+	// BindingPatrolFindings counts the last full-binding patrol by kind
+	// (confirmed / incomplete / drift / orphan_upload / unmanaged). The console maps
+	// confirmed / incomplete / drift; orphan_upload and unmanaged are both drift to an
+	// operator -- a cloud certificate that is not the one this deployment is serving.
+	BindingPatrolFindings = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "wecert_binding_patrol_findings",
+		Help: "Findings from the last periodic full-binding patrol, by kind. confirmed=incomplete=0 and drift=orphan_upload=unmanaged=0 means the account matches the state store. Non-zero drift after a console change is expected until the next deploy; non-zero orphan_upload means an upload lost its resume anchor.",
+	}, []string{"kind"})
+
+	// BindingPatrolLastRun is when the patrol last finished (unix seconds).
+	BindingPatrolLastRun = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_binding_patrol_last_run_timestamp_seconds",
+		Help: "Unix time the last full-binding patrol finished. If this stops advancing, the patrol is not running and the findings gauge is stale.",
+	})
+
 	OrphanedCertificates = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "wecert_orphaned_certificates",
 		Help: "Certificates present in the state store but absent from the desired state. They are not renewed and their row is deliberately KEPT (so a re-added name resumes its history), so this gauge stays 1 until an operator deletes the row; it is not a transient condition.",

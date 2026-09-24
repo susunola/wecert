@@ -100,6 +100,10 @@ type sslAPI interface {
 	DescribeHostUpdateRecordDetailWithContext(ctx context.Context, req *ssl.DescribeHostUpdateRecordDetailRequest) (*ssl.DescribeHostUpdateRecordDetailResponse, error)
 	DeleteCertificateWithContext(ctx context.Context, req *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error)
 	DescribeDeleteCertificatesTaskResultWithContext(ctx context.Context, req *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error)
+	// DescribeCertificates lists uploaded certificates in the account. The binding patrol
+	// uses it to spot cloud certificates wecert never recorded (orphan uploads and
+	// unmanaged uploads from the console).
+	DescribeCertificatesWithContext(ctx context.Context, req *ssl.DescribeCertificatesRequest) (*ssl.DescribeCertificatesResponse, error)
 	CreateCertificateBindResourceSyncTaskWithContext(ctx context.Context, req *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error)
 	DescribeCertificateBindResourceTaskResultWithContext(ctx context.Context, req *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error)
 }

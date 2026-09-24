@@ -176,8 +176,14 @@ type Manager struct {
 	// harmless, and this is bookkeeping about a transient state, not something that has
 	// to survive.
 	bindingCheckEvery time.Duration
-	bindingMu         sync.Mutex
-	bindingChecked    map[string]time.Time
+
+	// patrolMu guards the binding-patrol throttle: the account-wide enumeration is
+	// expensive and runs on a wrap-up interval, not every pass.
+	patrolMu       sync.Mutex
+	patrolAfter    time.Time
+	patrolLast     map[string]int
+	bindingMu      sync.Mutex
+	bindingChecked map[string]time.Time
 
 	now func() time.Time
 

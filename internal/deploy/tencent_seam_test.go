@@ -34,6 +34,7 @@ type fakeSSLAPI struct {
 	deleteTaskFn func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error)
 	createTaskFn func(context.Context, *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error)
 	taskResultFn func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error)
+	listCertsFn  func(context.Context, *ssl.DescribeCertificatesRequest) (*ssl.DescribeCertificatesResponse, error)
 }
 
 func (f *fakeSSLAPI) UploadCertificateWithContext(ctx context.Context, req *ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error) {
@@ -76,6 +77,13 @@ func (f *fakeSSLAPI) DescribeCertificateBindResourceTaskResultWithContext(ctx co
 		panic("unexpected DescribeCertificateBindResourceTaskResult call")
 	}
 	return f.taskResultFn(ctx, req)
+}
+
+func (f *fakeSSLAPI) DescribeCertificatesWithContext(ctx context.Context, req *ssl.DescribeCertificatesRequest) (*ssl.DescribeCertificatesResponse, error) {
+	if f.listCertsFn == nil {
+		panic("unexpected DescribeCertificates call")
+	}
+	return f.listCertsFn(ctx, req)
 }
 
 func (f *fakeSSLAPI) DescribeDeleteCertificatesTaskResultWithContext(ctx context.Context, req *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {

@@ -76,6 +76,14 @@ type Drainer interface {
 // TXTGuardian is the DNS cleanup guardian: an independent retry of leftover
 // _acme-challenge TXT records whose cleanup could not be confirmed. Optional so a test
 // double that does not model DNS cleanup needs none of it.
+// BindingPatroller is the periodic full-binding check. Optional: only a cloud
+// deployer that can enumerate the account implements it (nginx / Noop do not).
+// Returns kind -> finding count from the last patrol, and publishes metrics inside
+// the manager -- the reconciler only needs to know it ran.
+type BindingPatroller interface {
+	PatrolBindings(ctx context.Context) (map[string]int, error)
+}
+
 type TXTGuardian interface {
 	SweepStuckTXT(ctx context.Context) (retried, cleared int, err error)
 	ListStuckTXTReclaims() ([]*state.TXTReclaimStuck, error)

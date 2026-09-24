@@ -123,7 +123,23 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 	r.reclaimStaleProbeSeries(res)
 	r.publishQuota(res)
 	r.sweepStuckTXT(ctx)
+	r.runBindingPatrol(ctx)
 	return rep
+}
+
+// runBindingPatrol runs the account-wide binding audit if the manager can. Throttled
+// inside the manager (hours, not passes): this catches console changes and orphan
+// uploads that the per-certificate probe path never sees.
+func (r *Reconciler) runBindingPatrol(ctx context.Context) {
+	p, ok := r.manager.(BindingPatroller)
+	if !ok {
+		return
+	}
+	if counts, err := p.PatrolBindings(ctx); err != nil {
+		r.log.Warn("binding patrol failed", "err", err)
+	} else if counts != nil {
+		r.log.Info("binding patrol finished", "counts", counts)
+	}
 }
 
 // sweepStuckTXT runs the DNS cleanup guardian once per pass, independent of which

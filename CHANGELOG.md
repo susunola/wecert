@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Full-binding patrol.** Every 6 hours the Tencent deployer pages `DescribeCertificates`
+  (uploaded) and re-enumerates each known certificate's live bindings, then classifies the
+  gap: `confirmed` / `incomplete` / `drift` (state says deployed, cloud says bound nowhere --
+  a manual unbind), `orphan_upload` (uploaded, empty remark, no state row: deploy died
+  between upload and the resume anchor), `unmanaged` (console or other client upload).
+  Metrics `wecert_binding_patrol_findings{kind}` and
+  `wecert_binding_patrol_last_run_timestamp_seconds`; alert on persistent drift and on a
+  stale patrol. Read-only: a manual console change is reported so a human decides.
+
+### Added
+
 - **DNS cleanup guardian.** A leftover `_acme-challenge` TXT whose cleanup could not be
   *confirmed* (authoritative NS unreachable, or the provider cannot delete the record) is
   queued on its authorization row with `attempts`, `stuck_since` and `last_error`. Every
