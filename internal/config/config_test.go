@@ -374,7 +374,7 @@ acme:
   directory: https://acme-staging-v02.api.letsencrypt.org/directory
   email: ops@atomwangnus.com
 dns:
-  provider: route53
+  provider: not-a-provider
 tencent:
   credentialMode: static
   secretId: id

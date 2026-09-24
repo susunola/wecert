@@ -349,7 +349,10 @@ func (c *Config) normalizeNginx() error {
 	if c.Nginx.KeyFile == "" {
 		c.Nginx.KeyFile = "privkey.pem"
 	}
-	if len(c.Nginx.Reload) == 0 {
+	// YAML preserves absent as nil and reload: [] as a non-nil empty slice.
+	// The latter is an explicit, documented "write files but do not reload"
+	// choice; only an absent field receives the safe default.
+	if c.Nginx.Reload == nil {
 		// Default rather than "no reload": forgetting to reload is how a renewed
 		// certificate sits on disk while nginx keeps serving the old one until the
 		// next restart -- and the process cannot see that. An operator who manages

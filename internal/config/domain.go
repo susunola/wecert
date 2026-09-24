@@ -233,6 +233,9 @@ func NormalizeCertificates(certs []Certificate) error {
 		if err := certs[i].normalize(seen); err != nil {
 			return err
 		}
+		if err := rejectRedundantWildcardNames(certs[i]); err != nil {
+			return err
+		}
 
 		// Reject two certificates that ask for the same identifier set AND the same key
 		// type under different names.
@@ -264,6 +267,28 @@ func NormalizeCertificates(certs []Certificate) error {
 				prev, certs[i].Name, certs[i].DomainKey())
 		}
 		byDomainSet[key] = certs[i].Name
+	}
+	return nil
+}
+
+// rejectRedundantWildcardNames catches the CA rule before it becomes a permanent
+// renewal failure. It is kept here rather than importing group: group already
+// depends on config for domain validation.
+func rejectRedundantWildcardNames(cert Certificate) error {
+	for _, wildcard := range cert.Domains {
+		if !strings.HasPrefix(wildcard, "*.") {
+			continue
+		}
+		parent := strings.TrimPrefix(wildcard, "*.")
+		for _, name := range cert.Domains {
+			if name == wildcard || name == parent || !strings.HasSuffix(name, "."+parent) {
+				continue
+			}
+			prefix := strings.TrimSuffix(name, "."+parent)
+			if prefix != "" && !strings.Contains(prefix, ".") {
+				return fmt.Errorf("certificate %q includes %q and %q, but the explicit name is redundant with the wildcard and the CA rejects that identifier set; remove one", cert.Name, wildcard, name)
+			}
+		}
 	}
 	return nil
 }

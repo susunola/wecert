@@ -56,6 +56,9 @@ func TestNewTencentCLBCarriesRegionsAndTypes(t *testing.T) {
 // An unusable credential configuration must fail at construction rather than at the first
 // API call, where it would surface as an opaque authentication error mid-renewal.
 func TestNewTencentCLBRejectsAnUnusableCredentialConfig(t *testing.T) {
+	// The test verifies this configuration alone, not a developer's shell.
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "")
+	t.Setenv("TENCENTCLOUD_SECRET_KEY", "")
 	// Static mode with nothing anywhere, and an unknown mode, are both decidable now.
 	for _, mode := range []string{config.CredentialStatic, "instance-profile"} {
 		if _, err := NewTencentCLB(config.Tencent{CredentialMode: mode}, quietLog()); err == nil {
@@ -91,6 +94,10 @@ func TestLazyTencentCLBResolvesNothingAtConstruction(t *testing.T) {
 
 // The first operation builds the client; a failure must be reported then, not at construction.
 func TestLazyTencentCLBReportsAnUnusableCredentialOnFirstUse(t *testing.T) {
+	// Keep ambient CI or operator credentials from turning this negative test
+	// into a real cloud API request.
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "")
+	t.Setenv("TENCENTCLOUD_SECRET_KEY", "")
 	cfg := config.Tencent{CredentialMode: config.CredentialStatic}
 	d := NewLazyTencentCLB(cfg, quietLog())
 

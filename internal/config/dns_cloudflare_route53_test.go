@@ -666,3 +666,22 @@ func TestDeployTargetNginxAndTencent(t *testing.T) {
 		})
 	}
 }
+
+func TestNginxExplicitEmptyReloadDisablesDefault(t *testing.T) {
+	cfg, err := Load(writeConfig(t, minimalPrefix+`deploy:
+  target: nginx
+nginx:
+  reload: []
+certificates:
+  - name: c
+    domains: [example.com]
+    deploy:
+      enabled: true
+`))
+	if err != nil {
+		t.Fatalf("load nginx config: %v", err)
+	}
+	if cfg.Nginx.Reload == nil || len(cfg.Nginx.Reload) != 0 {
+		t.Fatalf("explicit nginx.reload: [] must stay disabled, got %v", cfg.Nginx.Reload)
+	}
+}

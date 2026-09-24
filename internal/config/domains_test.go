@@ -5,6 +5,28 @@ import (
 	"testing"
 )
 
+func TestCertificateRejectsRedundantWildcardIdentifier(t *testing.T) {
+	body := minimalPrefix + `
+certificates:
+  - name: wildcard
+    domains: ["*.example.com", "www.example.com"]
+`
+	if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "redundant with the wildcard") {
+		t.Fatalf("wildcard plus covered explicit hostname must be rejected before contacting the CA, got %v", err)
+	}
+}
+
+func TestCertificateAllowsANameOutsideWildcardCoverage(t *testing.T) {
+	body := minimalPrefix + `
+certificates:
+  - name: wildcard
+    domains: ["*.example.com", "a.b.example.com"]
+`
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("a wildcard covers only one label, so a deeper name must remain valid: %v", err)
+	}
+}
+
 // On certificates with many SANs the domains list is usually pasted in
 // wholesale from elsewhere. Deduplication must happen **before** the cap check,
 // or 100 domains plus 1 accidental duplicate is counted as 101 and a legal

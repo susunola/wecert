@@ -64,7 +64,7 @@ func TestEnforceDefersUnusedStaticCredentials(t *testing.T) {
 // real pass instead.
 func TestTheDryRunBuildsWhatReadsCredentials(t *testing.T) {
 	cfg := &config.Config{
-		Certificates: []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}}},
+		Certificates: []config.Certificate{{Name: "example-com", Domains: []string{"example.com"}, Deploy: config.Deploy{Enabled: true}}},
 	}
 	cfg.DNS.Provider = config.DNSProviderDNSPod
 	cfg.DNS.LoginToken = "12345,abcdef"

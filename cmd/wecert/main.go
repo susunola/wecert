@@ -957,13 +957,36 @@ func buildCredentialBearingComponents(cfg *config.Config, log *slog.Logger) erro
 	if _, err := acme.NewDNSSolver(cfg.DNS, cfg.Tencent, log); err != nil {
 		return fmt.Errorf("the DNS provider would not build: %w", err)
 	}
-	if _, err := deploy.NewCredentialSource(cfg.Tencent); err != nil {
-		return fmt.Errorf("the Tencent Cloud credentials would not build: %w", err)
+	if needsTencentCredentials(cfg) {
+		if _, err := deploy.NewCredentialSource(cfg.Tencent); err != nil {
+			return fmt.Errorf("the Tencent Cloud credentials would not build: %w", err)
+		}
 	}
 	if _, err := newDeployer(cfg, log); err != nil {
 		return fmt.Errorf("the deployer would not build: %w", err)
 	}
 	return nil
+}
+
+func needsTencentCredentials(cfg *config.Config) bool {
+	if cfg.DNS.Provider == config.DNSProviderTencentCloud {
+		return true
+	}
+	// nginx deployment is entirely local. Do not make an otherwise valid
+	// nginx-only configuration depend on Tencent Cloud credentials merely
+	// because the certificate has deployment enabled.
+	if cfg.Deploy.Target == config.DeployTargetNginx {
+		return false
+	}
+	if cfg.DesiredState.Mode == config.ModeEnforce {
+		return true
+	}
+	for _, cert := range cfg.Certificates {
+		if cert.Deploy.Enabled {
+			return true
+		}
+	}
+	return false
 }
 
 // minReconcileInterval is the smallest -interval the daemon accepts.

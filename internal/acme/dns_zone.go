@@ -16,7 +16,10 @@ import (
 
 func (s *DNSSolver) authoritativeExchange() func(*dns.Msg, string) (*dns.Msg, error) {
 	return func(msg *dns.Msg, server string) (*dns.Msg, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// exchangeDNS makes an UDP attempt and, when it cannot be used, a TCP
+		// attempt. Give each transport its bounded 3s opportunity: one shared 3s
+		// context meant a UDP-blackholed network cancelled TCP before it dialled.
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 		defer cancel()
 		return s.exchange(ctx, msg, server)
 	}
