@@ -62,6 +62,21 @@ rsync -a /var/lib/wecert/state.db.backup-*.db backup-host:/srv/wecert/
 
 If `stateBackup.enabled: false`, wecert logs a warning at startup saying so.
 
+### Recovery drill without a restore
+
+Run this on a schedule to prove that the newest backup can be fetched and opened without touching
+the live database. It accepts the same source forms as `-restore`, including a configured remote
+target:
+
+```sh
+wecert -config /etc/wecert/config.yaml -backup-drill remote:production-s3
+wecert -config /etc/wecert/config.yaml -backup-drill remote:offsite-sftp
+```
+
+The command downloads when necessary, runs SQLite's integrity checks, reports whether an ACME
+account and certificate rows are present, and exits. It never takes the live-state lock, replaces a
+file, issues a certificate, or calls the deployment API.
+
 ---
 
 ## 2. Restoring

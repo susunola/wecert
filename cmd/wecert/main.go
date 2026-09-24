@@ -89,6 +89,7 @@ type flags struct {
 	showVer     bool
 	revokeCert  string
 	restoreFrom string
+	backupDrill string
 	revokeWhy   string
 	yesFlag     bool
 }
@@ -107,6 +108,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.StringVar(&f.revokeCert, "revoke", "", "ask the CA to revoke this certificate and exit (see also -yes)")
 	fs.StringVar(&f.restoreFrom, "restore", "",
 		"restore a state snapshot and exit: a snapshot file, a directory of snapshots, or \"latest\"")
+	fs.StringVar(&f.backupDrill, "backup-drill", "", "download/open/check a backup without changing state: latest, a path, or remote:<target>")
 	fs.StringVar(&f.revokeWhy, "revoke-reason", "unspecified",
 		"revocation reason: unspecified|keyCompromise|affiliationChanged|superseded|cessationOfOperation")
 	fs.BoolVar(&f.yesFlag, "yes", false, "with -revoke or -restore: skip the interactive confirmation")
@@ -166,6 +168,12 @@ func run() error {
 			return errRestoreConflict
 		}
 		return runRestore(f.configPath, f.statePath, f.restoreFrom, f.yesFlag)
+	}
+	if f.backupDrill != "" {
+		if f.once || f.dryRun || f.revokeCert != "" {
+			return fmt.Errorf("%w: -backup-drill is read-only and cannot be combined with another mode", errUsage)
+		}
+		return runBackupDrill(f.configPath, f.statePath, f.backupDrill)
 	}
 
 	// Install signal handling before anything touches the network (config load, EnsureAccount,

@@ -264,6 +264,24 @@ type snapshotStats struct {
 	account      bool
 }
 
+// SnapshotInfo is the non-destructive result of opening and quick-checking a
+// backup. It is used by recovery drills: unlike Restore, it never takes the
+// state lock or changes the live database.
+type SnapshotInfo struct {
+	Certificates int
+	Account      bool
+}
+
+// InspectSnapshot verifies a candidate backup can be opened as a wecert state
+// database and reports the minimum recovery facts an operator needs.
+func InspectSnapshot(path string) (SnapshotInfo, error) {
+	stats, err := inspectSnapshot(path)
+	if err != nil {
+		return SnapshotInfo{}, err
+	}
+	return SnapshotInfo{Certificates: stats.certificates, Account: stats.account}, nil
+}
+
 // inspectSnapshot proves a file is a wecert state database before it is allowed to replace one.
 //
 // Three questions, cheapest first, because each rules out a different mistake an operator can

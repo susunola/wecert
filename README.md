@@ -347,6 +347,8 @@ snapshotted automatically: `stateBackup` is on by default, a consistent `VACUUM 
 Remote S3, COS and SFTP snapshots are counted successful only after wecert reads back the exact
 new object and verifies its size, so an upload acknowledgement alone is never mistaken for a
 recoverable backup.
+Use `wecert -config /etc/wecert/config.yaml -backup-drill remote:<target>` for a scheduled,
+non-destructive download and SQLite integrity drill.
 
 **Health and alerting.** `/metrics` on `127.0.0.1:9800` by default, with a
 [ready-to-load rule file](deploy/prometheus/wecert-alerts.yml): 17 alerts covering expiry per
