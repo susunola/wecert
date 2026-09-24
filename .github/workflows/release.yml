@@ -67,8 +67,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Files only: make release also copies deploy/systemd into dist/systemd/, and
+          # `dist/*` hands that directory to gh, which tries to upload it as an asset
+          # and dies with "is a directory". Units are listed in SHA256SUMS; the Release
+          # carries the binaries and the sums file, not the unit copies.
+          mapfile -t assets < <(find dist -maxdepth 1 -type f | sort)
+          test "${#assets[@]}" -gt 0
           gh release create "$GITHUB_REF_NAME" \
             --title "wecert $GITHUB_REF_NAME" \
             --notes-file release-notes.md \
             --verify-tag \
-            dist/*
+            "${assets[@]}"
