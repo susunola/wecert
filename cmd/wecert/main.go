@@ -697,13 +697,18 @@ func takeSnapshots(ctx context.Context, store *state.Store, dirs []string, remot
 	}
 	if uploaded != "" {
 		for _, target := range remote {
-			err := backup.Upload(ctx, backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: target.Prefix, Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: target.RemoteDir, PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, SecretIDEnv: target.SecretIDEnv, SecretKeyEnv: target.SecretKeyEnv, Keep: target.Keep, Timeout: target.TimeoutDur}, uploaded)
+			remoteTarget := backup.Target{Type: target.Type, Name: target.Name, Bucket: target.Bucket, Prefix: target.Prefix, Endpoint: target.Endpoint, Region: target.Region, Host: target.Host, Username: target.Username, RemoteDir: target.RemoteDir, PasswordEnv: target.PasswordEnv, PrivateKeyFile: target.PrivateKeyFile, PrivateKeyPassphraseEnv: target.PrivateKeyPassphraseEnv, KnownHostsFile: target.KnownHostsFile, SecretIDEnv: target.SecretIDEnv, SecretKeyEnv: target.SecretKeyEnv, Keep: target.Keep, Timeout: target.TimeoutDur}
+			err := backup.Upload(ctx, remoteTarget, uploaded)
 			if err != nil {
 				log.Error("remote state snapshot upload failed", "target", target.Name, "type", target.Type, "err", err)
 				metrics.BackupRemoteErrors.WithLabelValues(target.Name, target.Type).Inc()
 				errs = append(errs, fmt.Errorf("remote target %s: %w", target.Name, err))
+			} else if err := backup.VerifyUpload(ctx, remoteTarget, uploaded); err != nil {
+				log.Error("remote state snapshot verification failed", "target", target.Name, "type", target.Type, "err", err)
+				metrics.BackupRemoteErrors.WithLabelValues(target.Name, target.Type).Inc()
+				errs = append(errs, fmt.Errorf("remote target %s verification: %w", target.Name, err))
 			} else {
-				log.Info("state snapshot uploaded", "target", target.Name, "type", target.Type, "path", uploaded)
+				log.Info("state snapshot uploaded and verified", "target", target.Name, "type", target.Type, "path", uploaded)
 				metrics.BackupRemoteLastSuccess.WithLabelValues(target.Name, target.Type).Set(float64(time.Now().Unix()))
 			}
 		}

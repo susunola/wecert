@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -69,6 +70,14 @@ func TestCOSUploadAndRestore(t *testing.T) {
 				return
 			}
 			_, _ = w.Write(body)
+		case r.Method == http.MethodHead:
+			body, ok := objects[key]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -83,6 +92,9 @@ func TestCOSUploadAndRestore(t *testing.T) {
 	target := Target{Type: TypeCOS, Bucket: "bucket", Prefix: "wecert", Endpoint: server.URL, SnapshotBase: "state.db"}
 	if err := Upload(context.Background(), target, src); err != nil {
 		t.Fatalf("Upload: %v", err)
+	}
+	if err := VerifyUpload(context.Background(), target, src); err != nil {
+		t.Fatalf("VerifyUpload: %v", err)
 	}
 	mu.Lock()
 	objects["wecert/other.db.backup-99999999"] = []byte("wrong snapshot")
@@ -131,6 +143,9 @@ func TestSFTPUploadAndRestore(t *testing.T) {
 	target := Target{Type: TypeSFTP, Host: addr, Username: "wecert", RemoteDir: remoteDir, PasswordEnv: "WECERT_TEST_SFTP_PASSWORD", KnownHostsFile: knownHosts, SnapshotBase: "state.db"}
 	if err := Upload(context.Background(), target, src); err != nil {
 		t.Fatalf("Upload: %v", err)
+	}
+	if err := VerifyUpload(context.Background(), target, src); err != nil {
+		t.Fatalf("VerifyUpload: %v", err)
 	}
 	if err := os.WriteFile(path.Join(remoteDir, "other.db.backup-99999999"), []byte("wrong snapshot"), 0o600); err != nil {
 		t.Fatal(err)

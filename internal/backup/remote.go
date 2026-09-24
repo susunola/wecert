@@ -62,6 +62,65 @@ func Upload(ctx context.Context, target Target, src string) error {
 	}
 }
 
+// VerifyUpload proves that the object just published is visible from a fresh
+// remote operation and has the same length as the local, SQLite-verified
+// snapshot.  PutObject/rename acknowledgement alone is not a recovery
+// guarantee: a misconfigured gateway can acknowledge a write that cannot be
+// read by the credentials used for recovery.  This deliberately checks the
+// exact name, rather than "latest", so a concurrent retention pass or another
+// installation in the same bucket cannot make an old backup look healthy.
+func VerifyUpload(ctx context.Context, target Target, src string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("stat uploaded snapshot: %w", err)
+	}
+	if target.Timeout <= 0 {
+		target.Timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, target.Timeout)
+	defer cancel()
+	switch target.Type {
+	case TypeS3, TypeCOS:
+		client, err := objectClient(ctx, target)
+		if err != nil {
+			return err
+		}
+		key := path.Join(strings.Trim(target.Prefix, "/"), filepath.Base(src))
+		head, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &target.Bucket, Key: &key})
+		if err != nil {
+			return fmt.Errorf("read back %s://%s/%s: %w", target.Type, target.Bucket, key, err)
+		}
+		if head.ContentLength == nil || *head.ContentLength != info.Size() {
+			return fmt.Errorf("read back %s://%s/%s: size %d, want %d", target.Type, target.Bucket, key, derefInt64(head.ContentLength), info.Size())
+		}
+		return nil
+	case TypeSFTP:
+		session, err := openSFTP(ctx, target)
+		if err != nil {
+			return err
+		}
+		defer session.Close()
+		remote := path.Join(target.RemoteDir, filepath.Base(src))
+		got, err := session.client.Stat(remote)
+		if err != nil {
+			return fmt.Errorf("read back SFTP snapshot: %w", err)
+		}
+		if got.Size() != info.Size() {
+			return fmt.Errorf("read back SFTP snapshot %s: size %d, want %d", remote, got.Size(), info.Size())
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown backup target type %q", target.Type)
+	}
+}
+
+func derefInt64(v *int64) int64 {
+	if v == nil {
+		return -1
+	}
+	return *v
+}
+
 // DownloadLatest retrieves the newest snapshot for target into dir with 0600
 // permissions. The caller owns removing the returned file after state.Restore
 // has verified and staged it.

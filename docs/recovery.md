@@ -49,7 +49,11 @@ protect: a lost disk, a dropped directory or a bad `rm` takes both. Configure
 chain; COS uses `TENCENTCLOUD_SECRET_ID` and `TENCENTCLOUD_SECRET_KEY` by default
 (or its target's `secretIdEnv` / `secretKeyEnv`). Successful remote uploads expose
 `wecert_backup_remote_last_success_timestamp_seconds` (0 until the first successful upload) and failures increment
-`wecert_backup_remote_errors_total`. Alert when a configured target has no recent success.
+`wecert_backup_remote_errors_total`. Every successful upload is then read back through a fresh
+remote operation and checked against the local snapshot's byte length before it is counted as a
+success. This catches a write-only credential, an inaccessible object prefix, and incomplete
+gateway publication; it is deliberately a recovery check, not merely a successful upload HTTP
+response. Alert when a configured target has no recent success.
 
 ```sh
 # Anywhere off the host. The files are small (a few hundred KB).

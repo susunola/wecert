@@ -344,6 +344,9 @@ holds the ACME account key, every certificate private key, in-flight order URLs 
 certID — and losing an order URL costs an issuance against the 5-per-7-days limit. So it is also
 snapshotted automatically: `stateBackup` is on by default, a consistent `VACUUM INTO` every 24h with
 7 kept. What each loss costs and how to restore one: [docs/recovery.md](docs/recovery.md).
+Remote S3, COS and SFTP snapshots are counted successful only after wecert reads back the exact
+new object and verifies its size, so an upload acknowledgement alone is never mistaken for a
+recoverable backup.
 
 **Health and alerting.** `/metrics` on `127.0.0.1:9800` by default, with a
 [ready-to-load rule file](deploy/prometheus/wecert-alerts.yml): 17 alerts covering expiry per
