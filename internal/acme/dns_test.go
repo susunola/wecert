@@ -251,6 +251,8 @@ func TestCleanUpDefersDeleteAllWhileAnotherValueIsLive(t *testing.T) {
 		// Present resolves the zone before handing the write to the provider, so the fixture
 		// needs a resolver that answers. This test is about the lease registry, not discovery.
 		recursiveNameservers: []string{"192.0.2.53:53"},
+		// Present walks the zone with the provider-side resolver view, not the verification one.
+		providerResolvers: []string{"192.0.2.53:53"},
 		exchange: func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
 			return dnsReply(msg, &dns.SOA{Hdr: dns.RR_Header{
 				Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}}), nil
@@ -340,6 +342,7 @@ func cachedNXDOMAINHarness(
 	resolver, authority := "192.0.2.53:53", "198.51.100.53:53"
 	solver := &DNSSolver{
 		recursiveNameservers: []string{resolver},
+		providerResolvers:    []string{resolver},
 		log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	authorityQueries := 0
@@ -760,6 +763,7 @@ func TestPresentReportsTheZoneInsteadOfLettingLegoBlameTheAccount(t *testing.T) 
 	provider := &stubChallengeProvider{}
 	solver := &DNSSolver{
 		recursiveNameservers: []string{"192.0.2.53:53"},
+		providerResolvers:    []string{"192.0.2.53:53"},
 		log:                  slog.New(slog.NewTextHandler(io.Discard, nil)),
 		newProvider: func(context.Context) (challenge.Provider, error) {
 			return provider, nil
