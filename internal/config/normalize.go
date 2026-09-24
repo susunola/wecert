@@ -520,6 +520,17 @@ func (w *Webhook) normalize() error {
 			"this endpoint can trigger real issuance, so a weak token is no better than none",
 			len(w.Token), WebhookTokenMinLen)
 	}
+	if w.AdminToken != "" {
+		if len(w.AdminToken) < WebhookAdminTokenMinLen {
+			return fmt.Errorf("webhook.adminToken is too short (%d characters, minimum %d): "+
+				"it can restore state.db, so treat it like a root password",
+				len(w.AdminToken), WebhookAdminTokenMinLen)
+		}
+		if w.AdminToken == w.Token {
+			return fmt.Errorf("webhook.adminToken must differ from webhook.token: the read-only " +
+				"token is what a status poller holds, and the admin token can restore a snapshot")
+		}
+	}
 	return nil
 }
 

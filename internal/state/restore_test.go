@@ -546,3 +546,63 @@ func TestSnapshotsInListsOneStoresSnapshotsOldestFirst(t *testing.T) {
 		t.Errorf("oldest first: got %v", got)
 	}
 }
+
+// A snapshot staged while the daemon holds the lock is applied on the next Open
+// (which legitimately holds the lock). The pending file is one-shot.
+func TestPendingRestoreIsAppliedOnOpen(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+
+	// Build a source snapshot with one certificate.
+	srcPath := filepath.Join(dir, "snap.db")
+	src, err := Open(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := src.PutCert(&CertState{Name: "from-snapshot", NotAfter: time.Now().Add(24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Snapshot(dir, 3); err != nil {
+		t.Fatal(err)
+	}
+	_ = src.Close()
+	snaps, err := SnapshotsIn(dir, srcPath)
+	if err != nil || len(snaps) == 0 {
+		t.Fatalf("snapshots: %v %v", snaps, err)
+	}
+
+	// Live database with a different certificate.
+	live, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := live.PutCert(&CertState{Name: "live", NotAfter: time.Now().Add(24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	_ = live.Close()
+
+	pending, err := StagePendingRestore(dbPath, snaps[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pending); err != nil {
+		t.Fatal(err)
+	}
+
+	// Next Open applies it.
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	names, err := reopened.ListCertNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "from-snapshot" {
+		t.Fatalf("after pending restore got %v, want [from-snapshot]", names)
+	}
+	if _, err := os.Stat(pending); !os.IsNotExist(err) {
+		t.Error("pending file must be one-shot")
+	}
+}

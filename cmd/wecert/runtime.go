@@ -18,6 +18,7 @@ import (
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 	"github.com/susunola/wecert/internal/webhook"
+	"os"
 )
 
 // openRuntime loads the config, opens the state store under the cross-process lock
@@ -315,4 +316,125 @@ func runOncePass(
 			"there is no recovery point for it: %w", err)
 	}
 	return onceExit(rep)
+}
+
+// adminAuditPath is the append-only admin audit log beside the state database.
+func adminAuditPath(statePath string) string {
+	if statePath == "" {
+		return ""
+	}
+	return statePath + ".admin-audit.jsonl"
+}
+
+// adminOps wires the guarded /admin surface to the same code paths the CLI uses.
+// nil fields simply are not mounted (see webhook.AdminOps).
+func adminOps(cfg *config.Config, log *slog.Logger) webhook.AdminOps {
+	return webhook.AdminOps{
+		BackupHealth: func(ctx context.Context) (any, error) {
+			return backupHealth(cfg)
+		},
+		RecoveryPlan: func(ctx context.Context) (any, error) {
+			return recoveryPlan(cfg)
+		},
+		RecoveryDrill: func(ctx context.Context) (any, error) {
+			return recoveryDrill(cfg)
+		},
+		Restore: func(ctx context.Context, source string) (any, error) {
+			return adminRestore(cfg, source, log)
+		},
+	}
+}
+
+// backupHealth is the read-only snapshot posture (local + remote).
+func backupHealth(cfg *config.Config) (any, error) {
+	out := map[string]any{
+		"statePath": cfg.StatePath,
+		"enabled":   cfg.StateBackup.Enabled,
+		"dir":       cfg.StateBackup.Dir,
+	}
+	if fi, err := os.Stat(cfg.StatePath); err == nil {
+		out["stateAgeSeconds"] = int(time.Since(fi.ModTime()).Seconds())
+		out["stateBytes"] = fi.Size()
+	}
+	notice, err := state.LoadRestoreNotice(cfg.StatePath)
+	if err == nil && notice != nil {
+		out["lastRestoreAt"] = notice.RestoredAt.UTC().Format(time.RFC3339)
+	}
+	return out, nil
+}
+
+// recoveryPlan is non-destructive: what would `latest` restore.
+func recoveryPlan(cfg *config.Config) (any, error) {
+	src, cleanup, err := resolveRestoreSnapshot(cfg, "latest")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	info, err := state.InspectSnapshot(src)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := os.Stat(src)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"source":        src,
+		"snapshotAge":   time.Since(fi.ModTime()).Round(time.Second).String(),
+		"certificates":  info.Certificates,
+		"account":       info.Account,
+		"liveStatePath": cfg.StatePath,
+		"note":          "read-only; POST /admin/recovery-drill to test the snapshot, or /admin/challenge then /admin/restore to apply it (applied on next start if the daemon holds the lock)",
+	}, nil
+}
+
+// recoveryDrill opens and checks a snapshot without touching live state.
+func recoveryDrill(cfg *config.Config) (any, error) {
+	src, cleanup, err := resolveRestoreSnapshot(cfg, "latest")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	info, err := state.InspectSnapshot(src)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := os.Stat(src)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"source":       src,
+		"snapshotAge":  time.Since(fi.ModTime()).Round(time.Second).String(),
+		"certificates": info.Certificates,
+		"account":      info.Account,
+		"passed":       true,
+		"note":         "no live state was changed",
+	}, nil
+}
+
+// adminRestore applies (or stages) a snapshot. If the daemon holds the state lock --
+// which it does -- the snapshot is verified and staged as state.db.restore-pending and
+// applied on the next start. That is the only honest response to "restore now" while
+// this process has the database open: swapping the file underneath us would leave
+// every write going to an unlinked inode.
+func adminRestore(cfg *config.Config, source string, log *slog.Logger) (any, error) {
+	src, cleanup, err := resolveRestoreSnapshot(cfg, source)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	pending, err := state.StagePendingRestore(cfg.StatePath, src)
+	if err != nil {
+		return nil, err
+	}
+	log.Warn("admin restore staged; it is applied on the next start of wecert",
+		"source", src, "pending", pending, "statePath", cfg.StatePath)
+	return map[string]any{
+		"pending":            true,
+		"appliedOnNextStart": true,
+		"pendingPath":        pending,
+		"source":             src,
+		"note":               "the live database is still open in this process; restart wecert to apply. The previous database is kept as state.db.replaced-<stamp> when the pending restore runs.",
+	}, nil
 }

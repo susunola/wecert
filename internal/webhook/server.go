@@ -99,6 +99,16 @@ type Server struct {
 	log     *slog.Logger
 	now     func() time.Time
 	limiter *authLimiter
+
+	// adminToken is the second secret for /admin/... (see config.Webhook.AdminToken).
+	adminToken string
+	// ops is the guarded surface's real work; nil fields are simply not mounted.
+	ops AdminOps
+	// auditPath is the append-only admin audit log (0600). Empty disables it.
+	auditPath string
+	// confirms holds one-shot restore confirm tokens with their expiry.
+	confirmMu sync.Mutex
+	confirms  map[string]time.Time
 }
 
 // New builds the webhook server.
@@ -107,18 +117,34 @@ type Server struct {
 // layer: "Authorization: Bearer " would pass a constant-time compare against an
 // empty configured token, so the invariant "an authed endpoint always requires a
 // real token" must hold here rather than being outsourced to every caller.
+// AdminOptions configures the guarded /admin surface. Optional: without AdminToken
+// the routes are not mounted at all.
+type AdminOptions struct {
+	Token     string
+	AuditPath string
+	Ops       AdminOps
+}
+
 func New(rec Reconciler, store *state.Store, token string, baseCtx context.Context, log *slog.Logger) (*Server, error) {
+	return NewWithAdmin(rec, store, token, AdminOptions{}, baseCtx, log)
+}
+
+// NewWithAdmin is New plus the optional admin surface.
+func NewWithAdmin(rec Reconciler, store *state.Store, token string, admin AdminOptions, baseCtx context.Context, log *slog.Logger) (*Server, error) {
 	if token == "" {
 		return nil, errors.New("webhook: token must not be empty")
 	}
 	return &Server{
-		rec:     rec,
-		store:   store,
-		token:   token,
-		baseCtx: baseCtx,
-		log:     log,
-		now:     time.Now,
-		limiter: newAuthLimiter(),
+		rec:        rec,
+		store:      store,
+		token:      token,
+		baseCtx:    baseCtx,
+		log:        log,
+		now:        time.Now,
+		limiter:    newAuthLimiter(),
+		adminToken: admin.Token,
+		ops:        admin.Ops,
+		auditPath:  admin.AuditPath,
 	}, nil
 }
 

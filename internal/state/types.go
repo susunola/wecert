@@ -221,9 +221,9 @@ type Authorization struct {
 	// the row entered the stuck queue (zero = not stuck); LastReclaimError is why the last
 	// try failed. Together they are the independent retry queue for a TXT that may still be
 	// in DNS while authoritative NS is unreachable or the provider cannot delete it.
-	ReclaimAttempts    int
-	LastReclaimError   string
-	ReclaimStuckSince  time.Time
+	ReclaimAttempts   int
+	LastReclaimError  string
+	ReclaimStuckSince time.Time
 }
 
 // TXTReclaimStuck is one row of the DNS cleanup guardian queue.

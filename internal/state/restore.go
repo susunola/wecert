@@ -34,6 +34,12 @@ import (
 // leaves the deployment exactly as it was.
 const restoreStagedSuffix = ".restore-staged"
 
+// restorePendingSuffix names a verified snapshot staged by the admin surface while
+// the daemon still holds the state lock. Applied on the next Open (which holds the
+// lock legitimately): restoring underneath a running process would leave that
+// process writing to an unlinked inode.
+const restorePendingSuffix = ".restore-pending"
+
 // replacedSuffix names the database that a restore displaced.
 //
 // It is kept rather than deleted because that file holds the account key and any order placed after
@@ -201,7 +207,20 @@ func Restore(dest, source string) (RestoreResult, error) {
 		return res, err
 	}
 	defer func() { _ = lock.release() }()
+	return restoreLocked(res, dest, realDest, source)
+}
 
+// restoreLocked is Restore's body once the state lock is held. Called from Restore
+// and from ApplyPendingRestore (which runs inside Open, which already holds the lock
+// -- acquiring it again would deadlock).
+// dest is the configured path (possibly a symlink); realDest is the file the bytes
+// actually go to. The restore notice lives beside the CONFIGURED path, because that
+// is where the next start looks for it.
+func restoreLocked(res RestoreResult, dest, realDest, source string) (RestoreResult, error) {
+	srcInfo, err := os.Stat(source)
+	if err != nil {
+		return res, fmt.Errorf("restore: read the snapshot %s: %w", source, err)
+	}
 	dir := filepath.Dir(realDest)
 	staged := realDest + restoreStagedSuffix
 	// A leftover from a crashed restore would make the copy below fail with "file exists" on some
@@ -570,4 +589,61 @@ func LoadRestoreNotice(statePath string) (*RestoreNotice, error) {
 func SnapshotsIn(dir, statePath string) ([]string, error) {
 	s := &Store{base: filepath.Base(statePath)}
 	return s.listSnapshots(dir)
+}
+
+// StagePendingRestore writes a verified snapshot to dest+".restore-pending" without
+// touching the live database. Used when another process holds the state lock: the
+// daemon is running, so the swap cannot happen now, but the bytes are on disk and
+// verified for the next start.
+func StagePendingRestore(dest, source string) (string, error) {
+	if dest == "" || source == "" {
+		return "", errors.New("stage pending restore: need both a state path and a snapshot")
+	}
+	srcInfo, err := os.Lstat(source)
+	if err != nil {
+		return "", fmt.Errorf("stage pending restore: read the snapshot %s: %w", source, err)
+	}
+	if srcInfo.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("stage pending restore: %s is a symlink; point at the real snapshot file", source)
+	}
+	if _, err := inspectSnapshot(source); err != nil {
+		return "", fmt.Errorf("stage pending restore: %w", err)
+	}
+	pending := dest + restorePendingSuffix
+	dir := filepath.Dir(dest)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("stage pending restore: create %s: %w", dir, err)
+	}
+	if err := copyFileSync(pending, source, dir); err != nil {
+		return "", fmt.Errorf("stage pending restore: %w", err)
+	}
+	if _, err := inspectSnapshot(pending); err != nil {
+		_ = os.Remove(pending)
+		return "", fmt.Errorf("stage pending restore: the staged copy did not survive the copy: %w", err)
+	}
+	return pending, nil
+}
+
+// ApplyPendingRestore applies a snapshot staged by StagePendingRestore. The caller
+// must already hold the state lock (Open does). Returns applied=false when there is
+// nothing pending.
+func ApplyPendingRestore(dest string) (RestoreResult, bool, error) {
+	var res RestoreResult
+	pending := dest + restorePendingSuffix
+	if _, err := os.Lstat(pending); err != nil {
+		return res, false, nil
+	}
+	realDest, err := resolveStateTarget(dest)
+	if err != nil {
+		return res, true, err
+	}
+	res, err = restoreLocked(res, dest, realDest, pending)
+	// The pending file is one-shot whatever happened: a failed apply must not silently
+	// retry on every start with the same broken bytes. The error names the pending path.
+	_ = os.Remove(pending)
+	if err != nil {
+		return res, true, fmt.Errorf("apply pending restore from %s: %w", pending, err)
+	}
+	res.Source = pending
+	return res, true, nil
 }

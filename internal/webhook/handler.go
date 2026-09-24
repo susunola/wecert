@@ -25,5 +25,16 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/diagnostics/txt-reclaims", s.auth(s.handleTXTReclaims(g)))
 	}
 
+	// Guarded admin surface. Mounted only when an admin token is configured: a
+	// read-only token (Token) cannot reach these routes, and without AdminToken the
+	// process stays read-only over the network.
+	if s.adminToken != "" {
+		mux.HandleFunc("/admin/backup-health", s.adminAuth(s.handleAdminBackupHealth()))
+		mux.HandleFunc("/admin/recovery-plan", s.adminAuth(s.handleAdminRecoveryPlan()))
+		mux.HandleFunc("/admin/recovery-drill", s.adminAuth(s.handleAdminRecoveryDrill()))
+		mux.HandleFunc("/admin/challenge", s.adminAuth(s.handleAdminChallenge()))
+		mux.HandleFunc("/admin/restore", s.adminAuth(s.handleAdminRestore()))
+	}
+
 	return mux
 }

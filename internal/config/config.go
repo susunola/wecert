@@ -1005,7 +1005,20 @@ type Webhook struct {
 	// body>, which lets the receiver distinguish a genuine event from anything else
 	// that can reach its URL.
 	NotifySecret string `yaml:"notifySecret"`
+
+	// AdminToken is a SECOND shared secret for the guarded write/diagnostic surface
+	// (/admin/...). Optional: without it the admin routes are not mounted, and the
+	// process stays read-only over the network.
+	//
+	// Deliberately separate from Token: the read-only token is what a CI job holds to
+	// poll status; the admin token is what can restore a snapshot. Sharing one would
+	// give every status poller the ability to overwrite state.db.
+	AdminToken string `yaml:"adminToken,omitempty"`
 }
+
+// WebhookAdminTokenMinLen is the minimum admin token length. Longer than the
+// read-only token's floor: this one can restore state.
+const WebhookAdminTokenMinLen = 32
 
 // WebhookTokenMinLen is the minimum token length.
 // A short token is no authentication at all on this endpoint — an attacker who

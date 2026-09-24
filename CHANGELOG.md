@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Guarded web admin surface.** `webhook.adminToken` (separate from the read-only
+  `webhook.token`, minimum 32 characters) mounts `/admin/backup-health`,
+  `/admin/recovery-plan`, `/admin/recovery-drill`, `/admin/challenge` and
+  `/admin/restore`. The first three are diagnostics; restore is destructive and
+  needs a one-shot confirm token from `/admin/challenge` (10-minute TTL). Without
+  `adminToken` the routes are not mounted at all -- the process stays read-only
+  over the network. Every admin action is appended to `state.db.admin-audit.jsonl`
+  (0600). Because the live database is open in this process, a restore is staged
+  as `state.db.restore-pending` and applied on the **next** start (which holds the
+  state lock legitimately); the previous database is kept as
+  `state.db.replaced-<stamp>`.
+
+### Added
+
 - **Full-binding patrol.** Every 6 hours the Tencent deployer pages `DescribeCertificates`
   (uploaded) and re-enumerates each known certificate's live bindings, then classifies the
   gap: `confirmed` / `incomplete` / `drift` (state says deployed, cloud says bound nowhere --

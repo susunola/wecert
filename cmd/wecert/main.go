@@ -793,7 +793,12 @@ func startWebhookServer(
 			"failed to listen on the webhook port %s: %w (already in use?)", cfg.Webhook.Listen, err)
 	}
 
-	api, err := webhook.New(rec, store, cfg.Webhook.Token, ctx, log)
+	admin := webhook.AdminOptions{
+		Token:     cfg.Webhook.AdminToken,
+		AuditPath: adminAuditPath(cfg.StatePath),
+		Ops:       adminOps(cfg, log),
+	}
+	api, err := webhook.NewWithAdmin(rec, store, cfg.Webhook.Token, admin, ctx, log)
 	if err != nil {
 		// The port is already bound above, and returning here used to leak it: this process
 		// exits because of the error, so a restart is fine, but the exit path taken when

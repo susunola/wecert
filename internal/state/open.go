@@ -155,6 +155,17 @@ func open(path string, exclusive bool) (*Store, error) {
 		}
 	}
 
+	// Apply a snapshot the admin surface staged while this lock was held by someone
+	// else. The lock is already ours here, so restoreLocked must not try to take it again.
+	if _, applied, rerr := ApplyPendingRestore(path); applied {
+		if rerr != nil {
+			// The pending file is gone either way (one-shot). Refuse to start: the
+			// operator staged a restore and it failed, and silently continuing on the
+			// old database is exactly the false all-clear this path exists to prevent.
+			return nil, rerr
+		}
+	}
+
 	s, err := openFiles(path, lock, existedBefore, lockExisted, exclusive)
 	if err != nil {
 		_ = lock.release()
