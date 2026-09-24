@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-acme/lego/v4/challenge/dns01"
@@ -67,17 +68,38 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 	// in dnspod for domain ...", which reads like a DNSPod account problem and is not. This
 	// costs one short SOA walk (findZone already refuses to return a public suffix) and only
 	// runs when a record is about to be written.
-	if _, err := s.findZone(ctx, rec.FQDN); err != nil {
+	if _, err := s.findZoneWithResolvers(ctx, rec.FQDN, s.providerResolvers); err != nil {
 		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
 	}
 
 	if err := callProviderBounded("present TXT", func() error {
-		return provider.Present(domain, token, keyAuth)
+		return s.callLegoProviderResolvers(func() error { return provider.Present(domain, token, keyAuth) })
 	}); err != nil {
 		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
 	}
 	challengeLeases.add(rec.FQDN, rec.Value)
 	return rec, nil
+}
+
+func (s *DNSSolver) findZoneWithResolvers(ctx context.Context, fqdn string, resolvers []string) (string, error) {
+	copy := *s
+	copy.recursiveNameservers = resolvers
+	return copy.findZone(ctx, fqdn)
+}
+
+var legoResolverMu sync.Mutex
+
+// callLegoProviderResolvers keeps lego's provider-side zone lookup on the host
+// resolver. Verification may use public resolvers, but lego's Cloudflare
+// provider performs its own UDP-only lookup before writing a record.
+func (s *DNSSolver) callLegoProviderResolvers(fn func() error) error {
+	legoResolverMu.Lock()
+	defer legoResolverMu.Unlock()
+	defer dns01.AddRecursiveNameservers(s.recursiveNameservers)(&dns01.Challenge{})
+	if err := dns01.AddRecursiveNameservers(s.providerResolvers)(&dns01.Challenge{}); err != nil {
+		return err
+	}
+	return fn()
 }
 
 // WaitAll waits until every record is visible on all authoritative NS of its zone.

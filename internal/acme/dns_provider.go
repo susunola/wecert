@@ -143,6 +143,10 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 	if err != nil {
 		return nil, err
 	}
+	providerResolvers, err := recursiveNameservers(nil)
+	if err != nil {
+		return nil, err
+	}
 	// Applying the option to a throwaway Challenge works by side effect, and only because of how
 	// lego implements it: in lego v4.35.2 (challenge/dns01/nameserver.go -- the package-level
 	// `recursiveNameservers` variable at line 27, the option at line 65) AddRecursiveNameservers
@@ -151,7 +155,7 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 	if err := dns01.AddRecursiveNameservers(resolvers)(&dns01.Challenge{}); err != nil {
 		return nil, fmt.Errorf("configure lego recursive nameservers: %w", err)
 	}
-	solver := &DNSSolver{newProvider: newProvider, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS}
+	solver := &DNSSolver{newProvider: newProvider, providerResolvers: providerResolvers, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS}
 	if dnsCfg.Provider == config.DNSProviderCloudflare {
 		solver.recoverCloudflareTXT = newCloudflareTXTRecovery(dnsCfg.Cloudflare.APIToken, dnsCfg.Cloudflare.APITokenFile)
 	}

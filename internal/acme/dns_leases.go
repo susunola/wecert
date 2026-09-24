@@ -75,7 +75,7 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	}
 	// Same bound as Present: this call holds the per-name lease mutex. See callProviderBounded.
 	err = callProviderBounded("cleanup TXT", func() error {
-		return provider.CleanUp(domain, token, keyAuth)
+		return s.callLegoProviderResolvers(func() error { return provider.CleanUp(domain, token, keyAuth) })
 	})
 	if err == nil || s.recoverCloudflareTXT == nil || !providerForgotRecordError(err) {
 		return err

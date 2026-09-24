@@ -80,12 +80,17 @@ func (s *DNSSolver) waitZone(
 				fmt.Sprintf("%s = %s (%s)", res.record.FQDN, res.record.Value, res.summary))
 		}
 
-		if len(pending) == 0 {
+		if len(pending) == 0 || allAuthoritativeProbesUnreachable(results) {
 			// The authoritative servers agree. That is necessary but not sufficient: the CA
 			// validates through a recursive resolver, so ask that path too before telling the CA
-			// to look (see probeRecursive for why the two views can disagree).
+			// to look (see probeRecursive for why the two views can disagree). If every
+			// authority is unreachable from this host, the recursive answer is the only
+			// useful evidence we can collect; requiring an impossible direct probe turns an
+			// egress policy into a permanent issuance outage while the CA can still validate.
 			if ready, why := s.recursiveReady(ctx, recs); !ready {
 				pending = why
+			} else if allAuthoritativeProbesUnreachable(results) {
+				pending = nil
 			}
 		}
 
@@ -146,6 +151,24 @@ func (s *DNSSolver) waitZone(
 		case <-time.After(s.interval):
 		}
 	}
+}
+
+func allAuthoritativeProbesUnreachable(results []recordProbe) bool {
+	if len(results) == 0 {
+		return false
+	}
+	for _, result := range results {
+		idx := strings.LastIndex(result.summary, " / unreachable ")
+		if idx < 0 {
+			return false
+		}
+		part := result.summary[idx+len(" / unreachable "):]
+		var unreachable, total int
+		if _, err := fmt.Sscanf(part, "%d (of %d addresses)", &unreachable, &total); err != nil || total == 0 || unreachable != total {
+			return false
+		}
+	}
+	return true
 }
 
 // dnsProbeAttempts is how many times one authoritative ADDRESS may be asked within a single round
