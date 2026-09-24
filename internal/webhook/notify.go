@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"github.com/susunola/wecert/internal/config"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,9 +27,11 @@ type Notifier struct {
 	// pdRoutingKey is the PagerDuty Events API v2 integration key (only for
 	// format=notifyFormatPagerDuty).
 	pdRoutingKey string
-	client       *http.Client
-	log          *slog.Logger
-	sem          chan struct{}
+	// jira is the REST client config (only for format=notifyFormatJira).
+	jira   JiraTarget
+	client *http.Client
+	log    *slog.Logger
+	sem    chan struct{}
 
 	// mu guards draining, which is only ever set once.
 	mu sync.Mutex
@@ -60,8 +63,29 @@ func NewNotifier(url, secret string, log *slog.Logger) *Notifier {
 
 // NewNotifierFormat builds a notifier whose POST body is shaped for the named
 // product. format "" is treated as generic. An empty url still returns nil.
+// jiraTarget is the construction input for the Jira REST adapter.
+type JiraTarget struct {
+	BaseURL        string
+	ProjectKey     string
+	IssueType      string
+	Email          string
+	APIToken       string
+	Auth           string // basic | bearer
+	Labels         []string
+	ReuseOpenIssue bool
+}
+
+// NewNotifierFormat builds a notifier whose POST body is shaped for the named
+// product. format "" is treated as generic. An empty url still returns nil (except
+// jira, which uses the REST baseURL instead of a webhook URL).
 func NewNotifierFormat(url, secret, format, pdRoutingKey string, log *slog.Logger) *Notifier {
-	if url == "" {
+	return NewNotifierJira(url, secret, format, pdRoutingKey, JiraTarget{}, log)
+}
+
+// NewNotifierJira is NewNotifierFormat plus the Jira REST settings. jt is only read
+// when format is jira.
+func NewNotifierJira(url, secret, format, pdRoutingKey string, jt JiraTarget, log *slog.Logger) *Notifier {
+	if url == "" && format != "jira" {
 		return nil
 	}
 	if format == "" {
@@ -72,6 +96,7 @@ func NewNotifierFormat(url, secret, format, pdRoutingKey string, log *slog.Logge
 		secret:       secret,
 		format:       format,
 		pdRoutingKey: pdRoutingKey,
+		jira:         jt,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 			// Redirects are refused rather than followed.
@@ -128,6 +153,13 @@ func (n *Notifier) Renewal(ctx context.Context, certName string, reconcileErr er
 }
 
 func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
+	if n.format == config.NotifyFormatJira {
+		if err := n.deliverJira(ctx, ev); err != nil {
+			n.log.Warn("failed to deliver the jira notification", "cert", ev.Cert,
+				"target", RedactNotifyURL(n.jira.BaseURL), "err", withoutURL(err))
+		}
+		return
+	}
 	body, err := n.notifyPayload(ev)
 	if err != nil {
 		if errors.Is(err, errSkipPagerDutySuccess) {

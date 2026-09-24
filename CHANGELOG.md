@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Jira notifications.** `webhook.notifyFormat: jira` opens (or comments on) a Jira
+  issue for a failed renewal. `webhook.jira` names the instance and the issue
+  (`baseURL`, `projectKey`, `issueType`), authenticates with Cloud basic
+  (email + `apiToken`/`apiTokenFile`) or a bearer PAT, and adds labels `wecert` +
+  `wecert-cert-<name>`. By default (`reuseOpenIssue`) a second failure for the same
+  certificate comments on the open issue instead of opening a duplicate. Successful
+  renewals do not create tickets. API v2, so Server/DC and Cloud both work with a
+  plain-text description.
+
 ## 0.8.0 - 2026-09-24
 
 ### Added

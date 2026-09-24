@@ -1047,7 +1047,49 @@ type Webhook struct {
 
 	// PagerDuty is read only when notifyFormat=pagerduty.
 	PagerDuty PagerDutyNotify `yaml:"pagerduty,omitempty"`
+
+	// Jira is read only when notifyFormat=jira.
+	Jira JiraNotify `yaml:"jira,omitempty"`
 }
+
+// JiraNotify points at a Jira Server/Data Center or Cloud REST API and names the
+// issue to create. Field names are configurable on purpose: every team's project
+// uses a different issue type and label set, and a hardcoded one becomes a fork.
+type JiraNotify struct {
+	// BaseURL is the Jira origin (https://jira.example.com). notifyURL is NOT reused
+	// for this format: one is a webhook receiver, the other is a REST API root.
+	BaseURL string `yaml:"baseURL"`
+
+	// ProjectKey and IssueType are the issue to create (e.g. OPS / Bug / Incident).
+	ProjectKey string `yaml:"projectKey"`
+	IssueType  string `yaml:"issueType"`
+
+	// Email + APIToken is Jira Cloud's basic auth (email + API token). APITokenFile
+	// is preferred so the secret stays out of config.yaml.
+	Email        string `yaml:"email,omitempty"`
+	APIToken     string `yaml:"apiToken,omitempty"`
+	APITokenFile string `yaml:"apiTokenFile,omitempty"`
+
+	// Auth selects the Authorization header: "basic" (email:apiToken, Jira Cloud API
+	// tokens and Server PATs) or "bearer" (a raw PAT/OAuth access token). Default basic.
+	Auth string `yaml:"auth,omitempty"`
+
+	// Labels are added to every created issue. wecert always adds "wecert" and
+	// "wecert-cert-<name>" so a second failure for the same certificate can find the
+	// open issue instead of opening another.
+	Labels []string `yaml:"labels,omitempty"`
+
+	// ReuseOpenIssue finds an open issue with the wecert-cert-<name> label and
+	// comments on it instead of creating a duplicate. Default true when the field is
+	// unset -- a new ticket every failed renewal is how an integration gets ignored.
+	ReuseOpenIssue *bool `yaml:"reuseOpenIssue,omitempty"`
+}
+
+// Jira auth modes.
+const (
+	JiraAuthBasic  = "basic"
+	JiraAuthBearer = "bearer"
+)
 
 // PagerDutyNotify is the Events API v2 routing key. The URL is still
 // webhook.notifyURL (https://events.pagerduty.com/v2/enqueue).
@@ -1066,6 +1108,7 @@ const (
 	NotifyFormatWeCom     = "wecom"
 	NotifyFormatDingTalk  = "dingtalk"
 	NotifyFormatSlack     = "slack"
+	NotifyFormatJira      = "jira"
 )
 
 // WebhookAdminTokenMinLen is the minimum admin token length. Longer than the
@@ -1260,6 +1303,12 @@ func (c *Config) resolveSecretFiles() ([]string, error) {
 		}
 	}
 
+	if c.Webhook.NotifyFormat == NotifyFormatJira {
+		if err := resolve("webhook.jira.apiToken", c.Webhook.Jira.APIToken,
+			c.Webhook.Jira.APITokenFile, nil, &c.Webhook.Jira.APIToken); err != nil {
+			return warns, err
+		}
+	}
 	if c.Webhook.NotifyFormat == NotifyFormatPagerDuty {
 		if err := resolve("webhook.pagerduty.routingKey", c.Webhook.PagerDuty.RoutingKey,
 			c.Webhook.PagerDuty.RoutingKeyFile, nil, &c.Webhook.PagerDuty.RoutingKey); err != nil {

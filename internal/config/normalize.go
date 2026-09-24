@@ -528,7 +528,7 @@ func (w *Webhook) normalize() error {
 	}
 	switch w.NotifyFormat {
 	case NotifyFormatGeneric, NotifyFormatPagerDuty, NotifyFormatFeishu,
-		NotifyFormatWeCom, NotifyFormatDingTalk, NotifyFormatSlack:
+		NotifyFormatWeCom, NotifyFormatDingTalk, NotifyFormatSlack, NotifyFormatJira:
 	default:
 		return fmt.Errorf("webhook.notifyFormat must be %q, %q, %q, %q, %q or %q, got %q",
 			NotifyFormatGeneric, NotifyFormatPagerDuty, NotifyFormatFeishu,
@@ -539,6 +539,36 @@ func (w *Webhook) normalize() error {
 		return fmt.Errorf("webhook.notifyFormat=\"%s\" requires webhook.pagerduty.routingKey or "+
 			"webhook.pagerduty.routingKeyFile (the Events API v2 integration key)",
 			NotifyFormatPagerDuty)
+	}
+	if w.NotifyFormat == NotifyFormatJira {
+		if w.Jira.BaseURL == "" {
+			return fmt.Errorf("webhook.notifyFormat=%q requires webhook.jira.baseURL (the Jira origin, e.g. https://jira.example.com)",
+				NotifyFormatJira)
+		}
+		if w.Jira.ReuseOpenIssue == nil {
+			yes := true
+			w.Jira.ReuseOpenIssue = &yes
+		}
+		if w.Jira.ProjectKey == "" || w.Jira.IssueType == "" {
+			return fmt.Errorf("webhook.jira.projectKey and webhook.jira.issueType are required when notifyFormat=%q",
+				NotifyFormatJira)
+		}
+		switch w.Jira.Auth {
+		case "", JiraAuthBasic:
+			if w.Jira.Email == "" || (w.Jira.APIToken == "" && w.Jira.APITokenFile == "") {
+				return fmt.Errorf("webhook.jira basic auth requires email and apiToken or apiTokenFile")
+			}
+		case JiraAuthBearer:
+			if w.Jira.APIToken == "" && w.Jira.APITokenFile == "" {
+				return fmt.Errorf("webhook.jira bearer auth requires apiToken or apiTokenFile (the PAT)")
+			}
+		default:
+			return fmt.Errorf("webhook.jira.auth must be %q or %q, got %q", JiraAuthBasic, JiraAuthBearer, w.Jira.Auth)
+		}
+		if u, err := url.Parse(w.Jira.BaseURL); err != nil || u.Host == "" ||
+			(u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("webhook.jira.baseURL must be an http or https URL with a host, got %q", w.Jira.BaseURL)
+		}
 	}
 	if w.AdminToken != "" {
 		if len(w.AdminToken) < WebhookAdminTokenMinLen {
