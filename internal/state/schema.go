@@ -48,6 +48,7 @@ var schemaTables = []string{
 	"cert_fallback",
 	"revoke_requests",
 	"rate_buckets",
+	"state_generation",
 }
 
 // schemaColumns are the columns added to tables that predate them.

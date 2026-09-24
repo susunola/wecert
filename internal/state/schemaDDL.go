@@ -178,4 +178,12 @@ CREATE TABLE IF NOT EXISTS rate_buckets (
     reset_reason TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (limit_name, scope_id)
 );
+
+-- A monotonic generation is deliberately outside certificate state.  The sidecar
+-- mirror lets a later start notice a hand-copied older database before it places
+-- another order against a rate-limit ledger that has moved backwards.
+CREATE TABLE IF NOT EXISTS state_generation (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    generation INTEGER NOT NULL DEFAULT 0
+);
 `

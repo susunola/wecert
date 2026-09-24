@@ -177,12 +177,13 @@ systemctl start wecert
 journalctl -u wecert -f
 ```
 
-A hand restore does **not** write `state.db.restored`, so the rate-limit warning above will not
-appear and cannot be inferred afterwards: nothing in the file records that it was swapped in. If you
-restore by hand and the backup is more than a few minutes old, expect the same caveat and watch for a
-refused order. (Reproducing it is easy — copy the installed `state.db` aside, run
-`wecert -restore <the same snapshot>`, and it is recorded; the copy is then redundant and can be
-deleted.)
+A hand restore does **not** write `state.db.restored`, so it lacks the command's explicit recovery
+record. Newer wecert versions also keep a durable state-generation high-water mark beside the
+database: if a hand-copied snapshot moves that generation backwards, the next locked start warns
+before issuance that the local rate-limit ledger may be behind the CA. Treat that warning as a
+recovery incident, not a routine startup line; the supported `wecert -restore` command records the
+operator acknowledgement and begins a new generation cleanly. A backup more than a few minutes old
+still carries the same CA quota caveat and deserves monitoring for a refused order.
 
 ### What to check in the logs
 

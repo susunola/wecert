@@ -298,6 +298,10 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 			db.Close()
 			return nil, err
 		}
+		if err := s.advanceGeneration(); err != nil {
+			db.Close()
+			return nil, err
+		}
 	} else if pending, err := s.pendingMigrations(); err != nil {
 		db.Close()
 		return nil, err
