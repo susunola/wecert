@@ -38,6 +38,12 @@ type DNSSolver struct {
 	log                  *slog.Logger
 	recursiveNameservers []string
 	exchange             func(ctx context.Context, msg *dns.Msg, server string) (*dns.Msg, error)
+
+	// valueScopedCleanup says this provider's CleanUp removes only the record matching the
+	// (token, keyAuth) it was called with, leaving every other value at the name in place.
+	// For those providers CleanUp must not defer to a "last leaver": that call only removes
+	// its own value, so the deferred ones stay in DNS for good. See cleanupIsValueScoped.
+	valueScopedCleanup bool
 }
 
 // NewDNSSolver picks an implementation from dns.provider.
@@ -206,16 +212,7 @@ func (l *txtLeases) remove(fqdn, value string) (othersLive bool) {
 	return len(e.values) > 0
 }
 
-// CleanUp deletes the TXT record this call wrote -- or defers doing so.
-//
-// lego's provider deletes **every** TXT record at the challenge name, so this wrapper
-// only calls it once no other value is live at the name (see challengeLeases); while
-// another certificate (or this one's wildcard sibling) still needs its record there, the
-// deletion is skipped and left to the last leaver.
-//
-// A skipped record is not leaked: the last CleanUp at the name removes all records in
-// one call, and anything stranded by a crash is reclaimed later by the manager's
-// cleanupOrphanTXT.
+// exchangeDNS asks one server, over UDP first and TCP when the answer cannot be used.
 func exchangeDNS(ctx context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
 	client := &dns.Client{Timeout: 3 * time.Second}
 	resp, _, err := client.ExchangeContext(ctx, msg, server)

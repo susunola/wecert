@@ -155,11 +155,44 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 	if err := dns01.AddRecursiveNameservers(resolvers)(&dns01.Challenge{}); err != nil {
 		return nil, fmt.Errorf("configure lego recursive nameservers: %w", err)
 	}
-	solver := &DNSSolver{newProvider: newProvider, providerResolvers: providerResolvers, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS}
+	solver := &DNSSolver{newProvider: newProvider, providerResolvers: providerResolvers, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS, valueScopedCleanup: cleanupIsValueScoped(dnsCfg.Provider)}
 	if dnsCfg.Provider == config.DNSProviderCloudflare {
 		solver.recoverCloudflareTXT = newCloudflareTXTRecovery(dnsCfg.Cloudflare.APIToken, dnsCfg.Cloudflare.APITokenFile)
 	}
 	return solver, nil
+}
+
+// cleanupIsValueScoped reports whether the configured provider's CleanUp removes only the record
+// matching the (token, keyAuth) it was called with, leaving every other value at the challenge name
+// in place.
+//
+// The distinction decides whether CleanUp may defer to a "last leaver", and getting it wrong is
+// silent. lego's dnspod and tencentcloud providers delete **every** TXT at the name
+// (providers/dns/dnspod/dnspod.go, providers/dns/tencentcloud/tencentcloud.go), so the last
+// leaver's single call collects the values the earlier callers skipped. Route 53's and Cloudflare's
+// do not:
+//
+//   - route53 (providers/dns/route53/route53.go, CleanUp) reads the record set, keeps every value
+//     that is not its own, upserts the remainder, and only deletes the whole set when nothing else
+//     is left;
+//   - cloudflare (providers/dns/cloudflare/cloudflare.go) keeps the record IDs it created in a map
+//     keyed by the challenge token and deletes by ID.
+//
+// For those two a deferred value is never removed by anyone, so the cleanup would leave one stale
+// _acme-challenge TXT behind per shared challenge name -- the wildcard + apex shape, or two
+// certificates on one domain -- and a stale value is what a later validation can be answered from.
+// Deferring buys nothing there either: each call removes only its own record.
+//
+// Everything reached through `dns.provider: lego` is treated as delete-all on purpose: the
+// semantics of ~198 providers cannot be known here, and deferring is the conservative choice for
+// the ones that remove everything at the name.
+func cleanupIsValueScoped(provider string) bool {
+	switch provider {
+	case config.DNSProviderRoute53, config.DNSProviderCloudflare:
+		return true
+	default:
+		return false
+	}
 }
 
 // dnsAPITimeout bounds one call to the DNS provider's API.

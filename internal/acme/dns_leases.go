@@ -63,10 +63,23 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	mu.Lock()
 	defer mu.Unlock()
 
-	if challengeLeases.remove(fqdn, info.Value) {
+	// Remove this value's lease first, then decide whether the provider may be called.
+	//
+	// The deferral below is only correct for a provider whose CleanUp deletes **every** value at
+	// the name (dnspod and tencentcloud do): the last leaver's single call then removes whatever
+	// the earlier ones skipped. A value-scoped provider (route53, cloudflare — see
+	// cleanupIsValueScoped) removes only the record it is called for, so deferring there leaves
+	// the skipped value in DNS with nobody left to remove it, and buys nothing: calling it per
+	// value is exactly what it is built for.
+	othersLive := challengeLeases.remove(fqdn, info.Value)
+	if othersLive && !s.valueScopedCleanup {
 		s.log.Info("another challenge is still live at the TXT name; leaving its cleanup to the last leaver",
 			"name", fqdn)
 		return nil
+	}
+	if othersLive {
+		s.log.Info("another challenge is still live at the TXT name, but this provider removes only the "+
+			"record it is called for; cleaning this one up now", "name", fqdn)
 	}
 
 	provider, err := s.newProvider(ctx)
