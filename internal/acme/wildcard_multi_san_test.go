@@ -145,7 +145,7 @@ func wildcardHarness(t *testing.T) (*state.Store, *Manager, *fakeAPI, *faithfulS
 
 	certs := []config.Certificate{{
 		Name:    "site-example-com",
-		Domains: []string{"example.com", "*.example.com", "www.example.com", "api.example.com", "deep.sub.example.com"},
+		Domains: []string{"example.com", "*.example.com", "a.b.example.com", "c.d.example.com", "deep.sub.example.com"},
 		Profile: config.ProfileClassic,
 		KeyType: config.KeyTypeECDSAP256,
 	}}
@@ -285,8 +285,8 @@ func TestMultiSANWildcardAndApexShareOneTXTName(t *testing.T) {
 		t.Errorf("expected exactly two authorizations on the shared name, got %d", names[shared])
 	}
 	for _, want := range []string{
-		"_acme-challenge.www.example.com.",
-		"_acme-challenge.api.example.com.",
+		"_acme-challenge.a.b.example.com.",
+		"_acme-challenge.c.d.example.com.",
 		"_acme-challenge.deep.sub.example.com.",
 	} {
 		if names[want] != 1 {
@@ -364,11 +364,11 @@ func TestMultiSANFallbackDropsOnlyTheBrokenName(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Only api.example.com is broken, and it is a CONCRETE name -- not the wildcard, not
+	// Only c.d.example.com is broken, and it is a CONCRETE name -- not the wildcard, not
 	// the apex. The wildcard's own failure is booked against "*.example.com", which is a
 	// separate ledger entry from the apex's.
 	for i := 0; i < 5; i++ {
-		if err := store.RecordIdentifierFailure(cert.Name, "api.example.com", "dns says no", fixed); err != nil {
+		if err := store.RecordIdentifierFailure(cert.Name, "c.d.example.com", "dns says no", fixed); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -385,9 +385,9 @@ func TestMultiSANFallbackDropsOnlyTheBrokenName(t *testing.T) {
 	ordered := append([]string(nil), fake.newOrderDomains...)
 	fake.mu.Unlock()
 
-	want := []string{"example.com", "*.example.com", "www.example.com", "deep.sub.example.com"}
+	want := []string{"example.com", "*.example.com", "a.b.example.com", "deep.sub.example.com"}
 	if len(ordered) != len(want) {
-		t.Fatalf("ordered %v, want %v (only api.example.com should have been dropped)", ordered, want)
+		t.Fatalf("ordered %v, want %v (only c.d.example.com should have been dropped)", ordered, want)
 	}
 	for _, w := range want {
 		found := false
@@ -401,7 +401,7 @@ func TestMultiSANFallbackDropsOnlyTheBrokenName(t *testing.T) {
 		}
 	}
 	for _, got := range ordered {
-		if got == "api.example.com" {
+		if got == "c.d.example.com" {
 			t.Error("the broken identifier is still in the ordered set")
 		}
 	}
@@ -427,7 +427,7 @@ func TestMultiSANFallbackDropsOnlyTheBrokenName(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(failures) == 0 {
-		t.Error("the identifier ledger was cleared, so the next pass cannot tell api.example.com is broken")
+		t.Error("the identifier ledger was cleared, so the next pass cannot tell c.d.example.com is broken")
 	}
 
 	// The wildcard's records were on the shared name; cleanup of a partial set must still
@@ -549,7 +549,7 @@ func TestMultiSANWildcardFailureDoesNotDropTheApex(t *testing.T) {
 		t.Errorf("the wildcard is the broken identifier and must be dropped; ordered %v", ordered)
 	}
 	// The concrete names are also unrelated to the wildcard's failure and must survive.
-	for _, keep := range []string{"www.example.com", "api.example.com", "deep.sub.example.com"} {
+	for _, keep := range []string{"a.b.example.com", "c.d.example.com", "deep.sub.example.com"} {
 		if !containsStr(ordered, keep) {
 			t.Errorf("%s is unrelated to the wildcard failure and must stay; ordered %v", keep, ordered)
 		}
@@ -623,7 +623,7 @@ func TestMultiSANFallbackCanDropTheApexAndKeepTheWildcard(t *testing.T) {
 		t.Errorf("the wildcard is healthy and shares only the TXT name, not the failure; ordered %v", ordered)
 	}
 	// The concrete names are independent and must survive.
-	for _, keep := range []string{"www.example.com", "api.example.com", "deep.sub.example.com"} {
+	for _, keep := range []string{"a.b.example.com", "c.d.example.com", "deep.sub.example.com"} {
 		if !containsStr(ordered, keep) {
 			t.Errorf("%s is unrelated to the apex failure and must stay; ordered %v", keep, ordered)
 		}
@@ -661,7 +661,7 @@ func TestMultiSANDegradedRoundCleansUpAfterItself(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 5; i++ {
-		if err := store.RecordIdentifierFailure(cert.Name, "api.example.com", "dns says no", fixed); err != nil {
+		if err := store.RecordIdentifierFailure(cert.Name, "c.d.example.com", "dns says no", fixed); err != nil {
 			t.Fatal(err)
 		}
 	}

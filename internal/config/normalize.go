@@ -523,6 +523,23 @@ func (w *Webhook) normalize() error {
 			"this endpoint can trigger real issuance, so a weak token is no better than none",
 			len(w.Token), WebhookTokenMinLen)
 	}
+	if w.NotifyFormat == "" {
+		w.NotifyFormat = NotifyFormatGeneric
+	}
+	switch w.NotifyFormat {
+	case NotifyFormatGeneric, NotifyFormatPagerDuty, NotifyFormatFeishu,
+		NotifyFormatWeCom, NotifyFormatDingTalk, NotifyFormatSlack:
+	default:
+		return fmt.Errorf("webhook.notifyFormat must be %q, %q, %q, %q, %q or %q, got %q",
+			NotifyFormatGeneric, NotifyFormatPagerDuty, NotifyFormatFeishu,
+			NotifyFormatWeCom, NotifyFormatDingTalk, NotifyFormatSlack, w.NotifyFormat)
+	}
+	if w.NotifyFormat == NotifyFormatPagerDuty && w.PagerDuty.RoutingKey == "" &&
+		w.PagerDuty.RoutingKeyFile == "" {
+		return fmt.Errorf("webhook.notifyFormat=\"%s\" requires webhook.pagerduty.routingKey or "+
+			"webhook.pagerduty.routingKeyFile (the Events API v2 integration key)",
+			NotifyFormatPagerDuty)
+	}
 	if w.AdminToken != "" {
 		if len(w.AdminToken) < WebhookAdminTokenMinLen {
 			return fmt.Errorf("webhook.adminToken is too short (%d characters, minimum %d): "+

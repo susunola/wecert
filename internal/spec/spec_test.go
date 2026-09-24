@@ -128,7 +128,7 @@ func TestRevisionRejectsATamperedDocument(t *testing.T) {
 
 	// Change the content but keep the old fingerprint -- the most common shape of
 	// a hand edit.
-	doc.Certificates[0].Domains = append(doc.Certificates[0].Domains, "www.example.com")
+	doc.Certificates[0].Domains = append(doc.Certificates[0].Domains, "a.b.example.com")
 	if err := doc.Validate(); err == nil || !strings.Contains(err.Error(), "revision") {
 		t.Fatalf("expected a fingerprint mismatch error, got %v", err)
 	}

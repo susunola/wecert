@@ -1032,7 +1032,41 @@ type Webhook struct {
 	// poll status; the admin token is what can restore a snapshot. Sharing one would
 	// give every status poller the ability to overwrite state.db.
 	AdminToken string `yaml:"adminToken,omitempty"`
+
+	// NotifyFormat selects the POST body shape. "" or "generic" is the documented
+	// JSON event (and the only format that carries X-Wecert-Signature over the raw
+	// body the receiver is expected to verify). The others are the wire formats
+	// those products actually accept, so an operator does not have to run a
+	// translator in front of a chat webhook:
+	//   pagerduty — Events API v2 (routing key in webhook.pagerduty.routingKey)
+	//   feishu    — custom robot text message
+	//   wecom     — enterprise WeChat group robot text message
+	//   dingtalk  — DingTalk group robot text message
+	//   slack     — incoming webhook JSON (text)
+	NotifyFormat string `yaml:"notifyFormat,omitempty"`
+
+	// PagerDuty is read only when notifyFormat=pagerduty.
+	PagerDuty PagerDutyNotify `yaml:"pagerduty,omitempty"`
 }
+
+// PagerDutyNotify is the Events API v2 routing key. The URL is still
+// webhook.notifyURL (https://events.pagerduty.com/v2/enqueue).
+type PagerDutyNotify struct {
+	// RoutingKey is the integration key of the PagerDuty service. Required for
+	// notifyFormat=pagerduty. Prefer an environment-expanded file over inlining it.
+	RoutingKey     string `yaml:"routingKey,omitempty"`
+	RoutingKeyFile string `yaml:"routingKeyFile,omitempty"`
+}
+
+// Notify format names.
+const (
+	NotifyFormatGeneric   = "generic"
+	NotifyFormatPagerDuty = "pagerduty"
+	NotifyFormatFeishu    = "feishu"
+	NotifyFormatWeCom     = "wecom"
+	NotifyFormatDingTalk  = "dingtalk"
+	NotifyFormatSlack     = "slack"
+)
 
 // WebhookAdminTokenMinLen is the minimum admin token length. Longer than the
 // read-only token's floor: this one can restore state.
@@ -1226,6 +1260,12 @@ func (c *Config) resolveSecretFiles() ([]string, error) {
 		}
 	}
 
+	if c.Webhook.NotifyFormat == NotifyFormatPagerDuty {
+		if err := resolve("webhook.pagerduty.routingKey", c.Webhook.PagerDuty.RoutingKey,
+			c.Webhook.PagerDuty.RoutingKeyFile, nil, &c.Webhook.PagerDuty.RoutingKey); err != nil {
+			return warns, err
+		}
+	}
 	if err := resolve("tencent.secretId", c.Tencent.SecretID, c.Tencent.SecretIDFile,
 		[]string{"TENCENTCLOUD_SECRET_ID"}, &c.Tencent.SecretID); err != nil {
 		return warns, err

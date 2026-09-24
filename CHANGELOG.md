@@ -17,6 +17,16 @@
 
 ### Added
 
+- **Preset notification formats.** `webhook.notifyFormat` selects the POST body:
+  `generic` (default, the documented JSON + `X-Wecert-Signature`), `pagerduty`
+  (Events API v2; `webhook.pagerduty.routingKey` or `routingKeyFile`;
+  `dedup_key` is `wecert/<cert>`, and only `result=error` pages -- a green
+  renewal is not an on-call event), `feishu`, `wecom`, `dingtalk` and `slack`
+  (one-sentence text for a group robot). The chat formats do not replace
+  Prometheus alerts; they are the "did this renewal fail" channel.
+
+### Added
+
 - **Guarded web admin surface.** `webhook.adminToken` (separate from the read-only
   `webhook.token`, minimum 32 characters) mounts `/admin/backup-health`,
   `/admin/recovery-plan`, `/admin/recovery-drill`, `/admin/challenge` and

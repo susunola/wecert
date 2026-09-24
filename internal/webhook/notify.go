@@ -6,7 +6,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -22,9 +21,14 @@ const maxNotifyInFlight = 8
 type Notifier struct {
 	url    string
 	secret string
-	client *http.Client
-	log    *slog.Logger
-	sem    chan struct{}
+	// format is the POST body shape (see config.Webhook.NotifyFormat).
+	format string
+	// pdRoutingKey is the PagerDuty Events API v2 integration key (only for
+	// format=notifyFormatPagerDuty).
+	pdRoutingKey string
+	client       *http.Client
+	log          *slog.Logger
+	sem          chan struct{}
 
 	// mu guards draining, which is only ever set once.
 	mu sync.Mutex
@@ -48,13 +52,26 @@ type RenewalEvent struct {
 // sha256=<hex HMAC-SHA256 of the raw body>. The receiver can then tell a genuine
 // renewal event from anything else that can reach its URL — the notify target is
 // often a public endpoint that also accepts other traffic.
+// NewNotifier builds a generic-format notifier. See NewNotifierFormat for
+// PagerDuty / chat-robot shapes.
 func NewNotifier(url, secret string, log *slog.Logger) *Notifier {
+	return NewNotifierFormat(url, secret, "generic", "", log)
+}
+
+// NewNotifierFormat builds a notifier whose POST body is shaped for the named
+// product. format "" is treated as generic. An empty url still returns nil.
+func NewNotifierFormat(url, secret, format, pdRoutingKey string, log *slog.Logger) *Notifier {
 	if url == "" {
 		return nil
 	}
+	if format == "" {
+		format = "generic"
+	}
 	return &Notifier{
-		url:    url,
-		secret: secret,
+		url:          url,
+		secret:       secret,
+		format:       format,
+		pdRoutingKey: pdRoutingKey,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 			// Redirects are refused rather than followed.
@@ -111,8 +128,12 @@ func (n *Notifier) Renewal(ctx context.Context, certName string, reconcileErr er
 }
 
 func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
-	body, err := json.Marshal(ev)
+	body, err := n.notifyPayload(ev)
 	if err != nil {
+		if errors.Is(err, errSkipPagerDutySuccess) {
+			n.log.Debug("pagerduty: success renewal does not page", "cert", ev.Cert)
+			return
+		}
 		n.log.Warn("failed to serialise the notification event", "cert", ev.Cert, "err", err)
 		return
 	}
