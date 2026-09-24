@@ -40,6 +40,10 @@ func OpenSealed(path string, master []byte) (*Store, error) {
 		return nil, err
 	}
 	s.sealer = seal
+	if err := s.migrateSealedMaterial(); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 

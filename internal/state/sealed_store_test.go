@@ -70,6 +70,38 @@ func TestOpenSealedRoundTripsRetiredCertificateMaterial(t *testing.T) {
 	}
 }
 
+func TestOpenSealedMigratesExistingPlaintextState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	plain, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.PutAccount(&Account{Directory: "https://acme.example/d", PrivateKeyPEM: []byte("OLD ACCOUNT")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.PutOrder(&Order{CertName: "c", KeyPEM: []byte("OLD ORDER")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.PutCert(&CertState{Name: "c", CertPEM: []byte("OLD CERT"), KeyPEM: []byte("OLD KEY")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sealed, err := OpenSealed(path, []byte("master"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sealed.Close()
+	a, _ := sealed.GetAccount("https://acme.example/d")
+	o, _ := sealed.GetOrder("c")
+	c, _ := sealed.GetCert("c")
+	if string(a.PrivateKeyPEM) != "OLD ACCOUNT" || string(o.KeyPEM) != "OLD ORDER" || string(c.CertPEM) != "OLD CERT" || string(c.KeyPEM) != "OLD KEY" {
+		t.Fatal("migration did not preserve plaintext material")
+	}
+}
+
 func TestOpenSealedRoundTripsOrderAndCertificateMaterial(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	s, err := OpenSealed(path, []byte("master"))
