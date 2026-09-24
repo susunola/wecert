@@ -78,6 +78,11 @@ var schemaColumns = []struct{ table, column, decl string }{
 	// 0, which reads as "never cleaned" -- the conservative answer: such a name is torn down once
 	// more, and only then marked.
 	{"certificates", "orphan_cleaned_at", "INTEGER NOT NULL DEFAULT 0"},
+	// DNS cleanup guardian (see authorizations in schemaDDL). Legacy rows keep 0 = never
+	// stuck, so they are invisible to the stuck queue until a reclaim actually fails.
+	{"authorizations", "reclaim_attempts", "INTEGER NOT NULL DEFAULT 0"},
+	{"authorizations", "reclaim_last_error", "TEXT NOT NULL DEFAULT ''"},
+	{"authorizations", "reclaim_stuck_since", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // pendingMigrations reports schema changes this binary would apply, without applying them.

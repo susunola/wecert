@@ -176,6 +176,20 @@ var (
 		Help: "Unix time of the last successful shadow comparison in observe mode. If this stops advancing, the diff gauge is stale regardless of its value.",
 	})
 
+	// TXTReclaimStuck is the DNS cleanup guardian queue: authorization rows whose _acme-challenge
+	// TXT may still be in DNS and whose last reclaim could not be confirmed (authoritative NS
+	// unreachable, or the provider cannot delete the record). Each row is retried every pass.
+	TXTReclaimStuck = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_txt_reclaim_stuck",
+		Help: "TXT challenge records whose cleanup could not be confirmed and is being retried (the DNS cleanup guardian queue). 0 means every leftover _acme-challenge has either been reclaimed or proven absent. Non-zero is safe to page on only together with the age gauge: a row stuck for five minutes is a retry, stuck for a day is an operator in the DNS console.",
+	})
+
+	// TXTReclaimStuckOldestSeconds is how long the oldest queue item has been stuck.
+	TXTReclaimStuckOldestSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "wecert_txt_reclaim_stuck_oldest_seconds",
+		Help: "Age in seconds of the oldest stuck TXT reclaim. 0 when the queue is empty. This is the number to alert on: wecert_txt_reclaim_stuck > 0 for one pass is noise (a flaky NS), the same oldest age climbing for hours means the record will not go away on its own.",
+	})
+
 	OrphanedCertificates = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "wecert_orphaned_certificates",
 		Help: "Certificates present in the state store but absent from the desired state. They are not renewed and their row is deliberately KEPT (so a re-added name resumes its history), so this gauge stays 1 until an operator deletes the row; it is not a transient condition.",

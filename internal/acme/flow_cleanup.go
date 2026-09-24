@@ -278,6 +278,7 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 					// did not create in this process leaves a record the operator has to remove by
 					// hand, and the generic "could not be reclaimed automatically" reads like a
 					// DNS cleanup failure rather than like that instruction.
+					m.markReclaimStuck(a, err)
 					if errors.Is(err, errProviderLostRecord) {
 						lostByProvider++
 					} else {
@@ -298,15 +299,19 @@ func (m *Manager) cleanupOrphanTXT(ctx context.Context, certName string) error {
 		if err != nil {
 			m.log.Warn("failed to reclaim a leftover TXT record",
 				"cert", certName, "identifier", a.Identifier, "name", a.TxtName, "err", err)
+			m.markReclaimStuck(a, err)
 			continue
 		}
 		if !ok {
 			// The record cannot be located: keep the authorization row, do not lose the TxtName
 			// clue as well.
 			stuck++
+			m.markReclaimStuck(a, errMissingTXTClue)
 			continue
 		}
 		cleaned++
+		// Leave no stuck stamp on a row that is going away (and clear any older one).
+		_ = m.store.ClearTXTReclaimStuck(a.CertName, a.AuthzURL)
 		if err := m.store.DeleteAuthorization(certName, a.AuthzURL); err != nil {
 			m.log.Warn("failed to delete authorization rows", "cert", certName, "authz", a.AuthzURL, "err", err)
 		}

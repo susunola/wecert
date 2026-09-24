@@ -216,6 +216,29 @@ type Authorization struct {
 	// row predates the column (or was written by a path that does not pick a challenge), and the
 	// reader treats it as "age unknown" rather than as "just now".
 	ChallengePreparedAt time.Time
+
+	// DNS cleanup guardian. ReclaimAttempts counts failed reclaim tries; StuckSince is when
+	// the row entered the stuck queue (zero = not stuck); LastReclaimError is why the last
+	// try failed. Together they are the independent retry queue for a TXT that may still be
+	// in DNS while authoritative NS is unreachable or the provider cannot delete it.
+	ReclaimAttempts    int
+	LastReclaimError   string
+	ReclaimStuckSince  time.Time
+}
+
+// TXTReclaimStuck is one row of the DNS cleanup guardian queue.
+type TXTReclaimStuck struct {
+	CertName       string
+	AuthzURL       string
+	Identifier     string
+	TxtName        string
+	TxtValue       string
+	ChallengeToken string
+	Presented      bool
+	Attempts       int
+	LastError      string
+	StuckSince     time.Time
+	PreparedAt     time.Time
 }
 
 // Account is an ACME account.

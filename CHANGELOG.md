@@ -4,6 +4,19 @@
 
 ### Added
 
+- **DNS cleanup guardian.** A leftover `_acme-challenge` TXT whose cleanup could not be
+  *confirmed* (authoritative NS unreachable, or the provider cannot delete the record) is
+  queued on its authorization row with `attempts`, `stuck_since` and `last_error`. Every
+  reconcile pass sweeps that queue independently of which certificates were walked --
+  `cleanupOrphanTXT` only runs for a certificate that reaches its no-order branch, so a
+  happily renewing certificate would otherwise never retry a leftover TXT from an older
+  crash. Metrics `wecert_txt_reclaim_stuck` and `wecert_txt_reclaim_stuck_oldest_seconds`
+  plus an alert on the oldest age; read-only `GET /diagnostics/txt-reclaims` lists
+  `txtName`/`txtValue` for the DNS console. A deliberate keep inside the propagation
+  window is not queued.
+
+### Added
+
 - **Read-only desired-state diagnostic.** Authenticated
   `POST /diagnostics/desired-state` refreshes and reports declarations without
   starting issuance, deployment or recovery.

@@ -21,6 +21,9 @@ func (s *Server) Handler() http.Handler {
 	if dr, ok := s.rec.(DesiredRefresher); ok {
 		mux.HandleFunc("/diagnostics/desired-state", s.auth(s.handleDesiredDiagnostic(dr)))
 	}
+	if g, ok := s.rec.(TXTReclaimLister); ok {
+		mux.HandleFunc("/diagnostics/txt-reclaims", s.auth(s.handleTXTReclaims(g)))
+	}
 
 	return mux
 }

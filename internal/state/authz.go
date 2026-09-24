@@ -12,6 +12,7 @@ package state
 import (
 	"fmt"
 	_ "modernc.org/sqlite"
+	"time"
 )
 
 // Per-table CRUD, split out of state.go so one table lives in one file.
@@ -168,4 +169,82 @@ func (s *Store) DeleteAuthorization(certName, authzURL string) error {
 		return fmt.Errorf("delete authorization %s: %w", authzURL, err)
 	}
 	return nil
+}
+
+// MarkTXTReclaimStuck records that a reclaim of this row's TXT could not be confirmed
+// (authoritative NS unreachable, or the provider cannot delete the record). This is the
+// DNS cleanup guardian's enqueue: the row already *is* the queue item -- name, value and
+// token live here -- and this stamps how long it has been stuck and why.
+//
+// stuck_since is written only on the first failure so the age an alert fires on is "how
+// long has this been stuck", not "when did we last try".
+func (s *Store) MarkTXTReclaimStuck(certName, authzURL, errMsg string) error {
+	if errMsg != "" && len(errMsg) > maxLastErrorBytes {
+		errMsg = errMsg[:maxLastErrorBytes]
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`
+		UPDATE authorizations SET
+			reclaim_attempts = reclaim_attempts + 1,
+			reclaim_last_error = ?,
+			reclaim_stuck_since = CASE WHEN reclaim_stuck_since > 0
+				THEN reclaim_stuck_since ELSE ? END
+		WHERE cert_name = ? AND authz_url = ?`,
+		errMsg, toUnix(time.Now()), certName, authzURL)
+	if err != nil {
+		return fmt.Errorf("mark TXT reclaim stuck: %w", err)
+	}
+	return nil
+}
+
+// ClearTXTReclaimStuck drops the stuck stamp after a successful reclaim. Called before
+// DeleteAuthorization when the row is going away, and on its own when a probe proves
+// absence without deleting (so the queue does not grow a ghost).
+func (s *Store) ClearTXTReclaimStuck(certName, authzURL string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`
+		UPDATE authorizations SET
+			reclaim_attempts = 0, reclaim_last_error = '', reclaim_stuck_since = 0
+		WHERE cert_name = ? AND authz_url = ?`,
+		certName, authzURL)
+	if err != nil {
+		return fmt.Errorf("clear TXT reclaim stuck: %w", err)
+	}
+	return nil
+}
+
+// ListStuckTXTReclaims returns every row the DNS cleanup guardian is retrying: a TXT that
+// may still be in DNS and whose last reclaim could not be confirmed.
+//
+// Independent of any in-flight certificate pass -- this is what a sweep walks, and what the
+// read-only view page lists.
+func (s *Store) ListStuckTXTReclaims() ([]*TXTReclaimStuck, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`
+		SELECT cert_name, authz_url, identifier, txt_name, txt_value, challenge_token,
+		       presented, reclaim_attempts, reclaim_last_error, reclaim_stuck_since,
+		       challenge_prepared_at
+		FROM authorizations
+		WHERE reclaim_stuck_since > 0
+		ORDER BY reclaim_stuck_since, cert_name, txt_name`)
+	if err != nil {
+		return nil, fmt.Errorf("list stuck TXT reclaims: %w", err)
+	}
+	defer rows.Close()
+	var out []*TXTReclaimStuck
+	for rows.Next() {
+		e := &TXTReclaimStuck{}
+		var stuck, prepared int64
+		if err := rows.Scan(&e.CertName, &e.AuthzURL, &e.Identifier, &e.TxtName, &e.TxtValue,
+			&e.ChallengeToken, &e.Presented, &e.Attempts, &e.LastError, &stuck, &prepared); err != nil {
+			return nil, fmt.Errorf("scan stuck TXT reclaim: %w", err)
+		}
+		e.StuckSince = fromUnix(stuck)
+		e.PreparedAt = fromUnix(prepared)
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }

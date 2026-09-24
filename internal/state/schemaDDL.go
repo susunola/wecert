@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS authorizations (
     -- needs it: an authoritative "no such record" is only trustworthy once the write would have had
     -- time to propagate, and DNSPod's authoritative servers lag the API write by up to a minute.
     challenge_prepared_at INTEGER NOT NULL DEFAULT 0,
+    -- DNS cleanup guardian: how often a reclaim of this row has been attempted and failed,
+    -- since when it has been stuck (0 = not stuck), and why the last attempt failed. The
+    -- row is the retry queue for "TXT may still be in DNS but authoritative NS is
+    -- unreachable / the provider cannot delete it".
+    reclaim_attempts     INTEGER NOT NULL DEFAULT 0,
+    reclaim_last_error   TEXT    NOT NULL DEFAULT '',
+    reclaim_stuck_since  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (cert_name, authz_url)
 );
 

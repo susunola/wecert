@@ -367,3 +367,14 @@ groups:
             for this pass and left wecert_revocation_pending at its previous value. Check state.db and
             the disk it lives on. If that gauge is non-zero it is still a real outstanding revocation;
             if it is zero it means "unknown", not "clear".
+
+  - name: wecert-dns-cleanup-guardian
+    rules:
+      - alert: WecertTXTReclaimStuckTooLong
+        expr: wecert_txt_reclaim_stuck_oldest_seconds > 86400
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A leftover _acme-challenge TXT has been stuck for over a day"
+          description: "The DNS cleanup guardian is still retrying {{ $value | humanizeDuration }}. GET /diagnostics/txt-reclaims (auth) for the names; if a record is stuck for hours the provider cannot delete it -- remove it in the DNS console."

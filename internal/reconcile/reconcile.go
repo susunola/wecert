@@ -73,6 +73,14 @@ type Drainer interface {
 // convergence loop is testable — depending on the concrete type would mean
 // orchestration logic like "one certificate failing must not stall the others"
 // could only be verified by really running ACME.
+// TXTGuardian is the DNS cleanup guardian: an independent retry of leftover
+// _acme-challenge TXT records whose cleanup could not be confirmed. Optional so a test
+// double that does not model DNS cleanup needs none of it.
+type TXTGuardian interface {
+	SweepStuckTXT(ctx context.Context) (retried, cleared int, err error)
+	ListStuckTXTReclaims() ([]*state.TXTReclaimStuck, error)
+}
+
 type CertManager interface {
 	Reconcile(ctx context.Context, c *config.Certificate) error
 	ReapRetired(ctx context.Context)

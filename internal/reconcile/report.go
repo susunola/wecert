@@ -10,6 +10,7 @@ import (
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 	"strings"
+	"time"
 )
 
 // Split from reconcile.go so one concern is one file. Same package.
@@ -121,7 +122,47 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 	r.retryRevocations(ctx)
 	r.reclaimStaleProbeSeries(res)
 	r.publishQuota(res)
+	r.sweepStuckTXT(ctx)
 	return rep
+}
+
+// sweepStuckTXT runs the DNS cleanup guardian once per pass, independent of which
+// certificates were walked. cleanupOrphanTXT only runs for a certificate that reached
+// its no-order branch; a certificate that keeps renewing would otherwise never retry a
+// leftover TXT from an older crash. Also mirrors the queue onto metrics so a stale
+// _acme-challenge is visible without opening the read-only view.
+func (r *Reconciler) sweepStuckTXT(ctx context.Context) {
+	g, ok := r.manager.(TXTGuardian)
+	if !ok {
+		return
+	}
+	if retried, cleared, err := g.SweepStuckTXT(ctx); err != nil {
+		r.log.Warn("DNS cleanup guardian sweep failed", "err", err)
+	} else if retried > 0 {
+		r.log.Info("DNS cleanup guardian retried stuck TXT reclaims",
+			"retried", retried, "cleared", cleared)
+	}
+	rows, err := g.ListStuckTXTReclaims()
+	if err != nil {
+		r.log.Warn("cannot list stuck TXT reclaims for metrics", "err", err)
+		return
+	}
+	metrics.TXTReclaimStuck.Set(float64(len(rows)))
+	metrics.TXTReclaimStuckOldestSeconds.Set(StuckTXTLagSeconds(rows, time.Now()))
+}
+
+// StuckTXTLagSeconds is the age of the oldest stuck reclaim (0 when empty).
+func StuckTXTLagSeconds(rows []*state.TXTReclaimStuck, now time.Time) float64 {
+	var oldest float64
+	for _, e := range rows {
+		if e.StuckSince.IsZero() {
+			continue
+		}
+		if age := now.Sub(e.StuckSince).Seconds(); age > oldest {
+			oldest = age
+		}
+	}
+	return oldest
 }
 
 // publishQuota refreshes the rate-limit gauges from the desired state this pass resolved.
