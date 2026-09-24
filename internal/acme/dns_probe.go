@@ -148,6 +148,33 @@ func (s *DNSSolver) waitZone(
 	}
 }
 
+// dnsProbeAttempts is how many times one authoritative ADDRESS may be asked within a single round
+// before the round records it as unreachable. The first attempt is included in the count.
+//
+// Why a round must not be decided by one dropped packet, measured on a real machine (Route 53 +
+// Cloudflare, Let's Encrypt staging, four runs of the same zone): the same zone confirmed "2/4" or
+// "3/4" servers and issued in some runs, and in others ended the five-minute budget with a single
+// independent nameserver confirming -- which fails the verdict, because it requires two independent
+// servers to agree. The addresses that answered in one run were reported "unreachable" in the next.
+// The traffic itself is lossy: an authoritative address is probed ONCE per round, so one dropped
+// UDP packet (and an unanswered TCP fallback) costs that address the entire round -- and with a
+// small delegation that round is the verdict.
+//
+// The extra attempts are cheap because every address of every record is already probed
+// concurrently (see probeTXTWithExchange and probeRecords), so the added wall-clock time is
+// bounded by the delay alone, not by the number of addresses. Two attempts add dnsProbeRetryDelay
+// once per round: 250ms against a 5-minute budget (dns.propagationTimeout, default 5m) is 250ms of
+// 300000ms, under 0.1% of it -- and because attempts x addresses run concurrently, a round grows by
+// at most (attempts-1) x delay no matter how many addresses the delegation has. The polling interval
+// between rounds is untouched.
+const dnsProbeAttempts = 2
+
+// dnsProbeRetryDelay is the pause before asking the same address again.
+//
+// var rather than const so a test can shorten it: the retry itself is what the tests are about, and
+// the shipped value is the named constant above.
+var dnsProbeRetryDelay = 250 * time.Millisecond
+
 // nsProbe is the probe result for one address of one authoritative NS.
 //
 // ns is the nameserver NAME this address belongs to, and it is not decoration: a name with both an
@@ -163,16 +190,46 @@ func probeTXTWithExchange(servers []nsServer, fqdn, want string, exchange func(*
 			defer wg.Done()
 			results[i] = nsProbe{ns: server.ns, server: server.addr}
 
-			m := new(dns.Msg)
-			m.SetQuestion(fqdn, dns.TypeTXT)
-			m.RecursionDesired = false
-			// Without EDNS0 the answer is capped at 512 bytes (miekg falls back to
-			// MinMsgSize), and a challenge name shared by a wildcard and its apex plus a
-			// leftover value from the previous round gets close to that. Asking for a bigger
-			// buffer is what keeps the answer whole rather than truncated.
-			m.SetEdns0(4096, false)
+			// An exchange that produced no answer at all is retried a small, bounded number of
+			// times before this address is called unreachable (see dnsProbeAttempts).
+			//
+			// Only "no answer came back" is retried -- a transport failure, or an exchange that
+			// returned nothing at all, which is also what a truncated answer whose TCP retry failed
+			// leaves behind (exchangeDNS keeps that response, and the Truncated branch below still
+			// classifies it). A RESPONSE is an answer and is never retried, whatever its rcode:
+			// NXDOMAIN is a definitive denial, REFUSED and SERVFAIL are inconclusive but real
+			// answers, and re-asking them would burn the budget and blur the three buckets the
+			// summary exists to separate. So a retry can only change how many attempts an address
+			// gets -- never what counts as an answer.
+			var resp *dns.Msg
+			var err error
+			for attempt := 1; ; attempt++ {
+				// A fresh message per attempt: miekg's client writes the query id into the
+				// message it sends, and reusing one across attempts is not what a real resolver
+				// receives.
+				m := new(dns.Msg)
+				m.SetQuestion(fqdn, dns.TypeTXT)
+				m.RecursionDesired = false
+				// Without EDNS0 the answer is capped at 512 bytes (miekg falls back to
+				// MinMsgSize), and a challenge name shared by a wildcard and its apex plus a
+				// leftover value from the previous round gets close to that. Asking for a bigger
+				// buffer is what keeps the answer whole rather than truncated.
+				m.SetEdns0(4096, false)
 
-			resp, err := exchange(m, server.addr)
+				resp, err = exchange(m, server.addr)
+				// exchangeDNS already retried this same attempt over TCP when UDP came back
+				// truncated or silent, so whatever is here is what both transports produced.
+				if err == nil && resp != nil {
+					break
+				}
+				if attempt >= dnsProbeAttempts {
+					break
+				}
+				// The sleep is what makes this cheap: every address is probed in its own
+				// goroutine, so the retries overlap and one round grows by one delay per retry,
+				// not by delay x addresses.
+				time.Sleep(dnsProbeRetryDelay)
+			}
 			if err != nil {
 				results[i].err = err
 				return

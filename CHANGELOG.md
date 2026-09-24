@@ -19,6 +19,37 @@
 
 ### Fixed
 
+- **A Cloudflare issuance no longer leaves its challenge TXT record in the zone.** With
+  `dns.provider: cloudflare` and the token in a file (`cloudflare.apiTokenFile`), a fresh provider
+  was built for every call, and lego's Cloudflare provider deletes a record by the ID it
+  remembered when it created that record -- keyed by the challenge token. A provider built between
+  `Present` and `CleanUp` has an empty map, so every cleanup answered `cloudflare: unknown record
+  ID for '_acme-challenge.<name>.'` and the record stayed: one stale `_acme-challenge` TXT per
+  certificate per renewal, and a stale value is what a later validation can be answered from
+  (observed as `During secondary validation: Incorrect TXT record ... found`). The token file is
+  still re-read on every use, so a rotated token keeps taking effect without a restart; what is
+  kept is the provider instance, and only while the file holds the same token.
+- **The `lego_dns` build -- `make release` and `make test-tags` -- compiles from a clean
+  checkout again.** `go.mod` had no requirement for `github.com/exoscale/egoscale/v3`, which
+  that build needs because lego's DNS registry imports every provider it ships, exoscale
+  included, and four modules the program imports directly were still listed as `// indirect`.
+  A build in `-mod=readonly`, which is what CI runs, stopped at `go: updates to go.mod needed`
+  and took the `test` and `install` jobs with it -- including the Linux release build. `go mod
+  tidy` restores the list; no module version changes.
+- **A single dropped DNS packet no longer costs an authoritative server its whole propagation
+  round.** Every address of a zone is probed once per round, and an exchange that came back with no
+  answer at all put that address in the `unreachable` bucket for the rest of the round. On a flaky
+  path that can decide the verdict: on this machine the same zone reported different addresses
+  reachable in consecutive rounds (IPv6 addresses have no route here at all), and rounds that ended
+  the five-minute budget with a single independent nameserver confirming failed the propagation
+  check, which requires two independent servers to agree. `probeTXTWithExchange` now asks an
+  address that produced no answer twice, 250ms apart, before the round records it as unreachable.
+  Addresses are probed concurrently, so a round grows by that delay (250ms of a 300000ms budget,
+  under 0.1%) and not by delay times addresses. No verdict rule was relaxed: UDP stays first with
+  the TCP fallback on no answer, an answer of any kind is never re-asked (a `REFUSED` or `SERVFAIL`
+  is an answer, and re-asking would burn the budget and blur the `refused` / `failed` /
+  `unreachable` buckets), the evidence stays authoritative-only, and two independent servers must
+  still agree, with a single-authority zone still exempt.
 - **`install.sh` installs its own `make release` output again.** The unit checksum gate looked
   for a `SHA256SUMS` beside `deploy/systemd/`, where none exists, and refused to continue --
   so an install from a release layout failed on the units unless

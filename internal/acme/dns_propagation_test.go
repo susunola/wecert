@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,6 +139,175 @@ func TestTruncatedAnswerIsInconclusive(t *testing.T) {
 	}
 	if !strings.Contains(summary, "unreachable 1") || strings.Contains(summary, "denied 1") {
 		t.Errorf("a truncated answer must be inconclusive, not a denial: %s", summary)
+	}
+}
+
+// ── dropped packets: a round is not decided by one lost exchange ───────────
+
+// One dropped packet used to cost an address the whole round, and with a small delegation a lost
+// round is a lost verdict.
+//
+// Measured on the machine this was written for (Route 53 + Cloudflare, Let's Encrypt staging, four
+// runs of the same zone): the same zone confirmed 2/4 or 3/4 servers and issued in some runs, and
+// ended the five-minute budget with a single independent nameserver confirming in others -- which
+// fails the verdict, since it needs two independent servers to agree. The addresses that answered
+// in one run were reported unreachable in the next, so the path is lossy rather than the zone slow.
+// An address gets one exchange per round, so the retry inside the round is what keeps one dropped
+// packet from throwing the whole round away.
+func TestProbeRetriesADroppedExchangeWithinTheRoundAndConfirms(t *testing.T) {
+	servers := []nsServer{
+		{ns: "ns1.example.net.", addr: "192.0.2.1:53"},
+		{ns: "ns2.example.net.", addr: "192.0.2.2:53"},
+	}
+
+	// The first exchange to the first address is dropped, exactly as an intermittent path drops it:
+	// no response and no error. Every later exchange answers.
+	var flaky, asked []*dns.Msg
+	exchange := func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		if server == "192.0.2.1:53" {
+			flaky = append(flaky, msg)
+			if len(flaky) == 1 {
+				return nil, errors.New("i/o timeout")
+			}
+		} else {
+			asked = append(asked, msg)
+		}
+		return authoritativeTXT(msg, "wanted"), nil
+	}
+
+	ready, summary := probeReadyWithExchange(servers, "_acme-challenge.example.com.", "wanted", exchange)
+
+	// The lost exchange must not decide the record: both authorities eventually answer with the
+	// value, so the verdict has to pass.
+	if !ready {
+		t.Errorf("both authorities answered authoritatively and neither denied the value, so the "+
+			"retry inside the round must let this pass: %s", summary)
+	}
+	// This is the part the old behaviour cannot satisfy: one attempt per round means this address
+	// was asked once and recorded unreachable.
+	if len(flaky) < 2 {
+		t.Fatalf("the first address was asked %d time(s): a single dropped exchange still ends the "+
+			"round for that address, which is what makes the verdict depend on the packet", len(flaky))
+	}
+	if !strings.Contains(summary, "unreachable 0") {
+		t.Errorf("the address answered on the second attempt, so it is reachable and must be "+
+			"counted unreachable 0: %s", summary)
+	}
+	assertAllTXTQuestions(t, flaky, "_acme-challenge.example.com.")
+	assertAllTXTQuestions(t, asked, "_acme-challenge.example.com.")
+}
+
+// The retries are bounded, and an address that never answers is still what it always was:
+// unreachable. This guards the unchanged path -- what a retry adds is attempts, not leniency.
+func TestProbeStillCountsAnAlwaysTimingOutAddressUnreachable(t *testing.T) {
+	servers := []nsServer{
+		{ns: "ns1.example.net.", addr: "192.0.2.1:53"},
+		{ns: "ns2.example.net.", addr: "192.0.2.2:53"},
+	}
+	var dead []*dns.Msg
+	exchange := func(msg *dns.Msg, server string) (*dns.Msg, error) {
+		if server == "192.0.2.1:53" {
+			dead = append(dead, msg)
+			return nil, errors.New("i/o timeout")
+		}
+		return authoritativeTXT(msg, "wanted"), nil
+	}
+
+	ready, summary := probeReadyWithExchange(servers, "_acme-challenge.example.com.", "wanted", exchange)
+
+	if ready {
+		t.Errorf("only one authority confirmed; a zone with two authorities needs two independent "+
+			"confirmations and must not pass here: %s", summary)
+	}
+	if !strings.Contains(summary, "unreachable 1") {
+		t.Errorf("an address that answered on neither transport must still be counted unreachable "+
+			"after its attempts are spent: %s", summary)
+	}
+	// The retries are actually spent here -- one exchange per round is the old behaviour this test
+	// exists to pin -- and they stay bounded, so an address that never answers cannot hold a round
+	// open indefinitely. The literal 2 is deliberate: dnsProbeAttempts is what sets the bound, but
+	// "at least two attempts" is the shipped behaviour a probe must show to a timeout address, so
+	// the test states the behaviour rather than restating the constant.
+	if len(dead) < 2 {
+		t.Errorf("the address was asked %d time(s) within one probe, want at least 2: without the "+
+			"retry a single dropped exchange ends the round for that address", len(dead))
+	}
+	if len(dead) > dnsProbeAttempts {
+		t.Errorf("the address was asked %d time(s), want the bounded %d: an address that never "+
+			"answers must not be retried without limit", len(dead), dnsProbeAttempts)
+	}
+	assertAllTXTQuestions(t, dead, "_acme-challenge.example.com.")
+}
+
+// REFUSED is an ANSWER, not a dropped packet.
+//
+// A network that intercepts port 53 refuses on the authority's behalf, so every address comes back
+// REFUSED at once -- re-asking them would multiply that traffic by the attempt count and blur the
+// refused bucket, which is exactly the signal that says "look at your egress, not at the zone". The
+// retry loop must therefore not fire once a response came back, whatever its rcode.
+//
+// One address, so "asked once per round" is the strongest form of that: had the retry fired on an
+// answer, the count would be the attempt count instead of one.
+func TestProbeDoesNotRetryWhenTheServerAnswersRefused(t *testing.T) {
+	const addr = "192.0.2.1:53"
+	servers := oneAuthority(addr)
+
+	var mu sync.Mutex
+	var asked []*dns.Msg
+	exchange := func(msg *dns.Msg, _ string) (*dns.Msg, error) {
+		mu.Lock()
+		asked = append(asked, msg)
+		mu.Unlock()
+		resp := new(dns.Msg)
+		resp.SetReply(msg)
+		resp.Rcode = dns.RcodeRefused
+		return resp, nil
+	}
+
+	// Two rounds, so the count per round is what is being pinned rather than a single total.
+	const rounds = 2
+	for round := 0; round < rounds; round++ {
+		results := probeTXTWithExchange(servers, "_acme-challenge.example.com.", "wanted", exchange)
+		if len(results) != len(servers) {
+			t.Fatalf("round %d produced %d result(s), want %d", round+1, len(results), len(servers))
+		}
+		for i, res := range results {
+			// The classification is untouched: a REFUSED is neither a confirmation nor a denial,
+			// and it is emphatically not a transport failure.
+			if res.hasValue || res.err != nil {
+				t.Errorf("round %d: a server that answered REFUSED has not confirmed anything and is "+
+					"not unreachable, got %+v", round+1, res)
+			}
+			if res.rcode != "REFUSED" {
+				t.Errorf("round %d address %d: rcode = %q, want REFUSED", round+1, i, res.rcode)
+			}
+		}
+		// Checked per round: an ANSWER is never retried, whatever its rcode, so one server must
+		// have been asked exactly once -- not once per attempt.
+		if len(asked) != round+1 {
+			t.Fatalf("after round %d the server had been asked %d time(s), want exactly %d: a server "+
+				"that answered REFUSED answered, and re-asking it is a retry storm that burns the "+
+				"budget and blurs the refused bucket", round+1, len(asked), round+1)
+		}
+	}
+	assertAllTXTQuestions(t, asked, "_acme-challenge.example.com.")
+}
+
+// assertAllTXTQuestions pins what every recorded attempt was: a fresh TXT question for the
+// challenge name. An attempt that asked something else would not be a retry of the same question.
+func assertAllTXTQuestions(t *testing.T, msgs []*dns.Msg, fqdn string) {
+	t.Helper()
+	if len(msgs) == 0 {
+		t.Fatal("no query was recorded")
+	}
+	for i, m := range msgs {
+		if len(m.Question) != 1 {
+			t.Fatalf("attempt %d carried %d question(s), want exactly 1", i+1, len(m.Question))
+		}
+		if m.Question[0].Qtype != dns.TypeTXT || m.Question[0].Name != fqdn {
+			t.Errorf("attempt %d asked %s %s, want TXT %s", i+1, m.Question[0].Name,
+				dns.TypeToString[m.Question[0].Qtype], fqdn)
+		}
 	}
 }
 
