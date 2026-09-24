@@ -49,6 +49,7 @@ var schemaTables = []string{
 	"revoke_requests",
 	"rate_buckets",
 	"state_generation",
+	"probe_samples",
 }
 
 // schemaColumns are the columns added to tables that predate them.

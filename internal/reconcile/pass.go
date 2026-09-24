@@ -245,6 +245,24 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 			r.probedHosts[h] = struct{}{}
 			r.probeMu.Unlock()
 			p.Check(ctx, h, e)
+			// The runner remains the authority for live metrics and transition logs.
+			// Persist only its final, bounded verdict so the read-only inventory does
+			// not forget useful evidence on restart. A custom prober may not expose
+			// answers; that remains a supported best-effort probe implementation.
+			if answers, ok := p.(interface {
+				Answer(string) (probe.Answer, bool)
+			}); ok {
+				if answer, ok := answers.Answer(h); ok {
+					if err := r.store.PutProbeSample(state.ProbeSample{
+						CertName: c.Name, Host: answer.Host, Match: answer.Match,
+						Trusted: answer.Trusted, NotAfter: answer.NotAfter,
+						ProblemKind: answer.ProblemKind, ObservedAt: time.Now(),
+					}); err != nil {
+						r.log.Warn("could not persist TLS probe evidence; renewal is unaffected",
+							"cert", c.Name, "host", h, "err", err)
+					}
+				}
+			}
 		}(host)
 	}
 	wg.Wait()

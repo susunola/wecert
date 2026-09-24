@@ -95,6 +95,9 @@ type Input struct {
 type HostSample struct {
 	Host  string `json:"host"`
 	Match bool   `json:"match"`
+	// ObservedAt lets a restart preserve the distinction between evidence from
+	// the previous process and a probe that has never happened.
+	ObservedAt *time.Time `json:"observedAt,omitempty"`
 	// Trusted is the chain verdict, and NotAfter is the expiry of the certificate the
 	// probe actually read. Both are absent when the probe could not read one: the
 	// zero time would otherwise be published as year one.

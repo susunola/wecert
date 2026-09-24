@@ -193,4 +193,19 @@ CREATE TABLE IF NOT EXISTS state_generation (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     generation INTEGER NOT NULL DEFAULT 0
 );
+
+-- The last network-side TLS verdict for every certificate/host pair.  This is
+-- evidence only: renewal never consumes it, so losing a row must not change an
+-- issuance decision. Keeping it lets the read-only inventory survive a daemon
+-- restart without pretending the endpoint was never checked.
+CREATE TABLE IF NOT EXISTS probe_samples (
+    cert_name   TEXT NOT NULL,
+    host        TEXT NOT NULL,
+    match       INTEGER NOT NULL DEFAULT 0,
+    trusted     INTEGER NOT NULL DEFAULT 0,
+    not_after   INTEGER NOT NULL DEFAULT 0,
+    problem_kind TEXT NOT NULL DEFAULT '',
+    observed_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (cert_name, host)
+);
 `

@@ -100,6 +100,30 @@ func TestInventoryCarriesTheProbeAnswersTheDaemonRecorded(t *testing.T) {
 	}
 }
 
+func TestInventoryUsesPersistedProbeEvidenceAfterRestart(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC().Truncate(time.Second)
+	srv, store := newTestServer(t, &daemonFake{
+		fakeReconciler: &fakeReconciler{names: []string{"example-com"}},
+		probeEnabled:   true,
+		answers:        map[string][]probe.Answer{},
+	})
+	if err := store.PutProbeSample(state.ProbeSample{
+		CertName: "example-com", Host: "example.com", Match: false,
+		ProblemKind: string(probe.ProblemUnreachable), ObservedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap := inventorySnapshot(t, srv, store, &state.CertState{
+		Name: "example-com", NotAfter: now.Add(80 * 24 * time.Hour),
+		DeployedCertID: "c1", DeployConfirmed: true,
+	})
+	row := rowNamed(t, snap, "example-com")
+	if row.Status != inventory.StatusProbeUnreachable || len(row.Probe.Hosts) != 1 || row.Probe.Hosts[0].ObservedAt == nil {
+		t.Fatalf("restart inventory must retain the durable probe verdict, got %+v", row.Probe)
+	}
+}
+
 func TestInventoryWithoutTheProbeCapabilityClaimsNothing(t *testing.T) {
 	t.Parallel()
 	now := time.Now().UTC()

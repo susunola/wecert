@@ -1,7 +1,7 @@
 # Read-only inventory console
 
 The console is served at `GET /status` by the existing webhook listener. It shows
-certificate status, cloud bindings, expiration, and the latest in-memory TLS
+certificate status, cloud bindings, expiration, and the latest recorded TLS
 verification results. Search by certificate, domain, account UIN, certificate ID,
 CLB, or listener; filter by status or account; open a row for the underlying evidence.
 Light and dark themes and a mobile card layout are included.
@@ -131,8 +131,9 @@ loopback proxy on a public interface.
 - **Configured state**, **deployment record**, and **TLS verification** are separate
   sources. A confirmed upload alone does not prove what an endpoint serves.
 - **Passed**, **Failed**, **Unreachable**, **No result**, and **Disabled** remain
-  distinct. Each observed host has its own verdict, served expiration, and trust
-  result. TLS results are cleared when the daemon restarts.
+  distinct. Each observed host has its own verdict, observation time, served expiration,
+  and trust result. The last verdict is stored in `state.db`, so a restart does not erase
+  useful evidence; the next live probe replaces it.
 - **≥** is a minimum known binding count, not a complete cloud inventory. Unknown
   bindings do not mean unbound. Cached bindings include their observation time;
   local deployment records do not invent a cloud observation timestamp.

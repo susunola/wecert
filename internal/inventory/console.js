@@ -490,7 +490,7 @@ function probeDetails(r) {
       '<div class="binding-empty"><div class="binding-empty-title">TLS verification is disabled</div><p>Enable TLS probing in the daemon configuration to verify the certificate served by each endpoint.</p></div>';
   else if (!p.hosts.length)
     body =
-      '<div class="binding-empty"><div class="binding-empty-title">No TLS result available</div><p>TLS results are held in memory and cleared when the daemon restarts.</p></div>';
+      '<div class="binding-empty"><div class="binding-empty-title">No TLS result available</div><p>No completed TLS probe has been recorded for this certificate yet.</p></div>';
   else
     body = p.hosts
       .map((host) => {
@@ -505,10 +505,11 @@ function probeDetails(r) {
         const trust = unread(host.problemKind)
           ? "Certificate validity and chain trust could not be verified"
           : `Served certificate expires ${formatDate(host.notAfter, true)} · Chain ${host.trusted ? "trusted" : "untrusted"}`;
-        return `<div class="probe-box"><div class="probe-box-head"><span class="mono">${esc(host.host)}</span>${result}</div><div class="probe-box-body"><div class="comparison"><div><label>EXPECTED</label><p>Configured domains and deployed expiration</p><p class="mono">${esc(formatDate(r.notAfter, true))}</p></div><div><label>OBSERVED</label><div class="evidence-val ${host.match ? "positive" : "negative"}">${icon(host.match ? "check-circle" : "warning-circle")}${observed}</div>${host.problemKind ? `<p class="mono muted">${esc(host.problemKind)}</p>` : ""}</div></div><div class="probe-note">${icon("info")}${esc(trust)}</div></div></div>`;
+        const at = host.observedAt ? ` · Observed ${formatDate(host.observedAt, true)}` : "";
+        return `<div class="probe-box"><div class="probe-box-head"><span class="mono">${esc(host.host)}</span>${result}</div><div class="probe-box-body"><div class="comparison"><div><label>EXPECTED</label><p>Configured domains and deployed expiration</p><p class="mono">${esc(formatDate(r.notAfter, true))}</p></div><div><label>OBSERVED</label><div class="evidence-val ${host.match ? "positive" : "negative"}">${icon(host.match ? "check-circle" : "warning-circle")}${observed}</div>${host.problemKind ? `<p class="mono muted">${esc(host.problemKind)}</p>` : ""}</div></div><div class="probe-note">${icon("info")}${esc(trust + at)}</div></div></div>`;
       })
       .join("");
-  return `<section class="detail-section"><h3 class="section-heading">${icon("shield-check")}TLS verification<span class="right-label">Since daemon startup</span></h3>${body}</section>`;
+  return `<section class="detail-section"><h3 class="section-heading">${icon("shield-check")}TLS verification<span class="right-label">Last recorded result</span></h3>${body}</section>`;
 }
 function openDetail(index) {
   const r = records[index];

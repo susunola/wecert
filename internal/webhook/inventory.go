@@ -136,10 +136,20 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 		in.Probes = map[string][]inventory.HostSample{}
 		for name := range in.Certs {
 			answers := facts.ProbeAnswers(name)
-			if len(answers) == 0 {
+			if len(answers) > 0 {
+				in.Probes[name] = hostSamples(answers)
 				continue
 			}
-			in.Probes[name] = hostSamples(answers)
+			// A new process has no in-memory answers yet. Fall back to the durable
+			// last verdict rather than turning every known endpoint into unknown.
+			samples, err := s.store.ListProbeSamples(name)
+			if err != nil {
+				s.log.Warn("failed to read persisted TLS probe evidence", "cert", name, "err", err)
+				continue
+			}
+			if len(samples) > 0 {
+				in.Probes[name] = storedHostSamples(samples)
+			}
 		}
 	}
 	var quotas []ratelimit.QuotaReport
@@ -237,6 +247,26 @@ func hostSamples(answers []probe.Answer) []inventory.HostSample {
 		if !a.NotAfter.IsZero() {
 			at := a.NotAfter
 			row.NotAfter = &at
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func storedHostSamples(samples []state.ProbeSample) []inventory.HostSample {
+	out := make([]inventory.HostSample, 0, len(samples))
+	for _, sample := range samples {
+		row := inventory.HostSample{
+			Host: sample.Host, Match: sample.Match, Trusted: sample.Trusted,
+			ProblemKind: sample.ProblemKind,
+		}
+		if !sample.NotAfter.IsZero() {
+			at := sample.NotAfter
+			row.NotAfter = &at
+		}
+		if !sample.ObservedAt.IsZero() {
+			at := sample.ObservedAt
+			row.ObservedAt = &at
 		}
 		out = append(out, row)
 	}
