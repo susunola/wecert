@@ -27,6 +27,10 @@ type DNSSolver struct {
 	// goes through CAM temporary credentials that expire, so it must not be held long
 	// term.
 	newProvider func(ctx context.Context) (challenge.Provider, error)
+	// recoverCloudflareTXT removes one exact TXT value after a restart. lego's
+	// Cloudflare provider only remembers record IDs in memory, so its ordinary
+	// CleanUp cannot remove a record created by an earlier process.
+	recoverCloudflareTXT func(ctx context.Context, zone string, rec DNSRecord) error
 
 	timeout              time.Duration
 	interval             time.Duration

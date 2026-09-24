@@ -74,9 +74,21 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 		return fmt.Errorf("get the DNS provider: %w", err)
 	}
 	// Same bound as Present: this call holds the per-name lease mutex. See callProviderBounded.
-	return callProviderBounded("cleanup TXT", func() error {
+	err = callProviderBounded("cleanup TXT", func() error {
 		return provider.CleanUp(domain, token, keyAuth)
 	})
+	if err == nil || s.recoverCloudflareTXT == nil || !providerForgotRecordError(err) {
+		return err
+	}
+	zone, zoneErr := s.findZone(ctx, fqdn)
+	if zoneErr != nil {
+		return fmt.Errorf("%w (and could not locate the Cloudflare zone for recovery: %v)", err, zoneErr)
+	}
+	if recoverErr := s.recoverCloudflareTXT(ctx, zone, DNSRecord{FQDN: fqdn, Value: info.Value}); recoverErr != nil {
+		return fmt.Errorf("%w (Cloudflare restart recovery: %v)", err, recoverErr)
+	}
+	s.log.Info("removed a Cloudflare TXT record left by an earlier process", "name", fqdn)
+	return nil
 }
 
 // LookupTXT asks the zone's **authoritative** nameservers whether this challenge's TXT

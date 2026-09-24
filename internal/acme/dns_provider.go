@@ -144,7 +144,11 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 	if err := dns01.AddRecursiveNameservers(resolvers)(&dns01.Challenge{}); err != nil {
 		return nil, fmt.Errorf("configure lego recursive nameservers: %w", err)
 	}
-	return &DNSSolver{newProvider: newProvider, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS}, nil
+	solver := &DNSSolver{newProvider: newProvider, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS}
+	if dnsCfg.Provider == config.DNSProviderCloudflare {
+		solver.recoverCloudflareTXT = newCloudflareTXTRecovery(dnsCfg.Cloudflare.APIToken, dnsCfg.Cloudflare.APITokenFile)
+	}
+	return solver, nil
 }
 
 // dnsAPITimeout bounds one call to the DNS provider's API.
