@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/susunola/wecert/internal/spec"
@@ -84,6 +85,7 @@ type Server struct {
 	rec     Reconciler
 	store   *state.Store
 	token   string
+	tokenMu sync.RWMutex
 	uin     string
 	baseCtx context.Context
 	log     *slog.Logger
@@ -171,7 +173,19 @@ func (s *Server) tokenMatches(r *http.Request) bool {
 	// Constant-time comparison: a byte-by-byte compare returns at the first
 	// differing character, leaking the token prefix. This endpoint is valuable
 	// enough for someone to probe it bit by bit.
-	return subtle.ConstantTimeCompare([]byte(presented), []byte(s.token)) == 1
+	s.tokenMu.RLock()
+	token := s.token
+	s.tokenMu.RUnlock()
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1
+}
+
+// SetToken rotates the bearer token without rebinding the listener.  It is
+// intentionally narrow: callers have already fully validated the replacement
+// configuration before this method is reached.
+func (s *Server) SetToken(token string) {
+	s.tokenMu.Lock()
+	s.token = token
+	s.tokenMu.Unlock()
 }
 
 // SetAccountUIN records the Tencent Cloud account this process deploys into.

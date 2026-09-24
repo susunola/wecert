@@ -305,6 +305,22 @@ or your existing authenticated TLS gateway. The console needs a running daemon;
 an hourly `-once` timer does not keep the listener available. See the
 [console guide](docs/console.md) for access setup and status definitions.
 
+### Reloading configuration and credentials
+
+In daemon mode, send `SIGHUP` after changing policy, certificates, DNS or cloud
+credentials, notification settings, or the webhook token:
+
+```bash
+sudo systemctl kill -s HUP wecert
+```
+
+wecert parses and validates the complete replacement configuration, builds its
+credential-bearing components, then swaps it in only while no certificate pass is
+in flight. A bad configuration or a reload during issuance leaves the old runtime
+unchanged; the journal says why. Send HUP again after an in-flight pass completes.
+`statePath`, `acme.directory`, listener addresses and `stateBackup` identify
+long-lived resources and still require a normal service restart.
+
 ## Day-2 operations
 
 **Where state lives.** `statePath`, e.g. `/var/lib/wecert/state.db` (0600, directory 0700). It is

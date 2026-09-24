@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- **Safe daemon configuration reload.** `SIGHUP` now reloads certificates,
+  policy, credential files/environment, DNS/deploy settings, notifications and
+  the webhook token without restarting the daemon. The complete replacement is
+  parsed and constructed before an idle-only atomic swap; a rejected reload
+  leaves the previous runtime active. State path, ACME directory, listener
+  addresses and backup plan remain restart-only because they identify live
+  resources.
+
 ### Fixed
 
 - **Cloudflare and constrained DNS egress.** DNS lookups now retry over TCP when UDP returns

@@ -202,6 +202,16 @@ curl --fail --silent --show-error \
 
 用浏览器打开 `console.html`，即可搜索、筛选和查看详情。它是静态快照，更新数据需重新获取。需要在线刷新时，按[回环代理与 SSH 隧道示例](docs/console.md#live-browser-access)配置浏览器入口，或使用已有的鉴权 HTTPS 网关。页面依赖持续运行的 daemon；每小时执行一次的 `-once` timer 不会维持监听。完整开启步骤与状态含义见 [Console 使用说明](docs/console.md)。
 
+### 热加载配置与凭据
+
+daemon 模式下，修改策略、证书声明、DNS 或云凭据、通知配置或 webhook token 后，可发送 `SIGHUP`：
+
+```bash
+sudo systemctl kill -s HUP wecert
+```
+
+wecert 会完整解析、校验新配置并构建依赖组件，只有当前没有证书签发/部署任务时才原子切换。配置错误或仍有在途任务时，旧运行时保持不变，journal 会给出原因；待任务结束后再次发送 HUP 即可。`statePath`、`acme.directory`、监听地址和 `stateBackup` 属于长期资源标识，修改它们仍需正常重启服务。
+
 ## 部署到本机 nginx
 
 默认后端是腾讯云 CLB（上传 + 一次控制台绑定 + 一键换绑）。当 TLS 在**与 wecert 同一台机器**

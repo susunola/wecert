@@ -310,6 +310,19 @@ func (r *Reconciler) CertNames() []string {
 	return res.CertNames()
 }
 
+// Idle reports whether no certificate is currently being reconciled.  It is
+// deliberately a moment-in-time answer: callers that need to swap the runtime
+// must hold their own admission gate while checking it, otherwise a webhook can
+// start a pass immediately afterwards.
+//
+// This small primitive is what lets the daemon reload credentials and policy
+// without cancelling an order halfway through DNS-01 or deployment.
+func (r *Reconciler) Idle() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.running) == 0
+}
+
 // QuotaStatus returns the locally observed CA quota buckets for the most
 // recently resolved desired state. It never resolves desired state on an HTTP
 // request path; an unavailable cache simply yields no quota rows.

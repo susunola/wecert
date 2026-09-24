@@ -219,6 +219,7 @@ func run() error {
 	// rather than returning an empty list -- which reads as "the desired state is empty".
 	reconciler.Prime(ctx)
 	logEnforceFleet(cfg, reconciler, provider, log)
+	runtime := newRuntimeController(cfg, reconciler, notifier, store)
 
 	// Periodic consistent snapshots of state.db. Started here so a snapshot exists before
 	// the first renewal window can lose an order: the file holds the ACME account key and
@@ -241,7 +242,8 @@ func run() error {
 	}
 
 	// Event-trigger endpoint. Same rule: a failed port bind must be a hard failure.
-	if err := startWebhookServer(ctx, cfg, reconciler, store, log); err != nil {
+	web, err := startWebhookServer(ctx, cfg, runtime, store, log)
+	if err != nil {
 		return err
 	}
 
@@ -250,12 +252,26 @@ func run() error {
 	}
 
 	log.Info("entering daemon mode", "interval", f.interval)
-	runDaemon(ctx, f.interval, log, reconciler.RunDetailed)
+	reloadSignals := make(chan os.Signal, 1)
+	signal.Notify(reloadSignals, syscall.SIGHUP)
+	defer signal.Stop(reloadSignals)
+	runDaemonWithReload(ctx, f.interval, log, runtime.RunDetailed, reloadSignals, func() {
+		next, err := runtime.reload(ctx, f, log)
+		if err != nil {
+			log.Error("configuration reload rejected; continuing with the previous runtime", "err", err)
+			return
+		}
+		if web != nil {
+			web.SetToken(next.Webhook.Token)
+			web.SetAccountUIN(next.Tencent.UIN)
+		}
+		log.Info("configuration reloaded", "config", f.configPath, "certificates", certificateCountField(next))
+	})
 	// Wait for background passes and notifications before returning: the deferred store.Close()
 	// would otherwise close SQLite under a pass that is mid-renewal, losing the promotion or the
 	// resume anchor it was writing. See Reconciler.Drain.
-	drainBackground(reconciler, log)
-	drainNotifier(notifier, log)
+	drainRuntimeBackground(runtime, log)
+	drainNotifier(runtime.Notifier(), log)
 	return nil
 }
 
@@ -273,6 +289,15 @@ func drainBackground(reconciler *reconcile.Reconciler, log *slog.Logger) {
 		log.Warn("a background pass did not finish before shutdown; the state store is about to be "+
 			"closed under it, so its last write may be lost (the next pass resumes from the order URL "+
 			"that is already on disk)",
+			"waited", backgroundDrainTimeout, "err", err)
+	}
+}
+
+func drainRuntimeBackground(runtime *runtimeController, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundDrainTimeout)
+	defer cancel()
+	if err := runtime.Drain(ctx); err != nil {
+		log.Warn("a background pass did not finish before shutdown; the state store is about to be closed under it, so its last write may be lost (the next pass resumes from the order URL that is already on disk)",
 			"waited", backgroundDrainTimeout, "err", err)
 	}
 }
@@ -424,6 +449,13 @@ func newProvider(cfg *config.Config, log *slog.Logger) (spec.Provider, error) {
 // between the daemon and the one-shot unit, and it is the kind of behaviour that is easy to lose
 // when the two paths are edited separately.
 func runDaemon(ctx context.Context, interval time.Duration, log *slog.Logger, pass func(context.Context) reconcile.RunReport) {
+	runDaemonWithReload(ctx, interval, log, pass, nil, nil)
+}
+
+// runDaemonWithReload is runDaemon plus a deliberately narrow SIGHUP hook.  A
+// reload is handled between timer passes; the runtime controller itself also
+// rejects it while a webhook-started pass is in flight.
+func runDaemonWithReload(ctx context.Context, interval time.Duration, log *slog.Logger, pass func(context.Context) reconcile.RunReport, reload <-chan os.Signal, onReload func()) {
 	// Run one pass after startup, then loop on the interval; jitter avoids simultaneous knocking.
 	next := time.After(jitter(time.Second))
 	for {
@@ -431,6 +463,11 @@ func runDaemon(ctx context.Context, interval time.Duration, log *slog.Logger, pa
 		case <-ctx.Done():
 			log.Info("stop signal received; exiting")
 			return
+		case <-reload:
+			if onReload != nil {
+				onReload()
+			}
+			continue
 		case <-next:
 		}
 
@@ -730,16 +767,16 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) erro
 // every event is lost -- and certificates march on toward expiry regardless.
 func startWebhookServer(
 	ctx context.Context, cfg *config.Config,
-	rec *reconcile.Reconciler, store *state.Store, log *slog.Logger,
-) error {
+	rec webhook.Reconciler, store *state.Store, log *slog.Logger,
+) (*webhook.Server, error) {
 	if cfg.Webhook.Listen == "" {
 		log.Info("webhook disabled (webhook.listen is empty); converging on the timer only")
-		return nil
+		return nil, nil
 	}
 
 	ln, err := net.Listen("tcp", cfg.Webhook.Listen)
 	if err != nil {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"failed to listen on the webhook port %s: %w (already in use?)", cfg.Webhook.Listen, err)
 	}
 
@@ -751,7 +788,7 @@ func startWebhookServer(
 		// webhook.token and rerunning -- and the rerun then fails with "address already in
 		// use", pointing at a phantom instance instead of at the setting they just changed.
 		_ = ln.Close()
-		return fmt.Errorf("failed to initialise the webhook server (the port %s has been released): %w",
+		return nil, fmt.Errorf("failed to initialise the webhook server (the port %s has been released): %w",
 			cfg.Webhook.Listen, err)
 	}
 	api.SetAccountUIN(cfg.Tencent.UIN)
@@ -784,7 +821,7 @@ func startWebhookServer(
 		"addr", ln.Addr().String(),
 		"trigger", "POST /hook/reconcile",
 		"status", "GET /hook/status")
-	return nil
+	return api, nil
 }
 
 func newDeployer(cfg *config.Config, log *slog.Logger) (deploy.Deployer, error) {
