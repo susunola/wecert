@@ -2,8 +2,22 @@
 
 ## Unreleased
 
+## 0.7.0 - 2026-09-23
+
 ### Added
 
+- **Remote state backups and restore.** `stateBackup` gains S3-compatible (including
+  Tencent COS) and SFTP destinations alongside local directories: snapshot upload,
+  retention, health metrics, a stale-backup alert, and `wecert -restore` pulling the
+  latest snapshot back. SFTP passwords come from an environment variable and keys from
+  a file -- the target struct carries no secret value.
+- **Export issued certificates to local and remote targets.** `certificates[].export`
+  copies the full chain and private key to `localDir` and/or `remoteTargets` after
+  issuance. This is **distribution** (give the material to another system that will
+  serve it), not deployment: `deploy.target` remains what makes wecert put a
+  certificate into service (CLB rebind, or the nginx file pair + reload). One
+  certificate can export and deploy.
+- **Deploy certificates to local nginx.**
 - **Deploy certificates to local nginx.** `deploy.target: nginx` writes
   `fullchain.pem` + `privkey.pem` into `nginx.dirTemplate` (`%s` is the
   certificate name; default `/etc/nginx/ssl/%s`) and runs `nginx.reload`
@@ -16,6 +30,17 @@
   the directory. One process deploys to one backend — mixing CLB and nginx in
   one config is refused at load time. The unit still runs as `wecert`, so
   reloading nginx needs a sudoers rule, a helper, or `reload: []`.
+
+- **Per-certificate failure fallback.** `failureFallback` can be overridden on a
+  certificate (`certificates[].fallback`), so one stubborn name on a 25-SAN
+  certificate can degrade without changing the fleet-wide default.
+- **Multiple local snapshot destinations** for `stateBackup`, not one directory.
+- **`state.db` on a network filesystem is refused** (NFS / CIFS / SMB / FUSE on Linux):
+  SQLite locking over those is a known corruption source, and a corrupt state store is
+  the one disaster this program cannot recover from by re-issuing.
+- **Inventory shows blocked CA scopes** and onboarding respects known quota blocks, so
+  a paused identifier is visible instead of looking like a silent skip.
+
 
 ### Fixed
 
