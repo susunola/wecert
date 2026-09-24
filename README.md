@@ -42,15 +42,6 @@ New here? [Requirements](#requirements) then [Quick start](#quick-start) gets a 
 deployed and verified. The reasoning behind the design is in [How it works](#how-it-works) and the
 [full reference](README.reference.md).
 
-## Latest real E2E verification
-
-Two independent **Let's Encrypt staging** runs were completed on 2026-09-24 using Cloudflare
-DNS-01, Tencent Cloud SSL/CLB, and both Amazon S3 and Tencent COS. Each run issued a different
-certificate, uploaded it, completed a real CLB HTTPS listener rebind verified by a fresh
-`wecert-clbverify` read, and restored the remote S3 and COS snapshots into an isolated state
-database. This is staging-only evidence; it does not consume production CA quota. See the
-[full E2E record](docs/e2e-run-2026-09-24.md), including the network constraints and scope.
-
 ## Why this exists
 
 A Let's Encrypt certificate is free, and the price is a short validity — 90 days today, and the
