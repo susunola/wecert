@@ -2,6 +2,18 @@
 
 ## 0.9.0 - 2026-09-26
 
+### Security
+
+- **`google.golang.org/grpc` is v1.83.1, closing two advisories that turned `main`'s `test` job red.**
+  `GO-2026-6348` (heap exhaustion via HTTP/2 DATA frame fragmentation, CVE-2026-84304) and
+  `GO-2026-6061` (xDS RBAC and HTTP/2 issues) both affect versions before v1.83.1. grpc is an
+  indirect dependency of the build-tagged lego registry (`providers/dns/gcloud` ->
+  `google.golang.org/api`), so it is not linked into a default binary -- but `govulncheck` scans the
+  module graph, `make release` builds the tagged binary, and the advisory is fixed by one line. The
+  transitive `go.opentelemetry.io/otel` and `google.golang.org/genproto` versions move with it. This
+  commit also carries what `go mod tidy` reports on the current tree: `aws-sdk-go-v2/credentials` is
+  a direct import of `internal/backup/remote.go` and was still annotated `// indirect`.
+
 ### Fixed
 
 - **The Cloudflare TXT recovery fails closed on an answer that says `success:false`.** Cloudflare
