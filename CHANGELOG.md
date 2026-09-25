@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 - 2026-09-26
 
 ### Fixed
 
@@ -121,6 +121,162 @@
   certificate comments on the open issue instead of opening a duplicate. Successful
   renewals do not create tickets. API v2, so Server/DC and Cloud both work with a
   plain-text description.
+
+### Fixed
+
+- **A legacy account row with a KID but no key returned a client that could
+  only fail.** `EnsureAccount` generated a fresh key for such a row and stored
+  it with an empty KID, but the "is this row complete" check then read the
+  stale in-memory struct, saw the old KID, and skipped registration — so every
+  request was signed with the new key against the old account and the CA
+  answered `badSignature` for the rest of the process lifetime. Regenerating
+  the key now invalidates the remembered KID and forces a real registration,
+  and the contract test asserts the registration actually happens.
+- **The wildcard failed-authorizations budget now names the identifier the CA
+  counts.** Boulder reports `too many failed authorizations` against the bare
+  authorization identifier, which per RFC 8555 never carries the `*.` prefix,
+  while the spend, gate and refusal-recording sites keyed the wildcard form —
+  so a CA-told cooldown window was booked on a bucket the gate never queried,
+  and wildcard issuances kept ordering inside the very window the CA had
+  named. All three sites now use the bare identifier for the
+  `AuthzFailuresPerIdentifier` limit.
+- **An authorization seen valid on entry clears the identifier cooldown.**
+  Only the polling path did; a pass that found the authorization already valid
+  in phase 1 left the pre-accept claim frozen for its full hour, blocking
+  every certificate sharing the name.
+- **A certificate rejected by the post-download gates is booked once per
+  certificate URL, not once per pass.** The quota spend ran before the
+  notAfter/key-match gates, so a permanently rejected order re-downloaded the
+  same certificate every pass until the order expired — about 28 phantom
+  spends a week against the 50-per-7-days exact-set budget.
+- **The restart-seeded cooldown now covers identifiers failed by a different
+  certificate.** The ledger is written under the failing certificate's name
+  but read back per certificate, so after a restart a second certificate
+  sharing the identifier re-ordered inside the CA's window. The store grows
+  `ListIdentifierFailuresByIdentifier`, which reads the ledger across
+  certificates.
+- **Snapshot names carry a hash of the state path.** Snapshot identity used to
+  be the state file's basename alone, so two deployments sharing one backup
+  directory with the same basename pruned each other's snapshots and the temp
+  sweeper could delete the other deployment's in-flight `VACUUM INTO` target.
+  Pre-hash snapshot names remain listed, restorable and prunable.
+- **Snapshot restore inspects the payload, not just the container.** A
+  snapshot that passes SQLite's integrity check but holds an undecodable
+  account key or certificate PEM is now refused instead of being restored over
+  a healthy database. `setAsideDatabase` also stops treating every `Lstat`
+  error as "the sidecar does not exist", and restore refuses a `statePath`
+  that is an existing directory instead of renaming the directory away.
+- **The pass-level epilogue steps are panic-contained.** `publishQuota`,
+  `ReapRetired`, `retryRevocations` and `reclaimStaleProbeSeries` ran outside
+  every recover, on both the timer and the webhook path, so one panic in any
+  of them killed the daemon; they now go through the same panic-safe wrapper
+  as the per-certificate steps.
+- **Probe-series reclaim no longer races a finishing pass.** The
+  `probedHosts` snapshot and the pass-in-flight check were taken under two
+  different locks, so a sweep could delete the series a webhook-triggered pass
+  had written microseconds earlier; both reads now happen under the same
+  critical section.
+- **`StartAll` reports the passes it started when shutdown begins mid-walk.**
+  It used to drop the accumulated `accepted` list and return a bare
+  `ErrShuttingDown`, so the webhook answered 503 "nothing was started" while
+  passes were in fact running — the exact inversion `StartNamed` had already
+  been fixed for. The webhook now answers 202 with the partial result whenever
+  anything was accepted, and the 404 body serializes `accepted` as `[]` rather
+  than `null`.
+- **Onboarding refuses colliding output paths in all three directions.**
+  Only `StatePath == DocumentPath` was rejected; pointing `-report` at the
+  document overwrote the desired-state file with a report JSON, and pointing
+  it at the state file made `LoadState` silently parse that report as an empty
+  state, resetting the grace clocks and destroying the change ledger every
+  round. All three paths must now be pairwise distinct. Relatedly, a group
+  that is still over the SAN cap no longer carries the previous certificate
+  verbatim: names confirmed removed this round are stripped from the carried
+  certificate instead of being resurrected into the document, and if the
+  group still does not fit it freezes with an explicit message.
+- **The probe names the problem it actually found.** `mismatchMessage` had no
+  case for `untrusted`, so "the right certificate with a broken chain" — and
+  any expired certificate, which always also fails verification — was reported
+  as "the certificate being served is not the one that was deployed". The
+  verdict also gains an unconditional validity-window check: an expired or
+  not-yet-valid certificate is `validity_window`, independent of
+  `requireTrusted` and `minValidFor`, so a private-CA deployment no longer
+  answers OK for an expired certificate. A cancelled probe pass no longer
+  writes `probe_match=0` and an ERROR log on the way out, and concurrent
+  checks of one host (shared by two certificates) are serialized per host so
+  the transition dedup can actually dedup.
+- **`Install` fsyncs the file it installs.** The durability contract relied on
+  every caller having synced the temporary file itself — one did, one relied
+  on SQLite defaults. `Install` now syncs the temp file before the rename and
+  refuses a `dir` argument that is not the target's directory.
+- **`IsThrottled(nil)` no longer panics**, and the three classification
+  predicates that decide "retry vs give up" in every deploy poll loop have
+  their first tests.
+- **Usage errors print their message and exit 64, uniformly.** `-restore`
+  combined with another mode, `clbverify` without `-region`/`-clb`,
+  contradictory `wecert` flag combinations and a misspelled `-log-level` all
+  either exited 64 with an empty stderr or exited 1; all of them now print the
+  reason and exit 64. `-h` exits 0 on `wecert-onboard` and `wecert-probe`
+  (pinned by the CLI-surface checker), `-not-expect` with `-wait` is refused
+  instead of silently never polling, `wecert-onboard -dry-run` no longer
+  writes a failure report, `tatrun -timeout` rejects values the API would
+  misread, `preflight` normalizes a trailing dot before the leftover-record
+  query, and a second SIGTERM during shutdown force-kills the daemon.
+- **`install.sh` refuses a `WECERT_STATE_DIR` that is not wecert-specific.**
+  `install -d -o wecert -m 0700` applies to pre-existing directories too, so
+  `WECERT_STATE_DIR=/etc` used to chown and chmod a system directory; the path
+  must now end in or live under a `wecert` component.
+- **Smaller corrections:** `Store.Close` is idempotent; the remaining `Put*`
+  methods refuse nil like their siblings; re-requesting a revocation for
+  changed material resets the attempt ledger; `UpdateRateBucket` refuses a
+  callback that retargets the bucket's key; `Spend` on a non-positive-capacity
+  limit records no garbage tokens; `-restore latest` warns when the winning
+  snapshot name is dated in the future; `deployUploaded` enumerates each
+  certificate once instead of up to three times on the recovery path; `Delete`
+  treats an already-gone certificate as reclaimed; CVM role credentials with a
+  non-Success code or a past `ExpiredTime` are rejected; inline `secretId` /
+  `secretKey` values are trimmed like the file/env variants; `WaitAll` walks
+  the zone once per zone instead of once per record; a transport failure on
+  `AcceptChallenge` releases the budget claim instead of freezing the
+  identifier for an hour; a future-dated challenge timestamp no longer blocks
+  TXT reclaim; discarded orders forget their fetch-failure counts.
+
+### Security
+
+- **The webhook URL is redacted in startup warnings and load errors.** The
+  plaintext-http warning and the `notifyURL` parse/validation errors printed
+  the full URL — and the credential lives in the path of Slack/Lark/DingTalk
+  webhook URLs — into stderr and from there into the journal. Only
+  `scheme://host` is printed now.
+- **The desired-state document's directory must be owned by the process user
+  or root.** The mode check alone passed a 0755 directory owned by someone
+  else, and the directory's owner can replace the document regardless of the
+  document's own mode and owner.
+- **A trailing `---` no longer reads as a second document in the spec
+  loader.** yaml.v3 decodes that as a nil document; the config loader skipped
+  it, the spec loader rejected it, and in enforce mode that rejection keeps
+  the daemon from starting.
+- **`webhook.token` and `webhook.notifySecret` grow `tokenFile` /
+  `notifySecretFile` variants**, so every inline secret the permission warning
+  points at now actually has the file-based alternative the warning text
+  recommends.
+- **CI: the `lego_dns` release variant is now scanned by govulncheck** (it
+  links ~198 DNS provider SDKs and was never scanned), `ci.yml` declares
+  top-level `permissions: contents: read`, and the release workflow re-runs
+  the full `make check` gate instead of only `make test` before publishing a
+  tag.
+
+### Changed
+
+- **The desired-state `Revision` fingerprint is computed from the normalized
+  `renewBefore` duration**, so a document that writes `720h` explicitly and
+  one that inherits the same default hash identically. This is a one-time
+  fingerprint change: a document written by an older version reads as a
+  revision mismatch once after upgrade, and the next onboarding commit
+  rewrites it.
+- **`acme.directory` is validated as a URL at load time** and must be https
+  (http is accepted only on loopback, for Pebble-style local testing); the
+  config file itself is refused beyond 16 MiB, matching the desired-state
+  document's limit.
 
 ## 0.8.0 - 2026-09-24
 
@@ -1176,162 +1332,6 @@ All three `ratelimit` findings were found by fuzz testing (`make fuzz`). The fir
   a genuine event from anything else that could reach its URL. The secret is
   validated at load time (>= 32 characters, requires `notifyURL`) and each
   event is signed with HMAC-SHA256 over the raw body.
-
-### Fixed
-
-- **A legacy account row with a KID but no key returned a client that could
-  only fail.** `EnsureAccount` generated a fresh key for such a row and stored
-  it with an empty KID, but the "is this row complete" check then read the
-  stale in-memory struct, saw the old KID, and skipped registration — so every
-  request was signed with the new key against the old account and the CA
-  answered `badSignature` for the rest of the process lifetime. Regenerating
-  the key now invalidates the remembered KID and forces a real registration,
-  and the contract test asserts the registration actually happens.
-- **The wildcard failed-authorizations budget now names the identifier the CA
-  counts.** Boulder reports `too many failed authorizations` against the bare
-  authorization identifier, which per RFC 8555 never carries the `*.` prefix,
-  while the spend, gate and refusal-recording sites keyed the wildcard form —
-  so a CA-told cooldown window was booked on a bucket the gate never queried,
-  and wildcard issuances kept ordering inside the very window the CA had
-  named. All three sites now use the bare identifier for the
-  `AuthzFailuresPerIdentifier` limit.
-- **An authorization seen valid on entry clears the identifier cooldown.**
-  Only the polling path did; a pass that found the authorization already valid
-  in phase 1 left the pre-accept claim frozen for its full hour, blocking
-  every certificate sharing the name.
-- **A certificate rejected by the post-download gates is booked once per
-  certificate URL, not once per pass.** The quota spend ran before the
-  notAfter/key-match gates, so a permanently rejected order re-downloaded the
-  same certificate every pass until the order expired — about 28 phantom
-  spends a week against the 50-per-7-days exact-set budget.
-- **The restart-seeded cooldown now covers identifiers failed by a different
-  certificate.** The ledger is written under the failing certificate's name
-  but read back per certificate, so after a restart a second certificate
-  sharing the identifier re-ordered inside the CA's window. The store grows
-  `ListIdentifierFailuresByIdentifier`, which reads the ledger across
-  certificates.
-- **Snapshot names carry a hash of the state path.** Snapshot identity used to
-  be the state file's basename alone, so two deployments sharing one backup
-  directory with the same basename pruned each other's snapshots and the temp
-  sweeper could delete the other deployment's in-flight `VACUUM INTO` target.
-  Pre-hash snapshot names remain listed, restorable and prunable.
-- **Snapshot restore inspects the payload, not just the container.** A
-  snapshot that passes SQLite's integrity check but holds an undecodable
-  account key or certificate PEM is now refused instead of being restored over
-  a healthy database. `setAsideDatabase` also stops treating every `Lstat`
-  error as "the sidecar does not exist", and restore refuses a `statePath`
-  that is an existing directory instead of renaming the directory away.
-- **The pass-level epilogue steps are panic-contained.** `publishQuota`,
-  `ReapRetired`, `retryRevocations` and `reclaimStaleProbeSeries` ran outside
-  every recover, on both the timer and the webhook path, so one panic in any
-  of them killed the daemon; they now go through the same panic-safe wrapper
-  as the per-certificate steps.
-- **Probe-series reclaim no longer races a finishing pass.** The
-  `probedHosts` snapshot and the pass-in-flight check were taken under two
-  different locks, so a sweep could delete the series a webhook-triggered pass
-  had written microseconds earlier; both reads now happen under the same
-  critical section.
-- **`StartAll` reports the passes it started when shutdown begins mid-walk.**
-  It used to drop the accumulated `accepted` list and return a bare
-  `ErrShuttingDown`, so the webhook answered 503 "nothing was started" while
-  passes were in fact running — the exact inversion `StartNamed` had already
-  been fixed for. The webhook now answers 202 with the partial result whenever
-  anything was accepted, and the 404 body serializes `accepted` as `[]` rather
-  than `null`.
-- **Onboarding refuses colliding output paths in all three directions.**
-  Only `StatePath == DocumentPath` was rejected; pointing `-report` at the
-  document overwrote the desired-state file with a report JSON, and pointing
-  it at the state file made `LoadState` silently parse that report as an empty
-  state, resetting the grace clocks and destroying the change ledger every
-  round. All three paths must now be pairwise distinct. Relatedly, a group
-  that is still over the SAN cap no longer carries the previous certificate
-  verbatim: names confirmed removed this round are stripped from the carried
-  certificate instead of being resurrected into the document, and if the
-  group still does not fit it freezes with an explicit message.
-- **The probe names the problem it actually found.** `mismatchMessage` had no
-  case for `untrusted`, so "the right certificate with a broken chain" — and
-  any expired certificate, which always also fails verification — was reported
-  as "the certificate being served is not the one that was deployed". The
-  verdict also gains an unconditional validity-window check: an expired or
-  not-yet-valid certificate is `validity_window`, independent of
-  `requireTrusted` and `minValidFor`, so a private-CA deployment no longer
-  answers OK for an expired certificate. A cancelled probe pass no longer
-  writes `probe_match=0` and an ERROR log on the way out, and concurrent
-  checks of one host (shared by two certificates) are serialized per host so
-  the transition dedup can actually dedup.
-- **`Install` fsyncs the file it installs.** The durability contract relied on
-  every caller having synced the temporary file itself — one did, one relied
-  on SQLite defaults. `Install` now syncs the temp file before the rename and
-  refuses a `dir` argument that is not the target's directory.
-- **`IsThrottled(nil)` no longer panics**, and the three classification
-  predicates that decide "retry vs give up" in every deploy poll loop have
-  their first tests.
-- **Usage errors print their message and exit 64, uniformly.** `-restore`
-  combined with another mode, `clbverify` without `-region`/`-clb`,
-  contradictory `wecert` flag combinations and a misspelled `-log-level` all
-  either exited 64 with an empty stderr or exited 1; all of them now print the
-  reason and exit 64. `-h` exits 0 on `wecert-onboard` and `wecert-probe`
-  (pinned by the CLI-surface checker), `-not-expect` with `-wait` is refused
-  instead of silently never polling, `wecert-onboard -dry-run` no longer
-  writes a failure report, `tatrun -timeout` rejects values the API would
-  misread, `preflight` normalizes a trailing dot before the leftover-record
-  query, and a second SIGTERM during shutdown force-kills the daemon.
-- **`install.sh` refuses a `WECERT_STATE_DIR` that is not wecert-specific.**
-  `install -d -o wecert -m 0700` applies to pre-existing directories too, so
-  `WECERT_STATE_DIR=/etc` used to chown and chmod a system directory; the path
-  must now end in or live under a `wecert` component.
-- **Smaller corrections:** `Store.Close` is idempotent; the remaining `Put*`
-  methods refuse nil like their siblings; re-requesting a revocation for
-  changed material resets the attempt ledger; `UpdateRateBucket` refuses a
-  callback that retargets the bucket's key; `Spend` on a non-positive-capacity
-  limit records no garbage tokens; `-restore latest` warns when the winning
-  snapshot name is dated in the future; `deployUploaded` enumerates each
-  certificate once instead of up to three times on the recovery path; `Delete`
-  treats an already-gone certificate as reclaimed; CVM role credentials with a
-  non-Success code or a past `ExpiredTime` are rejected; inline `secretId` /
-  `secretKey` values are trimmed like the file/env variants; `WaitAll` walks
-  the zone once per zone instead of once per record; a transport failure on
-  `AcceptChallenge` releases the budget claim instead of freezing the
-  identifier for an hour; a future-dated challenge timestamp no longer blocks
-  TXT reclaim; discarded orders forget their fetch-failure counts.
-
-### Security
-
-- **The webhook URL is redacted in startup warnings and load errors.** The
-  plaintext-http warning and the `notifyURL` parse/validation errors printed
-  the full URL — and the credential lives in the path of Slack/Lark/DingTalk
-  webhook URLs — into stderr and from there into the journal. Only
-  `scheme://host` is printed now.
-- **The desired-state document's directory must be owned by the process user
-  or root.** The mode check alone passed a 0755 directory owned by someone
-  else, and the directory's owner can replace the document regardless of the
-  document's own mode and owner.
-- **A trailing `---` no longer reads as a second document in the spec
-  loader.** yaml.v3 decodes that as a nil document; the config loader skipped
-  it, the spec loader rejected it, and in enforce mode that rejection keeps
-  the daemon from starting.
-- **`webhook.token` and `webhook.notifySecret` grow `tokenFile` /
-  `notifySecretFile` variants**, so every inline secret the permission warning
-  points at now actually has the file-based alternative the warning text
-  recommends.
-- **CI: the `lego_dns` release variant is now scanned by govulncheck** (it
-  links ~198 DNS provider SDKs and was never scanned), `ci.yml` declares
-  top-level `permissions: contents: read`, and the release workflow re-runs
-  the full `make check` gate instead of only `make test` before publishing a
-  tag.
-
-### Changed
-
-- **The desired-state `Revision` fingerprint is computed from the normalized
-  `renewBefore` duration**, so a document that writes `720h` explicitly and
-  one that inherits the same default hash identically. This is a one-time
-  fingerprint change: a document written by an older version reads as a
-  revision mismatch once after upgrade, and the next onboarding commit
-  rewrites it.
-- **`acme.directory` is validated as a URL at load time** and must be https
-  (http is accepted only on loopback, for Pebble-style local testing); the
-  config file itself is refused beyond 16 MiB, matching the desired-state
-  document's limit.
 
 ## 0.4.2 - 2026-09-16
 
