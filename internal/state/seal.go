@@ -16,11 +16,13 @@ import (
 // Blob prefixes identify which KDF produced the AEAD key. A single prefix cannot
 // serve two KDFs: switching derivation without a new marker silently locks every
 // existing sealed row (the comment that claimed "v1 still decrypts" was false).
+//
+// V2 is what seal() writes; there is no alias variable for "the current prefix" -- an alias that
+// nothing reads is a second place to change when the version moves, and the one that matters
+// (seal()) is the one the compiler checks.
 var (
 	sealedPrefixV1 = []byte("wecert-seal-v1\x00") // SHA-256(master) -> AES-256-GCM
 	sealedPrefixV2 = []byte("wecert-seal-v2\x00") // Argon2id(master) -> AES-256-GCM
-	// sealedPrefix is the version new writes emit.
-	sealedPrefix = sealedPrefixV2
 )
 
 type sealer struct {
@@ -101,11 +103,6 @@ func (s *sealer) openWith(aead cipher.AEAD, prefix, blob, aad []byte) ([]byte, e
 		return nil, fmt.Errorf("decrypt state key material: %w", err)
 	}
 	return plain, nil
-}
-
-// isSealed reports whether a blob is already sealed (any version).
-func isSealed(blob []byte) bool {
-	return bytes.HasPrefix(blob, sealedPrefixV1) || bytes.HasPrefix(blob, sealedPrefixV2)
 }
 
 // isSealedV1 reports whether a blob still uses the pre-upgrade KDF.

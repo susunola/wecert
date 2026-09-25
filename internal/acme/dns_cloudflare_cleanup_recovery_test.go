@@ -209,15 +209,9 @@ func TestCloudflareRequestSendsTheCallersMethodAndDecodesTheEnvelope(t *testing.
 	}
 }
 
-// cloudflareRequest only looks at the HTTP status; the success/errors half of the envelope is
-// decoded for the callers to reason about. A rename on Cloudflare's side, or a typo in the struct
-// tags, has to show up here as missing data rather than as a silently empty result that the
-// recovery would read as "the record was already deleted".
-//
-// This asserts the decoding, and deliberately nothing more: no code in this file acts on Success.
-// An envelope that reports success:false under an HTTP 200 is therefore an ordinary call as far as
-// cloudflareRequest is concerned, and on the delete path an unreadable listing is indistinguishable
-// from an empty one. That gap is reported with these tests rather than pinned here as intended.
+// cloudflareRequest itself only looks at the HTTP status; the success/errors half of the envelope is
+// decoded for the callers to check. A rename on Cloudflare's side, or a typo in the struct tags, has
+// to show up here as missing data rather than as a silently empty result.
 func TestCloudflareRequestDecodesTheErrorEnvelope(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -234,6 +228,63 @@ func TestCloudflareRequestDecodesTheErrorEnvelope(t *testing.T) {
 	}
 	if len(out.Errors) != 1 || out.Errors[0].Message != "Invalid API Token" {
 		t.Errorf("errors = %+v, want the operator-facing message decoded from errors[].message", out.Errors)
+	}
+	if err := out.err(); err == nil || !strings.Contains(err.Error(), "Invalid API Token") {
+		t.Errorf("the envelope's own verdict must reach the caller, got: %v", err)
+	}
+}
+
+// A 200 that says success:false is a refusal, and the recovery must fail closed on it.
+//
+// Cloudflare answers some failures this way (a token that cannot read the filtered listing, for
+// instance). Reading it as "the listing came back empty" made cloudflareDeleteExactTXT return nil,
+// the caller log the record as removed, and the reclaim be recorded as done while the TXT was still
+// in the zone -- the one direction that loses a record instead of merely failing to delete one.
+func TestCloudflareRecoveryFailsClosedOnAnHTTP200ThatSaysSuccessFalse(t *testing.T) {
+	listingRefused := newCloudflareAPIStub(func(req *http.Request) (*http.Response, error) {
+		if !strings.Contains(req.URL.Path, "/dns_records") {
+			t.Errorf("the zone lookup is not what this test is about, got %s", req.URL.Path)
+		}
+		return cloudflareJSONResponse(http.StatusOK,
+			`{"success":false,"result":[],"errors":[{"message":"Invalid API Token"}]}`), nil
+	})
+
+	err := cloudflareDeleteExactTXT(context.Background(), listingRefused.client(), "tok", "zone-1", DNSRecord{
+		FQDN: "_acme-challenge.example.com.", Value: "value-1",
+	})
+	if err == nil {
+		t.Fatal("a listing the API refused must not be read as an empty listing: the record would be " +
+			"reported as reclaimed while it is still in the zone")
+	}
+	if !strings.Contains(err.Error(), "Invalid API Token") {
+		t.Errorf("the API's own message must reach the operator, got: %v", err)
+	}
+	// No delete may follow a listing that was never obtained.
+	for _, req := range listingRefused.requests() {
+		if req.method == http.MethodDelete {
+			t.Errorf("a delete was sent after a refused listing: %+v", req)
+		}
+	}
+}
+
+// The zone lookup has the same rule: success:false must not be reported as "not found uniquely",
+// which sends the operator looking for a zone problem instead of a credential problem.
+func TestCloudflareZoneLookupReportsTheAPIsRefusalRatherThanGuessing(t *testing.T) {
+	stub := newCloudflareAPIStub(func(*http.Request) (*http.Response, error) {
+		return cloudflareJSONResponse(http.StatusOK,
+			`{"success":false,"result":[],"errors":[{"message":"Invalid API Token"}]}`), nil
+	})
+
+	_, err := cloudflareZoneID(context.Background(), stub.client(), "tok", "example.com")
+	if err == nil {
+		t.Fatal("a refused zone lookup must be an error")
+	}
+	if strings.Contains(err.Error(), "not found uniquely") {
+		t.Errorf("the API said why it refused; reporting a zone problem instead sends the operator "+
+			"to the wrong fix: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Invalid API Token") {
+		t.Errorf("the API's message must survive, got: %v", err)
 	}
 }
 

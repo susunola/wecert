@@ -19,7 +19,6 @@ func (s *Store) migrateSealedMaterial() error {
 		return err
 	}
 	defer tx.Rollback()
-	type row struct{ table, id, column, aad string }
 	for _, spec := range []struct{ table, id, column, aad string }{
 		{"accounts", "directory", "private_key_pem", "accounts/private_key_pem/"},
 		{"orders", "cert_name", "key_pem", "orders/key_pem/"},

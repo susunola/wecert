@@ -19,7 +19,7 @@ func newCloudflareTXTRecovery(token, tokenFile string) func(context.Context, str
 			token = rereadSecretFile(tokenFile, token)
 		}
 		if token == "" {
-			return fmt.Errorf("Cloudflare API token is empty")
+			return fmt.Errorf("cloudflare API token is empty")
 		}
 		client := &http.Client{Timeout: dnsAPITimeout}
 		zoneID, err := cloudflareZoneID(ctx, client, token, strings.TrimSuffix(zone, "."))
@@ -30,12 +30,41 @@ func newCloudflareTXTRecovery(token, tokenFile string) func(context.Context, str
 	}
 }
 
-type cloudflareResponse[T any] struct {
+// cloudflareEnvelope is the success/errors half of every Cloudflare API answer.
+//
+// It is checked, not merely decoded. Cloudflare answers HTTP 200 with `success:false` for some
+// failures (a token without the right scope answering a filtered listing, for instance), and
+// reading that as an empty result turned "the listing was refused" into "no matching record":
+// cloudflareDeleteExactTXT returned nil, the caller logged the record as removed, and the
+// reclaim was treated as done while the TXT was still in the zone. Fail closed instead.
+type cloudflareEnvelope struct {
 	Success bool `json:"success"`
-	Result  T    `json:"result"`
 	Errors  []struct {
 		Message string `json:"message"`
 	} `json:"errors"`
+}
+
+// err reports the envelope's own verdict, with the API's message when it gave one: "was not found
+// uniquely" is a guess this code should not have to make when Cloudflare already said why.
+func (e cloudflareEnvelope) err() error {
+	if e.Success {
+		return nil
+	}
+	msgs := make([]string, 0, len(e.Errors))
+	for _, item := range e.Errors {
+		if m := strings.TrimSpace(item.Message); m != "" {
+			msgs = append(msgs, m)
+		}
+	}
+	if len(msgs) == 0 {
+		return fmt.Errorf("cloudflare API reported success=false")
+	}
+	return fmt.Errorf("cloudflare API reported success=false: %s", strings.Join(msgs, "; "))
+}
+
+type cloudflareResponse[T any] struct {
+	cloudflareEnvelope
+	Result T `json:"result"`
 }
 
 type cloudflareZone struct {
@@ -54,8 +83,11 @@ func cloudflareZoneID(ctx context.Context, client *http.Client, token, zone stri
 	if err := cloudflareRequest(ctx, client, token, http.MethodGet, "https://api.cloudflare.com/client/v4/zones?"+q.Encode(), &out); err != nil {
 		return "", err
 	}
+	if err := out.err(); err != nil {
+		return "", err
+	}
 	if len(out.Result) != 1 || out.Result[0].ID == "" {
-		return "", fmt.Errorf("Cloudflare zone %q was not found uniquely", zone)
+		return "", fmt.Errorf("cloudflare zone %q was not found uniquely", zone)
 	}
 	return out.Result[0].ID, nil
 }
@@ -64,6 +96,9 @@ func cloudflareDeleteExactTXT(ctx context.Context, client *http.Client, token, z
 	q := url.Values{"type": {"TXT"}, "name": {strings.TrimSuffix(rec.FQDN, ".")}, "per_page": {"100"}}
 	var listed cloudflareResponse[[]cloudflareTXTRecord]
 	if err := cloudflareRequest(ctx, client, token, http.MethodGet, "https://api.cloudflare.com/client/v4/zones/"+url.PathEscape(zoneID)+"/dns_records?"+q.Encode(), &listed); err != nil {
+		return err
+	}
+	if err := listed.err(); err != nil {
 		return err
 	}
 	for _, record := range listed.Result {
@@ -89,7 +124,7 @@ func cloudflareRequest(ctx context.Context, client *http.Client, token, method, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("Cloudflare API returned HTTP %d", resp.StatusCode)
+		return fmt.Errorf("cloudflare API returned HTTP %d", resp.StatusCode)
 	}
 	if out == nil {
 		return nil

@@ -32,7 +32,17 @@ PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 # started inside cmd/wecert (see startWebhookServer), so it ships with the first entry.
 CMDS := wecert wecert-onboard
 
-.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-tags test-repeat e2e vet cover check-coverage clean fmt validate-cloudinit check-english check-scripts check-cli check-alerts fmt-check check diagrams diagrams-check
+# The linter, pinned. staticcheck is not part of the Go toolchain, so it is fetched on demand --
+# and a floating version would make "the tree is clean" a claim about whichever staticcheck a
+# runner happened to resolve. v0.6.1 is staticcheck 2025.1.1, the release the tree was cleared
+# against; bump it deliberately and expect to fix whatever the new one finds.
+#
+# The default check set, not -checks=all: `all` adds the ST10xx documentation-style checks (package
+# comments, comment form on exported symbols), which is a documentation policy rather than a
+# correctness gate.
+STATICCHECK_VERSION ?= v0.6.1
+
+.PHONY: build build-lego-dns fuzz sbom repro-check tools release test test-race test-tags test-repeat e2e vet check-staticcheck cover check-coverage clean fmt validate-cloudinit check-english check-scripts check-cli check-alerts fmt-check check diagrams diagrams-check
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/wecert
@@ -214,6 +224,13 @@ test-repeat:
 vet:
 	$(GO) vet ./...
 
+# The mechanical half of the review: unused code, deprecated APIs, error strings that break the
+# convention, and the rest of staticcheck's default set. `go vet` covers only the checks the Go
+# team considers unambiguous, which is why three unused symbols and a deprecated net.Error method
+# sat on main unnoticed until this target existed.
+check-staticcheck:
+	$(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
+
 cover:
 	$(GO) test -coverprofile=coverage.out ./...
 	$(GO) tool cover -func=coverage.out | tail -1
@@ -308,7 +325,7 @@ fuzz:
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzLimitWithDegenerateRefill -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzParseRetryAfter -fuzztime $(FUZZTIME)
 
-check: check-english fmt-check vet test-race test-tags check-scripts check-alerts check-coverage
+check: check-english fmt-check vet check-staticcheck test-race test-tags check-scripts check-alerts check-coverage
 
 clean:
 	rm -rf bin dist coverage.out
