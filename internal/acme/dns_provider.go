@@ -253,14 +253,31 @@ func cloudflareConfig(dnsCfg config.DNS) *cloudflare.Config {
 //
 // NewDefaultConfig is the starting point on purpose here, because the fields a literal would leave
 // at their zero values are real behaviour rather than formatting: MaxRetries (5, since Route 53
-// throttles at 5 requests/second per account), WaitForRecordSetsChanged (true -- the API call
-// returns before the change is INSYNC) and the AWS_HOSTED_ZONE_ID fallback for a deployment that
-// pinned its zone that way under the old `dns.provider: lego` path.
+// throttles at 5 requests/second per account) and the AWS_HOSTED_ZONE_ID fallback for a deployment
+// that pinned its zone that way under the old `dns.provider: lego` path.
 //
 // The credential fields are copied verbatim, empty included: an empty AccessKeyID/SecretAccessKey
 // pair is what tells lego to load the AWS default chain (environment, shared config, instance
 // role), and filling either one from anywhere else here would replace that chain with a static
 // provider built from half a pair.
+//
+// WaitForRecordSetsChanged is turned **off**, against lego's default of true, and the reason is a
+// measured one. With it on, Present (and CleanUp, which shares changeRecord) waits for the change
+// to reach INSYNC, polling every PollingInterval for up to PropagationTimeout -- five minutes,
+// inside a call this program bounds at dnsAPITimeout (60s, see callProviderBounded). On this
+// machine that wait plus the API call took 32.7s, 38.4s and 32.1s over three measured changes
+// (ChangeResourceRecordSets itself 6.5-8.6s, INSYNC 23.5-31.9s later), leaving roughly twenty
+// seconds of headroom on a bound that exists to keep a wedged call from holding the per-name lease
+// forever. A staging round then failed exactly there: "present TXT timed out after 1m0s", one
+// failed pass, a discarded order and a backoff, for a record Route 53 had already accepted.
+//
+// Nothing is lost by not waiting here: this solver never lets lego decide when a record is live.
+// WaitAll probes the zone's authoritative nameservers itself, needs two independent servers to
+// agree (recursive resolvers included), holds the full propagation budget, and prints the evidence
+// -- for every provider, not just this one. The provider-side wait was a second, shorter, silently
+// enforced version of that check. Without it, a write is confirmed as soon as Route 53 accepts the
+// change (seconds), the per-name lease is released sooner, and the waiting happens where the
+// budget and the diagnostics are.
 func route53Config(dnsCfg config.DNS) *route53.Config {
 	cfg := route53.NewDefaultConfig()
 	cfg.Region = dnsCfg.Route53.Region
@@ -274,6 +291,7 @@ func route53Config(dnsCfg config.DNS) *route53.Config {
 	cfg.TTL = dnsCfg.TTL
 	cfg.PropagationTimeout = dnsCfg.Propagation
 	cfg.PollingInterval = dnsCfg.Polling
+	cfg.WaitForRecordSetsChanged = false
 	// No HTTP-timeout knob exists on this config in lego v4.35.2: the request goes through the AWS
 	// SDK's own transport, bounded by its dial/TLS timeouts and the retryer above rather than by one
 	// overall deadline. Re-check for such a field when the lego dependency is bumped.

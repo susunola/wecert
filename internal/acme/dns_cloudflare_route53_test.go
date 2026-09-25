@@ -194,14 +194,27 @@ func TestCloudflareAndRoute53ConfigsKeepTheirSettings(t *testing.T) {
 		t.Errorf("the config must carry what the caller passed, got %+v", r53)
 	}
 	// lego's own defaults, which a struct literal would have dropped: retries matter because Route
-	// 53 throttles at 5 requests/second per account, and the wait matters because the API returns
-	// before the change is visible.
+	// 53 throttles at 5 requests/second per account.
 	if r53.MaxRetries != 5 {
 		t.Errorf("MaxRetries = %d, want lego's default 5", r53.MaxRetries)
 	}
-	if !r53.WaitForRecordSetsChanged {
-		t.Error("WaitForRecordSetsChanged must stay true: the Route 53 API returns before the " +
-			"record change is INSYNC")
+	// And one default this program deliberately turns off.
+	//
+	// lego waits for the change to reach INSYNC, polling for up to PropagationTimeout -- five
+	// minutes inside a call this program bounds at 60s (dnsAPITimeout, see callProviderBounded),
+	// which is where a staging round actually failed: "present TXT timed out after 1m0s" for a
+	// record Route 53 had accepted. Measured change times on the machine that failed: API 6.5-8.6s,
+	// INSYNC 23.5-31.9s later, 32.1-38.4s total against the 60s bound.
+	//
+	// Turning it on again would restore that failure mode. It would not make anything more
+	// reliable: WaitAll probes the authoritative nameservers itself, requires two independent
+	// servers to agree, and prints the evidence -- with the whole propagation budget, not a
+	// provider-internal wait.
+	if r53.WaitForRecordSetsChanged {
+		t.Error("WaitForRecordSetsChanged must stay false: lego's wait for INSYNC is bounded by " +
+			"PropagationTimeout (5m) inside a Present call this program caps at 60s, so a change " +
+			"that takes longer than that fails the whole pass even though Route 53 accepted it; " +
+			"WaitAll is the check that decides when a record is live")
 	}
 
 	// AWS_HOSTED_ZONE_ID is lego's own fallback, and it survives an empty config field -- an
