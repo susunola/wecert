@@ -38,6 +38,26 @@ func (c *Config) normalize() error {
 	return c.normalizeCertificatesBlock()
 }
 
+// validateACMEDirectory requires the directory to be a real URL, https everywhere except
+// loopback. ACME authenticates every request with the account key, and while the protocol
+// signs rather than sends the key, a plaintext non-loopback endpoint is still a mistake
+// worth refusing at load time. http to loopback is explicitly allowed: that is how a
+// local test CA (Pebble) is wired up.
+func validateACMEDirectory(directory string) error {
+	u, err := url.Parse(directory)
+	if err != nil {
+		return fmt.Errorf("acme.directory: %v", urlErrorCause(err))
+	}
+	if u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return fmt.Errorf("acme.directory must be an https URL, got %s", redactURL(directory))
+	}
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return fmt.Errorf("acme.directory %s uses plaintext http to a non-loopback host; "+
+			"use https (http is accepted only for a loopback test CA such as Pebble)", redactURL(directory))
+	}
+	return nil
+}
+
 // normalizeRoot validates the process identity: where state lives and who the CA
 // account is.
 func (c *Config) normalizeRoot() error {
@@ -46,6 +66,9 @@ func (c *Config) normalizeRoot() error {
 	}
 	if c.ACME.Directory == "" {
 		return fmt.Errorf("acme.directory is required")
+	}
+	if err := validateACMEDirectory(c.ACME.Directory); err != nil {
+		return err
 	}
 	seenDirectories := map[string]bool{c.ACME.Directory: true}
 	for i, directory := range c.ACME.FallbackDirectories {
@@ -471,12 +494,15 @@ func (w *Webhook) normalize() error {
 	if w.NotifyURL != "" {
 		u, err := url.Parse(w.NotifyURL)
 		if err != nil {
-			return fmt.Errorf("webhook.notifyURL: %w", err)
+			// urlErrorCause, not %w on the url.Error: its message embeds the full URL,
+			// and a notification URL's path or userinfo can be the credential.
+			return fmt.Errorf("webhook.notifyURL: %v", urlErrorCause(err))
 		}
 		// A URL without a host or with another scheme would be POSTed to by the notifier
 		// and fail there, one renewal at a time, with the cause far from the config line.
 		if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return fmt.Errorf("webhook.notifyURL must be an http or https URL with a host, got %q", w.NotifyURL)
+			return fmt.Errorf("webhook.notifyURL must be an http or https URL with a host, got %s",
+				redactURL(w.NotifyURL))
 		}
 	}
 

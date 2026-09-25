@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
@@ -24,6 +25,15 @@ func (d *TencentCLB) Delete(ctx context.Context, certID string) error {
 	req.IsCheckResource = common.BoolPtr(true)
 	resp, err := client.DeleteCertificateWithContext(ctx, req)
 	if err != nil {
+		// "The certificate does not exist" is the goal state already reached, not a
+		// failure: the certificate was deleted out of band (console, another tool) and
+		// nothing remains to reclaim. Re-reporting it as an error would keep the
+		// retired_certificates row alerting on every pass forever.
+		if isCertificateNotFound(err) {
+			d.log.Info("the certificate is already gone from the cloud account; the reclaim is complete",
+				"certId", certID)
+			return nil
+		}
 		return sdkCallError(ctx, "DeleteCertificate("+certID+")", err)
 	}
 	// The certificate is gone from the account (or the delete is in flight): its
@@ -54,6 +64,7 @@ const (
 func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, certID string) error {
 	deadline := d.now().Add(deleteTaskTimeout)
 	var lastQueryErr error
+	var pollFailures int
 	throttled := false
 	for {
 		req := ssl.NewDescribeDeleteCertificatesTaskResultRequest()
@@ -64,6 +75,7 @@ func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, 
 				return fmt.Errorf("cannot query the delete task for %s (taskId=%s): %w", certID, taskID, err)
 			}
 			lastQueryErr = err
+			pollFailures++
 			if tcerr.IsThrottled(err) {
 				throttled = true
 			}
@@ -84,8 +96,10 @@ func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, 
 		}
 		if d.now().After(deadline) {
 			if lastQueryErr != nil {
-				return fmt.Errorf("the delete task for %s did not finish within %s (taskId=%s); every poll failed, most recently: %w; keeping it on the reclaim list to retry",
-					certID, deleteTaskTimeout, taskID, lastQueryErr)
+				return fmt.Errorf(
+					"the delete task for %s did not finish within %s (taskId=%s); the last %d polls failed, most recently: %w; "+
+						"keeping it on the reclaim list to retry",
+					certID, deleteTaskTimeout, taskID, pollFailures, lastQueryErr)
 			}
 			return fmt.Errorf("the delete task for %s did not finish within %s (taskId=%s); keeping it on the reclaim list to retry",
 				certID, deleteTaskTimeout, taskID)
@@ -94,6 +108,21 @@ func (d *TencentCLB) waitDeleteTask(ctx context.Context, client sslAPI, taskID, 
 			return err
 		}
 	}
+}
+
+// isCertificateNotFound reports whether err is the SSL service saying the certificate does
+// not exist.
+//
+// The SDK documents FailedOperation.CertificateNotFound for DeleteCertificate, and that is
+// the whole family: there is no bare FailedOperation.NotFound in this API's error list. The
+// substring fallback covers an error that was already flattened to text somewhere above, the
+// same convention tcerr's classifiers use.
+func isCertificateNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return tcerr.Code(err) == "FailedOperation.CertificateNotFound" ||
+		strings.Contains(err.Error(), "FailedOperation.CertificateNotFound")
 }
 
 func deleteTaskStatus(

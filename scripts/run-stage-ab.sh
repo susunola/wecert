@@ -19,6 +19,35 @@
 # Cloud side that the listener's CertId really changed.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Escape a value for use as the replacement of a sed s|pattern|replacement| command: an
+# unescaped `&` expands to the whole match, an unescaped `|` ends the command early (sed
+# errors out), and a backslash escapes the following character. The domain and email
+# reaching the config below are operator input, not literals.
+sed_escape_replacement() {
+	printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
+}
+
+# render_config <domain> <email> <dest> -- the staging config for the run, from
+# e2e-config-wildcard.yaml with the two operator-supplied values substituted.
+render_config() {
+	local domain email
+	domain="$(sed_escape_replacement "$1")"
+	email="$(sed_escape_replacement "$2")"
+	sed -e "s|REPLACE_ME|${domain}|g" \
+		-e "s|^  email: .*|  email: ${email}|" \
+		"${ROOT}/e2e-config-wildcard.yaml" > "$3"
+}
+
+# Sourced for the helpers above by scripts/test-run-stage-ab.sh: everything below is the
+# operator procedure, which must not run there -- it parses its own argv, requires cloud
+# credentials and creates real resources. `return` is valid precisely when the file was
+# sourced, which is what the guard detects.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+	return 0
+fi
+
 DOMAIN="${1:-}"
 EMAIL="${2:-}"
 shift 2 2>/dev/null || true
@@ -39,7 +68,6 @@ for arg in "$@"; do
 	esac
 done
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TESTENV="${ROOT}/testenv"
 STATE_DIR="/tmp/wecert-e2e"
 STATE_DB="${STATE_DIR}/state.db"
@@ -194,9 +222,7 @@ echo "=== [2/4] generate the config and register the ACME account ==="
 mkdir -p "${STATE_DIR}"
 rm -f "${STATE_DB}" "${STATE_DB}-wal" "${STATE_DB}-shm"
 
-sed -e "s|REPLACE_ME|${DOMAIN}|g" \
-	-e "s|^  email: .*|  email: ${EMAIL}|" \
-	"${ROOT}/e2e-config-wildcard.yaml" > "${CONFIG}"
+render_config "${DOMAIN}" "${EMAIL}" "${CONFIG}"
 
 # Force staging: one wrong character here burns real production quota. Anchored to the
 # directory key, because a bare "acme-staging" match could come from a comment while the

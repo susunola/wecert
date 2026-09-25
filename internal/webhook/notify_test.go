@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A redirect must not be reported as a delivered event.
@@ -97,5 +98,38 @@ func TestRedactNotifyURL(t *testing.T) {
 		if got := RedactNotifyURL(tc.in); got != tc.want {
 			t.Errorf("RedactNotifyURL(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// panickingTransport makes every request panic, to prove a send that explodes on the
+// background goroutine is contained rather than process-fatal.
+type panickingTransport struct{}
+
+func (panickingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	panic("simulated transport bug")
+}
+
+// A panic inside the delivery goroutine used to be process-fatal: the send runs on a bare
+// goroutine, where nothing recovers. The panic must be contained AND the semaphore slot
+// released -- otherwise Drain would hang forever behind a slot nobody returns.
+func TestAPanickingNotificationSendIsContainedAndReleasesItsSlot(t *testing.T) {
+	var logs bytes.Buffer
+	n := NewNotifier("http://127.0.0.1:1/hook", "", slog.New(slog.NewTextHandler(&logs, nil)))
+	n.client.Transport = panickingTransport{}
+
+	n.Renewal(context.Background(), "cert-a", nil)
+
+	drained := make(chan struct{})
+	go func() {
+		n.Drain(context.Background())
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain hung: the panicking send held its semaphore slot")
+	}
+	if !strings.Contains(logs.String(), "panic while delivering") {
+		t.Errorf("the contained panic must be logged with its stack, not vanish; got %s", logs.String())
 	}
 }

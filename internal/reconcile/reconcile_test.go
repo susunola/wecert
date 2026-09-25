@@ -43,6 +43,13 @@ type fakeManager struct {
 	// panic inside the manager is recovered rather than process-fatal.
 	panicWith map[string]string
 
+	// panicReap and panicQuota make the pass-level epilogue steps panic, to prove a panic
+	// there is contained rather than process-fatal: the epilogue runs outside reconcileOne's
+	// recover, and the quota publication on a background goroutine, where a panic kills the
+	// process.
+	panicReap  bool
+	panicQuota bool
+
 	// cleaned records every CleanupOrphan call, in call order.
 	cleaned []string
 
@@ -128,6 +135,9 @@ func (f *fakeManager) RetryPendingRevocations(context.Context) {
 }
 
 func (f *fakeManager) PublishQuota(scopes map[string][]string) {
+	if f.panicQuota {
+		panic("simulated quota publication bug")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.quotaScopes = append(f.quotaScopes, scopes)
@@ -159,6 +169,9 @@ func (f *fakeManager) CleanupOrphan(_ context.Context, certName string) error {
 }
 
 func (f *fakeManager) ReapRetired(_ context.Context) {
+	if f.panicReap {
+		panic("simulated epilogue bug")
+	}
 	if f.reapBefore != nil {
 		<-f.reapBefore
 	}
@@ -2465,4 +2478,179 @@ func TestSetProberIsSafeAgainstConcurrentReads(t *testing.T) {
 	r.SetProber(nil)
 	r.SetProber(nil)
 	<-done
+}
+
+// anyPassInFlight reports whether any certificate currently holds a convergence claim.
+//
+// A test helper: production code only ever asks this question with the probe record held
+// (reclaimStaleProbeSeries snapshots the claim set under mu), so the standalone form lives
+// here rather than as dead production code.
+func (r *Reconciler) anyPassInFlight() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.running) > 0
+}
+
+// A panic in a pass-level epilogue step must be contained, not process-fatal.
+//
+// The epilogue (reaping retired certificates, the revocation retry, the probe-series sweep,
+// the quota publication) runs outside reconcileOne's recover, and RunDetailed's caller -- the
+// timer loop -- has no recover either. A panicking step is logged with its stack and the
+// remaining steps still run; one bad step must not stop the rest of the bookkeeping any more
+// than one bad certificate may stall the others.
+func TestAPanickingPassEpilogueStepIsContained(t *testing.T) {
+	mgr := &fakeManager{panicReap: true, pendingRevocations: 1}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler := &recordLogHandler{}
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: "a"}}}
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, slog.New(handler))
+
+	rep := r.RunDetailed(context.Background())
+	if rep.Attempted != 1 || rep.Succeeded != 1 {
+		t.Errorf("an epilogue panic must not change the pass's own answer, got %+v", rep)
+	}
+	if mgr.revocationRetries != 1 {
+		t.Error("the step after the panicking one must still run")
+	}
+	if !handler.contains("panic in a pass epilogue step") {
+		t.Error("the contained panic must be logged with its stack, not vanish")
+	}
+}
+
+// The unreadable-source branch has its own epilogue -- retired certificates are still reaped
+// and revocations still retried -- and it is outside reconcileOne's recover too.
+func TestAPanickingEpilogueStepWithAnUnreadableSourceIsContained(t *testing.T) {
+	mgr := &fakeManager{panicReap: true, pendingRevocations: 1}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler := &recordLogHandler{}
+	cfg := &config.Config{}
+	r := New(cfg, failingProvider{err: errors.New("document service is down")}, store, mgr, nil,
+		slog.New(handler))
+
+	rep := r.RunDetailed(context.Background())
+	if !rep.DesiredStateUnreadable {
+		t.Error("the pass must still report the unreadable desired state")
+	}
+	if mgr.revocationRetries != 1 {
+		t.Error("the step after the panicking one must still run")
+	}
+	if !handler.contains("panic in a pass epilogue step") {
+		t.Error("the contained panic must be logged, not vanish")
+	}
+}
+
+// The webhook path's quota publication runs deferred on the pass's background goroutine,
+// past reconcileOne's recover: a panic there used to take the whole daemon down.
+func TestAPanickingQuotaPublicationOnTheWebhookPathIsContained(t *testing.T) {
+	mgr := &fakeManager{panicQuota: true}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler := &recordLogHandler{}
+	cfg := &config.Config{Certificates: []config.Certificate{{Name: "a"}}}
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, slog.New(handler))
+
+	if err := r.StartCert(context.Background(), "a"); err != nil {
+		t.Fatalf("StartCert: %v", err)
+	}
+
+	// The deferred publication runs before the claim is released (LIFO), so once no pass is
+	// in flight and the quota counter is back at zero, the panicking publish has happened.
+	deadline := time.Now().Add(5 * time.Second)
+	for r.quotaPasses.Load() != 0 || r.anyPassInFlight() {
+		if time.Now().After(deadline) {
+			t.Fatal("the pass never finished")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !handler.contains("panic in a pass epilogue step") {
+		t.Error("the contained panic must be logged with its stack, not vanish")
+	}
+	if calls := mgr.reconciled(); len(calls) != 1 || calls[0] != "a" {
+		t.Errorf("the pass itself is unaffected by the epilogue panic, reconciled=%v", calls)
+	}
+}
+
+// When Drain begins mid-walk, StartAll must hand back the names it already accepted, exactly
+// like StartNamed: those passes were registered and Drain waits for them, so discarding the
+// prefix reports a pass that is running as one that was refused.
+func TestStartAllReturnsTheAcceptedPrefixWhenShutdownBeginsMidWalk(t *testing.T) {
+	certs := []config.Certificate{{Name: "a"}, {Name: "b"}}
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mgr := &fakeManager{}
+	prov := &signalOnResolveProvider{inner: spec.NewStatic(certs), ch: make(chan struct{})}
+	cfg := &config.Config{Certificates: certs}
+	r := New(cfg, prov, store, mgr, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	type outcome struct {
+		accepted, skipped []string
+		err               error
+	}
+	out := make(chan outcome, 1)
+
+	// Holding the claim mutex parks the walk inside the first startCert: after the pass was
+	// registered with the drain group, before its goroutine launches.
+	r.mu.Lock()
+	go func() {
+		accepted, skipped, err := r.StartAll(context.Background())
+		out <- outcome{accepted, skipped, err}
+	}()
+
+	<-prov.ch                          // the walk has resolved and is heading into the first start
+	time.Sleep(100 * time.Millisecond) // let it reach the parked claim
+
+	drained := make(chan error, 1)
+	go func() { drained <- r.Drain(context.Background()) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !r.drainingNow() {
+		if time.Now().After(deadline) {
+			r.mu.Unlock()
+			t.Fatal("Drain never began")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Draining is set, so the second certificate can no longer be admitted; release the walk.
+	r.mu.Unlock()
+
+	got := <-out
+	if !errors.Is(got.err, ErrShuttingDown) {
+		t.Fatalf("want ErrShuttingDown, got %v", got.err)
+	}
+	if len(got.accepted) != 1 || got.accepted[0] != "a" {
+		t.Errorf("the accepted prefix must come back with the error, got accepted=%v", got.accepted)
+	}
+	if len(got.skipped) != 0 {
+		t.Errorf("nothing may be reported skipped, got skipped=%v", got.skipped)
+	}
+
+	// "a" was reported accepted, so its pass must really run and Drain must wait for it.
+	if err := <-drained; err != nil {
+		t.Errorf("Drain must wait for the accepted pass and then return clean, got %v", err)
+	}
+	if calls := mgr.reconciled(); len(calls) != 1 || calls[0] != "a" {
+		t.Errorf("the accepted pass must have run (Drain waited for it), reconciled=%v", calls)
+	}
 }

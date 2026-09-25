@@ -156,8 +156,28 @@ func newestSnapshot(dir, statePath string) (string, error) {
 			"stateBackup.dir points at, or the one holding state.db). Is stateBackup enabled? "+
 			"Nothing was changed", filepath.Base(statePath), dir)
 	}
-	return snaps[len(snaps)-1], nil
+	latest := snaps[len(snaps)-1]
+	// The name carries a wall-clock stamp, and a forward clock excursion (an NTP fix, a VM
+	// resumed from an image taken while the clock was ahead) writes a name that sorts newest
+	// FOREVER: every later, honestly-stamped snapshot loses to it, so "latest" keeps restoring
+	// the same stale file. The snapshot pass repairs such names when it runs (see
+	// repairFutureDatedSnapshots), but a host being restored is precisely one where no snapshot
+	// pass may have run since -- so the choice is announced before it is installed.
+	if at, ok := state.SnapshotTime(statePath, latest); ok && at.After(time.Now().Add(futureSnapshotNameGrace)) {
+		fmt.Fprintf(os.Stderr, "wecert: WARNING: the name of %s says it was written at %s, which "+
+			"is in the future -- the clock of whatever wrote it was ahead, and a future-dated name "+
+			"always wins \"latest\". Its data may be older than another snapshot's; name the file "+
+			"you want explicitly if so\n",
+			latest, at.Local().Format(time.RFC3339))
+	}
+	return latest, nil
 }
+
+// futureSnapshotNameGrace is how far a snapshot name's stamp may be ahead of the local clock
+// before "latest" warns about it. A minute absorbs ordinary skew between the host that took the
+// snapshot and the host being restored; anything beyond it is the excursion the warning exists
+// for.
+const futureSnapshotNameGrace = time.Minute
 
 // logRestoreNotice tells the operator what a previous restore did to the rate-limit accounting.
 //

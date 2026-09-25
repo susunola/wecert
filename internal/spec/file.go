@@ -25,6 +25,9 @@ type File struct {
 // wecert quietly renew nothing until every certificate expires -- the worst kind
 // of failure: silent, with all the consequences in production.
 func NewFile(path string, log *slog.Logger) (*File, error) {
+	if log == nil {
+		log = slog.Default()
+	}
 	f := &File{path: path, log: log}
 	doc, err := LoadDocument(path)
 	if err != nil {

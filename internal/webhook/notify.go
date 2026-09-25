@@ -7,15 +7,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"github.com/susunola/wecert/internal/config"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 // maxNotifyInFlight caps outstanding notification POSTs.
@@ -162,6 +165,17 @@ func (n *Notifier) Renewal(ctx context.Context, certName string, reconcileErr er
 			n.mu.Lock()
 			n.inFlight--
 			n.mu.Unlock()
+		}()
+		// A panic on a background goroutine is unrecoverable by its parent and takes the
+		// whole daemon down -- and this is a notification, the least important thing here
+		// to die for. The bookkeeping release above still runs: defers unwind in order.
+		defer func() {
+			if p := recover(); p != nil {
+				n.log.Error("recovered from a panic while delivering a renewal notification; "+
+					"the notification is lost, the pass it reported is unaffected. This is a "+
+					"bug, please report it",
+					"cert", ev.Cert, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+			}
 		}()
 		n.send(ctx, ev)
 	}()

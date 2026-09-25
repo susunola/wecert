@@ -94,11 +94,25 @@ func (m *Manager) awaitOrderStatus(
 // writes returns Capacity by design -- so the number was structurally always full and the alert
 // built on it could never fire, on the limit a DNS-01 misconfiguration burns first.
 //
-// The scope matches the one publishQuota derives (the lowercased identifier), so the spend and the
-// gauge land on the same series.
+// The scope matches the one publishQuota derives, and it is the BARE identifier -- never the
+// wildcard form. RFC 8555 §7.1.3 forbids the "*." prefix in an authorization's identifier, so
+// the CA's own failed-authorization refusal (and the deadline gate in blockedByRecordedDeadline)
+// names "example.com", while the caller here passes the name as the operator wrote it, which for
+// a wildcard is "*.example.com". Booking those under different scopes splits one budget into two
+// buckets: the spend would land on a series the CA's refusal never gates, and the refusal would
+// gate a scope nothing ever spends against.
 func (m *Manager) spendAuthzFailure(identifier string) {
 	if m.quota == nil {
 		return
 	}
-	m.quota.Spend(ratelimit.AuthzFailuresPerIdentifier, strings.ToLower(identifier), 1)
+	m.quota.Spend(ratelimit.AuthzFailuresPerIdentifier, bareIdentifierScope(identifier), 1)
+}
+
+// bareIdentifierScope is the scope the per-identifier failed-authorization budget is accounted
+// under: the lowercased identifier with any "*." prefix stripped. The budget belongs to the
+// authorization identifier (RFC 8555 §7.1.3 never carries the prefix), so every writer and every
+// reader of this limit -- spend, CA-refusal bookkeeping and the ordering gate -- must agree on
+// the bare form, or a wildcard's spend and its refusal land in two different buckets.
+func bareIdentifierScope(identifier string) string {
+	return strings.TrimPrefix(strings.ToLower(identifier), "*.")
 }

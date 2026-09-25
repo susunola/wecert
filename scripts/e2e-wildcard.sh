@@ -106,11 +106,23 @@ printf '    %s\n' "${NS_LIST[@]}"
 
 # Resolve each NS name to an address; query addresses, not names, so we never re-enter the
 # recursive path we are trying to avoid.
+#
+# dig +short A follows a CNAME and prints the target hostname on its own line before the
+# address, so a CNAME'd NS name would put a hostname into NS_ADDRS -- and every later
+# @server query against it would silently go back through the recursive resolver. Keep IP
+# literals only.
+is_ip_literal() {
+	case "$1" in
+		*:*) return 0 ;; # IPv6
+	esac
+	[[ "$1" =~ ^[0-9][0-9.]*[0-9]$ ]]
+}
 NS_ADDRS=()
 _seen_addrs=""
 for ns in "${NS_LIST[@]}"; do
 	while read -r ip; do
 		[[ -z "${ip}" ]] && continue
+		is_ip_literal "${ip}" || continue
 		case "${_seen_addrs}" in
 			*" ${ip} "*) continue ;;
 		esac
@@ -319,7 +331,13 @@ fi
 
 # The SAN set is read back from the certificate wecert holds, which is what the probe and
 # the CLB will actually serve.
-SAN_CHECK="$(sqlite3 "${STATE_DIR}/state.db" "SELECT length(cert_pem) FROM certificates;" 2>/dev/null || echo 0)"
+#
+# `| head -n 1`: when the count check above found something other than one certificate
+# this query returns one row per certificate, and a multi-line value in the arithmetic
+# below is a bash syntax error that aborts the script before it can report the real
+# failure. Non-numeric output (an unreadable database) degrades to 0, i.e. the fail branch.
+SAN_CHECK="$(sqlite3 "${STATE_DIR}/state.db" "SELECT length(cert_pem) FROM certificates;" 2>/dev/null | head -n 1)"
+[[ "${SAN_CHECK}" =~ ^[0-9]+$ ]] || SAN_CHECK=0
 if [[ "${SAN_CHECK}" -gt 0 ]]; then
 	pass "a certificate is persisted (cert_pem ${SAN_CHECK} bytes)"
 else

@@ -729,8 +729,10 @@ Optional. Omit it and wecert only converges on the timer.
 |---|---|---|
 | `listen` | *(empty — disabled)* | Address for the trigger endpoint |
 | `token` | — | **Required when `listen` is set**, minimum 16 characters |
+| `tokenFile` | *(empty)* | Read `token` from this file instead, keeping it out of config backups |
 | `notifyURL` | *(empty)* | Optional outbound event target |
 | `notifySecret` | *(empty)* | Optional HMAC key for outbound events, minimum 32 characters. Without `notifyURL` it is a config error |
+| `notifySecretFile` | *(empty)* | Read `notifySecret` from this file instead, like `tokenFile` |
 
 The trigger endpoint performs **real issuance** and consumes Let's Encrypt rate-limit quota, so it is never allowed to run unauthenticated. A token shorter than 16 characters is rejected at config load: on this endpoint a weak token is the same as no token.
 

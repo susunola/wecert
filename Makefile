@@ -118,6 +118,8 @@ release:
 	@echo && echo "=== artifacts ===" && ls -lh dist/ && echo && cat dist/SHA256SUMS
 
 # A CycloneDX SBOM for the release, generated from the module graph.
+# .github/workflows/release.yml runs this target after `make release` and attaches the
+# result to the GitHub Release (the upload is dist/*, which includes this file).
 #
 # Why it ships: this program holds private keys and links two cloud SDKs plus a TLS stack, so "what
 # exactly is in the binary" is a question operators and reviewers are entitled to answer without
@@ -248,6 +250,8 @@ fmt-check:
 check-scripts: check-cli
 	@bash scripts/test-e2e-wildcard.sh
 	@bash scripts/test-e2e-sni.sh
+	@bash scripts/test-e2e.sh
+	@bash scripts/test-run-stage-ab.sh
 	@python3 scripts/test-check-cam-policies.py
 	@python3 scripts/check-cam-policies.py
 

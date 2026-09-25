@@ -112,7 +112,11 @@ func LookupCachedBindings(certID string) (BindingSnapshot, time.Time, bool) {
 
 func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, bool, error) {
 	if certID == "" {
-		return 0, false, nil
+		// An empty ID identifies nothing that could be bound, so the zero is the COMPLETE
+		// answer here -- not the "the enumeration did not cover every region" kind of zero
+		// that complete=false marks. Reporting it incomplete would make the caller log
+		// "could not enumerate" forever for a state that is simply empty.
+		return 0, true, nil
 	}
 	client, err := d.client(ctx)
 	if err != nil {
@@ -124,7 +128,10 @@ func (d *TencentCLB) Bindings(ctx context.Context, certID string) (int, bool, er
 
 func (d *LazyTencentCLB) Bindings(ctx context.Context, certID string) (int, bool, error) {
 	if certID == "" {
-		return 0, false, nil
+		// An empty ID identifies nothing that could be bound, so the zero is the COMPLETE
+		// answer here -- not the "the enumeration did not cover every region" kind of zero
+		// that complete=false marks.
+		return 0, true, nil
 	}
 	inner, err := d.client()
 	if err != nil {
@@ -163,6 +170,7 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 
 	deadline := d.now().Add(d.enumerationWait())
 	var lastQueryErr error
+	var pollFailures int
 	throttled := false
 	for {
 		queryReq := ssl.NewDescribeCertificateBindResourceTaskResultRequest()
@@ -174,6 +182,7 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 				return bindingCount{}, sdkCallError(ctx, "DescribeCertificateBindResourceTaskResult", err)
 			}
 			lastQueryErr = err
+			pollFailures++
 			if tcerr.IsThrottled(err) {
 				throttled = true
 			}
@@ -196,7 +205,8 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 
 		if d.now().After(deadline) {
 			if lastQueryErr != nil {
-				return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within %s (taskId=%s); every poll failed, most recently: %w", d.enumerationWait(), taskID, lastQueryErr)
+				return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within %s "+
+					"(taskId=%s); the last %d polls failed, most recently: %w", d.enumerationWait(), taskID, pollFailures, lastQueryErr)
 			}
 			return bindingCount{}, fmt.Errorf("the bind-resource enumeration did not finish within %s (taskId=%s)", d.enumerationWait(), taskID)
 		}

@@ -1017,6 +1017,11 @@ type Webhook struct {
 	//   X-Wecert-Token: <token>
 	Token string `yaml:"token"`
 
+	// TokenFile reads the token from a file instead, for the same reason as
+	// dns.loginTokenFile: a 0600 file or a systemd credential keeps the secret out of
+	// config.yaml and its backups. Environment-expanded; mutually exclusive with token.
+	TokenFile string `yaml:"tokenFile,omitempty"`
+
 	// NotifyURL is optional. When set, every finished renewal attempt POSTs a JSON
 	// event to it, to wire "certificate renewed" into downstream flows (triggering
 	// a config reload, for example).
@@ -1054,6 +1059,8 @@ type Webhook struct {
 
 	// Jira is read only when notifyFormat=jira.
 	Jira JiraNotify `yaml:"jira,omitempty"`
+	// NotifySecretFile is the file variant of NotifySecret, exactly like TokenFile.
+	NotifySecretFile string `yaml:"notifySecretFile,omitempty"`
 }
 
 // JiraNotify points at a Jira Server/Data Center or Cloud REST API and names the
@@ -1190,6 +1197,21 @@ func ProfileMaxNames(profile string) int {
 // profile.
 func (c *Certificate) MaxNames() int { return ProfileMaxNames(c.Profile) }
 
+// ProfileRenewBefore returns the profile's default renew-ahead duration, or 0 for an
+// unknown profile.
+//
+// Exported for the same reason as ProfileMaxNames: spec.Revision fingerprints the
+// EFFECTIVE renewBefore, and a certificate that never went through
+// NormalizeCertificates (onboarding hashes its freshly built list before WriteDocument
+// validates it) carries neither the parsed duration nor the default.
+func ProfileRenewBefore(profile string) time.Duration { return profileRenewBefore[profile] }
+
+// maxConfigBytes bounds a config read, the same way maxDocumentBytes bounds a desired-state
+// document in internal/spec. A hand-written config is tiny -- a fleet of thousands of
+// certificates fits in a fraction of this -- so a file past the cap is a mistake or a
+// mounted surprise, and is refused rather than parsed.
+const maxConfigBytes = 16 << 20
+
 // Load reads and validates the configuration file.
 var profileValidity = map[string]time.Duration{
 	ProfileClassic:    90 * 24 * time.Hour,
@@ -1217,6 +1239,16 @@ func (c *Config) resolveSecretFiles() ([]string, error) {
 			return nil
 		}
 		if file != "" {
+			// The file wins over the environment, and says so: two live sources for one
+			// credential means a rotation of either one can silently not take effect.
+			// Only the variable NAME is printed, never its value.
+			for _, env := range envs {
+				if strings.TrimSpace(os.Getenv(env)) != "" {
+					warns = append(warns, fmt.Sprintf("%s is set both in %s and in $%s; the file is used "+
+						"and the environment value is ignored -- remove one of them so it is unambiguous "+
+						"which credential is in use", field, file, env))
+				}
+			}
 			// Environment-expanded so ${CREDENTIALS_DIRECTORY} works: systemd sets it only after
 			// the unit starts, so the path cannot be written literally in the file.
 			path := os.ExpandEnv(file)
@@ -1325,6 +1357,17 @@ func (c *Config) resolveSecretFiles() ([]string, error) {
 	}
 	if err := resolve("tencent.secretKey", c.Tencent.SecretKey, c.Tencent.SecretKeyFile,
 		[]string{"TENCENTCLOUD_SECRET_KEY"}, &c.Tencent.SecretKey); err != nil {
+		return warns, err
+	}
+
+	// The webhook secrets have no environment fallback: they guard a local endpoint and
+	// sign outbound events, so a file variant is the whole story.
+	if err := resolve("webhook.token", c.Webhook.Token, c.Webhook.TokenFile,
+		nil, &c.Webhook.Token); err != nil {
+		return warns, err
+	}
+	if err := resolve("webhook.notifySecret", c.Webhook.NotifySecret, c.Webhook.NotifySecretFile,
+		nil, &c.Webhook.NotifySecret); err != nil {
 		return warns, err
 	}
 	return warns, nil

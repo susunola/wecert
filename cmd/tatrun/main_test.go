@@ -445,6 +445,22 @@ func TestValidateIntervalRejectsANonPositiveInterval(t *testing.T) {
 	}
 }
 
+// The timeout goes to TAT as uint64(timeout.Seconds()): a negative value wraps to an enormous
+// one and a sub-second value truncates to 0 (no timeout at all) -- both silently mean something
+// the operator did not ask for.
+func TestValidateTimeoutRejectsValuesTheAPIWouldMisread(t *testing.T) {
+	for _, bad := range []time.Duration{0, -time.Second, 500 * time.Millisecond} {
+		if err := validateTimeout(bad); err == nil {
+			t.Errorf("timeout %s must be rejected: as whole seconds it becomes 0 or wraps", bad)
+		}
+	}
+	for _, good := range []time.Duration{time.Second, 180 * time.Second} {
+		if err := validateTimeout(good); err != nil {
+			t.Errorf("timeout %s must pass, got %v", good, err)
+		}
+	}
+}
+
 // A decodable string is not necessarily an encoded one.
 //
 // A short word in the Base64 alphabet ("DONE" -- exactly what a verification command prints on

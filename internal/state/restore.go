@@ -3,6 +3,7 @@ package state
 import (
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"github.com/susunola/wecert/internal/atomicfile"
@@ -310,10 +311,11 @@ func InspectSnapshot(path string) (SnapshotInfo, error) {
 
 // inspectSnapshot proves a file is a wecert state database before it is allowed to replace one.
 //
-// Three questions, cheapest first, because each rules out a different mistake an operator can
+// Four questions, cheapest first, because each rules out a different mistake an operator can
 // actually make: restoring a file that is not a database at all (a snapshot that was truncated by a
-// full disk), restoring a database that is corrupt, and restoring a well-formed SQLite file that is
-// simply not ours (a different deployment's state, a Terraform state file).
+// full disk), restoring a database that is corrupt, restoring a well-formed SQLite file that is
+// simply not ours (a different deployment's state, a Terraform state file), and restoring a sound
+// wecert database whose key material is damaged (see checkSnapshotPayload).
 func inspectSnapshot(path string) (snapshotStats, error) {
 	var stats snapshotStats
 
@@ -374,7 +376,80 @@ func inspectSnapshot(path string) (snapshotStats, error) {
 	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM accounts)`).Scan(&stats.account); err != nil {
 		return stats, fmt.Errorf("restore: look for an account in %s: %w", path, err)
 	}
+
+	// A sound container says nothing about the payload: integrity_check verifies the B-tree, not
+	// that the bytes in it are what wecert wrote. Material damaged at the application layer (a
+	// half-finished write an older build failed to roll back, a hand edit with sqlite3) passes
+	// every check above and would be installed over a working database, so the material a restore
+	// exists to preserve is decoded here, before anything is moved.
+	if err := checkSnapshotPayload(db, path); err != nil {
+		return stats, err
+	}
 	return stats, nil
+}
+
+// checkSnapshotPayload proves the key material inside a candidate snapshot is decodable PEM, not
+// merely that the file around it is a sound database.
+//
+// Every row is checked rather than a sample: accounts holds one row per directory, and even a
+// large certificates table is cheap here because the integrity_check above already read every
+// page of the file. Empty blobs are skipped, not rejected -- a legacy account row carries no key
+// at all (see PutAccountWithoutKey), and "no material" is a state the running program already
+// knows how to read.
+func checkSnapshotPayload(db *sql.DB, path string) error {
+	accountRows, err := db.Query(`SELECT directory, private_key_pem FROM accounts`)
+	if err != nil {
+		return fmt.Errorf("restore: read the account keys in %s: %w", path, err)
+	}
+	defer accountRows.Close()
+	for accountRows.Next() {
+		var directory string
+		var key []byte
+		if err := accountRows.Scan(&directory, &key); err != nil {
+			return fmt.Errorf("restore: scan an account key in %s: %w", path, err)
+		}
+		if len(key) == 0 {
+			continue
+		}
+		if block, _ := pem.Decode(key); block == nil {
+			return fmt.Errorf("restore: the account key for %s in %s is not PEM; the file is a "+
+				"sound database but its payload is damaged, and restoring it would strand the "+
+				"account. Use an older snapshot", directory, path)
+		}
+	}
+	if err := accountRows.Err(); err != nil {
+		return fmt.Errorf("restore: read the account keys in %s: %w", path, err)
+	}
+
+	certRows, err := db.Query(`SELECT name, cert_pem, key_pem FROM certificates`)
+	if err != nil {
+		return fmt.Errorf("restore: read the certificate material in %s: %w", path, err)
+	}
+	defer certRows.Close()
+	for certRows.Next() {
+		var name string
+		var certPEM, keyPEM []byte
+		if err := certRows.Scan(&name, &certPEM, &keyPEM); err != nil {
+			return fmt.Errorf("restore: scan the certificate material in %s: %w", path, err)
+		}
+		for _, material := range []struct {
+			kind string
+			pem  []byte
+		}{{"certificate", certPEM}, {"private key", keyPEM}} {
+			if len(material.pem) == 0 {
+				continue
+			}
+			if block, _ := pem.Decode(material.pem); block == nil {
+				return fmt.Errorf("restore: the %s of %q in %s is not PEM; the file is a sound "+
+					"database but its payload is damaged. Use an older snapshot",
+					material.kind, name, path)
+			}
+		}
+	}
+	if err := certRows.Err(); err != nil {
+		return fmt.Errorf("restore: read the certificate material in %s: %w", path, err)
+	}
+	return nil
 }
 
 // freeReplacedName picks a name for the displaced database that nothing occupies.
@@ -401,6 +476,11 @@ func freeReplacedName(dest string) (string, error) {
 // The chain is resolved rather than the first link: a symlink to a symlink is normal in a
 // state-directory migration, and restoring onto the middle link would recreate exactly the problem
 // this function exists to avoid.
+//
+// A directory is refused on either side of the resolution: os.Rename onto "dest is a directory"
+// would move the whole DIRECTORY aside as if it were the database, and a rename back onto it would
+// then fail -- the restore's own undo path, turned against a directory tree it never meant to
+// touch.
 func resolveStateTarget(dest string) (string, error) {
 	fi, err := os.Lstat(dest)
 	if err != nil {
@@ -411,6 +491,10 @@ func resolveStateTarget(dest string) (string, error) {
 		}
 		return "", fmt.Errorf("restore: look for the state database %s: %w", dest, err)
 	}
+	if fi.IsDir() {
+		return "", fmt.Errorf("restore: the state path %s is a directory; restoring into it would "+
+			"move the whole directory aside. Point statePath at the state database file", dest)
+	}
 	if fi.Mode()&os.ModeSymlink == 0 {
 		return dest, nil
 	}
@@ -419,8 +503,21 @@ func resolveStateTarget(dest string) (string, error) {
 		return "", fmt.Errorf("restore: the state path %s is a symlink that cannot be resolved (%w); "+
 			"repair the link or point statePath at the real file", dest, err)
 	}
+	if ti, err := os.Stat(target); err == nil && ti.IsDir() {
+		return "", fmt.Errorf("restore: the state path %s is a symlink to the directory %s; "+
+			"restoring into it would move the whole directory aside. Point statePath at the state "+
+			"database file", dest, target)
+	}
 	return target, nil
 }
+
+// lstatSidecar is os.Lstat, as a seam (see statOpenedFile).
+//
+// setAsideDatabase checks the database's sidecars before moving anything, and "the check itself
+// cannot be answered" (a lost search permission, an I/O error) must abort the move rather than be
+// read as "no sidecar". No real filesystem arrangement makes a sidecar's Lstat fail while the
+// database's own succeeds -- both sit in one directory -- so the failure has to be injected.
+var lstatSidecar = os.Lstat
 
 // setAsideDatabase moves the state database and its sidecars out of the way.
 //
@@ -439,6 +536,22 @@ func setAsideDatabase(dest string) (string, time.Time, error) {
 		writtenAt = fi.ModTime()
 	}
 
+	// Every existence check runs BEFORE the first rename: only "definitely absent" may be skipped.
+	// Treating any other Lstat failure as "absent" (a directory that lost its search permission, an
+	// I/O error) used to silently leave that sidecar behind -- and a -wal stranded next to the
+	// restored database is exactly the arrangement the paragraph above says must never happen.
+	var present []string
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if _, err := lstatSidecar(dest + suffix); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", time.Time{}, fmt.Errorf("restore: cannot tell whether %s exists, so nothing "+
+				"was moved: %w", dest+suffix, err)
+		}
+		present = append(present, suffix)
+	}
+
 	// The same fixed-width UTC layout snapshots use, so the names sort chronologically.
 	//
 	// A name that is already taken gets the "~N" suffix snapshots use for the same reason: this is
@@ -450,11 +563,8 @@ func setAsideDatabase(dest string) (string, time.Time, error) {
 		return "", time.Time{}, err
 	}
 	var moved []move
-	for _, suffix := range []string{"", "-wal", "-shm"} {
+	for _, suffix := range present {
 		from := dest + suffix
-		if _, err := os.Lstat(from); err != nil {
-			continue
-		}
 		if err := os.Rename(from, replaced+suffix); err != nil {
 			// Undo what was already moved. The database itself is moved first, so a failure here
 			// means dest is missing; putting the earlier files back is the difference between "the
@@ -592,9 +702,11 @@ func LoadRestoreNotice(statePath string) (*RestoreNotice, error) {
 // first.
 //
 // It exists for the restore path, which has to pick a snapshot without a store: the ordinary reason
-// to restore is that there is no usable state database to open.
+// to restore is that there is no usable state database to open. Names written before the snapshot
+// identity carried the path hash (Store.legacyBase) are listed too -- a restore after an upgrade is
+// exactly when the newest snapshot may still carry an old-style name.
 func SnapshotsIn(dir, statePath string) ([]string, error) {
-	s := &Store{base: filepath.Base(statePath)}
+	s := &Store{base: snapshotBase(statePath), legacyBase: filepath.Base(statePath)}
 	return s.listSnapshots(dir)
 }
 

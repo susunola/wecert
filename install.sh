@@ -39,6 +39,24 @@ if [[ "$(id -u)" -ne 0 ]]; then
 	exit 1
 fi
 
+# WECERT_STATE_DIR is honoured verbatim by the `install -d -o wecert -g wecert -m 0700`
+# below, which chowns and chmods the path even when it already exists. Pointed at /,
+# /etc, /usr, /var, /var/lib, /home or /root it would hand a system directory to the
+# wecert user at mode 0700, so the override is only accepted when the path is clearly
+# wecert's own (ends in /wecert, or has one underneath). Validated before anything is
+# installed, so a bad value fails fast with nothing half-done.
+case "${STATE_DIR}" in
+	*/wecert|*/wecert/*) ;;
+	*)
+		echo "Error: WECERT_STATE_DIR must name a wecert-specific directory (got: ${STATE_DIR})." >&2
+		echo "       The state directory is installed as wecert:wecert mode 0700, applied to the path" >&2
+		echo "       even when it already exists -- so a system directory here (/, /etc, /usr, /var," >&2
+		echo "       /var/lib, /home, /root) would be chowned to the wecert user. Use a path that ends" >&2
+		echo "       in /wecert, e.g. /var/lib/wecert or /opt/wecert." >&2
+		exit 1
+		;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Checking binary architecture"

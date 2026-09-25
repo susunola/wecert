@@ -35,6 +35,11 @@ type fakeReconciler struct {
 	// startAllErr simulates "the desired state is unreadable": nothing started.
 	startAllErr error
 
+	// acceptedOnErr is returned together with startAllErr -- the shape a shutdown that began
+	// mid-walk produces in the real reconciler: those passes were registered and Drain waits
+	// for them, so they come back WITH the error rather than being discarded.
+	acceptedOnErr []string
+
 	// fresh is what the reconciler's own resolve finds. When it is set it differs from names,
 	// which stands for the cache CertNames() reads -- the situation a named trigger meets when a
 	// certificate was onboarded after the last pass.
@@ -56,8 +61,9 @@ func (f *fakeReconciler) StartCert(_ context.Context, name string) error {
 // StartNamed mirrors the real reconciler's batch entry point: resolve once, then start
 // each name. The fake counts resolutions so a test can assert the webhook does not pay
 // one per name, and it keeps the same error buckets as the real implementation: an
-// "already running" or "not managed" answer lands in its bucket, while anything else
-// means the desired state could not be read and nothing may be reported as started.
+// "already running" or "not managed" answer lands in its bucket, and any other error stops
+// the walk -- with the accepted prefix returned ALONGSIDE the error, which is what the real
+// reconciler hands back when a shutdown begins mid-walk.
 func (f *fakeReconciler) StartNamed(_ context.Context, names []string) (started, running, unknown []string, err error) {
 	f.resolves++
 	for _, n := range names {
@@ -73,7 +79,7 @@ func (f *fakeReconciler) StartNamed(_ context.Context, names []string) (started,
 		case errors.Is(e, reconcile.ErrUnknownCert):
 			unknown = append(unknown, n)
 		default:
-			return nil, nil, nil, e
+			return started, running, unknown, e
 		}
 	}
 	return started, running, unknown, nil
@@ -98,7 +104,7 @@ func (f *fakeReconciler) known(name string) bool {
 
 func (f *fakeReconciler) StartAll(ctx context.Context) (accepted, skipped []string, err error) {
 	if f.startAllErr != nil {
-		return nil, nil, f.startAllErr
+		return f.acceptedOnErr, nil, f.startAllErr
 	}
 	if f.allBusy {
 		return nil, append([]string(nil), f.names...), nil
@@ -1445,5 +1451,110 @@ func TestDesiredReportsAnUnreadableCertificateState(t *testing.T) {
 	}
 	if c.Issued {
 		t.Error("a read failure must not be reported as issued")
+	}
+}
+
+// A nil store or a nil logger is a construction error, not something to discover when the
+// status endpoint dereferences the one or an auth failure logs through the other.
+func TestNewRejectsANilStoreAndANilLogger(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("failed to open the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	if _, err := New(rec, nil, testToken, context.Background(), log); err == nil {
+		t.Error("New with a nil store should fail")
+	}
+	if _, err := New(rec, store, testToken, context.Background(), nil); err == nil {
+		t.Error("New with a nil logger should fail")
+	}
+	// Control: the valid construction still works.
+	if _, err := New(rec, store, testToken, context.Background(), log); err != nil {
+		t.Errorf("New with valid arguments should succeed, got %v", err)
+	}
+}
+
+// A full trigger cut short by a mid-walk shutdown must still report the passes that WERE
+// accepted.
+//
+// StartAll hands the accepted prefix back with ErrShuttingDown (see the reconciler): those
+// passes are registered and Drain waits for them, so an unconditional 503 would report a
+// running pass as one that was refused -- and the caller would give up on a convergence that
+// is in fact on its way.
+func TestTriggerAllCutShortByShutdownReportsTheAcceptedPrefix(t *testing.T) {
+	rec := &fakeReconciler{
+		names:         []string{"a", "b"},
+		startAllErr:   reconcile.ErrShuttingDown,
+		acceptedOnErr: []string{"a"},
+	}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", "", bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("the accepted prefix is really running, so the answer must be 202, got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var resp reconcileResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Accepted) != 1 || resp.Accepted[0] != "a" {
+		t.Errorf("the accepted prefix must be reported, got %+v", resp)
+	}
+}
+
+// The named-trigger form of the same cutoff: "a" started, then the walk hit the shutdown.
+func TestTriggerNamedCutShortByShutdownReportsTheStartedPrefix(t *testing.T) {
+	rec := &fakeReconciler{
+		names:   []string{"a", "b"},
+		failFor: map[string]error{"b": reconcile.ErrShuttingDown},
+	}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"certs":["a","b"]}`, bearer())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("the started prefix is really running, so the answer must be 202, got %d: %s",
+			w.Code, w.Body.String())
+	}
+	var resp reconcileResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Accepted) != 1 || resp.Accepted[0] != "a" {
+		t.Errorf("the started prefix must be reported, got %+v", resp)
+	}
+
+	// Control: with nothing started, the same error is still a 503.
+	rec = &fakeReconciler{
+		names:   []string{"a"},
+		failFor: map[string]error{"a": reconcile.ErrShuttingDown},
+	}
+	s, _ = newTestServer(t, rec)
+	w = do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"a"}`, bearer())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("with no pass started the refusal must stay a 503, got %d", w.Code)
+	}
+}
+
+// The 404 answer shares the 202's shape, so its accepted field must keep the 202's contract:
+// an empty array, not null -- a client that iterates the field reads null as "no answer",
+// and here we KNOW nothing was accepted.
+func TestTriggerAllNamesUnknownSerializesAcceptedAsEmptyArray(t *testing.T) {
+	rec := &fakeReconciler{names: []string{"a"}}
+	s, _ := newTestServer(t, rec)
+
+	w := do(t, s, http.MethodPost, "/hook/reconcile", `{"cert":"nope"}`, bearer())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("a trigger that started nothing must not be reported as accepted, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, `"accepted": null`) {
+		t.Errorf("null reads as \"no answer\" to a client that iterates the field: %s", body)
+	}
+	if !strings.Contains(body, `"accepted": []`) {
+		t.Errorf("nothing was accepted, so the field must be an empty array: %s", body)
 	}
 }

@@ -50,15 +50,29 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 	if opts.DocumentPath == "" {
 		return nil, errors.New("onboarding: DocumentPath is required")
 	}
-	// Commit writes the document first and the state file second, so the same path for both
-	// means the round finishes by replacing the desired-state document with onboarding's own
-	// state -- the next round then cannot parse what it reads and the whole round is refused.
-	// It is one typo away (a copy-pasted -state flag), so refuse it here where the mistake is
-	// still obvious, rather than after the document is gone.
-	if opts.StatePath != "" && filepath.Clean(opts.StatePath) == filepath.Clean(opts.DocumentPath) {
+	// Commit writes the document, then the state file, then the report, so ANY two of the three
+	// paths naming the same file ends the round with one output overwriting another: a state file
+	// over the document leaves the next round unable to parse it, a report over the document does
+	// the same one write later (every later round's LoadDocument refuses the report JSON), and a
+	// report over the state file destroys the grace-period clock and the change ledger on every
+	// round. It is one typo away (a copy-pasted -state/-report flag), so refuse it here where the
+	// mistake is still obvious, rather than after a file is gone.
+	samePath := func(a, b string) bool {
+		return a != "" && b != "" && filepath.Clean(a) == filepath.Clean(b)
+	}
+	switch {
+	case samePath(opts.StatePath, opts.DocumentPath):
 		return nil, fmt.Errorf("onboarding: StatePath and DocumentPath are the same file (%q); "+
 			"the state file is written after the document, so this round would overwrite the "+
 			"desired-state document with onboarding's own state", opts.DocumentPath)
+	case samePath(opts.ReportPath, opts.DocumentPath):
+		return nil, fmt.Errorf("onboarding: ReportPath and DocumentPath are the same file (%q); "+
+			"the report is written after the document, so this round would overwrite the desired-state "+
+			"document with the decision report, and every later round would refuse to parse it", opts.DocumentPath)
+	case samePath(opts.ReportPath, opts.StatePath):
+		return nil, fmt.Errorf("onboarding: ReportPath and StatePath are the same file (%q); "+
+			"the report is written after the state file, so every round would overwrite the grace-period "+
+			"clock and the change ledger with the decision report", opts.ReportPath)
 	}
 	if opts.Profile == "" {
 		opts.Profile = config.ProfileClassic
@@ -76,8 +90,12 @@ func New(src Sources, opts Options, log *slog.Logger) (*Onboarder, error) {
 		opts.KeyType = config.KeyTypeECDSAP256
 	}
 	if !config.ValidKeyType(opts.KeyType) {
-		return nil, fmt.Errorf("onboarding: unknown keyType %q (want %s/%s)",
-			opts.KeyType, config.KeyTypeECDSAP256, config.KeyTypeRSA2048)
+		// List every value ValidKeyType accepts, as the declaration parser does
+		// (declaration.go): naming only some of them sends the operator fixing a typo with a
+		// wrong picture of what is legal.
+		return nil, fmt.Errorf("onboarding: unknown keyType %q (want %s/%s/%s/%s)",
+			opts.KeyType, config.KeyTypeECDSAP256, config.KeyTypeECDSAP384,
+			config.KeyTypeRSA2048, config.KeyTypeRSA4096)
 	}
 	// 0 means "use the default" for each knob below, but a NEGATIVE value is a typo, not
 	// "unset": the config layer rejects the same values (config.Onboarding.normalize), and

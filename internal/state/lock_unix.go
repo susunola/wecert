@@ -54,7 +54,9 @@ func acquireLock(path string) (*fileLock, error) {
 // identifier set run into the 5-per-7-days limit). Nothing can prevent the removal; what can be
 // done is to notice it. The caller reports this, and the operator has a process to stop.
 func (l *fileLock) VerifyHeld() error {
-	if l == nil {
+	if l == nil || l.f == nil {
+		// l.f is nil after release(): the lock is verifiably not held anymore, and a closed
+		// store asking this question at shutdown must not panic on the dereference.
 		return nil
 	}
 	held, err := l.f.Stat()
@@ -82,5 +84,10 @@ func (l *fileLock) release() error {
 	// explicitly makes "when the lock was dropped" readable in the code instead of
 	// relying on the reader knowing a close side effect.
 	_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
-	return l.f.Close()
+	err := l.f.Close()
+	// Forget the file either way: a second release must be a no-op, not a "file already closed"
+	// that reads as if the lock itself had failed. The flock is gone after the first close
+	// regardless of its error, so there is nothing left a retry could do.
+	l.f = nil
+	return err
 }

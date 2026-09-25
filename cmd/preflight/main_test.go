@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	tcerrors "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/errors"
@@ -458,5 +459,88 @@ func TestFindDomainRefusesToLoopForever(t *testing.T) {
 	}
 	if calls != domainListMaxPages {
 		t.Errorf("calls = %d, want exactly the page cap %d", calls, domainListMaxPages)
+	}
+}
+
+// Every wrong command line must exit 64, which is what exitUsage documents: a bad flag, a
+// contradictory mode combination (this used to be 1, the code for "the program ran and
+// failed"), and no operation selected at all. Asking for help is not an error.
+func TestRunArgsClassifiesTheExitCodes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"contradictory mode flags", []string{"-prune-certs", "-bindings", "cert-1"}, exitUsage},
+		{"a domain with a mode flag", []string{"-domain", "example.com", "-list-certs"}, exitUsage},
+		{"an unknown flag", []string{"-nope"}, exitUsage},
+		{"no operation selected", nil, exitUsage},
+		{"help is not an error", []string{"-h"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := runArgs(tc.args); got != tc.want {
+				t.Errorf("runArgs(%v) = %d, want %d", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// The leftover check must ask about the name DNSPod stores, not the raw flag value.
+//
+// findDomain trims a trailing dot for its own comparison, but DescribeRecordList was called
+// with the original string: "example.com." matched the domain in the list and then reported on
+// the _acme-challenge records of a name the API does not store.
+func TestCheckDNSPodNormalizesTheTrailingDotForTheRecordQuery(t *testing.T) {
+	stubDescribeDomainList(t, func(int64) *dnspod.DescribeDomainListResponse {
+		return domainPage(1, "example.com")
+	})
+	var queriedDomain string
+	orig := describeRecordList
+	describeRecordList = func(_ context.Context, _ *dnspod.Client, req *dnspod.DescribeRecordListRequest) (*dnspod.DescribeRecordListResponse, error) {
+		queriedDomain = *req.Domain
+		return &dnspod.DescribeRecordListResponse{Response: &dnspod.DescribeRecordListResponseParams{}}, nil
+	}
+	t.Cleanup(func() { describeRecordList = orig })
+
+	if err := checkDNSPod(context.Background(), nil, "example.com."); err != nil {
+		t.Fatalf("checkDNSPod: %v", err)
+	}
+	if queriedDomain != "example.com" {
+		t.Errorf("DescribeRecordList was asked about %q, want the stored name %q", queriedDomain, "example.com")
+	}
+}
+
+// The final -bindings answer is already printed, so there must be no wait after it: the loop
+// used to sleep a flat 4 seconds past the last poll, stalling every run's exit.
+func TestPollBindTaskResultDoesNotSleepAfterTheLastQuery(t *testing.T) {
+	var sleeps int
+	orig := sleepCtx
+	sleepCtx = func(context.Context, time.Duration) error { sleeps++; return nil }
+	t.Cleanup(func() { sleepCtx = orig })
+
+	queries := 0
+	if err := pollBindTaskResult(context.Background(), 3, func(int) error { queries++; return nil }); err != nil {
+		t.Fatalf("pollBindTaskResult: %v", err)
+	}
+	if queries != 3 {
+		t.Errorf("queries = %d, want 3", queries)
+	}
+	if sleeps != 2 {
+		t.Errorf("slept %d times for 3 queries, want 2: a wait after the final answer stalls the "+
+			"command for nothing", sleeps)
+	}
+
+	// A query error aborts without sleeping, and a cancelled wait still stops the loop.
+	sleeps = 0
+	boom := errors.New("api down")
+	if err := pollBindTaskResult(context.Background(), 3, func(int) error { return boom }); !errors.Is(err, boom) {
+		t.Errorf("a query error must surface, got %v", err)
+	}
+	if sleeps != 0 {
+		t.Errorf("a failed query must not be followed by a wait, slept %d times", sleeps)
+	}
+	sleepCtx = func(context.Context, time.Duration) error { return context.Canceled }
+	if err := pollBindTaskResult(context.Background(), 3, func(int) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Errorf("a cancelled wait must stop the loop, got %v", err)
 	}
 }

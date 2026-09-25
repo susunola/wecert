@@ -843,7 +843,7 @@ func TestARefreshedChallengeTokenReleasesTheOldRecordsLease(t *testing.T) {
 	}
 	// Whatever the propagation wait then decides, the refresh branch has run by the time this
 	// returns.
-	_, _ = m.solveChallenges(context.Background(), cert, st, order)
+	_ = m.solveChallenges(context.Background(), cert, st, order)
 
 	if hasTXTLease(oldName, oldValue) {
 		t.Error("a refreshed challenge token must release the lease of the record the old token " +
@@ -940,12 +940,9 @@ func TestAClosedAuthorizationDiscardsTheOrder(t *testing.T) {
 				Location: "https://ca.test/order/1",
 			}
 
-			done, err := m.solveChallenges(context.Background(), cert, st, order)
+			err = m.solveChallenges(context.Background(), cert, st, order)
 			if err == nil {
 				t.Fatal("a closed authorization means the order cannot complete, so the pass must fail")
-			}
-			if done {
-				t.Error("the pass must not report the challenges as solved")
 			}
 			if !strings.Contains(err.Error(), status) {
 				t.Errorf("the error must name the status, got %v", err)
@@ -1102,7 +1099,7 @@ func TestChoosingAChallengeRecordsWhenItWasChosen(t *testing.T) {
 		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
 		Location: "https://ca.test/order/1",
 	}
-	_, _ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
+	_ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
 
 	as, err := store.ListAuthorizations("c")
 	if err != nil {
@@ -1253,7 +1250,7 @@ func TestTheChallengeIsPersistedBeforeTheDNSWrite(t *testing.T) {
 		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
 		Location: "https://ca.test/order/1",
 	}
-	_, _ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
+	_ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
 
 	// Every assertion above runs inside the hook, so a fixture that never reaches the DNS write
 	// would make this test pass without checking anything. The test-quality review caught exactly
@@ -1336,7 +1333,7 @@ func TestTheFirstVisitChallengeIsPersistedBeforeTheDNSWrite(t *testing.T) {
 		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
 		Location: "https://ca.test/order/1",
 	}
-	_, _ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
+	_ = m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order)
 
 	if !hookRan {
 		t.Fatal("the fixture never reached the DNS write, so nothing above was asserted")
@@ -1425,7 +1422,7 @@ func TestAFailedWriteOnTheRevisitPathKeepsTheTokenThatNamesTheRecord(t *testing.
 		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
 		Location: "https://ca.test/order/1",
 	}
-	if _, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order); err == nil {
+	if err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order); err == nil {
 		t.Fatal("the provider refuses every write, so the pass must fail")
 	}
 
@@ -1547,7 +1544,7 @@ func TestAFailedStateWriteTakesThePresentedRecordBackOut(t *testing.T) {
 		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
 		Location: "https://ca.test/order/1",
 	}
-	if _, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order); err == nil {
+	if err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order); err == nil {
 		t.Fatal("the state write is refused, so the pass must fail")
 	}
 

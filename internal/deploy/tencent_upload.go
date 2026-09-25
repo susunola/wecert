@@ -48,17 +48,64 @@ func (d *TencentCLB) deployUploaded(ctx context.Context, client sslAPI, certName
 		return newID, nil
 	}
 	if err := d.updateInstance(ctx, client, oldID, newID); err != nil {
-		if d.nothingBoundYet(ctx, client, oldID, newID) {
-			d.log.Warn("neither the old nor the new certificate is bound to anything yet; "+
-				"recording the new one as uploaded and waiting for the one-time manual bind",
-				"oldCertId", oldID, "newCertId", newID)
-			return newID, ErrNothingBoundYet
-		}
-		if n, nerr := d.bindingsWith(ctx, client, newID, false); nerr == nil && n.count > 0 {
-			if oldBindings, oerr := d.bindingsWith(ctx, client, oldID, false); oerr == nil && oldBindings.complete && oldBindings.count == 0 {
+		// The new certificate is enumerated ONCE and the answer is shared by both verdicts
+		// below. Each verdict additionally needs the old certificate, so that one is
+		// enumerated once as well, lazily, only on a path that reads it. The previous shape
+		// (the pending-first-bind check enumerating the new certificate, then the repair path
+		// enumerating it again) spent up to three uncached full enumerations -- each a
+		// CreateCertificateBindResourceSyncTask plus up to enumerationWait of polling -- on
+		// a single failed switch.
+		//
+		// Both verdicts must be built from COMPLETE answers where a zero is load-bearing: a
+		// partial enumeration reports 0 for a certificate that is bound in a region the read
+		// could not reach, and treating that as "nothing is bound" is how a needed switch
+		// gets skipped and a listener keeps serving a certificate that is about to expire.
+		// A non-zero count needs no such guard: it proves a binding no matter which regions
+		// went unanswered (see bindingCount).
+		// cached=false on both: these decide whether a switch took effect, and the SDK's
+		// cache can answer from a completed task up to half an hour old.
+		newBindings, nerr := d.bindingsWith(ctx, client, newID, false)
+		if nerr == nil && newBindings.complete && newBindings.count == 0 {
+			// Nothing is bound to either certificate: this is not a failed switch, it is the
+			// documented first-issuance state, reached on a renewal because the first upload was
+			// never bound by hand.
+			//
+			// The distinction matters because the two look identical to the cloud
+			// (FailedOperation.CertificateDeployInstanceEmpty) and call for opposite answers.
+			// Before this, every renewal of a certificate nobody had bound yet failed the pass,
+			// so the promotion never ran and st.NotAfter/CertPEM stayed on the certificate that
+			// was expiring: the state kept naming a certificate whose only remaining future was
+			// to expire, and each failed cycle issued and uploaded another one.
+			oldBindings, oerr := d.bindingsWith(ctx, client, oldID, false)
+			if oerr == nil && oldBindings.complete && oldBindings.count == 0 {
+				d.log.Warn("neither the old nor the new certificate is bound to anything yet; "+
+					"recording the new one as uploaded and waiting for the one-time manual bind",
+					"oldCertId", oldID, "newCertId", newID)
+				return newID, ErrNothingBoundYet
+			}
+		} else if nerr == nil && newBindings.count > 0 {
+			// Repair the historical wedge only when the old anchor is entirely gone. A
+			// non-zero new binding alone is not completion: a partially failed task has
+			// exactly that shape and must remain an error.
+			//
+			// Why the old anchor has to be checked: this path exists for a switch that happened
+			// but was not recorded. The shape is that the rebind went through (or an earlier
+			// attempt's did), so the OLD certificate has no bindings left and every later round
+			// fails the "nothing to switch" check no matter how many certificates we upload.
+			// Asking only about the new certificate would also accept a partial failure -- some
+			// listeners switched, so n > 0 -- and then the state anchors on the new ID while the
+			// rest stay on the old certificate, never to be revisited. Requiring oldBindings == 0
+			// distinguishes the two structurally, without having to classify the error.
+			// oldBindings == 0 is the load-bearing half, so it must come from a COMPLETE answer.
+			// A partial enumeration that skipped a failed region also produces 0, and reading that
+			// as "the old certificate is bound nowhere" is exactly how a half-finished switch gets
+			// recorded as done -- with some listeners still serving the old certificate and nothing
+			// left to revisit them.
+			oldBindings, oerr := d.bindingsWith(ctx, client, oldID, false)
+			if oerr == nil && oldBindings.complete && oldBindings.count == 0 {
 				d.log.Warn("the one-click update reported nothing to switch, but the new certificate is bound "+
 					"and the old one is not; treating the switch as done (the rebind succeeded without being recorded)",
-					"oldCertId", oldID, "newCertId", newID, "boundResources", n.count)
+					"oldCertId", oldID, "newCertId", newID, "boundResources", newBindings.count)
 				return newID, nil
 			}
 		}

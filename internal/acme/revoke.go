@@ -166,6 +166,16 @@ func (m *Manager) RetryPendingRevocations(ctx context.Context) {
 		m.log.Warn("cannot list pending revocations", "err", err)
 		return
 	}
+	// A coreless manager (the CLI records revocations with one while the CA is unreachable; see
+	// RecordRevocation) cannot attempt anything. Say so once for the pass rather than once per
+	// request, each of which would read as a CA refusal.
+	if m.core == nil {
+		if len(reqs) > 0 {
+			m.log.Warn("cannot attempt revocations: this manager has no ACME core; the requests stay outstanding",
+				"pending", len(reqs))
+		}
+		return
+	}
 	for _, r := range reqs {
 		if err := m.processRevocation(ctx, r.CertName); err != nil {
 			m.log.Warn("revocation still not accepted by the CA; will retry on the next pass",
@@ -223,6 +233,15 @@ func (m *Manager) processRevocation(ctx context.Context, certName string) error 
 	}
 	if req == nil {
 		return nil
+	}
+
+	// Attempting the revocation needs the CA, and a manager without a core is a real
+	// configuration: the CLI builds one on purpose to record the decision while the CA is
+	// unreachable (see RecordRevocation). RevokeCertificate sits on that interface, so without
+	// this guard the attempt is a nil-interface panic instead of an error the caller can report
+	// -- and the request must stay outstanding either way.
+	if m.core == nil {
+		return errors.New("cannot attempt the revocation: this manager has no ACME core")
 	}
 
 	der, err := m.revocationMaterial(certName, req)

@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -393,5 +396,60 @@ func TestUnknownFlagIsRejected(t *testing.T) {
 	fs.SetOutput(io.Discard)
 	if err := fs.Parse([]string{"-nope"}); err == nil {
 		t.Error("fs.Parse accepted an undefined flag, want an error")
+	}
+}
+
+// Only the bare sentinel is silent: anything wrapping errUsage carries a sentence the operator
+// must see, because main prints it before exiting 64. This used to be where "-region and -clb
+// are required" disappeared -- the message existed, the exit carried nothing but the code.
+func TestUsageExitMessageDropsOnlyTheBareSentinel(t *testing.T) {
+	if got := usageExitMessage(errUsage); got != "" {
+		t.Errorf("a bare errUsage must not be re-printed (the flag package already printed), got %q", got)
+	}
+	wrapped := fmt.Errorf("%w: -region and -clb are required", errUsage)
+	if !errors.Is(wrapped, errUsage) {
+		t.Fatal("the wrapped error must still classify as a usage error")
+	}
+	if got := usageExitMessage(wrapped); !strings.Contains(got, "-region and -clb are required") {
+		t.Errorf("the wrapped message must reach the operator, got %q", got)
+	}
+}
+
+func withArgs(t *testing.T, args ...string) {
+	t.Helper()
+	old := os.Args
+	os.Args = append([]string{"clbverify"}, args...)
+	t.Cleanup(func() { os.Args = old })
+}
+
+// A run with no -region/-clb must come back as a usage error whose message main will print --
+// a bare errUsage here would exit 64 without a word, which is exactly what this fixes.
+func TestMissingRequiredFlagsAreAPrintedUsageError(t *testing.T) {
+	withArgs(t)
+	err := run()
+	if !errors.Is(err, errUsage) {
+		t.Fatalf("err = %v, want a usage error (exit %d)", err, exitUsage)
+	}
+	if usageExitMessage(err) == "" {
+		t.Error("the missing-flags error must carry its message; main prints only non-bare errors")
+	}
+}
+
+// -wait with only -not-expect used to be accepted and then ignored: the poll loop only ever
+// looked for -expect's certificate, so the operator believed the tool waited for the unbind
+// while it answered from the first response. The combination is refused instead.
+func TestWaitWithoutExpectIsRefused(t *testing.T) {
+	err := validateCombination(&options{wait: time.Second, notExpect: "cert-old"})
+	if !errors.Is(err, errUsage) {
+		t.Errorf("-wait with only -not-expect must be refused as a usage error, got %v", err)
+	}
+	if err := validateCombination(&options{wait: time.Second, expect: "cert-new"}); err != nil {
+		t.Errorf("-wait with -expect is the case the flag exists for, got %v", err)
+	}
+	if err := validateCombination(&options{notExpect: "cert-old"}); err != nil {
+		t.Errorf("-not-expect without -wait answers from the first query, got %v", err)
+	}
+	if err := validateCombination(&options{}); err != nil {
+		t.Errorf("the defaults must pass, got %v", err)
 	}
 }

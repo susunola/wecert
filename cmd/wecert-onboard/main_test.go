@@ -201,3 +201,41 @@ func TestRunFailureStillWritesAReport(t *testing.T) {
 		t.Error("the failure report must carry the cause as its freeze reason")
 	}
 }
+
+// Asking for help is not a wrong command line: -h must exit 0, not 64. The flag package has
+// already printed the usage; classifying it as a usage error made `wecert-onboard -h` look like
+// a typo to anything watching the exit code (tatrun already treats it as success).
+func TestHelpIsNotAnError(t *testing.T) {
+	withArgs(t, "-h")
+	code, err := run()
+	if err != nil {
+		t.Errorf("-h must not produce an error, got %v", err)
+	}
+	if code != exitOK {
+		t.Errorf("-h must exit %d, got %d", exitOK, code)
+	}
+}
+
+// A failing DRY run must not write the report: -dry-run promises to write nothing at all, and
+// it holds no lock, so a report written here could race the report of a real run happening
+// concurrently -- each overwriting the file the other just published.
+func TestDryRunFailureWritesNoReport(t *testing.T) {
+	cfgPath, out := writeConfig(t, t.TempDir())
+
+	// Same failure shape as the real-run case above: a state file that cannot be parsed.
+	if err := os.WriteFile(out+".state.json", []byte(`{"absentSince": {`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	withArgs(t, "-config", cfgPath, "-dry-run")
+	code, err := run()
+	if err == nil {
+		t.Fatal("a corrupt state file must fail the dry run")
+	}
+	if code != exitError {
+		t.Errorf("a failed round is a plain error, got exit code %d", code)
+	}
+	if _, statErr := os.Stat(out + ".report.json"); !os.IsNotExist(statErr) {
+		t.Errorf("a dry run must not write the report file (stat err %v)", statErr)
+	}
+}

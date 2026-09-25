@@ -86,6 +86,51 @@ func TestDeleteCertSeries(t *testing.T) {
 	}
 }
 
+// ClearProbeAnswer drops exactly the two gauges that describe a certificate the probe
+// READ (not_after, trusted) and leaves probe_match and the error counter alone: the
+// counter is the evidence that the probe -- not the certificate -- is the problem, and
+// probe_match=0 next to it is the documented way to tell "cannot dial" from "wrong
+// certificate". Deleting any of the four for the wrong host is the over-deletion failure
+// mode TestDeleteProbeSeries covers.
+//
+// This is the direct contract test; the probe package's runner tests can only observe
+// ClearProbeAnswer indirectly, through a ToFloat64 that returns 0 both for "deleted" and
+// for "never written".
+func TestClearProbeAnswer(t *testing.T) {
+	const (
+		cleared = "cleared.example.com"
+		kept    = "kept.example.com"
+	)
+
+	for _, host := range []string{cleared, kept} {
+		CertificateProbeMatch.WithLabelValues(host).Set(0)
+		CertificateProbeNotAfter.WithLabelValues(host).Set(1)
+		CertificateProbeTrusted.WithLabelValues(host).Set(1)
+		CertificateProbeErrors.WithLabelValues(host).Inc()
+	}
+
+	ClearProbeAnswer(cleared)
+
+	for _, tc := range []struct {
+		name string
+		vec  prometheus.Collector
+		want bool // whether `cleared` should still have a series
+	}{
+		{"CertificateProbeNotAfter", CertificateProbeNotAfter, false},
+		{"CertificateProbeTrusted", CertificateProbeTrusted, false},
+		{"CertificateProbeMatch", CertificateProbeMatch, true},
+		{"CertificateProbeErrors", CertificateProbeErrors, true},
+	} {
+		values := labelValues(t, tc.vec, "host")
+		if got := values[cleared]; got != tc.want {
+			t.Errorf("%s: series for %q present = %v, want %v", tc.name, cleared, got, tc.want)
+		}
+		if !values[kept] {
+			t.Errorf("%s must keep the series of %q -- clearing %q must not over-delete", tc.name, kept, cleared)
+		}
+	}
+}
+
 // Probe series have the same reclamation rule per host: a dropped host's series
 // must go, every other host's series must survive.
 func TestDeleteProbeSeries(t *testing.T) {

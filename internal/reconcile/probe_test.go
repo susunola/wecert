@@ -759,3 +759,101 @@ func TestAnOrphanedPassStillHoldsUpReclamation(t *testing.T) {
 			"this host, so its series must be kept")
 	}
 }
+
+// The probe record and the in-flight judgment must be atomic with respect to a pass
+// finishing.
+//
+// reclaimStaleProbeSeries used to take the probedHosts snapshot under probeMu and check
+// passInFlight under mu, separately: a pass that recorded the host after the snapshot but
+// released its claim before the check read as "not in flight, not probed this round" -- and
+// the sweep deleted the series that pass had just written, a probe_match gap on a host that
+// was probed moments ago. probeCert's record happens-before its claim's release, so reading
+// both under one hold of mu makes the interleaving impossible: the host is either IN the
+// snapshot or its certificate's claim is in the in-flight set.
+func TestReclaimKeepsAHostProbedByAPassThatFinishesMidSweep(t *testing.T) {
+	const (
+		certName = "mid-sweep-cert"
+		host     = "mid-sweep.example.com"
+	)
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	certs := []config.Certificate{{Name: certName, Domains: []string{host}}}
+	cfg := &config.Config{Certificates: certs}
+	r := New(cfg, spec.NewStatic(certs), store, &fakeManager{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r.prober = &fakeProber{hosts: []string{host}}
+
+	// Confirmed deployed, so only "probed this round" or "a pass in flight" can keep the
+	// series.
+	if err := store.PutCert(&state.CertState{Name: certName, DeployConfirmed: true}); err != nil {
+		t.Fatal(err)
+	}
+	metrics.CertificateProbeMatch.WithLabelValues(host).Set(1)
+
+	// The certificate's pass is in flight and has not reached probeCert yet.
+	if !r.acquire(certName) {
+		t.Fatal("acquiring the claim should succeed on a fresh reconciler")
+	}
+
+	// Holding the claim mutex parks the sweep before it reads either the claims or the probe
+	// record; the pass then finishes the way reconcileOne does -- the probe record lands
+	// BEFORE the claim is released.
+	r.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.reclaimStaleProbeSeries(r.resolve(context.Background()))
+	}()
+	time.Sleep(100 * time.Millisecond) // let the sweep reach the parked claim lock
+
+	r.probeMu.Lock()
+	r.probedHosts[host] = struct{}{}
+	r.probeMu.Unlock()
+	delete(r.running, certName) // the claim's release
+	r.mu.Unlock()
+
+	<-done
+
+	if !probeMatchSeriesExists(t, host) {
+		t.Error("the sweep reclaimed the series of a host whose pass probed it while the sweep " +
+			"was running: the probe record and the in-flight judgment must be read atomically, " +
+			"or a just-written series reads as stale")
+	}
+}
+
+// A certificate whose state cannot be READ must say so, on the probe path as on the publish
+// path.
+//
+// Silently returning stops the probe evidence for that certificate while every other signal
+// looks healthy, and on the gauges "not probed" is indistinguishable from "probed and fine".
+// An absent row stays silent -- it just means never issued.
+func TestProbeCertWarnsWhenTheStateCannotBeRead(t *testing.T) {
+	const name = "unreadable-state"
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Close the store so the read fails, the way a busy or broken database looks.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := &recordLogHandler{}
+	cfg := &config.Config{}
+	r := New(cfg, spec.NewStatic(nil), store, &fakeManager{}, nil, slog.New(handler))
+	r.prober = &fakeProber{}
+
+	c := &config.Certificate{Name: name, Domains: []string{"a.example.com"}, Deploy: config.Deploy{Enabled: true}}
+	r.probeCert(context.Background(), c)
+
+	if !handler.containsAtLevel("not probed", slog.LevelWarn) {
+		t.Error("an unreadable state must be logged at Warn; a silent return reads as " +
+			"\"probed and fine\" on the gauges")
+	}
+}

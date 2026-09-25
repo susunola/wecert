@@ -1,6 +1,7 @@
 package state
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"github.com/susunola/wecert/internal/atomicfile"
@@ -16,8 +17,8 @@ import (
 // usable without one.
 const defaultBackupKeep = 7
 
-// backupSuffix marks a snapshot file. The state file's own name is part of the snapshot
-// name (see Store.base) so several deployments sharing a directory cannot collide.
+// backupSuffix marks a snapshot file. The store's identity is part of the snapshot name (see
+// Store.base) so several deployments sharing a directory cannot collide.
 const backupSuffix = ".backup-"
 
 // snapshotStamp is the timestamp layout in a snapshot name. Fixed width and zero padded, so
@@ -244,8 +245,11 @@ func (s *Store) repairFutureDatedSnapshots(dir string) {
 // means a prefix match on ".snapshot-" alone would also match another deployment's in-progress
 // write, which this store has no business removing -- the age check exists so a live write is
 // never swept, and widening the match would punch through exactly that guarantee for files this
-// store does not own. Temp files written before the prefix carried the base (".snapshot-<stamp>-")
-// are deliberately left behind: they cannot be attributed to any store, so nobody may delete them.
+// store does not own. The prefix carries the hashed base (see snapshotBase) and not the plain
+// basename for the same reason the final snapshot name does: /etc/wecert-a/state.db and
+// /etc/wecert-b/state.db must not claim each other's temps either. Temps written before the name
+// carried this identity (".snapshot-<stamp>-", and later ".snapshot-<basename>-") cannot be
+// attributed to any store, so they keep the age threshold like everyone else's.
 func (s *Store) snapshotTempPrefix() string { return ".snapshot-" + s.base + "-" }
 
 // sweepStaleSnapshotTemps removes leftover temporary snapshots from an interrupted write.
@@ -322,6 +326,46 @@ func (s *Store) snapshotName(stamp string) string {
 	return s.base + backupSuffix + stamp + ".db"
 }
 
+// snapshotBase computes the identity a store's snapshot and snapshot-temp names carry: the state
+// file's basename plus a short stable hash of its absolute path.
+//
+// The basename alone is not an identity: /etc/wecert-a/state.db and /etc/wecert-b/state.db are two
+// deployments, and nothing refuses them one shared stateBackup.dir. With basename-only names their
+// retention pruned each other's snapshots, and one's sweep could delete the other's half-written
+// VACUUM INTO temp. Six hex digits of SHA-256 keep the name readable and short while making an
+// accidental collision between two configured paths a 1-in-16-million event per pair.
+//
+// The hash is of the absolute path rather than the string as configured, so "state.db" and
+// "./state.db" from the same directory name one store. A path that cannot be made absolute falls
+// back to the string itself: snapshot naming must not fail because getwd did.
+func snapshotBase(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	sum := sha256.Sum256([]byte(abs))
+	return fmt.Sprintf("%s-%x", filepath.Base(path), sum[:3])
+}
+
+// SnapshotTime reads the wall-clock instant carried by the name of a snapshot of the state
+// database at statePath, and whether snapshotPath is one of its snapshots at all.
+//
+// It exists for `-restore latest`, which picks by name: a stamp in the future (the writing host's
+// clock was ahead) sorts newest forever, and the operator choosing the file should be told the
+// name is lying before the restore installs it.
+func SnapshotTime(statePath, snapshotPath string) (time.Time, bool) {
+	s := &Store{base: snapshotBase(statePath), legacyBase: filepath.Base(statePath)}
+	stamp, ok := s.snapshotStampOf(filepath.Base(snapshotPath))
+	if !ok {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(snapshotStamp, stamp)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, true
+}
+
 // snapshotStampOf returns the timestamp part of a snapshot filename belonging to this store,
 // and whether the name is one at all.
 //
@@ -331,8 +375,27 @@ func (s *Store) snapshotName(stamp string) string {
 // sort, a hand-made name like state.backup-before-upgrade.db sorts before every real
 // timestamp and is deleted first -- evicting the genuine newest snapshot and destroying the
 // operator's own copy at the same time.
+//
+// Both identities are tried: the current one (basename + path hash, see snapshotBase) and the
+// pre-hash basename-only one (Store.legacyBase). Names written by an older build must keep
+// counting as ours, or an upgrade silently strands every existing recovery point: retention
+// would stop seeing them, and `-restore latest` would report an empty backup directory over a
+// full one.
 func (s *Store) snapshotStampOf(name string) (string, bool) {
-	rest, ok := strings.CutPrefix(name, s.base+backupSuffix)
+	for _, base := range []string{s.base, s.legacyBase} {
+		if base == "" {
+			continue
+		}
+		if stamp, ok := cutSnapshotStamp(name, base+backupSuffix); ok {
+			return stamp, true
+		}
+	}
+	return "", false
+}
+
+// cutSnapshotStamp parses the timestamp out of a snapshot name under one prefix.
+func cutSnapshotStamp(name, prefix string) (string, bool) {
+	rest, ok := strings.CutPrefix(name, prefix)
 	if !ok {
 		return "", false
 	}

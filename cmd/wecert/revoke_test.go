@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -76,7 +77,7 @@ func TestRevokeRecordsTheRequestBeforeItNeedsTheCA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runRevoke(configPath, "", "example-com", "keyCompromise", true)
+	err = runRevoke(context.Background(), configPath, "", "example-com", "keyCompromise", true)
 	if err == nil {
 		t.Fatal("an unreachable CA must be reported")
 	}
@@ -98,5 +99,64 @@ func TestRevokeRecordsTheRequestBeforeItNeedsTheCA(t *testing.T) {
 	}
 	if req.Reason != 1 {
 		t.Errorf("reason = %d, want 1 (keyCompromise)", req.Reason)
+	}
+}
+
+// The signal context now reaches runRevoke, but it must never be consulted BEFORE the
+// operator's decision is durable: a SIGTERM landing between the command line and the store
+// write would otherwise leave a compromised key unrecorded, with nothing to retry. The CA
+// attempt itself is intentionally context-free (see internal/acme's processRevocation), so a
+// cancelled ctx changes only the plumbing here -- the recording order is the contract this
+// pins.
+func TestRevokeWithACancelledSignalContextStillRecordsFirst(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.db")
+	configPath := filepath.Join(dir, "config.yaml")
+
+	store, err := state.Open(statePath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.PutCert(&state.CertState{
+		Name:     "example-com",
+		NotAfter: time.Now().Add(30 * 24 * time.Hour),
+		CertPEM:  selfSignedPEM(t, time.Now().Add(30*24*time.Hour)),
+	}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same unreachable directory as above: the CA attempt must fail, the record must not.
+	cfg := "statePath: " + statePath + "\n" +
+		"acme:\n  directory: https://acme.invalid/directory\n  email: ops@atomwangnus.com\n" +
+		"dns:\n  provider: dnspod\n  loginToken: \"12345,abcdef\"\n" +
+		"tencent:\n  credentialMode: static\n  secretId: id\n  secretKey: key\n" +
+		"  regions: [ap-guangzhou]\n" +
+		"certificates:\n  - name: example-com\n    domains: [example.com]\n"
+	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the signal arrived before the command even started
+	err = runRevoke(ctx, configPath, "", "example-com", "keyCompromise", true)
+	if err == nil {
+		t.Fatal("an unreachable CA must be reported even when the signal context is already cancelled")
+	}
+
+	store, err = state.Open(statePath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer store.Close()
+	req, err := store.GetRevokeRequest("example-com")
+	if err != nil {
+		t.Fatalf("GetRevokeRequest: %v", err)
+	}
+	if req == nil {
+		t.Fatal("a cancelled signal context must not prevent the revocation request from being " +
+			"recorded: without the record nothing retries when the CA returns")
 	}
 }

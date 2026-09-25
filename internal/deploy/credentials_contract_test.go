@@ -123,7 +123,7 @@ func TestCVMRoleCredentialIsNotCached(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		_ = json.NewEncoder(w).Encode(cvmRoleCredential{
-			TmpSecretID: "id", TmpSecretKey: "key", Token: "tok",
+			TmpSecretID: "id", TmpSecretKey: "key", Token: "tok", ExpiredTime: 4102444800,
 		})
 	}))
 	defer srv.Close()
@@ -151,7 +151,7 @@ func TestCVMRoleNameCannotEscapeTheMetadataPath(t *testing.T) {
 	var seenPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenPath = r.URL.EscapedPath()
-		_ = json.NewEncoder(w).Encode(cvmRoleCredential{TmpSecretID: "i", TmpSecretKey: "k"})
+		_ = json.NewEncoder(w).Encode(cvmRoleCredential{TmpSecretID: "i", TmpSecretKey: "k", ExpiredTime: 4102444800})
 	}))
 	defer srv.Close()
 	stubMetadataURL(t, srv.URL+"/")
@@ -224,5 +224,107 @@ func TestCVMRoleCredentialReportsTheBodyOnFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not attached") {
 		t.Errorf("the response body is what makes this actionable, got: %v", err)
+	}
+}
+
+// An inline secret that is only whitespace is no credential at all.
+//
+// The config layer's resolveSecretFiles only fills EMPTY fields, so secretId: "   " in the
+// YAML reaches this function verbatim. Untrimmed, it would shadow the environment fallback
+// and then fail the first API call with a SignatureFailure -- a wrong-key diagnosis for a
+// stray-space typo.
+func TestCredentialSourceStaticTrimsInlineWhitespace(t *testing.T) {
+	// Whitespace-only inline values must fall back to the environment, exactly like unset
+	// fields would.
+	t.Setenv(EnvSecretID, "env-id")
+	t.Setenv(EnvSecretKey, "env-key")
+	src, err := NewCredentialSource(config.Tencent{
+		CredentialMode: config.CredentialStatic, SecretID: "   ", SecretKey: "\t\n",
+	})
+	if err != nil {
+		t.Fatalf("whitespace-only inline values must behave as unset: %v", err)
+	}
+	cred, err := src(context.Background())
+	if err != nil {
+		t.Fatalf("credential: %v", err)
+	}
+	if cred.GetSecretId() != "env-id" || cred.GetSecretKey() != "env-key" {
+		t.Errorf("the environment fallback must win over whitespace-only inline values, got %q / %q",
+			cred.GetSecretId(), cred.GetSecretKey())
+	}
+
+	// Stray spaces around a real value are trimmed too, the same normalization the config
+	// layer applies to the file and environment variants.
+	src, err = NewCredentialSource(config.Tencent{
+		CredentialMode: config.CredentialStatic, SecretID: "  cfg-id ", SecretKey: "\tcfg-key\n",
+	})
+	if err != nil {
+		t.Fatalf("padded inline values must be accepted after trimming: %v", err)
+	}
+	cred, err = src(context.Background())
+	if err != nil {
+		t.Fatalf("credential: %v", err)
+	}
+	if cred.GetSecretId() != "cfg-id" || cred.GetSecretKey() != "cfg-key" {
+		t.Errorf("inline values must be trimmed, got %q / %q", cred.GetSecretId(), cred.GetSecretKey())
+	}
+
+	// And with nothing in the environment either, the answer is the honest "no credentials
+	// configured" error, not a credential built from whitespace.
+	t.Setenv(EnvSecretID, "")
+	t.Setenv(EnvSecretKey, "")
+	if _, err := NewCredentialSource(config.Tencent{
+		CredentialMode: config.CredentialStatic, SecretID: " ", SecretKey: " ",
+	}); err == nil {
+		t.Error("whitespace-only credentials with no environment fallback must be refused")
+	}
+}
+
+// The metadata service reports failure in-band: a Code other than "Success" means the
+// credential fields -- when present at all -- are not usable, so they must not be believed.
+func TestCVMRoleCredentialRejectsANonSuccessCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(cvmRoleCredential{
+			Code:        "AuthFailure",
+			TmpSecretID: "looks-usable", TmpSecretKey: "looks-usable", Token: "tok",
+			ExpiredTime: 4102444800,
+		})
+	}))
+	defer srv.Close()
+	stubMetadataURL(t, srv.URL+"/")
+
+	src, err := NewCredentialSource(config.Tencent{
+		CredentialMode: config.CredentialCVMRole, RoleName: "role",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src(context.Background()); err == nil {
+		t.Fatal("a metadata answer whose Code is not Success must be refused, even when it " +
+			"carries credential-looking fields")
+	}
+}
+
+// An already-expired credential must be refused: the fetch happens right before the deploy,
+// so using it guarantees the deploy fails with an authentication error that points at the
+// key rather than at the stale answer.
+func TestCVMRoleCredentialRejectsAnExpiredOne(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(cvmRoleCredential{
+			TmpSecretID: "id", TmpSecretKey: "key", Token: "tok",
+			ExpiredTime: 946684800, // 2000-01-01: long expired
+		})
+	}))
+	defer srv.Close()
+	stubMetadataURL(t, srv.URL+"/")
+
+	src, err := NewCredentialSource(config.Tencent{
+		CredentialMode: config.CredentialCVMRole, RoleName: "role",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src(context.Background()); err == nil {
+		t.Fatal("an expired credential must be refused instead of failing later as an auth error")
 	}
 }

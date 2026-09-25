@@ -380,12 +380,18 @@ func (m *Manager) reclaimUnpresentedTXT(ctx context.Context, a *state.Authorizat
 		//
 		// A row with no timestamp predates the column, so its age is unknown and the previous
 		// behaviour is kept: refusing to delete those would strand every one of them forever.
-		if age := m.now().Sub(a.ChallengePreparedAt); !a.ChallengePreparedAt.IsZero() &&
-			age < m.dns.PropagationTimeout() {
+		//
+		// A timestamp in the FUTURE also means "age unknown", not "still propagating": the clock
+		// stepped backwards, now.Sub is negative, and a negative age is younger than the window
+		// forever -- the row would be kept until the clock caught up, and with it the stale TXT
+		// it exists to reclaim. The same trap as bindingCheckDue's stored instant, so the same
+		// answer: only a timestamp that is not ahead of the clock can be "recent".
+		if !a.ChallengePreparedAt.IsZero() && !a.ChallengePreparedAt.After(m.now()) &&
+			m.now().Sub(a.ChallengePreparedAt) < m.dns.PropagationTimeout() {
 			m.log.Info("an unpresented row's record was denied, but its challenge is newer than the "+
 				"propagation window; keeping the row so a record that is still propagating is not lost",
 				"cert", a.CertName, "identifier", a.Identifier, "name", a.TxtName,
-				"preparedAgo", age.Round(time.Second),
+				"preparedAgo", m.now().Sub(a.ChallengePreparedAt).Round(time.Second),
 				"window", m.dns.PropagationTimeout())
 			return txtReclaimKeptPropagating, nil
 		}

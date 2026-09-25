@@ -28,12 +28,25 @@ jobs:
           check-latest: true
 
       # A release is exactly the commit CI already gates on, but a tag can point anywhere --
-      # re-run the gate so a tag placed on an untested commit cannot ship.
-      - name: test
-        run: make test
+      # re-run the gate so a tag placed on an untested commit cannot ship. The gate is the
+      # full pre-commit one (make check: fmt, vet, race + tagged tests, script and alert
+      # checks), not only `make test`: a tag on a commit whose scripts or tagged variant are
+      # broken is exactly what this step exists to refuse.
+      - name: check
+        run: make check
 
       - name: build artifacts
         run: make release
+
+      # The Makefile's sbom target promises a CycloneDX SBOM with the release; this is the
+      # step that keeps the promise. It runs after `make release` (which wipes dist/) and
+      # lands in dist/, so the `gh release create ... dist/*` below attaches it.
+      - name: sbom
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          make sbom
+          test -s dist/wecert-sbom.cdx.json
 
       # Provenance for the release binaries. `make repro-check` proves they can be rebuilt
       # bit-for-bit from this commit, but only for someone who does the rebuilding; this attaches a

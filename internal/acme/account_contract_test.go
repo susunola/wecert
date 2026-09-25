@@ -152,6 +152,11 @@ func TestEnsureAccountRefusesAnUnparseableStoredKey(t *testing.T) {
 //
 // PutAccount cannot produce this shape -- private_key_pem is NOT NULL, which this test found --
 // so the row is written the way an older database could hold it: straight SQL with a NULL key.
+//
+// The row also carries a kid, and that kid must NOT survive: it names an account whose key this
+// process never had, so pairing it with the freshly generated key (which is what reading the
+// stale row did) builds a core that skips the registration and then fails badSignature on every
+// request.
 func TestEnsureAccountTreatsAnEmptyKeyAsNoAccount(t *testing.T) {
 	fake, store, cfg := accountFixture(t)
 
@@ -161,12 +166,43 @@ func TestEnsureAccountTreatsAnEmptyKeyAsNoAccount(t *testing.T) {
 	if _, err := EnsureAccount(cfg, store, fake.srv.Client()); err != nil {
 		t.Fatalf("an account row with no key must be replaced by a real registration: %v", err)
 	}
+
+	// The legacy kid must have been discarded and the fresh key registered: exactly one
+	// new-account call.
+	if n := fake.newAccounts.Load(); n != 1 {
+		t.Errorf("the fresh key must be registered with the CA (the stored kid is worthless "+
+			"without its key): got %d new-account request(s), want 1", n)
+	}
+
 	stored, err := store.GetAccount(cfg.ACME.Directory)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(stored.PrivateKeyPEM) == 0 {
 		t.Error("no key was stored")
+	}
+	if stored.KID == "" {
+		t.Error("the kid the registration returned must be persisted: without it the next start " +
+			"cannot use the account it just registered")
+	}
+	if stored.KID == "https://acme.test/acct/1" {
+		t.Error("the legacy kid survived next to a key it does not belong to -- every request " +
+			"would fail badSignature at the CA")
+	}
+
+	// The registration must have been signed with the key that is now on disk: a kid persisted
+	// next to any other key is the badSignature state this test exists to prevent.
+	key, err := ParsePrivateKeyPEM(stored.PrivateKeyPEM)
+	if err != nil {
+		t.Fatalf("the stored key must parse: %v", err)
+	}
+	regs := fake.registeredKeys()
+	if len(regs) != 1 {
+		t.Fatalf("expected the one registration's key to be captured, got %d", len(regs))
+	}
+	if !regs[0].Equal(key.Public()) {
+		t.Error("the account was registered with a DIFFERENT key than the one persisted: the kid " +
+			"and the key on disk would not belong together")
 	}
 }
 

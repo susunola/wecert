@@ -248,6 +248,7 @@ func (o *Onboarder) Run(ctx context.Context) (*Report, error) {
 			Mode:        ModeWritten,
 		},
 		excludedIdx: map[string]int{},
+		removed:     map[string]bool{},
 	}
 
 	// A corrupt state file must fail outright, never continue as empty state: that
@@ -420,6 +421,13 @@ type run struct {
 	// different profile, and two excluded ones with different profiles froze the whole
 	// round with "the desired state came out empty".
 	accepted map[string]bool
+
+	// removed holds the names this round judged removed (past the grace period and
+	// unreferenced, or dropped under -force). A previous certificate carried forward by
+	// overLimit/overSettingsConflict must not resurrect them: the report already announced
+	// the removal, and putting the name back into the document would have wecert keep
+	// renewing a name every one of those judgements agreed to drop.
+	removed map[string]bool
 
 	// certs are the certificates computed this round, sorted by certificate name.
 	certs []config.Certificate

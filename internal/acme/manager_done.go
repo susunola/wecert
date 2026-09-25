@@ -81,13 +81,16 @@ func (m *Manager) download(
 	// "certs per exact identifier set" -- the limit with no override path -- must not be the one
 	// number that is structurally always full.
 	//
-	// A later failure of ours can double-count as well: the epilogue transaction may roll back
-	// after this point, and the next pass downloads the same certificate again (the CA issues it
-	// once, and the order is still valid) and spends a second slot. Also the conservative
-	// direction, and also bounded by one per retry.
-	m.quota.Spend(ratelimit.CertsPerExactIdentifierSet, c.DomainKey(), 1)
-	for _, domain := range uniqueRegisteredDomains(c.Domains) {
-		m.quota.Spend(ratelimit.CertsPerRegisteredDomain, domain, 1)
+	// Spent once per certificate URL, not once per download: a certificate one of the gates
+	// below permanently refuses (notAfter, key match) is re-downloaded on every pass until the
+	// order expires, and the CA counted that issuance once, so booking each pass would drain
+	// the published remainder for nothing issued. A restart re-books at most once per stuck
+	// order -- the conservative direction, and bounded.
+	if m.noteCertSpend(order.Certificate) {
+		m.quota.Spend(ratelimit.CertsPerExactIdentifierSet, c.DomainKey(), 1)
+		for _, domain := range uniqueRegisteredDomains(c.Domains) {
+			m.quota.Spend(ratelimit.CertsPerRegisteredDomain, domain, 1)
+		}
 	}
 	// Reject a certificate that is not actually a REPLACEMENT for the live one.
 	//
@@ -419,8 +422,8 @@ func (m *Manager) download(
 	// overwritten, so without this the id is lost: not in certificates, not in retired_certificates,
 	// and therefore never deleted. It is billed against the account's uploaded-certificate quota
 	// forever. Reclaiming it is safe because the deployer only reports ErrNothingBoundYet from
-	// COMPLETE enumerations of both certificates (see nothingBoundYet), and the delete itself still
-	// asks the cloud to refuse if anything is bound.
+	// COMPLETE enumerations of both certificates (see deployUploaded in internal/deploy), and the
+	// delete itself still asks the cloud to refuse if anything is bound.
 	reclaimFirstBind := waitingFirstBind && oldDeployedID != "" && oldDeployedID != deployedID
 
 	// The order may also carry the ID of a certificate that was uploaded but never rebound. Hand it
@@ -698,6 +701,14 @@ func (m *Manager) discardOrder(ctx context.Context, certName string) error {
 	// No promotion is in flight on this path, so the store's deployed_cert_id is the live one.
 	orphanID, orphanPEM, orphanKey := m.orphanToRecord(certName, "")
 
+	// Capture the URL before the row goes away: the fetch-failure counter is keyed by it, and
+	// a discarded order's URL is dead for good, so its count must not linger. (Without this,
+	// every discarded URL stranded its entry for the rest of the process.)
+	orderURL := ""
+	if o, err := m.store.GetOrder(certName); err == nil && o != nil {
+		orderURL = o.OrderURL
+	}
+
 	if err := m.cleanupOrphanTXT(ctx, certName); err != nil {
 		// A cleanup failure must not stop us discarding the order -- that would leave us stuck
 		// on an order that can never produce a result, which is far worse than one extra TXT
@@ -713,9 +724,14 @@ func (m *Manager) discardOrder(ctx context.Context, certName string) error {
 		}
 		return tx.DeleteOrder(certName)
 	})
-	if err == nil && orphanID != "" {
-		m.log.Info("the certificate uploaded during the failed deploy has been recorded for reclaim "+
-			"and will be deleted later", "cert", certName, "certId", orphanID)
+	if err == nil {
+		// Only once the row is actually gone: while it survives, the next pass still resumes
+		// this URL and the count remains meaningful.
+		m.clearOrderFetchFailures(orderURL)
+		if orphanID != "" {
+			m.log.Info("the certificate uploaded during the failed deploy has been recorded for reclaim "+
+				"and will be deleted later", "cert", certName, "certId", orphanID)
+		}
 	}
 	return err
 }

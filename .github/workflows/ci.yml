@@ -5,6 +5,10 @@ on:
     branches: [main, master]
   pull_request:
 
+# The default GITHUB_TOKEN is read-only here; no job in this workflow writes.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -39,6 +43,14 @@ jobs:
 
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      # The untagged scan above never compiles the lego_dns variant: lego's ~198-provider
+      # DNS registry is exactly the large third-party surface a vulnerability scan exists
+      # for, and `make release` ships that binary. Scoped to the packages the tag changes
+      # (plus the command that links them) to keep the scan's wall time bounded -- the
+      # registry itself is what takes the time, and it is reached through these.
+      - name: govulncheck (lego_dns variant)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest -tags lego_dns ./internal/acme/... ./cmd/wecert
 
       # -race matters more than usual here: on a certificate with many SANs the
       # DNS probing and the authorization polling are both concurrent, and a data
@@ -186,6 +198,32 @@ jobs:
           else
             note "neither run printed 'unbound variable'"
           fi
+
+          # WECERT_STATE_DIR is honoured verbatim by `install -d -o wecert -g wecert -m 0700`,
+          # which chowns and chmods the path even when it already exists -- so a system
+          # directory must be refused, and refused BEFORE anything is installed. The check
+          # runs first in the script, so each of these exits 1 without side effects.
+          for bad_dir in / /etc /usr /var /var/lib /home /root /srv/data; do
+            set +e
+            sudo WECERT_STATE_DIR="${bad_dir}" ./install.sh ./dist/wecert_linux_amd64 >"${log}" 2>&1
+            rc=$?
+            set -e
+            if [ "${rc}" -ne 0 ] && grep -q 'WECERT_STATE_DIR must name a wecert-specific directory' "${log}"; then
+              note "WECERT_STATE_DIR=${bad_dir} is refused (exit ${rc})"
+            else
+              problem "WECERT_STATE_DIR=${bad_dir}: want a refusal naming the variable, got exit ${rc}"
+              cat "${log}"
+            fi
+          done
+          # And the accepted shapes: the default already ran twice above; an override that
+          # names a wecert directory of its own must pass the check and be created 0700.
+          set +e
+          sudo WECERT_STATE_DIR=/opt/wecert ./install.sh ./dist/wecert_linux_amd64 >"${log}" 2>&1
+          rc=$?
+          set -e
+          expect_eq "install.sh with WECERT_STATE_DIR=/opt/wecert exit code" 0 "${rc}"
+          expect_path "the overridden state directory exists" -d /opt/wecert
+          expect_eq "overridden state directory mode" 700 "$(sudo stat -c '%a' /opt/wecert)"
 
           exit "${fail}"
 

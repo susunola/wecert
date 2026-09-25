@@ -106,6 +106,9 @@ func run() error {
 	if err := validateInterval(o.interval); err != nil {
 		return err
 	}
+	if err := validateTimeout(o.timeout); err != nil {
+		return err
+	}
 
 	secretID := os.Getenv("TENCENTCLOUD_SECRET_ID")
 	secretKey := os.Getenv("TENCENTCLOUD_SECRET_KEY")
@@ -260,6 +263,18 @@ func waitForTask(ctx context.Context, client tatAPI, invocationID string, timeou
 func validateInterval(interval time.Duration) error {
 	if interval <= 0 {
 		return fmt.Errorf("-interval must be positive, got %s (it is the sleep between TAT API polls)", interval)
+	}
+	return nil
+}
+
+// validateTimeout rejects a timeout buildRunCommand would mangle: it is sent to TAT as
+// uint64(timeout.Seconds()), so a negative duration wraps to an enormous value and a positive
+// sub-second one truncates to 0 -- which the API reads as no timeout at all. Both are silent
+// misreadings of what the operator asked for, so they are refused up front.
+func validateTimeout(timeout time.Duration) error {
+	if timeout < time.Second {
+		return fmt.Errorf("-timeout must be at least 1s, got %s (it is sent to TAT as whole "+
+			"seconds: a smaller value truncates to 0, and a negative one wraps)", timeout)
 	}
 	return nil
 }

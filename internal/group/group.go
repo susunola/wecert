@@ -41,9 +41,14 @@ func Normalize(raw string) (string, error) {
 }
 
 // IsWildcard reports whether the name is a wildcard, shaped like *.example.com.
+//
+// The input must already be normalized (see Normalize: lowercased, trailing dot stripped);
+// the check is a byte-level prefix test.
 func IsWildcard(name string) bool { return strings.HasPrefix(name, "*.") }
 
 // Base strips the wildcard prefix and returns the parent name it hangs off.
+//
+// The input must already be normalized (see Normalize); the strip is byte-level.
 func Base(name string) string { return strings.TrimPrefix(name, "*.") }
 
 // RegisteredDomain returns the host's registered domain (eTLD+1).
@@ -131,6 +136,7 @@ type Group struct {
 // byte-for-byte identical output.
 func GroupBy(declared []string) ([]Group, error) {
 	byReg := make(map[string]*Group)
+	seen := make(map[string]map[string]struct{}) // registered domain -> names already recorded
 	for _, raw := range declared {
 		n, err := Normalize(raw)
 		if err != nil {
@@ -145,11 +151,19 @@ func GroupBy(declared []string) ([]Group, error) {
 		if g == nil {
 			g = &Group{Registered: reg, Name: CertName(reg)}
 			byReg[reg] = g
+			seen[reg] = make(map[string]struct{})
 		}
+		// Dedup runs against a per-group set rather than a scan of the slices: a bulk import
+		// declares thousands of names under one registered domain, and a linear membership
+		// check per declaration makes exactly that case quadratic.
+		if _, dup := seen[reg][n]; dup {
+			continue
+		}
+		seen[reg][n] = struct{}{}
 		if IsWildcard(n) {
-			g.Wildcards = appendUnique(g.Wildcards, n)
+			g.Wildcards = append(g.Wildcards, n)
 		} else {
-			g.Names = appendUnique(g.Names, n)
+			g.Names = append(g.Names, n)
 		}
 	}
 
@@ -192,6 +206,10 @@ var ErrTooManyNames = errors.New("group exceeds the profile's max number of name
 // Note that it never **invents a wildcard**: adding a *.example.com means the
 // certificate can complete a handshake for any subdomain, which is privilege
 // expansion and must be an explicit declaration.
+//
+// A maxNames <= 0 means no limit: the check below only runs when it is positive, so a
+// profile that leaves the limit unset asks for every declaration to fit, however many
+// that is.
 func (g Group) Cover(maxNames int) (*Coverage, error) {
 	cov := &Coverage{Covered: make(map[string]string, len(g.Names))}
 
@@ -237,6 +255,10 @@ func (g Group) Cover(maxNames int) (*Coverage, error) {
 //
 // It covers **one** label only: *.example.com covers foo.example.com, but not
 // example.com (the most common misunderstanding) and not a.b.example.com.
+//
+// Both names must already be normalized (see Normalize: lowercased, trailing dot
+// stripped); the comparison is byte-level, so "FOO.Example.COM." is not covered by
+// "*.example.com".
 func WildcardCovers(wc, host string) bool {
 	if !IsWildcard(wc) {
 		return false
@@ -250,13 +272,4 @@ func WildcardCovers(wc, host string) bool {
 		return false
 	}
 	return rest != "" && !strings.Contains(rest, ".")
-}
-
-func appendUnique(dst []string, v string) []string {
-	for _, x := range dst {
-		if x == v {
-			return dst
-		}
-	}
-	return append(dst, v)
 }

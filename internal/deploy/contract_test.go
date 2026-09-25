@@ -300,16 +300,42 @@ func TestUploadFailsWithoutACertificateID(t *testing.T) {
 // ── Bindings ─────────────────────────────────────────────────────────────────────────
 
 // An empty CertId means "never uploaded", so asking the API about it is pointless.
+//
+// The zero it answers is COMPLETE: an empty ID identifies nothing that could be bound, so
+// "0 bindings" is the whole truth rather than a lower bound. Reporting it incomplete would
+// make the caller log "could not enumerate every region" forever for a state that is simply
+// empty -- which is also how Noop.Bindings answers, and the two must agree.
 func TestBindingsWithAnEmptyIDDoesNotCallTheAPI(t *testing.T) {
 	stubSSLClient(t, &fakeSSLAPI{}) // every method panics if called
 	d := newTestDeployer(time.Now)
 
-	n, _, err := d.Bindings(context.Background(), "")
+	n, complete, err := d.Bindings(context.Background(), "")
 	if err != nil {
 		t.Fatalf("Bindings(\"\") must not fail: %v", err)
 	}
 	if n != 0 {
 		t.Errorf("Bindings(\"\") = %d, want 0", n)
+	}
+	if !complete {
+		t.Error("Bindings(\"\") must be complete: nothing can be bound to a certificate that does not exist")
+	}
+}
+
+// The lazy wrapper must answer the empty-ID case identically -- and without building the
+// inner deployer, so a document that never deploys still needs no credentials.
+func TestLazyBindingsWithAnEmptyIDIsCompleteWithoutAClient(t *testing.T) {
+	cfg := config.Tencent{CredentialMode: config.CredentialStatic} // deliberately unusable
+	d := NewLazyTencentCLB(cfg, quietLog())
+
+	n, complete, err := d.Bindings(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Bindings(\"\") must not need credentials: %v", err)
+	}
+	if n != 0 || !complete {
+		t.Errorf("Bindings(\"\") = (%d, %v), want (0, true)", n, complete)
+	}
+	if d.inner != nil {
+		t.Error("answering the empty-ID case must not build the inner deployer")
 	}
 }
 

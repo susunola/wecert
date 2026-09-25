@@ -330,7 +330,7 @@ func openFiles(path string, lock *fileLock, existedBefore, lockExisted, mayMigra
 			realPath, path, realPath)
 	}
 
-	s := &Store{db: db, lock: lock, base: filepath.Base(path), path: path}
+	s := &Store{db: db, lock: lock, base: snapshotBase(path), legacyBase: filepath.Base(path), path: path}
 	// The identity of the file at that path right now. os.SameFile against a later stat is what
 	// catches "unlinked" and "replaced by a restore" alike, without needing the driver's own fd.
 	//
@@ -683,6 +683,11 @@ func databaseFilePath(db *sql.DB, configured string) (actual string, diverged bo
 }
 
 // Close closes the state database and releases the cross-process lock.
+//
+// It is idempotent: a second call returns nil. Callers defer it next to Open and also call it on
+// an explicit shutdown path, and without this the second call returned sql's "database is closed"
+// beside a flock "file already closed" -- two errors describing a state that is exactly the one
+// asked for, reportable only as noise in a shutdown log.
 func (s *Store) Close() error {
 	// Wait for an in-flight operation before closing.
 	//
@@ -694,6 +699,11 @@ func (s *Store) Close() error {
 	// inside it.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 
 	err := s.db.Close()
 	if relErr := s.lock.release(); err == nil {

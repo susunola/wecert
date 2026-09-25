@@ -45,11 +45,14 @@ func NewCredentialSource(cfg config.Tencent) (CredentialFunc, error) {
 		// the units 0644 root:root, so an inline Environment= line would make a
 		// long-lived CAM key world-readable. Put them in an EnvironmentFile that is
 		// 0600 root:wecert instead.
-		id, key := cfg.SecretID, cfg.SecretKey
 		// Trimmed, because the config layer trims the same variables when it validates them
 		// (config.go's resolveSecretFiles): a value of "   " passed that check and then reached the
 		// CAM client verbatim, so a whitespace-only secret produced a SignatureFailure from the API
 		// -- a wrong-key diagnosis -- instead of the honest "no credentials configured".
+		// The INLINE values are trimmed for the same reason: resolveSecretFiles only fills fields
+		// left empty, so an inline "   " stays put and would otherwise shadow the environment
+		// fallback while still being no credential at all.
+		id, key := strings.TrimSpace(cfg.SecretID), strings.TrimSpace(cfg.SecretKey)
 		if id == "" {
 			id = strings.TrimSpace(os.Getenv(EnvSecretID))
 		}
@@ -130,8 +133,22 @@ func fetchCVMRoleCredential(ctx context.Context, roleName string) (common.Creden
 	if err := json.Unmarshal(body, &mc); err != nil {
 		return nil, fmt.Errorf("parse the metadata credentials: %w", err)
 	}
+	// The metadata service reports failure in-band: an answer whose Code is set and is not
+	// "Success" is an error report, and its credential fields -- when present at all -- are
+	// not usable. Believing them anyway turns a refused role lookup into a SignatureFailure
+	// at the first real API call, far from the cause.
+	if mc.Code != "" && mc.Code != "Success" {
+		return nil, fmt.Errorf("the metadata service reported Code=%q for role %q", mc.Code, roleName)
+	}
 	if mc.TmpSecretID == "" || mc.TmpSecretKey == "" {
 		return nil, fmt.Errorf("the metadata service returned no usable credentials (Code=%q)", mc.Code)
+	}
+	// An already-expired credential is worse than none: the fetch happens right before the
+	// deploy, so using it guarantees the deploy fails with an authentication error that
+	// points at the key rather than at the stale answer.
+	if mc.ExpiredTime <= time.Now().Unix() {
+		return nil, fmt.Errorf("the metadata service returned an already-expired credential "+
+			"(ExpiredTime=%d) for role %q", mc.ExpiredTime, roleName)
 	}
 
 	return common.NewTokenCredential(mc.TmpSecretID, mc.TmpSecretKey, mc.Token), nil

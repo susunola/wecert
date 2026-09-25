@@ -29,7 +29,16 @@ PATH="$GOPATH/bin:$PATH"
 OUT="docs/e2e-run-$(date +%Y-%m-%d).html"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-	--out) OUT="$2"; shift 2 ;;
+	--out)
+		# Without the value this was `OUT="$2"` under set -u: "unbound variable" instead
+		# of a usable error (same shape as e2e-sni.sh's --wait).
+		if [[ $# -lt 2 ]]; then
+			echo "Error: --out needs a path to write the HTML report to" >&2
+			exit 2
+		fi
+		OUT="$2"
+		shift 2
+		;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done

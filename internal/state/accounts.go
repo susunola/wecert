@@ -64,6 +64,9 @@ func (s *Store) PutAccountWithoutKey(directory, kid string) error {
 
 // PutAccount writes the account.
 func (s *Store) PutAccount(a *Account) error {
+	if a == nil {
+		return fmt.Errorf("nil account")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := a.PrivateKeyPEM

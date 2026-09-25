@@ -168,7 +168,67 @@ func TestCheckOneDistinguishesUnreachableFromMismatch(t *testing.T) {
 	}
 }
 
-// ── flag parsing helpers ─────────────────────────────────────────────────────────────
+// ── the command line's own exit codes ────────────────────────────────────────────────
+
+// -h is a request for help, not a command-line error.
+//
+// flag.ContinueOnError reports -h as flag.ErrHelp after printing the usage, and the parse
+// error branch used to return exitUsage (64) for it -- the same code an unknown flag gets,
+// and the opposite of what the exit-code table documents. tatrun makes the same
+// distinction with its errHelp.
+func TestHelpRequestExitsZero(t *testing.T) {
+	restore := silenceStderr(t)
+	defer restore()
+	if code := runArgs([]string{"-h"}); code != exitOK {
+		t.Errorf("-h exited %d, want %d: asking for help is not a command-line error", code, exitOK)
+	}
+}
+
+// The distinction must not swallow real command-line errors: an unknown flag stays 64.
+func TestUnknownFlagStaysAUsageError(t *testing.T) {
+	restore := silenceStderr(t)
+	defer restore()
+	if code := runArgs([]string{"-definitely-not-a-flag"}); code != exitUsage {
+		t.Errorf("an unknown flag exited %d, want %d", code, exitUsage)
+	}
+}
+
+// silenceStderr redirects os.Stderr (where the flag package prints the usage) for the
+// duration of one call; the returned function restores it.
+func silenceStderr(t *testing.T) func() {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	return func() {
+		_ = w.Close()
+		os.Stderr = old
+		_ = r.Close()
+	}
+}
+
+// -require-trusted must reach the expectation, or the flag parses and does nothing.
+//
+// There was previously no way to turn the check on from the CLI at all, so the tool
+// answered exit 0 for a certificate whose name matches but whose chain no client accepts
+// -- while the daemon defaults the same check on (probe.requireTrusted).
+func TestRequireTrustedFlagReachesTheExpectation(t *testing.T) {
+	e, err := buildExpectation("", "", 0, true)
+	if err != nil {
+		t.Fatalf("buildExpectation: %v", err)
+	}
+	if !e.RequireTrusted {
+		t.Error("RequireTrusted was dropped between the flag and the expectation")
+	}
+	e, err = buildExpectation("", "", 0, false)
+	if err != nil || e.RequireTrusted {
+		t.Errorf("the default must stay off (an internal CA never verifies), got %v, %v",
+			e.RequireTrusted, err)
+	}
+}
 
 func TestSplitListTrimsAndDropsEmptyEntries(t *testing.T) {
 	got := splitList(" a.example.com , b.example.com ,,  , c.example.com ")

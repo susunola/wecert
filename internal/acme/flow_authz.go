@@ -62,19 +62,20 @@ func (m *Manager) fetchAuthzs(ctx context.Context, authzs []*state.Authorization
 	return out, nil
 }
 
-// solveChallenges returns allValid=true when every authorization of the order has passed
-// validation.
+// solveChallenges drives every authorization of the order to validity; a nil return means
+// all of them have passed validation. Every "not there yet" outcome is a non-nil error, so
+// the caller has no false-without-error case to wait out.
 func (m *Manager) solveChallenges(
 	ctx context.Context, c *config.Certificate, st *state.CertState, order legoacme.ExtendedOrder,
-) (bool, error) {
+) error {
 	authzs, err := m.loadAuthorizations(c.Name, order.Authorizations)
 	if err != nil {
-		return false, m.recordFailure(ctx, st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	current, err := m.fetchAuthzs(ctx, authzs)
 	if err != nil {
-		return false, m.recordFailure(ctx, st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	// As in the polling loop: a pass that sees several invalid authorizations books ALL of them.
@@ -121,8 +122,15 @@ func (m *Manager) solveChallenges(
 
 		switch cur.Status {
 		case "valid":
+			// It validated, so the name is not in trouble: forget any cooldown a previous
+			// pass (or the phase-3 claim below, on an earlier visit) started, so a later
+			// failure opens a fresh window rather than inheriting this one. awaitAuthorizations
+			// does the same when a poll observes the transition -- but a pass that finds the
+			// authorization ALREADY valid on entry never goes through that loop, so without
+			// this clear the cooldown would sit until it expired on its own.
+			m.clearIdentifierCooldown(targeted)
 			if err := m.store.PutAuthorization(a); err != nil {
-				return false, m.recordFailure(ctx, st, fmt.Errorf("persist a validated authorization (%s): %w", a.Identifier, err))
+				return m.recordFailure(ctx, st, fmt.Errorf("persist a validated authorization (%s): %w", a.Identifier, err))
 			}
 			continue
 		case "invalid":
@@ -180,11 +188,11 @@ func (m *Manager) solveChallenges(
 				"so the next pass places a fresh one",
 				"cert", c.Name, "identifier", targeted, "status", cur.Status, "authz", a.AuthzURL)
 			if derr := m.discardOrder(ctx, c.Name); derr != nil {
-				return false, m.recordFailure(ctx, st, fmt.Errorf(
+				return m.recordFailure(ctx, st, fmt.Errorf(
 					"the authorization for %s is %s and discarding the order failed: %w",
 					targeted, cur.Status, derr))
 			}
-			return false, m.recordFailure(ctx, st, fmt.Errorf(
+			return m.recordFailure(ctx, st, fmt.Errorf(
 				"the authorization for identifier %s is %s, which cannot be satisfied; a fresh order "+
 					"will be placed on the next pass", targeted, cur.Status))
 		}
@@ -192,11 +200,11 @@ func (m *Manager) solveChallenges(
 		if !a.Presented {
 			chlg, err := pickDNS01(cur)
 			if err != nil {
-				return false, m.recordFailure(ctx, st, err)
+				return m.recordFailure(ctx, st, err)
 			}
 			keyAuth, err := m.keyAuth.GetKeyAuthorization(chlg.Token)
 			if err != nil {
-				return false, m.recordFailure(ctx, st, fmt.Errorf("compute the key authorization: %w", err))
+				return m.recordFailure(ctx, st, fmt.Errorf("compute the key authorization: %w", err))
 			}
 
 			// The row must describe the challenge this pass is actually solving. The token
@@ -246,7 +254,7 @@ func (m *Manager) solveChallenges(
 				a.ChallengeURL = chlg.URL
 				a.ChallengeToken = chlg.Token
 				if err := m.store.PutAuthorization(a); err != nil {
-					return false, m.recordFailure(ctx, st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
+					return m.recordFailure(ctx, st, fmt.Errorf("persist a new challenge (%s): %w", a.Identifier, err))
 				}
 			} else {
 				// The row already names the record an earlier attempt wrote, so only the refreshed
@@ -256,7 +264,7 @@ func (m *Manager) solveChallenges(
 				// the old record stays in DNS with nothing naming it. See
 				// TestAFailedWriteOnTheRevisitPathKeepsTheTokenThatNamesTheRecord.
 				if err := m.store.PutAuthorization(a); err != nil {
-					return false, m.recordFailure(ctx, st, fmt.Errorf("persist the age of a new challenge (%s): %w", a.Identifier, err))
+					return m.recordFailure(ctx, st, fmt.Errorf("persist the age of a new challenge (%s): %w", a.Identifier, err))
 				}
 				a.ChallengeURL = chlg.URL
 				a.ChallengeToken = chlg.Token
@@ -292,7 +300,7 @@ func (m *Manager) solveChallenges(
 				// so that is minutes right there).
 				rec, err := m.dns.Present(ctx, a.Identifier, chlg.Token, keyAuth)
 				if err != nil {
-					return false, m.recordFailure(ctx, st, fmt.Errorf("present TXT (%s): %w", a.Identifier, err))
+					return m.recordFailure(ctx, st, fmt.Errorf("present TXT (%s): %w", a.Identifier, err))
 				}
 
 				a.TxtName = rec.FQDN
@@ -326,7 +334,7 @@ func (m *Manager) solveChallenges(
 						"cert", c.Name, "identifier", a.Identifier, "name", a.TxtName)
 				}
 			}
-			return false, m.recordFailure(ctx, st, fmt.Errorf("persist a presented challenge (%s): %w", a.Identifier, err))
+			return m.recordFailure(ctx, st, fmt.Errorf("persist a presented challenge (%s): %w", a.Identifier, err))
 		}
 		records = append(records, DNSRecord{FQDN: a.TxtName, Value: a.TxtValue})
 		pending = append(pending, pendingEntry{row: a, targeted: targeted})
@@ -346,10 +354,10 @@ func (m *Manager) solveChallenges(
 		// AcceptChallenge and hang until the CA's order TTL. A fresh order is the only way to
 		// get fresh authorizations for the healthy names.
 		if derr := m.discardOrder(ctx, c.Name); derr != nil {
-			return false, m.recordFailure(ctx, st, fmt.Errorf(
+			return m.recordFailure(ctx, st, fmt.Errorf(
 				"%w (and discarding the order failed: %v)", invalidErr, derr))
 		}
-		return false, m.recordFailure(ctx, st, fmt.Errorf(
+		return m.recordFailure(ctx, st, fmt.Errorf(
 			"%w; the order is discarded so the next pass places a fresh one", invalidErr))
 	}
 
@@ -358,7 +366,7 @@ func (m *Manager) solveChallenges(
 		// before cleanup). Still try to clear any leftover TXT, so DNSPod's record quota does
 		// not fill up slowly.
 		m.cleanup(ctx, c.Name, authzs)
-		return true, nil
+		return nil
 	}
 
 	// Phase 2: once every TXT is written, wait once for propagation to the authoritative NS.
@@ -373,7 +381,7 @@ func (m *Manager) solveChallenges(
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			m.markResumedUnpresented(c.Name, resumed)
 		}
-		return false, m.recordFailure(ctx, st, fmt.Errorf("wait for TXT propagation: %w", err))
+		return m.recordFailure(ctx, st, fmt.Errorf("wait for TXT propagation: %w", err))
 	}
 
 	// Phase 3: only once propagation is confirmed do we tell the CA, one by one, to validate.
@@ -400,14 +408,26 @@ func (m *Manager) solveChallenges(
 		// the wildcard that is actually about to be validated keeps spending.
 		m.noteIdentifierFailure(p.targeted)
 		if err := m.core.AcceptChallenge(a.ChallengeURL); err != nil {
-			return false, m.recordFailure(ctx, st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
+			// The claim stands only if the CA actually answered. An ACME problem detail means
+			// the request arrived and was refused, so the budget may indeed have been spent.
+			// A pure transport failure -- no problem detail, the CA was never reached --
+			// spent nothing, and freezing the identifier for an hour over our own network
+			// hiccup punishes a healthy name (and every other certificate sharing it) for a
+			// failure the CA never saw. The one uncertain case, a response lost after the CA
+			// accepted the challenge, re-arms the cooldown on its own: the authorization
+			// comes back invalid on a later pass and is booked then.
+			var pd *legoacme.ProblemDetails
+			if !errors.As(err, &pd) {
+				m.clearIdentifierCooldown(p.targeted)
+			}
+			return m.recordFailure(ctx, st, fmt.Errorf("trigger validation (%s): %w", a.Identifier, err))
 		}
 		a.ChallengeSent = true
 		if err := m.store.PutAuthorization(a); err != nil {
 			// The challenge WAS accepted; only the record of it failed. Counting the pass as a
 			// failure is still right: without the row, the next pass cannot tell that this
 			// challenge is already in flight, and the pass has not finished its job.
-			return false, m.recordFailure(ctx, st, fmt.Errorf("persist that a challenge was accepted (%s): %w", a.Identifier, err))
+			return m.recordFailure(ctx, st, fmt.Errorf("persist that a challenge was accepted (%s): %w", a.Identifier, err))
 		}
 	}
 
@@ -419,12 +439,12 @@ func (m *Manager) solveChallenges(
 
 	// Phase 4: poll until everything is valid.
 	if err := m.awaitAuthorizations(ctx, pendingRows); err != nil {
-		return false, m.recordFailure(ctx, st, err)
+		return m.recordFailure(ctx, st, err)
 	}
 
 	// Phase 5: only after every validation passes do we clean up the TXT records together.
 	m.cleanup(ctx, c.Name, pendingRows)
-	return true, nil
+	return nil
 }
 
 // markResumedUnpresented flips resumed rows back to Presented=false after the

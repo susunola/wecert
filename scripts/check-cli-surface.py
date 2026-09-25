@@ -17,11 +17,10 @@ What it reads:
     docs/staging-checklist.md, which is where the operator's actual commands live.
 
 For every documented flag it requires the flag to appear in that binary's own `-h` output.
-It also pins the two conventions the documented commands depend on: `-h` exits with the
-code that binary documents (0 for wecert/preflight/clbverify, 64 for the two tools that
-treat a help request as usage), and an unknown flag exits 64 -- the repository's "the
-command line itself is wrong" code -- so a flag that is on the wrong FlagSet cannot pass by
-being absent from help alone.
+It also pins the two conventions the documented commands depend on: `-h` exits 0
+everywhere (a help request is not a command-line mistake), and an unknown flag exits 64
+-- the repository's "the command line itself is wrong" code -- so a flag that is on the
+wrong FlagSet cannot pass by being absent from help alone.
 
 Exit codes: 0 clean, 1 a documented flag is missing (or a convention broke), 2 the check
 itself could not run (a doc or a binary is missing, or the tables could not be parsed).
@@ -55,13 +54,14 @@ DEFAULT_TABLES = ("README.md", "README.reference.md")
 DEFAULT_SPANS = ("docs/staging-checklist.md",)
 
 # `-h` exit codes, measured rather than assumed. wecert, preflight and clbverify let the
-# flag package handle -h (flag.ExitOnError -> 0); wecert-onboard and wecert-probe treat a
-# help request as usage and use 64, the repository's "invalid command line" code. Both are
-# deliberate -- what this pins is that neither silently changes.
+# flag package handle -h (flag.ExitOnError -> 0); wecert-probe and wecert-onboard
+# distinguish flag.ErrHelp from a real parse error (the same split tatrun's errHelp
+# makes), so a help request is 0 there too. What this pins is that none of them silently
+# changes.
 HELP_EXIT = {
     "wecert": 0,
-    "wecert-onboard": 64,
-    "wecert-probe": 64,
+    "wecert-onboard": 0,
+    "wecert-probe": 0,
     "wecert-preflight": 0,
     "wecert-clbverify": 0,
 }

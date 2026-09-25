@@ -71,3 +71,83 @@ func TestIsNoDataOfRecord(t *testing.T) {
 		}
 	}
 }
+
+// A nil error must be a plain "no" from every predicate -- the polling loop passes whatever the
+// last call returned, and Code(nil) is safe while err.Error() on a nil error is not.
+func TestPredicatesAcceptNil(t *testing.T) {
+	if IsThrottled(nil) {
+		t.Error("IsThrottled(nil) = true, want false")
+	}
+	if IsPermanent(nil) {
+		t.Error("IsPermanent(nil) = true, want false")
+	}
+	if got := Code(nil); got != "" {
+		t.Errorf("Code(nil) = %q, want \"\"", got)
+	}
+}
+
+func TestCode(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"the typed SDK error", &tcerrors.TencentCloudSDKError{Code: CodeNoDataOfRecord}, CodeNoDataOfRecord},
+		{"the typed error, wrapped", fmt.Errorf("list TXT records: %w", &tcerrors.TencentCloudSDKError{Code: CodeNoDataOfRecord}), CodeNoDataOfRecord},
+		{"a plain error carries no code", errors.New("dnspod: ResourceNotFound.NoDataOfRecord"), ""},
+	}
+	for _, tc := range cases {
+		if got := Code(tc.err); got != tc.want {
+			t.Errorf("%s: Code = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestIsPermanent(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"a bad key", &tcerrors.TencentCloudSDKError{Code: "AuthFailure.SignatureFailure"}, true},
+		{"a missing permission", &tcerrors.TencentCloudSDKError{Code: "UnauthorizedOperation"}, true},
+		{"a malformed request", &tcerrors.TencentCloudSDKError{Code: "InvalidParameterValue.DomainNotExists"}, true},
+		// Throttling must NOT be swallowed as permanent: it is transient and only needs a
+		// longer wait (see IsThrottled).
+		{"throttling is retryable", &tcerrors.TencentCloudSDKError{Code: "RequestLimitExceeded"}, false},
+		// A "not found" is not permanent either: in a polling loop it usually means the
+		// resource has not propagated yet.
+		{"a missing resource is retryable", &tcerrors.TencentCloudSDKError{Code: CodeNoDataOfRecord}, false},
+		{"an unrecognised code is retryable", &tcerrors.TencentCloudSDKError{Code: "InternalError"}, false},
+		{"a plain error carrying the code", errors.New("describe: InvalidParameter.Foo"), true},
+		{"the typed error, wrapped", fmt.Errorf("describe domain: %w", &tcerrors.TencentCloudSDKError{Code: "AuthFailure.SecretIdNotFound"}), true},
+		{"an unrelated error", errors.New("connection reset"), false},
+	}
+	for _, tc := range cases {
+		if got := IsPermanent(tc.err); got != tc.want {
+			t.Errorf("%s: IsPermanent = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestIsThrottled(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"the typed SDK error", &tcerrors.TencentCloudSDKError{Code: "RequestLimitExceeded"}, true},
+		{"a plain error carrying the code", errors.New("dnspod: RequestLimitExceeded"), true},
+		{"a wrapped error carrying the code", fmt.Errorf("poll order: %w", errors.New("RequestLimitExceeded")), true},
+		{"a permanent error is not throttling", &tcerrors.TencentCloudSDKError{Code: "AuthFailure.SignatureFailure"}, false},
+		{"an unrelated error", errors.New("connection reset"), false},
+	}
+	for _, tc := range cases {
+		if got := IsThrottled(tc.err); got != tc.want {
+			t.Errorf("%s: IsThrottled = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

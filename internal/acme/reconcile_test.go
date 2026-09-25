@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,6 +42,14 @@ type fakeACME struct {
 	// omitAccountLocation makes /new-account answer without a Location header, which is how a
 	// registration response that carries no kid looks. Only the account tests set it.
 	omitAccountLocation atomic.Bool
+
+	// newAccounts counts newAccount calls; registrations holds the account key each one was
+	// signed with. Registration is the one request a test can tie to a specific key, because
+	// its JWS carries the account JWK rather than a kid (see registrationJWK).
+	newAccounts atomic.Int64
+
+	regMu         sync.Mutex
+	registrations []*ecdsa.PublicKey
 }
 
 func newFakeACME(t *testing.T) *fakeACME {
@@ -75,6 +85,12 @@ func newFakeACME(t *testing.T) *fakeACME {
 		})
 	})
 	mux.HandleFunc("/new-account", func(w http.ResponseWriter, r *http.Request) {
+		f.newAccounts.Add(1)
+		if key := registrationJWK(r); key != nil {
+			f.regMu.Lock()
+			f.registrations = append(f.registrations, key)
+			f.regMu.Unlock()
+		}
 		if !f.omitAccountLocation.Load() {
 			w.Header().Set("Location", "https://"+r.Host+"/acct/1")
 		}
@@ -90,6 +106,51 @@ func newFakeACME(t *testing.T) *fakeACME {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// registrationJWK decodes the public key a newAccount request was signed with.
+//
+// Registration is the one ACME request that cannot carry a kid -- the account does not exist
+// yet -- so the JWS protected header carries the account key itself as a JWK, which is how a
+// test proves WHICH key a registration used.
+func registrationJWK(r *http.Request) *ecdsa.PublicKey {
+	var body struct {
+		Protected string `json:"protected"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(body.Protected)
+	if err != nil {
+		return nil
+	}
+	var protected struct {
+		JWK struct {
+			Kty string `json:"kty"`
+			Crv string `json:"crv"`
+			X   string `json:"x"`
+			Y   string `json:"y"`
+		} `json:"jwk"`
+	}
+	if err := json.Unmarshal(raw, &protected); err != nil || protected.JWK.Kty != "EC" {
+		return nil
+	}
+	x, err := base64.RawURLEncoding.DecodeString(protected.JWK.X)
+	if err != nil {
+		return nil
+	}
+	y, err := base64.RawURLEncoding.DecodeString(protected.JWK.Y)
+	if err != nil {
+		return nil
+	}
+	return &ecdsa.PublicKey{Curve: elliptic.P256(), X: new(big.Int).SetBytes(x), Y: new(big.Int).SetBytes(y)}
+}
+
+// registeredKeys returns the account keys of every newAccount call so far, in order.
+func (f *fakeACME) registeredKeys() []*ecdsa.PublicKey {
+	f.regMu.Lock()
+	defer f.regMu.Unlock()
+	return append([]*ecdsa.PublicKey(nil), f.registrations...)
 }
 
 // selfSignedCertPEM builds a self-signed certificate with the given SANs, used to fill CertState.CertPEM.

@@ -82,15 +82,21 @@ func TestNoopDeleteOfARealIDReportsDeploymentDisabled(t *testing.T) {
 	}
 }
 
-// Nothing is deployed anywhere, so nothing can be bound.
+// Nothing is deployed anywhere, so nothing can be bound -- and that zero is the COMPLETE
+// answer (complete=true): an incomplete zero is a lower bound that callers must not read as
+// "not bound", but here nothing is bound by construction.
 func TestNoopBindingsIsZero(t *testing.T) {
 	var n Noop
 
-	got, _, err := n.Bindings(context.Background(), "cert")
+	got, complete, err := n.Bindings(context.Background(), "cert")
 	if err != nil {
 		t.Fatalf("Bindings must not fail when deployment is disabled: %v", err)
 	}
 	if got != 0 {
 		t.Errorf("Bindings = %d, want 0: deployment is disabled, so nothing is bound", got)
+	}
+	if !complete {
+		t.Error("Bindings must report the zero as complete: with deployment disabled the " +
+			"answer \"nothing is bound\" is the whole truth, not a lower bound")
 	}
 }

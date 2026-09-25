@@ -89,8 +89,8 @@ func TestFetchCVMRoleCredentialSuccess(t *testing.T) {
 	}
 }
 
-// A 200 whose body carries no usable credentials (e.g. an error payload) must not be
-// mistaken for success.
+// A 200 whose body reports a failure Code (e.g. an error payload) must be refused on the
+// Code alone -- even when it also carries credential-looking fields, those are not usable.
 func TestFetchCVMRoleCredentialEmptyCredentials(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte(`{"Code":"AuthFailure"}`))
@@ -99,11 +99,11 @@ func TestFetchCVMRoleCredentialEmptyCredentials(t *testing.T) {
 	stubMetadataURL(t, srv.URL+"/")
 
 	_, err := fetchCVMRoleCredential(context.Background(), "my-role")
-	if err == nil || !strings.Contains(err.Error(), "no usable credentials") {
-		t.Fatalf("err = %v, want the no-usable-credentials error", err)
+	if err == nil || !strings.Contains(err.Error(), `Code="AuthFailure"`) {
+		t.Fatalf("err = %v, want the server-reported Code named in the refusal", err)
 	}
-	if !strings.Contains(err.Error(), `Code="AuthFailure"`) {
-		t.Errorf("err = %v, want the server-reported Code in the message", err)
+	if !strings.Contains(err.Error(), "my-role") {
+		t.Errorf("err = %v, want the role named so the refusal is actionable", err)
 	}
 }
 

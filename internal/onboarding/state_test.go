@@ -139,3 +139,43 @@ func TestLoadStateRefusesAGroupOrWorldWritableFile(t *testing.T) {
 		t.Errorf("a state file written by Save must load, got %v", err)
 	}
 }
+
+// An unknown field must fail the load, not be dropped silently: a misspelled or renamed field
+// would otherwise leave the operator believing a grace clock or budget ledger is running when
+// it is not. spec.LoadDocument holds the same line with KnownFields.
+func TestLoadStateRefusesUnknownFields(t *testing.T) {
+	// "absentSinse" is the shape that matters: one transposed letter in a field whose whole
+	// job is the deletion grace clock.
+	path := filepath.Join(t.TempDir(), "onboard-state.json")
+	if err := os.WriteFile(path, []byte(`{"absentSince": {}, "absentSinse": {"a.example.com": "2026-01-01T00:00:00Z"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadState(path); err == nil {
+		t.Error("an unknown field must fail the load rather than be silently dropped")
+	} else if !strings.Contains(err.Error(), "parse onboarding state") {
+		t.Errorf("the error must say what could not be parsed, got %v", err)
+	}
+
+	// Trailing data after the state object is refused too, as json.Unmarshal refused it.
+	trailing := filepath.Join(t.TempDir(), "onboard-state.json")
+	if err := os.WriteFile(trailing, []byte("{}\n{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadState(trailing); err == nil {
+		t.Error("a second JSON value after the state object must fail the load")
+	}
+
+	// The control: a file with only known fields still loads, so the checks above cannot be
+	// satisfied by refusing everything.
+	good := filepath.Join(t.TempDir(), "onboard-state.json")
+	st := &State{
+		AbsentSince: map[string]time.Time{"a.example.com": time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
+		LastNames:   []string{"a.example.com"},
+	}
+	if err := st.Save(good); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadState(good); err != nil {
+		t.Errorf("a state file Save wrote must load, got %v", err)
+	}
+}

@@ -153,9 +153,27 @@ type Manager struct {
 	//
 	// The cooldown is deliberately in memory: it guards a rate-limit budget that is itself
 	// time-based and cheap to relearn, and persisting it would mean another column for state
-	// that a restart may reasonably forget.
+	// that a restart may reasonably forget. What a restart must NOT forget is re-armed from
+	// the failure ledger (see persistedCooldown).
 	identifierMu       sync.Mutex
 	identifierCooldown map[string]time.Time
+
+	// spentCertURLs records which certificate URLs this process has already booked the two
+	// certificate budgets (exact identifier set, per registered domain) for.
+	//
+	// Why it exists: download books those budgets BEFORE the notAfter and key-match gates,
+	// because the CA counts the issuance the moment the certificate exists. A certificate a
+	// gate permanently rejects is then re-downloaded -- and re-booked -- on every pass for
+	// the order's whole TTL (7 days by default), so the published remainder drains while
+	// nothing new was issued. The certificate URL identifies one issuance unambiguously, so
+	// booking it twice is pure double-counting.
+	//
+	// In memory on purpose: a restart re-books at most once per stuck order, which is the
+	// conservative direction (the estimate stays a lower bound on what is left), and a
+	// durable record would need a schema migration for bookkeeping whose subject -- the
+	// order -- expires within days anyway.
+	spentCertMu   sync.Mutex
+	spentCertURLs map[string]struct{}
 
 	// quota answers "how much of each published rate limit is left".
 	//
@@ -274,8 +292,9 @@ func (m *Manager) coolingDown(certName string, domains []string) (string, time.T
 			// three minutes after the first failure let it through -- and with several certificates
 			// sharing the identifier, one restart per round spends the whole 5-per-hour budget.
 			// The ledger the fallback already relies on records when each name last failed, so it is
-			// the authority here too.
-			if seeded, ok := m.persistedCooldown(certName, d, now); ok {
+			// the authority here too -- across certificates, because the failure may be booked under
+			// whichever certificate happened to attempt the name.
+			if seeded, ok := m.persistedCooldown(d, now); ok {
 				m.identifierCooldown[d] = seeded
 				return d, seeded, true
 			}
@@ -287,24 +306,33 @@ func (m *Manager) coolingDown(certName string, domains []string) (string, time.T
 }
 
 // persistedCooldown reports the cooldown left for an identifier according to the stored ledger.
-func (m *Manager) persistedCooldown(certName, identifier string, now time.Time) (time.Time, bool) {
+//
+// The lookup is by IDENTIFIER, across every certificate: the budget the cooldown protects
+// belongs to the name, but a failure is recorded under whichever certificate happened to fail
+// the validation. Scoping the seed to the certificate asking would let a restart drop the
+// cooldown for every OTHER certificate carrying the name -- and with N of them sharing it, one
+// restart per round spends the whole 5-per-hour budget the cooldown exists to protect.
+func (m *Manager) persistedCooldown(identifier string, now time.Time) (time.Time, bool) {
 	if identifier == "" || m.store == nil {
 		return time.Time{}, false
 	}
-	rows, err := m.store.ListIdentifierFailures(certName)
+	rows, err := m.store.ListIdentifierFailuresByIdentifier(identifier)
 	if err != nil {
 		// Unreadable evidence is not evidence of health: leave the decision to the in-memory map
 		// rather than inventing a cooldown, and the next pass retries the read.
 		return time.Time{}, false
 	}
+	var latest time.Time
 	for _, r := range rows {
-		if r.Identifier != identifier || r.LastFailedAt.IsZero() {
-			continue
+		if r.LastFailedAt.After(latest) {
+			latest = r.LastFailedAt
 		}
-		until := r.LastFailedAt.Add(identifierCooldownFor)
-		if now.Before(until) {
-			return until, true
-		}
+	}
+	if latest.IsZero() {
+		return time.Time{}, false
+	}
+	if until := latest.Add(identifierCooldownFor); now.Before(until) {
+		return until, true
 	}
 	return time.Time{}, false
 }
@@ -357,6 +385,22 @@ func (m *Manager) clearIdentifierCooldown(identifier string) {
 	m.identifierMu.Lock()
 	defer m.identifierMu.Unlock()
 	delete(m.identifierCooldown, identifier)
+}
+
+// noteCertSpend reports whether this certificate URL has NOT been booked against the
+// certificate budgets yet, and records that it now has.
+//
+// The caller spends only on true: the same order's certificate is re-downloaded on every pass
+// while a gate keeps refusing it, and each of those downloads is the SAME issuance -- the CA
+// counted it once, so the local estimate must too.
+func (m *Manager) noteCertSpend(certURL string) bool {
+	m.spentCertMu.Lock()
+	defer m.spentCertMu.Unlock()
+	if _, ok := m.spentCertURLs[certURL]; ok {
+		return false
+	}
+	m.spentCertURLs[certURL] = struct{}{}
+	return true
 }
 
 // quotaNow reports the clock the quota accounting uses.
@@ -454,6 +498,7 @@ func newManager(
 		transientBackoff:   make(map[string]time.Time),
 		orderFetchFails:    make(map[string]int),
 		identifierCooldown: make(map[string]time.Time),
+		spentCertURLs:      make(map[string]struct{}),
 		quota:              ratelimit.NewTracker(rateBucketAdapter{store: store}, log, nil),
 		// quotaNow is kept in step with m.now by SetNow, so a test that drives the clock
 		// does not leave the quota accounting reading the wall clock.

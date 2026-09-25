@@ -1,7 +1,9 @@
 # wecert example config
 #
-# Security note: this file holds a DNSPod token, so chmod 600 it and make sure it
-# is owned by the user that runs wecert.
+# Security note: this file holds a DNSPod token, so keep it unreadable to anyone but
+# root and the wecert service account. install.sh places it as /etc/wecert/config.yaml
+# with mode 0640 root:wecert; if you install by hand, match that:
+#   chown root:wecert /etc/wecert/config.yaml && chmod 0640 /etc/wecert/config.yaml
 # Tencent Cloud credentials default to the CVM role (temporary credentials, never
 # written to disk), so there is no need to put SecretId/SecretKey here.
 
@@ -455,6 +457,10 @@ metrics:
 #   # endpoint is as good as no authentication at all.
 #   token: "REPLACE_ME_WITH_A_LONG_RANDOM_SECRET"
 #
+#   # Or read the token from a 0600 file / a systemd credential instead, so it
+#   # stays out of every backup of this file:
+#   # tokenFile: ${CREDENTIALS_DIRECTORY}/wecert-webhook-token
+#
 #   # Optional. When set, every renewal attempt ends by POSTing a JSON event to
 #   # it, to wire "the certificate was renewed" into downstream flows (for example
 #   # triggering a config reload).
@@ -465,6 +471,7 @@ metrics:
 #   # raw body>, so the receiver can tell a genuine event from anything else that
 #   # can reach its URL. Generate one with: openssl rand -hex 32
 #   # notifySecret: "REPLACE_ME_WITH_A_LONG_RANDOM_SECRET"
+#   # notifySecretFile: ${CREDENTIALS_DIRECTORY}/wecert-notify-secret
 
 certificates:
   # ── one certificate = one set of domains that live and die together ──────

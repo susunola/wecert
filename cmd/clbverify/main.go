@@ -28,17 +28,34 @@ import (
 // not flag's default 2 (documented as wecert-onboard's "deliberately frozen" code).
 const exitUsage = 64
 
-// errUsage marks a command-line error; the flag package has already explained it on stderr.
+// errUsage marks a command-line error. Returned bare it means the flag package has already
+// explained the problem on stderr; wrapped in another error it only sets the classification,
+// and main prints the wrapper's message before exiting 64.
 var errUsage = errors.New("invalid command line")
 
 func main() {
 	if err := run(); err != nil {
 		if errors.Is(err, errUsage) {
+			if msg := usageExitMessage(err); msg != "" {
+				fmt.Fprintf(os.Stderr, "error: %v\n", msg)
+			}
 			os.Exit(exitUsage)
 		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// usageExitMessage is what main prints for a command-line error before exiting 64: nothing for
+// a bare errUsage (the flag package has already printed the offending flag and the usage), the
+// message itself for anything wrapping it -- "-region and -clb are required", the rejected
+// -wait combination. Those sentences used to be discarded on the way to the exit code, so a
+// missing required flag produced a silent exit 64.
+func usageExitMessage(err error) string {
+	if err == errUsage {
+		return ""
+	}
+	return err.Error()
 }
 
 // options holds every flag this command takes.
@@ -85,6 +102,10 @@ func run() error {
 	if o.region == "" || o.lbID == "" {
 		return fmt.Errorf("%w: -region and -clb are required (-listener is optional; when omitted, "+
 			"the first listener on that CLB is used)", errUsage)
+	}
+
+	if err := validateCombination(&o); err != nil {
+		return err
 	}
 
 	cred := common.NewCredential(
@@ -135,6 +156,22 @@ func run() error {
 	}, func(ctx context.Context) ([]string, error) {
 		return fetchBoundCertIDs(ctx, client, o.lbID, o.listenerID, o.domain)
 	})
+}
+
+// validateCombination refuses flag pairings that would silently do nothing.
+//
+// -wait bounds how long to poll for the -expect certificate to APPEAR. With only -not-expect the
+// first query is already the whole answer (the certificate is either gone or still bound), so the
+// polling loop below never looked at notExpect and -wait was silently ignored: the operator
+// believed the tool had waited for the unbind while it had answered from the first response.
+// Refusing the combination is this repository's rule for flags that cannot mean what they say.
+func validateCombination(o *options) error {
+	if o.wait > 0 && o.expect == "" {
+		return fmt.Errorf("%w: -wait only has an effect with -expect (it bounds the poll for the "+
+			"expected certificate to appear); with -not-expect alone the first query is already the "+
+			"answer, so this combination is refused rather than silently ignored", errUsage)
+	}
+	return nil
 }
 
 // missingCredential reports the message to return when either credential half is empty, and "" when

@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -386,6 +387,106 @@ func TestAZeroFromAPopulatedEnumerationIsReachableAndMeansZero(t *testing.T) {
 		}
 		if n.complete {
 			t.Errorf("got %+v: a region with no TotalCount key is a missing answer, not the number zero", n)
+		}
+	})
+}
+
+// The recovery path decides between its two verdicts from ONE pair of enumerations.
+//
+// The earlier shape enumerated the new certificate in the pending-first-bind check and then
+// again in the repair path -- up to three uncached full enumerations for one failed switch,
+// each a CreateCertificateBindResourceSyncTask plus up to enumerationWait of polling. This
+// pins the count, not just the outcome: the repair verdict (new bound, old not) must cost
+// exactly one enumeration per certificate.
+func TestDeployUploadedEnumeratesEachCertificateOnce(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	newCreate, newResult := bindAnswer("new-id", "task-new", 2, false)
+	oldCreate, oldResult := bindAnswer("old-id", "task-old", 0, false)
+
+	var creates []string
+	fake := &fakeSSLAPI{
+		updateFn: func(_ context.Context, _ *ssl.UpdateCertificateInstanceRequest) (*ssl.UpdateCertificateInstanceResponse, error) {
+			return nil, errNothingToSwitch{}
+		},
+		createTaskFn: func(_ context.Context, req *ssl.CreateCertificateBindResourceSyncTaskRequest) (*ssl.CreateCertificateBindResourceSyncTaskResponse, error) {
+			if len(req.CertificateIds) == 0 {
+				t.Fatal("the enumeration request carried no certificate id")
+			}
+			id := derefStr(req.CertificateIds[0])
+			creates = append(creates, id)
+			if id == "old-id" {
+				return oldCreate, nil
+			}
+			return newCreate, nil
+		},
+		taskResultFn: func(_ context.Context, req *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			if derefStr(req.TaskIds[0]) == "task-old" {
+				return oldResult, nil
+			}
+			return newResult, nil
+		},
+	}
+
+	got, err := d.deployUploaded(context.Background(), fake, "c", "old-id", "new-id")
+	if err != nil {
+		t.Fatalf("the repair path should have accepted the complete answer: %v", err)
+	}
+	if got != "new-id" {
+		t.Errorf("repaired ID = %q, want new-id", got)
+	}
+	want := map[string]int{"new-id": 1, "old-id": 1}
+	gotCounts := map[string]int{}
+	for _, id := range creates {
+		gotCounts[id]++
+	}
+	for id, n := range want {
+		if gotCounts[id] != n {
+			t.Errorf("certificate %s was enumerated %d time(s), want %d (every enumeration is a "+
+				"fresh CreateCertificateBindResourceSyncTask plus its polling budget)", id, gotCounts[id], n)
+		}
+	}
+}
+
+// A task whose Error is set but carries no Message still failed.
+//
+// The check used to require a non-empty Message, so `{"Error": {}}` -- or an Error holding
+// only a Code -- read as "not finished yet" and the caller spun until the enumeration budget
+// expired, reporting a timeout for a task that had already answered.
+func TestATaskErrorWithoutAMessageStillFails(t *testing.T) {
+	t.Run("error with only a code", func(t *testing.T) {
+		resp := unmarshalBindResult(t, `{
+			"Response": {
+				"SyncTaskBindResourceResult": [{
+					"TaskId": "task-1", "Status": 1,
+					"Error": {"Code": "FailedOperation.SomethingBroke"},
+					"BindResourceResult": []
+				}]
+			}
+		}`)
+		_, _, err := countBindings(resp, "task-1")
+		if err == nil {
+			t.Fatal("an Error with only a Code must fail the enumeration")
+		}
+		if !strings.Contains(err.Error(), "FailedOperation.SomethingBroke") {
+			t.Errorf("the code is the only description there is; it must survive, got: %v", err)
+		}
+	})
+
+	t.Run("error with neither code nor message", func(t *testing.T) {
+		resp := unmarshalBindResult(t, `{
+			"Response": {
+				"SyncTaskBindResourceResult": [{
+					"TaskId": "task-1", "Status": 1,
+					"Error": {},
+					"BindResourceResult": []
+				}]
+			}
+		}`)
+		if _, _, err := countBindings(resp, "task-1"); err == nil {
+			t.Fatal("a present-but-empty Error must fail the enumeration, not spin until the budget expires")
 		}
 	})
 }

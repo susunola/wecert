@@ -116,6 +116,105 @@ func TestNotifyURLWarnings(t *testing.T) {
 	}
 }
 
+// The warning names scheme://host and nothing more: the URL's path (and userinfo) IS
+// the credential, and the warning lands on stderr, which systemd keeps in journald.
+func TestNotifyURLWarningsRedactTheCredential(t *testing.T) {
+	const secret = "T00000000abcdef0123456789"
+
+	w := notifyURLWarnings("http://user:password0@hooks.example.com/" + secret)
+	if len(w) != 1 {
+		t.Fatalf("http to a non-loopback host must warn, got %v", w)
+	}
+	if !strings.Contains(w[0], "http://hooks.example.com") {
+		t.Errorf("the warning must name the scheme and host, got %q", w[0])
+	}
+	if strings.Contains(w[0], secret) || strings.Contains(w[0], "user:password0") {
+		t.Errorf("the warning must not carry the credential or userinfo, got %q", w[0])
+	}
+
+	// The re-parse failure branch is drift between normalize and this helper; it must
+	// be loud AND redacted, because url.Error's message embeds the full input URL.
+	w = notifyURLWarnings("http://exa mple.com/" + secret)
+	if len(w) != 1 {
+		t.Fatalf("an unparseable URL must produce the drift warning, got %v", w)
+	}
+	if strings.Contains(w[0], secret) {
+		t.Errorf("the drift warning must not carry the URL, got %q", w[0])
+	}
+}
+
+// The load-time errors must obey the same rule as the warnings: url.Error embeds the
+// full input URL, and "got %q" printed it verbatim.
+func TestNotifyURLValidationDoesNotLeakTheURL(t *testing.T) {
+	const secret = "abcdef0123456789"
+	for _, u := range []string{
+		"ftp://user:password0@hooks.example.com/" + secret, // wrong scheme
+		"https://",                      // no host
+		"http://exa mple.com/" + secret, // unparseable
+	} {
+		body := minimalPrefix + `
+webhook:
+  notifyURL: "` + u + `"
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+		_, err := Load(writeConfig(t, body))
+		if err == nil {
+			t.Errorf("notifyURL %q must be rejected", u)
+			continue
+		}
+		if !strings.Contains(err.Error(), "notifyURL") {
+			t.Errorf("notifyURL %q: the error must name the field, got %v", u, err)
+		}
+		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "user:") {
+			t.Errorf("the error must not carry the URL's path or userinfo, got %v", err)
+		}
+	}
+}
+
+// acme.directory is an API endpoint the account key speaks to, so it must be a real
+// https URL -- with one explicit exception: http to loopback is how a local test CA
+// (Pebble) is wired up.
+func TestACMEDirectoryMustBeHTTPSExceptOnLoopback(t *testing.T) {
+	withDirectory := func(directory string) string {
+		return strings.Replace(minimalPrefix,
+			"  directory: https://acme-staging-v02.api.letsencrypt.org/directory\n",
+			"  directory: \""+directory+"\"\n", 1) + `certificates:
+  - name: t
+    domains: ["example.com"]
+`
+	}
+
+	for _, directory := range []string{
+		"http://acme.example.com/directory",
+		"http://10.0.0.5:4000/directory",
+		"ftp://acme.example.com/directory",
+		"acme.example.com/directory",
+		"https://",
+	} {
+		_, err := Load(writeConfig(t, withDirectory(directory)))
+		if err == nil {
+			t.Errorf("directory %q must be rejected", directory)
+			continue
+		}
+		if !strings.Contains(err.Error(), "acme.directory") {
+			t.Errorf("directory %q: the error must name the field, got %v", directory, err)
+		}
+	}
+
+	for _, directory := range []string{
+		"http://127.0.0.1:14000/dir",
+		"http://[::1]:14000/dir",
+		"http://localhost:14000/dir",
+		"https://acme-v02.api.letsencrypt.org/directory",
+	} {
+		if _, err := Load(writeConfig(t, withDirectory(directory))); err != nil {
+			t.Errorf("directory %q must be accepted, got %v", directory, err)
+		}
+	}
+}
+
 // Binding beyond loopback widens the exposure of /metrics and of the token-guarded
 // trigger endpoint. Sometimes that is exactly what is wanted (a Prometheus scraper on
 // another host), so it warns rather than refuses.
@@ -153,6 +252,24 @@ func TestConfigPermWarnings(t *testing.T) {
 	}
 	if w := configPermWarnings("/etc/wecert/config.yaml", 0o644, nil); len(w) != 0 {
 		t.Errorf("a 0644 config without inline secrets must not warn, got %v", w)
+	}
+}
+
+// The warning must name an alternative that actually exists for each field: webhook's
+// secrets have file variants but no environment fallback, and pointing at a
+// nonexistent one sends the operator on a chase through the documentation.
+func TestConfigPermWarningsNamesAnAlternativeThatExists(t *testing.T) {
+	w := configPermWarnings("/etc/wecert/config.yaml", 0o644, []string{"webhook.token", "webhook.notifySecret"})
+	if len(w) != 1 {
+		t.Fatalf("a 0644 config carrying inline webhook secrets must warn, got %v", w)
+	}
+	if !strings.Contains(w[0], "webhook.tokenFile") || !strings.Contains(w[0], "webhook.notifySecretFile") {
+		t.Errorf("the warning must point at the file variants, got %q", w[0])
+	}
+
+	w = configPermWarnings("/etc/wecert/config.yaml", 0o644, []string{"dns.loginToken"})
+	if len(w) != 1 || !strings.Contains(w[0], "loginTokenFile") || !strings.Contains(w[0], EnvDNSPodLoginToken) {
+		t.Errorf("the dns warning must name both the file variant and the environment variable, got %v", w)
 	}
 }
 

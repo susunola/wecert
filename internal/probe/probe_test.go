@@ -8,11 +8,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -652,6 +654,55 @@ func TestResolveFailureMarksProbeMatchZero(t *testing.T) {
 	}
 }
 
+// A host that still resolves but where NO address completes a handshake must not keep a stale
+// probe_match of 1 either.
+//
+// It is a third branch, not the resolve failure above and not the partial failure: probeAll
+// succeeded (DNS answered with addresses), every one of those addresses was dialled, and every
+// dial failed. That is the shape of a listener deleted at the CLB, a security group closed on
+// every backend, or a timeout on all of them -- the endpoint serves nothing at all.
+//
+// The branch called ClearProbeAnswer, which drops not_after and trusted, so the stale 1 was left
+// with nothing to contradict it: the dashboard read "match = 1" for a host nobody could reach, and
+// the documented alert on probe_match == 0 never fired.
+func TestNoAddressCompletedAHandshakeMarksProbeMatchZero(t *testing.T) {
+	const host = "nothing-answers.example"
+	cert := makeCert(t, []string{host},
+		time.Now().Add(-time.Hour), time.Now().Add(60*24*time.Hour))
+	good := resultFromCert(t, cert, host)
+	expectation := Expectation{Domains: []string{host}, NotAfter: good.NotAfter}
+
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{{Address: "192.0.2.10:443", Result: good}}, nil
+	}
+	if v := r.Check(context.Background(), host, expectation); !v.OK {
+		t.Fatalf("the priming round should pass, got: %s", v.Summary())
+	}
+	if got := testutil.ToFloat64(metrics.CertificateProbeMatch.WithLabelValues(host)); got != 1 {
+		t.Fatalf("probe_match should be 1 after a clean round, got %v", got)
+	}
+
+	// The name still resolves -- so this is not the resolve-failure branch -- but every address
+	// fails the handshake. Two addresses, so it is not the single-address case either.
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return []Attempt{
+			{Address: "192.0.2.10:443", Err: context.DeadlineExceeded},
+			{Address: "192.0.2.11:443", Err: context.DeadlineExceeded},
+		}, nil
+	}
+	if v := r.Check(context.Background(), host, expectation); v.OK {
+		t.Fatal("a host where no address completed a handshake must not pass")
+	}
+	if got := testutil.ToFloat64(metrics.CertificateProbeMatch.WithLabelValues(host)); got != 0 {
+		t.Errorf("probe_match must drop to 0 when no address completed a handshake, got %v (stale 1)", got)
+	}
+	// And no series is left behind claiming to describe a certificate that was never read.
+	if got := testutil.ToFloat64(metrics.CertificateProbeNotAfter.WithLabelValues(host)); got != 0 {
+		t.Errorf("probe_not_after must not survive a round that read no certificate, got %v", got)
+	}
+}
+
 // A name with more addresses than the cap is reported as unverified, never sampled.
 //
 // Every resolved address has to be checked -- a rebind takes effect per backend -- so "here are the
@@ -957,6 +1008,274 @@ func TestAnswerIsRaceFreeUnderConcurrentChecks(t *testing.T) {
 		}
 		if !a.NotAfter.Equal(want.NotAfter) {
 			t.Errorf("%s: NotAfter is %v, want %v", host, a.NotAfter, want.NotAfter)
+		}
+	}
+}
+
+// ── The transition line must name the actual problem class ─────────────────────────
+
+// The transition line is what the CRITICAL alert's annotation repeats, so it must name
+// what Verify actually found: "not the one that was deployed" sends the operator to CLB
+// bindings, SNI and the deploy path -- the wrong direction entirely when the served
+// certificate IS the deployed one and the problem is a broken chain or an expired leaf.
+func TestMismatchMessageNamesTheActualProblemClass(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		problems []Problem
+		want     string
+	}{
+		{"untrusted only", []Problem{{Kind: ProblemUntrusted}},
+			"the certificate being served does not verify against the system roots"},
+		{"outside validity window only", []Problem{{Kind: ProblemValidityWindow}},
+			"the certificate being served is expired or not yet valid"},
+		{"validity floor only", []Problem{{Kind: ProblemMinValidFor}},
+			"the certificate being served has less validity left than required"},
+		{"not covered only", []Problem{{Kind: ProblemNotCovered}},
+			"the certificate being served does not cover this name"},
+		// The mix that used to fall into the default: the deployed certificate IS
+		// being served, expiring AND with a chain no client accepts.
+		{"validity floor and untrusted", []Problem{{Kind: ProblemMinValidFor}, {Kind: ProblemUntrusted}},
+			"the certificate being served is the deployed one, but it is currently not usable"},
+		{"a different certificate", []Problem{{Kind: ProblemNotAfter}},
+			"the certificate being served is not the one that was deployed"},
+		{"name problems stay wrong-certificate", []Problem{{Kind: ProblemNotCovered}, {Kind: ProblemNotAfter}},
+			"the certificate being served is not the one that was deployed"},
+	} {
+		if got := mismatchMessage(tc.problems); got != tc.want {
+			t.Errorf("%s: mismatchMessage = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// ── The validity window is not opt-in ───────────────────────────────────────────────
+
+// An expired certificate must fail even when nothing asked about validity.
+//
+// Verify's only clock checks used to be opt-in: RequireTrusted covers the chain and
+// MinValidFor a remaining-validity floor. With both off -- the default for a plain probe
+// -- a certificate whose names and notAfter matched the expectation came back OK while
+// every client rejected it as expired: exactly the false green this package exists to
+// rule out.
+func TestVerifyRejectsAnExpiredCertificateWithoutBeingAsked(t *testing.T) {
+	port := startServer(t, makeCert(t, []string{"localhost"},
+		time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour)))
+	res := probeLocalhost(t, port)
+
+	v := res.Verify(Expectation{})
+	if v.OK {
+		t.Fatal("an expired certificate must not pass with every policy check off")
+	}
+	found := false
+	for _, p := range v.Problems {
+		if p.Kind == ProblemValidityWindow {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the problem must be ProblemValidityWindow, got %+v", v.Problems)
+	}
+}
+
+// The other direction of the window: a certificate whose validity has not started yet.
+func TestVerifyRejectsANotYetValidCertificate(t *testing.T) {
+	port := startServer(t, makeCert(t, []string{"localhost"},
+		time.Now().Add(time.Hour), time.Now().Add(60*24*time.Hour)))
+	res := probeLocalhost(t, port)
+
+	v := res.Verify(Expectation{})
+	if v.OK {
+		t.Fatal("a not-yet-valid certificate must not pass")
+	}
+	if !strings.Contains(v.Summary(), "not valid until") {
+		t.Errorf("it should say when validity starts, got: %s", v.Summary())
+	}
+}
+
+// With no certificate captured, Verify must report exactly that -- and not pile on
+// "different notAfter", "too little validity left" and "outside the validity window" for
+// the zero times a missing leaf leaves behind. Checks 2 and 5 already guarded on r.cert;
+// 3 and 4 did not.
+func TestVerifyWithoutACertificateReportsOnlyThat(t *testing.T) {
+	res := &Result{Host: "example.com"} // no leaf: the zero times must not double-report
+	v := res.Verify(Expectation{
+		Domains:        []string{"example.com"},
+		NotAfter:       time.Now().Add(24 * time.Hour),
+		MinValidFor:    time.Hour,
+		RequireTrusted: true,
+	})
+	if v.OK {
+		t.Fatal("no certificate cannot be OK")
+	}
+	if len(v.Problems) != 1 || v.Problems[0].Kind != ProblemNoCertificate {
+		t.Errorf("want exactly ProblemNoCertificate, got %+v", v.Problems)
+	}
+}
+
+// ── Shutdown is not an environment failure ──────────────────────────────────────────
+
+// A cancelled context is the daemon shutting down, not a host that became unreachable.
+//
+// The error branch used to treat it as one: probe_errors incremented, probe_match forced
+// to 0, ClearProbeAnswer deleting the notAfter/trusted series and an ERROR-level
+// transition logged -- a full "environment is broken" record for a process that was
+// simply stopping, which then pages whoever is on call for the wrong reason.
+func TestCancelledContextWritesNoMetricsOrState(t *testing.T) {
+	const host = "cancelled-shutdown.example"
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		return nil, context.Canceled
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	v := r.Check(ctx, host, Expectation{Domains: []string{host}})
+	if v.OK {
+		t.Fatal("a cancelled probe cannot be OK")
+	}
+	if got := r.LastState(host); got != "" {
+		t.Errorf("a cancelled probe must not record a state transition, got %q", got)
+	}
+	// The error counter is the discriminating series: it only ever increases, so 0 here
+	// means the cancelled round truly wrote nothing. (probe_match cannot tell "never
+	// written" from "written 0" -- reading the gauge creates the child either way.)
+	if got := testutil.ToFloat64(metrics.CertificateProbeErrors.WithLabelValues(host)); got != 0 {
+		t.Errorf("a cancelled probe must not count as a probe error, got %v", got)
+	}
+}
+
+// The same rule when the resolution succeeded and the context died during the dials:
+// every cancelled dial would otherwise count as a probe error, and the whole-addresses-
+// failed branch would record an unreachable transition.
+func TestCancelledDuringDialsWritesNoMetricsOrState(t *testing.T) {
+	const host = "cancelled-mid-probe.example"
+	ctx, cancel := context.WithCancel(context.Background())
+	r := NewRunner(Options{}, 0, nil)
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		cancel() // the context dies while the answers are coming back
+		return []Attempt{{Address: "192.0.2.10:443", Err: context.Canceled}}, nil
+	}
+
+	v := r.Check(ctx, host, Expectation{Domains: []string{host}})
+	if v.OK {
+		t.Fatal("a cancelled probe cannot be OK")
+	}
+	if got := r.LastState(host); got != "" {
+		t.Errorf("a cancelled probe must not record a state transition, got %q", got)
+	}
+	if got := testutil.ToFloat64(metrics.CertificateProbeErrors.WithLabelValues(host)); got != 0 {
+		t.Errorf("cancelled dials must not count as probe errors, got %v", got)
+	}
+}
+
+// ── Per-host serialization ──────────────────────────────────────────────────────────
+
+// Two Checks for the SAME host must never overlap.
+//
+// Two certificates can cover one name, and the reconciler dials a certificate's names
+// concurrently, so the same host can legitimately be checked twice at once. Unserialized,
+// the two interleave their metric writes and their state transitions: transition() then
+// never sees the same state twice in a row for that host, the dedup never fires, and a
+// persistent mismatch re-alerts every single round.
+func TestCheckSerializesOneHost(t *testing.T) {
+	r := NewRunner(Options{}, 0, nil)
+	var inFlight, maxSeen atomic.Int32
+	r.probeAll = func(context.Context, string, Options) ([]Attempt, error) {
+		n := inFlight.Add(1)
+		for {
+			if m := maxSeen.Load(); n <= m || maxSeen.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		inFlight.Add(-1)
+		return nil, errors.New("no such host")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.Check(context.Background(), "shared.example", Expectation{Domains: []string{"shared.example"}})
+		}()
+	}
+	wg.Wait()
+
+	if got := maxSeen.Load(); got != 1 {
+		t.Errorf("checks of one host overlapped: %d were in flight at once, so the "+
+			"transition dedup never fires and every round re-alerts", got)
+	}
+}
+
+// The serialization is PER HOST: different hosts must still probe in parallel, or one
+// slow host would stall every other certificate's probe behind it.
+func TestCheckSerializesPerHostOnly(t *testing.T) {
+	r := NewRunner(Options{}, 0, nil)
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	r.probeAll = func(_ context.Context, host string, _ Options) ([]Attempt, error) {
+		entered <- host
+		<-release
+		return nil, errors.New("no such host")
+	}
+
+	var wg sync.WaitGroup
+	for _, host := range []string{"a.example", "b.example"} {
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			r.Check(context.Background(), h, Expectation{Domains: []string{h}})
+		}(host)
+	}
+
+	// Both must be inside probeAll before either is released: if the lock were global,
+	// the second receive would never happen and the first Check would wait forever.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the second host never entered probeAll: the serialization is global, not per-host")
+		}
+	}
+	close(release)
+	wg.Wait()
+}
+
+// ── Options validation and address deduplication ────────────────────────────────────
+
+// Options are validated before any DNS lookup: an invalid port or an absurd timeout is a
+// caller/configuration error, and reporting it as "could not resolve" sends the diagnosis
+// to DNS for a mistake that is in the arguments. (The config layer floors probe.timeout
+// at 1s; the maximum here is the other end -- the timeout is the per-address budget, so
+// past it a probe is stalled, not patient.)
+func TestProbeRejectsAnOutOfRangePort(t *testing.T) {
+	for _, port := range []int{-1, 70000} {
+		_, err := Probe(context.Background(), "example.com", Options{Port: port})
+		if err == nil || !strings.Contains(err.Error(), "port") {
+			t.Errorf("port %d: want a port validation error before any lookup, got %v", port, err)
+		}
+	}
+}
+
+func TestProbeRejectsAnAbsurdTimeout(t *testing.T) {
+	_, err := Probe(context.Background(), "example.com", Options{Timeout: maxProbeTimeout + time.Second})
+	if err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("a timeout past the maximum must be rejected before any lookup, got %v", err)
+	}
+}
+
+// The same resolved address twice is dialled twice for no extra evidence -- and counted
+// twice against the address cap. A hosts-file line next to the DNS answer is enough to
+// produce the duplicate.
+func TestDedupeAddrs(t *testing.T) {
+	got := dedupeAddrs([]string{"10.0.0.2", "10.0.0.1", "10.0.0.2", "2001:db8::1", "10.0.0.1"})
+	want := []string{"10.0.0.2", "10.0.0.1", "2001:db8::1"}
+	if len(got) != len(want) {
+		t.Fatalf("dedupeAddrs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dedupeAddrs = %v, want %v (order must be preserved)", got, want)
 		}
 	}
 }

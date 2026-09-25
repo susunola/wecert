@@ -138,7 +138,13 @@ func (r *run) resolve() {
 		// expanded name as written, so a wildcard rule covers "*.example.com" and not the
 		// apex -- that asymmetry is real and is why both names are checked separately.
 		if r.o.opts.RequireRule && !r.guardUnavailable && !r.anyNameServed(d) {
-			r.reject(d.Hostname, "no CLB rule serves this name (guard 1 not satisfied)")
+			// One verdict per NAME the declaration contributes, as in the allowlist branch
+			// above: a wildcard declaration contributes both the apex and *.<host>, and
+			// rejecting only d.Hostname left the wildcard with no verdict at all in the one
+			// artifact an operator reads to find out why nothing was issued.
+			for _, n := range d.Names() {
+				r.reject(n, "no CLB rule serves this name (guard 1 not satisfied)")
+			}
 			continue
 		}
 
@@ -259,6 +265,7 @@ func (r *run) applyGrace() {
 		switch {
 		case r.o.opts.Force:
 			r.reject(n, "removed: -force was used, so the grace period and the reference check were skipped")
+			r.removed[n] = true
 
 		case r.guardUnavailable:
 			// With the guard unreadable we cannot say whether the name is still served,
@@ -287,6 +294,7 @@ func (r *run) applyGrace() {
 			// hold before removal is allowed.
 			r.reject(n, fmt.Sprintf("removed: confirmed absent for %s, past the %s grace period, "+
 				"and no CLB rule references it", humanDuration(age), humanDuration(r.o.opts.GracePeriod)))
+			r.removed[n] = true
 		}
 	}
 

@@ -85,15 +85,43 @@ func Write(path string, data []byte, perm os.FileMode) error {
 	return Install(tmpName, path, perm, dir)
 }
 
-// Install moves an already-written temporary file into place and makes the rename durable.
+// Install moves an already-written temporary file into place and makes both the contents and the
+// rename durable.
 //
 // For callers whose temporary file is produced by something else -- internal/state's snapshots are
 // written by SQLite's VACUUM INTO, which refuses to write into an existing file -- but who want the
 // same permissions-before-rename and directory-sync guarantees.
 //
+// The temporary file is fsynced here, before the rename: the package promise is that the new
+// contents survive a power loss, and "the caller surely synced it already" is exactly the kind of
+// implicit precondition that drifts the next time a caller appears. Write therefore pays one
+// extra, nearly free fsync of an already-clean file rather than exempt itself. The sync follows
+// the chmod so the permissions are part of what reaches the disk.
+//
+// dir must be the directory that holds path: it is the directory synced after the rename, and a
+// wrong one would make that sync succeed quietly while the rename itself stays volatile. It is a
+// parameter at all because a caller may already hold the directory open or know it by another
+// route; anything but filepath.Dir(path) is reported rather than trusted.
+//
+// Unlike Write, Install does not refuse a symlinked TARGET. Write's refusal exists because Write
+// replaces the user-facing document path, where an operator may have placed a link and the
+// desired-state reader applies the same rule; Install's callers are internal/state's restore and
+// snapshot paths, whose targets are store files wecert itself manages. The temporary file -- the
+// side a mistaken or malicious swap could actually redirect -- is checked below instead.
+//
 // It takes ownership of tmpPath: on success the caller must not touch it again, and on failure it is
 // left in place for the caller's own cleanup (the caller knows which cleanup its writer needs).
+// A crash between the write and the rename leaves the temporary file behind and nothing in this
+// package sweeps it: a sweeper cannot tell a leftover from an in-flight write without the writer's
+// lock, so the files are made recognisable instead (see TempPrefix and IsTemp), and internal/state
+// sweeps the temporary names it owns itself.
 func Install(tmpPath, path string, perm os.FileMode, dir string) error {
+	// dir is synced after the rename; pointing it at the wrong directory would make that sync
+	// succeed while the rename itself is never made durable.
+	if filepath.Clean(dir) != filepath.Dir(path) {
+		return fmt.Errorf("install %s: the directory to sync (%s) is not the file's directory (%s)",
+			path, dir, filepath.Dir(path))
+	}
 	// chmod(2) follows symlinks, and both callers hand this function a name they created -- but
 	// "a name we created a moment ago" is not a property chmod can check, and the failure mode is
 	// ugly: the mode of an unrelated file changes, and the symlink itself is installed under the
@@ -114,6 +142,23 @@ func Install(tmpPath, path string, perm os.FileMode, dir string) error {
 	}
 	if err := os.Chmod(tmpPath, perm); err != nil {
 		return fmt.Errorf("set the permissions of %s: %w", path, err)
+	}
+	// fsync the contents before the rename, so the package promise -- the new contents survive a
+	// power loss -- holds for every caller and not only for those whose writer happened to sync.
+	// Write already synced this file before closing it; the second sync is nearly free, and the
+	// alternative is an implicit precondition ("the caller surely synced") of exactly the kind
+	// that drifted the last time this protocol lived in more than one place. The sync follows the
+	// chmod so the permissions are part of what is durable.
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		return fmt.Errorf("install %s: %w", path, err)
+	}
+	if err := syncFile(f); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", path, err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace %s: %w", path, err)

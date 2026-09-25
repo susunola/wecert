@@ -151,7 +151,9 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		// Deferred functions run last-in-first-out, so this runs before the claim is released.
 		defer func() {
 			if r.quotaPasses.Add(-1) == 0 {
-				r.publishQuota(res)
+				// Panic-safe: this runs on the pass's background goroutine, past
+				// reconcileOne's recover, so an unrecovered panic here is process-fatal.
+				r.passStepPanicSafe("publish the quota gauges", func() { r.publishQuota(res) })
 			}
 		}()
 
@@ -224,6 +226,12 @@ func (r *Reconciler) drainingNow() bool {
 // just triggered. A resolve failure is an error, not an empty result: reporting
 // "accepted: all certificates" (from the last good cache) while nothing started
 // is exactly the lie this return value exists to prevent.
+//
+// A non-nil error therefore means one of two things, and the buckets say which: the desired
+// state could not be read (nothing started, both lists are empty), or a shutdown began
+// mid-walk -- in the latter case the lists are the PARTIAL answer: every name already in
+// `accepted` was registered and is waited for by Drain, exactly as StartNamed documents, so
+// discarding them would report a running pass as one that was refused.
 func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, err error) {
 	if r.drainingNow() {
 		// Answer for the whole trigger at once. Reporting every certificate as "skipped" would
@@ -273,6 +281,12 @@ func (r *Reconciler) Drain(ctx context.Context) error {
 	r.bgMu.Unlock()
 
 	done := make(chan struct{})
+	// On the timeout path this goroutine outlives the return: it stays parked in Wait until
+	// the in-flight passes finish. That is bounded -- Drain is the shutdown path and runs
+	// once per process, so at most one such goroutine exists, and it cannot block forever
+	// because a pass's own work is bounded by the CA and store timeouts above it. A
+	// "cancellable Wait" would need a second WaitGroup per call, which is more machinery than
+	// a single parked goroutine at exit is worth.
 	go func() {
 		r.bg.Wait()
 		close(done)

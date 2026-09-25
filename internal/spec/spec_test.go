@@ -513,6 +513,28 @@ func TestNewFileFailsWhenThereIsNothingToFallBackTo(t *testing.T) {
 	}
 }
 
+// NewFile must tolerate a nil logger: the freeze path logs through f.log, and a nil
+// *slog.Logger panics there. NewObserver already falls back to slog.Default; the file
+// source does the same.
+func TestNewFileToleratesANilLogger(t *testing.T) {
+	path := writeDoc(t, testDoc(t))
+	f, err := NewFile(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	// The freeze path calls f.log.Warn; with the fallback this must not panic.
+	res, err := f.DesiredWithReasons(context.Background())
+	if err != nil {
+		t.Fatalf("an unreadable document must freeze, not error: %v", err)
+	}
+	if !res.Frozen {
+		t.Error("the result must be marked frozen")
+	}
+}
+
 // ── Observer: the static -> enforce migration step ───────────────────────────────────
 
 // Observe mode must converge on the PRIMARY source. It is a reporting step, and if the shadow

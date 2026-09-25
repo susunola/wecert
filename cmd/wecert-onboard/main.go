@@ -110,6 +110,10 @@ Flags:
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		// flag.ContinueOnError has already printed the error and the usage to fs.Output();
 		// returning the error here would make main print it a second time.
+		// -h is not a usage error: the operator asked for help and got it (tatrun agrees).
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK, nil
+		}
 		return exitUsage, nil
 	}
 	if *showVer {
@@ -211,7 +215,14 @@ Flags:
 		// stale -- and the report file is what monitoring watches. Publish a minimal
 		// frozen report carrying the failure as its reason, best effort: the exit code
 		// and stderr carry the error either way.
-		writeFailureReport(report, err)
+		//
+		// A dry run is exempt: it promises to write nothing at all, and it holds no lock,
+		// so a report written here could race the report of a real run happening
+		// concurrently. The non-dry-run call is made while holding the state lock, so it
+		// cannot race a peer.
+		if !*dryRun {
+			writeFailureReport(report, err)
+		}
 		return exitError, err
 	}
 
@@ -408,6 +419,10 @@ func printDecisions(w io.Writer, ds []spec.Decision) {
 //
 // Best effort on purpose: the exit code and stderr already carry the error, so a report
 // that cannot be written (the same broken directory usually holds it) is only warned about.
+//
+// Callers: only a real (non-dry-run) round, while holding the state lock. A dry run must not
+// call this -- it promises to write nothing, and without the lock its write could race a
+// concurrent real run's report.
 func writeFailureReport(path string, cause error) {
 	if path == "" {
 		return
