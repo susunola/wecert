@@ -247,7 +247,7 @@ func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
 		return "", err
 	}
 	if len(t.HMACKey) > 0 {
-		if err := verifySFTPSignature(t, src); err != nil {
+		if err := verifySFTPSignature(ctx, t, src); err != nil {
 			_ = os.Remove(src)
 			return "", err
 		}
@@ -255,8 +255,20 @@ func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
 	return src, nil
 }
 
-func verifySFTPSignature(t Target, src string) error {
-	sess, err := openSFTP(context.Background(), t)
+// verifySFTPSignature reads the remote .hmac sidecar and checks the downloaded snapshot against it.
+//
+// It opens a **second** SFTP connection, and that connection is bounded by the caller's context:
+// DownloadLatest put target.Timeout on it. Dialing with context.Background() discarded that
+// deadline -- openSFTP only calls SetDeadline when the context has one -- so a server that accepted
+// TCP and then never sent its SSH banner held the restore open for ever. Only reachable with a
+// signing key configured, which is the recommended shape.
+//
+// One budget for the whole restore, not one per phase: a download that consumes the timeout leaves
+// the signature read nothing, and the restore then fails with "snapshot signature: connect SFTP ...
+// i/o timeout" instead of hanging. That is the intended trade-off -- target.Timeout is the promise
+// the caller made about how long a restore may take.
+func verifySFTPSignature(ctx context.Context, t Target, src string) error {
+	sess, err := openSFTP(ctx, t)
 	if err != nil {
 		return fmt.Errorf("snapshot signature: %w", err)
 	}
@@ -286,6 +298,16 @@ func verifySFTPSignature(t Target, src string) error {
 	return VerifySnapshot(t.HMACKey, data, string(sig))
 }
 
+// uploadingSuffix marks an SFTP upload in flight: uploadSFTP writes this sibling and renames it
+// only after Close succeeds.
+//
+// A leftover of this shape is not a snapshot, and both listings have to say so. It sorts AFTER the
+// snapshot it was going to become, so treating it as one made a restore pick a half-written file
+// over the last complete snapshot beside it (state.Restore then rejects it on integrity_check, and
+// the operator gets a failed restore while a good snapshot sits in the same directory), and made
+// retention count it against Keep -- evicting a real recovery point to keep the garbage.
+const uploadingSuffix = ".uploading-"
+
 func downloadSFTPFile(ctx context.Context, t Target, dir string) (string, error) {
 	session, err := openSFTP(ctx, t)
 	if err != nil {
@@ -298,7 +320,8 @@ func downloadSFTPFile(ctx context.Context, t Target, dir string) (string, error)
 	}
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasPrefix(e.Name(), t.SnapshotBase+".backup-") && !strings.HasSuffix(e.Name(), ".hmac") {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), t.SnapshotBase+".backup-") &&
+			!strings.HasSuffix(e.Name(), ".hmac") && !strings.Contains(e.Name(), uploadingSuffix) {
 			names = append(names, e.Name())
 		}
 	}
@@ -675,27 +698,44 @@ func uploadSFTP(ctx context.Context, t Target, src string) error {
 	return nil
 }
 
+// pruneSFTP keeps the newest t.Keep snapshots.
+//
+// current is the name just published, and it is a candidate like any other -- exactly as it is in
+// pruneS3, which lists the object it just wrote too. Excluding it made the signed-upload path wrong,
+// because that path uploads twice and prunes twice: the first pass publishes the snapshot, the
+// second publishes its .hmac sidecar, and on that second pass "the file just published" is the
+// sidecar's name, so the snapshot it belongs to looked like an old sibling. With keep: 1 that
+// deleted the only recovery point (the remote ended up empty) and with keep: N it left N-1
+// (the default 7 left 6). Counting every snapshot, including the newest, is idempotent for both
+// passes.
 func pruneSFTP(client *sftp.Client, t Target, current string) error {
 	entries, err := client.ReadDir(t.RemoteDir)
 	if err != nil {
 		return fmt.Errorf("list SFTP snapshots: %w", err)
 	}
+	// base comes from current's own name rather than from t.SnapshotBase, because current is always
+	// a name that was just published and therefore carries the prefix: on the signed path's second
+	// pass it is the sidecar's name ("...db.hmac"), whose prefix is still the snapshot's. Do not
+	// "simplify" this into the sidecar name without checking the split still lands in the same place.
 	base := strings.Split(current, ".backup-")[0] + ".backup-"
 	var names []string
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || name == current || strings.HasSuffix(name, ".hmac") {
+		// Sidecars are not recovery points and an in-flight upload is not a snapshot; neither may
+		// occupy a Keep slot, and the second one would also be renamed away or left behind by a
+		// crashed upload.
+		if entry.IsDir() || strings.HasSuffix(name, ".hmac") || strings.Contains(name, uploadingSuffix) {
 			continue
 		}
 		if strings.HasPrefix(name, base) {
 			names = append(names, name)
 		}
 	}
-	if len(names) < t.Keep {
+	if len(names) <= t.Keep {
 		return nil
 	}
 	sort.Strings(names)
-	for _, name := range names[:len(names)-(t.Keep-1)] {
+	for _, name := range names[:len(names)-t.Keep] {
 		if err := client.Remove(path.Join(t.RemoteDir, name)); err != nil {
 			return fmt.Errorf("prune SFTP snapshot %s: %w", name, err)
 		}

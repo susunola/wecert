@@ -16,6 +16,25 @@
 
 ### Fixed
 
+- **A signed SFTP backup no longer deletes the snapshot it just published.** `pruneSFTP` excluded
+  "the snapshot being uploaded" from the retention candidates, which is wrong on an SFTP target
+  because a signed upload publishes twice and prunes twice: the first pass writes the snapshot, the
+  second writes its `.hmac` sidecar, and on that second pass the excluded name is the sidecar -- so
+  the snapshot it belongs to counted as an old sibling. With `keep: 1` the remote ended up **empty**
+  (the only recovery point deleted); with the default `keep: 7` it held 6. Retention now counts every
+  snapshot including the newest, exactly as the S3/COS path already did, which makes both passes
+  idempotent.
+- **A signed SFTP restore is bounded by the target's timeout.** The sidecar check opens a second
+  SSH connection, and it did so with `context.Background()`: the deadline `DownloadLatest` had put
+  on the restore was discarded, and `openSFTP` only sets a socket deadline when its context has one.
+  A server that accepted TCP and then never sent its SSH banner held the restore open for ever. The
+  caller's context is passed through now.
+- **An upload left half-written by an interrupted transfer is not a recovery point.** `uploadSFTP`
+  publishes `<snapshot>.uploading-<hex>` and renames it only after `Close`, and a crash (or a failed
+  rename) leaves that file behind. Because it sorts *after* the snapshot it was going to become,
+  both SFTP listings treated it as the newest one: a restore could pick the partial file over the
+  last complete snapshot beside it, and retention could evict a real snapshot while keeping the
+  garbage. Both the restore listing and the retention pass now skip `.uploading-` names.
 - **The Cloudflare TXT recovery fails closed on an answer that says `success:false`.** Cloudflare
   answers HTTP 200 with `success:false` for some failures -- a token that cannot read the filtered
   listing, for instance -- and the recovery decoded that envelope without checking it. A refused
