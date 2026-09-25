@@ -14,6 +14,19 @@
   (`internal/state`), and the confirmation gate in front of `-prune-certs` (`cmd/preflight`).
   Coverage is 76.5% with the new tests. No production code changed.
 
+- **A Route 53 issuance no longer fails a pass over a wait the provider does not need.** With
+  `dns.provider: route53`, lego's provider waits for the record change to reach INSYNC before
+  `Present` returns, polling every `dns.polling` for up to the propagation budget -- five minutes,
+  inside a call this program bounds at 60 seconds so one wedged API call cannot hold the per-name
+  TXT lease forever. Measured on the machine that failed: the `ChangeResourceRecordSets` call took
+  6.5-8.6s and INSYNC arrived 23.5-31.9s later, 32.1-38.4s in total, and a staging round then
+  failed with `present TXT timed out after 1m0s` for a record Route 53 had already accepted -- one
+  discarded order and a backoff. That wait is now off: the write is confirmed when Route 53 accepts
+  the change, and when a record is actually live stays what it already is for every provider --
+  `WaitAll` probing the zone's authoritative nameservers, two independent servers agreeing, with
+  the full propagation budget and the evidence in the log. Cleanup is affected the same way and is
+  better for it: the delete is confirmed seconds after the API accepts it, instead of holding the
+  lease through an INSYNC wait.
 - **Sealed-state KDF migration no longer double-encrypts.** `migrateSealedMaterial`
   used to re-seal a v1 blob without opening it, storing `v2(v1(plain))`. The next
   open peeled only the v2 layer and handed back a second AEAD blob instead of the
