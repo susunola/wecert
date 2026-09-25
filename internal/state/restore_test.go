@@ -20,7 +20,6 @@ import (
 var (
 	testAccountKeyPEM = []byte("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n")
 	testCertKeyPEM    = []byte("-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n")
-	testCertPEM       = []byte("-----BEGIN CERTIFICATE-----\nBAUG\n-----END CERTIFICATE-----\n")
 )
 
 type restoreHarness struct {

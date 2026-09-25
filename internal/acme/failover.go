@@ -113,11 +113,17 @@ func directoryUnavailable(err error) bool {
 	// a NewOrder that was sent and then lost mid-response may well have created the
 	// order on the server, and retrying on standby spends a second exact-set quota.
 	var ne net.Error
-	if errors.As(err, &ne) && (ne.Timeout() || ne.Temporary() || strings.Contains(ne.Error(), "connection refused") ||
-		strings.Contains(ne.Error(), "no such host")) {
+	if errors.As(err, &ne) && ne.Timeout() {
 		return true
 	}
+	// net.Error.Temporary is deprecated since Go 1.18 and is not used here. It was true for a
+	// grab-bag of errnos, and "temporary" is not a property this decision may rest on: the cost of
+	// being wrong is a second exact-set order against the standby CA. The cases it used to catch
+	// -- a connection that died mid-flight, a route that is not there -- are named explicitly, in
+	// the same spirit as the strings below, so the accepted set is visible rather than implied.
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "connection refused") || strings.Contains(s, "no such host") ||
+		strings.Contains(s, "connection reset") || strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "network is unreachable") || strings.Contains(s, "no route to host") ||
 		strings.Contains(s, "server internal") || strings.Contains(s, "too many new orders")
 }

@@ -142,7 +142,10 @@ func TestInspectSnapshotRefusesAnythingThatIsNotOneOfOurDatabases(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PutCert(&CertState{Name: "example-com", KeyPEM: []byte("KEY")}); err != nil {
+	// Real PEM, like every other fixture here: inspectSnapshot decodes the material before it lets
+	// a snapshot replace a database, so placeholder bytes make a sound snapshot look damaged and the
+	// test would fail for a reason that has nothing to do with what it is checking.
+	if err := store.PutCert(&CertState{Name: "example-com", KeyPEM: testCertKeyPEM}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := store.Snapshot(dir, 3)

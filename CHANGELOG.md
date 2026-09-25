@@ -4,6 +4,32 @@
 
 ### Fixed
 
+- **The Cloudflare TXT recovery fails closed on an answer that says `success:false`.** Cloudflare
+  answers HTTP 200 with `success:false` for some failures -- a token that cannot read the filtered
+  listing, for instance -- and the recovery decoded that envelope without checking it. A refused
+  listing therefore read as an empty listing: `cloudflareDeleteExactTXT` returned nil, the caller
+  logged the record as removed, and the reclaim was recorded as done while the TXT was still in the
+  zone. That is the one direction that loses a record rather than merely failing to delete one. The
+  envelope's own verdict now decides, and when the API gave a message it is reported instead of the
+  code's guess: a refused zone lookup no longer reads as "was not found uniquely", which sent the
+  operator looking for a zone problem instead of a credential problem.
+- **`net.Error.Temporary` is gone from the CA-failover decision.** It has been deprecated since Go
+  1.18 because "temporary" is not a defined property of an error, and it was true for a grab-bag of
+  errnos. The cases it used to catch -- a connection that died mid-flight, a route that is not there
+  -- are now named explicitly, so what qualifies as "the directory is unreachable, try the standby
+  CA" is visible rather than implied. Being wrong in that direction spends a second exact-set order.
+- **Three dead symbols and an unused test fixture are gone**: `sealedPrefix` (an alias nothing read,
+  a second place to change when the seal version moves), `isSealed`, the unused `row` type in
+  `seal_migrate.go`, and `testCertPEM`.
+
+### Added
+
+- **`staticcheck` is a gate** (`make check-staticcheck`, wired into `make check`, pinned to v0.6.1
+  in the Makefile). `go vet` covers only the checks the Go team considers unambiguous, which
+  is why the dead symbols, the deprecated method and the capitalized error strings above sat on
+  `main` unnoticed. The default check set is used, not `-checks=all`: `all` adds the ST10xx
+  documentation-style checks, which are a documentation policy rather than a correctness gate.
+
 - **The coverage floor holds again.** Total statement coverage had fallen to 72.4% against the
   76% floor `scripts/check-coverage.py` records, so `make check-coverage` -- and with it the `test`
   job -- failed on every push. The gap was in surfaces that had no tests rather than in broken
