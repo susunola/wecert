@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- **The coverage floor holds again.** Total statement coverage had fallen to 72.4% against the
+  76% floor `scripts/check-coverage.py` records, so `make check-coverage` -- and with it the `test`
+  job -- failed on every push. The gap was in surfaces that had no tests rather than in broken
+  behaviour, and the tests added here are aimed at the ones where a silent wrong answer is the
+  failure mode: the daemon's boot sequence and its `/admin` restore surface (`cmd/wecert`), the
+  admin and inventory HTTP handlers (`internal/webhook`), the Cloudflare TXT recovery helper, the
+  certificate export path (`internal/certsync`), the snapshot and pending-restore guards
+  (`internal/state`), and the confirmation gate in front of `-prune-certs` (`cmd/preflight`).
+  Coverage is 76.5% with the new tests. No production code changed.
+
 - **Sealed-state KDF migration no longer double-encrypts.** `migrateSealedMaterial`
   used to re-seal a v1 blob without opening it, storing `v2(v1(plain))`. The next
   open peeled only the v2 layer and handed back a second AEAD blob instead of the
