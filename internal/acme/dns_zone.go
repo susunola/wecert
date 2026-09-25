@@ -108,29 +108,65 @@ func (s *DNSSolver) probeRecords(servers []nsServer, delegated int, recs []DNSRe
 	return probeRecordsWithExchange(servers, delegated, recs, s.authoritativeExchange())
 }
 
+// recursiveLookupAttempts is how many times one resolver is asked for the same question before the
+// next resolver is tried, and recursiveLookupRetryDelay how long the retry waits first.
+//
+// Only an exchange that produced no answer at all is asked again -- the same rule the authoritative
+// probe follows (see probeTXTWithExchange). A response is an answer even when it is unwelcome, so
+// REFUSED, SERVFAIL and a truncated answer still hand the question to the next resolver rather than
+// being retried here, and the buckets those answers feed stay meaningful.
+//
+// This path is the one that runs *before* the propagation wait: findZone's SOA walk, the NS
+// delegation lookup, and the A/AAAA lookups that turn NS names into addresses. A single dropped
+// datagram used to end the whole pass there, and it did: a staging run failed with "lookup NS for
+// <zone>.: all configured recursive resolvers failed: 1.1.1.1:53: read udp ...: i/o timeout;
+// 8.8.8.8:53: read udp ...: i/o timeout" and no record had even been written yet. The retry costs
+// 250ms per unanswered exchange against a five-minute propagation budget.
+const recursiveLookupAttempts = 2
+
+// var, not const, so a test can shorten it; its meaning stays a named constant.
+var recursiveLookupRetryDelay = 250 * time.Millisecond
+
 func (s *DNSSolver) queryRecursive(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 	var errs []error
+resolvers:
 	for _, resolver := range s.recursiveNameservers {
-		resp, err := s.exchange(ctx, msg.Copy(), resolver)
-		if err == nil && resp != nil && resp.Truncated {
-			// exchangeDNS hands back the UDP answer when its TCP retry fails, with Truncated still
-			// set so the caller can decide -- the probe paths do decide. Callers of this one read
-			// the answer structurally (authoritativeNS builds the server list out of resp.Answer),
-			// so accepting it would silently shrink the authority set, and a reduced set is how the
-			// "two independent servers must agree" rule degrades into the single-authority
-			// exemption it exists to avoid. Ask the next resolver instead.
-			errs = append(errs, fmt.Errorf("%s: truncated answer (TCP retry failed)", resolver))
-			continue
-		}
-		if err == nil && resp != nil && (resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError) {
-			return resp, nil
-		}
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", resolver, err))
-		} else if resp == nil {
-			errs = append(errs, fmt.Errorf("%s: empty response", resolver))
-		} else {
-			errs = append(errs, fmt.Errorf("%s: DNS response %s", resolver, dns.RcodeToString[resp.Rcode]))
+		for attempt := 1; ; attempt++ {
+			resp, err := s.exchange(ctx, msg.Copy(), resolver)
+			if err == nil && resp != nil && resp.Truncated {
+				// exchangeDNS hands back the UDP answer when its TCP retry fails, with Truncated still
+				// set so the caller can decide -- the probe paths do decide. Callers of this one read
+				// the answer structurally (authoritativeNS builds the server list out of resp.Answer),
+				// so accepting it would silently shrink the authority set, and a reduced set is how the
+				// "two independent servers must agree" rule degrades into the single-authority
+				// exemption it exists to avoid. Ask the next resolver instead.
+				errs = append(errs, fmt.Errorf("%s: truncated answer (TCP retry failed)", resolver))
+				break
+			}
+			if err == nil && resp != nil && (resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError) {
+				return resp, nil
+			}
+			if err == nil && resp != nil {
+				errs = append(errs, fmt.Errorf("%s: DNS response %s", resolver, dns.RcodeToString[resp.Rcode]))
+				break
+			}
+			// No answer at all: the datagram was dropped, or the resolver is unreachable. That says
+			// nothing about the question, so ask this resolver once more before moving on.
+			if attempt >= recursiveLookupAttempts {
+				if err != nil {
+					errs = append(errs, fmt.Errorf("%s: %w (asked %d time(s))", resolver, err, attempt))
+				} else {
+					errs = append(errs, fmt.Errorf("%s: empty response (asked %d time(s))", resolver, attempt))
+				}
+				break
+			}
+			select {
+			case <-ctx.Done():
+				// Cancelled: the next resolver would fail the same way, and the caller gets the reason.
+				errs = append(errs, fmt.Errorf("%s: %w (asked %d time(s))", resolver, ctx.Err(), attempt))
+				break resolvers
+			case <-time.After(recursiveLookupRetryDelay):
+			}
 		}
 	}
 	return nil, fmt.Errorf("all configured recursive resolvers failed: %w", errors.Join(errs...))

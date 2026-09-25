@@ -352,10 +352,14 @@ func TestFindZoneRejectsAPublicSuffix(t *testing.T) {
 
 // A failing resolver must not end the lookup: the next configured one is tried, so one dead
 // resolver does not stall every issuance.
+//
+// "Failing" here means the exchange produced no answer at all, which is now asked twice before the
+// next resolver gets its turn (see TestQueryRecursiveAsksAgainWhenTheExchangeIsDropped), so the
+// count is asserted per resolver rather than in total.
 func TestQueryRecursiveFallsBackToTheNextResolver(t *testing.T) {
-	var tried []string
+	tries := map[string]int{}
 	solver := quietSolver(func(_ context.Context, msg *dns.Msg, server string) (*dns.Msg, error) {
-		tried = append(tried, server)
+		tries[server]++
 		if server == "192.0.2.53:53" {
 			return nil, fmt.Errorf("connection refused")
 		}
@@ -368,8 +372,95 @@ func TestQueryRecursiveFallsBackToTheNextResolver(t *testing.T) {
 	if _, err := solver.queryRecursive(context.Background(), msg); err != nil {
 		t.Fatalf("a working second resolver must be used: %v", err)
 	}
-	if len(tried) != 2 {
-		t.Errorf("tried %v, want both resolvers", tried)
+	if tries["192.0.2.53:53"] != recursiveLookupAttempts {
+		t.Errorf("the dead resolver was asked %d time(s), want the bounded %d",
+			tries["192.0.2.53:53"], recursiveLookupAttempts)
+	}
+	if tries["198.51.100.53:53"] != 1 {
+		t.Errorf("the working resolver was asked %d time(s), want 1: an answer is never re-asked",
+			tries["198.51.100.53:53"])
+	}
+}
+
+// An exchange that produced no answer at all -- a dropped datagram, a resolver that is briefly
+// unreachable -- is asked again before it is recorded as a failure.
+//
+// This is the path that runs before the propagation wait: findZone's SOA walk, the NS delegation
+// lookup, the A/AAAA lookup that turns NS names into addresses. One dropped datagram used to end
+// the pass there, and it did: a staging run failed with "lookup NS for <zone>.: all configured
+// recursive resolvers failed: 1.1.1.1:53: read udp ...: i/o timeout; 8.8.8.8:53: read udp ...:
+// i/o timeout" before a record had been written.
+func TestQueryRecursiveAsksAgainWhenTheExchangeIsDropped(t *testing.T) {
+	var asked int
+	solver := quietSolver(func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
+		asked++
+		if asked == 1 {
+			return nil, fmt.Errorf("read udp 172.17.0.2:58330->1.1.1.1:53: i/o timeout")
+		}
+		return dnsReply(msg), nil
+	})
+	solver.recursiveNameservers = []string{"192.0.2.53:53"}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeSOA)
+	if _, err := solver.queryRecursive(context.Background(), msg); err != nil {
+		t.Fatalf("the second attempt answered, so the lookup must succeed: %v", err)
+	}
+	if asked != 2 {
+		t.Errorf("the resolver was asked %d time(s), want 2: a dropped exchange says nothing about "+
+			"the question", asked)
+	}
+}
+
+// An address that never answers is still a failure, and the error says how hard it was tried.
+func TestQueryRecursiveStillFailsWhenEveryAttemptTimesOut(t *testing.T) {
+	asked := map[string]int{}
+	solver := quietSolver(func(_ context.Context, _ *dns.Msg, server string) (*dns.Msg, error) {
+		asked[server]++
+		return nil, fmt.Errorf("read udp 172.17.0.2:58330->%s: i/o timeout", server)
+	})
+	solver.recursiveNameservers = []string{"192.0.2.53:53", "198.51.100.53:53"}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeSOA)
+	_, err := solver.queryRecursive(context.Background(), msg)
+	if err == nil {
+		t.Fatal("every resolver timed out, so the lookup must fail")
+	}
+	for _, resolver := range []string{"192.0.2.53:53", "198.51.100.53:53"} {
+		if asked[resolver] != recursiveLookupAttempts {
+			t.Errorf("%s was asked %d time(s), want the bounded %d",
+				resolver, asked[resolver], recursiveLookupAttempts)
+		}
+		if !strings.Contains(err.Error(), resolver) {
+			t.Errorf("the error must name resolver %s, got: %v", resolver, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "asked 2 time(s)") {
+		t.Errorf("the error should say the resolver was asked more than once, got: %v", err)
+	}
+}
+
+// An answer is never re-asked, however unwelcome: REFUSED is a verdict about the query, not a
+// dropped packet, and retrying it would burn the budget and blur what the resolver actually said.
+func TestQueryRecursiveDoesNotReAskARefusedAnswer(t *testing.T) {
+	var asked int
+	solver := quietSolver(func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
+		asked++
+		resp := new(dns.Msg)
+		resp.SetReply(msg)
+		resp.Rcode = dns.RcodeRefused
+		return resp, nil
+	})
+	solver.recursiveNameservers = []string{"192.0.2.53:53"}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeSOA)
+	if _, err := solver.queryRecursive(context.Background(), msg); err == nil {
+		t.Fatal("a REFUSED answer from every resolver is still a failed lookup")
+	}
+	if asked != 1 {
+		t.Errorf("the resolver was asked %d time(s), want exactly 1: REFUSED is an answer", asked)
 	}
 }
 

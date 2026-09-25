@@ -27,6 +27,16 @@
   the full propagation budget and the evidence in the log. Cleanup is affected the same way and is
   better for it: the delete is confirmed seconds after the API accepts it, instead of holding the
   lease through an INSYNC wait.
+- **A dropped datagram during zone discovery no longer fails the whole pass.** The recursive
+  lookups that run before the propagation wait -- `findZone`'s SOA walk, the NS delegation query,
+  and the A/AAAA lookup that turns NS names into addresses -- asked each configured resolver once,
+  and one exchange that produced no answer at all ended the pass there, before any record had been
+  written. A staging run failed exactly that way: `lookup NS for <zone>.: all configured recursive
+  resolvers failed: 1.1.1.1:53: read udp ...: i/o timeout; 8.8.8.8:53: read udp ...: i/o timeout`.
+  Each resolver is now asked twice, 250ms apart, before the next one gets its turn. Only an
+  exchange with no answer is retried, the same rule the authoritative probe follows: REFUSED,
+  SERVFAIL, NXDOMAIN and a truncated answer are answers, they are never re-asked, and they still
+  hand the question to the next resolver.
 - **Sealed-state KDF migration no longer double-encrypts.** `migrateSealedMaterial`
   used to re-seal a v1 blob without opening it, storing `v2(v1(plain))`. The next
   open peeled only the v2 layer and handed back a second AEAD blob instead of the
