@@ -42,6 +42,16 @@
   `main` unnoticed. The default check set is used, not `-checks=all`: `all` adds the ST10xx
   documentation-style checks, which are a documentation policy rather than a correctness gate.
 
+- **A state-database snapshot uploaded to a remote target is only as private as the bucket, and the
+  program now says so at startup.** `state.db` holds the ACME account key and the private key of
+  every certificate this program manages. With `stateBackup.remoteTargets` configured and
+  `stateEncryption.keyFile` unset, those copies are not encrypted: the bucket's server-side
+  encryption protects the bytes at rest, not from anyone who can read the bucket, who gets the keys
+  that terminate TLS for production domains. The snapshot loop now logs a warning naming the targets
+  and the one-line fix (sealing the database seals the snapshot with it, since a snapshot is a
+  `VACUUM INTO` copy of the sealed rows). A warning rather than a refusal, for the same reason a
+  group-writable state directory is a warning: refusing to start would take a working deployment
+  down on upgrade over a copy that is already in the bucket.
 - **The coverage floor holds again.** Total statement coverage had fallen to 72.4% against the
   76% floor `scripts/check-coverage.py` records, so `make check-coverage` -- and with it the `test`
   job -- failed on every push. The gap was in surfaces that had no tests rather than in broken

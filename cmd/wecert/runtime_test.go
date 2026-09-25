@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/probe"
@@ -754,5 +755,70 @@ func TestRunOncePassReportsWhatTheOneShotRunMustNotSwallow(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "snapshot") || !strings.Contains(err.Error(), "no space left") {
 		t.Errorf("the error must say the snapshot failed and why, got: %v", err)
+	}
+}
+
+// A remote snapshot target copies state.db off the host, and state.db holds the ACME account key
+// and every certificate's private key unless state encryption is configured. The bucket's
+// server-side encryption protects the bytes at rest, not from whoever can read the bucket.
+//
+// This is a warning and not a refusal -- a working deployment must not go down on upgrade over a
+// copy that is already in the bucket -- so the test pins both halves: it is said when the exposure
+// is real, and it is not said once stateEncryption.keyFile is set, or when nothing leaves the host.
+func TestStartBackupsWarnsWhenSnapshotsLeaveTheHostUnencrypted(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	newCfg := func() *config.Config {
+		return &config.Config{
+			StatePath: filepath.Join(dir, "state.db"),
+			StateBackup: config.StateBackup{
+				Dir:           filepath.Join(dir, "backups"),
+				Keep:          3,
+				IntervalDur:   time.Hour, // the immediate snapshot is all this test needs
+				RemoteTargets: []config.BackupTarget{{Name: "nightly", Type: "s3", Bucket: "b"}},
+			},
+		}
+	}
+
+	log, buf := quietLog()
+	_, stop := startBackupsIfNeeded(context.Background(), store, newCfg(), log)
+	if stop != nil {
+		stop()
+	}
+	if !strings.Contains(buf.String(), "stateEncryption.keyFile") {
+		t.Errorf("an unencrypted database on its way to a bucket must be called out with the fix, got:\n%s",
+			buf.String())
+	}
+	if !strings.Contains(buf.String(), "nightly") {
+		t.Errorf("the warning must name the targets that receive it, got:\n%s", buf.String())
+	}
+
+	// With the key configured the snapshot is ciphertext, so there is nothing to warn about.
+	cfg := newCfg()
+	cfg.StateEncryption.KeyFile = filepath.Join(dir, "seal.key")
+	log, buf = quietLog()
+	_, stop = startBackupsIfNeeded(context.Background(), store, cfg, log)
+	if stop != nil {
+		stop()
+	}
+	if strings.Contains(buf.String(), "stateEncryption.keyFile is unset") {
+		t.Errorf("a sealed database must not produce the plaintext warning, got:\n%s", buf.String())
+	}
+
+	// And a purely local deployment has nothing to say: the keys do not leave the host.
+	cfg = newCfg()
+	cfg.StateBackup.RemoteTargets = nil
+	log, buf = quietLog()
+	_, stop = startBackupsIfNeeded(context.Background(), store, cfg, log)
+	if stop != nil {
+		stop()
+	}
+	if strings.Contains(buf.String(), "remote targets") {
+		t.Errorf("local-only snapshots must not be reported as leaving the host, got:\n%s", buf.String())
 	}
 }

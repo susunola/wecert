@@ -262,6 +262,7 @@ func startBackupsIfNeeded(ctx context.Context, store *state.Store, cfg *config.C
 	// because its guard was the same condition the first branch had already consumed.
 	switch planStateBackups(cfg.StateBackup.Enabled, writable) {
 	case backupsRun:
+		warnAboutPlaintextRemoteBackups(cfg, log)
 		return startStateBackups(ctx, store, cfg, log)
 	case backupsEnabledButUnwritable:
 		log.Error("periodic state database snapshots are ENABLED but the directory is not writable, "+
@@ -296,6 +297,37 @@ func stateBackupDirs(cfg *config.Config) []string {
 		primary = filepath.Dir(cfg.StatePath)
 	}
 	return append([]string{primary}, cfg.StateBackup.LocalDirs...)
+}
+
+// warnAboutPlaintextRemoteBackups says, once at startup, when a snapshot is about to leave the host
+// with the private keys in the clear.
+//
+// state.db holds the ACME account key and the private key of every certificate this program
+// manages. A remote target copies it to S3, COS or SFTP, and unless stateEncryption.keyFile is set
+// those copies carry that material unencrypted: the bucket's server-side encryption protects the
+// bytes at rest, not from anyone who can read the bucket, who gets keys that terminate TLS for
+// production domains. Sealing the state database seals the snapshot with it (the snapshot is a
+// VACUUM INTO copy of the sealed rows), so the fix is one config line.
+//
+// A warning rather than a refusal, deliberately: this is the same exposure class as a
+// group-writable state directory, which this program also warns about rather than refusing to
+// start, and refusing here would take a working deployment down on upgrade over a copy that is
+// already sitting in the bucket. It is logged where the decision to run the snapshot loop is made,
+// which is the first point that knows both the targets and the key.
+func warnAboutPlaintextRemoteBackups(cfg *config.Config, log *slog.Logger) {
+	if len(cfg.StateBackup.RemoteTargets) == 0 || cfg.StateEncryption.KeyFile != "" {
+		return
+	}
+	names := make([]string, 0, len(cfg.StateBackup.RemoteTargets))
+	for _, target := range cfg.StateBackup.RemoteTargets {
+		names = append(names, target.Name)
+	}
+	log.Warn("state database snapshots are uploaded to remote targets while stateEncryption.keyFile "+
+		"is unset: state.db holds the ACME account key and every certificate's private key in the "+
+		"clear, so each uploaded snapshot carries them, and the copy is only as private as the "+
+		"bucket. Set stateEncryption.keyFile to seal the database (the snapshot is sealed with it) "+
+		"or keep snapshots local",
+		"targets", strings.Join(names, ","), "dir", cfg.StateBackup.Dir)
 }
 
 // runOncePass runs the single convergence pass -once is named for, then drains.
