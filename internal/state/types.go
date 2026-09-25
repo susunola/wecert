@@ -70,14 +70,29 @@ type Store struct {
 	// a limit with no override: trip it and you wait the full 7 days.
 	lock *fileLock
 
-	// base is the state file's own name, used to prefix snapshot filenames.
+	// closed makes Close idempotent (see Close). Guarded by mu like everything else.
+	closed bool
+
+	// base is the identity this store's snapshot names carry: the state file's own name plus a
+	// short stable hash of its absolute path (see snapshotBase).
 	//
-	// Snapshot names used to hardcode "state", so two deployments sharing one
-	// stateBackup.dir wrote and pruned the SAME files: each one's retention deleted the
-	// other's backups, and the survivor was whichever ran last. Nothing refuses a shared
-	// directory -- it is a reasonable thing to configure, and the config layer cannot see
-	// who else writes there -- so the name has to carry the identity.
+	// Snapshot names used to hardcode "state", so two deployments sharing one stateBackup.dir
+	// wrote and pruned the SAME files: each one's retention deleted the other's backups, and the
+	// survivor was whichever ran last. The basename alone has the same hole one level up --
+	// /etc/wecert-a/state.db and /etc/wecert-b/state.db sharing a backup directory still collide.
+	// Nothing refuses a shared directory -- it is a reasonable thing to configure, and the config
+	// layer cannot see who else writes there -- so the name has to carry the path's identity, not
+	// just the file's.
 	base string
+
+	// legacyBase is the state file's plain basename: the identity snapshot names carried before
+	// the path hash was mixed in. It is never written into a new name and never used to claim
+	// temp-file ownership, but listing still matches it, so snapshots taken by an older build
+	// remain visible to retention and to `-restore latest`. Those old names cannot be attributed
+	// when two same-basename deployments share a directory -- both stores see the same legacy
+	// pool and either may prune from it, which is exactly the behaviour those files were written
+	// under, so nothing gets worse.
+	legacyBase string
 }
 
 // ErrLocked means the state database is already held exclusively by another wecert

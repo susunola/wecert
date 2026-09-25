@@ -62,6 +62,9 @@ func (r *run) build() {
 		profile, keyType, deploy, err := r.groupSettings(g)
 		if err != nil {
 			r.overSettingsConflict(g, err)
+			if r.rep.Frozen() {
+				return
+			}
 			continue
 		}
 
@@ -69,6 +72,9 @@ func (r *run) build() {
 		if err != nil {
 			if errors.Is(err, group.ErrTooManyNames) {
 				r.overLimit(g, err)
+				if r.rep.Frozen() {
+					return
+				}
 				continue
 			}
 			r.freeze(fmt.Sprintf("certificate %q: %v", g.Name, err))
@@ -118,28 +124,76 @@ func (r *run) build() {
 //
 // The whole group must not be dropped: that makes wecert see a certificate vanish
 // into thin air. The correct reaction is to keep the previous revision's certificate
-// and shout the reason -- the fix (add a wildcard declaration, or move names to
-// another group) can only be done by a human.
+// (minus the names this round judged removed -- see keepPreviousCertificate) and shout
+// the reason -- the fix (add a wildcard declaration, or move names to another group)
+// can only be done by a human.
 func (r *run) overLimit(g group.Group, cause error) {
 	all := append(append([]string(nil), g.Names...), g.Wildcards...)
 
-	if prev := r.previousCert(g.Name); prev != nil {
-		r.certs = append(r.certs, *prev)
-		for _, n := range all {
-			r.include(spec.Decision{
-				Hostname:    n,
-				Included:    true,
-				Reason:      fmt.Sprintf("kept at the previous revision: %v", cause),
-				Certificate: g.Name,
-			})
-		}
-		r.rep.CarriedForward += len(all)
+	if r.keepPreviousCertificate(g, all, cause) {
 		return
 	}
 
 	for _, n := range all {
 		r.reject(n, fmt.Sprintf("cannot be expressed: %v", cause))
 	}
+}
+
+// keepPreviousCertificate carries a group's certificate forward from the previous revision when
+// this round cannot rebuild the group (over the SAN cap, or declarations that disagree on
+// settings). It reports whether there was a certificate left to keep.
+//
+// The carry is NOT verbatim. A name this round judged removed (past the grace period and
+// unreferenced, or dropped under -force) is not in the group's eligible set any more, but it IS
+// still in the previous revision's certificate: copying that certificate as-is would resurrect
+// the name into the document while the report announces its removal -- the grace period, the
+// reference check and the round's own verdict all agreed to drop it, and wecert would go on
+// renewing it. Those names are filtered out of the carried certificate.
+//
+// If dropping the removed names still leaves the previous certificate over the cap (the
+// operator lowered the SAN cap, say), the group can be neither rebuilt nor carried -- and
+// writing it anyway would produce a document the writer refuses. The round freezes instead,
+// with a reason that says a human has to converge the group.
+//
+// A previous certificate made entirely of names removed this round leaves nothing to carry, so
+// the caller falls back to rejecting the group's names as if there were no previous revision.
+func (r *run) keepPreviousCertificate(g group.Group, all []string, cause error) bool {
+	prev := r.previousCert(g.Name)
+	if prev == nil {
+		return false
+	}
+
+	domains := make([]string, 0, len(prev.Domains))
+	for _, n := range prev.Domains {
+		if !r.removed[n] {
+			domains = append(domains, n)
+		}
+	}
+	if len(domains) == 0 {
+		return false
+	}
+	if cap := groupNameCap(r.o.opts.MaxNames, prev.Profile); len(domains) > cap {
+		r.freeze(fmt.Sprintf(
+			"certificate %q: %v, and the previous revision cannot be kept either: after dropping "+
+				"the names removed this round it still holds %d names over the cap of %d. "+
+				"A human must converge the group by hand (declare a wildcard, or move names to another group)",
+			g.Name, cause, len(domains), cap))
+		return true
+	}
+
+	kept := *prev
+	kept.Domains = domains
+	r.certs = append(r.certs, kept)
+	for _, n := range all {
+		r.include(spec.Decision{
+			Hostname:    n,
+			Included:    true,
+			Reason:      fmt.Sprintf("kept at the previous revision: %v", cause),
+			Certificate: g.Name,
+		})
+	}
+	r.rep.CarriedForward += len(all)
+	return true
 }
 
 func (r *run) previousCert(name string) *config.Certificate {
@@ -224,16 +278,15 @@ func (r *run) groupSettings(g group.Group) (profile, keyType string, deploy bool
 	return profile, keyType, deploy, nil
 }
 
+// overSettingsConflict handles a group whose declarations disagree on the certificate settings.
+// As with overLimit, the previous revision's certificate is kept (minus the names this round
+// judged removed -- see keepPreviousCertificate) rather than the group vanishing.
 func (r *run) overSettingsConflict(g group.Group, cause error) {
-	if prev := r.previousCert(g.Name); prev != nil {
-		r.certs = append(r.certs, *prev)
-		for _, n := range append(append([]string(nil), g.Names...), g.Wildcards...) {
-			r.include(spec.Decision{Hostname: n, Included: true, Certificate: g.Name, Reason: fmt.Sprintf("kept at the previous revision: %v", cause)})
-		}
-		r.rep.CarriedForward += len(g.Names) + len(g.Wildcards)
+	all := append(append([]string(nil), g.Names...), g.Wildcards...)
+	if r.keepPreviousCertificate(g, all, cause) {
 		return
 	}
-	for _, n := range append(append([]string(nil), g.Names...), g.Wildcards...) {
+	for _, n := range all {
 		r.reject(n, fmt.Sprintf("cannot choose group-level certificate settings: %v", cause))
 	}
 }

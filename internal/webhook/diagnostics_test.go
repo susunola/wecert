@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/spec"
+	"github.com/susunola/wecert/internal/state"
 )
 
 type diagnosticReader struct {
@@ -30,7 +32,15 @@ func (d *diagnosticReader) StartAll(context.Context) ([]string, []string, error)
 
 func TestDesiredDiagnosticIsAuthenticatedReadOnly(t *testing.T) {
 	d := &diagnosticReader{result: &spec.Result{Revision: "r1", Certificates: []config.Certificate{{Name: "example"}}}}
-	s, err := New(d, nil, "0123456789abcdef", context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// New refuses a nil store: the status and inventory routes are mounted on every
+	// server and dereference it, so even a test that only exercises /diagnostics needs
+	// a real one.
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	s, err := New(d, store, "0123456789abcdef", context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

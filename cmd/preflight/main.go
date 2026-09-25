@@ -34,12 +34,21 @@ import (
 )
 
 // exitUsage is the conventional "the command line itself is wrong" code, the same one wecert,
-// wecert-onboard and wecert-probe use. It used to be 1 for the no-arguments case and 2 (flag's
-// default) for an unknown flag, which every document in this repository defines as "the program ran
-// and failed" -- and 2 as wecert-onboard's "deliberately frozen, a human should look".
+// wecert-onboard and wecert-probe use. It used to be 1 for the no-arguments case and for a
+// contradictory mode combination, and 2 (flag's default) for an unknown flag, which every
+// document in this repository defines as "the program ran and failed" -- and 2 as
+// wecert-onboard's "deliberately frozen, a human should look".
 const exitUsage = 64
 
 func main() {
+	os.Exit(runArgs(os.Args[1:]))
+}
+
+// runArgs is main, factored to return the exit code so the classification itself is testable:
+// 64 for a wrong command line (a bad flag, contradictory mode flags, no operation selected), 1
+// for a run that failed, 0 for success or -h. The mode-conflict case used to exit 1, which every
+// document in this repository defines as "the program ran and failed".
+func runArgs(args []string) int {
 	// ContinueOnError, so an unknown flag does not exit 2 behind our back (see exitUsage).
 	fs := flag.NewFlagSet("preflight", flag.ContinueOnError)
 	domain := fs.String("domain", "", "domain to verify, e.g. atomwangnus.com")
@@ -47,52 +56,53 @@ func main() {
 	pruneCerts := fs.Bool("prune-certs", false, "delete the certificates wecert uploaded (alias starting with wecert/)")
 	yes := fs.Bool("yes", false, "use with -prune-certs to skip the interactive confirmation")
 	bindings := fs.String("bindings", "", "dump the raw bind-resource result for a certificate ID (debugging)")
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return
+			return 0
 		}
-		os.Exit(exitUsage)
+		return exitUsage
 	}
 
 	if modes := selectedModes(*bindings, *pruneCerts, *listCerts, *domain); len(modes) > 1 {
 		fmt.Fprintf(os.Stderr, "these flags select different operations and cannot be combined: %s\n",
 			strings.Join(modes, ", "))
-		os.Exit(1)
+		return exitUsage
 	}
 
 	if *bindings != "" {
 		if err := dumpBindings(*bindings); err != nil {
 			fmt.Fprintf(os.Stderr, "\nFAILED: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
-		return
+		return 0
 	}
 
 	switch {
 	case *pruneCerts:
 		if err := pruneCertificates(*yes); err != nil {
 			fmt.Fprintf(os.Stderr, "\n❌ %v\n", err)
-			os.Exit(1)
+			return 1
 		}
-		return
+		return 0
 	case *listCerts:
 		if err := listCertificates(); err != nil {
 			fmt.Fprintf(os.Stderr, "\n❌ %v\n", err)
-			os.Exit(1)
+			return 1
 		}
-		return
+		return 0
 	case *domain == "":
 		fmt.Fprintln(os.Stderr, "usage: preflight -domain <domain>")
 		fmt.Fprintln(os.Stderr, "      preflight -list-certs")
 		fmt.Fprintln(os.Stderr, "      preflight -prune-certs [-yes]")
-		os.Exit(exitUsage)
+		return exitUsage
 	}
 
 	if err := run(*domain); err != nil {
 		fmt.Fprintf(os.Stderr, "\nFAILED: preflight error: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	fmt.Println("\nOK: all preflight checks passed")
+	return 0
 }
 
 // selectedModes lists the operations the command line asked for. They are mutually exclusive:
@@ -345,9 +355,21 @@ func findDomain(ctx context.Context, client *dnspod.Client, domain string) (*dns
 	}
 }
 
+// describeRecordList is the seam over the SDK call, so the leftover check's request -- above
+// all, which domain it asks about -- can be tested without real credentials.
+var describeRecordList = func(ctx context.Context, client *dnspod.Client, req *dnspod.DescribeRecordListRequest) (*dnspod.DescribeRecordListResponse, error) {
+	return client.DescribeRecordListWithContext(ctx, req)
+}
+
 // checkDNSPod verifies DNSPod read access and confirms the domain belongs to this account.
 func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string) error {
 	fmt.Println("[2/4] DNSPod domain ownership")
+
+	// Normalise the same way findDomain does: DNSPod stores the name without a trailing dot, and
+	// the DescribeRecordList call below used to receive the raw flag value, so "example.com."
+	// matched the domain in the list and then asked about the records of a name DNSPod does not
+	// store -- the leftover check answered about the wrong domain.
+	domain = strings.TrimSuffix(domain, ".")
 
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "dnspod.tencentcloudapi.com"
@@ -384,7 +406,7 @@ func checkDNSPod(ctx context.Context, cred common.CredentialIface, domain string
 	recReq.Subdomain = common.StringPtr("_acme-challenge")
 	recReq.RecordType = common.StringPtr("TXT")
 
-	recResp, err := client.DescribeRecordListWithContext(ctx, recReq)
+	recResp, err := describeRecordList(ctx, client, recReq)
 	if err != nil {
 		// When there are no records at all DNSPod returns an error code rather than an
 		// empty list -- which is exactly the state we want, so it must not count as failure.
@@ -734,7 +756,7 @@ func dumpBindings(certID string) error {
 	}
 	fmt.Printf("taskId = %s\n\n", taskID)
 
-	for i := 1; i <= 6; i++ {
+	return pollBindTaskResult(ctx, bindingsPolls, func(i int) error {
 		queryReq := ssl.NewDescribeCertificateBindResourceTaskResultRequest()
 		queryReq.TaskIds = []*string{common.StringPtr(taskID)}
 
@@ -744,11 +766,42 @@ func dumpBindings(certID string) error {
 		}
 		b2, _ := json.MarshalIndent(queryResp.Response, "", "  ")
 		fmt.Printf("=== DescribeCertificateBindResourceTaskResult (poll %d) ===\n%s\n", i, b2)
+		return nil
+	})
+}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(4 * time.Second):
+// The -bindings polling cadence: how many times the task result is queried, and the pause
+// between queries.
+const (
+	bindingsPolls     = 6
+	bindingsPollDelay = 4 * time.Second
+)
+
+// sleepCtx waits between result polls; a variable so the pacing has a test without waiting out
+// the real delay.
+var sleepCtx = func(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
+// pollBindTaskResult queries the task result polls times, sleeping between queries.
+//
+// There is no sleep after the LAST answer: it is already printed, so one more wait would only
+// stall the command's exit -- and did, adding a flat 4 seconds to every -bindings run.
+func pollBindTaskResult(ctx context.Context, polls int, query func(i int) error) error {
+	for i := 1; i <= polls; i++ {
+		if err := query(i); err != nil {
+			return err
+		}
+		if i == polls {
+			return nil
+		}
+		if err := sleepCtx(ctx, bindingsPollDelay); err != nil {
+			return err
 		}
 	}
 	return nil

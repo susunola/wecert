@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -147,19 +148,56 @@ func NewDNSSolver(dnsCfg config.DNS, tencentCfg config.Tencent, log *slog.Logger
 	if err != nil {
 		return nil, err
 	}
-	// Applying the option to a throwaway Challenge works by side effect, and only because of how
-	// lego implements it: in lego v4.35.2 (challenge/dns01/nameserver.go -- the package-level
-	// `recursiveNameservers` variable at line 27, the option at line 65) AddRecursiveNameservers
-	// ignores its *Challenge argument and assigns that package-level variable, which every later
-	// lego DNS lookup then uses. Re-check both spots when the lego dependency is bumped.
-	if err := dns01.AddRecursiveNameservers(resolvers)(&dns01.Challenge{}); err != nil {
-		return nil, fmt.Errorf("configure lego recursive nameservers: %w", err)
+	if err := applyLegoRecursiveNameservers(resolvers, log); err != nil {
+		return nil, err
 	}
 	solver := &DNSSolver{newProvider: newProvider, providerResolvers: providerResolvers, timeout: dnsCfg.Propagation, interval: dnsCfg.Polling, log: log, recursiveNameservers: resolvers, exchange: exchangeDNS, valueScopedCleanup: cleanupIsValueScoped(dnsCfg.Provider)}
 	if dnsCfg.Provider == config.DNSProviderCloudflare {
 		solver.recoverCloudflareTXT = newCloudflareTXTRecovery(dnsCfg.Cloudflare.APIToken, dnsCfg.Cloudflare.APITokenFile)
 	}
 	return solver, nil
+}
+
+// legoResolvers guards the one piece of process-wide state NewDNSSolver cannot avoid writing:
+// lego keeps the recursive resolver list its own lookups use in a package-level variable (see
+// applyLegoRecursiveNameservers), so all solvers in a process necessarily share one list and
+// the write has to be serialised here -- lego's assignment carries no synchronisation at all.
+var legoResolvers struct {
+	mu      sync.Mutex
+	applied []string
+}
+
+// applyLegoRecursiveNameservers configures the resolver list lego's own DNS lookups use.
+//
+// Applying the option to a throwaway Challenge works by side effect, and only because of how
+// lego implements it: in lego v4.35.2 (challenge/dns01/nameserver.go -- the package-level
+// `recursiveNameservers` variable at line 27, the option at line 65) AddRecursiveNameservers
+// ignores its *Challenge argument and assigns that package-level variable, which every later
+// lego DNS lookup (FindZoneByFqdn inside a provider's Present, CNAME chasing) then uses.
+// Re-check both spots when the lego dependency is bumped.
+//
+// The consequence is a global constraint: one process can have ONE such list, and every solver
+// agrees on it or the process runs on mixed resolver views. A repeated construction with the
+// same list is a no-op; a DIFFERENT list cannot be refused without breaking legitimate rebuilds
+// (the CLI constructs a solver more than once), so it overwrites -- there is no per-instance
+// override to offer -- and warns, because solvers built earlier change behaviour with it.
+func applyLegoRecursiveNameservers(resolvers []string, log *slog.Logger) error {
+	legoResolvers.mu.Lock()
+	defer legoResolvers.mu.Unlock()
+
+	if slices.Equal(legoResolvers.applied, resolvers) {
+		return nil
+	}
+	if legoResolvers.applied != nil {
+		log.Warn("lego's recursive nameservers are a process-wide global already set to a DIFFERENT "+
+			"list; overwriting it, so solvers built earlier resolve through the new list too",
+			"was", legoResolvers.applied, "now", resolvers)
+	}
+	if err := dns01.AddRecursiveNameservers(resolvers)(&dns01.Challenge{}); err != nil {
+		return fmt.Errorf("configure lego recursive nameservers: %w", err)
+	}
+	legoResolvers.applied = append([]string(nil), resolvers...)
+	return nil
 }
 
 // cleanupIsValueScoped reports whether the configured provider's CleanUp removes only the record

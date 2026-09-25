@@ -880,3 +880,35 @@ func TestListRuleDomainsPagesPastOnePage(t *testing.T) {
 		t.Errorf("a response that reports more instances than its pages returned must stay an error, got %v", err)
 	}
 }
+
+// A zone listed twice would be enumerated twice -- every record in it read and parsed a second
+// time per round -- so the constructor de-duplicates after normalising (which is what makes
+// "Example.COM." and "example.com" catch each other).
+func TestNewDNSPodDeclarationsDeduplicatesZones(t *testing.T) {
+	d := newDeclarations(t, []string{"example.com", "EXAMPLE.com.", " example.com ", "a.example.com"})
+	want := []string{"a.example.com", "example.com"}
+	if len(d.zones) != len(want) {
+		t.Fatalf("zones = %v, want %v", d.zones, want)
+	}
+	for i := range want {
+		if d.zones[i] != want[i] {
+			t.Fatalf("zones = %v, want %v (normalised, sorted, de-duplicated)", d.zones, want)
+		}
+	}
+}
+
+// A region listed twice would be enumerated twice -- every load balancer and listener in it read
+// a second time per round -- so the constructor de-duplicates. Sorting is what lets the compact
+// catch duplicates that are not adjacent.
+func TestNewCLBRulesDeduplicatesRegions(t *testing.T) {
+	r := newRules(t, []string{"ap-shanghai", "ap-guangzhou", " ap-guangzhou "})
+	want := []string{"ap-guangzhou", "ap-shanghai"}
+	if len(r.regions) != len(want) {
+		t.Fatalf("regions = %v, want %v", r.regions, want)
+	}
+	for i := range want {
+		if r.regions[i] != want[i] {
+			t.Fatalf("regions = %v, want %v (sorted and de-duplicated)", r.regions, want)
+		}
+	}
+}

@@ -62,16 +62,37 @@ func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 			}
 		}
 	}
-	// A pass for a certificate the desired state no longer lists: the only in-flight pass that
-	// can still be about a host that has no owner here.
-	orphanPassInFlight := r.anyPassInFlightExcept(desiredNames)
-
-	// The record is per-round, so take it and reset it only now that the round is really being
-	// judged -- see the res == nil branch above.
+	// The probe record and the claim set are read under ONE hold of the claim lock.
+	//
+	// The record is per-round, so it is taken and reset only now that the round is really
+	// being judged -- see the res == nil branch above.
+	//
+	// Reading the two separately was a check-then-act across two locks: the snapshot ran under
+	// probeMu and the per-host in-flight check under mu, so a pass that recorded the host
+	// after the snapshot but released its claim before the check read as "not in flight,
+	// not probed this round" -- and the sweep deleted the series that pass had just written.
+	// probeCert's record happens-before its claim's release (probeCert waits for its
+	// goroutines before reconcileOne returns), so holding mu across both reads makes them
+	// atomic with respect to acquire/release: a host probed this round is either IN the
+	// snapshot, or its certificate's claim is held and shows up in inFlight. probeMu nests
+	// inside mu here and is never held while taking mu (the probe record path touches only
+	// probeMu), so there is no lock-order cycle.
+	r.mu.Lock()
 	r.probeMu.Lock()
 	current := r.probedHosts
 	r.probedHosts = map[string]struct{}{}
 	r.probeMu.Unlock()
+	inFlight := make(map[string]bool, len(r.running))
+	orphanPassInFlight := false
+	for n := range r.running {
+		inFlight[n] = true
+		// A pass for a certificate the desired state no longer lists: the only in-flight
+		// pass that can still be about a host that has no owner here.
+		if !desiredNames[n] {
+			orphanPassInFlight = true
+		}
+	}
+	r.mu.Unlock()
 
 	for _, h := range all.ProbedHosts() {
 		if _, live := current[h]; live {
@@ -96,7 +117,7 @@ func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 		// Only the host's own certificate being mid-pass justifies waiting.
 		name, inDesiredState := hostOwner[h]
 		if inDesiredState {
-			if r.passInFlight(name) {
+			if inFlight[name] {
 				continue
 			}
 			// And a certificate that is merely UNCONFIRMED is still being worked on.
@@ -133,44 +154,6 @@ func (r *Reconciler) reclaimStaleProbeSeries(res *spec.Result) {
 		// SetProber(nil) and panic on the method call.
 		p.Forget(h)
 	}
-}
-
-// anyPassInFlight reports whether any certificate currently holds a convergence claim.
-func (r *Reconciler) anyPassInFlight() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.running) > 0
-}
-
-// anyPassInFlightExcept reports whether any certificate outside names currently holds a
-// convergence claim.
-//
-// That is "is a pass running for a certificate that is no longer part of the desired state":
-// such a pass can still be about a host the desired state does not own, so its probeCert has
-// not necessarily run yet. A pass for a certificate the desired state DOES list cannot be about
-// that host, and must not hold reclamation up -- that is what the plain anyPassInFlight test
-// used to do to the whole fleet.
-func (r *Reconciler) anyPassInFlightExcept(names map[string]bool) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for n := range r.running {
-		if !names[n] {
-			return true
-		}
-	}
-	return false
-}
-
-// passInFlight reports whether this one certificate currently holds a convergence claim.
-//
-// The per-certificate form of anyPassInFlight, and the one reclaimStaleProbeSeries needs: a
-// global "anybody busy" test let one unrelated in-flight pass suspend reclamation for every
-// host in the fleet.
-func (r *Reconciler) passInFlight(name string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, busy := r.running[name]
-	return busy
 }
 
 // RunCert processes exactly one named certificate. An unknown name returns an

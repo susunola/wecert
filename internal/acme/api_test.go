@@ -95,6 +95,10 @@ type fakeAPI struct {
 	// will never serve again (a purged order, or a different ACME directory).
 	getOrderErr error
 
+	// acceptErr, when set, is returned by AcceptChallenge. A plain error models a request
+	// that never reached the CA; a *legoacme.ProblemDetails models the CA itself refusing.
+	acceptErr error
+
 	// newOrderErr, when set, is returned by the next NewOrder call and then cleared. It
 	// scripts "the CA refused this order" without making the fake stateful.
 	newOrderErr error
@@ -260,7 +264,7 @@ func (f *fakeAPI) AcceptChallenge(challengeURL string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.accepted = append(f.accepted, challengeURL)
-	return nil
+	return f.acceptErr
 }
 
 func (f *fakeAPI) GetCertificate(_ string, bundle bool) ([]byte, []byte, error) {
@@ -1002,9 +1006,8 @@ func TestSolveChallengesRefreshesAStaleChallengeToken(t *testing.T) {
 		},
 		Location: "https://ca.test/order/8",
 	}
-	ok, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: cert.Name}, order)
-	if err != nil || !ok {
-		t.Fatalf("solveChallenges = %v, %v", ok, err)
+	if err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: cert.Name}, order); err != nil {
+		t.Fatalf("solveChallenges: %v", err)
 	}
 
 	rows, err := store.ListAuthorizations(cert.Name)
@@ -1075,8 +1078,8 @@ func TestStoreFailureWhileSolvingCountsAsAPassFailure(t *testing.T) {
 		Location: "https://ca.test/order/8",
 	}
 
-	if ok, err := m.solveChallenges(context.Background(), cert, st, order); err == nil || ok {
-		t.Fatalf("with the store refusing the write this pass cannot have succeeded: ok=%v err=%v", ok, err)
+	if err := m.solveChallenges(context.Background(), cert, st, order); err == nil {
+		t.Fatal("with the store refusing the write this pass cannot have succeeded")
 	}
 
 	after, err := store.GetCert(cert.Name)
@@ -1134,9 +1137,8 @@ func TestSolveChallengesAcceptsARefreshedChallenge(t *testing.T) {
 		},
 		Location: "https://ca.test/order/8",
 	}
-	ok, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: cert.Name}, order)
-	if err != nil || !ok {
-		t.Fatalf("solveChallenges = %v, %v", ok, err)
+	if err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: cert.Name}, order); err != nil {
+		t.Fatalf("solveChallenges: %v", err)
 	}
 
 	if len(fake.accepted) == 0 {

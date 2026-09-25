@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -549,5 +550,38 @@ func TestUpdateCertReportsAMissingRow(t *testing.T) {
 	}
 	if called {
 		t.Error("the update function must not run for a row that does not exist")
+	}
+}
+
+// A nil record is an error at every whole-row write entry point, matching PutAuthorization and
+// PutRateBucket: dereferencing it would panic with the store mutex held, and a caller's "record
+// that was never built" bug must surface as an error, not a crash.
+func TestPutMethodsRefuseNil(t *testing.T) {
+	s := openTestStore(t)
+
+	for name, put := range map[string]func() error{
+		"PutAccount": func() error { return s.PutAccount(nil) },
+		"PutCert":    func() error { return s.PutCert(nil) },
+		"PutOrder":   func() error { return s.PutOrder(nil) },
+	} {
+		if err := put(); err == nil {
+			t.Errorf("%s(nil) must be refused", name)
+		} else if !strings.Contains(err.Error(), "nil") {
+			t.Errorf("%s(nil): the error must say what was wrong, got: %v", name, err)
+		}
+	}
+
+	// The transaction path has its own entry point into the same statement.
+	if err := s.WithTx(context.Background(), func(tx *Tx) error {
+		return tx.PutCert(nil)
+	}); err == nil {
+		t.Error("Tx.PutCert(nil) must be refused")
+	} else if !strings.Contains(err.Error(), "nil") {
+		t.Errorf("Tx.PutCert(nil): the error must say what was wrong, got: %v", err)
+	}
+
+	// None of the refusals may poison the store.
+	if err := s.PutCert(&CertState{Name: "example-com", KeyPEM: []byte("KEY")}); err != nil {
+		t.Fatalf("PutCert after the refusals: %v", err)
 	}
 }

@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -43,7 +44,11 @@ const (
 
 func main() { os.Exit(run()) }
 
-func run() int {
+func run() int { return runArgs(os.Args[1:]) }
+
+// runArgs is run's body with the arguments passed in, so the exit-code contract
+// (which parse failure maps to which code) is testable without spawning the binary.
+func runArgs(args []string) int {
 	fs := flag.NewFlagSet("wecert-probe", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), `wecert-probe %s
@@ -61,6 +66,7 @@ Exit codes:
   0  every host served the expected certificate
   1  could not complete a probe (resolve / dial / handshake failed)
   2  a probe completed but the certificate served was not the expected one
+  64 the command line itself was wrong (asking for help with -h is not; it exits 0)
 
 Flags:
 `, version)
@@ -74,12 +80,21 @@ Flags:
 		minValid = fs.Duration("min-valid", 0, "fail if the served certificate has less than this left, e.g. 168h")
 		expectSA = fs.String("expect-san", "", "comma-separated SAN set that was deployed; the served set must match exactly")
 		expectNA = fs.String("expect-not-after", "", "RFC3339 notAfter of the certificate that was deployed; catches a rebind that did not take effect")
-		wait     = fs.Duration("wait", 0, "poll until the verdict is ok or this long elapses (e.g. 90s)")
-		asJSON   = fs.Bool("json", false, "print the raw result as JSON")
-		showVer  = fs.Bool("version", false, "print the version and exit")
+		reqTrust = fs.Bool("require-trusted", false, "fail if the served chain does not verify against the system roots "+
+			"(the daemon defaults this on; leave it off for an internal CA)")
+		wait    = fs.Duration("wait", 0, "poll until the verdict is ok or this long elapses (e.g. 90s)")
+		asJSON  = fs.Bool("json", false, "print the raw result as JSON")
+		showVer = fs.Bool("version", false, "print the version and exit")
 	)
 
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
+		// flag.ContinueOnError has already printed the message and the usage to
+		// fs.Output(). Asking for help is not a command-line error -- the same
+		// distinction tatrun's errHelp makes -- so -h exits 0 while a genuinely bad
+		// command line keeps 64.
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
 		return exitUsage
 	}
 	if *showVer {
@@ -93,17 +108,10 @@ Flags:
 		return exitUsage
 	}
 
-	e := probe.Expectation{
-		Domains:     splitList(*expectSA),
-		MinValidFor: *minValid,
-	}
-	if *expectNA != "" {
-		t, err := time.Parse(time.RFC3339, *expectNA)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "wecert-probe: -expect-not-after must be RFC3339: %v\n", err)
-			return exitUsage
-		}
-		e.NotAfter = t
+	e, err := buildExpectation(*expectSA, *expectNA, *minValid, *reqTrust)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "wecert-probe: %v\n", err)
+		return exitUsage
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -116,6 +124,28 @@ Flags:
 		worst = worseExitCode(worst, checkOne(ctx, host, opts, e, *wait, *asJSON, probe.ProbeAll))
 	}
 	return worst
+}
+
+// buildExpectation assembles what the served certificate is compared against.
+//
+// Split out of runArgs so the flag-to-field wiring is testable without a network: a flag
+// that parses but never reaches the expectation is invisible to every test that goes
+// through checkOne, because checkOne receives the Expectation already built -- which is
+// exactly how this CLI spent its life with no way to turn RequireTrusted on.
+func buildExpectation(expectSAN, expectNotAfter string, minValid time.Duration, requireTrusted bool) (probe.Expectation, error) {
+	e := probe.Expectation{
+		Domains:        splitList(expectSAN),
+		MinValidFor:    minValid,
+		RequireTrusted: requireTrusted,
+	}
+	if expectNotAfter != "" {
+		t, err := time.Parse(time.RFC3339, expectNotAfter)
+		if err != nil {
+			return e, fmt.Errorf("-expect-not-after must be RFC3339: %w", err)
+		}
+		e.NotAfter = t
+	}
+	return e, nil
 }
 
 // worseExitCode folds one host's result into the summary.

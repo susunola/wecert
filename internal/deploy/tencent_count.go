@@ -1,7 +1,6 @@
 package deploy
 
 import (
-	"context"
 	"errors"
 	"fmt"
 
@@ -17,15 +16,6 @@ type bindingCount struct {
 // replaces is bound to any cloud resource.
 var ErrNothingBoundYet = errors.New("the certificate is uploaded but nothing is bound to it yet")
 
-func (d *TencentCLB) nothingBoundYet(ctx context.Context, client sslAPI, oldID, newID string) bool {
-	newBindings, nerr := d.bindingsWith(ctx, client, newID, false)
-	if nerr != nil || !newBindings.complete || newBindings.count > 0 {
-		return false
-	}
-	oldBindings, oerr := d.bindingsWith(ctx, client, oldID, false)
-	return oerr == nil && oldBindings.complete && oldBindings.count == 0
-}
-
 const bindStatusDone = 1
 
 func countBindings(
@@ -39,8 +29,18 @@ func countBindings(
 		if r == nil || r.TaskId == nil || *r.TaskId != taskID {
 			continue
 		}
-		if r.Error != nil && r.Error.Message != nil && *r.Error.Message != "" {
-			return bindingCount{}, false, fmt.Errorf("bind-resource task %s failed: %s", taskID, *r.Error.Message)
+		// The presence of the Error field is the signal, not whether it happens to carry a
+		// Message: a response with Error set but an empty message still failed, and reading
+		// it as "not finished yet" would spin until the enumeration budget expired.
+		if r.Error != nil {
+			msg := derefStr(r.Error.Message)
+			if msg == "" {
+				msg = derefStr(r.Error.Code)
+			}
+			if msg == "" {
+				msg = "the server reported an error with no message or code"
+			}
+			return bindingCount{}, false, fmt.Errorf("bind-resource task %s failed: %s", taskID, msg)
 		}
 		if r.Status == nil || *r.Status != bindStatusDone || len(r.BindResourceResult) == 0 {
 			// An empty result with Status=done is NOT "finished, nothing bound": the first

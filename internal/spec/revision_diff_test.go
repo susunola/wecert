@@ -29,6 +29,53 @@ func TestRevisionIgnoresCertificateOrder(t *testing.T) {
 	}
 }
 
+// Revision fingerprints what renewBefore MEANS, not how it was written: "720h" and the
+// empty default are the same 30 days on classic, and a certificate that never went
+// through config.NormalizeCertificates -- onboarding hashes its freshly built list
+// before WriteDocument validates it -- carries neither the string nor the parsed
+// duration. All three forms must hash identically, or the revision flips without the
+// desired state changing and the observe-mode gate reads a change that says nothing.
+func TestRevisionTreatsEquivalentRenewBeforeAsIdentical(t *testing.T) {
+	explicit := []config.Certificate{{
+		Name: "example-com", Domains: []string{"example.com"}, RenewBefore: "720h",
+	}}
+	deflt := []config.Certificate{{
+		Name: "example-com", Domains: []string{"example.com"},
+	}}
+	if err := config.NormalizeCertificates(explicit); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.NormalizeCertificates(deflt); err != nil {
+		t.Fatal(err)
+	}
+	if Revision(explicit) != Revision(deflt) {
+		t.Errorf("\"720h\" and the classic default are the same 30 days: %s vs %s",
+			Revision(explicit), Revision(deflt))
+	}
+
+	// The unnormalized shape onboarding fingerprints: profile and keyType are always
+	// concrete there, but renewBefore is the empty string and the duration is zero.
+	raw := []config.Certificate{{
+		Name: "example-com", Domains: []string{"example.com"},
+		Profile: config.ProfileClassic, KeyType: config.KeyTypeECDSAP256,
+	}}
+	if Revision(raw) != Revision(deflt) {
+		t.Errorf("a freshly built certificate and its normalized form must hash identically: %s vs %s",
+			Revision(raw), Revision(deflt))
+	}
+
+	// A real change must still change the fingerprint.
+	other := []config.Certificate{{
+		Name: "example-com", Domains: []string{"example.com"}, RenewBefore: "360h",
+	}}
+	if err := config.NormalizeCertificates(other); err != nil {
+		t.Fatal(err)
+	}
+	if Revision(other) == Revision(deflt) {
+		t.Error("360h vs the 720h default must change the fingerprint")
+	}
+}
+
 // diffCert compares renewBefore semantically: both sides came through
 // config.NormalizeCertificates, so "720h" written on one side and the empty default
 // on the other are the SAME 30 days on the classic profile -- a string comparison

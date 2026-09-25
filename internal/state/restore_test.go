@@ -2,6 +2,7 @@ package state
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,16 @@ import (
 // restoreHarness is a state database with one certificate, a snapshot of it, and then one more
 // certificate written afterwards -- the shape every restore question is asked about: does the
 // restored database carry the snapshot's content and not the later writes?
+//
+// The material is real PEM, not placeholder bytes: inspectSnapshot decodes the payload before it
+// lets a snapshot replace a database (see checkSnapshotPayload), so a harness key that is not PEM
+// would make every restore here fail for the wrong reason.
+var (
+	testAccountKeyPEM = []byte("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n")
+	testCertKeyPEM    = []byte("-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n")
+	testCertPEM       = []byte("-----BEGIN CERTIFICATE-----\nBAUG\n-----END CERTIFICATE-----\n")
+)
+
 type restoreHarness struct {
 	dir      string
 	dbPath   string
@@ -33,11 +44,11 @@ func newRestoreHarness(t *testing.T) restoreHarness {
 		t.Fatalf("Open: %v", err)
 	}
 	if err := s.PutAccount(&Account{
-		Directory: "https://acme.test/d", KID: "kid-1", PrivateKeyPEM: []byte("ACCOUNT KEY"),
+		Directory: "https://acme.test/d", KID: "kid-1", PrivateKeyPEM: testAccountKeyPEM,
 	}); err != nil {
 		t.Fatalf("PutAccount: %v", err)
 	}
-	if err := s.PutCert(&CertState{Name: "old-cert", KeyPEM: []byte("OLD KEY")}); err != nil {
+	if err := s.PutCert(&CertState{Name: "old-cert", KeyPEM: testCertKeyPEM}); err != nil {
 		t.Fatalf("PutCert: %v", err)
 	}
 	snap, err := s.Snapshot(h.snapDir, 3)
@@ -46,7 +57,7 @@ func newRestoreHarness(t *testing.T) restoreHarness {
 	}
 	h.snapshot = snap
 	// Written AFTER the snapshot: the restore must lose this, and the copy it displaced must keep it.
-	if err := s.PutCert(&CertState{Name: "new-cert", KeyPEM: []byte("NEW KEY")}); err != nil {
+	if err := s.PutCert(&CertState{Name: "new-cert", KeyPEM: testCertKeyPEM}); err != nil {
 		t.Fatalf("PutCert: %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -604,5 +615,138 @@ func TestPendingRestoreIsAppliedOnOpen(t *testing.T) {
 	}
 	if _, err := os.Stat(pending); !os.IsNotExist(err) {
 		t.Error("pending file must be one-shot")
+	}
+}
+
+// A sidecar whose existence cannot be told (a lost search permission, an I/O error) must stop the
+// move, not be silently skipped: a -wal left next to a database it does not belong to is the one
+// arrangement SQLite must never be handed on open. The failure is injected through the seam -- no
+// real arrangement makes a sidecar's Lstat fail while the database's own succeeds.
+func TestSetAsideRefusesWhenASidecarsExistenceCannotBeTold(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "state.db")
+	for _, p := range []string{dest, dest + "-wal"} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	saved := lstatSidecar
+	lstatSidecar = func(path string) (os.FileInfo, error) {
+		if strings.HasSuffix(path, "-wal") {
+			return nil, errors.New("injected: permission denied")
+		}
+		return saved(path)
+	}
+	defer func() { lstatSidecar = saved }()
+
+	replaced, _, err := setAsideDatabase(dest)
+	if err == nil {
+		t.Fatal("an unanswerable sidecar check must abort the move, not read as \"absent\"")
+	}
+	if !strings.Contains(err.Error(), "-wal") {
+		t.Errorf("the error must name the file it could not check, got: %v", err)
+	}
+	if replaced != "" {
+		t.Errorf("nothing may be reported moved when the move never started, got %s", replaced)
+	}
+	// The refusal happens before the first rename: both files are exactly where they were.
+	for _, p := range []string{dest, dest + "-wal"} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s must not have been touched: %v", p, err)
+		}
+	}
+	matches, err := filepath.Glob(dest + replacedSuffix + "*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("a refused move-aside left displaced copies behind: %v", matches)
+	}
+}
+
+// A snapshot can pass every container check (magic, integrity_check, wecert's tables) and still be
+// worthless: material corrupted at the application layer is a sound database holding bytes that are
+// not keys. Restoring it would install the damage over a working database.
+func TestRestoreRefusesASnapshotWhosePayloadIsNotPEM(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt string
+		want    string
+	}{
+		{"the account key", `UPDATE accounts SET private_key_pem = 'garbage'`, "account key"},
+		{"a certificate's key", `UPDATE certificates SET key_pem = 'garbage'`, "private key"},
+		{"a certificate", `UPDATE certificates SET cert_pem = 'garbage'`, "certificate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRestoreHarness(t)
+
+			damaged := filepath.Join(h.dir, "damaged-payload.db")
+			data, err := os.ReadFile(h.snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(damaged, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := sql.Open("sqlite", sqliteDSN(damaged))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(tc.corrupt); err != nil {
+				t.Fatalf("corrupt the payload: %v", err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Restore(h.dbPath, damaged); err == nil {
+				t.Fatal("a snapshot whose payload is not PEM must be refused")
+			} else if !strings.Contains(err.Error(), "not PEM") || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the refusal should name the damaged material (%s), got: %v", tc.want, err)
+			}
+			assertNothingWasMoved(t, h)
+		})
+	}
+}
+
+// A restore into a path that IS a directory must be refused: os.Rename would move the whole
+// directory aside as if it were the database.
+func TestRestoreRefusesADirectoryAsStatePath(t *testing.T) {
+	h := newRestoreHarness(t)
+
+	dirDest := filepath.Join(h.dir, "state-dir")
+	if err := os.Mkdir(dirDest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Restore(dirDest, h.snapshot); err == nil {
+		t.Fatal("restoring into a directory must be refused")
+	} else if !strings.Contains(err.Error(), "directory") {
+		t.Errorf("the refusal should say the path is a directory, got: %v", err)
+	}
+	if fi, err := os.Stat(dirDest); err != nil || !fi.IsDir() {
+		t.Errorf("the directory must be untouched (stat err %v)", err)
+	}
+
+	// Same through a symlink: the bytes go to the link's target, so the target is what must not
+	// be a directory.
+	linkDest := filepath.Join(h.dir, "state-link")
+	if err := os.Symlink(dirDest, linkDest); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+	if _, err := Restore(linkDest, h.snapshot); err == nil {
+		t.Fatal("restoring through a symlink to a directory must be refused")
+	} else if !strings.Contains(err.Error(), "directory") {
+		t.Errorf("the refusal should say the target is a directory, got: %v", err)
+	}
+	if fi, err := os.Stat(dirDest); err != nil || !fi.IsDir() {
+		t.Errorf("the directory must be untouched (stat err %v)", err)
+	}
+
+	// And the live database was never involved.
+	if got := h.certNames(t); len(got) != 2 {
+		t.Errorf("the refused restores must not change the database, got %v", got)
 	}
 }

@@ -166,6 +166,10 @@ func TestInstallRefusesANonRegularTemporaryFile(t *testing.T) {
 // behind a round that otherwise completed. Whether the bytes reached the platter is not observable
 // from inside the process, but the two things the fix actually changed are: which file is synced,
 // and that it is synced before the rename. Both are pinned here through the syncFile seam.
+//
+// Write now syncs twice: once before closing the temporary file, and once inside Install (which
+// makes the same promise for callers whose writer is not Write). What is pinned is not the count
+// but that every sync is on the temporary file and precedes the rename.
 func TestWriteSyncsTheTemporaryFileBeforeTheRename(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "onboarding-report.json")
@@ -202,8 +206,8 @@ func TestWriteSyncsTheTemporaryFileBeforeTheRename(t *testing.T) {
 	mu.Lock()
 	n := len(synced)
 	mu.Unlock()
-	if n != 1 {
-		t.Fatalf("exactly one fsync belongs on the temporary file, got %d", n)
+	if n == 0 {
+		t.Fatal("no fsync happened on the temporary file: the durability claim is empty")
 	}
 	got, err := os.ReadFile(target)
 	if err != nil {
@@ -249,5 +253,85 @@ func TestAFailedSyncLeavesTheOldContentsInPlace(t *testing.T) {
 		if IsTemp(e.Name()) {
 			t.Errorf("a failed write left %s behind", e.Name())
 		}
+	}
+}
+
+// Install must fsync the temporary file itself, before the rename.
+//
+// The package promises the new contents survive a power loss; callers whose writer is not Write
+// (internal/state's snapshots come from SQLite's VACUUM INTO) used to carry that as an implicit
+// "the caller surely synced" precondition -- exactly the kind that drifts. The seam records which
+// file is synced, and the target must not exist yet when it happens.
+func TestInstallSyncsTheTemporaryFileBeforeTheRename(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, ".atomic-456.tmp")
+	if err := os.WriteFile(tmp, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "final")
+
+	var synced []string
+	orig := syncFile
+	syncFile = func(f *os.File) error {
+		synced = append(synced, f.Name())
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Errorf("the target already exists when Sync runs (%s): the sync must precede the rename", f.Name())
+		}
+		return f.Sync()
+	}
+	t.Cleanup(func() { syncFile = orig })
+
+	if err := Install(tmp, target, 0o600, dir); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if len(synced) != 1 || synced[0] != tmp {
+		t.Errorf("expected exactly one fsync, on the temporary file; got %v", synced)
+	}
+}
+
+// A failed sync inside Install must fail the install before the rename, and leave the temporary
+// file in place: on failure the caller owns the cleanup.
+func TestAFailedInstallSyncRenamesNothing(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, ".atomic-789.tmp")
+	if err := os.WriteFile(tmp, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "final")
+
+	orig := syncFile
+	syncFile = func(*os.File) error { return errors.New("EIO") }
+	t.Cleanup(func() { syncFile = orig })
+
+	if err := Install(tmp, target, 0o600, dir); err == nil {
+		t.Fatal("a sync failure must be reported: the caller has to know the install is not durable")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Error("nothing may be installed when the sync failed")
+	}
+	if _, err := os.Stat(tmp); err != nil {
+		t.Errorf("the temporary file must be left in place for the caller's cleanup: %v", err)
+	}
+}
+
+// dir is the directory synced after the rename; a mismatched one would make that sync succeed
+// quietly while the rename itself stays volatile.
+func TestInstallRefusesAMismatchedDirectory(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, ".atomic-012.tmp")
+	if err := os.WriteFile(tmp, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "final")
+
+	if err := Install(tmp, target, 0o600, t.TempDir()); err == nil {
+		t.Fatal("a directory that does not hold the target must be refused: the directory sync " +
+			"would land on the wrong directory")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Error("nothing may be installed when the directory is wrong")
+	}
+	if _, err := os.Stat(tmp); err != nil {
+		t.Errorf("the temporary file must be left in place for the caller's cleanup: %v", err)
 	}
 }

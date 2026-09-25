@@ -85,7 +85,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	// No cert/certs means a full trigger.
 	if len(targets) == 0 {
 		accepted, skipped, err := s.rec.StartAll(s.baseCtx)
-		if err != nil {
+		if err != nil && len(accepted) == 0 && len(skipped) == 0 {
 			// Two causes, both "nothing started", and both an answer of 202
 			// with every certificate "accepted" would misreport as a
 			// convergence that is on its way: the desired state is unreadable,
@@ -96,6 +96,16 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 				"err", err, "remote", r.RemoteAddr)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
+		}
+		if err != nil {
+			// A shutdown that began mid-walk: StartAll hands back the accepted prefix with
+			// the error (see reconcile.StartAll). Those passes are registered and Drain
+			// waits for them, so they are honestly "accepted" and the answer stays 202 --
+			// answering 503 would report passes that are running as ones that were refused.
+			// The cutoff itself is named here, since the response shape has no place for it.
+			s.log.Warn("the full trigger was cut short by shutdown; the accepted passes are "+
+				"running and will finish, the rest were not started",
+				"accepted", accepted, "skipped", skipped, "err", err, "remote", r.RemoteAddr)
 		}
 		// append, not assign: StartAll hands back a nil slice when it accepted nothing, and
 		// assigning it would undo the initialisation above -- a full trigger that skipped every
@@ -111,7 +121,7 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		// a full validation and a document hash -- all synchronously inside this request,
 		// which has a 15s write timeout.
 		started, running, notFound, err := s.rec.StartNamed(s.baseCtx, targets)
-		if err != nil {
+		if err != nil && len(started) == 0 && len(running) == 0 {
 			// Anything else -- an unreadable desired state, or a process that is
 			// already draining and refuses new passes -- is a transient internal
 			// failure, not "not managed". Reporting it in unknown would tell the
@@ -121,6 +131,14 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 				"certs", targets, "err", err, "remote", r.RemoteAddr)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
+		}
+		if err != nil {
+			// Mid-walk shutdown with a partial answer (see reconcile.StartNamed): the
+			// started prefix is really running and Drain waits for it, so it is reported
+			// as accepted below and the cutoff is named here rather than hidden by a 503.
+			s.log.Warn("the named trigger was cut short by shutdown; the started passes are "+
+				"running and will finish, the rest were not started",
+				"started", started, "certs", targets, "err", err, "remote", r.RemoteAddr)
 		}
 		resp.Accepted = append(resp.Accepted, started...)
 		resp.Skipped = append(resp.Skipped, running...)
@@ -132,6 +150,10 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, unknownNamesResponse{
 				Error:   "no certificate with any of those names is managed here",
 				Unknown: resp.Unknown,
+				// Initialised, not nil: the field is part of the shared response shape, and a
+				// null would read as "no answer" to a client that iterates it -- we KNOW
+				// nothing was accepted, so the honest value is an empty array.
+				Accepted: []string{},
 			})
 			return
 		}

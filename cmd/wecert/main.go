@@ -50,14 +50,33 @@ func main() {
 		// wecert-onboard and wecert-probe use -- and it matters here because the alternative was
 		// flag.ExitOnError's 2, which this repository documents as wecert-onboard's "deliberately
 		// frozen, a human should look" code. A typo in wecert-once.service's ExecStart is not a
-		// freeze, and a monitoring rule keyed on 2 must not read it as one. The flag package has
-		// already printed the offending flag and the usage to stderr.
+		// freeze, and a monitoring rule keyed on 2 must not read it as one.
 		if errors.Is(err, errUsage) {
+			// A bare errUsage carries nothing to print: the flag package has already printed
+			// the offending flag and the usage. An error that only WRAPS it (a contradictory
+			// flag combination, an unknown -log-level, a -restore conflict) carries its own
+			// sentence, which used to be discarded right here -- the message existed and the
+			// operator never saw it.
+			if msg := usageExitMessage(err); msg != "" {
+				fmt.Fprintf(os.Stderr, "wecert: %v\n", msg)
+			}
 			os.Exit(exitUsage)
 		}
 		slog.Error("wecert exited with an error", "err", err)
 		os.Exit(1)
 	}
+}
+
+// usageExitMessage is what main prints for a command-line error before exiting 64: nothing for
+// a bare errUsage (the flag package has already printed the offending flag and the usage), the
+// message itself for anything wrapping it -- validateFlags' contradictions, an unknown
+// -log-level, errRestoreConflict. Those sentences used to be discarded on the way to the exit
+// code, so a contradictory command line produced a silent exit 64.
+func usageExitMessage(err error) string {
+	if err == errUsage {
+		return ""
+	}
+	return err.Error()
 }
 
 const (
@@ -69,8 +88,9 @@ const (
 	snapshotWait = 60 * time.Second
 )
 
-// errUsage marks a command-line error, so main can pick the exit code without re-printing what the
-// flag package already printed.
+// errUsage marks a command-line error, so main can pick the exit code. Returned bare it means
+// the flag package already printed the cause; wrapped in another error it only sets the
+// classification, and main prints the wrapper's message before exiting.
 var errUsage = errors.New("invalid command line")
 
 // flags holds every flag this command takes.
@@ -156,8 +176,11 @@ func run() error {
 		return nil
 	}
 
+	// A contradiction or a bad value here is a command-line error, not a run failure: wrap
+	// errUsage so main prints the sentence and exits 64 instead of 1 (the repository's own
+	// classification, documented at exitUsage).
 	if err := validateFlags(explicit, f.once, f.dryRun, f.interval); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errUsage, err)
 	}
 
 	if f.restoreFrom != "" {
@@ -177,22 +200,28 @@ func run() error {
 	}
 
 	// Install signal handling before anything touches the network (config load, EnsureAccount,
-	// the revocation path). This used to be registered just before the daemon loop, so a SIGTERM
-	// during the first account setup -- a network call that can hang for a while -- got the
-	// default kill instead of a graceful shutdown.
+	// the revocation path -- which receives this ctx below). This used to be registered just
+	// before the daemon loop, so a SIGTERM during the first account setup -- a network call that
+	// can hang for a while -- got the default kill instead of a graceful shutdown.
 	//
 	// The context is process-level on purpose: a webhook-triggered reconcile runs in the
 	// background for minutes, so it must hang off the process context, not a request's.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	//
+	// notifyContext, not a bare signal.NotifyContext: NotifyContext keeps diverting signals for
+	// the rest of the process's life, so a second SIGTERM during a slow graceful shutdown was
+	// swallowed too, leaving no way to force the process down short of SIGKILL. Restoring the
+	// default disposition once the graceful path has started is the missing half.
+	ctx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if f.revokeCert != "" {
-		return runRevoke(f.configPath, f.statePath, f.revokeCert, f.revokeWhy, f.yesFlag)
+		return runRevoke(ctx, f.configPath, f.statePath, f.revokeCert, f.revokeWhy, f.yesFlag)
 	}
 
 	level, err := parseLogLevel(f.logLevel)
 	if err != nil {
-		return err
+		// Same classification as validateFlags: an illegal -log-level is a wrong command line.
+		return fmt.Errorf("%w: %v", errUsage, err)
 	}
 	log := newLogger(level)
 
@@ -282,6 +311,24 @@ func run() error {
 	drainRuntimeBackground(runtime, log)
 	drainNotifier(runtime.Notifier(), log)
 	return nil
+}
+
+// notifyContext is signal.NotifyContext plus the missing second half of graceful shutdown.
+//
+// NotifyContext keeps diverting the signals into the (already cancelled) context for the rest
+// of the process's life, so a second SIGTERM during a slow graceful shutdown -- waiting on a
+// background pass, on the snapshot goroutine, on the network -- was swallowed exactly like the
+// first, and the only way out was SIGKILL. Once the first signal has started the graceful path
+// the default disposition is restored: a second signal then kills the process immediately.
+// The returned stop is the one NotifyContext handed back, so the caller's deferred stop and the
+// context's cancellation semantics are unchanged.
+func notifyContext(parent context.Context, signals ...os.Signal) (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(parent, signals...)
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return ctx, stop
 }
 
 // backgroundDrainTimeout bounds how long a shutdown waits for webhook-triggered passes.

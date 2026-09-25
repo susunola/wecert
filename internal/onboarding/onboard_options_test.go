@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 // baseOptions fills every field New validates before the policy knobs, so a test for one
@@ -89,6 +91,32 @@ func TestNewDoesNotMutateTheCallersAllowlist(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("normalised allowlist = %v, want %v (registered-domain form, sorted)", got, want)
+		}
+	}
+}
+
+// The constructor's keyType message must list every value ValidKeyType accepts, like the
+// declaration parser does (declaration.go): naming only some of them sends the operator fixing
+// a typo with a wrong picture of what is legal.
+func TestNewRejectsAnUnknownKeyTypeNamingEveryValidValue(t *testing.T) {
+	opts := baseOptions(t)
+	opts.KeyType = "rsa-2048" // a plausible typo; the real value is rsa2048
+	_, err := New(Sources{Declarations: &fakeDeclarations{}, Rules: &fakeRules{}}, opts, testLogger())
+	if err == nil {
+		t.Fatal("an unknown keyType must be rejected")
+	}
+	for _, kt := range []string{config.KeyTypeECDSAP256, config.KeyTypeECDSAP384, config.KeyTypeRSA2048, config.KeyTypeRSA4096} {
+		if !strings.Contains(err.Error(), kt) {
+			t.Errorf("the error must list %q as a valid keyType, got %v", kt, err)
+		}
+	}
+
+	// The control: every listed value must really be accepted.
+	for _, kt := range []string{config.KeyTypeECDSAP256, config.KeyTypeECDSAP384, config.KeyTypeRSA2048, config.KeyTypeRSA4096} {
+		opts := baseOptions(t)
+		opts.KeyType = kt
+		if _, err := New(Sources{Declarations: &fakeDeclarations{}, Rules: &fakeRules{}}, opts, testLogger()); err != nil {
+			t.Errorf("a valid keyType %q must be accepted, got %v", kt, err)
 		}
 	}
 }

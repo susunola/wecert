@@ -470,3 +470,52 @@ func TestThePauseIsReportableWithoutBeingSpendable(t *testing.T) {
 		}
 	}
 }
+
+// A limit with no positive capacity has no bucket: spending must record nothing rather than
+// manufacture tokens. level() reads such a limit as empty, but Spend's debt floor is
+// -Capacity -- POSITIVE for a negative capacity -- so the subtraction used to be clamped UP
+// into credit, and the stored snapshot then read as spendable quota that never existed.
+func TestSpendOnACapacitylessLimitRecordsNoTokens(t *testing.T) {
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	for _, capacity := range []float64{0, -5} {
+		l := Limit{Name: "broken", Capacity: capacity, Refill: time.Minute}
+		s := Spend(Snapshot{}, l, 1, now)
+		if s.Tokens != 0 {
+			t.Errorf("capacity %v: a spend must record no tokens, stored %v", capacity, s.Tokens)
+		}
+		if got := Remaining(s, l, now); got != 0 {
+			t.Errorf("capacity %v: a bucket that does not exist has nothing available, got %v",
+				capacity, got)
+		}
+	}
+}
+
+// The delay form of Retry-After is relative to "now", and a caller with an injected clock
+// (the Tracker keeps one so tests can simulate time) must be able to supply it: computing
+// against the wall clock lands the deadline on a different timeline than the accounting it
+// gates.
+func TestParseRetryAfterHeaderUsesTheGivenClock(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+
+	at, ok := ParseRetryAfterHeaderAt("120", now)
+	if !ok {
+		t.Fatal("a delay in seconds must parse")
+	}
+	if want := now.Add(120 * time.Second); !at.Equal(want) {
+		t.Errorf("deadline = %s, want exactly %s (the given clock plus the delay)", at, want)
+	}
+
+	// The HTTP-date form is absolute and ignores the clock.
+	want := time.Date(2026, 9, 23, 4, 0, 0, 0, time.UTC)
+	at, ok = ParseRetryAfterHeaderAt(want.Format(http.TimeFormat), now)
+	if !ok || !at.Equal(want) {
+		t.Errorf("an HTTP-date must parse to %s, got %s (ok=%v)", want, at, ok)
+	}
+
+	// And the rejections hold against the given clock too.
+	for _, v := range []string{"", "0", "-5", "soon"} {
+		if at, ok := ParseRetryAfterHeaderAt(v, now); ok {
+			t.Errorf("%q must not parse as a deadline, got %s", v, at)
+		}
+	}
+}

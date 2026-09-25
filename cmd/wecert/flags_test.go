@@ -3,10 +3,18 @@ package main
 import (
 	"errors"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func withArgs(t *testing.T, args ...string) {
+	t.Helper()
+	old := os.Args
+	os.Args = append([]string{"wecert"}, args...)
+	t.Cleanup(func() { os.Args = old })
+}
 
 // A contradictory flag combination must be an error at startup, not one flag silently winning
 // over the other.
@@ -157,5 +165,41 @@ func TestParseArgsRejectsAnUnknownFlag(t *testing.T) {
 	}
 	if !errors.Is(err, errUsage) {
 		t.Errorf("err = %v, want errUsage (exit %d, not 1)", err, exitUsage)
+	}
+	// Bare means "the flag package already printed": main must not print it again.
+	if msg := usageExitMessage(err); msg != "" {
+		t.Errorf("a bare errUsage must be silent, got %q", msg)
+	}
+}
+
+// A wrong command line is classified 64 ("the command line is wrong"), never 1 ("the program
+// ran and failed") -- and unlike the bare sentinel, each of these carries a sentence that main
+// must print before exiting. The validateFlags/parseLogLevel errors used to exit 1, and
+// errRestoreConflict's message was discarded on the way to 64.
+func TestCommandLineMistakesAreUsageErrorsWithAMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"a contradictory flag combination", []string{"-once", "-dry-run"}, "-once and -dry-run"},
+		{"an unknown log level", []string{"-log-level", "wran"}, "wran"},
+		{"-restore with a mode flag", []string{"-restore", "latest", "-once"}, "-restore"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withArgs(t, tc.args...)
+			err := run()
+			if !errors.Is(err, errUsage) {
+				t.Fatalf("err = %v, want errUsage so main exits %d (not 1)", err, exitUsage)
+			}
+			msg := usageExitMessage(err)
+			if msg == "" {
+				t.Fatal("the error must carry its message: a bare sentinel would exit 64 silently")
+			}
+			if !strings.Contains(msg, tc.want) {
+				t.Errorf("the message must explain the mistake (%q), got %q", tc.want, msg)
+			}
+		})
 	}
 }

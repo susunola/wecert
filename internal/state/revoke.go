@@ -45,6 +45,11 @@ type RevokeRequest struct {
 // operator asking, right now, for the certificate stored under this name now. A retry does not
 // come through here, so it keeps targeting the certificate the request was made about -- which is
 // the whole point of storing the identity.
+//
+// When the identity CHANGES, the attempt ledger (attempts, last_error, last_attempt_at) is
+// reset with it: those counters describe tries at revoking the OLD material, and carrying them
+// onto a new request makes a fresh decision look already-failed -- including pushing it past a
+// retry ceiling it has never once hit.
 func (s *Store) AddRevokeRequest(certName string, reason int, certIdentity string, now time.Time) error {
 	if certName == "" {
 		return errors.New("revoke request needs a certificate name")
@@ -57,7 +62,16 @@ func (s *Store) AddRevokeRequest(certName string, reason int, certIdentity strin
 		VALUES (?, ?, ?, ?, 0, '', 0)
 		ON CONFLICT(cert_name) DO UPDATE SET
 		    reason = excluded.reason,
-		    cert_identity = excluded.cert_identity`,
+		    cert_identity = excluded.cert_identity,
+		    -- A request naming DIFFERENT material is a new decision: the attempts and the error
+		    -- on file describe tries at revoking the old certificate and say nothing about this
+		    -- one. Same identity (the operator simply asking again) keeps the ledger as it is.
+		    attempts        = CASE WHEN excluded.cert_identity != revoke_requests.cert_identity
+		                           THEN 0 ELSE revoke_requests.attempts END,
+		    last_error      = CASE WHEN excluded.cert_identity != revoke_requests.cert_identity
+		                           THEN '' ELSE revoke_requests.last_error END,
+		    last_attempt_at = CASE WHEN excluded.cert_identity != revoke_requests.cert_identity
+		                           THEN 0 ELSE revoke_requests.last_attempt_at END`,
 		certName, reason, certIdentity, toUnix(now))
 	if err != nil {
 		return fmt.Errorf("record revoke request for %s: %w", certName, err)

@@ -122,7 +122,13 @@ func (s *Store) PruneIdentifierFailures(certName string, now time.Time, age time
 // on every degraded pass. Letting the upsert refresh it would make "degraded for three
 // days" unanswerable, which is exactly the question an operator asks when the fallback
 // metric goes off.
+//
+// A nil record is an error, matching PutAuthorization: accepting it would panic on the
+// dereference with the store mutex held.
 func (s *Store) PutFallback(f *Fallback) error {
+	if f == nil {
+		return fmt.Errorf("nil fallback")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dropped := append([]string(nil), f.Dropped...)

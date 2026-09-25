@@ -153,6 +153,48 @@ else
 	ok "A. bound_certs_are rejects a certificate that is not bound"
 fi
 
+# ── fixture D: the after-renewal shape, for assertion 5 ─────────────────────────────
+# Assertion 5 ("A is no longer bound anywhere on the listener") is script-side against the
+# stored dump, so it runs even when the snapshot fell back to the unfiltered query. The
+# after-renewal dump has a NEW primary, B still among the extensions, and A gone: the
+# reverse assertion must find A absent, and must not false-positive on B or the new id.
+cat > d.full <<'EOF'
+{
+  "Listeners": [
+    {
+      "ListenerId": "lbl-yyyy",
+      "Protocol": "HTTPS",
+      "Port": 443,
+      "SniSwitch": 1,
+      "Certificate": {
+        "CertId": "apNEW001",
+        "ExtCertIds": [
+          "apJRqDsC"
+        ]
+      }
+    }
+  ],
+  "RequestId": "after-renewal"
+}
+EOF
+keep_first_json d.full d.json
+LISTENER="lbl-yyyy"
+if bound_certs_are apJdfyPa d.json; then
+	bad "D. bound_certs_are still finds the old A after the renewal (assertion 5 would miss it)"
+else
+	ok "D. bound_certs_are: the old A is gone after the renewal"
+fi
+if bound_certs_are apJRqDsC d.json; then
+	ok "D. bound_certs_are: B is still bound after the renewal"
+else
+	bad "D. bound_certs_are lost B after the renewal"
+fi
+if bound_certs_are apNEW001 d.json; then
+	ok "D. bound_certs_are: the new primary is bound"
+else
+	bad "D. bound_certs_are missed the new primary"
+fi
+
 # ── fixture B: pure JSON, the shape a stub prints ────────────────────────────────
 cat > b.full <<'EOF'
 {"Listeners":[{"ListenerId":"lbl-yyyy","Protocol":"HTTPS","Port":443,"SniSwitch":0,

@@ -1,15 +1,19 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 func quietSolver(exchange func(context.Context, *dns.Msg, string) (*dns.Msg, error)) *DNSSolver {
@@ -82,6 +86,92 @@ func TestRecursiveNameserversCopiesTheSlice(t *testing.T) {
 	got[0] = "mutated"
 	if cfg[0] != "1.1.1.1:53" {
 		t.Error("the solver mutated the caller's configured resolver list")
+	}
+}
+
+// ── lego's process-wide resolver list ─────────────────────────────────────────────────
+//
+// NewDNSSolver configures the resolvers lego's own DNS lookups use by writing a package-level
+// variable inside lego (see applyLegoRecursiveNameservers). One process therefore has ONE such
+// list, and these tests pin how construction behaves under that constraint.
+
+// resetLegoResolverGuard isolates a test from the resolver list recorded by solver
+// constructions elsewhere in the package -- the tests share one process, and the list is
+// process-wide -- and restores it afterwards.
+func resetLegoResolverGuard(t *testing.T) {
+	t.Helper()
+	legoResolvers.mu.Lock()
+	saved := legoResolvers.applied
+	legoResolvers.applied = nil
+	legoResolvers.mu.Unlock()
+	t.Cleanup(func() {
+		legoResolvers.mu.Lock()
+		legoResolvers.applied = saved
+		legoResolvers.mu.Unlock()
+	})
+}
+
+// dnspodSolverConfig is the cheapest configuration NewDNSSolver accepts, with the resolver list
+// as the variable under test.
+func dnspodSolverConfig(servers ...string) config.DNS {
+	return config.DNS{
+		Provider:             config.DNSProviderDNSPod,
+		LoginToken:           "12345,token",
+		RecursiveNameservers: servers,
+		Propagation:          time.Minute,
+		Polling:              time.Second,
+	}
+}
+
+// Rebuilding a solver with the SAME resolver list must be a silent no-op; rebuilding with a
+// DIFFERENT one must be loud, because the earlier solver silently changes behaviour with it --
+// there is no per-instance override to offer instead.
+func TestNewDNSSolverGuardsTheGlobalResolverList(t *testing.T) {
+	resetLegoResolverGuard(t)
+
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+
+	if _, err := NewDNSSolver(dnspodSolverConfig("192.0.2.53:53"), config.Tencent{}, log); err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	if _, err := NewDNSSolver(dnspodSolverConfig("192.0.2.53:53"), config.Tencent{}, log); err != nil {
+		t.Fatalf("a rebuild with the same resolvers must be a no-op, got: %v", err)
+	}
+	if logs.Len() != 0 {
+		t.Errorf("no warning belongs to an unchanged rebuild, got:\n%s", logs.String())
+	}
+
+	if _, err := NewDNSSolver(dnspodSolverConfig("198.51.100.53:53"), config.Tencent{}, log); err != nil {
+		t.Fatalf("a differing rebuild is warned about, not refused: %v", err)
+	}
+	if !strings.Contains(logs.String(), "recursive nameservers") {
+		t.Errorf("changing the process-wide resolver list must be loud -- solvers built earlier "+
+			"now resolve through the new list -- got:\n%s", logs.String())
+	}
+}
+
+// lego's package-level variable carries no synchronisation of its own, so two concurrent
+// constructions used to race on it. Under -race this fails without the guard.
+func TestNewDNSSolverIsSafeToBuildConcurrently(t *testing.T) {
+	resetLegoResolverGuard(t)
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := NewDNSSolver(dnspodSolverConfig("192.0.2.53:53"), config.Tencent{}, log); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent build failed: %v", err)
 	}
 }
 
@@ -206,6 +296,48 @@ func TestWaitAllConfirmsEachValueAtASharedName(t *testing.T) {
 	}
 	if !confirmed["value-a"] {
 		t.Log("value-a was confirmed before the timeout, as expected")
+	}
+}
+
+// A certificate's SANs mostly live in ONE zone, and findZone's SOA walk answers for the zone's
+// whole subtree -- so the second record in an already-resolved zone must not walk again. The
+// walk is the only per-record network step before the budget starts, and one per SAN is one
+// resolver round-trip per SAN spent on a question already answered.
+func TestWaitAllWalksTheZoneOncePerZone(t *testing.T) {
+	var soaWalks int
+	solver := quietSolver(func(_ context.Context, msg *dns.Msg, _ string) (*dns.Msg, error) {
+		name := msg.Question[0].Name
+		switch msg.Question[0].Qtype {
+		case dns.TypeSOA:
+			if strings.HasSuffix(name, ".example.com.") {
+				// findZone walks from the left and takes the first SOA, so each walk costs
+				// exactly one answer here.
+				soaWalks++
+				return soaReply(msg, "example.com."), nil
+			}
+			return dnsReply(msg), nil // no SOA here: keep climbing
+		case dns.TypeNS:
+			return nsReply(msg, name, "ns1.example.net."), nil
+		case dns.TypeA:
+			return aReply(msg), nil
+		default:
+			// Both the authoritative probes and the recursive confirmation see the value.
+			return authTXT(msg, "v"), nil
+		}
+	})
+	solver.timeout = 200 * time.Millisecond
+
+	err := solver.WaitAll(context.Background(), []DNSRecord{
+		{FQDN: "_acme-challenge.a.example.com.", Value: "v"},
+		{FQDN: "_acme-challenge.b.example.com.", Value: "v"},
+		{FQDN: "_acme-challenge.c.example.com.", Value: "v"},
+	})
+	if err != nil {
+		t.Fatalf("every record is visible, so WaitAll must succeed: %v", err)
+	}
+	if soaWalks != 1 {
+		t.Errorf("three records in one zone caused %d SOA walks, want 1: the walk's answer holds "+
+			"for the whole subtree and must be reused", soaWalks)
 	}
 }
 

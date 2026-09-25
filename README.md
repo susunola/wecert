@@ -634,15 +634,18 @@ Dials a real TLS connection and reports the certificate the far end actually ser
 | `-min-valid` | `0` | Fail if the served certificate has less than this left, e.g. `168h` |
 | `-expect-san` | — | SAN set that was deployed; the served set must match exactly |
 | `-expect-not-after` | — | RFC3339 `notAfter` of the deployed certificate; catches a rebind that did not take effect |
+| `-require-trusted` | `false` | Fail when the served chain does not verify against the system roots (the daemon's `probe.requireTrusted` defaults to `true`; leave this off for an internal CA) |
 | `-wait` | `0` | Poll until the verdict is ok or this long elapses (e.g. `90s`) — useful right after a rebind |
 | `-json` | `false` | Print each attempt as one JSON object (NDJSON, so a retry under `-wait`, or a host that resolves to several addresses, produces one line per attempt) |
 
-Exit codes: `0` served as expected · `1` could not complete a probe · `2` probed successfully but the certificate served was not the expected one.
+Exit codes: `0` served as expected · `1` could not complete a probe · `2` probed successfully but the certificate served was not the expected one · `64` the command line itself was wrong. Asking for help is not an error: `-h` prints the usage and exits `0`.
 
 Under `-json`, `verdict.problems` is a list of objects — `{"kind": "...", "text": "..."}` — one per
 independent problem, because they point in different directions: `min_valid_for` means the deployed
-certificate **is** being served but has too little validity left (renewal has not run), while
-`not_after` or `names_extra` mean a different certificate is being served.
+certificate **is** being served but has too little validity left (renewal has not run),
+`validity_window` means the served certificate is expired or not yet valid, `untrusted` means its
+chain does not verify against the system roots, while `not_after` or `names_extra` mean a different
+certificate is being served.
 
 ```bash
 ./bin/wecert-probe -host www.example.com -min-valid 168h

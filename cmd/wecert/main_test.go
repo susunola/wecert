@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -444,5 +447,68 @@ func TestStartStateBackupsPublishesRemoteBackupExpectations(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.BackupRemoteConfiguredAt.WithLabelValues(labels...)); got <= 0 {
 		t.Errorf("remote backup configured metric = %v, want a Unix timestamp", got)
+	}
+}
+
+// A second SIGTERM during the graceful shutdown must kill the process, not be swallowed.
+//
+// signal.NotifyContext alone keeps diverting the signals into the (already cancelled) context
+// for the rest of the process's life, so a wedged shutdown -- a CA call that cannot be
+// interrupted, a drain that never finishes -- had no way out short of SIGKILL. notifyContext
+// restores the default disposition once the first signal has started the graceful path. The
+// only honest test for "the default disposition is back" is a process that actually dies of
+// the second signal, so this re-runs itself as a helper child.
+func TestASecondSignalForceKillsAfterTheFirstStartsShutdown(t *testing.T) {
+	if os.Getenv("WECERT_SECOND_SIGNAL_HELPER") == "1" {
+		ctx, _ := notifyContext(context.Background(), syscall.SIGTERM)
+		fmt.Println("ready")
+		<-ctx.Done()
+		// A graceful shutdown that never finishes: only a second signal can end this process.
+		select {}
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(self, "-test.run", "^TestASecondSignalForceKillsAfterTheFirstStartsShutdown$")
+	cmd.Env = append(os.Environ(), "WECERT_SECOND_SIGNAL_HELPER=1")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until the child has installed its handler before signalling it.
+	ready := make([]byte, len("ready\n"))
+	if _, err := io.ReadFull(stdout, ready); err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("the helper never became ready: %v", err)
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("the first SIGTERM failed: %v", err)
+	}
+	// Give the first signal time to start the graceful path (and restore the default
+	// disposition) before the second one arrives.
+	time.Sleep(300 * time.Millisecond)
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("the second SIGTERM failed: %v", err)
+	}
+
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case err := <-waited:
+		if err == nil || !strings.Contains(err.Error(), "terminated") {
+			t.Errorf("the second SIGTERM must kill the process, got exit error %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("the second SIGTERM was swallowed: the process kept hanging in its graceful shutdown")
 	}
 }

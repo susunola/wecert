@@ -86,14 +86,12 @@ func (m *Manager) advance(ctx context.Context, c *config.Certificate, st *state.
 		return m.download(ctx, c, st, o, final, rd)
 	}
 
-	// pending: drive the DNS-01 challenges through to the end.
-	allValid, err := m.solveChallenges(ctx, c, st, order)
-	if err != nil {
+	// pending: drive the DNS-01 challenges through to the end. A nil return means every
+	// authorization is valid: each "not yet" outcome inside solveChallenges is reported as a
+	// non-nil error (with the backoff that comes with it), so there is no false-without-error
+	// case to wait out here.
+	if err := m.solveChallenges(ctx, c, st, order); err != nil {
 		return err
-	}
-	if !allValid {
-		// Still waiting on CA validation; keep the order and carry on next round.
-		return nil
 	}
 
 	// Every authorization is valid; wait for the order to turn ready, then finalize.

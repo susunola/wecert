@@ -1568,8 +1568,9 @@ func TestWaitDeleteTaskStopsOnAPermanentQueryError(t *testing.T) {
 }
 
 // The enumeration loop must not abandon a switch that already succeeded: one unreachable
-// query used to fail the whole call, so the repair path skipped its fix and nothingBoundYet
-// answered false for a certificate whose rebind had in fact gone through.
+// query used to fail the whole call, so the repair path skipped its fix and the
+// pending-first-bind check answered false for a certificate whose rebind had in fact gone
+// through.
 func TestBindingsWithRetriesATransientQueryError(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	stubSleeper(t, clock)
@@ -1624,5 +1625,125 @@ func TestADeadlineKeepsBothTheContextAndTheAPIError(t *testing.T) {
 	// signal that makes the caller back off longer instead of retrying into the same limit.
 	if !tcerr.IsThrottled(err) {
 		t.Errorf("a throttled call that hit its deadline must still be classified as throttled, got %v", err)
+	}
+}
+
+// ── reclaiming a certificate that is already gone ─────────────────────────────
+
+// Deleting a certificate that no longer exists must be a success, not an error.
+//
+// The certificate can be removed out of band (console, another tool), and then the goal
+// state of the reclaim -- "the certificate does not occupy a quota slot" -- is already
+// reached. The SDK documents FailedOperation.CertificateNotFound for DeleteCertificate.
+// Reporting it as a failure kept the retired_certificates row forever and warned on every
+// pass about a certificate that no longer existed.
+func TestDeleteTreatsAnAlreadyGoneCertificateAsReclaimed(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	fake := &fakeSSLAPI{
+		deleteFn: func(context.Context, *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error) {
+			return nil, tcerrors.NewTencentCloudSDKError(
+				"FailedOperation.CertificateNotFound", "certificate not found", "req-1")
+		},
+		// deleteTaskFn deliberately unset: there is no task to poll.
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	if err := d.Delete(context.Background(), "cert-1"); err != nil {
+		t.Errorf("deleting a certificate that is already gone is the reclaim's goal state: %v", err)
+	}
+}
+
+// The control: any other failure of the delete call must still surface, or the reaper would
+// drop reclaim records for certificates that do still exist.
+func TestDeleteStillReportsOtherFailures(t *testing.T) {
+	orig := newSSLClient
+	t.Cleanup(func() { newSSLClient = orig })
+
+	fake := &fakeSSLAPI{
+		deleteFn: func(context.Context, *ssl.DeleteCertificateRequest) (*ssl.DeleteCertificateResponse, error) {
+			return nil, tcerrors.NewTencentCloudSDKError(
+				"AuthFailure.SignatureFailure", "the secret id is disabled", "req-1")
+		},
+	}
+	newSSLClient = func(common.CredentialIface) (sslAPI, error) { return fake, nil }
+
+	d := newTestDeployer(time.Now)
+	if err := d.Delete(context.Background(), "cert-1"); err == nil {
+		t.Error(`a delete failure that is not "already gone" must keep the reclaim record`)
+	}
+}
+
+// ── the timeout wording says what actually happened ───────────────────────────
+
+// "Every poll failed" is wrong the moment one poll succeeded -- the common timeout shape is
+// a slow task with some failed queries. The message must count the failed polls instead,
+// the same way waitDeployRecord does.
+func TestWaitDeleteTaskTimeoutCountsTheFailedPolls(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var calls int
+	fake := &fakeSSLAPI{
+		deleteTaskFn: func(context.Context, *ssl.DescribeDeleteCertificatesTaskResultRequest) (*ssl.DescribeDeleteCertificatesTaskResultResponse, error) {
+			calls++
+			if calls == 1 {
+				// One poll answers "still running"; the rest fail until the deadline.
+				return deleteTaskResp("del-task-1", 0, ""), nil
+			}
+			return nil, errors.New("throttled")
+		},
+	}
+
+	err := d.waitDeleteTask(context.Background(), fake, "del-task-1", "cert-1")
+	if err == nil {
+		t.Fatal("a task that never finishes must fail")
+	}
+	if strings.Contains(err.Error(), "every poll failed") {
+		t.Errorf(`one poll succeeded, so "every poll failed" is a misdiagnosis: %v`, err)
+	}
+	if !strings.Contains(err.Error(), "the last ") || !strings.Contains(err.Error(), " polls failed") {
+		t.Errorf("the timeout must count the failed polls, got: %v", err)
+	}
+}
+
+// The enumeration timeout follows the same rule.
+func TestBindingsTimeoutCountsTheFailedPolls(t *testing.T) {
+	clock := &fakeClock{t: time.Now()}
+	stubSleeper(t, clock)
+	d := newTestDeployer(clock.now)
+
+	var calls int
+	fake := &fakeSSLAPI{
+		createTaskFn: stubCreateTask("cert-1", "task-1"),
+		taskResultFn: func(context.Context, *ssl.DescribeCertificateBindResourceTaskResultRequest) (*ssl.DescribeCertificateBindResourceTaskResultResponse, error) {
+			calls++
+			if calls == 1 {
+				// The task exists but is not done; the rest of the polls fail.
+				return &ssl.DescribeCertificateBindResourceTaskResultResponse{
+					Response: &ssl.DescribeCertificateBindResourceTaskResultResponseParams{
+						SyncTaskBindResourceResult: []*ssl.SyncTaskBindResourceResult{{
+							TaskId: common.StringPtr("task-1"),
+							Status: common.Uint64Ptr(0),
+						}},
+					},
+				}, nil
+			}
+			return nil, errors.New("throttled")
+		},
+	}
+
+	_, err := d.bindingsWith(context.Background(), fake, "cert-1", false)
+	if err == nil {
+		t.Fatal("an enumeration that never finishes must fail")
+	}
+	if strings.Contains(err.Error(), "every poll failed") {
+		t.Errorf(`one poll succeeded, so "every poll failed" is a misdiagnosis: %v`, err)
+	}
+	if !strings.Contains(err.Error(), "the last ") || !strings.Contains(err.Error(), " polls failed") {
+		t.Errorf("the timeout must count the failed polls, got: %v", err)
 	}
 }

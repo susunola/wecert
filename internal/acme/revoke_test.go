@@ -71,6 +71,59 @@ func TestRevocationIsRecordedWithoutAnyCAccess(t *testing.T) {
 	}
 }
 
+// A manager built without a CA core records revocations but must refuse to ATTEMPT one.
+//
+// The CLI builds exactly this shape on purpose -- RecordRevocation while the CA is unreachable
+// -- and processRevocation's RevokeCertificate call sits on the nil interface there: without
+// the guard the attempt panics instead of failing, taking the caller down with it. The request
+// must stay outstanding either way, because the operator's decision is still not honoured.
+func TestRevocationAttemptWithoutACoreFailsInsteadOfPanicking(t *testing.T) {
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if err := store.PutCert(&state.CertState{
+		Name: "example-com", NotAfter: fixed.Add(30 * 24 * time.Hour),
+		CertPEM: selfSignedCertPEM(t, fixed.Add(30*24*time.Hour), "example.com"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// nil core: the shape cmd/wecert builds to record a revocation while the CA is down.
+	m := newManager(store, nil, nil, nil, deploy.Noop{}, log)
+	m.SetNow(func() time.Time { return fixed })
+
+	if err := m.RecordRevocation("example-com", RevocationReasons["keyCompromise"]); err != nil {
+		t.Fatalf("recording must not need the CA: %v", err)
+	}
+
+	err = m.AttemptRecordedRevocation(context.Background(), "example-com")
+	if err == nil {
+		t.Fatal("attempting without a core must fail rather than panic on the nil interface")
+	}
+	if !contains(err.Error(), "no ACME core") {
+		t.Errorf("the error must say why the attempt is impossible, got: %v", err)
+	}
+
+	// The pass-level retry must degrade to one warning, not a panic per request.
+	m.RetryPendingRevocations(context.Background())
+
+	req, err := store.GetRevokeRequest("example-com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req == nil {
+		t.Fatal("the request must stay outstanding: the certificate has not been revoked")
+	}
+	if n, perr := m.PendingRevocations(); perr != nil || n != 1 {
+		t.Errorf("wecert_revocation_pending must stay at 1, got (%d, %v)", n, perr)
+	}
+}
+
 // A revocation the CA does not accept must survive as a durable request.
 //
 // Revocation is unbounded in time: a leaked private key does not stop being leaked because the

@@ -26,7 +26,12 @@ import (
 // It reuses the daemon's own config and state so there is one source of truth for the ACME
 // account: revocation is authenticated with the same account key that issued the certificate,
 // and being a separate binary must not mean a second copy of that key.
-func runRevoke(configPath, statePathOverride, certName, reasonName string, assumeYes bool) error {
+//
+// The ctx is the process's signal context: main installs it before this runs precisely so a
+// SIGTERM during revocation takes the graceful path, and passing context.Background() here
+// silently dropped that promise -- the comment at the signal installation said this path was
+// covered, and it was not.
+func runRevoke(ctx context.Context, configPath, statePathOverride, certName, reasonName string, assumeYes bool) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -94,7 +99,7 @@ func runRevoke(configPath, statePathOverride, certName, reasonName string, assum
 	// A manager with no solver and no deployer: revocation needs neither, and passing nil keeps
 	// it obvious that this path cannot issue or deploy anything.
 	m := acme.NewManager(store, acme.NewAPI(core), nil, nil, log)
-	if err := m.AttemptRecordedRevocation(context.Background(), certName); err != nil {
+	if err := m.AttemptRecordedRevocation(ctx, certName); err != nil {
 		fmt.Fprintf(os.Stderr, "\nNOT YET REVOKED: %v\n", err)
 		// The record was written before EnsureAccount ran, so by this point the request is durable and
 		// the daemon's next pass retries it. (The ErrRevocationNotRecorded branch that used to be here

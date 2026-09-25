@@ -75,7 +75,7 @@ func Revision(certs []config.Certificate) string {
 	h := sha256.New()
 	for _, c := range ordered {
 		fmt.Fprintf(h, "name=%s\nprofile=%s\nkeyType=%s\nrenewBefore=%s\ndeploy=%t\n",
-			c.Name, c.Profile, c.KeyType, c.RenewBefore, c.Deploy.Enabled)
+			c.Name, c.Profile, c.KeyType, effectiveRenewBefore(c), c.Deploy.Enabled)
 
 		domains := append([]string(nil), c.Domains...)
 		sort.Strings(domains)
@@ -85,6 +85,30 @@ func Revision(certs []config.Certificate) string {
 		h.Write([]byte{0})
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// effectiveRenewBefore is the duration a certificate's renewBefore MEANS, independent
+// of how it was written: "720h", the empty string (the profile default) and an
+// already-normalized RenewBeforeDur are the same setting, and Revision answers "did the
+// desired state actually change", so all three must hash identically.
+//
+// All three forms reach Revision in practice: documents and static config arrive via
+// config.NormalizeCertificates (duration filled), while onboarding fingerprints its
+// freshly built list -- raw string empty, duration zero -- before WriteDocument
+// normalizes it.
+func effectiveRenewBefore(c config.Certificate) time.Duration {
+	if c.RenewBeforeDur > 0 {
+		return c.RenewBeforeDur
+	}
+	if c.RenewBefore != "" {
+		// An unparseable value never survives NormalizeCertificates; hashing 0 for it
+		// is fine because such a list is rejected before its revision matters.
+		if d, err := time.ParseDuration(c.RenewBefore); err == nil {
+			return d
+		}
+		return 0
+	}
+	return config.ProfileRenewBefore(c.Profile)
 }
 
 // LoadDocument reads and validates a desired-state document.
@@ -229,10 +253,13 @@ func checkDocumentOwner(path string, fi os.FileInfo) error {
 	return nil
 }
 
-// checkDocumentDir rejects a document whose parent directory is group- or world-writable.
+// checkDocumentDir rejects a document whose parent directory is group- or world-writable
+// or owned by another user.
 //
-// WriteDocument installs the file by rename, so the directory's permissions -- not the
-// file's -- are what decide whether someone else can replace its contents with their own.
+// WriteDocument installs the file by rename, so the directory's permissions -- and its
+// owner, about whom the mode bits say nothing -- are what decide whether someone else can
+// replace the document with their own: a 0755 directory owned by another user passes the
+// mode check while its owner can still swap the file at will.
 func checkDocumentDir(path string) error {
 	dir := filepath.Dir(path)
 	fi, err := os.Stat(dir)
@@ -244,6 +271,24 @@ func checkDocumentDir(path string) error {
 			"the directory holding the desired-state document (%s) is group- or world-writable (%04o); "+
 				"anyone who can write it can replace the document, which decides which domains are served",
 			dir, perm)
+	}
+	return checkDocumentDirOwner(dir, fi)
+}
+
+// checkDocumentDirOwner requires the directory to be owned by the account running
+// wecert, with uid 0 explicitly exempt: a root-owned system directory (/etc/wecert/...)
+// with the daemon running as its own user is a normal arrangement, and root can replace
+// anything on the machine anyway, so the check would only ever reject legitimate setups.
+func checkDocumentDirOwner(dir string, fi os.FileInfo) error {
+	uid, ok := fileOwnerUID(fi)
+	if !ok {
+		return nil
+	}
+	if uid != 0 && uid != uint32(os.Geteuid()) {
+		return fmt.Errorf(
+			"the directory holding the desired-state document (%s) is owned by uid %d but wecert runs as uid %d; "+
+				"the directory's owner can replace the document by rename, which decides which domains are served",
+			dir, uid, os.Geteuid())
 	}
 	return nil
 }

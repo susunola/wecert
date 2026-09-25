@@ -75,8 +75,10 @@ func isNoData(err error, code string) bool {
 // so a revoked key or a missing permission reaches the operator as "the task was slow".
 //
 // Deliberately absent: RequestLimitExceeded (throttling is transient, it only needs a longer
-// wait -- see IsThrottled) and FailedOperation.* (its meaning is per-API and some of its
-// members are genuinely transient).
+// wait -- see IsThrottled), FailedOperation.* (its meaning is per-API and some of its
+// members are genuinely transient), and ResourceNotFound.* (in a polling loop a missing
+// resource usually means "not propagated yet", not "gone for good"; the codes that ARE an
+// answer -- like DNSPod's NoDataOfRecord -- have their own predicates above).
 var permanentCodePrefixes = []string{
 	"AuthFailure.",          // the key is wrong, disabled or deleted
 	"UnauthorizedOperation", // the key is fine, the account may not call this API

@@ -554,6 +554,15 @@ bound_certs_are "${CERT_B}" "${AFTER_FILE}" ||
 echo "OK: primary is ${AFTER_PRIMARY} (a new certificate id, not A=${CERT_A})"
 echo "OK: B=${CERT_B} is still bound with the same certificate id"
 
+# Assertion 5 ("A is no longer bound anywhere on the listener") reads the STORED dump, not
+# a fresh query: clbverify_assert below re-asks the API, so it would pass against a state
+# the evidence in ${EVIDENCE_DIR} does not show (and it skips entirely on the unfiltered
+# fallback). This check is what the saved dump is asserted to show.
+if bound_certs_are "${CERT_A}" "${AFTER_FILE}"; then
+	fail "A=${CERT_A} is still bound to listener ${LISTENER} after the renewal (bound: ${AFTER_PRIMARY} ${AFTER_EXT}). The old certificate id should be gone from the listener once the rebind lands."
+fi
+echo "OK: A=${CERT_A} is no longer bound anywhere on the listener"
+
 # Anything else on the listener that changed is reported, not asserted on: the
 # pair (primary + ExtCertIds) is not a documented, stable representation of a
 # multi-certificate listener, so a strict set comparison here would produce false
@@ -572,6 +581,9 @@ fi
 
 echo
 echo "--- wecert-clbverify's own assertion: the old A must be gone ---"
+# A live re-query, so it confirms the CURRENT state; the script-side check above is the one
+# tied to the stored evidence, and the only one of the two that runs on the unfiltered
+# fallback (see clbverify_assert).
 clbverify_assert -not-expect "${CERT_A}"
 
 cat <<EOF

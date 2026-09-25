@@ -22,9 +22,20 @@ import (
 // Split out so one concern lives in one file. Same package.
 
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
+	}
+	defer f.Close()
+	// Read one byte past the cap rather than truncating, so an oversized file is
+	// refused outright instead of being parsed as a prefix of itself.
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	if len(data) > maxConfigBytes {
+		return nil, fmt.Errorf("config %s is larger than %d bytes, which no hand-written config "+
+			"approaches; refusing the read rather than parsing a file this size", path, maxConfigBytes)
 	}
 
 	cfg := &Config{}
@@ -175,11 +186,58 @@ func configPermWarnings(path string, perm os.FileMode, inlineSecrets []string) [
 	if len(inlineSecrets) == 0 || perm&0o077 == 0 {
 		return nil
 	}
+	described := make([]string, 0, len(inlineSecrets))
+	for _, field := range inlineSecrets {
+		if alt, ok := secretAlternatives[field]; ok {
+			described = append(described, field+" (use "+alt+")")
+		} else {
+			described = append(described, field)
+		}
+	}
 	return []string{fmt.Sprintf(
 		"the config file %s is readable by group or other (%04o) while carrying inline "+
 			"credentials (%s). A credential in a 0644 file is in every backup and every "+
-			"backup's off-site copy; use the *_file variants or the environment instead, or "+
-			"chmod 0600 the file", path, perm, strings.Join(inlineSecrets, ", "))}
+			"backup's off-site copy; move the secrets out of the file, or chmod 0600 it",
+		path, perm, strings.Join(described, ", "))}
+}
+
+// secretAlternatives names the way each inline credential field can be kept out of the
+// config file, so the permission warning can point at an alternative that actually exists
+// for that field instead of claiming they all share one.
+var secretAlternatives = map[string]string{
+	"acme.eab.hmac":                "acme.eab.hmacFile or $WECERT_ACME_EAB_HMAC",
+	"dns.loginToken":               "dns.loginTokenFile or $" + EnvDNSPodLoginToken,
+	"dns.cloudflare.apiToken":      "dns.cloudflare.apiTokenFile or $" + EnvCloudflareAPIToken,
+	"dns.route53.secretAccessKey":  "dns.route53.secretAccessKeyFile",
+	"tencent.secretId":             "tencent.secretIdFile or $TENCENTCLOUD_SECRET_ID",
+	"tencent.secretKey":            "tencent.secretKeyFile or $TENCENTCLOUD_SECRET_KEY",
+	"webhook.token":                "webhook.tokenFile",
+	"webhook.jira.apiToken":        "webhook.jira.apiTokenFile",
+	"webhook.pagerduty.routingKey": "webhook.pagerduty.routingKeyFile",
+	"webhook.notifySecret":         "webhook.notifySecretFile",
+}
+
+// redactURL reduces a URL to scheme://host for warnings and errors. Notification and
+// directory endpoints can carry a credential in the URL path or userinfo (chat/CI
+// webhooks do, by design), and these messages land on stderr -- which systemd keeps in
+// journald -- so the full URL must never be printed.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<redacted>"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// urlErrorCause unwraps a url.Parse failure to its underlying reason: *url.Error's
+// message embeds the full input URL, and for a credential-carrying URL that text must
+// not reach an error string.
+func urlErrorCause(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 // notifyURLWarnings warns about a plaintext notification URL to another host.
@@ -187,6 +245,9 @@ func configPermWarnings(path string, perm os.FileMode, inlineSecrets []string) [
 // Chat/CI webhook endpoints (Slack, Feishu, DingTalk) carry their credential in the
 // URL path itself, so http to a non-loopback host exposes the credential to anyone on
 // the path. Loopback is exempt: nothing leaves the machine.
+//
+// The warning names only scheme://host (see redactURL): printing the full URL would
+// copy the credential it warns about into stderr and journald.
 func notifyURLWarnings(notifyURL string) []string {
 	if notifyURL == "" {
 		return nil
@@ -195,13 +256,14 @@ func notifyURLWarnings(notifyURL string) []string {
 	if err != nil {
 		// normalize already rejected an unparseable or non-http(s) URL; reaching this
 		// branch would mean the two drifted apart, and silence is the wrong drift.
-		return []string{fmt.Sprintf("webhook.notifyURL %q could not be re-parsed for the plaintext check: %v", notifyURL, err)}
+		return []string{fmt.Sprintf("webhook.notifyURL %s could not be re-parsed for the plaintext check: %v",
+			redactURL(notifyURL), urlErrorCause(err))}
 	}
 	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
 		return []string{fmt.Sprintf(
-			"webhook.notifyURL %q uses plaintext http to a non-loopback host. Notification "+
+			"webhook.notifyURL %s uses plaintext http to a non-loopback host. Notification "+
 				"endpoints usually carry their credential in the URL path, so anyone on the "+
-				"network path can read it; use https", notifyURL)}
+				"network path can read it; use https", redactURL(notifyURL))}
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package state
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -156,5 +157,22 @@ func TestFallbackRoundTrip(t *testing.T) {
 	}
 	if again, err := s.GetFallback("c1"); err != nil || again != nil {
 		t.Fatalf("want empty after clearing, got %+v, %v", again, err)
+	}
+}
+
+// A nil record is an error, matching PutAuthorization and PutRateBucket: accepting it would panic
+// on the dereference with the store mutex held, turning a caller bug into a crash.
+func TestPutFallbackRefusesANilRecord(t *testing.T) {
+	s := openTestStore(t)
+
+	if err := s.PutFallback(nil); err == nil {
+		t.Fatal("a nil fallback record must be refused")
+	} else if !strings.Contains(err.Error(), "nil") {
+		t.Errorf("the error must say what was wrong, got: %v", err)
+	}
+
+	// And the refusal must not get in the way of a real write.
+	if err := s.PutFallback(&Fallback{CertName: "example-com", Dropped: []string{"www.example.com"}}); err != nil {
+		t.Fatalf("PutFallback: %v", err)
 	}
 }

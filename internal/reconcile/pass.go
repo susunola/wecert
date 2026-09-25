@@ -184,7 +184,16 @@ func (r *Reconciler) probeCert(ctx context.Context, c *config.Certificate) {
 	// first upload needs a manual bind, and until then the live endpoint is still
 	// serving the old certificate anyway.
 	st, err := r.store.GetCert(c.Name)
-	if err != nil || st == nil || !c.Deploy.Enabled || !st.DeployConfirmed {
+	if err != nil {
+		// Same rule as publish: a state that cannot be READ is said out loud. Swallowing
+		// it here stops the probe evidence for this certificate while every other signal
+		// looks healthy, and "not probed" is indistinguishable from "probed and fine" on
+		// the gauges. An absent row (st == nil) stays silent: it just means never issued.
+		r.log.Warn("cannot read this certificate's state, so the live endpoint is not probed "+
+			"this pass and its probe series keep their previous values", "cert", c.Name, "err", err)
+		return
+	}
+	if st == nil || !c.Deploy.Enabled || !st.DeployConfirmed {
 		return
 	}
 

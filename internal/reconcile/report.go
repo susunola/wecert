@@ -4,6 +4,9 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime/debug"
+
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/metrics"
@@ -54,8 +57,8 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 		// have already been replaced, reaping them is unrelated to the desired state,
 		// and ignoring them slowly exhausts the cloud certificate quota.
 		rep.DesiredStateUnreadable = true
-		r.manager.ReapRetired(ctx)
-		r.retryRevocations(ctx)
+		r.passStepPanicSafe("reap retired certificates", func() { r.manager.ReapRetired(ctx) })
+		r.passStepPanicSafe("retry revocations", func() { r.retryRevocations(ctx) })
 		return rep
 	}
 	// Before anything is written this pass: is the database still the file this process opened, and
@@ -118,13 +121,33 @@ func (r *Reconciler) RunDetailed(ctx context.Context) RunReport {
 		}
 	}
 
-	r.manager.ReapRetired(ctx)
-	r.retryRevocations(ctx)
-	r.reclaimStaleProbeSeries(res)
-	r.publishQuota(res)
-	r.sweepStuckTXT(ctx)
-	r.runBindingPatrol(ctx)
+	r.passStepPanicSafe("reap retired certificates", func() { r.manager.ReapRetired(ctx) })
+	r.passStepPanicSafe("retry revocations", func() { r.retryRevocations(ctx) })
+	r.passStepPanicSafe("reclaim stale probe series", func() { r.reclaimStaleProbeSeries(res) })
+	r.passStepPanicSafe("publish the quota gauges", func() { r.publishQuota(res) })
+	r.passStepPanicSafe("sweep stuck TXT records", func() { r.sweepStuckTXT(ctx) })
+	r.passStepPanicSafe("run the binding patrol", func() { r.runBindingPatrol(ctx) })
 	return rep
+}
+
+// passStepPanicSafe runs one pass-level epilogue step inside its own recover.
+//
+// These steps are outside reconcileOne's panic fence: they run on the pass's own goroutine
+// (RunDetailed, whose caller -- the timer loop in runDaemon -- has no recover) or, for the
+// quota publication, on a webhook-started background goroutine, where an unrecovered panic is
+// process-fatal. They are bookkeeping, not the pass's answer, so a panic in one is logged with
+// its stack and the remaining steps still run -- the same contract publishPanicSafe gives the
+// per-certificate work. No metric is counted: ReconcilePanics is labelled by certificate and a
+// pass-level step has none.
+func (r *Reconciler) passStepPanicSafe(step string, fn func()) {
+	defer func() {
+		if p := recover(); p != nil {
+			r.log.Error("recovered from a panic in a pass epilogue step; the rest of the pass "+
+				"is unaffected. This is a bug, please report it",
+				"step", step, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+		}
+	}()
+	fn()
 }
 
 // runBindingPatrol runs the account-wide binding audit if the manager can. Throttled

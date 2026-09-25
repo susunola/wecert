@@ -1181,6 +1181,129 @@ func TestDNSLoginTokenCanComeFromAFileOrTheEnvironment(t *testing.T) {
 	})
 }
 
+// webhook.token and webhook.notifySecret have file variants for the same reason
+// dns.loginTokenFile exists: a credential in config.yaml is in every backup and every
+// scrollback. Unlike the DNS and Tencent fields they have no environment fallback --
+// they guard a local endpoint, so a file is the whole story.
+func TestWebhookSecretsCanComeFromFiles(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "webhook.token")
+	if err := os.WriteFile(tokenFile, []byte("0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secretFile := filepath.Join(dir, "webhook.notifysecret")
+	if err := os.WriteFile(secretFile, []byte("0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("token and notifySecret from files", func(t *testing.T) {
+		body := minimalPrefix + `
+webhook:
+  listen: "127.0.0.1:9801"
+  tokenFile: ` + tokenFile + `
+  notifyURL: "https://example.com/hook"
+  notifySecretFile: ` + secretFile + `
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+		cfg, err := Load(writeConfig(t, body))
+		if err != nil {
+			t.Fatalf("webhook secrets from files must be accepted: %v", err)
+		}
+		if cfg.Webhook.Token != "0123456789abcdef0123456789abcdef" {
+			t.Errorf("Token = %q, want the file's contents with the newline trimmed", cfg.Webhook.Token)
+		}
+		if cfg.Webhook.NotifySecret != "0123456789abcdef0123456789abcdef" {
+			t.Errorf("NotifySecret = %q, want the file's contents", cfg.Webhook.NotifySecret)
+		}
+	})
+
+	t.Run("inline and file together are refused", func(t *testing.T) {
+		body := minimalPrefix + `
+webhook:
+  listen: "127.0.0.1:9801"
+  token: "0123456789abcdef0123456789abcdef"
+  tokenFile: ` + tokenFile + `
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+		if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "both set") {
+			t.Errorf("two sources for one secret must be refused, got %v", err)
+		}
+	})
+
+	t.Run("a typo'd path fails where the operator can fix it", func(t *testing.T) {
+		body := minimalPrefix + `
+webhook:
+  listen: "127.0.0.1:9801"
+  tokenFile: /nonexistent/webhook.token
+certificates:
+  - name: t
+    domains: ["example.com"]
+`
+		if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "webhook.token") {
+			t.Errorf("an unreadable secret file must be a config error naming the field, got %v", err)
+		}
+	})
+}
+
+// A file variant set next to a live environment variable is not an error -- the file
+// wins -- but a silent choice between two credentials is how a rotation appears not to
+// take effect, so it warns. The warning names the variable, never its value.
+func TestSecretFileWinsOverTheEnvironmentWithAWarning(t *testing.T) {
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "dnspod.token")
+	if err := os.WriteFile(secret, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// No environment variable: no warning.
+	cfg := &Config{}
+	cfg.DNS.LoginTokenFile = secret
+	warns, err := cfg.resolveSecretFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warns) != 0 {
+		t.Errorf("a file with no competing environment variable must not warn, got %v", warns)
+	}
+
+	t.Setenv(EnvDNSPodLoginToken, "from-env")
+	cfg = &Config{}
+	cfg.DNS.LoginTokenFile = secret
+	warns, err = cfg.resolveSecretFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DNS.LoginToken != "from-file" {
+		t.Errorf("the file must win, got LoginToken = %q", cfg.DNS.LoginToken)
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], EnvDNSPodLoginToken) {
+		t.Fatalf("the overlap must warn and name the variable, got %v", warns)
+	}
+	if strings.Contains(warns[0], "from-env") {
+		t.Errorf("the warning must never carry the credential itself, got %q", warns[0])
+	}
+}
+
+// A config is tiny by nature, so a file past the cap is a mistake or a mounted
+// surprise: refuse the read, the same way the desired-state document is refused.
+func TestLoadRefusesAnOversizedConfig(t *testing.T) {
+	body := minimalPrefix + `certificates:
+  - name: example-com
+    domains: ["example.com"]
+# ` + strings.Repeat("x", maxConfigBytes) + "\n"
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a config past the size cap must be refused")
+	}
+	if !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("the refusal must name the size, got %v", err)
+	}
+}
+
 // probe.minValidFor must be satisfiable by the shortest profile in use.
 //
 // The check exists because the failure is so misleading: probe.Verify fails every probe whose

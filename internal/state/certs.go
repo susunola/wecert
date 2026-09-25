@@ -232,7 +232,14 @@ func (s *Store) getCertLocked(name string) (*CertState, error) {
 }
 
 // PutCert writes certificate state.
+//
+// A nil state is an error, matching PutAuthorization: the dereference would otherwise panic with
+// the store mutex held (the lock is released by the deferred Unlock, but the process still
+// crashes on a caller bug that a one-line check turns into an ordinary error).
 func (s *Store) PutCert(c *CertState) error {
+	if c == nil {
+		return fmt.Errorf("nil certificate state")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.putCertLocked(c)
@@ -261,6 +268,11 @@ func (s *Store) putCertLocked(c *CertState) error {
 }
 
 func putCertExec(e execer, c *CertState) error {
+	// Tx.PutCert reaches here without passing through Store.PutCert's nil guard, so the check
+	// lives at the shared statement too.
+	if c == nil {
+		return fmt.Errorf("nil certificate state")
+	}
 	_, err := e.Exec(`
 		INSERT INTO certificates (
 			name, not_after, cert_url, cert_pem, key_pem, issued_at,

@@ -110,8 +110,17 @@ func LoadState(path string) (*State, error) {
 
 	// A corrupt state file must **not** count as empty: that zeroes every grace
 	// period, turning deletion from conservative into aggressive. Better to refuse.
-	if err := json.Unmarshal(data, st); err != nil {
+	// Unknown fields are refused for the same reason spec.LoadDocument sets
+	// KnownFields on the document: a misspelled or renamed field must blow up rather
+	// than be silently dropped, or a grace clock the operator believes is running is
+	// not.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(st); err != nil {
 		return nil, fmt.Errorf("parse onboarding state %s: %w", path, err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("parse onboarding state %s: trailing data after the state object", path)
 	}
 	if st.AbsentSince == nil {
 		st.AbsentSince = map[string]time.Time{}

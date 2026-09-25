@@ -139,7 +139,7 @@ func (m *Manager) noteNewOrderRefusal(c *config.Certificate, err error) bool {
 	headerAt, headerOK := time.Time{}, false
 	var rle *legoacme.RateLimitedError
 	if errors.As(err, &rle) && rle.RetryAfter != "" {
-		headerAt, headerOK = ratelimit.ParseRetryAfterHeader(rle.RetryAfter)
+		headerAt, headerOK = ratelimit.ParseRetryAfterHeaderAt(rle.RetryAfter, m.now())
 	}
 
 	blocked := false
@@ -222,7 +222,12 @@ func (m *Manager) blockedByRecordedDeadline(c *config.Certificate) (time.Time, s
 		checks = append(checks, check{limit: ratelimit.CertsPerRegisteredDomain, scope: d})
 	}
 	for _, d := range c.Domains {
-		checks = append(checks, check{limit: ratelimit.AuthzFailuresPerIdentifier, scope: strings.ToLower(d)})
+		// The bare identifier, matching the spend path and the CA's own refusal: the
+		// authorization identifier never carries the wildcard's "*." prefix (RFC 8555
+		// §7.1.3), so gating on "*.example.com" would consult a bucket the refusal was
+		// never recorded against -- and the wildcard would keep ordering inside the very
+		// window the CA named.
+		checks = append(checks, check{limit: ratelimit.AuthzFailuresPerIdentifier, scope: bareIdentifierScope(d)})
 		// The identifier PAUSE is per identifier too, and its deadline is a day or more rather than
 		// minutes: an identifier the CA has paused cannot be ordered at all until the operator clears
 		// it in the CA's portal, so this is the check that turns a refusal into "stop knocking"
@@ -278,10 +283,12 @@ func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate, msg string) 
 		// two certificates sharing a first domain, the one containing the paused name kept ordering
 		// inside the CA's window while the unrelated one was refused.
 		if named := quotedDomain(msg); named != "" {
-			return named
+			// Defensive: the authorization identifier is always the bare name, but the scope
+			// must stay bare even if a CA ever quotes the wildcard form.
+			return bareIdentifierScope(named)
 		}
 		if len(c.Domains) > 0 {
-			return strings.ToLower(c.Domains[0])
+			return bareIdentifierScope(c.Domains[0])
 		}
 	case ratelimit.ConsecutiveAuthzFailuresPerIdentifier.Name:
 		// The pause names what it paused when it names anything, in one of two forms: the legacy

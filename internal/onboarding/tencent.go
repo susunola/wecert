@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 
@@ -76,7 +77,11 @@ func NewDNSPodDeclarations(cfg config.Tencent, zones []string, log *slog.Logger)
 			clean = append(clean, z)
 		}
 	}
+	// A zone listed twice would be enumerated twice: every record in it read and parsed a
+	// second time, per round. Normalising first means the compact catches spellings of the
+	// same zone too ("Example.COM.").
 	sort.Strings(clean)
+	clean = slices.Compact(clean)
 	return &DNSPodDeclarations{credential: src, zones: clean, log: log}, nil
 }
 
@@ -320,6 +325,11 @@ func NewCLBRules(cfg config.Tencent, regions []string, log *slog.Logger) (*CLBRu
 			clean = append(clean, r)
 		}
 	}
+	// A region listed twice would be enumerated twice: every load balancer and listener in it
+	// read a second time, per round. Sorting first is what lets the compact catch duplicates
+	// that are not adjacent.
+	sort.Strings(clean)
+	clean = slices.Compact(clean)
 	if len(clean) == 0 {
 		return nil, fmt.Errorf("no region is configured (tencent.regions); CLB is regional, " +
 			"so an empty list would silently guard nothing")

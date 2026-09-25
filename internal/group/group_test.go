@@ -2,6 +2,7 @@ package group
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -295,5 +296,45 @@ func TestNormalizeRejectsInvalidNames(t *testing.T) {
 	}
 	if got, err := Normalize(" API.Example.COM. "); err != nil || got != "api.example.com" {
 		t.Errorf("Normalize must accept and normalize case and a trailing dot, got %q, %v", got, err)
+	}
+}
+
+// Declared duplicates collapse exactly once, whether they repeat verbatim or differ only by
+// case or a trailing dot: the SAN set must not depend on how often a name was declared.
+func TestGroupByDeduplicatesDeclarations(t *testing.T) {
+	groups, err := GroupBy([]string{
+		"example.com", "EXAMPLE.COM", "example.com.",
+		"*.example.com", "*.Example.Com",
+		"api.example.com", "api.example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("expected exactly one group, got %d", len(groups))
+	}
+	if !reflect.DeepEqual(groups[0].Names, []string{"api.example.com", "example.com"}) {
+		t.Errorf("Names = %v, want each declaration exactly once", groups[0].Names)
+	}
+	if !reflect.DeepEqual(groups[0].Wildcards, []string{"*.example.com"}) {
+		t.Errorf("Wildcards = %v, want each declaration exactly once", groups[0].Wildcards)
+	}
+}
+
+// A non-positive maxNames means "no limit": a profile that leaves the limit unset asks for
+// every declaration to fit, however many that is.
+func TestCoverWithoutLimitAcceptsAnyGroupSize(t *testing.T) {
+	var names []string
+	for i := 0; i < 200; i++ {
+		names = append(names, fmt.Sprintf("n%03d.example.com", i))
+	}
+	g := Group{Registered: "example.com", Name: "example-com", Names: names}
+
+	cov, err := g.Cover(0)
+	if err != nil {
+		t.Fatalf("maxNames 0 must lift the limit, got %v", err)
+	}
+	if len(cov.Domains) != len(names) {
+		t.Errorf("SAN set = %d names, want all %d", len(cov.Domains), len(names))
 	}
 }

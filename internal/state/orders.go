@@ -51,6 +51,9 @@ func (s *Store) GetOrder(certName string) (*Order, error) {
 // PutOrder writes the in-flight order.
 
 func (s *Store) PutOrder(o *Order) error {
+	if o == nil {
+		return fmt.Errorf("nil order")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := o.KeyPEM

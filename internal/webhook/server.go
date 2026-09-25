@@ -134,6 +134,15 @@ func NewWithAdmin(rec Reconciler, store *state.Store, token string, admin AdminO
 	if token == "" {
 		return nil, errors.New("webhook: token must not be empty")
 	}
+	// The nil checks are the same shape as the empty-token one: the server dereferences the
+	// store on the status endpoint and the logger on every auth failure, so a nil either one
+	// is a construction error, not something to discover mid-request.
+	if store == nil {
+		return nil, errors.New("webhook: store must not be nil")
+	}
+	if log == nil {
+		return nil, errors.New("webhook: log must not be nil")
+	}
 	return &Server{
 		rec:        rec,
 		store:      store,

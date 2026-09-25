@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -25,13 +26,21 @@ func seedRestorableState(t *testing.T) (cfg *config.Config, snapshotDir string) 
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if err := store.PutCert(&state.CertState{Name: "old-cert", KeyPEM: []byte("OLD")}); err != nil {
+	// The key material must be decodable PEM: state.Restore inspects the snapshot's payload
+	// (checkSnapshotPayload), and placeholder bytes would be refused for the wrong reason.
+	if err := store.PutCert(&state.CertState{
+		Name:   "old-cert",
+		KeyPEM: []byte("-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n"),
+	}); err != nil {
 		t.Fatalf("PutCert: %v", err)
 	}
 	if _, err := store.Snapshot(snapshotDir, 3); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
-	if err := store.PutCert(&state.CertState{Name: "new-cert", KeyPEM: []byte("NEW")}); err != nil {
+	if err := store.PutCert(&state.CertState{
+		Name:   "new-cert",
+		KeyPEM: []byte("-----BEGIN PRIVATE KEY-----\nBAUG\n-----END PRIVATE KEY-----\n"),
+	}); err != nil {
 		t.Fatalf("PutCert: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -157,4 +166,82 @@ func TestTheRestoreWarningAppearsAndThenStops(t *testing.T) {
 	if !strings.Contains(logs.String(), "restore record that cannot be read") {
 		t.Errorf("an unreadable restore record must be reported, got:\n%s", logs.String())
 	}
+}
+
+// "latest" picks by the timestamp in the NAME, so a snapshot written while the clock was ahead
+// sorts newest forever and wins every time. The restore must say so before installing it.
+func TestRestoreLatestWarnsAboutAFutureDatedName(t *testing.T) {
+	cfg, snapshotDir := seedRestorableState(t)
+	snaps, err := state.SnapshotsIn(snapshotDir, cfg.StatePath)
+	if err != nil {
+		t.Fatalf("SnapshotsIn: %v", err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("expected one snapshot, got %v", snaps)
+	}
+
+	// The honestly-named snapshot alone: no warning.
+	honest := captureStderr(t, func() {
+		got, err := newestSnapshot(snapshotDir, cfg.StatePath)
+		if err != nil {
+			t.Fatalf("newestSnapshot: %v", err)
+		}
+		if got != snaps[0] {
+			t.Errorf("newestSnapshot = %s, want %s", got, snaps[0])
+		}
+	})
+	if strings.Contains(honest, "WARNING") {
+		t.Errorf("an honestly-dated snapshot must not be warned about, got %q", honest)
+	}
+
+	// Add a snapshot whose name claims next year (the pre-hash naming still lists, which is what
+	// an upgrade-then-restore looks like): it wins "latest", and the operator must be told the
+	// name is lying before it is installed.
+	futureName := filepath.Join(snapshotDir,
+		"state.db.backup-"+time.Now().AddDate(1, 0, 0).UTC().Format("20060102T150405.000Z")+".db")
+	data, err := os.ReadFile(snaps[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(futureName, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	warned := captureStderr(t, func() {
+		got, err := newestSnapshot(snapshotDir, cfg.StatePath)
+		if err != nil {
+			t.Fatalf("newestSnapshot: %v", err)
+		}
+		if got != futureName {
+			t.Errorf("the future-dated name sorts newest and must be the pick, got %s", got)
+		}
+	})
+	if !strings.Contains(warned, "future") {
+		t.Errorf("a future-dated pick must be announced, got %q", warned)
+	}
+	if !strings.Contains(warned, filepath.Base(futureName)) {
+		t.Errorf("the warning must name the file it picked, got %q", warned)
+	}
+}
+
+// captureStderr runs fn with the process stderr redirected and returns what it wrote.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
 }

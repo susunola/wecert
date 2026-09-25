@@ -308,3 +308,35 @@ func TestOpenForToolFallsBackToTheUnlockedPath(t *testing.T) {
 		t.Fatalf("the tool released the daemon's lock, got: %v", err)
 	}
 }
+
+// Close is idempotent: callers defer it next to Open and also run it on an explicit shutdown path,
+// so a second Close must be a quiet no-op -- not sql's "database is closed" beside a flock
+// "file already closed", two errors describing exactly the state that was asked for.
+func TestCloseIsIdempotent(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Errorf("second Close must be nil, got: %v", err)
+	}
+	// A released lock is nil'ed, so the post-shutdown VerifyOnDisk must not panic dereferencing it.
+	if problems := s.VerifyOnDisk(); len(problems) != 0 {
+		t.Errorf("VerifyOnDisk after a clean Close should have nothing to report, got %v", problems)
+	}
+
+	// The same holds for the standalone lock handle, which shares release().
+	lock, err := AcquireFileLock(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("AcquireFileLock: %v", err)
+	}
+	if err := lock.Unlock(); err != nil {
+		t.Fatalf("first Unlock: %v", err)
+	}
+	if err := lock.Unlock(); err != nil {
+		t.Errorf("second Unlock must be nil, got: %v", err)
+	}
+}

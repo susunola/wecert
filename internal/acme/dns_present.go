@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -104,10 +105,13 @@ func (s *DNSSolver) callLegoProviderResolvers(fn func() error) error {
 
 // WaitAll waits until every record is visible on all authoritative NS of its zone.
 //
-// It deduplicates by (FQDN, Value), and resolves each zone's authoritative NS list once.
+// It deduplicates by (FQDN, Value), resolves each zone with at most one SOA walk (a walk's
+// answer holds for the zone's whole subtree, so later records inside a known zone reuse it),
+// and resolves each zone's authoritative NS list once.
 func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 	byZone := map[string][]DNSRecord{}
 	seen := map[string]bool{}
+	knownZones := map[string]bool{}
 
 	for _, r := range records {
 		key := r.FQDN + "|" + r.Value
@@ -127,9 +131,18 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 		// land in the window and have its value deleted (see addUnderLock).
 		challengeLeases.addUnderLock(r.FQDN, r.Value)
 
-		zone, err := s.findZone(ctx, r.FQDN)
-		if err != nil {
-			return fmt.Errorf("find the zone for %s: %w", r.FQDN, err)
+		zone := zoneContaining(knownZones, r.FQDN)
+		if zone == "" {
+			// The SOA walk is the only per-record network step before the budget starts, and its
+			// answer is a property of the zone, not of the record: a certificate's SANs mostly
+			// share one zone, so walking once per record spends one resolver round-trip per SAN
+			// on a question already answered.
+			var err error
+			zone, err = s.findZone(ctx, r.FQDN)
+			if err != nil {
+				return fmt.Errorf("find the zone for %s: %w", r.FQDN, err)
+			}
+			knownZones[zone] = true
 		}
 		byZone[zone] = append(byZone[zone], r)
 	}
@@ -165,6 +178,22 @@ func (s *DNSSolver) WaitAll(ctx context.Context, records []DNSRecord) error {
 		}
 	}
 	return nil
+}
+
+// zoneContaining returns the already-resolved zone fqdn falls in, or "".
+//
+// A zone contains everything at or below its apex, so containment is a suffix test on the FQDN
+// form with the label boundary kept ("."+zone, so that "notexample.com." cannot match
+// "example.com."). The longest match wins: a delegated sub-zone is more specific than its
+// parent, and it is the sub-zone that carries the records.
+func zoneContaining(zones map[string]bool, fqdn string) string {
+	zone := ""
+	for z := range zones {
+		if (fqdn == z || strings.HasSuffix(fqdn, "."+z)) && len(z) > len(zone) {
+			zone = z
+		}
+	}
+	return zone
 }
 
 // maxProbeConcurrency caps how many record probes are in flight at once.

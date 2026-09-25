@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -792,8 +793,12 @@ func TestStaleSnapshotTempsAreSweptAndFreshOnesKept(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stale := filepath.Join(backups, ".snapshot-state.db-20200101T000000.000-0.tmp")
-	fresh := filepath.Join(backups, ".snapshot-state.db-29990101T000000.000-0.tmp")
+	// The names carry this store's own prefix (the hashed base, see snapshotBase): only temps the
+	// store can prove are its own may go at any age. A name built from the plain basename is
+	// unattributable now -- another same-basename deployment could own it -- and is covered by the
+	// age-threshold test below instead.
+	stale := filepath.Join(backups, fmt.Sprintf(".snapshot-%s-20200101T000000.000-0.tmp", s.base))
+	fresh := filepath.Join(backups, fmt.Sprintf(".snapshot-%s-29990101T000000.000-0.tmp", s.base))
 	journal := stale + "-journal"
 	for _, p := range []string{stale, fresh, journal} {
 		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
@@ -889,18 +894,22 @@ func TestTheSweepLeavesAnotherStoresTempsAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A temp file whose owner cannot be established: another deployment sharing the directory, or a
-	// file from before the name carried the base.
+	// A temp file whose owner cannot be established: another deployment sharing the directory, a
+	// file from before the name carried the base, or one from before the base carried the path
+	// hash (".snapshot-state.db-..." here is this store's basename but NOT its identity -- a
+	// second deployment whose state file is also named state.db could be writing it right now).
 	foreign := filepath.Join(backups, ".snapshot-other.db-20200101T000000.000-0.tmp")
 	legacy := filepath.Join(backups, ".snapshot-20200101T000000.000-0.tmp")
+	prehash := filepath.Join(backups, ".snapshot-state.db-20200101T000000.000-0.tmp")
 	freshForeign := filepath.Join(backups, ".snapshot-other.db-29990101T000000.000-0.tmp")
-	for _, p := range []string{foreign, legacy, freshForeign} {
+	freshPrehash := filepath.Join(backups, ".snapshot-state.db-29990101T000000.000-0.tmp")
+	for _, p := range []string{foreign, legacy, prehash, freshForeign, freshPrehash} {
 		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	old := time.Now().Add(-3 * time.Hour)
-	for _, p := range []string{foreign, legacy} {
+	for _, p := range []string{foreign, legacy, prehash} {
 		if err := os.Chtimes(p, old, old); err != nil {
 			t.Fatal(err)
 		}
@@ -910,10 +919,12 @@ func TestTheSweepLeavesAnotherStoresTempsAlone(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
-	// The FRESH one may be another deployment's live write, so it is never touched -- that is the
-	// property the prefix exists for, and it is what this test guard against.
-	if _, err := os.Stat(freshForeign); err != nil {
-		t.Errorf("a fresh temp that may belong to another deployment's live write must be left alone: %v", err)
+	// The FRESH ones may be another deployment's live write, so they are never touched -- that is
+	// the property the prefix exists for, and it is what this test guards against.
+	for _, p := range []string{freshForeign, freshPrehash} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("a fresh temp that may belong to another deployment's live write must be left alone: %v", err)
+		}
 	}
 
 	// The three-hour-old ones are swept. This used to say "nobody may delete them", and the reasoning
@@ -923,7 +934,7 @@ func TestTheSweepLeavesAnotherStoresTempsAlone(t *testing.T) {
 	// any snapshot takes, which is what the threshold meant in the first place, before the crash-fault
 	// verification showed that for OUR OWN files the lock is the stronger proof and the age rule was
 	// only leaving the partial copy behind for an hour).
-	for _, p := range []string{foreign, legacy} {
+	for _, p := range []string{foreign, legacy, prehash} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("%s is unattributable but hours old, so no live writer can hold it and it must be swept: %v",
 				filepath.Base(p), err)
@@ -982,5 +993,166 @@ func TestRepairedSnapshotsAreMadeDurable(t *testing.T) {
 	}
 	if _, err := os.Stat(future); !os.IsNotExist(err) {
 		t.Errorf("the future-dated name must be gone after the repair, stat err %v", err)
+	}
+}
+
+// Two deployments whose state files share a BASENAME but not a directory
+// (/etc/wecert-a/state.db, /etc/wecert-b/state.db) still must not collide in a shared backup
+// directory: the snapshot identity is the basename plus a hash of the absolute path
+// (see snapshotBase), because the basename alone left each store pruning the other's backups and
+// sweeping the other's half-written temps.
+func TestSnapshotsOfSameBasenameStoresInOneDirectoryDoNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	backups := filepath.Join(dir, "backups")
+
+	open := func(subdir string) *Store {
+		t.Helper()
+		s, err := Open(filepath.Join(dir, subdir, "state.db"))
+		if err != nil {
+			t.Fatalf("Open(%s): %v", subdir, err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		if err := s.PutCert(&CertState{Name: "example-com", KeyPEM: []byte("KEY")}); err != nil {
+			t.Fatalf("PutCert: %v", err)
+		}
+		return s
+	}
+
+	first := open("wecert-a")
+	second := open("wecert-b")
+
+	if first.base == second.base {
+		t.Fatalf("two state files on different paths share the snapshot identity %q; "+
+			"their retention will delete each other's backups", first.base)
+	}
+	for _, s := range []*Store{first, second} {
+		if !strings.HasPrefix(s.base, "state.db-") {
+			t.Errorf("the snapshot identity should stay human-readable (\"state.db-<hash>\"), got %q", s.base)
+		}
+	}
+
+	// keep=1 each: a shared identity lets the second store's prune delete the first's only
+	// snapshot.
+	firstPath, err := first.Snapshot(backups, 1)
+	if err != nil {
+		t.Fatalf("first Snapshot: %v", err)
+	}
+	secondPath, err := second.Snapshot(backups, 1)
+	if err != nil {
+		t.Fatalf("second Snapshot: %v", err)
+	}
+
+	if firstPath == secondPath {
+		t.Fatalf("both stores wrote the same snapshot path %s", firstPath)
+	}
+	for _, p := range []string{firstPath, secondPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("snapshot %s was removed by the other store's retention: %v", p, err)
+		}
+	}
+
+	firstSeen, err := first.Snapshots(backups)
+	if err != nil {
+		t.Fatalf("first Snapshots: %v", err)
+	}
+	if len(firstSeen) != 1 || firstSeen[0] != firstPath {
+		t.Errorf("the first store must only ever see its own snapshots, got %v", firstSeen)
+	}
+	secondSeen, err := second.Snapshots(backups)
+	if err != nil {
+		t.Fatalf("second Snapshots: %v", err)
+	}
+	if len(secondSeen) != 1 || secondSeen[0] != secondPath {
+		t.Errorf("the second store must only ever see its own snapshots, got %v", secondSeen)
+	}
+
+	// One store's sweep must not touch the other's in-progress write: a fresh temp under the
+	// second store's temp prefix survives the first store's snapshot pass.
+	freshTemp := filepath.Join(backups,
+		fmt.Sprintf(".snapshot-%s-29990101T000000.000-0.tmp", second.base))
+	if err := os.WriteFile(freshTemp, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Snapshot(backups, 1); err != nil {
+		t.Fatalf("first Snapshot: %v", err)
+	}
+	if _, err := os.Stat(freshTemp); err != nil {
+		t.Errorf("the first store's sweep removed the second store's fresh temp: %v", err)
+	}
+}
+
+// Snapshots written before the identity carried the path hash must still be found -- an upgrade
+// followed by a state.db loss is exactly when the newest recovery point has an old-style name --
+// and still be pruned, or they would hold retention slots forever.
+func TestPreHashSnapshotNamesAreStillListedAndPruned(t *testing.T) {
+	s, dir := snapshotStore(t)
+	backups := filepath.Join(dir, "backups")
+	if err := os.MkdirAll(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The pre-hash naming: plain basename, no path hash.
+	for _, name := range []string{
+		"state.db.backup-20260101T000000.000Z.db",
+		"state.db.backup-20260102T000000.000Z.db",
+	} {
+		if err := os.WriteFile(filepath.Join(backups, name), []byte("old snapshot"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatalf("Snapshots: %v", err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("the pre-hash names must still be listed (they are the only recovery points an "+
+			"upgraded deployment has), got %v", seen)
+	}
+
+	// keep=1: the two legacy names are the oldest, so both go and the fresh snapshot stays.
+	fresh, err := s.Snapshot(backups, 1)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	left, err := s.Snapshots(backups)
+	if err != nil {
+		t.Fatalf("Snapshots after pruning: %v", err)
+	}
+	if len(left) != 1 || left[0] != fresh {
+		t.Errorf("retention over the legacy pool should end at exactly the fresh snapshot, got %v", left)
+	}
+}
+
+// SnapshotTime is what `-restore latest` uses to tell whether the name it picked is lying about
+// being newest.
+func TestSnapshotTimeReadsTheStampOfBothNamingGenerations(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.db")
+
+	stamp := "20260203T040506.007Z"
+	for _, name := range []string{
+		// The pre-hash naming and the current one both parse.
+		"state.db.backup-" + stamp + ".db",
+		snapshotBase(statePath) + ".backup-" + stamp + ".db",
+		snapshotBase(statePath) + ".backup-" + stamp + "~2.db",
+	} {
+		at, ok := SnapshotTime(statePath, filepath.Join("/snapshots", name))
+		if !ok {
+			t.Errorf("SnapshotTime(%s) reported not-a-snapshot", name)
+			continue
+		}
+		if got := at.UTC().Format(snapshotStamp); got != stamp {
+			t.Errorf("SnapshotTime(%s) = %s, want %s", name, got, stamp)
+		}
+	}
+
+	for _, name := range []string{
+		"other.db.backup-" + stamp + ".db",
+		"state.db.backup-not-a-stamp.db",
+		"state.db.replaced-" + stamp,
+	} {
+		if _, ok := SnapshotTime(statePath, name); ok {
+			t.Errorf("SnapshotTime(%s) must not parse a name that is not this store's snapshot", name)
+		}
 	}
 }

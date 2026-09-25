@@ -63,6 +63,17 @@ type Runner struct {
 	// Check runs one goroutine per host and an inventory read happens at any time, so an
 	// unguarded map here would be a genuine data race.
 	answers map[string]Answer
+
+	// hostLocks serializes Check calls for the same host. Two certificates can cover the
+	// same name, and the reconciler probes a certificate's names concurrently; without a
+	// per-host mutex two Checks for one host interleave their metric writes and state
+	// transitions, and the transition dedup in transition() never sees a repeat -- every
+	// round re-alerts. Different hosts still run in parallel.
+	//
+	// Entries are dropped by Forget, which is only for hosts that will never be probed
+	// again; without that the map would grow with every host ever seen, the same leak
+	// `last` had.
+	hostLocks map[string]*sync.Mutex
 }
 
 // NewRunner constructs the prober. A minValidFor of 0 means remaining validity is not
@@ -78,6 +89,7 @@ func NewRunner(opts Options, minValidFor time.Duration, log *slog.Logger) *Runne
 		log:         log,
 		last:        make(map[string]string),
 		answers:     make(map[string]Answer),
+		hostLocks:   make(map[string]*sync.Mutex),
 	}
 }
 
@@ -87,15 +99,25 @@ func NewRunner(opts Options, minValidFor time.Duration, log *slog.Logger) *Runne
 // It returns the verdict for callers to use, but **whether to alert is decided here** --
 // this is the only place that holds "what the last state was".
 func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict {
+	unlock := r.lockHost(host)
+	defer unlock()
+
 	attempts, err := r.probeAll(ctx, host, r.opts)
 	if err != nil {
+		// A dead context means the daemon is shutting down (or the pass ran out of time),
+		// not that the host is unreachable. Recording it would write probe_match=0, delete
+		// the answer gauges and log a spurious ERROR transition for an environment problem
+		// that does not exist -- so say nothing and leave the last known state in place.
+		if ctx.Err() != nil {
+			return Verdict{Problems: []Problem{{Kind: ProblemUnreachable, Text: err.Error()}}}
+		}
 		metrics.CertificateProbeErrors.WithLabelValues(host).Inc()
 
 		// The verdict is not OK, so "the served certificate is the deployed one" must stop claiming
 		// it is. This branch used to leave probe_match at its previous value: a host that resolved
 		// and matched last round, then lost its DNS, kept a stale 1 for as long as the resolution
 		// failed -- and the documented alert on probe_match == 0 could not fire for the one host
-		// whose name no longer resolves. The two sibling branches below already say this.
+		// whose name no longer resolves. Every non-OK branch below says this for the same reason.
 		metrics.CertificateProbeMatch.WithLabelValues(host).Set(0)
 
 		// The two gauges that describe a certificate the probe READ go too, and for the same reason:
@@ -113,6 +135,13 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 			"cannot reach this name to check which certificate it serves", "err", err)
 		r.recordUnreachable(host)
 		return Verdict{Problems: []Problem{{Kind: ProblemUnreachable, Text: err.Error()}}}
+	}
+
+	// The resolution succeeded but the context died while the addresses were being
+	// dialled: same rule as above, and it has to be checked BEFORE the per-attempt loop,
+	// which increments probe_errors for every cancelled dial.
+	if ctx.Err() != nil {
+		return Verdict{Problems: []Problem{{Kind: ProblemUnreachable, Text: ctx.Err().Error()}}}
 	}
 
 	if e.Now.IsZero() {
@@ -154,6 +183,17 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 		if len(attemptErrs) > 0 {
 			msg += ": " + strings.Join(attemptErrs, " | ")
 		}
+		// Same reasoning as the two branches around it, and the same omission would have the same
+		// consequence: the name still resolves, so the resolve-failure branch above never runs, and
+		// probe_match kept whatever the last healthy round wrote. A listener deleted at the CLB, a
+		// security group closed on every backend, or a timeout on every address all land here --
+		// and "the endpoint serves nothing at all" is the strongest possible reason to stop saying
+		// it serves the deployed certificate.
+		//
+		// It is also the branch where the stale value is least visible: ClearProbeAnswer takes the
+		// two gauges that could contradict a match (notAfter, trusted) away with it, so a leftover
+		// 1 stands alone in the exported picture.
+		metrics.CertificateProbeMatch.WithLabelValues(host).Set(0)
 		metrics.ClearProbeAnswer(host)
 		r.transition(host, stateUnreachable,
 			"cannot reach this name to check which certificate it serves", "err", msg)
@@ -227,10 +267,11 @@ func (r *Runner) Check(ctx context.Context, host string, e Expectation) Verdict 
 // mismatchMessage words the transition line after what Verify actually found.
 //
 // The line used to be one hard-coded sentence -- "the certificate being served is not the one that
-// was deployed" -- for all four classes of problem, and it is false for the validity floor: there the
-// served certificate IS the deployed one, and the finding is that renewal has not run yet. The
-// sentence is also what the CRITICAL alert's annotation repeats, so getting it wrong sends the
-// operator to CLB bindings, SNI and the deploy path for a renewal problem.
+// was deployed" -- for every class of problem, and it is false for all of the servedButBroken set:
+// there the served certificate IS the deployed one, and the finding is that renewal has not run
+// yet, the certificate is out of its validity window, or the chain does not verify. The sentence
+// is also what the CRITICAL alert's annotation repeats, so getting it wrong sends the operator to
+// CLB bindings, SNI and the deploy path for a renewal or chain problem.
 func mismatchMessage(problems []Problem) string {
 	only := func(kind ProblemKind) bool {
 		for _, p := range problems {
@@ -240,11 +281,31 @@ func mismatchMessage(problems []Problem) string {
 		}
 		return len(problems) > 0
 	}
+	// servedButBroken is the class where the deployed certificate IS the one being served
+	// and the problem is with the certificate itself. A mix of these (an expiring
+	// certificate that also does not chain) still points at the certificate, not at the
+	// deployment path.
+	servedButBroken := func() bool {
+		for _, p := range problems {
+			switch p.Kind {
+			case ProblemMinValidFor, ProblemValidityWindow, ProblemUntrusted:
+			default:
+				return false
+			}
+		}
+		return len(problems) > 0
+	}
 	switch {
 	case only(ProblemMinValidFor):
 		return "the certificate being served has less validity left than required"
+	case only(ProblemValidityWindow):
+		return "the certificate being served is expired or not yet valid"
+	case only(ProblemUntrusted):
+		return "the certificate being served does not verify against the system roots"
 	case only(ProblemNotCovered):
 		return "the certificate being served does not cover this name"
+	case servedButBroken():
+		return "the certificate being served is the deployed one, but it is currently not usable"
 	default:
 		return "the certificate being served is not the one that was deployed"
 	}
@@ -322,15 +383,34 @@ func (r *Runner) LastState(host string) string {
 // Forget drops the remembered state and answer for a host that will never be probed again
 // (its certificate left the desired state).
 //
-// Without it, last and answers grow with every host ever seen -- and certificate names are
-// derived from domains, which churn by design. The exported metric series have the same
-// problem and are reclaimed separately (metrics.DeleteProbeSeries); both have to happen, or
-// a dropped host leaks memory here and a frozen gauge there.
+// Without it, last, answers and hostLocks grow with every host ever seen -- and certificate
+// names are derived from domains, which churn by design. The exported metric series have the
+// same problem and are reclaimed separately (metrics.DeleteProbeSeries); both have to happen,
+// or a dropped host leaks memory here and a frozen gauge there.
+//
+// The contract "will never be probed again" is what makes dropping the lock safe:
+// a Check still holding it while the entry is deleted would no longer be mutually
+// exclusive with the next one.
 func (r *Runner) Forget(host string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.last, host)
 	delete(r.answers, host)
+	delete(r.hostLocks, host)
+}
+
+// lockHost takes the per-host serialization lock and returns the unlock function.
+// See the hostLocks field for why one host must not be checked twice at once.
+func (r *Runner) lockHost(host string) func() {
+	r.mu.Lock()
+	l, ok := r.hostLocks[host]
+	if !ok {
+		l = &sync.Mutex{}
+		r.hostLocks[host] = l
+	}
+	r.mu.Unlock()
+	l.Lock()
+	return l.Unlock
 }
 
 func (r *Runner) transition(host, state, msg string, attrs ...any) {

@@ -58,7 +58,7 @@ func TestTheBudgetClaimNamesTheWildcardNotTheApex(t *testing.T) {
 		Order:    legoacme.Order{Status: "pending", Authorizations: []string{"https://ca.test/authz/1"}},
 		Location: "https://ca.test/order/1",
 	}
-	if _, err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order); err == nil {
+	if err := m.solveChallenges(context.Background(), cert, &state.CertState{Name: "c"}, order); err == nil {
 		t.Fatal("the invalid authorization must fail the pass")
 	}
 

@@ -155,8 +155,21 @@ func prepareProbe(ctx context.Context, host string, opts Options) (string, []str
 	if opts.Port == 0 {
 		opts.Port = 443
 	}
+	if opts.Port < 1 || opts.Port > 65535 {
+		return "", nil, opts, fmt.Errorf("probe: port %d is outside the valid range 1-65535", opts.Port)
+	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = DefaultTimeout
+	}
+	// The config layer floors its probe.timeout at 1s; this is the other end. The timeout
+	// is the per-address budget, shared by dial and handshake, so an absurd one is not a
+	// patient probe but a stalled one: with several addresses it multiplies inside the
+	// certificate's own pass. Cross-AZ handshakes take 3-5s against a 10s default, so a
+	// value past a few minutes is a misconfiguration, not a slow link.
+	if opts.Timeout > maxProbeTimeout {
+		return "", nil, opts, fmt.Errorf("probe: timeout %s exceeds the %s maximum; the timeout is "+
+			"the per-address dial+handshake budget, so past that a probe is stalled, not patient",
+			opts.Timeout, maxProbeTimeout)
 	}
 
 	ips, err := net.DefaultResolver.LookupHost(ctx, host)
@@ -166,6 +179,10 @@ func prepareProbe(ctx context.Context, host string, opts Options) (string, []str
 	if len(ips) == 0 {
 		return "", nil, opts, fmt.Errorf("probe: %s resolved to no address", host)
 	}
+	// A resolver can hand back the same address twice (a hosts-file line next to the DNS
+	// answer, or a stub merging responses): dedupe before the cap, because the cap counts
+	// dials and a duplicate would be dialled twice for no extra evidence.
+	ips = dedupeAddrs(ips)
 	// Refuse rather than sample a name with an implausible number of addresses.
 	//
 	// Every resolved address has to be checked (that is the whole point of ProbeAll: a rebind can
@@ -180,6 +197,25 @@ func prepareProbe(ctx context.Context, host string, opts Options) (string, []str
 	}
 	sort.Strings(ips)
 	return host, ips, opts, nil
+}
+
+// maxProbeTimeout caps Options.Timeout; see prepareProbe for why an upper bound exists
+// next to the config layer's 1s floor.
+const maxProbeTimeout = 5 * time.Minute
+
+// dedupeAddrs drops duplicate addresses, preserving order. It reuses the input's backing
+// array, which is safe here because prepareProbe sorts the result and hands out copies.
+func dedupeAddrs(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := in[:0]
+	for _, ip := range in {
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		out = append(out, ip)
+	}
+	return out
 }
 
 // maxProbeAddresses caps how many addresses one host may resolve to before the probe refuses it.
@@ -369,7 +405,7 @@ type Verdict struct {
 
 // ProblemKind is the direction a verification problem points in.
 //
-// It exists because the four classes below "point in completely different directions" (see Verify)
+// It exists because the classes below "point in completely different directions" (see Verify)
 // and the caller that logs the transition needs to know which one it is looking at: a validity-floor
 // failure means the deployed certificate IS being served, and telling the operator that a different
 // certificate is being served sends them to the CLB console for a renewal that has not run yet.
@@ -388,6 +424,11 @@ const (
 	ProblemNotAfter ProblemKind = "not_after"
 	// ProblemMinValidFor: the deployed certificate is served, with less validity left than required.
 	ProblemMinValidFor ProblemKind = "min_valid_for"
+	// ProblemValidityWindow: the served certificate is expired, or not valid yet.
+	//
+	// Unlike MinValidFor this one is unconditional: an expectation with no validity floor
+	// and no trust requirement still must not call a certificate OK that no clock accepts.
+	ProblemValidityWindow ProblemKind = "validity_window"
 	// ProblemUntrusted: the peer's chain does not verify against the system roots.
 	//
 	// A deployment can be "the right certificate, in the right place, still broken": a
@@ -426,7 +467,7 @@ func (v Verdict) Summary() string {
 
 // Verify compares the probe result against the expectation.
 //
-// The five classes of problem are reported separately rather than merged into one
+// The classes of problem are reported separately rather than merged into one
 // "verification failed": they point in completely different directions -- a name mismatch
 // means looking at DNS and CLB rules, a different certificate means checking whether the
 // rebind took effect, an expired one means finding out why renewal never ran, and a chain
@@ -464,7 +505,11 @@ func (r *Result) Verify(e Expectation) Verdict {
 	}
 
 	// 3. Is this the one I deployed?
-	if !e.NotAfter.IsZero() && !r.NotAfter.Equal(e.NotAfter) {
+	//
+	// Guarded on r.cert like checks 2 and 5: with no leaf captured, NotAfter is the zero
+	// time, and comparing it against the expectation would double-report "no certificate"
+	// as also "a different certificate".
+	if r.cert != nil && !e.NotAfter.IsZero() && !r.NotAfter.Equal(e.NotAfter) {
 		problems = append(problems, Problem{Kind: ProblemNotAfter, Text: fmt.Sprintf(
 			"the served certificate expires at %s but the deployed one expires at %s "+
 				"(the rebind did not take effect, or another certificate is winning SNI)",
@@ -472,7 +517,7 @@ func (r *Result) Verify(e Expectation) Verdict {
 	}
 
 	// 4. How much time is left?
-	if e.MinValidFor > 0 {
+	if r.cert != nil && e.MinValidFor > 0 {
 		left := r.NotAfter.Sub(now)
 		if left < e.MinValidFor {
 			problems = append(problems, Problem{Kind: ProblemMinValidFor, Text: fmt.Sprintf(
@@ -481,13 +526,37 @@ func (r *Result) Verify(e Expectation) Verdict {
 		}
 	}
 
-	// 5. Will a client accept it?
+	// 5. Is it inside its validity window AT ALL?
 	//
-	// The four checks above all answer "is this the certificate I deployed". None of them
-	// answers "does it work": a listener that serves the leaf without its intermediate --
-	// the single most common CLB configuration mistake -- passes every one of them and
-	// fails in every real client. Trusted is only meaningful when a certificate was
-	// captured at all, so a missing leaf stays ProblemNoCertificate rather than doubling up.
+	// This one is deliberately unconditional -- independent of RequireTrusted and
+	// MinValidFor. Those two are opt-in policies; "the certificate is expired" is not. A
+	// certificate whose names and notAfter all match the expectation used to pass here
+	// with both policies off, so the probe's answer to "is production serving something a
+	// client can use" was OK for a certificate every clock rejects -- the false green this
+	// package exists to rule out. The floor check above stays separate: its message and
+	// its ProblemKind point at renewal not having run yet, while this one points at a
+	// certificate that is already useless.
+	if r.cert != nil {
+		switch {
+		case now.Before(r.NotBefore):
+			problems = append(problems, Problem{Kind: ProblemValidityWindow, Text: fmt.Sprintf(
+				"the served certificate is not valid until %s",
+				r.NotBefore.UTC().Format(time.RFC3339))})
+		case now.After(r.NotAfter):
+			problems = append(problems, Problem{Kind: ProblemValidityWindow, Text: fmt.Sprintf(
+				"the served certificate expired at %s (%s ago)",
+				r.NotAfter.UTC().Format(time.RFC3339), now.Sub(r.NotAfter).Round(time.Hour))})
+		}
+	}
+
+	// 6. Will a client accept it?
+	//
+	// The checks above all answer "is this the certificate I deployed" and "is it inside
+	// its dates". None of them answers "does it work": a listener that serves the leaf
+	// without its intermediate -- the single most common CLB configuration mistake --
+	// passes every one of them and fails in every real client. Trusted is only meaningful
+	// when a certificate was captured at all, so a missing leaf stays
+	// ProblemNoCertificate rather than doubling up.
 	if r.cert != nil && e.RequireTrusted && !r.Trusted {
 		text := "the served certificate's chain does not verify against the system roots"
 		if r.ChainError != "" {

@@ -2297,3 +2297,180 @@ func TestAnIgnoredBrokenRecordIsNamedInTheJournal(t *testing.T) {
 		t.Errorf("the warning has to say which zone the ignored record came from, got:\n%s", logs)
 	}
 }
+
+// The report is written LAST in Commit, after both the document and the state file, so a report
+// path colliding with either of them destroys that file every round: the document would be
+// replaced by the report JSON (which every later LoadDocument refuses), and the state file would
+// lose the grace-period clock and the change ledger. The constructor must hold the same line it
+// already holds for StatePath == DocumentPath.
+func TestNewRejectsAReportPathThatCollides(t *testing.T) {
+	dir := t.TempDir()
+	doc := filepath.Join(dir, "desired-state.yaml")
+	state := filepath.Join(dir, "onboard-state.json")
+
+	for name, opts := range map[string]Options{
+		"report is the document": {DocumentPath: doc, StatePath: state, ReportPath: doc},
+		"report is the state":    {DocumentPath: doc, StatePath: state, ReportPath: state},
+		// The spellings a copy-pasted flag can carry for the same file.
+		"report is the document, spelled differently": {DocumentPath: doc, StatePath: state, ReportPath: dir + "//desired-state.yaml"},
+	} {
+		opts.Generator = "wecert-onboard/test"
+		ob, err := New(Sources{Declarations: &fakeDeclarations{}}, opts, testLogger())
+		if err == nil {
+			t.Errorf("%s: New must refuse it", name)
+		}
+		if ob != nil {
+			t.Errorf("%s: a refused construction must not hand back an onboarder", name)
+		}
+	}
+
+	// Three distinct paths are fine, so the checks above cannot be satisfied by refusing
+	// everything.
+	if _, err := New(Sources{Declarations: &fakeDeclarations{}}, Options{
+		DocumentPath: doc,
+		StatePath:    state,
+		ReportPath:   filepath.Join(dir, "report.json"),
+		Generator:    "wecert-onboard/test",
+	}, testLogger()); err != nil {
+		t.Errorf("three distinct output paths must be accepted, got %v", err)
+	}
+}
+
+// Guard 1 rejects a declaration when no rule serves it, and a wildcard declaration contributes
+// TWO names -- the apex and *.<host>. Both must get a verdict: rejecting only the apex left the
+// wildcard with no entry at all, in the artifact an operator reads to find out why nothing was
+// issued.
+func TestGuardOneReportsEveryNameOfARejectedWildcardDeclaration(t *testing.T) {
+	h := newHarness(t, Options{RequireRule: true})
+
+	// Nothing serves example.com or anything under it -- a rule serving any subdomain would
+	// satisfy guard 1 for the wildcard, which is the arrangement the guard exists to recognise.
+	// other.com is declared and served so the round has something to cover.
+	h.decls.raw = []RawDeclaration{
+		decl("example.com", "wildcard=1"),
+		decl("other.com"),
+	}
+	h.rules.domains = []string{"other.com"}
+
+	rep := h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("the served declaration must carry the round: %v", rep.FreezeReasons)
+	}
+	for _, n := range []string{"example.com", "*.example.com"} {
+		d, ok := decisionFor(rep, n)
+		if !ok {
+			t.Fatalf("%s must get a verdict; decisions: %+v", n, rep.Decisions)
+		}
+		if d.Included {
+			t.Errorf("%s must be excluded: %+v", n, d)
+		}
+		if !strings.Contains(d.Reason, "no CLB rule serves this name") {
+			t.Errorf("%s: the reason must say guard 1 was not satisfied, got %q", n, d.Reason)
+		}
+	}
+}
+
+// An over-cap group keeps its previous certificate, but the carry must not resurrect a name
+// this round already judged removed.
+//
+// The group's eligible set is over the SAN cap, so overLimit carries the previous revision's
+// certificate -- and it used to carry it VERBATIM, including a name whose deletion had just
+// completed (grace period elapsed, no CLB rule referencing it, the report saying "removed").
+// The report announced the removal while the document went on serving the name and wecert went
+// on renewing it: three judgements, all undermined by the carry. The carried certificate must
+// drop the removed names.
+func TestOverLimitDoesNotResurrectARemovedName(t *testing.T) {
+	// A high drop threshold keeps the fuse out of the way: this test is about the over-cap
+	// carry and the removal verdict, not about freezing.
+	h := newHarness(t, Options{MaxNames: 3, DropThreshold: 0.9})
+
+	// Round 1: a group of three, at the cap.
+	for _, n := range []string{"a", "b", "c"} {
+		h.decls.raw = append(h.decls.raw, decl(n+".example.com"))
+		h.rules.domains = append(h.rules.domains, n+".example.com")
+	}
+	if r := h.run(t); r.Certificates != 1 {
+		t.Fatalf("round 1 should write one certificate, got %d", r.Certificates)
+	}
+
+	// Round 2: b stops being declared (its rule goes too, so nothing references it) and three
+	// more names join -- the group is over the cap, so the previous certificate is carried.
+	// b is inside its grace period this round, so the carried certificate still contains it.
+	h.decls.raw = nil
+	h.rules.domains = nil
+	for _, n := range []string{"a", "c", "d", "e", "f"} {
+		h.decls.raw = append(h.decls.raw, decl(n+".example.com"))
+		h.rules.domains = append(h.rules.domains, n+".example.com")
+	}
+	h.run(t)
+	if got := h.domains(t); !containsAllDomains(got, "b.example.com") {
+		t.Fatalf("b must still be covered inside its grace period, got %v", got)
+	}
+
+	// Round 3, past the grace period: b's removal completes. The group is still over the cap,
+	// so the previous certificate is carried again -- minus b.
+	h.clock.advance(25 * time.Hour)
+	rep := h.run(t)
+	if rep.Frozen() {
+		t.Fatalf("the round must not freeze: %v", rep.FreezeReasons)
+	}
+
+	d, ok := decisionFor(rep, "b.example.com")
+	if !ok || d.Included {
+		t.Fatalf("b.example.com's removal completed this round, so it must be reported as removed: %+v", d)
+	}
+	if !strings.Contains(d.Reason, "removed:") {
+		t.Errorf("b.example.com's verdict must be the removal, got %q", d.Reason)
+	}
+
+	domains := h.domains(t)
+	if containsAllDomains(domains, "b.example.com") {
+		t.Errorf("the carried certificate must not resurrect b.example.com -- the report said it "+
+			"was removed, and keeping it in the document has wecert renew it anyway: %v", domains)
+	}
+	if !containsAllDomains(domains, "a.example.com", "c.example.com") {
+		t.Errorf("the rest of the previous certificate must be carried, got %v", domains)
+	}
+}
+
+// If dropping the removed names still leaves the previous certificate over the cap -- the
+// operator lowered the SAN cap, say -- the group can be neither rebuilt nor carried. Writing it
+// anyway would produce a document the writer refuses (spec.WriteDocument enforces the profile's
+// cap), so the round must freeze and say a human has to converge the group.
+func TestOverLimitCarryStillOverTheCapFreezes(t *testing.T) {
+	h := newHarness(t, Options{MaxNames: 10})
+
+	for i := 0; i < 6; i++ {
+		host := "n" + itoa(i) + ".example.com"
+		h.decls.raw = append(h.decls.raw, decl(host))
+		h.rules.domains = append(h.rules.domains, host)
+	}
+	if r := h.run(t); r.Certificates != 1 {
+		t.Fatalf("round 1 should write one certificate, got %d", r.Certificates)
+	}
+
+	// The cap drops below what the previous certificate holds. Same paths, same sources, a
+	// tighter onboarder -- the way an operator lowering onboarding.maxNames would run it.
+	opts := h.opts
+	opts.MaxNames = 3
+	ob, err := New(Sources{Declarations: h.decls, Rules: h.rules}, opts, testLogger())
+	if err != nil {
+		t.Fatalf("constructing the tighter onboarder failed: %v", err)
+	}
+	rep, err := ob.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if !rep.Frozen() {
+		t.Fatal("a group that can be neither rebuilt nor carried must freeze, not write a document " +
+			"the writer will refuse")
+	}
+	if !strings.Contains(strings.Join(rep.FreezeReasons, " "), "converge") {
+		t.Errorf("the freeze reason must tell a human to converge the group: %v", rep.FreezeReasons)
+	}
+
+	// And nothing moved on disk: the frozen round keeps the previous document.
+	if got := h.domains(t); len(got) != 6 {
+		t.Errorf("a frozen round must leave the document untouched, got %v", got)
+	}
+}

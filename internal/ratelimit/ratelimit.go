@@ -260,6 +260,13 @@ func Remaining(s Snapshot, l Limit, now time.Time) float64 {
 // so an over-spend is not silently forgiven. The CA would have rejected that request, so a
 // negative bucket is itself a signal worth keeping.
 func Spend(s Snapshot, l Limit, cost float64, now time.Time) Snapshot {
+	// A limit with no positive capacity has no bucket at all: level() already reads it as
+	// empty, and running the arithmetic anyway records garbage -- the debt clamp's floor is
+	// -Capacity, which for a negative capacity is POSITIVE, so the subtraction would be
+	// clamped UP into credit a bucket with no quota could never hold.
+	if l.Capacity <= 0 {
+		return Snapshot{At: now}
+	}
 	// A negative cost is not a credit, and treating it as one is how a caller's sign error
 	// silently hands back quota: `tokens - (-c)` is `tokens + c`, so a bug in the caller would
 	// *increase* the reported allowance. The API records consumption, so the only defensible
@@ -318,7 +325,7 @@ type Deadline struct {
 // "UTC" as Go's reference layout writes it.
 func ParseRetryAfter(msg string) (time.Time, bool) {
 	const marker = "retry after "
-	i := indexOf(msg, marker)
+	i := strings.Index(msg, marker)
 	if i < 0 {
 		return time.Time{}, false
 	}
@@ -335,7 +342,7 @@ func ParseRetryAfter(msg string) (time.Time, bool) {
 	// deadline was ever recorded and the WecertRateLimitBlocked alert was unreachable -- the one
 	// signal that says the whole account has to wait. The test used a fabricated message with no
 	// suffix, which is why the suite stayed green.
-	if j := indexOf(rest, ": see "); j >= 0 {
+	if j := strings.Index(rest, ": see "); j >= 0 {
 		rest = rest[:j]
 	}
 	// Trim the trailing sentence punctuation the message may carry.
@@ -357,14 +364,25 @@ func ParseRetryAfter(msg string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// ParseRetryAfterHeader parses an HTTP Retry-After header value.
+// ParseRetryAfterHeader parses an HTTP Retry-After header value against the wall clock.
 //
 // RFC 9110 section 10.2.3 allows two forms: a delay in seconds, or an HTTP-date. It is a different
 // syntax from the free text Boulder puts in the error MESSAGE (see ParseRetryAfter), and it is the
 // authoritative field: a CA may send the header without repeating the instant in the message, and
 // lego exposes it on its typed error. Reading only the message meant such a refusal recorded no
 // deadline at all, so the pass retried inside the window the CA had just named.
+//
+// The delay form is relative to "now", and this variant takes that from the real clock; a caller
+// with an injected clock (the Tracker keeps one so tests can simulate time) should call
+// ParseRetryAfterHeaderAt instead, or the recorded deadline lands on a different timeline than
+// the accounting it gates.
 func ParseRetryAfterHeader(value string) (time.Time, bool) {
+	return ParseRetryAfterHeaderAt(value, time.Now())
+}
+
+// ParseRetryAfterHeaderAt is ParseRetryAfterHeader with the clock made explicit: the delay
+// form ("120") is relative to the given instant rather than the wall clock.
+func ParseRetryAfterHeaderAt(value string, now time.Time) (time.Time, bool) {
 	v := strings.TrimSpace(value)
 	if v == "" {
 		return time.Time{}, false
@@ -381,22 +399,12 @@ func ParseRetryAfterHeader(value string) (time.Time, bool) {
 		if int64(secs) > math.MaxInt64/int64(time.Second) {
 			return time.Time{}, false
 		}
-		return time.Now().Add(time.Duration(secs) * time.Second).UTC(), true
+		return now.Add(time.Duration(secs) * time.Second).UTC(), true
 	}
 	if t, err := http.ParseTime(v); err == nil && !t.IsZero() {
 		return t.UTC(), true
 	}
 	return time.Time{}, false
-}
-
-// indexOf is strings.Index, kept local so the parse is self-contained and testable.
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 // trimTrailing drops sentence-ending punctuation and whitespace from the parsed tail.

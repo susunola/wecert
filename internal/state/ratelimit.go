@@ -65,7 +65,9 @@ func (s *Store) GetRateBucket(limitName, scopeID string) (*RateBucket, error) {
 // fn runs while the store's mutex is held, so it must not call back into the Store: s.mu is a
 // plain sync.Mutex, not a reentrant one, and a callback that reads or writes through the same Store
 // would deadlock rather than make progress. Every current caller is pure arithmetic on the record
-// it is handed; that is the contract, not an accident.
+// it is handed; that is the contract, not an accident. The bucket's identity is part of the
+// contract too: fn changing LimitName or ScopeID is an error, because writing the mutated key back
+// would silently create a second row instead of updating the bucket that was read.
 //
 // The read and the write have to be one operation, for the same reason UpdateCert exists: the
 // mutex covers one statement, not a Get...Put pair, so two concurrent callers both read the same
@@ -105,6 +107,16 @@ func (s *Store) UpdateRateBucket(limitName, scopeID string, fn func(*RateBucket)
 		return err
 	}
 
+	// fn may spend and annotate, but the bucket's identity is not its to move. Writing back under
+	// b.LimitName/b.ScopeID after fn changed them would silently INSERT a new row (the conflict
+	// target no longer matches the row that was read), leaving the real bucket unspent and the
+	// estimate optimistic -- the exact failure the read-modify-write under one mutex exists to
+	// prevent. Refuse instead, and write back under the keys the caller asked about.
+	if b.LimitName != limitName || b.ScopeID != scopeID {
+		return fmt.Errorf("update rate bucket %s/%s: fn changed the bucket's identity to %s/%s; "+
+			"fn may update the level, never the key", limitName, scopeID, b.LimitName, b.ScopeID)
+	}
+
 	_, err = s.db.Exec(`
 		INSERT INTO rate_buckets (limit_name, scope_id, tokens, observed_at, reset_at, reset_reason)
 		VALUES (?, ?, ?, ?, ?, ?)
@@ -113,7 +125,7 @@ func (s *Store) UpdateRateBucket(limitName, scopeID string, fn func(*RateBucket)
 			observed_at = excluded.observed_at,
 			reset_at    = CASE WHEN excluded.reset_at != 0 THEN excluded.reset_at ELSE rate_buckets.reset_at END,
 			reset_reason = CASE WHEN excluded.reset_at != 0 THEN excluded.reset_reason ELSE rate_buckets.reset_reason END`,
-		b.LimitName, b.ScopeID, b.Tokens, toUnix(b.ObservedAt), toUnix(b.ResetAt), b.ResetReason)
+		limitName, scopeID, b.Tokens, toUnix(b.ObservedAt), toUnix(b.ResetAt), b.ResetReason)
 	if err != nil {
 		return fmt.Errorf("write rate bucket %s/%s: %w", limitName, scopeID, err)
 	}

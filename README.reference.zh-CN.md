@@ -645,8 +645,10 @@ wecert 只读那份文档。**wecert 自己永远不推断。**
 |---|---|---|
 | `listen` | *（空 = 不启用）* | 触发端点的监听地址 |
 | `token` | — | 设置 `listen` 时**必填**，至少 16 字符 |
+| `tokenFile` | *（空）* | 改为从该文件读取 `token`，避免它随配置文件进备份 |
 | `notifyURL` | *（空）* | 可选的出站事件目标 |
 | `notifySecret` | *（空）* | 出站事件的 HMAC 密钥，至少 32 字符。没有 `notifyURL` 时配置它会报错 |
+| `notifySecretFile` | *（空）* | 改为从该文件读取 `notifySecret`，同 `tokenFile` |
 
 触发端点会执行**真实签发**并消耗 Let's Encrypt 的速率限制配额，所以不允许无鉴权运行。token 短于 16 字符会在配置加载阶段被拒 —— 在这个端点上，弱 token 等于没有 token。
 
