@@ -104,7 +104,7 @@ probe has not run for this certificate this process life" is not
 | `probe_mismatch` | the probe read a served certificate for some host and it is not the deployed one |
 | `probe_unreachable` | the probe could not read a served certificate for any host (`unreachable`, `no_certificate`) |
 | `binding_unknown` | a live enumeration came back incomplete with `count == 0` |
-| `probe_unknown` | probing is on, the deployment is confirmed, and this process has no answer yet |
+| `probe_unknown` | probing is on, the deployment is confirmed, and there is no answer -- neither from this process nor from the persisted last verdict |
 | `failing` | `consecutiveFailures > 0` |
 | `expiring` | the certificate is inside its `renewBefore` window (30 days if unset) |
 | `ok` | issued, deployed as configured, probe match (or probing off), not expiring |
@@ -317,9 +317,12 @@ Honest limits, so a reader does not take the table for more than it is:
 - CLB / listener rows exist only for certificates the reconciler has enumerated.
   `Bindings()` runs to confirm a first bind, so a confirmed certificate usually
   shows the store-side lower bound rather than listener ids.
-- Probe answers live in the prober's memory for this process life. A restart
-  empties them and rows read `probe_unknown` until the next pass; v1 stores no
-  probe history.
+- Probe answers come from the running prober, with the durable last verdict per
+  host (`probe_samples`) as the fallback when this process has read nothing yet,
+  so a restart shows what the previous process observed rather than
+  `probe_unknown`. Each host sample carries `observedAt`, which is how the
+  reader tells "read a minute ago" from "read before the last restart"; the
+  table keeps one row per certificate/host and nothing prunes it.
 - `time` is the reader's clock. The only observation instants in the payload are
   `desired.generatedAt` and `bindings.observedAt`; there is no per-source
   staleness for the store yet.
