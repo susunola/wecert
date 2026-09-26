@@ -402,3 +402,36 @@ func assertRemotePairVerifies(t *testing.T, remoteDir, stamp string, key []byte)
 		t.Fatalf("surviving pair for %s does not verify: %v", stamp, err)
 	}
 }
+
+// A snapshot published over SFTP must not be readable by every user on the backup host.
+//
+// The snapshot holds the ACME account key and every certificate private key, and certsync's export
+// path uploads through the same function, so one missing mode is two private keys wide. SFTP servers
+// create files with their own default -- commonly 0644 minus umask -- and nothing in the client asks
+// for anything else unless it is asked explicitly. The temp file is chmodded before the rename, so
+// the published name never exists with a wider mode.
+func TestSFTPUploadPublishesTheSnapshotWithAPrivateMode(t *testing.T) {
+	remote := t.TempDir()
+	addr, knownHosts, stop := startTestSFTPServer(t, serveTestSFTPRealFS)
+	defer stop()
+	t.Setenv("WECERT_EDGE_SFTP_PASSWORD", "password")
+
+	dir := t.TempDir()
+	src := writeSnapshot(t, dir, "state.db-abcdef"+snapshotNameSuffix+"20260101T000000.000Z.db", "snapshot")
+	target := sftpTarget(addr, knownHosts, remote, 0, nil)
+	if err := Upload(context.Background(), target, src); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+
+	// serveTestSFTPRealFS serves the real filesystem, so the published file can be inspected
+	// directly -- which is the point: this asserts the mode on disk, not what the protocol said.
+	published := filepath.Join(remote, filepath.Base(src))
+	fi, err := os.Stat(published)
+	if err != nil {
+		t.Fatalf("the snapshot was not published: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("published snapshot mode = %o, want 0600: its contents are the account key and every "+
+			"certificate private key, and the backup host's other users can read %o", perm, perm)
+	}
+}

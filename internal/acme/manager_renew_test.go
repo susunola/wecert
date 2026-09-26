@@ -575,3 +575,55 @@ func newOrderCalls(fake *fakeAPI) int {
 	}
 	return n
 }
+
+// The identifier pause and the failed-authorization budget must key on the same name for a wildcard.
+//
+// The CA's pause names (or is recorded against) the authorization identifier, which never carries the
+// wildcard's "*." prefix -- the same rule the budget's own scope follows. Keying the pause gate on
+// the configured domain instead split the pair: the refusal was booked against "example.com" and the
+// gate asked about "*.example.com", so a paused wildcard identifier kept ordering inside the window
+// the CA had just named -- the one thing this limit is checked for.
+func TestAWildcardIdentifierPauseGatesTheWildcardCertificate(t *testing.T) {
+	store, m, fake, cert := newAPITestHarness(t, []string{"*.example.com"})
+	fixed := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	m.SetNow(func() time.Time { return fixed })
+	dueForRenewal(t, store, cert, fixed)
+	fake.orders = []legoacme.ExtendedOrder{terminalOrder(
+		"https://ca.test/order/1", "https://ca.test/finalize/1", "https://ca.test/cert/1")}
+	// Boulder's pause wording, naming the bare identifier (never the wildcard form).
+	fake.newOrderErr = errors.New("acme: error: 429 :: urn:ietf:params:acme:error:rateLimited :: " +
+		"too many failed authorizations recently: see https://letsencrypt.org/docs/rate-limits/ " +
+		"temporarily prevented from requesting certificates for example.com")
+
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Fatal("a refused order must be reported as a failure")
+	}
+
+	// The refusal is booked against the bare name, and the gate for this wildcard certificate has to
+	// find it there.
+	if _, _, blocked := m.quota.BlockedUntil(
+		ratelimit.ConsecutiveAuthzFailuresPerIdentifier, "example.com"); !blocked {
+		t.Fatal("the pause was not booked against the identifier the CA named")
+	}
+	if _, _, blocked := m.quota.BlockedUntil(ratelimit.ConsecutiveAuthzFailuresPerIdentifier, "*.example.com"); blocked {
+		t.Error("the pause was booked against the wildcard form, which no other scope of this limit uses")
+	}
+
+	// And ordering stops: the next due pass must not place another order while the pause stands.
+	//
+	// The clock moves past our own backoff and past the failure cooldown first, so the pause is the
+	// only thing left that can stop the order -- at the same instant the pass would be refused for
+	// being inside its retry window, and the test would pass without testing the gate at all. The
+	// pause's floor is a day, so six hours later it is still in force.
+	fake.newOrderErr = nil
+	fake.orders = nil
+	advanced := fixed.Add(6 * time.Hour)
+	m.SetNow(func() time.Time { return advanced })
+	before := newOrderCalls(fake)
+	if err := m.Reconcile(context.Background(), cert); err == nil {
+		t.Error("a paused identifier must not be ordered again")
+	}
+	if got := newOrderCalls(fake); got != before {
+		t.Errorf("an order was placed for a paused wildcard identifier (%d new call(s))", got-before)
+	}
+}

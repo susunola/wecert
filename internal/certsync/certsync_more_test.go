@@ -429,3 +429,50 @@ func objectNames(objects map[string][]byte) []string {
 	sort.Strings(names)
 	return names
 }
+
+// ".." is not a certificate name, it is a step up the tree.
+//
+// filepath.Base("..") == "..", so the equality half of the guard passed it and the export landed
+// one directory ABOVE LocalDir -- outside the tree the operator configured, and outside the reach of
+// any later cleanup that walks that tree. The config layer puts no character restriction on a
+// certificate name, so this guard is the only one on the path.
+func TestExportRejectsTheParentDirectoryName(t *testing.T) {
+	root := t.TempDir()
+	local := filepath.Join(root, "exports")
+	if err := os.MkdirAll(local, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.CertificateExport{LocalDir: local}
+
+	err := Export(context.Background(), cfg, "..", []byte("CHAIN"), []byte("PRIVATE KEY"))
+	if err == nil {
+		t.Fatal("a certificate named \"..\" must be refused: the export would be written above LocalDir")
+	}
+	// Nothing may have been written anywhere: not in the parent, not in LocalDir.
+	for _, dir := range []string{root, local} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if e.Name() == "fullchain.pem" || e.Name() == "privkey.pem" {
+				t.Errorf("%s/%s exists after a refused export of %q", dir, e.Name(), "..")
+			}
+		}
+	}
+
+	// The neighbouring navigation names, for the same reason.
+	for _, name := range []string{".", "", "../escape", "a/../../b", "/absolute"} {
+		if err := Export(context.Background(), cfg, name, []byte("CHAIN"), []byte("PRIVATE KEY")); err == nil {
+			t.Errorf("export name %q must be refused", name)
+		}
+	}
+
+	// And a legitimate name still lands where it should.
+	if err := Export(context.Background(), cfg, "example-com", []byte("CHAIN"), []byte("PRIVATE KEY")); err != nil {
+		t.Fatalf("a normal name must still export: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(local, "example-com", "privkey.pem")); err != nil {
+		t.Errorf("the exported key is not where the operator configured it: %v", err)
+	}
+}

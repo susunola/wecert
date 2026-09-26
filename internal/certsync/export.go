@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/susunola/wecert/internal/backup"
 	"github.com/susunola/wecert/internal/config"
@@ -31,7 +32,13 @@ func Export(ctx context.Context, cfg *config.CertificateExport, cert string, ful
 	if cfg == nil {
 		return nil
 	}
-	if filepath.Base(cert) != cert || cert == "." || cert == "" {
+	// ".." passes filepath.Base unchanged, so the equality test alone let it through: the export
+	// landed one directory above LocalDir, outside the tree the operator configured. The guard is
+	// the only one on this path -- the config layer does not restrict the characters a certificate
+	// name may contain -- so the check is explicit about the two names that navigate rather than
+	// name, and about the separator.
+	if cert == "" || cert == "." || cert == ".." || filepath.Base(cert) != cert ||
+		strings.ContainsRune(cert, os.PathSeparator) {
 		return fmt.Errorf("unsafe certificate export name %q", cert)
 	}
 	dir, err := os.MkdirTemp("", ".wecert-export-*")

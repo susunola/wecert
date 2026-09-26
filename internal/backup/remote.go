@@ -712,6 +712,16 @@ func uploadSFTP(ctx context.Context, t Target, src string) error {
 	if err != nil {
 		return fmt.Errorf("open SFTP temporary object: %w", err)
 	}
+	// A snapshot holds the ACME account key and every certificate private key, and the exported
+	// certificate bundles hold one too (certsync uploads through this same path). SFTP servers
+	// create files with their own default -- commonly 0644 minus umask -- so without this the copy
+	// that exists to survive a disk loss is readable by every user on the backup host. Fail closed:
+	// a snapshot that cannot be made private is not published.
+	if err := out.Chmod(0o600); err != nil {
+		_ = out.Close()
+		_ = client.Remove(temp)
+		return fmt.Errorf("set a private mode on the SFTP temporary object: %w", err)
+	}
 	if _, err = io.Copy(out, in); err == nil {
 		err = out.Close()
 	} else {
