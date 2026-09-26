@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -358,5 +359,60 @@ func TestALeftoverAuthorizationRowKeepsTheTeardownRetried(t *testing.T) {
 	}
 	if got := h.pass(t); got != 0 {
 		t.Errorf("once marked, the teardown must stop: %d CleanupOrphan calls", got)
+	}
+}
+
+// The orphan teardown drops the certificate's persisted probe evidence, with the rest of its
+// per-name traces.
+//
+// probe_samples is what lets a restart show the last verdict instead of `probe_unknown`; for a name
+// that has left the desired state there is no next pass to overwrite it and no endpoint left to
+// probe, so the rows would stay for the life of the deployment and the console would keep offering
+// evidence about endpoints that are not ours. The metric series and the prober's memory are dropped
+// in the same place, which is what makes this the consistent thing to do rather than an extra rule.
+func TestOrphanTeardownDropsThePersistedProbeEvidence(t *testing.T) {
+	t.Parallel()
+	const gone = "departed-cert"
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// NotAfter drives orphanProbeHosts, which is how the teardown knows which hosts were the
+	// certificate's -- but the rows are deleted by certificate name, so seed both shapes.
+	if err := store.PutCert(&state.CertState{
+		Name: gone, NotAfter: time.Now().Add(48 * time.Hour),
+	}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	observed := time.Now().Add(-5 * time.Minute)
+	if err := store.PutProbeSample(state.ProbeSample{
+		CertName: gone, Host: "departed.example.com", Match: true, ObservedAt: observed,
+	}); err != nil {
+		t.Fatalf("PutProbeSample: %v", err)
+	}
+
+	cfg := &config.Config{}
+	prov := &mutableProvider{}
+	prov.set() // nothing desired: the certificate is an orphan
+	mgr := &fakeManager{}
+	r := New(cfg, prov, store, mgr, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if rep := r.RunDetailed(context.Background()); rep.Failed > 0 {
+		t.Fatalf("the pass failed: %+v", rep)
+	}
+	if cleaned := mgr.orphanCleaned(); len(cleaned) != 1 || cleaned[0] != gone {
+		t.Fatalf("the orphan was not torn down: %v", cleaned)
+	}
+
+	rows, err := store.ListProbeSamples(gone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("probe_samples still holds %d row(s) for a certificate that left the desired state: "+
+			"nothing will ever read or overwrite them", len(rows))
 	}
 }
