@@ -2654,3 +2654,71 @@ func TestStartAllReturnsTheAcceptedPrefixWhenShutdownBeginsMidWalk(t *testing.T)
 		t.Errorf("the accepted pass must have run (Drain waited for it), reconciled=%v", calls)
 	}
 }
+
+// A pass that finishes while its trigger is still handing out work must not publish the gauges.
+//
+// The counter alone answers "is a pass running right now", which is not the question: a trigger
+// registers its passes in a loop, each in its own goroutine, so the first pass can finish while the
+// loop is still starting the rest. Publishing there is a publication for a partial batch, and the
+// later passes publish again -- measured at three publications for one twelve-certificate trigger on
+// a loaded CI runner, which is the quadratic cost the single publication exists to avoid. The quiet
+// condition is "no pass running AND no trigger still registering", and this drives both halves
+// directly instead of hoping the scheduler interleaves.
+func TestATriggerPublishesOnlyAfterItStopsRegistering(t *testing.T) {
+	t.Parallel()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{}
+	for i := 0; i < 2; i++ {
+		cfg.Certificates = append(cfg.Certificates, config.Certificate{
+			Name:    fmt.Sprintf("c-%02d", i),
+			Domains: []string{fmt.Sprintf("c-%02d.example.com", i)},
+		})
+	}
+	mgr := &fakeManager{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	r := New(cfg, spec.NewStatic(cfg.Certificates), store, mgr, nil, log)
+	res := r.resolve(context.Background())
+	if res == nil {
+		t.Fatal("the fixture's desired state must resolve")
+	}
+
+	// The trigger is registering: beginQuotaTrigger has run, the loop has not finished.
+	r.beginQuotaTrigger()
+	r.startQuotaPass()
+	// The first pass finishes here -- exactly what a loaded runner does mid-loop.
+	if r.quotaPasses.Add(-1) == 0 {
+		r.publishQuotaIfQuiet(res)
+	}
+	if n := len(mgr.publishedQuota()); n != 0 {
+		t.Fatalf("published %d time(s) while the trigger was still registering its passes: that is "+
+			"a publication for a partial batch, and the rest of the batch publishes again", n)
+	}
+
+	// The loop ends. Now the batch is complete, and publishing is the last thing left to do.
+	r.endQuotaTrigger(res)
+	if n := len(mgr.publishedQuota()); n != 1 {
+		t.Fatalf("published %d time(s) for one finished trigger, want exactly 1", n)
+	}
+
+	// And the quiet period is published: a second check with nothing running must not publish again.
+	r.publishQuotaIfQuiet(res)
+	if n := len(mgr.publishedQuota()); n != 1 {
+		t.Errorf("published %d time(s) for one quiet period, want exactly 1", n)
+	}
+
+	// A new pass opens a new period.
+	r.startQuotaPass()
+	if r.quotaPasses.Add(-1) == 0 {
+		r.publishQuotaIfQuiet(res)
+	}
+	if n := len(mgr.publishedQuota()); n != 2 {
+		t.Errorf("published %d time(s) after a later pass finished, want 2: a new pass has new spend "+
+			"to report", n)
+	}
+}
