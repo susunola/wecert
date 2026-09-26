@@ -96,9 +96,12 @@ They are ordered by real exposure over effort.
    - Probe answers are read from the running prober, and the durable last verdict per host
      (`probe_samples`, written by the pass that dialled it) is the fallback when this process has
      none of its own. A restart therefore shows what the previous process observed, with the
-     observation instant, instead of `probe_unknown` until the next pass. What is still open here is
-     narrower: the samples are diagnostic evidence, not history -- one row per certificate/host, no
-     retention policy, and nothing prunes them when a certificate or host leaves the fleet.
+     observation instant, instead of `probe_unknown` until the next pass. The orphan teardown drops
+     the rows of a certificate that has left the desired state, with the metric series and the
+     prober's memory. What is still open is narrower: the samples are diagnostic evidence, not
+     history -- one row per certificate/host and no retention -- so a host that leaves a
+     certificate's SAN list while the certificate stays keeps its last row until a later pass
+     overwrites it.
 
 ## The rest
 

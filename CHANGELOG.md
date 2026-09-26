@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- **A certificate that leaves the desired state takes its persisted probe evidence with it.** The
+  last verdict per host is written to `probe_samples` so a restart can show what the previous
+  process observed instead of `probe_unknown`. Nothing ever revisits a name that has left the
+  desired state, so those rows stayed for the life of the deployment -- one per certificate/host
+  pair for every name the fleet has ever had -- and the read-only console kept offering evidence
+  about endpoints that were not ours any more. The orphan teardown now drops them, in the same place
+  it drops the per-certificate metric series and makes the prober forget the hosts: the same rule
+  applied to the durable copy. A teardown that fails is retried and deletes again, which is
+  harmless.
 - **The documents that describe the state database now describe the one the code writes.** Four had
   drifted, in the direction this repository treats as a defect class of its own:
   - `docs/recovery.md` printed the snapshot name as `state.db.backup-<stamp>.db` and told the reader

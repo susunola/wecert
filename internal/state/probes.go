@@ -39,6 +39,27 @@ func (s *Store) PutProbeSample(sample ProbeSample) error {
 	return nil
 }
 
+// DeleteProbeSamples drops every persisted verdict for one certificate and reports how many rows
+// went with it.
+//
+// It exists for the orphan teardown: a name that has left the desired state is never probed again,
+// so its rows have no reader left -- the same reason the teardown drops the per-certificate metric
+// series and makes the prober forget the hosts. Without this the table keeps one row per
+// certificate/host pair for every name the fleet has ever had, which is the kind of growth nobody
+// notices until an inventory query is slow.
+func (s *Store) DeleteProbeSamples(certName string) (int64, error) {
+	if certName == "" {
+		return 0, fmt.Errorf("delete probe samples needs a certificate name")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`DELETE FROM probe_samples WHERE cert_name = ?`, certName)
+	if err != nil {
+		return 0, fmt.Errorf("delete probe samples for %s: %w", certName, err)
+	}
+	return res.RowsAffected()
+}
+
 // ListProbeSamples returns the newest known verdict per host, in host order.
 func (s *Store) ListProbeSamples(certName string) ([]ProbeSample, error) {
 	s.mu.Lock()

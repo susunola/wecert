@@ -223,6 +223,27 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string, counted bo
 		}
 	}
 
+	// The durable half of the same leak: the last verdict per host is written to probe_samples so a
+	// restart can show what the previous process observed, and nothing else ever revisits a name
+	// that has left the desired state. Dropping the metric series and the prober's memory while
+	// leaving the rows behind keeps one diagnostic row per certificate/host pair for every name the
+	// fleet has ever had -- and the inventory would go on offering evidence for endpoints that are
+	// not ours any more. Deleted here, with the other per-name cleanup, rather than on the success
+	// path below: a teardown that fails and is retried must not leave the rows to the retry to
+	// forget, and deleting them twice is harmless.
+	if stErr == nil && st != nil {
+		if removed, err := r.store.DeleteProbeSamples(name); err != nil {
+			// Not fatal, never silent: the alternative is rows accumulating for the life of the
+			// deployment with nothing pointing at them.
+			r.log.Warn("failed to drop the persisted TLS probe evidence of a certificate that left "+
+				"the desired state; its rows will stay in probe_samples",
+				"cert", name, "err", err)
+		} else if removed > 0 {
+			r.log.Info("dropped the persisted TLS probe evidence of a certificate that left the desired state",
+				"cert", name, "rows", removed)
+		}
+	}
+
 	// The expiry comes from the row just read, when that read worked. The rest of the line is the
 	// same one every later pass prints from the sweep's own read (see reportOrphan).
 	var notAfter time.Time

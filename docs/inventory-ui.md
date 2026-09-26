@@ -321,8 +321,11 @@ Honest limits, so a reader does not take the table for more than it is:
   host (`probe_samples`) as the fallback when this process has read nothing yet,
   so a restart shows what the previous process observed rather than
   `probe_unknown`. Each host sample carries `observedAt`, which is how the
-  reader tells "read a minute ago" from "read before the last restart"; the
-  table keeps one row per certificate/host and nothing prunes it.
+  reader tells "read a minute ago" from "read before the last restart". The
+  table keeps one row per certificate/host; a certificate that leaves the
+  desired state takes its rows with it in the orphan teardown, and a host that
+  merely leaves one certificate's SAN list keeps its last row until a later
+  pass overwrites it.
 - `time` is the reader's clock. The only observation instants in the payload are
   `desired.generatedAt` and `bindings.observedAt`; there is no per-source
   staleness for the store yet.
