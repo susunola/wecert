@@ -61,6 +61,11 @@ func (r *Reconciler) StartNamed(ctx context.Context, names []string) (
 			ErrDesiredStateUnavailable, len(names))
 	}
 
+	// One publication for the whole trigger, decided after the registration loop ends -- not by
+	// whichever pass happens to finish last (see beginQuotaTrigger).
+	r.beginQuotaTrigger()
+	defer r.endQuotaTrigger(res)
+
 	// Dedupe while preserving order: a caller that lists the same name twice should not
 	// get the second one back as "already running" purely because of its own duplicate.
 	seen := make(map[string]bool, len(names))
@@ -119,8 +124,9 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		r.bg.Done()
 		return ErrAlreadyRunning
 	}
-	// Count this pass towards one quota publication for the whole trigger (see quotaPasses).
-	r.quotaPasses.Add(1)
+	// Count this pass towards one quota publication for the whole trigger (see quotaPasses), and mark
+	// the quiet period as unpublished: a pass that starts after a publication has something to add.
+	r.startQuotaPass()
 
 	// res is heap-allocated and not reused during this pass, so referring to its
 	// elements is safe.
@@ -151,9 +157,7 @@ func (r *Reconciler) startCert(ctx context.Context, res *spec.Result, c *config.
 		// Deferred functions run last-in-first-out, so this runs before the claim is released.
 		defer func() {
 			if r.quotaPasses.Add(-1) == 0 {
-				// Panic-safe: this runs on the pass's background goroutine, past
-				// reconcileOne's recover, so an unrecovered panic here is process-fatal.
-				r.passStepPanicSafe("publish the quota gauges", func() { r.publishQuota(res) })
+				r.publishQuotaIfQuiet(res)
 			}
 		}()
 
@@ -188,7 +192,56 @@ func (r *Reconciler) StartCert(ctx context.Context, name string) error {
 	if found == nil {
 		return fmt.Errorf("%w: %q", ErrUnknownCert, name)
 	}
+	r.beginQuotaTrigger()
+	defer r.endQuotaTrigger(res)
 	return r.startCert(ctx, res, found)
+}
+
+// beginQuotaTrigger marks the start of a trigger that is about to register passes, and endQuotaTrigger
+// marks the end of that registration.
+//
+// Between the two the gauges are not published, however many passes come and go: the batch is not
+// complete until the loop that starts it has finished, and publishing for a partial batch means
+// publishing again for the rest (see quotaStarting).
+func (r *Reconciler) beginQuotaTrigger() {
+	r.quotaStarting.Add(1)
+	r.quotaMu.Lock()
+	r.quotaPublished = false
+	r.quotaMu.Unlock()
+}
+
+func (r *Reconciler) endQuotaTrigger(res *spec.Result) {
+	if r.quotaStarting.Add(-1) == 0 {
+		r.publishQuotaIfQuiet(res)
+	}
+}
+
+// startQuotaPass counts one pass towards its trigger's single publication.
+func (r *Reconciler) startQuotaPass() {
+	r.quotaPasses.Add(1)
+	r.quotaMu.Lock()
+	r.quotaPublished = false
+	r.quotaMu.Unlock()
+}
+
+// publishQuotaIfQuiet publishes the gauges when nothing is running and no trigger is still
+// registering, at most once per quiet period.
+//
+// The check and the claim happen under one lock. Checking the counters and then publishing without
+// it lets the pass side and the trigger side both observe the quiet state -- the last pass finishing
+// while the registration loop ends -- and publish twice for one trigger.
+func (r *Reconciler) publishQuotaIfQuiet(res *spec.Result) {
+	r.quotaMu.Lock()
+	if r.quotaPublished || r.quotaPasses.Load() != 0 || r.quotaStarting.Load() != 0 {
+		r.quotaMu.Unlock()
+		return
+	}
+	r.quotaPublished = true
+	r.quotaMu.Unlock()
+
+	// Panic-safe: this can run on a pass's background goroutine, past reconcileOne's recover, where
+	// an unrecovered panic is process-fatal.
+	r.passStepPanicSafe("publish the quota gauges", func() { r.publishQuota(res) })
 }
 
 // beginPass registers a background pass, or refuses it once Drain has begun.
@@ -242,6 +295,11 @@ func (r *Reconciler) StartAll(ctx context.Context) (accepted, skipped []string, 
 	if res == nil {
 		return nil, nil, ErrDesiredStateUnavailable
 	}
+
+	// One publication for the whole trigger, decided after the registration loop ends (see
+	// beginQuotaTrigger): with the counter alone, a fast first pass could publish for a partial batch.
+	r.beginQuotaTrigger()
+	defer r.endQuotaTrigger(res)
 
 	// Walk the resolved slice directly: looking each name up with Find over the same
 	// slice would make this O(n^2).

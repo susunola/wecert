@@ -62,6 +62,19 @@
   likely to run it are the ones that sealed the database. It opens the store the way the daemon does.
 ### Fixed
 
+- **The quota gauges are published once per trigger, by construction rather than by luck.** The
+  count of in-flight webhook-triggered passes answers "is one running right now", which is not the
+  question: a trigger registers its passes in a loop and each runs in its own goroutine, so on a
+  loaded machine the first pass can finish -- driving the count to zero -- while the loop is still
+  starting the rest. Publishing there reports a partial batch, and the remaining passes publish
+  again: measured at three publications for one twelve-certificate trigger in CI, which is exactly
+  the per-trigger cost this mechanism exists to avoid (publishing is proportional to the scopes in
+  the desired state, and per-certificate publication once cost 11 million SQL statements at 500
+  certificates). Registration is now bracketed (`beginQuotaTrigger`/`endQuotaTrigger`), the quiet
+  condition every publisher checks is "no pass running **and** no trigger still registering", and the
+  check-and-claim happens under one lock so two publishers cannot both observe the quiet state.
+### Fixed
+
 - **A certificate that leaves the desired state takes its persisted probe evidence with it.** The
   last verdict per host is written to `probe_samples` so a restart can show what the previous
   process observed instead of `probe_unknown`. Nothing ever revisits a name that has left the

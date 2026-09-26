@@ -146,6 +146,24 @@ type Reconciler struct {
 	// made a full trigger quadratic in the fleet (11 million SQL statements at 500 certificates).
 	quotaPasses atomic.Int64
 
+	// quotaStarting counts the triggers that are still registering their passes.
+	//
+	// "The last pass finished" is not the same as "the trigger finished handing out work": a trigger
+	// registers its passes in a loop and each one runs in its own goroutine, so on a loaded machine
+	// the first pass can finish (and drive quotaPasses to zero) while the loop is still starting the
+	// rest. Publishing there is a publication for a partial batch, and the trigger's later passes
+	// publish again -- measured at three publications for one twelve-certificate trigger, which is
+	// the quadratic cost the single publication exists to avoid. The quiet condition every publisher
+	// checks is quotaPasses == 0 && quotaStarting == 0.
+	quotaStarting atomic.Int64
+
+	// quotaMu guards quotaPublished, and through it the decision to publish: the check and the claim
+	// have to be one step, or two publishers that both observe the quiet state both publish.
+	quotaMu sync.Mutex
+	// quotaPublished records that the current quiet period has been published. Cleared whenever a
+	// trigger or a pass starts, since that is a new period.
+	quotaPublished bool
+
 	// bgMu serializes a pass's registration against Drain's transition to draining.
 	//
 	// sync.WaitGroup requires that a positive Add which starts from zero does not run concurrently
