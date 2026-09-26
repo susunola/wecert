@@ -11,6 +11,30 @@
 
 ## Unreleased
 
+### Security
+
+- **An SFTP snapshot is published with a private mode.** `uploadSFTP` created the temporary object and
+  renamed it without ever asking for one, so the file landed with whatever the server's default is --
+  commonly 0644 minus umask, readable by every user on the backup host. A snapshot holds the ACME
+  account key and every certificate private key, and `certsync`'s exported bundles (which carry a
+  private key by design) travel through the same function, so one missing mode is two kinds of
+  private key. The mode is set on the temporary name before the rename, and a snapshot whose mode
+  cannot be set is not published.
+
+### Fixed
+
+- **The identifier pause and the failed-authorization budget key on the same name for a wildcard.**
+  The failed-authorization budget was fixed to use the bare identifier (`*.example.com` becomes
+  `example.com`, because that is what the CA's refusal names and what the authorization carries),
+  but the pause check next to it kept the configured domain. For a wildcard certificate the refusal
+  was booked against `example.com` and the gate asked about `*.example.com`, so a paused wildcard
+  identifier went on ordering inside the window the CA had just named -- the exact thing this limit
+  is consulted for. Both the gate and the booking fallback use the bare name now.
+- **A certificate export cannot be named `..`.** `filepath.Base("..")` is `".."`, so the guard's
+  equality test passed it and the export was written one directory ABOVE `LocalDir` -- outside the
+  tree the operator configured and outside any later cleanup that walks it. The config layer puts no
+  character restriction on a certificate name, so that guard is the only one on the path; it now
+  rejects the names that navigate rather than name.
 ### Fixed
 
 - **A sealed deployment's snapshots can be restored again.** `checkSnapshotPayload` proves a

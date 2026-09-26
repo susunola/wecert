@@ -232,8 +232,14 @@ func (m *Manager) blockedByRecordedDeadline(c *config.Certificate) (time.Time, s
 		// minutes: an identifier the CA has paused cannot be ordered at all until the operator clears
 		// it in the CA's portal, so this is the check that turns a refusal into "stop knocking"
 		// instead of "knock again at the next backoff step".
+		// The same bare-name rule as the budget above, and for the same reason: the CA's pause names
+		// (or is recorded against) the authorization identifier, which never carries the wildcard's
+		// "*." prefix. Keying this one on strings.ToLower(d) split the pair -- the refusal was booked
+		// against "example.com" and the gate consulted "*.example.com" -- so a paused wildcard
+		// identifier went on ordering inside the window the CA had just named. This is the twin of
+		// the bareIdentifierScope fix one line up; they have to move together.
 		checks = append(checks, check{
-			limit: ratelimit.ConsecutiveAuthzFailuresPerIdentifier, scope: strings.ToLower(d),
+			limit: ratelimit.ConsecutiveAuthzFailuresPerIdentifier, scope: bareIdentifierScope(d),
 		})
 	}
 	for _, ch := range checks {
@@ -309,7 +315,10 @@ func newOrderRefusalScope(l ratelimit.Limit, c *config.Certificate, msg string) 
 			return named
 		}
 		if len(c.Domains) > 0 {
-			return strings.ToLower(c.Domains[0])
+			// Bare, like every other scope of this limit: the fallback is the certificate's own first
+			// domain, and for a wildcard certificate that is "*.example.com" -- a key the gate above
+			// (and the CA) would never look under.
+			return bareIdentifierScope(c.Domains[0])
 		}
 	}
 	return ""
