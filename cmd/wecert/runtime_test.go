@@ -741,7 +741,7 @@ func TestRunOncePassReportsWhatTheOneShotRunMustNotSwallow(t *testing.T) {
 	ctx := context.Background()
 
 	// No certificates declared: the pass attempts nothing, fails nothing, and must exit 0.
-	if err := runOncePass(ctx, reconciler, notifier, nil, log); err != nil {
+	if err := runOncePass(ctx, reconciler, notifier, nil, nil, log); err != nil {
 		t.Errorf("a pass with no certificate to converge is not trouble: %v", err)
 	}
 
@@ -749,7 +749,7 @@ func TestRunOncePassReportsWhatTheOneShotRunMustNotSwallow(t *testing.T) {
 	// the one thing a green one-shot run would hide, and the next run may be a restore.
 	failed := &snapshotHealth{first: make(chan error, 1)}
 	failed.first <- errors.New("no space left on device")
-	err = runOncePass(ctx, reconciler, notifier, failed, log)
+	err = runOncePass(ctx, reconciler, notifier, failed, nil, log)
 	if err == nil {
 		t.Fatal("a failed state snapshot must fail the one-shot run even when the pass converged")
 	}
@@ -820,5 +820,62 @@ func TestStartBackupsWarnsWhenSnapshotsLeaveTheHostUnencrypted(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "remote targets") {
 		t.Errorf("local-only snapshots must not be reported as leaving the host, got:\n%s", buf.String())
+	}
+}
+
+// The one-shot path must close its listeners before it waits for anything.
+//
+// The listeners hang off the process context, which nothing cancels before the process exits on
+// this path: `defer stop()` is registered first, so it runs last -- after the drain, after the
+// final snapshot wait and after store.Close(). A trigger accepted in that window starts a pass
+// nothing waits for, on a database that is closing, which is exactly the failure drainBackground
+// exists to prevent. runOncePass therefore stops them itself, right after the pass it ran returns.
+func TestOncePassClosesTheListenersBeforeItDrains(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	log, _ := quietLog()
+	cfg := &config.Config{
+		StatePath:    filepath.Join(dir, "state.db"),
+		DesiredState: config.DesiredState{Mode: config.ModeStatic},
+	}
+	cfg.DNS.Provider = config.DNSProviderDNSPod
+	cfg.DNS.LoginToken = "12345,abcdef"
+	cfg.Tencent.CredentialMode = config.CredentialStatic
+
+	provider, prober, err := buildDesiredAndProber(cfg, log)
+	if err != nil {
+		t.Fatalf("buildDesiredAndProber: %v", err)
+	}
+	reconciler, notifier, err := buildManager(cfg, store, nil, provider, prober, log)
+	if err != nil {
+		t.Fatalf("buildManager: %v", err)
+	}
+
+	var stopped int
+	stop := func() { stopped++ }
+
+	if err := runOncePass(context.Background(), reconciler, notifier, nil, stop, log); err != nil {
+		t.Errorf("a pass with no certificate to converge is not trouble: %v", err)
+	}
+	if stopped != 1 {
+		t.Errorf("stopListeners called %d time(s), want exactly once: the listeners must be closed "+
+			"before the drain, and closing them twice is a programming error this pins against", stopped)
+	}
+
+	// And the snapshot-failure path returns through the same defer-less sequence: the listeners are
+	// already closed by then, so a failing snapshot cannot keep the endpoint alive either.
+	stopped = 0
+	failed := &snapshotHealth{first: make(chan error, 1)}
+	failed.first <- errors.New("no space left on device")
+	if err := runOncePass(context.Background(), reconciler, notifier, failed, stop, log); err == nil {
+		t.Fatal("a failed state snapshot must fail the one-shot run")
+	}
+	if stopped != 1 {
+		t.Errorf("stopListeners called %d time(s) on the snapshot-failure path, want 1", stopped)
 	}
 }

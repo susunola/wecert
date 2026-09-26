@@ -43,9 +43,36 @@ type Target struct {
 	SecretIDEnv, SecretKeyEnv                                                                       string
 	// SnapshotBase identifies this installation's database filename. It prevents a
 	// restore from selecting another installation's backup in a shared target.
+	//
+	// It is the *plain* basename ("state.db"), which is the widest prefix this deployment's objects
+	// share -- so it is what the object listing asks for -- and the name every build before the
+	// hashed naming uploaded under.
 	SnapshotBase string
-	Keep         int
-	Timeout      time.Duration
+	// SnapshotIdentity is the identity the store writes into snapshot names today: basename plus a
+	// short hash of the absolute state path (state.SnapshotIdentity). A download accepts objects
+	// under either identity, because an upgrade must not strand the recovery points the previous
+	// build uploaded -- which is the same reason the state package still recognises both forms
+	// locally. Empty means "match SnapshotBase only", which is what a caller that does not know the
+	// identity gets.
+	SnapshotIdentity string
+	Keep             int
+	Timeout          time.Duration
+}
+
+// snapshotNameSuffix is what follows a snapshot's identity in both naming generations.
+const snapshotNameSuffix = ".backup-"
+
+// isOwnSnapshot reports whether a remote object name is a snapshot this deployment can restore:
+// under the current identity or the pre-hash one, and not a signature sidecar or an upload that
+// never finished.
+func (t Target) isOwnSnapshot(name string) bool {
+	if strings.HasSuffix(name, ".hmac") || strings.Contains(name, uploadingSuffix) {
+		return false
+	}
+	if t.SnapshotIdentity != "" && strings.HasPrefix(name, t.SnapshotIdentity+snapshotNameSuffix) {
+		return true
+	}
+	return strings.HasPrefix(name, t.SnapshotBase+snapshotNameSuffix)
 }
 
 // Upload sends src under its base name. S3 PutObject is all-or-nothing; SFTP
@@ -320,8 +347,7 @@ func downloadSFTPFile(ctx context.Context, t Target, dir string) (string, error)
 	}
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasPrefix(e.Name(), t.SnapshotBase+".backup-") &&
-			!strings.HasSuffix(e.Name(), ".hmac") && !strings.Contains(e.Name(), uploadingSuffix) {
+		if !e.IsDir() && t.isOwnSnapshot(e.Name()) {
 			names = append(names, e.Name())
 		}
 	}
@@ -435,7 +461,11 @@ func downloadS3Object(ctx context.Context, t Target, dir string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	prefix := path.Join(strings.Trim(t.Prefix, "/"), t.SnapshotBase+".backup-")
+	// The listing asks for the plain basename rather than "<base>.backup-": it is a superset that
+	// covers both the current hashed names and the ones older builds wrote, and the filter below
+	// decides what is actually ours. Asking for the suffix instead is what made this return "no
+	// snapshots found" for a deployment whose own uploads were sitting right there.
+	prefix := path.Join(strings.Trim(t.Prefix, "/"), t.SnapshotBase)
 	objects, err := listObjects(ctx, client, t, prefix)
 	if err != nil {
 		return "", fmt.Errorf("list remote snapshots: %w", err)
@@ -443,12 +473,16 @@ func downloadS3Object(ctx context.Context, t Target, dir string) (string, error)
 	var newest *types.Object
 	for i := range objects {
 		o := &objects[i]
-		// Sidecars are not snapshots. A ".hmac" sibling sorts after its object in
-		// lexicographic order, so "newest" would otherwise always be the signature.
-		if o.Key != nil && strings.HasSuffix(*o.Key, ".hmac") {
+		if o.Key == nil {
 			continue
 		}
-		if newest == nil || (o.Key != nil && newest.Key != nil && *o.Key > *newest.Key) {
+		// Sidecars are not snapshots. A ".hmac" sibling sorts after its object in
+		// lexicographic order, so "newest" would otherwise always be the signature; an upload
+		// that never finished is not a snapshot either.
+		if !t.isOwnSnapshot(path.Base(*o.Key)) {
+			continue
+		}
+		if newest == nil || newest.Key == nil || *o.Key > *newest.Key {
 			newest = o
 		}
 	}

@@ -347,6 +347,16 @@ func snapshotBase(path string) string {
 	return fmt.Sprintf("%s-%x", filepath.Base(path), sum[:3])
 }
 
+// SnapshotIdentity returns the identity a snapshot of the store at statePath carries today: the
+// state file's basename plus a short hash of its absolute path (see snapshotBase).
+//
+// Exported for the remote backup path. An uploaded object is named after the snapshot file, so a
+// restore has to recognise that name again -- and filepath.Base(statePath) is not it. Passing the
+// plain basename to the download side made every remote restore look for a prefix no upload ever
+// wrote ("<base>.backup-" against objects named "<base>-<hash>.backup-..."), which reports "no
+// snapshots found" over a bucket full of them.
+func SnapshotIdentity(statePath string) string { return snapshotBase(statePath) }
+
 // SnapshotTime reads the wall-clock instant carried by the name of a snapshot of the state
 // database at statePath, and whether snapshotPath is one of its snapshots at all.
 //
