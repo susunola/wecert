@@ -431,8 +431,26 @@ func cutSnapshotStamp(name, prefix string) (string, bool) {
 // database file is named stateBase. The matcher is the same strict one retention
 // uses (snapshotStampOf), so a hand-made `state.backup-before-upgrade.db` is
 // refused rather than treated as a recovery point.
+//
+// stateBase may be either identity a snapshot can carry: the current one
+// (basename plus path hash, see SnapshotIdentity) or the pre-hash basename. Callers
+// that know the state path should prefer IsSnapshotOf, which tries both.
 func IsSnapshotName(name, stateBase string) bool {
 	s := &Store{base: stateBase}
+	_, ok := s.snapshotStampOf(name)
+	return ok
+}
+
+// IsSnapshotOf reports whether name is a snapshot of the store at statePath, under either naming
+// generation.
+//
+// Exported for the admin restore guard, which has the state path and needs the same answer the
+// store's own listings give: checking only the plain basename refused every snapshot a current
+// build writes, because those carry the path hash. The guard is not a listing -- it decides whether
+// an HTTP client may point a staged restore at a file -- so getting it wrong in this direction is
+// "restore is impossible", and in the other it is "a file that is not ours is staged".
+func IsSnapshotOf(statePath, name string) bool {
+	s := &Store{base: snapshotBase(statePath), legacyBase: filepath.Base(statePath)}
 	_, ok := s.snapshotStampOf(name)
 	return ok
 }

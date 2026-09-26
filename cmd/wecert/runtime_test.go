@@ -86,11 +86,17 @@ func TestAdminRestoreSourceAllowedKeepsTheHTTPSurfaceInsideItsSnapshots(t *testi
 		}
 	}
 	statePath := filepath.Join(root, "state.db")
+	// Both naming generations, because the guard has to accept what the store writes *today*: a
+	// check that only knew the pre-hash basename refused every snapshot a current build produces,
+	// which is "the admin restore surface cannot stage anything" -- and the fixtures here used the
+	// old name, so it stayed green.
+	identityName := state.SnapshotIdentity(statePath) + ".backup-20260102T000000.000Z.db"
 	goodName := "state.db.backup-20260101T000000.000Z.db"
-	good := filepath.Join(dir, goodName)
+	good := filepath.Join(dir, identityName)
+	legacy := filepath.Join(dir, goodName)
 	planted := filepath.Join(dir, "state.db.backup-not-a-stamp.db")
-	besideState := filepath.Join(root, goodName)
-	for _, f := range []string{good, planted, besideState} {
+	besideState := filepath.Join(root, identityName)
+	for _, f := range []string{good, legacy, planted, besideState} {
 		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -101,14 +107,13 @@ func TestAdminRestoreSourceAllowedKeepsTheHTTPSurfaceInsideItsSnapshots(t *testi
 	if resolved, err := filepath.EvalSymlinks(elsewhere); err == nil {
 		elsewhere = resolved
 	}
-	target := filepath.Join(elsewhere, goodName)
+	// A separate name from the real file above: this one is removed and replaced by the symlink.
+	linkName := state.SnapshotIdentity(statePath) + ".backup-20260103T000000.000Z.db"
+	target := filepath.Join(elsewhere, linkName)
 	if err := os.WriteFile(target, []byte("not ours"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(dir, goodName)
-	if err := os.Remove(link); err != nil {
-		t.Fatal(err)
-	}
+	link := filepath.Join(dir, linkName)
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlinks are not available here: %v", err)
 	}
@@ -116,7 +121,7 @@ func TestAdminRestoreSourceAllowedKeepsTheHTTPSurfaceInsideItsSnapshots(t *testi
 	if resolved, err := filepath.EvalSymlinks(outsideDir); err == nil {
 		outsideDir = resolved
 	}
-	inLocal := filepath.Join(local, goodName)
+	inLocal := filepath.Join(local, identityName)
 	if err := os.WriteFile(inLocal, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +144,9 @@ func TestAdminRestoreSourceAllowedKeepsTheHTTPSurfaceInsideItsSnapshots(t *testi
 		{"latest is resolved by the caller, not judged here", "latest"},
 		{"a configured remote target", "remote:nightly"},
 		{"the snapshot directory itself", dir},
-		{"a snapshot file this deployment wrote", inLocal},
+		{"a snapshot under the store's current identity", good},
+		{"a snapshot written before the hashed naming", legacy},
+		{"the same current-identity name in a local mirror", inLocal},
 		{"a snapshot copied beside the state database", besideState},
 	}
 	for _, tc := range allowed {

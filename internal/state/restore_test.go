@@ -701,8 +701,9 @@ func TestRestoreRefusesASnapshotWhosePayloadIsNotPEM(t *testing.T) {
 			}
 
 			if _, err := Restore(h.dbPath, damaged); err == nil {
-				t.Fatal("a snapshot whose payload is not PEM must be refused")
-			} else if !strings.Contains(err.Error(), "not PEM") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatal("a snapshot whose payload is neither PEM nor sealed material must be refused")
+			} else if !strings.Contains(err.Error(), "neither PEM nor sealed") ||
+				!strings.Contains(err.Error(), tc.want) {
 				t.Errorf("the refusal should name the damaged material (%s), got: %v", tc.want, err)
 			}
 			assertNothingWasMoved(t, h)

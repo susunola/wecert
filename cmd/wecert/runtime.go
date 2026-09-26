@@ -543,9 +543,10 @@ func adminRestoreSourceAllowed(cfg *config.Config, source string) error {
 		return fmt.Errorf("admin restore source %s is outside the snapshot directories; "+
 			"use latest, a file under stateBackup.dir, or remote:<name>", source)
 	}
-	if !state.IsSnapshotName(filepath.Base(abs), filepath.Base(cfg.StatePath)) {
+	if !state.IsSnapshotOf(cfg.StatePath, filepath.Base(abs)) {
 		return fmt.Errorf("admin restore source %s is not a wecert snapshot name "+
-			"(%s.backup-<stamp>.db); pick a file this deployment wrote", source, filepath.Base(cfg.StatePath))
+			"(%s.backup-<stamp>.db or %s.backup-<stamp>.db); pick a file this deployment wrote",
+			source, filepath.Base(cfg.StatePath), state.SnapshotIdentity(cfg.StatePath))
 	}
 	return nil
 }
