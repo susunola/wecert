@@ -4,6 +4,31 @@
 
 ### Fixed
 
+- **A sealed deployment's snapshots can be restored again.** `checkSnapshotPayload` proves a
+  candidate snapshot's material is readable rather than merely well-framed: it decodes PEM. Sealing
+  stores `wecert-seal-v*` ciphertext in exactly those columns, so every snapshot a sealed deployment
+  wrote was rejected -- by `-restore`, by the admin recovery endpoints, by `-backup-drill` and by
+  remote restore -- with "its payload is damaged ... use an older snapshot", a message that fails
+  identically for every snapshot the deployment has. Uploading kept working, so the first symptom
+  would have been an operator trying to recover. The payload check now accepts sealed material (and
+  still refuses bytes that are neither PEM nor sealed), and `SnapshotInfo` reports whether a snapshot
+  is sealed, because the deployment that opens the restored database has to be given the same key.
+  The two features had tests of their own and no test that crossed them; the new one is the whole
+  chain: seal, snapshot, inspect, restore, read back.
+- **The admin restore surface accepts the snapshot names this build writes.** Its guard asked
+  `IsSnapshotName(basename(abs), filepath.Base(cfg.StatePath))`, which only matches the pre-hash name
+  (`state.db.backup-<stamp>.db`). Snapshots carry the store identity (`state.db-<hash>.backup-...`,
+  see `state.SnapshotIdentity`), so `/admin/restore`, `/admin/recovery-plan` and
+  `/admin/recovery-drill` refused every file a current build produces -- while the tests stayed green
+  because their fixtures used the old name. There is an identity-aware `state.IsSnapshotOf` now, and
+  the guard's message names both forms.
+- **`-revoke` works on a sealed deployment.** The command opened the state store with the tool path,
+  which installs no sealer, so on a deployment that had configured `stateEncryption` every sealed
+  blob reached the caller as ciphertext and the command failed while reading the certificate it was
+  asked to revoke. `-revoke` is what an operator runs when a key has leaked, and the deployments most
+  likely to run it are the ones that sealed the database. It opens the store the way the daemon does.
+### Fixed
+
 - **A certificate that leaves the desired state takes its persisted probe evidence with it.** The
   last verdict per host is written to `probe_samples` so a restart can show what the previous
   process observed instead of `probe_unknown`. Nothing ever revisits a name that has left the

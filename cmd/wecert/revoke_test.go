@@ -160,3 +160,72 @@ func TestRevokeWithACancelledSignalContextStillRecordsFirst(t *testing.T) {
 			"recorded: without the record nothing retries when the CA returns")
 	}
 }
+
+// A sealed deployment can still record a revocation.
+//
+// revoke.go opened the state store with the tool path, which installs no sealer: on a deployment
+// that had configured stateEncryption, every sealed blob reached the caller as ciphertext, and the
+// command failed while reading the certificate it was asked to revoke. That is the worst possible
+// place for this failure -- -revoke is the command an operator runs when a key has leaked, and the
+// deployments most likely to run it are the ones that sealed the database. The store is opened the
+// way the daemon opens it now.
+func TestRevokeRecordIsWrittenOnASealedStore(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.db")
+	configPath := filepath.Join(dir, "config.yaml")
+	keyPath := filepath.Join(dir, "state.key")
+	master := "a-long-random-master-key-for-the-test"
+	if err := os.WriteFile(keyPath, []byte(master+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := state.OpenSealed(statePath, []byte(master))
+	if err != nil {
+		t.Fatalf("OpenSealed: %v", err)
+	}
+	if err := store.PutCert(&state.CertState{
+		Name:     "example-com",
+		NotAfter: time.Now().Add(30 * 24 * time.Hour),
+		CertPEM:  selfSignedPEM(t, time.Now().Add(30*24*time.Hour)),
+	}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := "statePath: " + statePath + "\n" +
+		"stateEncryption:\n  keyFile: " + keyPath + "\n" +
+		"acme:\n  directory: https://acme.invalid/directory\n  email: ops@atomwangnus.com\n" +
+		"dns:\n  provider: dnspod\n  loginToken: \"12345,abcdef\"\n" +
+		"tencent:\n  credentialMode: static\n  secretId: id\n  secretKey: key\n" +
+		"  regions: [ap-guangzhou]\n" +
+		"certificates:\n  - name: example-com\n    domains: [example.com]\n"
+	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = runRevoke(context.Background(), configPath, "", "example-com", "keyCompromise", true)
+	if err == nil {
+		t.Fatal("an unreachable CA must still be reported")
+	}
+	if strings.Contains(err.Error(), "not encrypted with this format") ||
+		strings.Contains(err.Error(), "private key") {
+		t.Fatalf("the sealed store was opened without its sealer: %v", err)
+	}
+
+	// The record is what the next daemon pass retries, so it is the thing that must be durable --
+	// and reading it back through a sealed open proves the whole path stayed sealed.
+	sealed, err := state.OpenSealed(statePath, []byte(master))
+	if err != nil {
+		t.Fatalf("reopen sealed: %v", err)
+	}
+	defer sealed.Close()
+	req, err := sealed.GetRevokeRequest("example-com")
+	if err != nil {
+		t.Fatalf("GetRevokeRequest: %v", err)
+	}
+	if req == nil || req.Reason != 1 {
+		t.Fatalf("sealed revocation request = %+v, want reason 1 (keyCompromise) recorded", req)
+	}
+}

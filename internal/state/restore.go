@@ -289,6 +289,7 @@ func restoreLocked(res RestoreResult, dest, realDest, source string) (RestoreRes
 type snapshotStats struct {
 	certificates int
 	account      bool
+	sealed       bool
 }
 
 // SnapshotInfo is the non-destructive result of opening and quick-checking a
@@ -297,6 +298,12 @@ type snapshotStats struct {
 type SnapshotInfo struct {
 	Certificates int
 	Account      bool
+	// Sealed reports that the snapshot's private material is sealed (stateEncryption was configured
+	// when it was written). It is not a defect and not a problem for the restore itself -- the bytes
+	// are copied as they are -- but the deployment that opens the restored database has to be given
+	// the same key, or every sealed row reads as "not encrypted with this format". Reporting it here
+	// is what lets the CLI and the recovery endpoints say so before the operator finds out.
+	Sealed bool
 }
 
 // InspectSnapshot verifies a candidate backup can be opened as a wecert state
@@ -306,7 +313,7 @@ func InspectSnapshot(path string) (SnapshotInfo, error) {
 	if err != nil {
 		return SnapshotInfo{}, err
 	}
-	return SnapshotInfo{Certificates: stats.certificates, Account: stats.account}, nil
+	return SnapshotInfo{Certificates: stats.certificates, Account: stats.account, Sealed: stats.sealed}, nil
 }
 
 // inspectSnapshot proves a file is a wecert state database before it is allowed to replace one.
@@ -382,74 +389,83 @@ func inspectSnapshot(path string) (snapshotStats, error) {
 	// half-finished write an older build failed to roll back, a hand edit with sqlite3) passes
 	// every check above and would be installed over a working database, so the material a restore
 	// exists to preserve is decoded here, before anything is moved.
-	if err := checkSnapshotPayload(db, path); err != nil {
+	sealed, err := checkSnapshotPayload(db, path)
+	if err != nil {
 		return stats, err
 	}
+	stats.sealed = sealed
 	return stats, nil
 }
 
-// checkSnapshotPayload proves the key material inside a candidate snapshot is decodable PEM, not
-// merely that the file around it is a sound database.
+// checkSnapshotPayload proves the key material inside a candidate snapshot is readable -- decodable
+// PEM, or sealed material this deployment's key can open -- not merely that the file around it is a
+// sound database.
 //
 // Every row is checked rather than a sample: accounts holds one row per directory, and even a
 // large certificates table is cheap here because the integrity_check above already read every
 // page of the file. Empty blobs are skipped, not rejected -- a legacy account row carries no key
 // at all (see PutAccountWithoutKey), and "no material" is a state the running program already
 // knows how to read.
-func checkSnapshotPayload(db *sql.DB, path string) error {
+func checkSnapshotPayload(db *sql.DB, path string) (sealed bool, err error) {
+	check := func(kind, subject string, blob []byte) error {
+		if len(blob) == 0 {
+			// A legacy account row carries no key at all (see PutAccountWithoutKey), and "no
+			// material" is a state the running program already knows how to read.
+			return nil
+		}
+		if isSealed(blob) {
+			sealed = true
+			return nil
+		}
+		if block, _ := pem.Decode(blob); block == nil {
+			return fmt.Errorf("restore: the %s of %s in %s is neither PEM nor sealed state "+
+				"material; the file is a sound database but its payload is damaged. Use an older "+
+				"snapshot", kind, subject, path)
+		}
+		return nil
+	}
+
 	accountRows, err := db.Query(`SELECT directory, private_key_pem FROM accounts`)
 	if err != nil {
-		return fmt.Errorf("restore: read the account keys in %s: %w", path, err)
+		return false, fmt.Errorf("restore: read the account keys in %s: %w", path, err)
 	}
 	defer accountRows.Close()
 	for accountRows.Next() {
 		var directory string
 		var key []byte
 		if err := accountRows.Scan(&directory, &key); err != nil {
-			return fmt.Errorf("restore: scan an account key in %s: %w", path, err)
+			return false, fmt.Errorf("restore: scan an account key in %s: %w", path, err)
 		}
-		if len(key) == 0 {
-			continue
-		}
-		if block, _ := pem.Decode(key); block == nil {
-			return fmt.Errorf("restore: the account key for %s in %s is not PEM; the file is a "+
-				"sound database but its payload is damaged, and restoring it would strand the "+
-				"account. Use an older snapshot", directory, path)
+		if err := check("account key", directory, key); err != nil {
+			return false, err
 		}
 	}
 	if err := accountRows.Err(); err != nil {
-		return fmt.Errorf("restore: read the account keys in %s: %w", path, err)
+		return false, fmt.Errorf("restore: read the account keys in %s: %w", path, err)
 	}
 
 	certRows, err := db.Query(`SELECT name, cert_pem, key_pem FROM certificates`)
 	if err != nil {
-		return fmt.Errorf("restore: read the certificate material in %s: %w", path, err)
+		return false, fmt.Errorf("restore: read the certificate material in %s: %w", path, err)
 	}
 	defer certRows.Close()
 	for certRows.Next() {
 		var name string
 		var certPEM, keyPEM []byte
 		if err := certRows.Scan(&name, &certPEM, &keyPEM); err != nil {
-			return fmt.Errorf("restore: scan the certificate material in %s: %w", path, err)
+			return false, fmt.Errorf("restore: scan the certificate material in %s: %w", path, err)
 		}
-		for _, material := range []struct {
-			kind string
-			pem  []byte
-		}{{"certificate", certPEM}, {"private key", keyPEM}} {
-			if len(material.pem) == 0 {
-				continue
-			}
-			if block, _ := pem.Decode(material.pem); block == nil {
-				return fmt.Errorf("restore: the %s of %q in %s is not PEM; the file is a sound "+
-					"database but its payload is damaged. Use an older snapshot",
-					material.kind, name, path)
-			}
+		if err := check("certificate", fmt.Sprintf("%q", name), certPEM); err != nil {
+			return false, err
+		}
+		if err := check("private key", fmt.Sprintf("%q", name), keyPEM); err != nil {
+			return false, err
 		}
 	}
 	if err := certRows.Err(); err != nil {
-		return fmt.Errorf("restore: read the certificate material in %s: %w", path, err)
+		return false, fmt.Errorf("restore: read the certificate material in %s: %w", path, err)
 	}
-	return nil
+	return sealed, nil
 }
 
 // freeReplacedName picks a name for the displaced database that nothing occupies.

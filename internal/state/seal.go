@@ -105,6 +105,16 @@ func (s *sealer) openWith(aead cipher.AEAD, prefix, blob, aad []byte) ([]byte, e
 	return plain, nil
 }
 
+// isSealed reports whether a blob is sealed material (either KDF generation) rather than plaintext.
+//
+// It exists for the restore path: a snapshot of a sealed database holds ciphertext where a plaintext
+// one holds PEM, and the payload check has to tell "sealed" from "damaged" -- treating the first as
+// the second rejects every snapshot of every sealed deployment, on every restore path, with a
+// message telling the operator to try an older snapshot (which fails the same way).
+func isSealed(blob []byte) bool {
+	return bytes.HasPrefix(blob, sealedPrefixV1) || bytes.HasPrefix(blob, sealedPrefixV2)
+}
+
 // isSealedV1 reports whether a blob still uses the pre-upgrade KDF.
 func isSealedV1(blob []byte) bool {
 	return bytes.HasPrefix(blob, sealedPrefixV1)

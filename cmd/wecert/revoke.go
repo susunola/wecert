@@ -65,7 +65,17 @@ func runRevoke(ctx context.Context, configPath, statePathOverride, certName, rea
 	// OpenForTool, not OpenUnlocked: the daemon usually holds the lock (this is the command an
 	// operator runs while it is up), but if it does not, taking the lock means a schema that is
 	// behind gets migrated instead of the revocation failing.
-	store, err := state.OpenForTool(cfg.StatePath)
+	// Sealed deployments have to be opened the way the daemon opens them. Opening without the sealer
+	// hands the caller sealed blobs as if they were plaintext, so the one command an operator runs
+	// about a leaked key failed on exactly the deployments that had done the most to protect it --
+	// with a PEM parse error, since that is what the ciphertext looks like to a PEM decoder.
+	openStore := state.OpenForTool
+	if cfg.StateEncryption.Key != "" {
+		openStore = func(path string) (*state.Store, error) {
+			return state.OpenSealedForTool(path, []byte(cfg.StateEncryption.Key))
+		}
+	}
+	store, err := openStore(cfg.StatePath)
 	if err != nil {
 		return fmt.Errorf("open the state store: %w", err)
 	}
