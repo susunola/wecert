@@ -416,3 +416,106 @@ func TestOrphanTeardownDropsThePersistedProbeEvidence(t *testing.T) {
 			"nothing will ever read or overwrite them", len(rows))
 	}
 }
+
+// Probe evidence is keyed by the certificate name, so deleting it does not need the encrypted
+// certificate row to decrypt successfully. A damaged row must not strand evidence behind the
+// orphan-cleaned mark.
+func TestOrphanTeardownDropsProbeEvidenceWhenCertificateCannotBeDecrypted(t *testing.T) {
+	t.Parallel()
+	const gone = "departed-sealed-cert"
+	path := filepath.Join(t.TempDir(), "state.db")
+	seed, err := state.OpenSealed(path, []byte("correct-master"))
+	if err != nil {
+		t.Fatalf("OpenSealed(seed): %v", err)
+	}
+	if err := seed.PutCert(&state.CertState{
+		Name: gone, NotAfter: time.Now().Add(48 * time.Hour),
+		CertPEM: []byte("encrypted certificate material"), KeyPEM: []byte("encrypted private key"),
+	}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	if err := seed.PutProbeSample(state.ProbeSample{
+		CertName: gone, Host: "departed.example.com", Match: true, ObservedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("PutProbeSample: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("Close(seed): %v", err)
+	}
+
+	store, err := state.OpenSealed(path, []byte("wrong-master"))
+	if err != nil {
+		t.Fatalf("OpenSealed(wrong key): %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.GetCert(gone); err == nil {
+		t.Fatal("GetCert with the wrong master key unexpectedly succeeded")
+	}
+
+	prov := &mutableProvider{}
+	prov.set()
+	mgr := &fakeManager{}
+	r := New(&config.Config{}, prov, store, mgr, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if rep := r.RunDetailed(context.Background()); rep.Failed > 0 {
+		t.Fatalf("the pass failed: %+v", rep)
+	}
+	rows, err := store.ListProbeSamples(gone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("probe evidence survived a successful name-keyed cleanup: %+v", rows)
+	}
+	orphanRows, err := store.ListOrphanRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphanRows) != 1 || !orphanRows[0].OrphanCleanedAt.IsZero() {
+		t.Fatalf("an unreadable certificate must remain unmarked for retry, rows = %+v", orphanRows)
+	}
+	if rep := r.RunDetailed(context.Background()); rep.Failed > 0 {
+		t.Fatalf("the retry pass failed: %+v", rep)
+	}
+	if cleaned := mgr.orphanCleaned(); len(cleaned) != 2 {
+		t.Fatalf("an unreadable certificate must be retried on the next pass, got %d teardown calls", len(cleaned))
+	}
+}
+
+// A failed sample deletion is part of incomplete orphan cleanup: do not set the durable mark and
+// thereby suppress the retry that will remove the rows after the storage error clears.
+func TestOrphanProbeEvidenceDeletionFailureIsRetried(t *testing.T) {
+	t.Parallel()
+	h := newOrphanMarkHarness(t)
+	const gone = "departed-cert-delete-retry"
+	h.seedOrphan(t, gone)
+	if err := h.store.PutProbeSample(state.ProbeSample{
+		CertName: gone, Host: "departed.example.com", Match: true, ObservedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("PutProbeSample: %v", err)
+	}
+	if err := h.store.ExecForTest(`CREATE TRIGGER fail_probe_sample_delete BEFORE DELETE ON probe_samples
+		BEGIN SELECT RAISE(ABORT, 'injected probe cleanup failure'); END`); err != nil {
+		t.Fatalf("create delete-failure trigger: %v", err)
+	}
+	if got := h.pass(t); got != 1 {
+		t.Fatalf("the first pass must attempt the teardown, got %d CleanupOrphan calls", got)
+	}
+	if got := h.mark(t, gone); !got.IsZero() {
+		t.Fatalf("a failed probe-sample deletion must leave the orphan unmarked, mark = %s", got)
+	}
+	if err := h.store.ExecForTest(`DROP TRIGGER fail_probe_sample_delete`); err != nil {
+		t.Fatalf("drop delete-failure trigger: %v", err)
+	}
+	if got := h.pass(t); got != 1 {
+		t.Fatalf("the second pass must retry the teardown, got %d CleanupOrphan calls", got)
+	}
+	if got := h.mark(t, gone); got.IsZero() {
+		t.Fatal("the orphan should be marked after its probe evidence is deleted")
+	}
+	if rows, err := h.store.ListProbeSamples(gone); err != nil || len(rows) != 0 {
+		t.Fatalf("probe evidence after retry = %+v, %v; want no rows", rows, err)
+	}
+	if got := h.pass(t); got != 0 {
+		t.Errorf("a completed orphan teardown must not repeat, got %d CleanupOrphan calls", got)
+	}
+}
