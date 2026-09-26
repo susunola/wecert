@@ -127,6 +127,17 @@ func (n *RestoreNotice) CaveatApplies(now time.Time) bool {
 // together with its -wal and -shm sidecars -- moving the database without them would leave a
 // write-ahead log belonging to a different file next to the restored one.
 func Restore(dest, source string) (RestoreResult, error) {
+	return restore(dest, source, nil)
+}
+
+// RestoreSealed is Restore with an additional preflight: if the snapshot contains
+// encrypted material, every encrypted field must authenticate with master before
+// the live database is moved aside.
+func RestoreSealed(dest, source string, master []byte) (RestoreResult, error) {
+	return restore(dest, source, master)
+}
+
+func restore(dest, source string, master []byte) (RestoreResult, error) {
 	var res RestoreResult
 
 	if dest == "" {
@@ -173,7 +184,7 @@ func Restore(dest, source string) (RestoreResult, error) {
 
 	// Everything that can be checked about the snapshot is checked before the live database is
 	// touched, because the alternative is discovering a bad snapshot halfway through.
-	stats, err := inspectSnapshot(source)
+	stats, err := inspectSnapshotWithKey(source, master)
 	if err != nil {
 		return res, err
 	}
@@ -316,6 +327,19 @@ func InspectSnapshot(path string) (SnapshotInfo, error) {
 	return SnapshotInfo{Certificates: stats.certificates, Account: stats.account, Sealed: stats.sealed}, nil
 }
 
+// InspectSnapshotWithKey performs the same validation as InspectSnapshot and,
+// when the snapshot contains sealed material, verifies every sealed blob with
+// master.  This is intentionally separate from InspectSnapshot so callers that
+// only need to inventory a backup do not need the encryption key, while restore
+// callers can fail before replacing a live database.
+func InspectSnapshotWithKey(path string, master []byte) (SnapshotInfo, error) {
+	stats, err := inspectSnapshotWithKey(path, master)
+	if err != nil {
+		return SnapshotInfo{}, err
+	}
+	return SnapshotInfo{Certificates: stats.certificates, Account: stats.account, Sealed: stats.sealed}, nil
+}
+
 // inspectSnapshot proves a file is a wecert state database before it is allowed to replace one.
 //
 // Four questions, cheapest first, because each rules out a different mistake an operator can
@@ -324,6 +348,10 @@ func InspectSnapshot(path string) (SnapshotInfo, error) {
 // simply not ours (a different deployment's state, a Terraform state file), and restoring a sound
 // wecert database whose key material is damaged (see checkSnapshotPayload).
 func inspectSnapshot(path string) (snapshotStats, error) {
+	return inspectSnapshotWithKey(path, nil)
+}
+
+func inspectSnapshotWithKey(path string, master []byte) (snapshotStats, error) {
 	var stats snapshotStats
 
 	// The 16-byte magic first: it catches "that is not a database" without asking SQLite to open
@@ -389,7 +417,14 @@ func inspectSnapshot(path string) (snapshotStats, error) {
 	// half-finished write an older build failed to roll back, a hand edit with sqlite3) passes
 	// every check above and would be installed over a working database, so the material a restore
 	// exists to preserve is decoded here, before anything is moved.
-	sealed, err := checkSnapshotPayload(db, path)
+	var seal *sealer
+	if master != nil {
+		seal, err = newSealer(master)
+		if err != nil {
+			return stats, fmt.Errorf("restore: prepare state key for %s: %w", path, err)
+		}
+	}
+	sealed, err := checkSnapshotPayload(db, path, seal)
 	if err != nil {
 		return stats, err
 	}
@@ -406,8 +441,8 @@ func inspectSnapshot(path string) (snapshotStats, error) {
 // page of the file. Empty blobs are skipped, not rejected -- a legacy account row carries no key
 // at all (see PutAccountWithoutKey), and "no material" is a state the running program already
 // knows how to read.
-func checkSnapshotPayload(db *sql.DB, path string) (sealed bool, err error) {
-	check := func(kind, subject string, blob []byte) error {
+func checkSnapshotPayload(db *sql.DB, path string, seal *sealer) (sealed bool, err error) {
+	check := func(kind, subject, aad string, blob []byte) error {
 		if len(blob) == 0 {
 			// A legacy account row carries no key at all (see PutAccountWithoutKey), and "no
 			// material" is a state the running program already knows how to read.
@@ -415,6 +450,12 @@ func checkSnapshotPayload(db *sql.DB, path string) (sealed bool, err error) {
 		}
 		if isSealed(blob) {
 			sealed = true
+			if seal == nil {
+				return nil
+			}
+			if _, err := seal.open(blob, []byte(aad)); err != nil {
+				return fmt.Errorf("restore: the %s of %s in %s cannot be opened with the configured state key: %w", kind, subject, path, err)
+			}
 			return nil
 		}
 		if block, _ := pem.Decode(blob); block == nil {
@@ -436,7 +477,7 @@ func checkSnapshotPayload(db *sql.DB, path string) (sealed bool, err error) {
 		if err := accountRows.Scan(&directory, &key); err != nil {
 			return false, fmt.Errorf("restore: scan an account key in %s: %w", path, err)
 		}
-		if err := check("account key", directory, key); err != nil {
+		if err := check("account key", directory, "accounts/private_key_pem/"+directory, key); err != nil {
 			return false, err
 		}
 	}
@@ -455,15 +496,69 @@ func checkSnapshotPayload(db *sql.DB, path string) (sealed bool, err error) {
 		if err := certRows.Scan(&name, &certPEM, &keyPEM); err != nil {
 			return false, fmt.Errorf("restore: scan the certificate material in %s: %w", path, err)
 		}
-		if err := check("certificate", fmt.Sprintf("%q", name), certPEM); err != nil {
+		if err := check("certificate", fmt.Sprintf("%q", name), "certificates/cert_pem/"+name, certPEM); err != nil {
 			return false, err
 		}
-		if err := check("private key", fmt.Sprintf("%q", name), keyPEM); err != nil {
+		if err := check("private key", fmt.Sprintf("%q", name), "certificates/key_pem/"+name, keyPEM); err != nil {
 			return false, err
 		}
 	}
 	if err := certRows.Err(); err != nil {
 		return false, fmt.Errorf("restore: read the certificate material in %s: %w", path, err)
+	}
+
+	// Orders and retired certificates are optional in older snapshots, but when
+	// present they also contain private material that must authenticate before a
+	// sealed restore is allowed to replace a live database.
+	var tableCount int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'orders'`).Scan(&tableCount); err != nil {
+		return false, fmt.Errorf("restore: inspect orders in %s: %w", path, err)
+	}
+	if tableCount > 0 {
+		rows, err := db.Query(`SELECT cert_name, key_pem FROM orders`)
+		if err != nil {
+			return false, fmt.Errorf("restore: read order keys in %s: %w", path, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			var key []byte
+			if err := rows.Scan(&name, &key); err != nil {
+				return false, fmt.Errorf("restore: scan an order key in %s: %w", path, err)
+			}
+			if err := check("order private key", fmt.Sprintf("%q", name), "orders/key_pem/"+name, key); err != nil {
+				return false, err
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return false, fmt.Errorf("restore: read order keys in %s: %w", path, err)
+		}
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'retired_certificates'`).Scan(&tableCount); err != nil {
+		return false, fmt.Errorf("restore: inspect retired certificates in %s: %w", path, err)
+	}
+	if tableCount > 0 {
+		rows, err := db.Query(`SELECT cert_id, cert_pem, key_pem FROM retired_certificates`)
+		if err != nil {
+			return false, fmt.Errorf("restore: read retired certificate material in %s: %w", path, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			var certPEM, keyPEM []byte
+			if err := rows.Scan(&id, &certPEM, &keyPEM); err != nil {
+				return false, fmt.Errorf("restore: scan retired certificate material in %s: %w", path, err)
+			}
+			if err := check("retired certificate", fmt.Sprintf("%q", id), "retired_certificates/cert_pem/"+id, certPEM); err != nil {
+				return false, err
+			}
+			if err := check("retired private key", fmt.Sprintf("%q", id), "retired_certificates/key_pem/"+id, keyPEM); err != nil {
+				return false, err
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return false, fmt.Errorf("restore: read retired certificate material in %s: %w", path, err)
+		}
 	}
 	return sealed, nil
 }
@@ -731,6 +826,16 @@ func SnapshotsIn(dir, statePath string) ([]string, error) {
 // daemon is running, so the swap cannot happen now, but the bytes are on disk and
 // verified for the next start.
 func StagePendingRestore(dest, source string) (string, error) {
+	return stagePendingRestore(dest, source, nil)
+}
+
+// StagePendingRestoreSealed verifies encrypted payloads with master before
+// staging a restore that will be applied on the next daemon start.
+func StagePendingRestoreSealed(dest, source string, master []byte) (string, error) {
+	return stagePendingRestore(dest, source, master)
+}
+
+func stagePendingRestore(dest, source string, master []byte) (string, error) {
 	if dest == "" || source == "" {
 		return "", errors.New("stage pending restore: need both a state path and a snapshot")
 	}
@@ -741,7 +846,7 @@ func StagePendingRestore(dest, source string) (string, error) {
 	if srcInfo.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("stage pending restore: %s is a symlink; point at the real snapshot file", source)
 	}
-	if _, err := inspectSnapshot(source); err != nil {
+	if _, err := inspectSnapshotWithKey(source, master); err != nil {
 		return "", fmt.Errorf("stage pending restore: %w", err)
 	}
 	pending := dest + restorePendingSuffix
@@ -752,7 +857,7 @@ func StagePendingRestore(dest, source string) (string, error) {
 	if err := copyFileSync(pending, source, dir); err != nil {
 		return "", fmt.Errorf("stage pending restore: %w", err)
 	}
-	if _, err := inspectSnapshot(pending); err != nil {
+	if _, err := inspectSnapshotWithKey(pending, master); err != nil {
 		_ = os.Remove(pending)
 		return "", fmt.Errorf("stage pending restore: the staged copy did not survive the copy: %w", err)
 	}

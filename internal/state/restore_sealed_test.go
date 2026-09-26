@@ -66,6 +66,13 @@ func TestASealedSnapshotInspectsAndRestores(t *testing.T) {
 	if _, err := Restore(restored, snapshot); err != nil {
 		t.Fatalf("Restore of a sealed snapshot: %v", err)
 	}
+	wrong := filepath.Join(dir, "wrong-key.db")
+	if _, err := RestoreSealed(wrong, snapshot, []byte("not-the-master")); err == nil {
+		t.Fatal("RestoreSealed must reject a snapshot before installing it when the key is wrong")
+	}
+	if _, err := os.Stat(wrong); !os.IsNotExist(err) {
+		t.Fatalf("failed sealed restore must not create a destination: stat err = %v", err)
+	}
 	back, err := OpenSealed(restored, master)
 	if err != nil {
 		t.Fatalf("OpenSealed on the restored database: %v", err)

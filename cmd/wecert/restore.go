@@ -51,7 +51,12 @@ func restoreState(cfg *config.Config, arg string) error {
 	}
 	defer cleanup()
 
-	res, err := state.Restore(cfg.StatePath, source)
+	var res state.RestoreResult
+	if cfg.StateEncryption.Key != "" {
+		res, err = state.RestoreSealed(cfg.StatePath, source, []byte(cfg.StateEncryption.Key))
+	} else {
+		res, err = state.Restore(cfg.StatePath, source)
+	}
 	if err != nil {
 		return err
 	}

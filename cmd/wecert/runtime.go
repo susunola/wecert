@@ -469,7 +469,12 @@ func adminRestore(cfg *config.Config, source string, log *slog.Logger) (any, err
 		return nil, err
 	}
 	defer cleanup()
-	pending, err := state.StagePendingRestore(cfg.StatePath, src)
+	var pending string
+	if cfg.StateEncryption.Key != "" {
+		pending, err = state.StagePendingRestoreSealed(cfg.StatePath, src, []byte(cfg.StateEncryption.Key))
+	} else {
+		pending, err = state.StagePendingRestore(cfg.StatePath, src)
+	}
 	if err != nil {
 		return nil, err
 	}
