@@ -41,6 +41,11 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # The mechanical half of the review, pinned in the Makefile. `go vet` sees none of this:
+      # deprecated methods, unused symbols, error strings that break convention.
+      - name: staticcheck
+        run: make check-staticcheck
+
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
