@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.1 - 2026-09-27
+
+### Security
+
+- **Sealed snapshots are authenticated before restore.** When `stateEncryption.keyFile` is
+  configured, CLI and admin restores now verify every encrypted account, certificate, in-flight
+  order and retired rollback blob with the active key before replacing the live database. A wrong
+  key or tampered ciphertext is rejected without installing the snapshot.
+
 ## Unreleased
 
 ### Fixed
