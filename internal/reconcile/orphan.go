@@ -231,17 +231,18 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string, counted bo
 	// not ours any more. Deleted here, with the other per-name cleanup, rather than on the success
 	// path below: a teardown that fails and is retried must not leave the rows to the retry to
 	// forget, and deleting them twice is harmless.
-	if stErr == nil && st != nil {
-		if removed, err := r.store.DeleteProbeSamples(name); err != nil {
-			// Not fatal, never silent: the alternative is rows accumulating for the life of the
-			// deployment with nothing pointing at them.
-			r.log.Warn("failed to drop the persisted TLS probe evidence of a certificate that left "+
-				"the desired state; its rows will stay in probe_samples",
-				"cert", name, "err", err)
-		} else if removed > 0 {
-			r.log.Info("dropped the persisted TLS probe evidence of a certificate that left the desired state",
-				"cert", name, "rows", removed)
-		}
+	var probeCleanupErr error
+	if removed, err := r.store.DeleteProbeSamples(name); err != nil {
+		// Keep the orphan unmarked so a transient write failure is retried on the next pass.
+		// The delete is keyed by certificate name and does not need the certificate material read
+		// above; even a decryption/read failure must not strand its durable probe evidence.
+		probeCleanupErr = err
+		r.log.Warn("failed to drop the persisted TLS probe evidence of a certificate that left "+
+			"the desired state; cleanup will be retried",
+			"cert", name, "err", err)
+	} else if removed > 0 {
+		r.log.Info("dropped the persisted TLS probe evidence of a certificate that left the desired state",
+			"cert", name, "rows", removed)
 	}
 
 	// The expiry comes from the row just read, when that read worked. The rest of the line is the
@@ -266,7 +267,7 @@ func (r *Reconciler) tearDownOrphan(ctx context.Context, name string, counted bo
 	// its propagation window), which leaves the name unmarked on purpose for the same reason. That
 	// refusal is not logged here -- the manager already said why it kept the row, and repeating it
 	// every pass is the flood orphanLogLimit exists to stop.
-	if cleanupErr != nil {
+	if stErr != nil || cleanupErr != nil || probeCleanupErr != nil {
 		return
 	}
 	marked, err := r.store.MarkOrphanCleaned(name)

@@ -143,12 +143,27 @@ func (r webhookReconciler) StartAll(context.Context) ([]string, []string, error)
 	return nil, nil, nil
 }
 
+type contextWebhookReconciler struct{ seen chan context.Context }
+
+func (r contextWebhookReconciler) CertNames() []string { return []string{"example-com"} }
+
+func (r contextWebhookReconciler) StartCert(context.Context, string) error { return nil }
+
+func (r contextWebhookReconciler) StartNamed(context.Context, []string) ([]string, []string, []string, error) {
+	return nil, nil, nil, nil
+}
+
+func (r contextWebhookReconciler) StartAll(ctx context.Context) ([]string, []string, error) {
+	r.seen <- ctx
+	return []string{"example-com"}, nil, nil
+}
+
 // An empty webhook.listen means disabled, and that must not be an error: the timer-only
 // deployment is a supported shape, and the configuration layer has already refused every
 // contradictory combination (a token with no address is rejected there).
 func TestStartWebhookServerIsOffWithoutAListenAddress(t *testing.T) {
 	log, buf := quietLog()
-	api, err := startWebhookServer(context.Background(), &config.Config{}, webhookReconciler{}, serverStore(t), log)
+	api, err := startWebhookServer(context.Background(), context.Background(), &config.Config{}, webhookReconciler{}, serverStore(t), log)
 	if err != nil {
 		t.Fatalf("webhook.listen is empty, which means disabled and not failure: %v", err)
 	}
@@ -178,7 +193,7 @@ func TestStartWebhookServerServesTheTriggerEndpointBehindItsToken(t *testing.T) 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	api, err := startWebhookServer(ctx, cfg, webhookReconciler{names: []string{"example-com"}}, serverStore(t), log)
+	api, err := startWebhookServer(ctx, ctx, cfg, webhookReconciler{names: []string{"example-com"}}, serverStore(t), log)
 	if err != nil {
 		t.Fatalf("startWebhookServer: %v", err)
 	}
@@ -217,7 +232,7 @@ func TestStartWebhookServerReleasesThePortWhenTheConfigIsRefused(t *testing.T) {
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	_, err := startWebhookServer(context.Background(), cfg, webhookReconciler{}, serverStore(t), log)
+	_, err := startWebhookServer(context.Background(), context.Background(), cfg, webhookReconciler{}, serverStore(t), log)
 	if err == nil {
 		t.Fatal("a webhook with no token must be refused: the endpoint triggers real issuance")
 	}
@@ -245,7 +260,7 @@ func TestStartWebhookServerStopsWithTheContext(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	if _, err := startWebhookServer(ctx, cfg, webhookReconciler{}, serverStore(t), log); err != nil {
+	if _, err := startWebhookServer(ctx, ctx, cfg, webhookReconciler{}, serverStore(t), log); err != nil {
 		t.Fatalf("startWebhookServer: %v", err)
 	}
 	cancel()
@@ -267,5 +282,60 @@ func TestStartWebhookServerStopsWithTheContext(t *testing.T) {
 	// alongside the server it describes.
 	if got := testutil.ToFloat64(metrics.BackupRemoteErrors.WithLabelValues("unused-server-test", "s3")); got != 0 {
 		t.Errorf("an unrelated counter started at %v, want 0", got)
+	}
+}
+
+// Stopping the listener must not cancel an accepted reconciliation. The daemon uses separate
+// contexts for HTTP shutdown and process work so -once can stop admission, then drain accepted
+// webhook passes before closing the state store.
+func TestStartWebhookServerKeepsAcceptedPassContextAliveWhenListenerStops(t *testing.T) {
+	addr := freeAddress(t)
+	const token = "0123456789abcdef0123456789abcdef"
+	cfg := &config.Config{
+		StatePath: filepath.Join(t.TempDir(), "state.db"),
+		Webhook:   config.Webhook{Listen: addr, Token: token},
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	listenerCtx, stopListener := context.WithCancel(context.Background())
+	defer stopListener()
+	processCtx, cancelProcess := context.WithCancel(context.Background())
+	defer cancelProcess()
+	seen := make(chan context.Context, 1)
+	if _, err := startWebhookServer(listenerCtx, processCtx, cfg, contextWebhookReconciler{seen: seen}, serverStore(t), log); err != nil {
+		t.Fatalf("startWebhookServer: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/hook/reconcile", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("POST /hook/reconcile: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /hook/reconcile = %d, want %d", resp.StatusCode, http.StatusAccepted)
+	}
+
+	var passCtx context.Context
+	select {
+	case passCtx = <-seen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the accepted webhook pass did not reach the reconciler")
+	}
+	stopListener()
+	select {
+	case <-passCtx.Done():
+		t.Fatal("stopping the HTTP listener cancelled an already accepted pass")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancelProcess()
+	select {
+	case <-passCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("the pass context did not follow the process context")
 	}
 }

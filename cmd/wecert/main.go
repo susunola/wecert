@@ -299,7 +299,7 @@ func run() error {
 	}
 
 	// Event-trigger endpoint. Same rule: a failed port bind must be a hard failure.
-	web, err := startWebhookServer(serverCtx, cfg, runtime, store, log)
+	web, err := startWebhookServer(serverCtx, ctx, cfg, runtime, store, log)
 	if err != nil {
 		return err
 	}
@@ -867,7 +867,7 @@ func startMetricsServer(ctx context.Context, addr string, log *slog.Logger) erro
 // port while merely logging a line makes people believe it is configured when in fact
 // every event is lost -- and certificates march on toward expiry regardless.
 func startWebhookServer(
-	ctx context.Context, cfg *config.Config,
+	listenerCtx, processCtx context.Context, cfg *config.Config,
 	rec webhook.Reconciler, store *state.Store, log *slog.Logger,
 ) (*webhook.Server, error) {
 	if cfg.Webhook.Listen == "" {
@@ -886,7 +886,7 @@ func startWebhookServer(
 		AuditPath: adminAuditPath(cfg.StatePath),
 		Ops:       adminOps(cfg, log),
 	}
-	api, err := webhook.NewWithAdmin(rec, store, cfg.Webhook.Token, admin, ctx, log)
+	api, err := webhook.NewWithAdmin(rec, store, cfg.Webhook.Token, admin, processCtx, log)
 	if err != nil {
 		// The port is already bound above, and returning here used to leak it: this process
 		// exits because of the error, so a restart is fine, but the exit path taken when
@@ -911,7 +911,7 @@ func startWebhookServer(
 	}
 
 	go func() {
-		<-ctx.Done()
+		<-listenerCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
