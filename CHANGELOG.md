@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The documents that describe the state database now describe the one the code writes.** Four had
+  drifted, in the direction this repository treats as a defect class of its own:
+  - `docs/recovery.md` printed the snapshot name as `state.db.backup-<stamp>.db` and told the reader
+    to back up `state.db.backup-*.db`. Snapshots carry the store's identity
+    (`state.db-9e1647.backup-<stamp>.db`, the hash of the absolute state path, which is what keeps
+    two deployments sharing a backup directory from pruning each other), so the documented glob
+    matched nothing -- the same silent-copy failure the section already warns about from a previous
+    round. Both naming generations are now spelled out, and the copy commands use both.
+  - `SECURITY.md` said `state.db` is written in plaintext and stopped there. It now also says that
+    authenticated encryption is available and off by default, is not hot-rotatable, and that a
+    backup is exactly as private as the database it copies: without a sealing key, every uploaded
+    snapshot carries the account key and every certificate private key, and the bucket's
+    server-side encryption protects the bytes at rest rather than from whoever can read the bucket.
+  - `docs/backlog.md` §11 still claimed probe answers live in the prober's memory for one process
+    life. The last verdict per host is persisted (`probe_samples`) and used as the fallback when the
+    process has none of its own, which is what a restart of a healthy daemon reads. What is still
+    open there is narrower and now written down: one row per certificate/host, no retention, nothing
+    prunes rows for certificates that left the fleet.
+  - `docs/inventory-ui.md` repeated the same claim in its status table and its limits list.
+- **`docs/staging-checklist.md` gained the off-host backup section** (6b): configure a remote target
+  without a sealing key and see the startup warning; decide on the record between sealing and
+  accepting that the bucket holds the keys; confirm `-restore remote:<target>` finds this
+  deployment's own uploads; confirm `-backup-drill remote:<target>` reads one back and changes
+  nothing. `config.example.yaml` says the same where the target is configured, which is where an
+  operator meets the decision.
+
+### Added
+
+- **A regression test for the inventory's cold-start probe fallback.** `internal/webhook` reads the
+  running prober's answers first and falls back to the durable last verdict per host when a fresh
+  process has none; the existing test covered that fallback *failing* (an unreadable table must not
+  take the console down), not it working. Without the fallback every known endpoint reads
+  `probe_unknown` after a restart, and nothing else fails -- which is exactly how it was removed
+  once already. The test seeds `probe_samples`, serves the page with an empty in-memory answer set,
+  and asserts the row carries the persisted verdict with its `observedAt`; deleting the fallback
+  makes it fail with `status = "probe_unknown"`.
+
 ## 0.9.0 - 2026-09-26
 
 ### Security

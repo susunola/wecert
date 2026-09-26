@@ -28,12 +28,17 @@ Enabled by default (`stateBackup`, see `config.example.yaml`). Every `interval` 
 writes a consistent copy beside `state.db`, keeping the newest `keep` (7) named:
 
 ```
-/var/lib/wecert/state.db.backup-20060102T150405.123Z.db
+/var/lib/wecert/state.db-9e1647.backup-20060102T150405.123Z.db
 ```
 
-The name is `<state.db's file name>.backup-<UTC stamp, milliseconds>.db`, so the glob for this
-deployment is `state.db.backup-*.db`. (This section used to print `state.backup-<stamp>.db`, which
-matches nothing the code writes: the rsync below silently copied zero files and exited 0.)
+The name is `<state.db's file name>-<6 hex of the hash of state.db's absolute path>.backup-<UTC
+stamp, milliseconds>.db`. The hash is the store's identity: two deployments whose databases are
+both called `state.db` can share one backup directory, and without it their retention sets prune
+each other's snapshots. The glob for one deployment is therefore `state.db-??????.backup-*.db`,
+and snapshots written before the hash existed (`state.db.backup-*.db`) are still recognised, so an
+upgrade does not strand them. (An earlier version of this section printed
+`state.backup-<stamp>.db`, which matches nothing the code writes: the rsync below silently copied
+zero files and exited 0. The same mistake is easy to make again by assuming the plain basename.)
 
 They are **not** plain file copies. The database runs in WAL mode, so the bytes on disk are
 `state.db` plus a `-wal` holding everything since the last checkpoint — copying `state.db`
@@ -42,6 +47,15 @@ recovering. Snapshots use `VACUUM INTO`, which asks SQLite for a consistent logi
 the result is a single self-contained database with no sidecars to keep in step.
 
 They are written `0600`. They contain the account key and every certificate private key.
+
+**A snapshot carries whatever protection `state.db` has, and by default that is none.** Without
+`stateEncryption.keyFile`, an uploaded snapshot is the database, in the clear: the bucket's
+server-side encryption protects the bytes at rest, not from anyone who can read the bucket, and
+whoever reads it holds the keys that terminate TLS for the domains this instance manages. Setting
+`stateEncryption.keyFile` seals the private material in the database, and a snapshot is a copy of
+those sealed rows -- so it is sealed too. The key is not hot-rotatable: changing it needs a restart.
+The daemon logs a warning at startup when `stateBackup.remoteTargets` is configured without a
+sealing key, and that warning is the last point at which the destination can be changed cheaply.
 
 **Snapshots are not a substitute for off-host backup.** They sit next to the file they
 protect: a lost disk, a dropped directory or a bad `rm` takes both. Configure
@@ -57,7 +71,8 @@ response. Alert when a configured target has no recent success.
 
 ```sh
 # Anywhere off the host. The files are small (a few hundred KB).
-rsync -a /var/lib/wecert/state.db.backup-*.db backup-host:/srv/wecert/
+rsync -a /var/lib/wecert/state.db-??????.backup-*.db \
+      /var/lib/wecert/state.db.backup-*.db backup-host:/srv/wecert/   # both naming generations
 ```
 
 If `stateBackup.enabled: false`, wecert logs a warning at startup saying so.
@@ -127,7 +142,7 @@ the literal confirmation `RESTORE`; non-interactive recovery must opt in with `-
 
 ```
 $ wecert -restore latest
-Restored /var/lib/wecert/state.db.backup-20260918T055804.461Z.db over /var/lib/wecert/state.db.
+Restored /var/lib/wecert/state.db-9e1647.backup-20260918T055804.461Z.db over /var/lib/wecert/state.db.
   The snapshot holds an ACME account and 4 certificate(s); its data is from 2026-09-18T13:58:04+08:00.
   The rate-limit ledger in the snapshot stops at that date: any order placed after it
   is still counted by the CA but not here. Until 2026-09-25T13:58:06+08:00 the CA may refuse an
@@ -176,7 +191,7 @@ rm -f /var/lib/wecert/state.db-wal /var/lib/wecert/state.db-shm
 
 # 3. Install the snapshot as the live database. A snapshot has no sidecars, so nothing else
 #    has to be copied.
-cp /var/lib/wecert/state.db.backup-<newest>.db /var/lib/wecert/state.db
+cp /var/lib/wecert/state.db-<hash>.backup-<newest>.db /var/lib/wecert/state.db
 chown wecert:wecert /var/lib/wecert/state.db
 chmod 0600 /var/lib/wecert/state.db
 
@@ -213,7 +228,7 @@ still carries the same CA quota caveat and deserves monitoring for a refused ord
 Try the next one. `PRAGMA quick_check` on each before installing:
 
 ```sh
-for f in /var/lib/wecert/state.db.backup-*.db; do
+for f in /var/lib/wecert/state.db-??????.backup-*.db; do
   printf '%s: ' "$f"; sqlite3 "$f" 'PRAGMA quick_check;' 2>&1 | head -1
 done
 ```

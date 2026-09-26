@@ -41,6 +41,13 @@ stateBackup:
   #   - /mnt/backup-disk/wecert
   # Off-host destinations. S3 credentials use the standard AWS environment/profile chain;
   # COS uses its S3-compatible endpoint and the same credential chain.
+  #
+  # Read this before pointing a target at a bucket: a snapshot is a copy of state.db, so unless
+  # stateEncryption.keyFile above is set it carries the ACME account key and every certificate
+  # private key in the clear. The bucket's server-side encryption protects the bytes at rest, not
+  # from anyone who can read the bucket. Setting the key seals both the database and its snapshots
+  # (they are VACUUM INTO copies of the sealed rows); it needs a restart to change. The daemon logs
+  # a warning at startup when remoteTargets is configured without it.
   # remoteTargets:
   #   - name: production-s3
   #     type: s3

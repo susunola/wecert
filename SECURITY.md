@@ -61,9 +61,17 @@ Please do not report these as vulnerabilities. They are documented decisions wit
   credential. See `README.reference.md` → `webhook`.
 - **The metrics listener serves no authentication.** It exposes certificate names, expiry dates and
   failure counts. Bind it to `127.0.0.1` (the default) or a private interface.
-- **`state.db` is written in plaintext**, including private keys, protected only by file
-  permissions (0600) and the state directory's mode (0700). Disk-level encryption is the operator's
-  responsibility, as is the choice of snapshots destination.
+- **`state.db` is written in plaintext by default**, including private keys, protected only by file
+  permissions (0600) and the state directory's mode (0700). Optional authenticated encryption exists
+  (`stateEncryption.keyFile`, see `config.example.yaml`); it is off unless configured, is not
+  hot-rotatable, and a lost key makes the encrypted rows unrecoverable. Disk-level encryption
+  remains the operator's responsibility.
+- **A backup is exactly as private as the database it copies.** With `stateBackup.remoteTargets`
+  configured and no sealing key, every uploaded snapshot carries the account key and every
+  certificate private key in the clear: the bucket's server-side encryption protects the bytes at
+  rest, not from anyone who can read the bucket. The daemon warns at startup when that combination
+  is configured; `docs/recovery.md` documents the choice. The same applies to
+  `certificates[].export.remoteTargets`, which distributes the certificate and its key on purpose.
 - **A single instance per state directory, enforced by `flock`.** A second process is refused rather
   than queued; that is deliberate.
 - **`docs/availability.md` and `docs/challenge-types.md`** record what this deployment shape cannot

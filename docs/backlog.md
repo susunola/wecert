@@ -93,9 +93,12 @@ They are ordered by real exposure over effort.
      runs to confirm a *first* bind. A confirmed certificate therefore shows a lower bound, not
      listener ids. Filling that in means a periodic `CreateCertificateBindResourceSyncTask` per
      certificate — a real API cost and rate-limit spend, which is why it is not done quietly.
-   - Probe answers live in the prober's memory for one process life, so every restart shows
-     `probe_unknown` until the next pass. Persisting the last verdict per host would fix it;
-     v1 explicitly kept probe history out of SQLite.
+   - Probe answers are read from the running prober, and the durable last verdict per host
+     (`probe_samples`, written by the pass that dialled it) is the fallback when this process has
+     none of its own. A restart therefore shows what the previous process observed, with the
+     observation instant, instead of `probe_unknown` until the next pass. What is still open here is
+     narrower: the samples are diagnostic evidence, not history -- one row per certificate/host, no
+     retention policy, and nothing prunes them when a certificate or host leaves the fleet.
 
 ## The rest
 
