@@ -183,6 +183,15 @@ func run() error {
 		return fmt.Errorf("%w: %v", errUsage, err)
 	}
 
+	// -restore and -backup-drill are the two one-shot state commands, and they contradict each
+	// other: one replaces the database, the other reads a snapshot without touching it. Checked
+	// before either branch runs, because the -restore branch returns first -- so "the read-only
+	// mode was asked for next to the destructive one" used to end in a completed restore with the
+	// drill silently ignored.
+	if f.restoreFrom != "" && f.backupDrill != "" {
+		return fmt.Errorf("%w: -restore and -backup-drill are different one-shot state commands and "+
+			"cannot be combined", errUsage)
+	}
 	if f.restoreFrom != "" {
 		// A mode flag next to -restore is a mistake worth refusing rather than ordering: every one of
 		// the others does something to a state database, and "restore, and then also reconcile once"
@@ -273,19 +282,30 @@ func run() error {
 	}()
 	snapshots, stopBackups = startBackupsIfNeeded(ctx, store, cfg, log)
 
+	// The two HTTP listeners get their own context, cancelled before the one-shot path drains.
+	//
+	// They hang off ctx, and nothing cancels ctx before the process exits on the -once path:
+	// `defer stop()` was registered first, so it runs last -- after the drain, after the final
+	// snapshot wait and after store.Close(). A trigger accepted in that window starts a pass
+	// nothing waits for, on a database that is closing, which is the failure drainBackground
+	// exists to prevent. Cancelling this context closes the listeners; the passes already
+	// accepted are still drained below.
+	serverCtx, stopServers := context.WithCancel(ctx)
+	defer stopServers()
+
 	// Metrics server. Bind the port synchronously first and exit on failure -- see below.
-	if err := startMetricsServer(ctx, cfg.Metrics.Listen, log); err != nil {
+	if err := startMetricsServer(serverCtx, cfg.Metrics.Listen, log); err != nil {
 		return err
 	}
 
 	// Event-trigger endpoint. Same rule: a failed port bind must be a hard failure.
-	web, err := startWebhookServer(ctx, cfg, runtime, store, log)
+	web, err := startWebhookServer(serverCtx, cfg, runtime, store, log)
 	if err != nil {
 		return err
 	}
 
 	if f.once {
-		return runOncePass(ctx, reconciler, notifier, snapshots, log)
+		return runOncePass(ctx, reconciler, notifier, snapshots, stopServers, log)
 	}
 
 	log.Info("entering daemon mode", "interval", f.interval)

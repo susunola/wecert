@@ -16,6 +16,26 @@
 
 ### Fixed
 
+- **`-restore remote:<name>` can find this deployment's own uploads again.** Snapshots are named
+  after the state file's identity -- basename plus a short hash of the absolute path
+  (`state.db-ddaedd.backup-<stamp>.db`) -- and an upload keeps that name as the object key, but the
+  download side listed the remote prefix `state.db.backup-`. No upload ever wrote that prefix, so a
+  remote restore reported "no snapshots found" over a bucket holding its own recovery points: the
+  off-host recovery path was unusable, and the error named the wrong cause. The listing now asks for
+  the plain basename (a superset) and filters by identity, accepting both the current name and the
+  pre-hash one an older build uploaded -- the same two identities the state package already
+  recognises locally, for the same reason: an upgrade must not strand existing recovery points.
+- **`-restore` and `-backup-drill` are refused together instead of the restore silently winning.**
+  The `-restore` branch returned before the drill's conflict check and never tested the drill flag,
+  so `wecert -restore latest -backup-drill latest` performed the restore, ignored the read-only
+  command, and exited 0 with no mention of it. The check now runs before either branch, so the pair
+  is a command-line error (exit 64) in both orders.
+- **A one-shot run closes its HTTP listeners before it drains.** The listeners hang off the process
+  context, and nothing cancels that before the process exits on the `-once` path: `defer stop()` is
+  registered first, so it runs last -- after the drain, after the final snapshot wait and after
+  `store.Close()`. A webhook trigger accepted in that window would start a pass nothing waits for,
+  on a database that is closing, which is the failure `drainBackground` exists to prevent. The
+  listeners now get their own context, cancelled as soon as the pass they belong to returns.
 - **A signed SFTP backup no longer deletes the snapshot it just published.** `pruneSFTP` excluded
   "the snapshot being uploaded" from the retention candidates, which is wrong on an SFTP target
   because a signed upload publishes twice and prunes twice: the first pass writes the snapshot, the

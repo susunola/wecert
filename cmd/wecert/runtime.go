@@ -342,12 +342,18 @@ func runOncePass(
 	reconciler *reconcile.Reconciler,
 	notifier reconcile.Notifier,
 	snapshots *snapshotHealth,
+	stopListeners func(),
 	log *slog.Logger,
 ) error {
 	rep := reconciler.RunDetailed(ctx)
-	// That pass has finished, but a webhook-triggered one may be running: the listener is
-	// started before this branch, so -once can coexist with an accepted background pass. Both
-	// it and the notifications have to be waited for before the deferred store.Close() runs.
+	// Close the listeners before draining, so the set of passes to wait for cannot grow while it
+	// is being waited for. That pass has finished, but a webhook-triggered one may be running: the
+	// listener is started before this branch, so -once can coexist with an accepted background
+	// pass. Both it and the notifications have to be waited for before the deferred store.Close()
+	// runs -- and a trigger accepted after this point would be a pass nothing waits for.
+	if stopListeners != nil {
+		stopListeners()
+	}
 	drainBackground(reconciler, log)
 	drainNotifier(notifier, log)
 	if err := snapshots.wait(snapshotWait); err != nil {

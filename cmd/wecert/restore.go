@@ -92,7 +92,7 @@ func resolveRestoreSnapshot(cfg *config.Config, arg string) (string, func(), err
 		if err != nil {
 			return "", func() {}, err
 		}
-		source, err := backup.DownloadLatest(context.Background(), backup.Target{HMACKey: hmacKey, Type: t.Type, Name: t.Name, Bucket: t.Bucket, Prefix: t.Prefix, Endpoint: t.Endpoint, Region: t.Region, Host: t.Host, Username: t.Username, RemoteDir: t.RemoteDir, PasswordEnv: t.PasswordEnv, PrivateKeyFile: t.PrivateKeyFile, PrivateKeyPassphraseEnv: t.PrivateKeyPassphraseEnv, KnownHostsFile: t.KnownHostsFile, SecretIDEnv: t.SecretIDEnv, SecretKeyEnv: t.SecretKeyEnv, SnapshotBase: filepath.Base(cfg.StatePath), Timeout: t.TimeoutDur}, filepath.Dir(cfg.StatePath))
+		source, err := backup.DownloadLatest(context.Background(), backup.Target{HMACKey: hmacKey, Type: t.Type, Name: t.Name, Bucket: t.Bucket, Prefix: t.Prefix, Endpoint: t.Endpoint, Region: t.Region, Host: t.Host, Username: t.Username, RemoteDir: t.RemoteDir, PasswordEnv: t.PasswordEnv, PrivateKeyFile: t.PrivateKeyFile, PrivateKeyPassphraseEnv: t.PrivateKeyPassphraseEnv, KnownHostsFile: t.KnownHostsFile, SecretIDEnv: t.SecretIDEnv, SecretKeyEnv: t.SecretKeyEnv, SnapshotBase: filepath.Base(cfg.StatePath), SnapshotIdentity: state.SnapshotIdentity(cfg.StatePath), Timeout: t.TimeoutDur}, filepath.Dir(cfg.StatePath))
 		if err != nil {
 			return "", func() {}, err
 		}
