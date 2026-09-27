@@ -349,6 +349,9 @@ func startAuthDNS(t *testing.T) *authDNS {
 	go func() { _ = s.udp.ActivateAndServe() }()
 	go func() { _ = s.tcp.ActivateAndServe() }()
 	s.addr = net.JoinHostPort(bindAddr, bindPort)
+	if os.Getenv("WECERT_E2E_DNS_PORT") == "0" {
+		t.Setenv("WECERT_E2E_DNS_PORT", bindPort)
+	}
 
 	// Binding a port and being reachable on it are different things, and the difference decides
 	// whether this run can validate for real. Sandboxes routinely allow the bind and drop the

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -90,8 +91,12 @@ func (s *DNSSolver) authoritativeNS(ctx context.Context, zone string) ([]nsServe
 			s.log.Warn("could not resolve an authoritative nameserver; skipping it", "ns", ns, "err", err)
 			continue
 		}
+		port := strings.TrimSpace(os.Getenv("WECERT_E2E_DNS_PORT"))
+		if port == "" || port == "0" {
+			port = "53"
+		}
 		for _, ip := range ips {
-			addr := net.JoinHostPort(ip, "53")
+			addr := net.JoinHostPort(ip, port)
 			if !seen[addr] {
 				seen[addr] = true
 				servers = append(servers, nsServer{ns: ns, addr: addr})
