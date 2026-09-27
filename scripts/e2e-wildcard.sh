@@ -144,7 +144,11 @@ txt_values_from() {
 	# sampling loop.
 	"${DIG}" +short +time=3 +tries=1 TXT "${CHALLENGE}" "@${server}" 2>/dev/null |
 		sed -e 's/^"//' -e 's/"$//' -e 's/" "//g' |
-		grep -v '^$' | sort -u || true
+		grep -v '^$' |
+		# dig writes resolver diagnostics to stdout on some macOS/BSD builds. They
+		# are not TXT values and must not turn a clean zone into a false leak.
+		grep -vE 'connection timed out|no servers could be reached|communications error' |
+		sort -u || true
 }
 
 # All distinct values across every authoritative server. A value counts as visible if any

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Wildcard E2E sampling no longer treats macOS/BSD `dig` timeout diagnostics as leaked TXT values.
+
 ## 0.9.2 - 2026-09-27
 
 ### Fixed
