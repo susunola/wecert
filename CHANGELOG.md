@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.2 - 2026-09-27
+
+### Fixed
+
+- ACME HTTP clients explicitly append `SSL_CERT_FILE` to the system trust pool, making local/private ACME E2E fixtures reliable on macOS while preserving normal system trust.
+- Added the production E2E execution report for the real Cloudflare, S3, COS and Tencent CLB runs.
+
 ## 0.9.1 - 2026-09-27
 
 ### Security
