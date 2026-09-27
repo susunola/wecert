@@ -53,6 +53,14 @@ LOG="$ROOT/dist/e2e.log"
 : >"$LOG"
 
 echo "==> 1/3 real DNS-01 lifecycle (pebble + authoritative DNS on :53 + real solver)"
+# Linux images commonly run systemd-resolved on 127.0.0.53:53. The suite can still use the
+# loopback address without stopping the host resolver; the test server and Pebble both receive
+# the same address through WECERT_E2E_DNS_BIND. Operators can override this explicitly.
+if [[ -z "${WECERT_E2E_DNS_BIND:-}" ]] && command -v ss >/dev/null 2>&1 &&
+	ss -ltnup 2>/dev/null | grep -q '127\.0\.0\.53:53'; then
+	export WECERT_E2E_DNS_BIND=127.0.0.1
+	echo "    using WECERT_E2E_DNS_BIND=127.0.0.1 (systemd-resolved owns 127.0.0.53:53)"
+fi
 # A SKIP is not a pass.
 #
 # This suite binds port 53 to be a real authoritative server, so on a machine where something

@@ -297,6 +297,8 @@ func (s *authDNS) transportWorks(transport string) bool {
 }
 
 // startAuthDNS binds the authoritative server on port 53 and the control API on a free port.
+// WECERT_E2E_DNS_BIND may select a specific local address (for example 127.0.0.1 on Linux
+// hosts where systemd-resolved owns 127.0.0.53:53); the default remains wildcard for portability.
 func startAuthDNS(t *testing.T) *authDNS {
 	t.Helper()
 
@@ -313,10 +315,14 @@ func startAuthDNS(t *testing.T) *authDNS {
 		_ = w.WriteMsg(s.answer(r))
 	})
 
-	// 0.0.0.0 rather than 127.0.0.1: on macOS and the BSDs an unprivileged process may bind the
+	bindAddr := strings.TrimSpace(os.Getenv("WECERT_E2E_DNS_BIND"))
+	if bindAddr == "" {
+		bindAddr = "0.0.0.0"
+	}
+	// 0.0.0.0 rather than 127.0.0.1 by default: on macOS and the BSDs an unprivileged process may bind the
 	// wildcard on a privileged port but not a specific address, and a wildcard bind answers on
 	// 127.0.0.1 anyway. On Linux neither is allowed without CAP_NET_BIND_SERVICE.
-	pc, err := net.ListenPacket("udp", "0.0.0.0:53")
+	pc, err := net.ListenPacket("udp", net.JoinHostPort(bindAddr, "53"))
 	if err != nil {
 		t.Skipf("cannot bind port 53 (%v).\n"+
 			"A DNS delegation carries no port, so both wecert's propagation probe and pebble's "+
@@ -324,7 +330,7 @@ func startAuthDNS(t *testing.T) *authDNS {
 			"(docker run --cap-add=NET_BIND_SERVICE ...), as root, or on macOS/BSD where an "+
 			"unprivileged wildcard bind on 53 is permitted.", err)
 	}
-	ln, err := net.Listen("tcp", "0.0.0.0:53")
+	ln, err := net.Listen("tcp", net.JoinHostPort(bindAddr, "53"))
 	if err != nil {
 		_ = pc.Close()
 		t.Skipf("cannot bind TCP port 53 (%v); see the UDP message for what this needs", err)
@@ -334,7 +340,7 @@ func startAuthDNS(t *testing.T) *authDNS {
 	s.tcp = &dns.Server{Listener: ln, Handler: handler}
 	go func() { _ = s.udp.ActivateAndServe() }()
 	go func() { _ = s.tcp.ActivateAndServe() }()
-	s.addr = "127.0.0.1:53"
+	s.addr = net.JoinHostPort(bindAddr, "53")
 
 	// Binding a port and being reachable on it are different things, and the difference decides
 	// whether this run can validate for real. Sandboxes routinely allow the bind and drop the
