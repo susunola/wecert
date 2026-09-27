@@ -5,8 +5,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -37,7 +40,28 @@ func userAgent() string {
 
 // NewHTTPClient builds the HTTP client used for ACME.
 func NewHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout}
+	// Go's macOS runtime does not consistently honour SSL_CERT_FILE when building
+	// the system pool.  Loading it explicitly keeps local/private ACME directories
+	// testable without weakening the default trust store: the configured PEM is
+	// appended to the platform roots, never used as a replacement.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if caFile := os.Getenv("SSL_CERT_FILE"); caFile != "" {
+		if pem, err := os.ReadFile(caFile); err == nil {
+			pool, poolErr := x509.SystemCertPool()
+			if poolErr != nil || pool == nil {
+				pool = x509.NewCertPool()
+			}
+			if pool.AppendCertsFromPEM(pem) {
+				if tr.TLSClientConfig == nil {
+					tr.TLSClientConfig = &tls.Config{}
+				} else {
+					tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+				}
+				tr.TLSClientConfig.RootCAs = pool
+			}
+		}
+	}
+	return &http.Client{Transport: tr, Timeout: timeout}
 }
 
 // EnsureAccount loads or registers the ACME account, returning a ready-to-use

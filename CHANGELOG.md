@@ -11,6 +11,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Local ACME test directories trust `SSL_CERT_FILE` on macOS.** The ACME HTTP client now
+  explicitly appends the PEM bundle named by `SSL_CERT_FILE` to the system root pool. This keeps
+  private/Pebble endpoints testable in child processes without replacing normal system trust.
+
 ### Security
 
 - **An SFTP snapshot is published with a private mode.** `uploadSFTP` created the temporary object and
