@@ -531,7 +531,7 @@ Deletion is deliberately an order of magnitude more conservative than addition, 
 - [Recovery](docs/recovery.md) — what is in `state.db`, what each loss costs, and how to restore a snapshot and verify it before starting.
 - [Real staging E2E record (2026-09-24)](docs/e2e-run-2026-09-24.md) — two independent Cloudflare, S3, COS and CLB runs, including restore evidence and their scope.
 - [Real SFTP E2E report (2026-09-27)](docs/production-e2e-sftp-report-2026-09-27.html) — disposable Tencent CVM, chroot SFTP, encrypted snapshot upload/read-back, backup drill and restore verification.
-- [Production test scenario matrix (2026-09-27)](docs/production-test-scenarios-2026-09-27.html) — executable coverage for issuance, CLB/SNI, S3/COS/SFTP, restore, policies, hot reload, security and failure injection.
+- [Production test scenario matrix (2026-09-27)](docs/production-test-scenarios-2026-09-27.html) — executable coverage for issuance, CLB/SNI, S3/COS/SFTP, restore, policies, hot reload, security, failure injection and cross-component full-chain recovery.
 - [Availability](docs/availability.md) — what a restart already survives, why a second process on the same host would be redundant, and the three real options with what each costs.
 - [Backlog](docs/backlog.md) — what is worth doing next, ordered by real exposure over effort.
 
