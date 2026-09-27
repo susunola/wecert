@@ -45,6 +45,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -319,10 +320,14 @@ func startAuthDNS(t *testing.T) *authDNS {
 	if bindAddr == "" {
 		bindAddr = "0.0.0.0"
 	}
+	bindPort := strings.TrimSpace(os.Getenv("WECERT_E2E_DNS_PORT"))
+	if bindPort == "" {
+		bindPort = "53"
+	}
 	// 0.0.0.0 rather than 127.0.0.1 by default: on macOS and the BSDs an unprivileged process may bind the
 	// wildcard on a privileged port but not a specific address, and a wildcard bind answers on
 	// 127.0.0.1 anyway. On Linux neither is allowed without CAP_NET_BIND_SERVICE.
-	pc, err := net.ListenPacket("udp", net.JoinHostPort(bindAddr, "53"))
+	pc, err := net.ListenPacket("udp", net.JoinHostPort(bindAddr, bindPort))
 	if err != nil {
 		t.Skipf("cannot bind port 53 (%v).\n"+
 			"A DNS delegation carries no port, so both wecert's propagation probe and pebble's "+
@@ -330,7 +335,10 @@ func startAuthDNS(t *testing.T) *authDNS {
 			"(docker run --cap-add=NET_BIND_SERVICE ...), as root, or on macOS/BSD where an "+
 			"unprivileged wildcard bind on 53 is permitted.", err)
 	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(bindAddr, "53"))
+	if bindPort == "0" {
+		bindPort = strconv.Itoa(pc.LocalAddr().(*net.UDPAddr).Port)
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(bindAddr, bindPort))
 	if err != nil {
 		_ = pc.Close()
 		t.Skipf("cannot bind TCP port 53 (%v); see the UDP message for what this needs", err)
@@ -340,7 +348,7 @@ func startAuthDNS(t *testing.T) *authDNS {
 	s.tcp = &dns.Server{Listener: ln, Handler: handler}
 	go func() { _ = s.udp.ActivateAndServe() }()
 	go func() { _ = s.tcp.ActivateAndServe() }()
-	s.addr = net.JoinHostPort(bindAddr, "53")
+	s.addr = net.JoinHostPort(bindAddr, bindPort)
 
 	// Binding a port and being reachable on it are different things, and the difference decides
 	// whether this run can validate for real. Sandboxes routinely allow the bind and drop the
@@ -649,7 +657,7 @@ func TestRealDNS01Lifecycle(t *testing.T) {
 		solver, err := NewDNSSolver(config.DNS{
 			Provider:             config.DNSProviderLego,
 			LegoProvider:         "httpreq",
-			RecursiveNameservers: []string{"127.0.0.1:53"},
+			RecursiveNameservers: []string{dnsSrv.addr},
 			Propagation:          60 * time.Second,
 			Polling:              2 * time.Second,
 		}, config.Tencent{}, slog.New(slog.NewTextHandler(io.Discard, nil)))

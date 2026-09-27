@@ -61,7 +61,8 @@ if [[ -z "${WECERT_E2E_DNS_BIND:-}" ]] && {
 	(command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:53 -sTCP:LISTEN 2>/dev/null | grep -q LISTEN);
 }; then
 	export WECERT_E2E_DNS_BIND=127.0.0.1
-	echo "    using WECERT_E2E_DNS_BIND=127.0.0.1 (another resolver owns the wildcard/host port 53)"
+	export WECERT_E2E_DNS_PORT=0
+	echo "    using WECERT_E2E_DNS_BIND=127.0.0.1 with an ephemeral DNS port (port 53 is occupied)"
 fi
 # A SKIP is not a pass.
 #
