@@ -31,9 +31,14 @@ They are ordered by real exposure over effort.
 
 4. **Notice a state database that was restored without `wecert -restore`**
 
-   Half done, and the remaining half is the awkward one. `wecert -restore` writes `state.db.restored`, and the next start warns for seven days that the rate-limit ledger stops at the snapshot (`state.RestoreCaveatWindow`); what is still invisible is the hand path — `cp snapshot state.db`, which is what docs/recovery.md documented for years. Nothing inside the file records that it was swapped in, so `NextAttemptAt`, the ARI window and the rate-limit buckets can all move backwards in silence.
+   Mostly done, and the remaining half is the awkward one. `wecert -restore` writes `state.db.restored`, and the next start warns for seven days that the rate-limit ledger stops at the snapshot (`state.RestoreCaveatWindow`). The hand path — `cp snapshot state.db`, which is what docs/recovery.md documented for years — is now caught by a durable sidecar: `state.db.generation` holds the high-water mark of every locked open (`state.advanceGeneration`), and a snapshot carries an older generation. Copying only `state.db` over a live install leaves the sidecar ahead, and the next start warns that the database looks like it was restored outside `wecert -restore`. The supported command resets the lineage via its own marker, so a legitimate restore is not a false alarm.
 
-   The tempting signal is "the file's mtime is much newer than the newest row in it", and it is a false-positive generator: SQLite checkpoints the WAL at open and at close, so a daemon that wrote once and then idled for a week has exactly that signature after an ordinary restart. Ruling that out needs something the file does not carry today — a heartbeat row, or a start/stop ledger — and a warning that also fires on legitimate restarts teaches the reader to ignore the one that matters. Worth doing only once that design is settled; until then the answer is "restore through the command, which records it".
+   What the sidecar still cannot see, and this is the design that is not settled:
+
+   - **Copy the database *and* its `.generation` together.** The pair is self-consistent, so the high-water mark moves with the file and the warning never fires. Detecting that needs something inside the file itself (a heartbeat row or a start/stop ledger), not another sibling.
+   - **Copy onto a machine that has no sidecar at all.** A fresh host, or a restore directory that never ran wecert, has nothing to compare against. `present && previous > generation` is the only warning path; `!present` is silent by design (a first start is not a restore).
+
+   The tempting in-file signal — "the file's mtime is much newer than the newest row in it" — remains a false-positive generator: SQLite checkpoints the WAL at open and at close, so a daemon that wrote once and then idled for a week has exactly that signature after an ordinary restart. Worth doing only once the in-file design is settled; until then the answer is "restore through the command, which records it", and the sidecar catches the common copy-over mistake.
 
 4b. **Done: the orphan teardown is proportional to what needs cleaning** (closed 2026-09-22)
 

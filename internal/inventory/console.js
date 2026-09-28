@@ -1,21 +1,23 @@
 "use strict";
-const snapshot = JSON.parse(
+let snapshot = JSON.parse(
   document.getElementById("inventory-data").textContent,
 );
-const records = (snapshot.certificates || []).map((r, index) => ({
-  ...r,
-  index,
-  domains: r.domains || [],
-  regions: r.regions || [],
-  drift: r.drift || [],
-  bindings: {
-    ...r.bindings,
-    items: r.bindings.items || [],
-    resourceTypes: r.bindings.resourceTypes || [],
-  },
-  probe: { ...r.probe, hosts: r.probe.hosts || [] },
-}));
-const quotas = snapshot.quotas || [];
+const normalizeRecords = (certs) =>
+  (certs || []).map((r, index) => ({
+    ...r,
+    index,
+    domains: r.domains || [],
+    regions: r.regions || [],
+    drift: r.drift || [],
+    bindings: {
+      ...r.bindings,
+      items: r.bindings.items || [],
+      resourceTypes: r.bindings.resourceTypes || [],
+    },
+    probe: { ...r.probe, hosts: r.probe.hosts || [] },
+  }));
+let records = normalizeRecords(snapshot.certificates);
+let quotas = snapshot.quotas || [];
 const $ = (id) => document.getElementById(id);
 const esc = (value) =>
   String(value ?? "").replace(
@@ -440,7 +442,45 @@ function resetFilters() {
   $("search").value = "";
   $("account").value = "all";
   $("sort").value = "attention";
+  syncURL();
   render();
+}
+// URL state: shareable filters and a certificate deep link. replaceState only --
+// filters are not a navigation the Back button should walk.
+function syncURL() {
+  try {
+    const p = new URLSearchParams();
+    if (state.q) p.set("q", state.q);
+    if (state.filter !== "all") p.set("status", state.filter);
+    if (state.account !== "all") p.set("account", state.account);
+    if (state.sort !== "attention") p.set("sort", state.sort);
+    const selected = records[state.selected];
+    if (selected) p.set("cert", selected.name);
+    const qs = p.toString();
+    history.replaceState(null, "", qs ? `?${qs}` : location.pathname);
+  } catch {}
+}
+function readURLState() {
+  try {
+    const p = new URLSearchParams(location.search);
+    const q = (p.get("q") || "").trim().toLowerCase();
+    const filter = p.get("status") || "all";
+    const account = p.get("account") || "all";
+    const sort = p.get("sort") || "attention";
+    if (q) {
+      state.q = q;
+      $("search").value = p.get("q") || "";
+    }
+    if (["all", "attention", "expiring", "healthy"].includes(filter))
+      state.filter = filter;
+    if (account) state.account = account;
+    if (["attention", "expiry", "name"].includes(sort)) state.sort = sort;
+    $("account").value = state.account;
+    $("sort").value = state.sort;
+    return (p.get("cert") || "").trim();
+  } catch {
+    return "";
+  }
 }
 const field = (label, value, mono = false) =>
   `<div><dt>${label}</dt><dd${mono ? ' class="mono"' : ""}>${esc(value || "Unavailable")}</dd></div>`;
@@ -516,6 +556,7 @@ function openDetail(index) {
   if (!r) return;
   if (state.selected == null) previousFocus = document.activeElement;
   state.selected = index;
+  syncURL();
   render();
   const position = visibleRecords.indexOf(r);
   const issued = !!r.notAfter;
@@ -552,6 +593,7 @@ function closeDetail() {
   document.querySelector(".topbar").inert = false;
   document.body.style.overflow = "";
   state.selected = null;
+  syncURL();
   render();
   const button = [
     ...document.querySelectorAll(`button[data-open="${index}"]`),
@@ -568,19 +610,29 @@ function toast(message) {
 document.querySelectorAll("[data-filter]").forEach((b) =>
   b.addEventListener("click", () => {
     state.filter = b.dataset.filter;
+    syncURL();
     render();
   }),
 );
+// Debounce the search: every keystroke used to rebuild the whole table, which
+// is fine at ten rows and janky at a few hundred.
+let searchTimer;
 $("search").addEventListener("input", (e) => {
-  state.q = e.target.value.trim().toLowerCase();
-  render();
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    state.q = e.target.value.trim().toLowerCase();
+    syncURL();
+    render();
+  }, 180);
 });
 $("account").addEventListener("change", (e) => {
   state.account = e.target.value;
+  syncURL();
   render();
 });
 $("sort").addEventListener("change", (e) => {
   state.sort = e.target.value;
+  syncURL();
   render();
 });
 $("reset-filters").addEventListener("click", resetFilters);
@@ -626,6 +678,15 @@ function setTheme(theme) {
     theme === "dark" ? "Switch to light theme" : "Switch to dark theme",
   );
 }
+function initialTheme() {
+  try {
+    const saved = localStorage.getItem("wecert-theme");
+    if (saved === "dark" || saved === "light") return saved;
+  } catch {}
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
+}
 $("theme").addEventListener("click", () => {
   const theme =
     document.documentElement.dataset.theme === "dark" ? "light" : "dark";
@@ -634,7 +695,87 @@ $("theme").addEventListener("click", () => {
     localStorage.setItem("wecert-theme", theme);
   } catch {}
 });
-$("refresh").addEventListener("click", () => location.reload());
+function refreshSnapshotMeta() {
+  $("snapshot-time").textContent = formatDate(snapshot.time, true);
+  $("revision").textContent =
+    snapshot.desired.revision ||
+    (snapshot.desired.frozen == null ? "Not read" : "Revision unavailable");
+  $("revision").title = snapshot.desired.generatedAt
+    ? "Generated " + formatDate(snapshot.desired.generatedAt, true)
+    : "";
+  $("freeze-state").textContent =
+    snapshot.desired.frozen == null
+      ? "Freeze state unknown"
+      : snapshot.desired.frozen
+        ? "Frozen"
+        : "Not frozen";
+  $("freeze-state").title = snapshot.desired.freezeReason || "";
+  $("account").options[0].textContent =
+    `All accounts (${new Set(records.map((r) => r.uin || "")).size})`;
+  updateSnapshotAge();
+}
+function updateSnapshotAge() {
+  const el = $("snapshot-age");
+  if (!el) return;
+  const at = new Date(snapshot.time).getTime();
+  if (Number.isNaN(at)) {
+    el.textContent = "";
+    el.className = "snapshot-age";
+    return;
+  }
+  const mins = Math.max(0, Math.round((Date.now() - at) / 60000));
+  if (mins < 1) {
+    el.textContent = "just now";
+    el.className = "snapshot-age";
+  } else if (mins < 60) {
+    el.textContent = `${mins} min ago`;
+    el.className = mins >= 10 ? "snapshot-age stale" : "snapshot-age";
+  } else {
+    const hours = Math.floor(mins / 60);
+    el.textContent = `${hours}h ${mins % 60}m ago`;
+    el.className = "snapshot-age stale";
+  }
+}
+function applySnapshot(next, { silent } = {}) {
+  const selectedName = records[state.selected]?.name || null;
+  snapshot = next;
+  records = normalizeRecords(next.certificates);
+  quotas = next.quotas || [];
+  refreshSnapshotMeta();
+  if (selectedName) {
+    const again = records.find((r) => r.name === selectedName);
+    state.selected = again ? again.index : null;
+    if (!again && !$("drawer").classList.contains("hidden")) closeDetail();
+    else if (again && !$("drawer").classList.contains("hidden"))
+      openDetail(again.index);
+    else render();
+  } else {
+    render();
+  }
+  if (!silent) toast("Inventory refreshed");
+}
+// Live refresh: pull the JSON the page is already built over, instead of a full
+// navigation. A saved console.html (file://) has no API to call -- say so rather
+// than pretending the refresh landed.
+async function refreshInventory({ silent } = {}) {
+  const button = $("refresh");
+  button.disabled = true;
+  try {
+    const res = await fetch("api/inventory", {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    applySnapshot(await res.json(), { silent });
+  } catch {
+    if (!silent)
+      toast("Live refresh unavailable — this copy is a saved snapshot or the API is unreachable");
+    updateSnapshotAge();
+  } finally {
+    button.disabled = false;
+  }
+}
+$("refresh").addEventListener("click", () => refreshInventory());
 $("legend-list").innerHTML = Object.entries(statuses)
   .map(
     ([key, value]) =>
@@ -687,9 +828,18 @@ $("freeze-state").textContent =
 $("freeze-state").title = snapshot.desired.freezeReason || "";
 $("account").options[0].textContent =
   `All accounts (${new Set(records.map((r) => r.uin || "")).size})`;
-let theme = "light";
-try {
-  theme = localStorage.getItem("wecert-theme") === "dark" ? "dark" : "light";
-} catch {}
-setTheme(theme);
+const deepLink = readURLState();
+refreshSnapshotMeta();
+setTheme(initialTheme());
 render();
+if (deepLink) {
+  const target = records.find((r) => r.name === deepLink);
+  if (target) openDetail(target.index);
+}
+// Age the snapshot label without re-rendering the table.
+setInterval(updateSnapshotAge, 30_000);
+// Quiet background refresh while the tab is visible. Saved snapshots (file://)
+// fail the fetch and fall back to the age label; no toast on the timer.
+setInterval(() => {
+  if (document.visibilityState === "visible") refreshInventory({ silent: true });
+}, 60_000);
