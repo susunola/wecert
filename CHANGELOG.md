@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Docs
+
+- **`docs/rate-limit-ari-invariants.md`** is the map for changing the quota ledger or the ARI
+  clock: which limit is filled by whom, what is memory-only, and the invariants (bare identifier
+  keys, spend points, `SpentByCA`, deadline direction) that a change must keep.
+
 ### Security
 
 - **Remote snapshots without a sealing key are refused until someone says that is

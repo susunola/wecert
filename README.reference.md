@@ -569,6 +569,8 @@ Every kind of "cannot read it" has a defined reaction. **None of them treats "un
 
 That last row is what makes wildcard-first more than an optimisation: **changing the name set makes the issuance a brand-new certificate**, which forfeits the ARI exemption. The cost of "add one domain" therefore has to be driven to nearly zero, and a wildcard is the only way to do that. It is also why the desired-state generator prefers to report "covered by the declared wildcard, 0 issuances" over touching the SAN set.
 
+Who fills which bucket, what is memory-only, and the invariants a change to this area must keep are in [docs/rate-limit-ari-invariants.md](rate-limit-ari-invariants.md).
+
 ---
 
 ## Domains that change often
