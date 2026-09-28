@@ -1,10 +1,5 @@
 package main
 
-// Runtime hot reload support.  A reload is deliberately an admission-controlled
-// replacement, not mutation of a live manager: DNS solvers, cloud credentials and
-// ACME cores all hold configuration internally.  Replacing the complete bundle
-// avoids a half-old / half-new credential set.
-
 import (
 	"context"
 	"fmt"
@@ -21,6 +16,11 @@ import (
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
+
+// Runtime hot reload support.  A reload is deliberately an admission-controlled
+// replacement, not mutation of a live manager: DNS solvers, cloud credentials and
+// ACME cores all hold configuration internally.  Replacing the complete bundle
+// avoids a half-old / half-new credential set.
 
 // runtimeController is the stable object handed to the daemon and HTTP server.
 // Its read lock is also the admission gate: a reload holds the write lock while

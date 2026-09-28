@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -20,7 +21,6 @@ import (
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 	"github.com/susunola/wecert/internal/webhook"
-	"os"
 )
 
 // openRuntime loads the config, opens the state store under the cross-process lock

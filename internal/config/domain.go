@@ -8,12 +8,13 @@ package config
 
 import (
 	"fmt"
-	"golang.org/x/net/publicsuffix"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // Split out so one concern lives in one file. Same package.
