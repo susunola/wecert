@@ -609,6 +609,7 @@ Deletion is deliberately an order of magnitude more conservative than addition: 
 | `stateBackup.keep` | no | `7` | Snapshots retained, newest first. `1`–`365` |
 | `stateBackup.dir` | no | directory of `statePath` | Where snapshots are written. Defaults beside the database (0700), so copy them off-host for real protection |
 | `stateBackup.remoteTargets[].hmacKeyFile` | no | — | Signs every uploaded snapshot with HMAC-SHA256 (a `<object>.hmac` sidecar) and refuses a remote restore whose sidecar is missing or does not match. **Without it a writable backup bucket is a trusted restore source.** Prefer a 0600 file (systemd `LoadCredential` path works). The key is **not** the `stateEncryption` master. An unreadable or empty key file fails upload/restore rather than silently publishing unsigned objects. |
+| `stateBackup.allowUnencryptedRemote` | when `remoteTargets` is set and `stateEncryption.keyFile` is not | `false` | Explicit acceptance that uploaded snapshots leave the host with private keys in the clear. Without it (and without `wecert -accept-plaintext-backups`) the daemon and `-dry-run` refuse to run: the install path must not copy the ACME account key into a bucket without someone choosing that. Setting `stateEncryption.keyFile` is the preferred fix and needs neither flag. |
 | `acme` | yes | — | See below |
 | `dns` | yes | — | See below |
 | `tencent` | yes | — | See below |

@@ -113,7 +113,7 @@ not after the first upload.
 
 | # | Do | Expect |
 |---|---|---|
-| 6b.1 | Configure `stateBackup.remoteTargets` with `stateEncryption.keyFile` **unset**, then start the daemon | a startup WARN naming the targets: the uploaded snapshots carry the ACME account key and every certificate private key in the clear, and the bucket's server-side encryption protects the bytes at rest, not from anyone who can read the bucket |
+| 6b.1 | Configure `stateBackup.remoteTargets` with `stateEncryption.keyFile` **unset**, then start the daemon | startup refuses with the four ways out named (set `keyFile`, set `allowUnencryptedRemote`, pass `-accept-plaintext-backups`, or drop the targets). With `allowUnencryptedRemote: true` the daemon starts and logs a WARN naming the targets: the uploaded snapshots carry the ACME account key and every certificate private key in the clear, and the bucket's server-side encryption protects the bytes at rest, not from anyone who can read the bucket |
 | 6b.2 | Decide, on the record: seal the database (`stateEncryption.keyFile`, which seals its snapshots too) or accept that the bucket holds the keys. Sealing needs a restart and the key cannot be hot-rotated; losing it makes the sealed rows unrecoverable | the warning is gone in 6b.1's shape, and the decision is written where the next person will look |
 | 6b.3 | `wecert -restore remote:<target>` with the target configured | it finds this deployment's own uploads (the listing matches the store's snapshot identity, not just the bare `state.db` name) |
 | 6b.4 | `wecert -backup-drill remote:<target>` | it reads the newest snapshot back, verifies its signature when `hmacKeyFile` is set, and changes nothing |

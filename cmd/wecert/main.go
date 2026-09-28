@@ -112,6 +112,8 @@ type flags struct {
 	backupDrill string
 	revokeWhy   string
 	yesFlag     bool
+	// acceptPlaintextBackups is the CLI half of stateBackup.allowUnencryptedRemote.
+	acceptPlaintextBackups bool
 }
 
 // newFlagSet registers every flag on fs -- never on the package-level flag.CommandLine, which
@@ -132,6 +134,8 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.StringVar(&f.revokeWhy, "revoke-reason", "unspecified",
 		"revocation reason: unspecified|keyCompromise|affiliationChanged|superseded|cessationOfOperation")
 	fs.BoolVar(&f.yesFlag, "yes", false, "with -revoke or -restore: skip the interactive confirmation")
+	fs.BoolVar(&f.acceptPlaintextBackups, "accept-plaintext-backups", false,
+		"allow stateBackup.remoteTargets while stateEncryption.keyFile is unset (snapshots leave the host with private keys in the clear)")
 	return fs
 }
 

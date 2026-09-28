@@ -334,6 +334,16 @@ type StateBackup struct {
 	// never YAML values.
 	RemoteTargets []BackupTarget `yaml:"remoteTargets"`
 
+	// AllowUnencryptedRemote is the explicit decision to upload snapshots whose
+	// private keys are in the clear. Required whenever RemoteTargets is non-empty
+	// and stateEncryption.keyFile is unset: without it the daemon refuses to start
+	// (and -dry-run refuses to pass), because the install path must not be able to
+	// copy the ACME account key and every certificate private key into a bucket
+	// without someone choosing that. The key file is the other way out and is
+	// preferred. Also accepted as wecert -accept-plaintext-backups, for
+	// automation that cannot edit the config.
+	AllowUnencryptedRemote bool `yaml:"allowUnencryptedRemote,omitempty"`
+
 	// Parsed, filled in by normalize.
 	IntervalDur time.Duration `yaml:"-"`
 }

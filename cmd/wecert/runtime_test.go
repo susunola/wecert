@@ -769,9 +769,51 @@ func TestRunOncePassReportsWhatTheOneShotRunMustNotSwallow(t *testing.T) {
 // and every certificate's private key unless state encryption is configured. The bucket's
 // server-side encryption protects the bytes at rest, not from whoever can read the bucket.
 //
-// This is a warning and not a refusal -- a working deployment must not go down on upgrade over a
-// copy that is already in the bucket -- so the test pins both halves: it is said when the exposure
-// is real, and it is not said once stateEncryption.keyFile is set, or when nothing leaves the host.
+// The choice is required, not assumed: without keyFile, allowUnencryptedRemote or
+// -accept-plaintext-backups the run refuses (see requireRemoteBackupPrivacyChoice). Once the
+// choice is made, startBackupsIfNeeded still says so once -- the journal reminder is separate
+// from the gate.
+func TestRemoteBackupsRequireAnExplicitPrivacyChoice(t *testing.T) {
+	targets := []config.BackupTarget{{Name: "nightly", Type: "s3", Bucket: "b"}}
+
+	// The install path used to reach this shape and just start copying keys.
+	cfg := &config.Config{StateBackup: config.StateBackup{RemoteTargets: targets}}
+	err := requireRemoteBackupPrivacyChoice(cfg, false)
+	if err == nil {
+		t.Fatal("remoteTargets without a sealing key and without an explicit acceptance must refuse to run")
+	}
+	for _, want := range []string{"stateEncryption.keyFile", "allowUnencryptedRemote", "-accept-plaintext-backups", "nightly"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must name %q so the operator can act, got:\n%v", want, err)
+		}
+	}
+
+	// The config field is the decision that lives next to the targets.
+	cfg.StateBackup.AllowUnencryptedRemote = true
+	if err := requireRemoteBackupPrivacyChoice(cfg, false); err != nil {
+		t.Fatalf("allowUnencryptedRemote: true must accept the exposure: %v", err)
+	}
+
+	// The CLI flag is the same decision for automation that cannot edit the YAML.
+	cfg.StateBackup.AllowUnencryptedRemote = false
+	if err := requireRemoteBackupPrivacyChoice(cfg, true); err != nil {
+		t.Fatalf("-accept-plaintext-backups must accept the exposure: %v", err)
+	}
+
+	// Sealing the database is the other way out and needs neither.
+	cfg.StateEncryption.KeyFile = "/etc/wecert/state.key"
+	if err := requireRemoteBackupPrivacyChoice(cfg, false); err != nil {
+		t.Fatalf("a sealed database must not need the plaintext acceptance: %v", err)
+	}
+
+	// Nothing leaving the host is not this problem at all.
+	cfg = &config.Config{StateBackup: config.StateBackup{Dir: "/var/backups/wecert"}}
+	if err := requireRemoteBackupPrivacyChoice(cfg, false); err != nil {
+		t.Fatalf("local-only snapshots must not hit the gate: %v", err)
+	}
+}
+
+// Once the privacy choice is made, the journal still says what is leaving the host.
 func TestStartBackupsWarnsWhenSnapshotsLeaveTheHostUnencrypted(t *testing.T) {
 	dir := t.TempDir()
 	store, err := state.Open(filepath.Join(dir, "state.db"))
@@ -784,10 +826,11 @@ func TestStartBackupsWarnsWhenSnapshotsLeaveTheHostUnencrypted(t *testing.T) {
 		return &config.Config{
 			StatePath: filepath.Join(dir, "state.db"),
 			StateBackup: config.StateBackup{
-				Dir:           filepath.Join(dir, "backups"),
-				Keep:          3,
-				IntervalDur:   time.Hour, // the immediate snapshot is all this test needs
-				RemoteTargets: []config.BackupTarget{{Name: "nightly", Type: "s3", Bucket: "b"}},
+				Dir:                    filepath.Join(dir, "backups"),
+				Keep:                   3,
+				IntervalDur:            time.Hour, // the immediate snapshot is all this test needs
+				RemoteTargets:          []config.BackupTarget{{Name: "nightly", Type: "s3", Bucket: "b"}},
+				AllowUnencryptedRemote: true,
 			},
 		}
 	}

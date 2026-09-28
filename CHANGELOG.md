@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Security
+
+- **Remote snapshots without a sealing key are refused until someone says that is
+  acceptable.** `stateBackup.remoteTargets` plus an unset `stateEncryption.keyFile` used to
+  start anyway and log a warning: the install path could copy the ACME account key and every
+  certificate private key into a bucket without a decision point. The daemon and `-dry-run`
+  now refuse with four ways out named (`stateEncryption.keyFile`, `stateBackup.allowUnencryptedRemote: true`,
+  `-accept-plaintext-backups`, or drop the targets). This is a deliberate upgrade break for
+  that config shape -- one line or one flag from running again, versus keys that are already
+  out of the host. The startup WARN remains once the choice is explicit.
+
 ### Fixed
 
 - Wildcard E2E sampling no longer treats macOS/BSD `dig` timeout diagnostics as leaked TXT values.

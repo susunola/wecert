@@ -42,6 +42,12 @@ func openRuntime(f *flags, log *slog.Logger) (*config.Config, *state.Store, erro
 	if f.statePath != "" {
 		cfg.StatePath = f.statePath
 	}
+	// Before the store is opened or anything is issued: -dry-run must catch this too,
+	// and a restore/revoke path that never snapshots is still running a daemon-shaped
+	// config past the same decision.
+	if err := requireRemoteBackupPrivacyChoice(cfg, f.acceptPlaintextBackups); err != nil {
+		return nil, nil, err
+	}
 
 	openStore := state.Open
 	if cfg.StateEncryption.Key != "" {
@@ -299,21 +305,49 @@ func stateBackupDirs(cfg *config.Config) []string {
 	return append([]string{primary}, cfg.StateBackup.LocalDirs...)
 }
 
-// warnAboutPlaintextRemoteBackups says, once at startup, when a snapshot is about to leave the host
-// with the private keys in the clear.
+// requireRemoteBackupPrivacyChoice refuses to run when snapshots would leave the host with
+// private keys in the clear and nobody has said that is acceptable.
 //
-// state.db holds the ACME account key and the private key of every certificate this program
-// manages. A remote target copies it to S3, COS or SFTP, and unless stateEncryption.keyFile is set
-// those copies carry that material unencrypted: the bucket's server-side encryption protects the
-// bytes at rest, not from anyone who can read the bucket, who gets keys that terminate TLS for
-// production domains. Sealing the state database seals the snapshot with it (the snapshot is a
-// VACUUM INTO copy of the sealed rows), so the fix is one config line.
+// state.db holds the ACME account key and every certificate private key. A remote target
+// copies it to S3, COS or SFTP; without stateEncryption.keyFile those copies carry that
+// material unencrypted, and the bucket's server-side encryption protects the bytes at rest,
+// not from anyone who can read the bucket. The install path used to reach that state with a
+// log line and no decision point: start, and the keys were already on their way out.
 //
-// A warning rather than a refusal, deliberately: this is the same exposure class as a
-// group-writable state directory, which this program also warns about rather than refusing to
-// start, and refusing here would take a working deployment down on upgrade over a copy that is
-// already sitting in the bucket. It is logged where the decision to run the snapshot loop is made,
-// which is the first point that knows both the targets and the key.
+// Two ways to say "yes": stateBackup.allowUnencryptedRemote: true (the decision lives next to
+// the targets in the config) or wecert -accept-plaintext-backups (for automation that cannot
+// edit the YAML). Preferring stateEncryption.keyFile is the other way out and does not need
+// either.
+//
+// Refusal, not a warning, on purpose -- and that is a deliberate upgrade break for the
+// config shape that uploaded plaintext. A working deployment is one config line or one flag
+// from running again; a silent key leak is not recoverable by a log line someone read in
+// September.
+func requireRemoteBackupPrivacyChoice(cfg *config.Config, acceptCLI bool) error {
+	if len(cfg.StateBackup.RemoteTargets) == 0 || cfg.StateEncryption.KeyFile != "" {
+		return nil
+	}
+	if cfg.StateBackup.AllowUnencryptedRemote || acceptCLI {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.StateBackup.RemoteTargets))
+	for _, target := range cfg.StateBackup.RemoteTargets {
+		names = append(names, target.Name)
+	}
+	return fmt.Errorf(
+		"stateBackup.remoteTargets (%s) is set while stateEncryption.keyFile is unset: every uploaded "+
+			"snapshot would carry the ACME account key and every certificate private key in the clear.\n"+
+			"       Pick one:\n"+
+			"       1. Set stateEncryption.keyFile and restart (preferred; the snapshots are sealed with it).\n"+
+			"       2. Set stateBackup.allowUnencryptedRemote: true to accept that the bucket holds the keys.\n"+
+			"       3. Run with -accept-plaintext-backups for the same decision outside the config.\n"+
+			"       4. Remove the remote targets and keep snapshots local.",
+		strings.Join(names, ","))
+}
+
+// warnAboutPlaintextRemoteBackups says, once at startup, when an accepted plaintext backup
+// is about to run. The choice was explicit (see requireRemoteBackupPrivacyChoice); this is
+// the standing reminder in the journal, not the gate.
 func warnAboutPlaintextRemoteBackups(cfg *config.Config, log *slog.Logger) {
 	if len(cfg.StateBackup.RemoteTargets) == 0 || cfg.StateEncryption.KeyFile != "" {
 		return

@@ -46,8 +46,11 @@ stateBackup:
   # stateEncryption.keyFile above is set it carries the ACME account key and every certificate
   # private key in the clear. The bucket's server-side encryption protects the bytes at rest, not
   # from anyone who can read the bucket. Setting the key seals both the database and its snapshots
-  # (they are VACUUM INTO copies of the sealed rows); it needs a restart to change. The daemon logs
-  # a warning at startup when remoteTargets is configured without it.
+  # (they are VACUUM INTO copies of the sealed rows); it needs a restart to change.
+  #
+  # remoteTargets without stateEncryption.keyFile is refused at startup unless you say that is
+  # acceptable: either allowUnencryptedRemote: true below, or wecert -accept-plaintext-backups.
+  # The install path is not allowed to reach "keys are already in the bucket" without that choice.
   # remoteTargets:
   #   - name: production-s3
   #     type: s3
