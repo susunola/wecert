@@ -56,11 +56,21 @@ stateBackup:
   #     region: ap-southeast-1
   #     keep: 7
   #     timeout: 5m
+  #     # Sign every uploaded snapshot with HMAC-SHA256 (a <object>.hmac sidecar)
+  #     # and refuse to restore an object whose sidecar is missing or does not
+  #     # match. Without this, a writable bucket is a trusted restore source:
+  #     # anyone who can PutObject under the prefix can plant a state.db that
+  #     # replaces the live one on the next restore. Prefer a 0600 file over an
+  #     # inline value. The key is NOT the stateEncryption master -- leaking one
+  #     # must not unlock the other. An unreadable or empty key file fails the
+  #     # upload/restore rather than silently publishing unsigned objects.
+  #     # hmacKeyFile: /etc/wecert/backup-hmac.key
   #   - name: tencent-cos
   #     type: cos
   #     bucket: wecert-1250000000
   #     endpoint: https://cos.ap-guangzhou.myqcloud.com
   #     region: ap-guangzhou
+  #     # hmacKeyFile: /etc/wecert/backup-hmac.key
   #     # COS reads these by default (custom env variable names are supported).
   #     # secretIdEnv: TENCENTCLOUD_SECRET_ID
   #     # secretKeyEnv: TENCENTCLOUD_SECRET_KEY
@@ -72,6 +82,7 @@ stateBackup:
   #     privateKeyFile: /etc/wecert/backup_ed25519
   #     # privateKeyPassphraseEnv: WECERT_SFTP_KEY_PASSPHRASE
   #     knownHostsFile: /etc/wecert/backup_known_hosts
+  #     # hmacKeyFile: /etc/wecert/backup-hmac.key
 
 acme:
   # ⚠️ Defaults to staging. install.sh installs this very file as

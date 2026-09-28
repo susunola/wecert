@@ -204,9 +204,11 @@ func open(path string, exclusive bool) (*Store, error) {
 	if exclusive && lock != nil {
 		if _, applied, rerr := ApplyPendingRestore(path); applied {
 			if rerr != nil {
-				// The pending file is gone either way (one-shot). Refuse to start: the
-				// operator staged a restore and it failed, and silently continuing on the
-				// old database is exactly the false all-clear this path exists to prevent.
+				// Refuse to start: the operator staged a restore and it failed, and
+				// silently continuing on the old database is exactly the false all-clear
+				// this path exists to prevent. ApplyPendingRestore keeps the staged file
+				// unless its own bytes are bad (see that function), so the next start
+				// retries the same restore rather than losing the only verified copy.
 				// Release the lock we already hold -- the openFiles failure path below does.
 				_ = lock.release()
 				return nil, rerr

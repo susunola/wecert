@@ -5,30 +5,26 @@
 ### Fixed
 
 - Wildcard E2E sampling no longer treats macOS/BSD `dig` timeout diagnostics as leaked TXT values.
-
-## 0.9.2 - 2026-09-27
-
-### Fixed
-
-- ACME HTTP clients explicitly append `SSL_CERT_FILE` to the system trust pool, making local/private ACME E2E fixtures reliable on macOS while preserving normal system trust.
-- Added the production E2E execution report for the real Cloudflare, S3, COS and Tencent CLB runs.
-
-## 0.9.1 - 2026-09-27
+- **`VerifyUpload` checks the `.hmac` sidecar when a signing key is configured.** It used to
+  confirm only that the snapshot object was readable and the right size, then report the backup
+  healthy -- while the first restore failed with "signature missing" because the sidecar had
+  never been published. A signed upload is a pair; verify both or neither.
+- **Remote restore drops its `<temp>.remotekey` bookkeeping file** together with the download,
+  instead of leaving it in the state directory.
+- **`hmacKeyFile` is documented** in `config.example.yaml`, `README.reference.md` and the
+  state-backup section of the READMEs. The field existed and was load-bearing; the only prose
+  about it lived in this changelog.
+- **The nginx `reload: []` docs say what the code actually does.** Files land on disk and
+  nothing tells nginx, so `DeployConfirmed` stays false and the inventory keeps reporting
+  "not confirmed". The previous wording said a successful write counts as confirmed, which is
+  only true when `reload` is non-empty.
 
 ### Security
 
-- **Sealed snapshots are authenticated before restore.** When `stateEncryption.keyFile` is
-  configured, CLI and admin restores now verify every encrypted account, certificate, in-flight
-  order and retired rollback blob with the active key before replacing the live database. A wrong
-  key or tampered ciphertext is rejected without installing the snapshot.
+- **`VerifyUpload` refuses a signed upload whose sidecar is missing or does not match**, so a
+  backup that will not restore is not reported as healthy.
 
-## Unreleased
-
-### Fixed
-
-- **Local ACME test directories trust `SSL_CERT_FILE` on macOS.** The ACME HTTP client now
-  explicitly appends the PEM bundle named by `SSL_CERT_FILE` to the system root pool. This keeps
-  private/Pebble endpoints testable in child processes without replacing normal system trust.
+## 0.9.2 - 2026-09-27
 
 ### Security
 
@@ -42,6 +38,8 @@
 
 ### Fixed
 
+- ACME HTTP clients explicitly append `SSL_CERT_FILE` to the system trust pool, making local/private ACME E2E fixtures reliable on macOS while preserving normal system trust.
+- Added the production E2E execution report for the real Cloudflare, S3, COS and Tencent CLB runs.
 - **The identifier pause and the failed-authorization budget key on the same name for a wildcard.**
   The failed-authorization budget was fixed to use the bare identifier (`*.example.com` becomes
   `example.com`, because that is what the CA's refusal names and what the authorization carries),
@@ -54,8 +52,6 @@
   tree the operator configured and outside any later cleanup that walks it. The config layer puts no
   character restriction on a certificate name, so that guard is the only one on the path; it now
   rejects the names that navigate rather than name.
-### Fixed
-
 - **A sealed deployment's snapshots can be restored again.** `checkSnapshotPayload` proves a
   candidate snapshot's material is readable rather than merely well-framed: it decodes PEM. Sealing
   stores `wecert-seal-v*` ciphertext in exactly those columns, so every snapshot a sealed deployment
@@ -79,8 +75,6 @@
   blob reached the caller as ciphertext and the command failed while reading the certificate it was
   asked to revoke. `-revoke` is what an operator runs when a key has leaked, and the deployments most
   likely to run it are the ones that sealed the database. It opens the store the way the daemon does.
-### Fixed
-
 - **The quota gauges are published once per trigger, by construction rather than by luck.** The
   count of in-flight webhook-triggered passes answers "is one running right now", which is not the
   question: a trigger registers its passes in a loop and each runs in its own goroutine, so on a
@@ -92,8 +86,6 @@
   certificates). Registration is now bracketed (`beginQuotaTrigger`/`endQuotaTrigger`), the quiet
   condition every publisher checks is "no pass running **and** no trigger still registering", and the
   check-and-claim happens under one lock so two publishers cannot both observe the quiet state.
-### Fixed
-
 - **A certificate that leaves the desired state takes its persisted probe evidence with it.** The
   last verdict per host is written to `probe_samples` so a restart can show what the previous
   process observed instead of `probe_unknown`. Nothing ever revisits a name that has left the
@@ -139,6 +131,15 @@
   once already. The test seeds `probe_samples`, serves the page with an empty in-memory answer set,
   and asserts the row carries the persisted verdict with its `observedAt`; deleting the fallback
   makes it fail with `status = "probe_unknown"`.
+
+## 0.9.1 - 2026-09-27
+
+### Security
+
+- **Sealed snapshots are authenticated before restore.** When `stateEncryption.keyFile` is
+  configured, CLI and admin restores now verify every encrypted account, certificate, in-flight
+  order and retired rollback blob with the active key before replacing the live database. A wrong
+  key or tampered ciphertext is rejected without installing the snapshot.
 
 ## 0.9.0 - 2026-09-26
 

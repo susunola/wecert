@@ -247,9 +247,12 @@ nginx:
 ```
 
 wecert writes `fullchain.pem` (0644) and `privkey.pem` (0600) with an atomic rename and then
-runs the reload argv (never a shell string). The file pair *is* the deployment: there is no
-cloud certificate id and no console bind, so a successful write counts as confirmed. Point
-`ssl_certificate` / `ssl_certificate_key` in the server block at those two files.
+runs the reload argv (never a shell string). Point `ssl_certificate` / `ssl_certificate_key` in
+the server block at those two files. The file pair *is* the deployment: there is no cloud
+certificate id and no console bind. With a non-empty `reload`, a successful write plus reload
+is confirmed. With `reload: []` the files land but nothing tells nginx, so wecert deliberately
+leaves the deployment unconfirmed (`DeployConfirmed` stays false) — the inventory keeps saying
+"not confirmed" until something reloads nginx and a later pass observes the files being served.
 
 
 If you only need the material **copied somewhere** (another host, a backup bucket) without
@@ -259,7 +262,9 @@ Export is distribution; deploy is putting the certificate into service. Both can
 One process deploys to one backend (`deploy.target: tencent` or `nginx`); mixing CLB and
 nginx in one config is refused at load time. The unit runs as user `wecert`, which cannot
 reload nginx by itself — allow exactly that command in sudoers, use a helper script, or set
-`reload: []` and reload on your own schedule. See `config.example.yaml` for the full block.
+`reload: []` and reload on your own schedule. With `reload: []` wecert writes the files and
+stops there: it never marks the deployment confirmed, because it has not seen nginx pick
+the new pair up. See `config.example.yaml` for the full block.
 
 ## Read-only console
 

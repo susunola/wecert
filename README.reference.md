@@ -608,6 +608,7 @@ Deletion is deliberately an order of magnitude more conservative than addition: 
 | `stateBackup.interval` | no | `24h` | Minimum `1m`. Snapshots are a recovery mechanism, not a change log |
 | `stateBackup.keep` | no | `7` | Snapshots retained, newest first. `1`–`365` |
 | `stateBackup.dir` | no | directory of `statePath` | Where snapshots are written. Defaults beside the database (0700), so copy them off-host for real protection |
+| `stateBackup.remoteTargets[].hmacKeyFile` | no | — | Signs every uploaded snapshot with HMAC-SHA256 (a `<object>.hmac` sidecar) and refuses a remote restore whose sidecar is missing or does not match. **Without it a writable backup bucket is a trusted restore source.** Prefer a 0600 file (systemd `LoadCredential` path works). The key is **not** the `stateEncryption` master. An unreadable or empty key file fails upload/restore rather than silently publishing unsigned objects. |
 | `acme` | yes | — | See below |
 | `dns` | yes | — | See below |
 | `tencent` | yes | — | See below |

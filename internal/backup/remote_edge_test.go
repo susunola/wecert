@@ -766,6 +766,46 @@ func TestDownloadWithoutSigningKeyNeverReadsASidecar(t *testing.T) {
 
 // --- HMAC sidecar verification (S3) ---------------------------------------------
 
+// A signed upload is a pair: the snapshot object and its `.hmac`. VerifyUpload must
+// refuse a backup whose sidecar is missing or does not match -- reporting that pair
+// healthy and then failing the first restore with "signature missing" is the lie the
+// sidecar exists to prevent.
+func TestVerifyUploadRequiresTheHMACSidecar(t *testing.T) {
+	s3TestEnv(t)
+	store := newFakeS3Store(t)
+	key := []byte("verify-upload-signing-key")
+	dir := t.TempDir()
+	src := writeSnapshot(t, dir, snapshotName("20260101T000000.000Z"), "snapshot-bytes")
+	target := s3Target(store, 0, key)
+
+	if err := Upload(context.Background(), target, src); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if err := VerifyUpload(context.Background(), target, src); err != nil {
+		t.Fatalf("signed upload + matching sidecar must verify: %v", err)
+	}
+
+	// Drop the sidecar: the snapshot object alone is not a healthy signed backup.
+	store.remove(objectKey("20260101T000000.000Z") + ".hmac")
+	if err := VerifyUpload(context.Background(), target, src); err == nil ||
+		!strings.Contains(err.Error(), "sidecar") {
+		t.Fatalf("VerifyUpload without a sidecar = %v, want a missing-sidecar error", err)
+	}
+
+	// Restore the sidecar but corrupt it: same refusal, different reason.
+	store.put(objectKey("20260101T000000.000Z")+".hmac", []byte("not-a-signature"))
+	if err := VerifyUpload(context.Background(), target, src); err == nil {
+		t.Fatal("VerifyUpload must refuse a sidecar that is not a signature")
+	}
+
+	// Without a signing key the sidecar is not part of the contract.
+	unsigned := s3Target(store, 0, nil)
+	store.remove(objectKey("20260101T000000.000Z") + ".hmac")
+	if err := VerifyUpload(context.Background(), unsigned, src); err != nil {
+		t.Fatalf("unsigned VerifyUpload must not require a sidecar: %v", err)
+	}
+}
+
 // A writable bucket is not a trusted restore source. When a signing key is configured,
 // an object whose bytes do not match its sidecar must be refused -- and the refused
 // download must not stay in the directory that the caller restores from.

@@ -122,12 +122,17 @@ func uploadOnce(ctx context.Context, target Target, src string) error {
 }
 
 // VerifyUpload proves that the object just published is visible from a fresh
-// remote operation and has the same length as the local, SQLite-verified
-// snapshot.  PutObject/rename acknowledgement alone is not a recovery
-// guarantee: a misconfigured gateway can acknowledge a write that cannot be
-// read by the credentials used for recovery.  This deliberately checks the
-// exact name, rather than "latest", so a concurrent retention pass or another
-// installation in the same bucket cannot make an old backup look healthy.
+// remote operation, has the same length as the local, SQLite-verified snapshot,
+// and -- when a signing key is configured -- carries a matching `.hmac` sidecar.
+// PutObject/rename acknowledgement alone is not a recovery guarantee: a
+// misconfigured gateway can acknowledge a write that cannot be read by the
+// credentials used for recovery. This deliberately checks the exact name, rather
+// than "latest", so a concurrent retention pass or another installation in the
+// same bucket cannot make an old backup look healthy.
+//
+// Checking only the snapshot object while a signing key is set would call a
+// backup "verified" and then fail the first restore with "signature missing".
+// The sidecar is part of the published pair; verify both or neither.
 func VerifyUpload(ctx context.Context, target Target, src string) error {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -152,6 +157,11 @@ func VerifyUpload(ctx context.Context, target Target, src string) error {
 		if head.ContentLength == nil || *head.ContentLength != info.Size() {
 			return fmt.Errorf("read back %s://%s/%s: size %d, want %d", target.Type, target.Bucket, key, derefInt64(head.ContentLength), info.Size())
 		}
+		if len(target.HMACKey) > 0 {
+			if err := verifyRemoteSignatureBytes(ctx, target, key, src); err != nil {
+				return fmt.Errorf("read back %s://%s/%s: %w", target.Type, target.Bucket, key, err)
+			}
+		}
 		return nil
 	case TypeSFTP:
 		session, err := openSFTP(ctx, target)
@@ -167,10 +177,42 @@ func VerifyUpload(ctx context.Context, target Target, src string) error {
 		if got.Size() != info.Size() {
 			return fmt.Errorf("read back SFTP snapshot %s: size %d, want %d", remote, got.Size(), info.Size())
 		}
+		if len(target.HMACKey) > 0 {
+			f, err := session.client.Open(remote + ".hmac")
+			if err != nil {
+				return fmt.Errorf("read back SFTP snapshot %s.hmac: %w (a signed upload must publish its sidecar)", remote, err)
+			}
+			sig, rerr := io.ReadAll(io.LimitReader(f, 4096))
+			_ = f.Close()
+			if rerr != nil {
+				return fmt.Errorf("read back SFTP snapshot %s.hmac: %w", remote, rerr)
+			}
+			data, err := os.ReadFile(src)
+			if err != nil {
+				return fmt.Errorf("read uploaded snapshot: %w", err)
+			}
+			if err := VerifySnapshot(target.HMACKey, data, string(sig)); err != nil {
+				return fmt.Errorf("read back SFTP snapshot %s: %w", remote, err)
+			}
+		}
 		return nil
 	default:
 		return fmt.Errorf("unknown backup target type %q", target.Type)
 	}
+}
+
+// verifyRemoteSignatureBytes fetches the `.hmac` sidecar for remoteKey and checks
+// it against the local snapshot bytes.
+func verifyRemoteSignatureBytes(ctx context.Context, t Target, remoteKey, src string) error {
+	sig, err := downloadS3Bytes(ctx, t, remoteKey+".hmac")
+	if err != nil {
+		return fmt.Errorf("signature sidecar missing or unreadable (%s.hmac): %w (a signed upload must publish its sidecar)", remoteKey, err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("read uploaded snapshot: %w", err)
+	}
+	return VerifySnapshot(t.HMACKey, data, string(sig))
 }
 
 func derefInt64(v *int64) int64 {

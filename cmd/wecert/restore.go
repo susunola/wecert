@@ -101,7 +101,14 @@ func resolveRestoreSnapshot(cfg *config.Config, arg string) (string, func(), err
 		if err != nil {
 			return "", func() {}, err
 		}
-		return source, func() { _ = os.Remove(source) }, nil
+		// DownloadLatest leaves a `<temp>.remotekey` bookkeeping file naming the
+		// remote object the sidecar belongs to. Drop it with the download; leaving
+		// it behind litters the state directory and the next restore can mistake
+		// it for something that should be cleaned up as a snapshot.
+		return source, func() {
+			_ = os.Remove(source)
+			_ = os.Remove(source + ".remotekey")
+		}, nil
 	}
 	return "", func() {}, fmt.Errorf("restore: no remote backup target named %q", name)
 }

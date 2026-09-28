@@ -232,12 +232,16 @@ nginx:
 ```
 
 wecert 以原子 rename 写入 `fullchain.pem`（0644）和 `privkey.pem`（0600），再执行 reload
-（argv 形式，不会进 shell）。这两份文件本身就是部署结果：没有云证书 id，也没有控制台绑定，
-写入成功即视为已确认。把 server 块里的 `ssl_certificate` / `ssl_certificate_key` 指到它们即可。
+（argv 形式，不会进 shell）。把 server 块里的 `ssl_certificate` / `ssl_certificate_key` 指到它们即可。
+这两份文件本身就是部署结果：没有云证书 id，也没有控制台绑定。`reload` 非空时，写入加 reload
+成功即视为已确认；`reload: []` 时文件会落盘，但没有人通知 nginx，wecert 因此**故意**不把部署标为
+已确认（`DeployConfirmed` 保持 false）——清单会一直显示“未确认”，直到有人重载 nginx 且后续某一轮
+观察到新文件正在被服务。
 
 一个进程只对接一个后端（`deploy.target: tencent` 或 `nginx`），同一配置里混用会在加载时被拒绝。
 服务以用户 `wecert` 运行，默认无法 reload nginx——请用 sudoers 放行这一条命令、放 helper 脚本，
-或设 `reload: []` 自己调度重载。完整示例见 `config.example.yaml`。
+或设 `reload: []` 自己调度重载。`reload: []` 时 wecert 只负责把文件写到位，不会把部署标为已确认，
+因为它没看到 nginx 用上新文件。完整示例见 `config.example.yaml`。
 
 ## 日常运维
 
