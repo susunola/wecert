@@ -15,6 +15,16 @@
 
 ### Fixed
 
+- **A hand copy that takes the generation sidecar along is no longer silent.**
+  `state.db.generation` only catches `cp snapshot state.db`. A copy of `state.db` *and*
+  its sidecar (or a copy onto a machine that has no sidecar) is self-consistent and used
+  to look like a normal start. The database now carries `state_generation.install_id` and
+  the host keeps an `install-id` file beside it under a name a `state.db*` glob does not
+  match: a missing or disagreeing file is called out on the next locked open, then the
+  host identity is adopted so a second start of that copy is quiet. `wecert -restore`
+  adopts the host identity without alarming. The remaining hole -- copying `install-id`
+  with the pair -- is an explicit whole-directory restore and is documented in
+  `docs/backlog.md` §4.
 - Wildcard E2E sampling no longer treats macOS/BSD `dig` timeout diagnostics as leaked TXT values.
 - **`VerifyUpload` checks the `.hmac` sidecar when a signing key is configured.** It used to
   confirm only that the snapshot object was readable and the right size, then report the backup

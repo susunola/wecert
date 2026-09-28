@@ -188,7 +188,10 @@ CREATE TABLE IF NOT EXISTS rate_buckets (
 
 -- A monotonic generation is deliberately outside certificate state.  The sidecar
 -- mirror lets a later start notice a hand-copied older database before it places
--- another order against a rate-limit ledger that has moved backwards.
+-- another order against a rate-limit ledger that has moved backwards.  install_id
+-- is the other half: a copy that takes the sidecar along is self-consistent, so
+-- this column is compared against a host file that a "state.db*" glob does not
+-- match (see installid.go).
 CREATE TABLE IF NOT EXISTS state_generation (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     generation INTEGER NOT NULL DEFAULT 0

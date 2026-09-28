@@ -31,14 +31,30 @@ They are ordered by real exposure over effort.
 
 4. **Notice a state database that was restored without `wecert -restore`**
 
-   Mostly done, and the remaining half is the awkward one. `wecert -restore` writes `state.db.restored`, and the next start warns for seven days that the rate-limit ledger stops at the snapshot (`state.RestoreCaveatWindow`). The hand path — `cp snapshot state.db`, which is what docs/recovery.md documented for years — is now caught by a durable sidecar: `state.db.generation` holds the high-water mark of every locked open (`state.advanceGeneration`), and a snapshot carries an older generation. Copying only `state.db` over a live install leaves the sidecar ahead, and the next start warns that the database looks like it was restored outside `wecert -restore`. The supported command resets the lineage via its own marker, so a legitimate restore is not a false alarm.
+   Done for the copies anyone actually makes. Three paths, three signals:
 
-   What the sidecar still cannot see, and this is the design that is not settled:
+   - **`cp snapshot state.db`** (the hand restore docs/recovery.md used to document): the
+     `state.db.generation` sidecar holds the high-water mark of every locked open
+     (`state.advanceGeneration`), and a snapshot carries an older generation. Copying only
+     `state.db` leaves the sidecar ahead, and the next start warns. The supported command
+     resets the lineage via its own marker, so a legitimate restore is not a false alarm.
+   - **`cp state.db state.db.generation` as a pair** (or onto a machine that has no
+     sidecar): file and database agree, so the sidecar check stays quiet. The host keeps an
+     `install-id` beside the database under a name a `state.db*` glob does not match, and
+     `state_generation.install_id` inside the database. A missing file, or a file that
+     disagrees with the column, is called out on the next locked open -- then the host
+     identity is adopted so a second ordinary start of that copy is quiet (the alarm is
+     about the arrival, not forever).
+   - **`wecert -restore`**: the marker starts a new generation lineage *and* adopts the
+     host install-id, so the supported path is silent in both checks.
 
-   - **Copy the database *and* its `.generation` together.** The pair is self-consistent, so the high-water mark moves with the file and the warning never fires. Detecting that needs something inside the file itself (a heartbeat row or a start/stop ledger), not another sibling.
-   - **Copy onto a machine that has no sidecar at all.** A fresh host, or a restore directory that never ran wecert, has nothing to compare against. `present && previous > generation` is the only warning path; `!present` is silent by design (a first start is not a restore).
-
-   The tempting in-file signal — "the file's mtime is much newer than the newest row in it" — remains a false-positive generator: SQLite checkpoints the WAL at open and at close, so a daemon that wrote once and then idled for a week has exactly that signature after an ordinary restart. Worth doing only once the in-file design is settled; until then the answer is "restore through the command, which records it", and the sidecar catches the common copy-over mistake.
+   What is still a known hole, and is accepted: an operator who copies the whole state
+   directory including `install-id` has a self-consistent pair that neither check can see
+   from inside the machine. Detecting that needs an external anchor (a second host's
+   generation, or a remote ledger) and is not planned. The tempting in-file signal —
+   "the file's mtime is much newer than the newest row in it" — remains a false-positive
+   generator: SQLite checkpoints the WAL at open and at close, so a daemon that wrote once
+   and then idled for a week has exactly that signature after an ordinary restart.
 
 4b. **Done: the orphan teardown is proportional to what needs cleaning** (closed 2026-09-22)
 

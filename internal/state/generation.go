@@ -43,7 +43,11 @@ func (s *Store) advanceGeneration() error {
 	if err := atomicfile.Write(s.path+generationSuffix, []byte(strconv.FormatInt(generation, 10)+"\n"), 0o600); err != nil {
 		return fmt.Errorf("record state generation: %w", err)
 	}
-	return nil
+	// The generation sidecar catches `cp snapshot state.db`. The install-id pair
+	// (this database's identity column vs a host file a `state.db*` glob does not
+	// match) catches the copy that takes the sidecar along, and the copy onto a
+	// machine that never had one. See installid.go.
+	return s.reconcileInstallID()
 }
 
 func loadGeneration(path string) (int64, bool) {

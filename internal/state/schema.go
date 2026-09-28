@@ -84,6 +84,9 @@ var schemaColumns = []struct{ table, column, decl string }{
 	{"authorizations", "reclaim_attempts", "INTEGER NOT NULL DEFAULT 0"},
 	{"authorizations", "reclaim_last_error", "TEXT NOT NULL DEFAULT ''"},
 	{"authorizations", "reclaim_stuck_since", "INTEGER NOT NULL DEFAULT 0"},
+	// Host-side install identity (see installid.go). Legacy rows keep '' = unknown,
+	// which the first locked open stamps with this host's id without alarming.
+	{"state_generation", "install_id", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // pendingMigrations reports schema changes this binary would apply, without applying them.
