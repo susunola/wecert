@@ -95,6 +95,7 @@ type Server struct {
 	token   string
 	tokenMu sync.RWMutex
 	uin     string
+	uinMu   sync.RWMutex
 	baseCtx context.Context
 	log     *slog.Logger
 	now     func() time.Time
@@ -243,6 +244,8 @@ func (s *Server) SetAdminToken(token string) {
 // SetAccountUIN records the Tencent Cloud account this process deploys into.
 // Empty is valid: the inventory then omits uin unless a certificate sets its own.
 func (s *Server) SetAccountUIN(uin string) {
+	s.uinMu.Lock()
+	defer s.uinMu.Unlock()
 	s.uin = strings.TrimSpace(uin)
 }
 

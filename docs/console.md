@@ -61,8 +61,9 @@ unset WECERT_TOKEN
 
 Open the resulting `console.html` in a browser. Search, filters, sorting, themes,
 and details work offline. This file contains a point-in-time inventory: **Refresh
-only reloads the saved file**. Fetch it again for new data. It contains no private
-keys or certificate PEM, but does contain inventory metadata.
+cannot update a saved file** and reports that live refresh is unavailable. Fetch
+it again for new data. It contains no private keys or certificate PEM, but does
+contain inventory metadata.
 
 The same authenticated request to `http://127.0.0.1:9801/api/inventory` returns JSON.
 
@@ -72,8 +73,13 @@ When the daemon has resolved desired state, the Console shows an **Issuance
 quota** strip above the certificate list. It reports the tightest local bucket
 for account orders, certificates per registered domain (50, refilling one token
 every 202 minutes), and certificates per exact identifier set (5, refilling one
-token every 34 hours). A value under 20% is amber; a request refused by the CA
-is red and includes the CA-provided retry time when one is available.
+token every 34 hours), plus authorization failures and consecutive authorization
+failure pauses per identifier. A value at or below the low-capacity threshold is
+amber; a request refused by the CA is red and includes the CA-provided retry time
+when one is available. CA-only capacity is shown as unknown rather than as a
+remaining balance. Unreadable scopes are called out separately; they never produce
+an all-clear summary. The expanded table includes every reported scope, and the
+quota cards stack on narrow screens.
 
 These are deliberately labelled **local issuance estimates**. Let's Encrypt
 does not offer a remaining-quota API, and the registered-domain and exact-set
@@ -121,9 +127,14 @@ ssh -N -L 127.0.0.1:9802:127.0.0.1:9802 user@daemon-host
 ```
 
 Open **http://127.0.0.1:9802/status** on the workstation. **Refresh** requests a new
-server snapshot. Reads use the daemon's existing state and caches; they do not
-trigger issuance or a Tencent Cloud API enumeration. For shared browser access,
-use your existing TLS and SSO gateway instead of exposing this unauthenticated
+server snapshot; visible tabs also refresh every 60 seconds. Manual and background
+refresh share one in-flight request with a 15-second deadline. Account options follow the new snapshot, while
+an open certificate drawer retains its reading position and keyboard focus.
+Reads use the daemon's existing state and caches; they do not trigger issuance or
+a Tencent Cloud API enumeration. Cached bindings are forwarded through the runtime
+controller across reloads. Disabled probes (including deployment-disabled
+certificates) do not turn historical evidence into current health failures.
+For shared browser access, use your existing TLS and SSO gateway instead of exposing this unauthenticated
 loopback proxy on a public interface.
 
 ## Reading the evidence
@@ -136,13 +147,39 @@ loopback proxy on a public interface.
   useful evidence; the next live probe replaces it.
 - **≥** is a minimum known binding count, not a complete cloud inventory. Unknown
   bindings do not mean unbound. Cached bindings include their observation time;
-  local deployment records do not invent a cloud observation timestamp.
+  local deployment records do not invent a cloud observation timestamp. The parsed
+  cloud cache currently covers CLB only; completeness applies to that stated scope,
+  not to other configured deployment types such as CDN.
 - **Expiring** means within the configured renewal window. Details include an ARI
   window, retry time, failure reason, and drift tokens when those fields exist.
 - Account UINs organize the display. They do not change which cloud credentials
   the daemon uses.
 
 ![Certificate evidence drawer](console-detail.png)
+
+## Browser regression gate
+
+`make check-console` generates a temporary fixture through the production Go
+renderer and exercises it in Chromium. Every test uses an isolated context;
+network requests are intercepted, and no daemon, credentials, or cloud API is
+needed. The suite covers quota uncertainty and blocks, account changes, overlapping
+refreshes and retries, drawer focus/scroll, keyboard navigation, and 320/390/1440px
+quota layout. CI runs the same target.
+
+Install the test dependency in a dedicated virtual environment:
+
+```bash
+python3 -m venv /tmp/wecert-console-venv
+/tmp/wecert-console-venv/bin/python -m pip install playwright==1.62.0
+/tmp/wecert-console-venv/bin/python -m playwright install chromium
+make check-console PYTHON=/tmp/wecert-console-venv/bin/python
+```
+
+Set `WECERT_CHROME` to an executable to use a specific Chrome/Chromium build.
+On macOS an installed Google Chrome is used by default; otherwise the suite uses
+Playwright Chromium. `scripts/check-console.py --html /path/to/console.html`
+checks a frozen fixture; `--artifacts-dir /tmp/console-evidence` writes screenshots
+into a new run directory without overwriting prior evidence.
 
 ## Reproduce the screenshots
 

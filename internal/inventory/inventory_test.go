@@ -9,6 +9,46 @@ import (
 	"github.com/susunola/wecert/internal/state"
 )
 
+func TestInactiveProbeEvidenceDoesNotAffectHealth(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC)
+	for _, disabledBy := range []string{"probe", "deployment"} {
+		for _, sample := range []HostSample{
+			{Host: "example.com", ProblemKind: "unreachable"},
+			{Host: "example.com", ProblemKind: "not_after"},
+			{Host: "example.com", ProblemKind: "untrusted"},
+			{Host: "example.com", Match: true, Trusted: true},
+		} {
+			t.Run(disabledBy+"/"+sample.ProblemKind, func(t *testing.T) {
+				in := Input{
+					Now: now, Names: []string{"a"}, ProbeEnabled: disabledBy != "probe",
+					Certs: map[string]*state.CertState{"a": {
+						Name: "a", NotAfter: now.Add(10 * 24 * time.Hour), DeployedCertID: "fixture-cert", DeployConfirmed: true,
+					}},
+					Probes: map[string][]HostSample{"a": {sample}},
+				}
+				if disabledBy == "deployment" {
+					in.Desired = &spec.Result{Certificates: []config.Certificate{{Name: "a", Deploy: config.Deploy{Enabled: false}}}}
+				}
+				snap := Assemble(in)
+				row := snap.Certificates[0]
+				if row.Status != StatusExpiring || snap.Summary.Expiring != 1 {
+					t.Errorf("inactive probe masks expiry: status=%s summary=%+v", row.Status, snap.Summary)
+				}
+				if row.Probe.Enabled || row.Probe.OK != nil || row.Probe.Hosts == nil || len(row.Probe.Hosts) != 0 {
+					t.Errorf("inactive probe has an active verdict: %+v", row.Probe)
+				}
+				if len(row.Drift) != 0 {
+					t.Errorf("inactive evidence caused drift: %v", row.Drift)
+				}
+				if len(in.Probes["a"]) != 1 {
+					t.Error("assembly mutated the input evidence")
+				}
+			})
+		}
+	}
+}
+
 func TestStatusTokens(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)

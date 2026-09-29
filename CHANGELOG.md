@@ -21,6 +21,24 @@
 
 ### Fixed
 
+- **The production Console receives cached cloud bindings.** The stable runtime
+  controller now forwards `BindingSnapshot` under its reload read lock, with an
+  interface assertion and an integration test through the real controller. The
+  CLB-only detail cache keeps its observed scope even with mixed CLB/CDN deployment.
+- **Disabled probes do not revive historical failures.** Persisted samples remain
+  stored, but disabled probing, explicitly disabled deployment, and unconfirmed
+  deployments exclude them from active status and drift. Enabled restart fallback
+  remains intact. Account UIN reads and SIGHUP updates are synchronized.
+- **Quota diagnostics include authorization failures and CA-only pauses.** Every
+  reported family remains visible; unreadable and CA-only capacity no longer look
+  healthy. Known blocks take precedence, empty snapshots clear stale cards, and
+  mobile quota rows stack without clipping.
+- **Live Console refresh preserves user context.** Manual/timer refreshes are
+  single-flight with a 15-second deadline, account options follow added/removed UINs, and passive drawer
+  updates retain scroll and keyboard focus. Closing a removed certificate restores
+  focus to a connected control. A real-browser regression gate runs in CI via
+  `make check-console` using isolated fixtures and no cloud access.
+
 - **Remote retention and download honour the local clock-drift rules.** A
   future-stamped snapshot name sorts as newest forever and used to hold a Keep slot
   forever on S3/COS/SFTP; it is now never the download "newest" and is always a prune

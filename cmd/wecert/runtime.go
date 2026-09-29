@@ -341,7 +341,7 @@ func requireRemoteBackupPrivacyChoice(cfg *config.Config, acceptCLI bool) error 
 			"       1. Set stateEncryption.keyFile and restart (preferred; the snapshots are sealed with it).\n"+
 			"       2. Set stateBackup.allowUnencryptedRemote: true to accept that the bucket holds the keys.\n"+
 			"       3. Run with -accept-plaintext-backups for the same decision outside the config.\n"+
-			"       4. Remove the remote targets and keep snapshots local.",
+			"       4. Remove the remote targets and keep snapshots local",
 		strings.Join(names, ","))
 }
 

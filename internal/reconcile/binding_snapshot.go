@@ -18,10 +18,13 @@ func (r *Reconciler) BindingSnapshot(certID string) (inventory.Bindings, bool) {
 		return inventory.Bindings{}, false
 	}
 	out := inventory.Bindings{
-		Count:     snap.Count,
-		Complete:  snap.Complete,
-		Freshness: inventory.FreshnessCached,
-		Items:     make([]inventory.BindingItem, 0, len(snap.Items)),
+		// TaskDetail and its parser currently observe CLB only. Do not let the
+		// inventory fallback broaden that scope to every configured deploy type.
+		ResourceTypes: []string{"clb"},
+		Count:         snap.Count,
+		Complete:      snap.Complete,
+		Freshness:     inventory.FreshnessCached,
+		Items:         make([]inventory.BindingItem, 0, len(snap.Items)),
 	}
 	if !observedAt.IsZero() {
 		out.ObservedAt = observedAt.UTC().Format(time.RFC3339)

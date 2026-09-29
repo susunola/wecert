@@ -10,11 +10,13 @@ import (
 
 	"github.com/susunola/wecert/internal/acme"
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/inventory"
 	"github.com/susunola/wecert/internal/probe"
 	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
+	"github.com/susunola/wecert/internal/webhook"
 )
 
 // Runtime hot reload support.  A reload is deliberately an admission-controlled
@@ -32,6 +34,8 @@ type runtimeController struct {
 	notifier reconcile.Notifier
 	store    *state.Store
 }
+
+var _ webhook.BindingReader = (*runtimeController)(nil)
 
 func newRuntimeController(cfg *config.Config, rec *reconcile.Reconciler, notifier reconcile.Notifier, store *state.Store) *runtimeController {
 	return &runtimeController{cfg: cfg, rec: rec, notifier: notifier, store: store}
@@ -82,6 +86,11 @@ func (c *runtimeController) ProbeAnswers(name string) []probe.Answer {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.rec.ProbeAnswers(name)
+}
+func (c *runtimeController) BindingSnapshot(certID string) (inventory.Bindings, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rec.BindingSnapshot(certID)
 }
 func (c *runtimeController) ResourceTypes() []string {
 	c.mu.RLock()

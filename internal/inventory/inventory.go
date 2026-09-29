@@ -313,6 +313,7 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 		desired = in.Desired.Find(name)
 	}
 	if desired != nil {
+		row.Probe.Enabled = row.Probe.Enabled && desired.Deploy.Enabled
 		row.Profile = desired.Profile
 		row.KeyType = desired.KeyType
 		row.Domains = append([]string(nil), desired.Domains...)
@@ -363,7 +364,12 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 	}
 	row.Bindings = bindingsFor(in, name, st)
 	row.Regions = bindingRegions(row.Bindings)
-	samples := in.Probes[name]
+	// Inactive evidence must not populate the verdict, status, drift or summary,
+	// even when a caller supplies historical samples directly to Assemble.
+	var samples []HostSample
+	if row.Probe.Enabled && st != nil && st.DeployConfirmed {
+		samples = in.Probes[name]
+	}
 	if samples == nil {
 		samples = []HostSample{}
 	}
