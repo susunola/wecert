@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -437,8 +438,9 @@ func bindCertificateAdmin(cfg *config.Config, name string, body map[string]any, 
 	lis, _ := body["listenerId"].(string)
 	region, _ := body["region"].(string)
 	sni, _ := body["sniDomain"].(string)
-	if lb == "" || lis == "" {
-		return nil, fmt.Errorf("loadBalancerId and listenerId are required")
+	createRaw, _ := body["createListener"].(map[string]any)
+	if lb == "" {
+		return nil, fmt.Errorf("loadBalancerId is required")
 	}
 	if region == "" {
 		region = "ap-guangzhou"
@@ -474,6 +476,46 @@ func bindCertificateAdmin(cfg *config.Config, name string, body map[string]any, 
 		rec.DeployedCertID = uploadedID
 		log.Info("uploaded certificate for console bind", "cert", name, "certId", uploadedID)
 	}
+	// Optional: create a brand-new HTTPS listener before attaching. The console
+	// offers this when the CLB has no suitable listener yet.
+	createdListener := ""
+	if lis == "" {
+		if createRaw == nil {
+			return nil, fmt.Errorf("listenerId is required unless createListener is set")
+		}
+		port := int64(443)
+		switch v := createRaw["port"].(type) {
+		case float64:
+			port = int64(v)
+		case string:
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				port = n
+			}
+		case int64:
+			port = v
+		}
+		if port < 1 || port > 65535 {
+			return nil, fmt.Errorf("createListener.port must be 1-65535, got %d", port)
+		}
+		lname, _ := createRaw["name"].(string)
+		// SNI is the default for a multi-name console flow; sni=false makes the
+		// certificate the listener's default (Certificate only applies then).
+		sniOn := true
+		if b, ok := createRaw["sni"].(bool); ok {
+			sniOn = b
+		}
+		newID, cerr := tencentCreateHTTPSListener(region, lb, port, lname, sniOn, rec.DeployedCertID)
+		if cerr != nil {
+			log.Error("CLB create listener failed", "cert", name, "lb", lb, "port", port, "err", cerr)
+			return nil, fmt.Errorf("create HTTPS listener on %s: %w", lb, cerr)
+		}
+		lis = newID
+		createdListener = newID
+		log.Info("CLB listener created", "cert", name, "lb", lb, "listener", lis, "port", port, "sni", sniOn)
+	}
+	if lis == "" {
+		return nil, fmt.Errorf("listenerId is required")
+	}
 	if err := tencentBindListener(region, lb, lis, rec.DeployedCertID, sni); err != nil {
 		log.Error("CLB bind failed", "cert", name, "lb", lb, "listener", lis, "err", err)
 		return nil, err
@@ -481,9 +523,53 @@ func bindCertificateAdmin(cfg *config.Config, name string, body map[string]any, 
 	log.Info("CLB bind succeeded", "cert", name, "certId", rec.DeployedCertID, "lb", lb, "listener", lis)
 	return map[string]any{
 		"ok": true, "name": name, "loadBalancerId": lb, "listenerId": lis,
-		"deployedCertId": rec.DeployedCertID, "sniDomain": sni,
+		"createdListener": createdListener,
+		"deployedCertId":  rec.DeployedCertID, "sniDomain": sni,
 		"note": "certificate attached to the CLB listener via the cloud API",
 	}, nil
+}
+
+// tencentCreateHTTPSListener opens a new HTTPS listener. With sniOn the
+// certificate is attached per-domain (CreateRule later); without SNI it becomes
+// the listener default, which is the only place Certificate is accepted.
+func tencentCreateHTTPSListener(region, lb string, port int64, name string, sniOn bool, certID string) (string, error) {
+	cred, err := adminCred()
+	if err != nil {
+		return "", err
+	}
+	client, err := clb.NewClient(cred, region, profile.NewClientProfile())
+	if err != nil {
+		return "", err
+	}
+	req := clb.NewCreateListenerRequest()
+	req.LoadBalancerId = &lb
+	req.Protocol = common.StringPtr("HTTPS")
+	req.Ports = []*int64{common.Int64Ptr(port)}
+	if name != "" {
+		req.ListenerNames = []*string{common.StringPtr(name)}
+	}
+	if sniOn {
+		req.SniSwitch = common.Int64Ptr(1)
+	} else {
+		req.SniSwitch = common.Int64Ptr(0)
+		req.Certificate = &clb.CertificateInput{
+			CertId:  &certID,
+			SSLMode: common.StringPtr("UNIDIRECTIONAL"),
+		}
+	}
+	resp, err := client.CreateListener(req)
+	if err != nil {
+		return "", err
+	}
+	if resp == nil || resp.Response == nil || len(resp.Response.ListenerIds) == 0 {
+		return "", fmt.Errorf("CreateListener returned no listener id")
+	}
+	for _, id := range resp.Response.ListenerIds {
+		if id != nil && *id != "" {
+			return *id, nil
+		}
+	}
+	return "", fmt.Errorf("CreateListener returned empty listener ids")
 }
 
 func unbindCertificateAdmin(cfg *config.Config, name string, log *slog.Logger) (any, error) {

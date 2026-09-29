@@ -66,6 +66,10 @@
 - **`renewBefore` accepts the console's day values.** The create API maps
   `30d`/`14d`/`7d` onto Go durations (`720h`/`336h`/`168h`) before writing
   config.yaml; the parser still rejects day units with "use hours".
+- **Bind can create a new HTTPS listener.** `createListener` opens a port on
+  the chosen CLB (SNI on by default; `sni:false` makes the certificate the
+  listener default) and then attaches, so a CLB with no suitable listener no
+  longer blocks the console flow.
 - **`deploy: clb|nginx` on create writes `deploy.enabled: true`.** Issue-only
   (`deploy: none`) keeps `enabled: false`. The console no longer invents
   post-create status: it refreshes `/api/inventory` and requests a reconcile.
