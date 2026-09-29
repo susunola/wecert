@@ -12,13 +12,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"regexp"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/redact"
 )
 
 // maxNotifyInFlight caps outstanding notification POSTs.
@@ -264,32 +263,6 @@ func (n *Notifier) Drain(ctx context.Context) {
 	}
 }
 
-// RedactNotifyURL keeps a notification target's scheme and host and withholds everything else.
-//
-// A chat or CI notification URL IS a credential: Slack, Feishu, DingTalk and friends put the
-// secret in the path, and a signed target can carry it in the query. The journal is shipped
-// somewhere with a wider audience than the daemon's owner, so the operator gets "where", not the
-// bearer token for "where". cmd/wecert logs this form at startup, and every failed delivery logs
-// it too.
-func RedactNotifyURL(raw string) string {
-	if raw == "" {
-		return "(no notification URL)"
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		// Unparseable: the host cannot be separated from the credential, so nothing is printed.
-		return "(notification URL withheld)"
-	}
-	out := u.Scheme + "://" + u.Host
-	if u.Path != "" && u.Path != "/" {
-		out += "/...(path withheld)"
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		out += "?..."
-	}
-	return out
-}
-
 // withoutURL returns err without the URL a *url.Error embeds in its message.
 //
 // "Post \"https://hooks.example/T00/B00/SECRET\": dial tcp: connection refused" is the shape
@@ -304,47 +277,15 @@ func withoutURL(err error) error {
 	return err
 }
 
-// redactSecrets strips credentials from outbound event text before it is shipped
-// to Jira / PagerDuty / a chat robot. withoutURL only protected the
-// delivery-failure *log*; the event body itself still carried the raw error.
-//
-// Beyond URLs: an error string can embed a Bearer token, an AWS access key id, or
-// a PEM block that fell out of a failed parse. Each is a credential that must not
-// leave the host just because a renewal failed.
+// redactSecrets strips credentials from outbound event text. See redact.Secrets:
+// one implementation for every face that can leak (notify body, journal, LastError).
 func redactSecrets(s string) string {
-	s = urlRegexp.ReplaceAllStringFunc(s, func(u string) string {
-		return RedactNotifyURL(u)
-	})
-	s = bearerRegexp.ReplaceAllString(s, "$1[redacted]")
-	s = accessKeyRegexp.ReplaceAllString(s, "[redacted-access-key]")
-	s = pemRegexp.ReplaceAllString(s, "[redacted-pem]")
-	s = keyValSecretRegexp.ReplaceAllStringFunc(s, func(m string) string {
-		i := strings.IndexByte(m, '=')
-		if i < 0 {
-			i = strings.IndexByte(m, ':')
-		}
-		if i < 0 {
-			return "[redacted]"
-		}
-		return m[:i+1] + "[redacted]"
-	})
-	if len(s) > 512 {
-		s = s[:512] + "…"
-	}
-	return s
+	return redact.Secrets(s)
 }
 
-var (
-	// urlRegexp matches an absolute http(s) URL in free text. Deliberately simple: the
-	// goal is to drop userinfo, path and query, not to parse RFC 3986 perfectly.
-	urlRegexp = regexp.MustCompile(`https?://[^\s]+`)
-	// bearerRegexp keeps the scheme so the operator can see a token was there.
-	bearerRegexp = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._\-+/=]{8,}`)
-	// accessKeyRegexp covers the AWS / Tencent CAM access-key-id shapes that show up
-	// in SDK error strings.
-	accessKeyRegexp = regexp.MustCompile(`\b(?:AKIA|ASIA|AKID)[0-9A-Za-z]{12,}\b`)
-	// pemRegexp collapses a whole PEM block: the body is the secret.
-	pemRegexp = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]+-----[\s\S]*?-----END [A-Z0-9 ]+-----`)
-	// keyValSecretRegexp covers `token=...`, `secretKey: ...` and friends in free text.
-	keyValSecretRegexp = regexp.MustCompile(`(?i)\b(?:secret[_-]?key|access[_-]?key|api[_-]?token|api[_-]?key|password|token|authorization)["']?\s*[:=]\s*["']?[A-Za-z0-9._\-+/=]{8,}`)
-)
+// RedactNotifyURL keeps a notification target's scheme and host and withholds
+// everything else. See redact.URL. cmd/wecert logs this form at startup, and
+// every failed delivery logs it too.
+func RedactNotifyURL(raw string) string {
+	return redact.URL(raw)
+}

@@ -86,7 +86,13 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	if err != nil {
 		return fmt.Errorf("get the DNS provider: %w", err)
 	}
-	// Same bound as Present: this call holds the per-name lease mutex. See callProviderBounded.
+	// Same bound as Present, and the same rule about who holds the lego resolver
+	// slot: acquire it here so a timeout still releases it, instead of queueing the
+	// whole fleet behind one wedged call.
+	if err := acquireLegoResolver(dnsAPITimeout); err != nil {
+		return fmt.Errorf("cleanup TXT: %w", err)
+	}
+	defer legoResolverMu.Unlock()
 	err = callProviderBounded("cleanup TXT", func() error {
 		return s.callLegoProviderResolvers(func() error { return provider.CleanUp(domain, token, keyAuth) })
 	})
@@ -120,13 +126,17 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 //   - one name can carry several TXT values (two certificates, or a wildcard and its
 //     apex, share one challenge name), and the cached answer may hold only some of them.
 //
-// The rules mirror probeReady's:
+// The rules mirror probeReady's, with one tightening: "absent" licenses deleting
+// the only row that records a value, so it is not enough that SOME server denied.
 //   - confirmed by at least one authoritative server -> found, no error;
-//   - denied by at least one and confirmed by none   -> absent (found=false, no error);
-//   - nothing authoritative answered                 -> error, meaning "cannot tell".
+//   - denied by every authoritative server that answered, and none unanswered
+//     -> absent (found=false, no error);
+//   - denied by some but others unreachable / non-authoritative -> cannot tell,
+//     same as no answer at all: keep the row and retry next round.
 //
-// The last case must not be folded into "absent": the caller keeps the authorization row,
-// which is the only record of the value, and retries next round.
+// The optimistic rule ("any deny + no confirm") treated a single unreachable NS
+// as proof the record is gone and threw away the authorization row -- the only
+// clue that could recover the TXT value.
 func (s *DNSSolver) LookupTXT(ctx context.Context, domain, keyAuth string) (DNSRecord, bool, error) {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
 	rec := DNSRecord{
@@ -159,8 +169,12 @@ func (s *DNSSolver) LookupTXT(ctx context.Context, domain, keyAuth string) (DNSR
 	switch {
 	case confirmed > 0:
 		return rec, true, nil
-	case denied > 0:
+	case denied > 0 && unanswered == 0:
 		return rec, false, nil
+	case denied > 0:
+		return rec, false, fmt.Errorf("cannot tell whether %s still holds the challenge: "+
+			"%d authoritative server(s) denied it and %d did not answer; keeping the authorization row",
+			rec.FQDN, denied, unanswered)
 	default:
 		return rec, false, fmt.Errorf(
 			"cannot tell whether %s still carries the record: none of its %d authoritative nameservers answered",

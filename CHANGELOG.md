@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Security
+
+- **A wedged DNS provider call no longer stalls every other Present/CleanUp.** The
+  package-global `legoResolverMu` was taken inside `callProviderBounded`'s helper
+  goroutine: the caller timed out and dropped its per-name lease, but the mutex stayed
+  held until the hung Route 53/Cloudflare call returned, so every later name queued
+  behind it. The slot is acquired in the caller now and fails fast as "busy" after
+  `dnsAPITimeout`, which keeps the outage proportional to the one stuck call.
+- **`LastError` is redacted before it is written.** It is served verbatim by
+  `/hook/status` and `/api/inventory` to whoever holds the read-only token; the notify
+  path already redacted its copy. Shared `internal/redact` covers both faces.
+
+### Fixed
+
+- **Remote retention and download honour the local clock-drift rules.** A
+  future-stamped snapshot name sorts as newest forever and used to hold a Keep slot
+  forever on S3/COS/SFTP; it is now never the download "newest" and is always a prune
+  victim. The object just uploaded is protected from prune (`pruneS3`), matching the
+  local `protect` rule -- after a backward step its name is the oldest while its
+  content is the newest. Victim count stays `len-Keep` so the signed path's second
+  prune (where `current` is the `.hmac` sidecar) does not retain Keep+1.
+- **A TXT record is not declared absent when some authoritative NS simply did not
+  answer.** `LookupTXT` required only "some denied, none confirmed", which a single
+  unreachable NS next to one deny satisfied -- and the cleanup path then deleted the
+  authorization row, the only clue that could recover the value. Absence now requires
+  every answering NS to deny and none to be unanswered.
+- **SIGHUP can turn the admin surface on.** `/admin/*` were registered only when
+  `adminEnabled()` was true at mux-build time, so adding `webhook.adminToken` and
+  reloading left the routes 404 with no hint. The routes are always registered;
+  `adminAuth` still answers 404 while the token is unset.
+
 ### Docs
 
 - **`docs/rate-limit-ari-invariants.md`** is the map for changing the quota ledger or the ARI

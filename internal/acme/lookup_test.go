@@ -175,3 +175,30 @@ func containsQuery(queries []string, want string) bool {
 	}
 	return false
 }
+
+// "Absent" licenses deleting the only row that records the TXT value. A single
+// denied NS next to unreachable ones is not proof the record is gone: the
+// optimistic rule threw away the authorization row on a half-answered zone.
+func TestLookupTXTMixedDenyAndUnansweredIsNotAbsence(t *testing.T) {
+	h := newLookupHarness(t, "shared.example.com", "keyauth(tok)")
+	calls := 0
+	h.authoritative = func(msg *dns.Msg) (*dns.Msg, error) {
+		calls++
+		if calls%2 == 1 {
+			return nil, errors.New("i/o timeout")
+		}
+		// Denied: authoritative, empty answer.
+		return dnsReply(msg), nil
+	}
+
+	_, found, err := h.solver.LookupTXT(context.Background(), "shared.example.com", "keyauth(tok)")
+	if found {
+		t.Fatal("a half-answered zone must not claim the record is still there")
+	}
+	if err == nil {
+		t.Fatal("deny + unanswered must not be reported as a confident absence")
+	}
+	if !strings.Contains(err.Error(), "cannot tell") {
+		t.Errorf("the error must say the answer is unknown, got: %v", err)
+	}
+}

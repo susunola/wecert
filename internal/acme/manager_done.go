@@ -14,6 +14,7 @@ import (
 	"github.com/susunola/wecert/internal/group"
 	"github.com/susunola/wecert/internal/metrics"
 	"github.com/susunola/wecert/internal/ratelimit"
+	"github.com/susunola/wecert/internal/redact"
 	"github.com/susunola/wecert/internal/state"
 )
 
@@ -607,7 +608,11 @@ func (m *Manager) recordFailure(ctx context.Context, st *state.CertState, err er
 	}
 
 	st.ConsecutiveFailures++
-	st.LastError = err.Error()
+	// Redact before it is written: LastError is served verbatim by /hook/status and
+	// /api/inventory to whoever holds the read-only token. The notify path already
+	// redacted its copy; this column did not, so a provider error that embedded a
+	// key or bearer token reached a low-privilege poller.
+	st.LastError = redact.Secrets(err.Error())
 
 	shift := st.ConsecutiveFailures - 1
 	if shift > 10 {

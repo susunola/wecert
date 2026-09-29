@@ -7,12 +7,17 @@ package webhook
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/susunola/wecert/internal/state"
 )
 
 // adminReq builds a request to drive the handler a test holds directly, which is what a
@@ -169,5 +174,39 @@ func TestAdminLockoutStillAnswersTheCorrectToken(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"action":"admin_auth_blocked"`) {
 		t.Errorf("engaging the lockout must be audited:\n%s", b)
+	}
+}
+
+// The other direction: a process that started with no admin token must be able to
+// turn the surface on via SIGHUP (SetAdminToken) without rebuilding the mux.
+// Handler() registers /admin/* unconditionally; adminAuth is what gates them.
+func TestAdminSurfaceOpensWhenTheTokenIsAddedLater(t *testing.T) {
+	t.Parallel()
+	rec := &fakeReconciler{names: []string{"a"}}
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	s, err := NewWithAdmin(rec, store, testToken, AdminOptions{AuditPath: t.TempDir() + "/audit.jsonl", Ops: AdminOps{
+		BackupHealth: func(context.Context) (any, error) { return map[string]any{"ok": true}, nil },
+	}}, context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := s.Handler() // built once, as a running process would
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, adminReq(http.MethodGet, "/admin/backup-health", map[string]string{"Authorization": "Bearer " + adminTok}))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("no admin token yet = %d, want 404", w.Code)
+	}
+
+	s.SetAdminToken(adminTok) // SIGHUP equivalent
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, adminReq(http.MethodGet, "/admin/backup-health", map[string]string{"Authorization": "Bearer " + adminTok}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("after SetAdminToken the same mux must serve /admin, got %d %s", w.Code, w.Body.String())
 	}
 }

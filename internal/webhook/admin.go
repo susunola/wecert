@@ -85,9 +85,10 @@ func (s *Server) adminTokenMatches(r *http.Request) bool {
 }
 
 // adminEnabled reports whether the admin surface is mounted (read under tokenMu
-// so SIGHUP can enable it without a data race on handler registration... the
-// routes themselves are registered at construction; SetAdminToken only rotates
-// the secret. Mounting a new surface still needs a restart -- see handler.go).
+// so SIGHUP can rotate the secret without a data race). The routes themselves are
+// always registered; this only gates whether adminAuth will accept anyone. A
+// token added later therefore takes effect on the next request, not the next
+// restart -- see Handler.
 func (s *Server) adminEnabled() bool {
 	s.tokenMu.RLock()
 	defer s.tokenMu.RUnlock()

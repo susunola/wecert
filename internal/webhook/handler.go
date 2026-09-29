@@ -25,19 +25,15 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/diagnostics/txt-reclaims", s.auth(s.handleTXTReclaims(g)))
 	}
 
-	// Guarded admin surface. Mounted only when an admin token is configured: a
-	// read-only token (Token) cannot reach these routes, and without AdminToken the
-	// process stays read-only over the network.
-	//
-	// adminEnabled, not a bare field read: SetAdminToken rotates the secret under
-	// tokenMu, and reading s.adminToken here while SIGHUP does that is a data race.
-	if s.adminEnabled() {
-		mux.HandleFunc("/admin/backup-health", s.adminAuth(s.handleAdminBackupHealth()))
-		mux.HandleFunc("/admin/recovery-plan", s.adminAuth(s.handleAdminRecoveryPlan()))
-		mux.HandleFunc("/admin/recovery-drill", s.adminAuth(s.handleAdminRecoveryDrill()))
-		mux.HandleFunc("/admin/challenge", s.adminAuth(s.handleAdminChallenge()))
-		mux.HandleFunc("/admin/restore", s.adminAuth(s.handleAdminRestore()))
-	}
+	// Admin routes are always registered. adminAuth answers 404 while adminToken is
+	// unset, so the surface stays closed -- and a later SIGHUP that supplies the token
+	// enables it without a restart. Mounting here on a one-shot adminEnabled() check
+	// made "add adminToken + SIGHUP" look like it worked while /admin/* stayed 404.
+	mux.HandleFunc("/admin/backup-health", s.adminAuth(s.handleAdminBackupHealth()))
+	mux.HandleFunc("/admin/recovery-plan", s.adminAuth(s.handleAdminRecoveryPlan()))
+	mux.HandleFunc("/admin/recovery-drill", s.adminAuth(s.handleAdminRecoveryDrill()))
+	mux.HandleFunc("/admin/challenge", s.adminAuth(s.handleAdminChallenge()))
+	mux.HandleFunc("/admin/restore", s.adminAuth(s.handleAdminRestore()))
 
 	return mux
 }

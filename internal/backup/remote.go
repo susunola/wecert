@@ -389,7 +389,7 @@ func downloadSFTPFile(ctx context.Context, t Target, dir string) (string, error)
 	}
 	var names []string
 	for _, e := range entries {
-		if !e.IsDir() && t.isOwnSnapshot(e.Name()) {
+		if !e.IsDir() && t.isOwnSnapshot(e.Name()) && !futureDatedSnapshot(e.Name()) {
 			names = append(names, e.Name())
 		}
 	}
@@ -520,8 +520,10 @@ func downloadS3Object(ctx context.Context, t Target, dir string) (string, error)
 		}
 		// Sidecars are not snapshots. A ".hmac" sibling sorts after its object in
 		// lexicographic order, so "newest" would otherwise always be the signature; an upload
-		// that never finished is not a snapshot either.
-		if !t.isOwnSnapshot(path.Base(*o.Key)) {
+		// that never finished is not a snapshot either. A future-stamped name is not the
+		// newest recovery point: a forward clock excursion makes it sort after every later
+		// honest stamp forever.
+		if !t.isOwnSnapshot(path.Base(*o.Key)) || futureDatedSnapshot(*o.Key) {
 			continue
 		}
 		if newest == nil || newest.Key == nil || *o.Key > *newest.Key {
@@ -601,6 +603,31 @@ func uploadS3(ctx context.Context, t Target, src string) error {
 	return nil
 }
 
+// snapshotStamp is the same layout the state package writes into snapshot names.
+const snapshotStamp = "20060102T150405.000Z"
+
+// futureDatedSnapshot reports whether a snapshot's name stamps a time after now.
+// A forward clock excursion writes names that sort after every later honest stamp,
+// so "newest by name" would pick them forever and retention would keep them as
+// permanent Keep slots. The local path repairs those names; remote retention and
+// download treat them as neither the newest nor a keeper.
+func futureDatedSnapshot(name string) bool {
+	base := filepath.Base(name)
+	i := strings.Index(base, ".backup-")
+	if i < 0 {
+		return false
+	}
+	stamp := strings.TrimSuffix(base[i+len(".backup-"):], ".db")
+	if j := strings.IndexByte(stamp, '~'); j >= 0 {
+		stamp = stamp[:j]
+	}
+	at, err := time.Parse(snapshotStamp, stamp)
+	if err != nil {
+		return false
+	}
+	return at.After(time.Now())
+}
+
 func pruneS3(ctx context.Context, client *s3.Client, t Target, current string) error {
 	base := strings.Split(filepath.Base(current), ".backup-")[0]
 	prefix := path.Join(strings.Trim(t.Prefix, "/"), base+".backup-")
@@ -618,20 +645,72 @@ func pruneS3(ctx context.Context, client *s3.Client, t Target, current string) e
 		}
 		snapshots = append(snapshots, object)
 	}
-	// Snapshot names sort chronologically, and only this deployment's base name is uploaded by one target.
-	if len(snapshots) <= t.Keep {
-		return nil
+	// Snapshot names sort chronologically. Two clock-drift rules from the local
+	// pruner (internal/state/backup.go) have to hold here too:
+	//   - never delete the object this call just uploaded (protect): after a
+	//     backward step its name is the OLDEST while its content is the newest;
+	//   - a future-stamped name is always a victim and never the download "newest",
+	//     so it cannot hold a Keep slot forever.
+	//
+	// Victim count is len-Keep (the local rule), not "everything except the newest
+	// Keep names": on the signed path prune runs twice and the second pass's
+	// `current` is the .hmac sidecar, which is not in `snapshots` at all. Protecting
+	// a name and then keeping `Keep` of the rest would retain Keep+1 on that pass.
+	currentBase := filepath.Base(current)
+	sort.Slice(snapshots, func(i, j int) bool {
+		a, b := snapshots[i].Key, snapshots[j].Key
+		if a == nil {
+			return true
+		}
+		if b == nil {
+			return false
+		}
+		return *a < *b
+	})
+	extra := len(snapshots) - t.Keep
+	if extra < 0 {
+		extra = 0
 	}
 	var victims []types.ObjectIdentifier
-	for _, object := range snapshots[:len(snapshots)-t.Keep] {
+	snapshotVictims := 0
+	add := func(object types.Object) {
 		victims = append(victims, types.ObjectIdentifier{Key: object.Key})
+		snapshotVictims++
 		// Drop the sidecar with its snapshot. Leaving it behind makes the prefix
-		// look signed for an object that is gone, and a later restore that picks
-		// a still-present sibling would see a stale signature name in listings.
+		// look signed for an object that is gone.
 		if object.Key != nil {
 			sidecar := *object.Key + ".hmac"
 			victims = append(victims, types.ObjectIdentifier{Key: &sidecar})
 		}
+	}
+	for _, object := range snapshots {
+		if object.Key == nil {
+			continue
+		}
+		if filepath.Base(*object.Key) == currentBase {
+			continue
+		}
+		if futureDatedSnapshot(*object.Key) {
+			add(object)
+		}
+	}
+	for _, object := range snapshots {
+		if object.Key == nil {
+			continue
+		}
+		if filepath.Base(*object.Key) == currentBase {
+			continue
+		}
+		if futureDatedSnapshot(*object.Key) {
+			continue
+		}
+		if snapshotVictims >= extra {
+			break
+		}
+		add(object)
+	}
+	if len(victims) == 0 {
+		return nil
 	}
 	if t.Type == TypeCOS {
 		// COS requires Content-MD5 for the S3 multi-object delete payload. The AWS
@@ -818,10 +897,34 @@ func pruneSFTP(client *sftp.Client, t Target, current string) error {
 		}
 	}
 	if len(names) <= t.Keep {
+		// Still clear future-dated names: they sort as "newest" forever and would
+		// keep replacing the honest recovery point on the next download.
+		var onlyFuture []string
+		for _, name := range names {
+			if futureDatedSnapshot(name) {
+				onlyFuture = append(onlyFuture, name)
+			}
+		}
+		for _, name := range onlyFuture {
+			_ = client.Remove(path.Join(t.RemoteDir, name))
+			_ = client.Remove(path.Join(t.RemoteDir, name+".hmac"))
+		}
 		return nil
 	}
 	sort.Strings(names)
-	for _, name := range names[:len(names)-t.Keep] {
+	var future, honest []string
+	for _, name := range names {
+		if futureDatedSnapshot(name) {
+			future = append(future, name)
+		} else {
+			honest = append(honest, name)
+		}
+	}
+	victims := append([]string(nil), future...)
+	if extra := len(honest) - t.Keep; extra > 0 {
+		victims = append(victims, honest[:extra]...)
+	}
+	for _, name := range victims {
 		if err := client.Remove(path.Join(t.RemoteDir, name)); err != nil {
 			return fmt.Errorf("prune SFTP snapshot %s: %w", name, err)
 		}
