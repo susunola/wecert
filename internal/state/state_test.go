@@ -313,6 +313,112 @@ func TestRetiredCerts(t *testing.T) {
 	}
 }
 
+// A swap must outlive the rollback window, and it must survive ordinary state writes.
+//
+// The previous certificate is not derivable from retired_certificates: that table is pruned seven
+// days after a renewal -- "no previous certificate" for the ten months between two renewals -- and
+// it also holds certificates wecert uploaded without ever binding them, so the newest row under a
+// name can name something that never served a request. The durable answer therefore lives in the
+// certificate row, written by RecordSwap alone, which is also why PutCert -- the whole-row upsert
+// every failure report funnels through -- must not touch it.
+func TestRecordSwapSurvivesWholeRowWrites(t *testing.T) {
+	s := openTestStore(t)
+	swappedAt := time.Unix(1790000000, 0).UTC()
+
+	if err := s.PutCert(&CertState{
+		Name: "example-com", NotAfter: time.Unix(1893456000, 0),
+		DeployedCertID: "new-id", DeployConfirmed: true,
+	}); err != nil {
+		t.Fatalf("PutCert: %v", err)
+	}
+	if err := s.RecordSwap("example-com", "old-id", swappedAt); err != nil {
+		t.Fatalf("RecordSwap: %v", err)
+	}
+
+	// The failure path: a whole-row upsert of the same name, built from a partial read.
+	if err := s.PutCert(&CertState{
+		Name: "example-com", NotAfter: time.Unix(1893456000, 0),
+		DeployedCertID: "new-id", DeployConfirmed: true, ConsecutiveFailures: 1,
+	}); err != nil {
+		t.Fatalf("PutCert after RecordSwap: %v", err)
+	}
+
+	c, err := s.GetCert("example-com")
+	if err != nil || c == nil {
+		t.Fatalf("GetCert: %v (c=%v)", err, c)
+	}
+	if c.PreviousCertID != "old-id" {
+		t.Errorf("PreviousCertID = %q, want old-id: a whole-row write erased the swap record", c.PreviousCertID)
+	}
+	if !c.SwappedAt.Equal(swappedAt) {
+		t.Errorf("SwappedAt = %s, want %s", c.SwappedAt, swappedAt)
+	}
+	if c.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want the upsert to have done its own job", c.ConsecutiveFailures)
+	}
+}
+
+// Recording a swap for a name with no row is a caller bug, and it is reported as one: the only
+// caller writes the swap in the same transaction as the new state, so accepting it silently would
+// hide an ordering mistake behind an inventory that simply never shows a previous certificate.
+func TestRecordSwapWithoutARowFails(t *testing.T) {
+	s := openTestStore(t)
+	at := time.Unix(1790000000, 0)
+	if err := s.RecordSwap("missing", "old-id", at); err == nil {
+		t.Error("RecordSwap on a name with no row must fail")
+	}
+	if err := s.RecordSwap("", "old-id", at); err == nil {
+		t.Error("RecordSwap with an empty name must fail")
+	}
+	if err := s.RecordSwap("missing", "", at); err == nil {
+		t.Error("RecordSwap with an empty previous id must fail")
+	}
+}
+
+// The rollback window is read without touching its material.
+//
+// Two reasons, both about what a read-only view is allowed to do: it has no business decrypting
+// archived private keys in order to draw a list, and the orphan path records an upload with no
+// material at all -- a name that still holds a cloud certificate -- which a material-filtered
+// query would hide from the one screen that should show it.
+func TestListRetiredCertRefsIncludesRowsWithoutMaterial(t *testing.T) {
+	s := openTestStore(t)
+
+	if err := s.AddRetiredCert("orphan-1", "example-com", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddRetiredCert("old-2", "example-com", []byte("cert"), []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	// retired_at comes from the store's own clock, so ordering cannot be driven from outside;
+	// backdate one row to make "newest first" observable.
+	if _, err := s.db.Exec(
+		`UPDATE retired_certificates SET retired_at = ? WHERE cert_id = ?`, 1000, "orphan-1"); err != nil {
+		t.Fatalf("backdating the retired row: %v", err)
+	}
+
+	refs, err := s.ListRetiredCertRefs("example-com")
+	if err != nil {
+		t.Fatalf("ListRetiredCertRefs: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("want both retired rows, material or not, got %+v", refs)
+	}
+	if refs[0].CertID != "old-2" || refs[1].CertID != "orphan-1" {
+		t.Errorf("want newest first, got %+v", refs)
+	}
+	if !refs[1].RetiredAt.Equal(time.Unix(1000, 0)) {
+		t.Errorf("RetiredAt = %s, want the stored unix second", refs[1].RetiredAt)
+	}
+
+	if refs, err = s.ListRetiredCertRefs("other-name"); err != nil {
+		t.Fatalf("ListRetiredCertRefs(other-name): %v", err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("another name must not see these rows, got %+v", refs)
+	}
+}
+
 // A retired certificate must keep its archived key material.
 //
 // The row used to hold only a CertId, while the private key was overwritten in the

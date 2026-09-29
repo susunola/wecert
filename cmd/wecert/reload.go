@@ -15,11 +15,13 @@ import (
 
 	"github.com/susunola/wecert/internal/acme"
 	"github.com/susunola/wecert/internal/config"
+	"github.com/susunola/wecert/internal/inventory"
 	"github.com/susunola/wecert/internal/probe"
 	"github.com/susunola/wecert/internal/ratelimit"
 	"github.com/susunola/wecert/internal/reconcile"
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
+	"github.com/susunola/wecert/internal/webhook"
 )
 
 // runtimeController is the stable object handed to the daemon and HTTP server.
@@ -36,6 +38,22 @@ type runtimeController struct {
 func newRuntimeController(cfg *config.Config, rec *reconcile.Reconciler, notifier reconcile.Notifier, store *state.Store) *runtimeController {
 	return &runtimeController{cfg: cfg, rec: rec, notifier: notifier, store: store}
 }
+
+// The daemon hands the HTTP server this wrapper rather than the reconciler, so every
+// optional capability the trigger/inventory endpoints probe for has to be forwarded here.
+//
+// These assertions exist because the failure mode is silent: a missing forward makes the
+// webhook's type assertion fail, and the endpoint then answers with the degraded fallback
+// instead of erroring. That is exactly what happened to BindingSnapshot -- the inventory
+// served "Deployment record only" with an empty binding list even though the reconciler had
+// cached the CLB / listener rows.
+var (
+	_ webhook.BindingReader    = (*runtimeController)(nil)
+	_ webhook.DaemonFacts      = (*runtimeController)(nil)
+	_ webhook.QuotaReader      = (*runtimeController)(nil)
+	_ webhook.DesiredReader    = (*runtimeController)(nil)
+	_ webhook.DesiredRefresher = (*runtimeController)(nil)
+)
 
 func (c *runtimeController) RunDetailed(ctx context.Context) reconcile.RunReport {
 	c.mu.RLock()
@@ -92,6 +110,21 @@ func (c *runtimeController) ResourceTypes() []string {
 // QuotaStatus is intentionally forwarded so the read-only inventory remains a
 // truthful view after a reload.  The concrete result type keeps it compatible
 // with webhook.QuotaReader without coupling that package back into main.
+// BindingSnapshot forwards the read-only bind-resource rows the reconciler cached on its
+// last enumeration, so the inventory page can show which CLB / listener a certificate is
+// bound to.
+//
+// The webhook discovers this capability by asserting webhook.BindingReader on the value it
+// was given, and the daemon hands it this wrapper -- not the reconciler. Without the
+// forward the assertion fails, every row falls back to the state store (which has no CLB or
+// listener rows at all) and the page prints "Deployment record only" with an empty binding
+// list, no matter how fresh the cache is.
+func (c *runtimeController) BindingSnapshot(certID string) (inventory.Bindings, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rec.BindingSnapshot(certID)
+}
+
 func (c *runtimeController) QuotaStatus() []ratelimit.QuotaReport {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

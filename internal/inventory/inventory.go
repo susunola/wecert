@@ -86,6 +86,11 @@ type Input struct {
 	// for a certificate whose enumeration came back incomplete.
 	LiveBindings  map[string]Bindings
 	ResourceTypes []string
+	// Retired holds, per certificate name, the certificates still inside the rollback window
+	// (state.Store.ListRetiredCertRefs). The caller reads it because this package is a pure
+	// function of its input: it must not reach for the store, and it must not decrypt archived
+	// material to draw a list.
+	Retired map[string][]RetiredRef
 	// UIN is the Tencent Cloud account this process deploys into. Copied onto
 	// every row unless the desired-state certificate sets its own.
 	UIN string
@@ -170,21 +175,62 @@ type Certificate struct {
 	// store cannot enumerate bindings, and one certificate can be bound in several
 	// regions. A Tencent Cloud SSL certificate is not itself regional -- the regions
 	// are the load balancers it is attached to.
-	Regions             []string  `json:"regions,omitempty"`
-	NotAfter            string    `json:"notAfter,omitempty"`
-	DaysLeft            *int      `json:"daysLeft,omitempty"`
-	IssuedAt            string    `json:"issuedAt,omitempty"`
-	Uploaded            bool      `json:"uploaded"`
-	DeployConfirmed     bool      `json:"deployConfirmed"`
-	DeployedCertID      string    `json:"deployedCertId,omitempty"`
-	Bindings            Bindings  `json:"bindings"`
-	Probe               ProbeView `json:"probe"`
-	ARI                 *ARIView  `json:"ari,omitempty"`
-	ConsecutiveFailures int       `json:"consecutiveFailures"`
-	NextAttemptAt       string    `json:"nextAttemptAt,omitempty"`
-	LastError           string    `json:"lastError,omitempty"`
-	Error               string    `json:"error,omitempty"`
-	Drift               []string  `json:"drift,omitempty"`
+	Regions         []string `json:"regions,omitempty"`
+	NotAfter        string   `json:"notAfter,omitempty"`
+	DaysLeft        *int     `json:"daysLeft,omitempty"`
+	IssuedAt        string   `json:"issuedAt,omitempty"`
+	Uploaded        bool     `json:"uploaded"`
+	DeployConfirmed bool     `json:"deployConfirmed"`
+	// Alias is the SSL remark this certificate carries ("wecert/<name>", see
+	// config.UploadAlias). The Tencent Cloud SSL console lists the remark instead of any
+	// wecert-side name, so the row shows it next to the deployed certificate ID: that is
+	// what makes a row here match a row there.
+	Alias          string `json:"alias,omitempty"`
+	DeployedCertID string `json:"deployedCertId,omitempty"`
+	// Serial is the serial number of the certificate that is currently in effect, upper-case
+	// hex. It is the identity the certificate itself carries: a browser shows it, and it is the
+	// only identity that survives a change of DNS provider, cloud account, or deployment target --
+	// where DeployedCertID and Alias stop existing. Neither is derivable from the other, so a row
+	// that shows only one of them cannot be matched against the other system.
+	Serial string `json:"serial,omitempty"`
+	// ACMECertURL is where the certificate was issued from; its last path segment is the same
+	// serial in the CA's own lower-case hex.
+	ACMECertURL string `json:"acmeCertUrl,omitempty"`
+	// ARICertID is the RFC 9773 identifier (base64url(AKI) + "." + base64url(serial)) the
+	// renewal-info endpoint is queried with.
+	ARICertID string `json:"ariCertId,omitempty"`
+	// Previous is the certificate this name served before the current one, and when the swap
+	// happened. Recorded at the swap itself, so it keeps answering after the rollback window
+	// (retired_certificates) has been pruned.
+	Previous *PreviousCert `json:"previous,omitempty"`
+	// Retired lists what is still inside the rollback window under this name. It is a wider set
+	// than Previous by design: the orphan path queues an upload that was never bound, which is
+	// not anyone's predecessor.
+	Retired             []RetiredRef `json:"retired,omitempty"`
+	Bindings            Bindings     `json:"bindings"`
+	Probe               ProbeView    `json:"probe"`
+	ARI                 *ARIView     `json:"ari,omitempty"`
+	ConsecutiveFailures int          `json:"consecutiveFailures"`
+	NextAttemptAt       string       `json:"nextAttemptAt,omitempty"`
+	LastError           string       `json:"lastError,omitempty"`
+	Error               string       `json:"error,omitempty"`
+	Drift               []string     `json:"drift,omitempty"`
+}
+
+// PreviousCert is the certificate a name served before the current one.
+//
+// Both fields come from the certificate row rather than from the rollback table: retired
+// certificates are deleted seven days after a renewal, and that table also holds uploads nobody
+// ever bound, so "the newest retired row" is neither durable nor necessarily a predecessor.
+type PreviousCert struct {
+	CertID    string `json:"certId"`
+	SwappedAt string `json:"swappedAt,omitempty"`
+}
+
+// RetiredRef is one certificate still inside the rollback window under a name.
+type RetiredRef struct {
+	CertID    string `json:"certId"`
+	RetiredAt string `json:"retiredAt,omitempty"`
 }
 
 type Bindings struct {
@@ -299,8 +345,9 @@ func collectNames(in Input) []string {
 
 func assembleOne(in Input, name string, now time.Time) Certificate {
 	row := Certificate{
-		Name: name,
-		UIN:  in.UIN,
+		Name:  name,
+		Alias: config.UploadAlias(name),
+		UIN:   in.UIN,
 		Bindings: Bindings{
 			ResourceTypes: append([]string(nil), in.ResourceTypes...),
 			Freshness:     FreshnessStore,
@@ -344,6 +391,15 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 		row.Uploaded = st.DeployedCertID != ""
 		row.DeployConfirmed = st.DeployConfirmed
 		row.DeployedCertID = st.DeployedCertID
+		row.ACMECertURL = st.CertURL
+		row.ARICertID = st.ARICertID
+		if st.PreviousCertID != "" {
+			prev := &PreviousCert{CertID: st.PreviousCertID}
+			if !st.SwappedAt.IsZero() {
+				prev.SwappedAt = st.SwappedAt.UTC().Format(time.RFC3339)
+			}
+			row.Previous = prev
+		}
 		row.ConsecutiveFailures = st.ConsecutiveFailures
 		row.LastError = st.LastError
 		if !st.NextAttemptAt.IsZero() {
@@ -359,9 +415,18 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 			}
 			row.ARI = ari
 		}
-		issued = namesFromPEM(st.CertPEM)
+		// One parse for both answers: the names the certificate covers (drift comparison) and the
+		// serial number that identifies it everywhere else. A certificate that cannot be parsed
+		// leaves both empty -- the row still has to render.
+		if leaf := leafFromPEM(st.CertPEM); leaf != nil {
+			row.Serial = serialOf(leaf)
+			issued = namesOf(leaf)
+		}
 	}
 	row.Bindings = bindingsFor(in, name, st)
+	if refs := in.Retired[name]; len(refs) > 0 {
+		row.Retired = append([]RetiredRef(nil), refs...)
+	}
 	row.Regions = bindingRegions(row.Bindings)
 	samples := in.Probes[name]
 	if samples == nil {
@@ -544,7 +609,12 @@ func liveIncomplete(b Bindings) bool {
 	return !b.Complete && b.Count == 0
 }
 
-func namesFromPEM(derPEM []byte) []string {
+// leafFromPEM parses the first certificate block of a PEM bundle.
+//
+// A nil return means "no usable certificate", which every caller treats as "nothing known" rather
+// than as an error: this feeds a read-only page, and a row that cannot state its serial still has
+// to render the rest of its state.
+func leafFromPEM(derPEM []byte) *x509.Certificate {
 	if len(derPEM) == 0 {
 		return nil
 	}
@@ -556,11 +626,33 @@ func namesFromPEM(derPEM []byte) []string {
 	if err != nil {
 		return nil
 	}
+	return cert
+}
+
+// serialOf renders a certificate's serial number the way the certificate itself states it:
+// upper-case hex, no separators, no padding. It is the identity a browser shows and the only one
+// that survives a change of cloud account or deployment target, so the page shows it next to the
+// cloud-side certificate id rather than instead of it.
+func serialOf(cert *x509.Certificate) string {
+	if cert == nil || cert.SerialNumber == nil {
+		return ""
+	}
+	return strings.ToUpper(cert.SerialNumber.Text(16))
+}
+
+func namesOf(cert *x509.Certificate) []string {
+	if cert == nil {
+		return nil
+	}
 	names := append([]string(nil), cert.DNSNames...)
 	if cert.Subject.CommonName != "" {
 		names = appendUnique(names, cert.Subject.CommonName)
 	}
 	return names
+}
+
+func namesFromPEM(derPEM []byte) []string {
+	return namesOf(leafFromPEM(derPEM))
 }
 
 func coversAll(issued, desired []string) bool {

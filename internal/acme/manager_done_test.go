@@ -242,6 +242,18 @@ func TestRenewalArchivesTheOutgoingCertificateMaterial(t *testing.T) {
 	if st.DeployedCertID != "cloud-new" {
 		t.Errorf("live DeployedCertID = %q, want cloud-new", st.DeployedCertID)
 	}
+
+	// The swap itself is recorded on the live row, not only in the reclaim queue.
+	//
+	// The queue is pruned seven days after the renewal, so anything that answers "which
+	// certificate did this name serve before, and since when" has to live here: this is the row
+	// the inventory reads, and after the retention window the queue can no longer stand in for it.
+	if st.PreviousCertID != "cloud-old" {
+		t.Errorf("live PreviousCertID = %q, want cloud-old", st.PreviousCertID)
+	}
+	if !st.SwappedAt.Equal(fixed) {
+		t.Errorf("live SwappedAt = %s, want the manager's clock (%s)", st.SwappedAt, fixed)
+	}
 }
 
 // recordingDeployer reports a configurable new CertId and records what it was asked to do.

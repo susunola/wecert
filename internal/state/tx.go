@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 // Transactions.
@@ -130,6 +131,16 @@ func (t *Tx) AddRetiredCert(certID, certName string, certPEM, keyPEM []byte) err
 		}
 	}
 	return addRetiredCertExec(t.tx, certID, certName, certPEM, keyPEM)
+}
+
+// RecordSwap records the previous certificate of a name inside the transaction.
+//
+// It exists on the transaction path because that is where the swap actually happens: the
+// promotion epilogue writes the new state and queues the old certificate for reclamation in one
+// transaction, and an inventory that reads "which certificate did this name serve before" has to
+// be able to see the answer even if the reclaim row is pruned seven days later.
+func (t *Tx) RecordSwap(name, previousCertID string, at time.Time) error {
+	return recordSwapExec(t.tx, name, previousCertID, at)
 }
 
 // DeleteOrder removes the in-flight order row inside the transaction.

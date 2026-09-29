@@ -87,6 +87,66 @@ func TestLegacyDatabaseGainsTheNewColumns(t *testing.T) {
 	}
 }
 
+// The swap columns are newer than the orphan-clean column, and a database that has been running
+// for a year is exactly the one that needs them most.
+//
+// Legacy rows must read as "no swap recorded": that is the honest answer for a row written before
+// the column existed, and it is deliberately not back-filled from retired_certificates, which
+// cannot tell a replaced certificate from an upload nobody ever bound. The columns must be
+// writable on the migrated row and must survive a reopen.
+func TestLegacyDatabaseGainsTheSwapColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	if err := buildLegacyDB(t, path); err != nil {
+		t.Fatal(err)
+	}
+
+	// A certificate that predates both columns.
+	db, err := openSQLForTest(path)
+	if err != nil {
+		t.Fatalf("open the legacy database: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO certificates (name, not_after, deployed_cert_id, updated_at)
+		VALUES ('legacy', 1893456000, 'ap-live', 1893456000)`); err != nil {
+		t.Fatalf("seeding the legacy row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("closing the legacy database: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("an older database must migrate on open, got %v", err)
+	}
+	c, err := store.GetCert("legacy")
+	if err != nil || c == nil {
+		t.Fatalf("GetCert on the migrated row: %v (c=%v)", err, c)
+	}
+	if c.PreviousCertID != "" || !c.SwappedAt.IsZero() {
+		t.Errorf("a legacy row must read as no swap recorded, got %q / %s", c.PreviousCertID, c.SwappedAt)
+	}
+
+	swappedAt := time.Unix(1790000000, 0).UTC()
+	if err := store.RecordSwap("legacy", "ap-old", swappedAt); err != nil {
+		t.Fatalf("RecordSwap on the migrated row: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopening the migrated database: %v", err)
+	}
+	defer reopened.Close()
+	if c, err = reopened.GetCert("legacy"); err != nil || c == nil {
+		t.Fatalf("GetCert after the reopen: %v (c=%v)", err, c)
+	}
+	if c.PreviousCertID != "ap-old" || !c.SwappedAt.Equal(swappedAt) {
+		t.Errorf("the swap did not survive a reopen: %q / %s", c.PreviousCertID, c.SwappedAt)
+	}
+}
+
 // The orphan-clean column is newer than the two columns above, and it is the one where "rows that
 // predate it" is the normal case rather than an edge: every existing deployment that has ever
 // dropped a certificate from its document already holds those rows, and the sweep reads the column

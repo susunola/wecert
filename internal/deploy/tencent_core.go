@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	clb "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
@@ -121,6 +122,32 @@ func (d *TencentCLB) client(ctx context.Context) (sslAPI, error) {
 		return nil, err
 	}
 	return newSSLClient(cred)
+}
+
+// logger returns the deployer's logger, falling back to the default one. A deployer built
+// through a struct literal in a test (or before SetLogger) has a nil logger, and the
+// fallback keeps the log call sites from having to care.
+func (d *TencentCLB) logger() *slog.Logger {
+	if d.log != nil {
+		return d.log
+	}
+	return slog.Default()
+}
+
+// clbAPI is the read-only slice of the CLB API that the listener binding fallback needs.
+//
+// It exists because the SSL bind-resource enumeration cannot see a certificate that is
+// bound only as an SNI extension: see listenerBindingsForCert for the measurement.
+type clbAPI interface {
+	DescribeLoadBalancersWithContext(ctx context.Context, req *clb.DescribeLoadBalancersRequest) (*clb.DescribeLoadBalancersResponse, error)
+	DescribeListenersWithContext(ctx context.Context, req *clb.DescribeListenersRequest) (*clb.DescribeListenersResponse, error)
+}
+
+var newCLBClient = func(cred common.CredentialIface, region string) (clbAPI, error) {
+	cpf := profile.NewClientProfile()
+	cpf.HttpProfile.Endpoint = "clb.tencentcloudapi.com"
+	cpf.HttpProfile.ReqTimeout = 60
+	return clb.NewClient(cred, region, cpf)
 }
 
 var waitBetweenPolls = func(ctx context.Context, d time.Duration) error {

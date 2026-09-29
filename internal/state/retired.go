@@ -139,6 +139,40 @@ func (s *Store) ListRetiredCertMaterial(certName string) ([]*RetiredCert, error)
 	return out, rows.Err()
 }
 
+// ListRetiredCertRefs lists the certificates retired under one name, newest first, without
+// touching their material.
+//
+// This is what a read-only view of the rollback window needs: the ids and the times, not the
+// archived private keys (which is why it does not decrypt, and why it does not filter on
+// cert_pem IS NOT NULL the way ListRetiredCertMaterial does -- the orphan path records an upload
+// with no material, and "this name still holds a cloud certificate" is exactly the question that
+// row answers).
+func (s *Store) ListRetiredCertRefs(certName string) ([]RetiredCertRef, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`
+		SELECT cert_id, retired_at
+		FROM retired_certificates
+		WHERE cert_name = ?
+		ORDER BY retired_at DESC, cert_id`, certName)
+	if err != nil {
+		return nil, fmt.Errorf("list retired refs for %s: %w", certName, err)
+	}
+	defer rows.Close()
+
+	var out []RetiredCertRef
+	for rows.Next() {
+		var r RetiredCertRef
+		var retiredAt int64
+		if err := rows.Scan(&r.CertID, &retiredAt); err != nil {
+			return nil, fmt.Errorf("scan retired refs for %s: %w", certName, err)
+		}
+		r.RetiredAt = fromUnix(retiredAt)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) openRetiredMaterial(r *RetiredCert) error {
 	if s.sealer == nil {
 		return nil

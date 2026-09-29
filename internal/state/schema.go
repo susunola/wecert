@@ -79,6 +79,12 @@ var schemaColumns = []struct{ table, column, decl string }{
 	// 0, which reads as "never cleaned" -- the conservative answer: such a name is torn down once
 	// more, and only then marked.
 	{"certificates", "orphan_cleaned_at", "INTEGER NOT NULL DEFAULT 0"},
+	// The previous certificate of a name and when it was replaced (see the certificates schema).
+	// Legacy rows keep the empty default, which reads as "no swap recorded yet" -- the honest
+	// answer, because the row predates the column and the rollback table cannot tell a replaced
+	// certificate from an upload nobody ever bound.
+	{"certificates", "previous_cert_id", "TEXT NOT NULL DEFAULT ''"},
+	{"certificates", "swapped_at", "INTEGER NOT NULL DEFAULT 0"},
 	// DNS cleanup guardian (see authorizations in schemaDDL). Legacy rows keep 0 = never
 	// stuck, so they are invisible to the stuck queue until a reclaim actually fails.
 	{"authorizations", "reclaim_attempts", "INTEGER NOT NULL DEFAULT 0"},

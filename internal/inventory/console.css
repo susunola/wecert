@@ -796,23 +796,36 @@ table {
   border-collapse: collapse;
   table-layout: fixed;
 }
+/* Column budget. The row action needs real width, so the six data columns no longer
+   add up to exactly 100% while the seventh column silently takes what is left (which
+   was nothing). Measured 2026-09-29 in a 1083px window: the table laid out 1105px
+   inside a 1014px scroller and the Renew button landed 91px past the right edge —
+   present in the DOM, invisible to the operator, which reads as "there is no Renew
+   button on the rows".
+   Plain percentages, not calc(16% - 15px): Chromium ignores calc() on <col> widths,
+   which silently degrades all seven columns to equal widths (found by measuring the
+   live page). The proportions below are the upstream ones scaled by ~0.9 so that the
+   action column gets 10% (≈100px at this width, enough for the 78px button). */
 col.status {
-  width: 15%;
+  width: 16%;
 }
 col.cert {
-  width: 18%;
+  width: 15%;
 }
 col.domains {
-  width: 21%;
+  width: 19%;
 }
 col.bindings {
-  width: 20%;
+  width: 18%;
 }
 col.expiry {
-  width: 13%;
+  width: 10.5%;
 }
 col.probe {
-  width: 13%;
+  width: 11.5%;
+}
+col.actions {
+  width: 10%;
 }
 th {
   padding: 10px 22px;
@@ -900,6 +913,31 @@ tr.group td {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+/* The certificate cell mirrors the Tencent Cloud SSL console: the deployed certificate ID
+   on the first line, the upload remark it is known by there on the second. */
+.cert-id {
+  display: block;
+  font-weight: 600;
+  letter-spacing: -0.12px;
+}
+.cert-id.pending {
+  font-weight: 500;
+  color: var(--muted);
+}
+.cert-alias {
+  display: block;
+  margin-top: 1px;
+  font-weight: 400;
+  color: var(--quiet);
+  overflow-wrap: anywhere;
+}
+/* A row lists up to three names (MAX_ROW_DOMAINS in console.js): more than that and the
+   table stops being scannable, so the remainder is counted instead. */
+.row-domains {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
 }
 .row-domain {
   font-size: 11px;
@@ -1885,19 +1923,19 @@ th {
   width: 16%;
 }
 .table-scroll col.cert {
-  width: 18%;
+  width: 15%;
 }
 .table-scroll col.domains {
-  width: 21%;
+  width: 19%;
 }
 .table-scroll col.bindings {
-  width: 20%;
+  width: 18%;
 }
 .table-scroll col.expiry {
-  width: 12%;
+  width: 10.5%;
 }
 .table-scroll col.probe {
-  width: 13%;
+  width: 11.5%;
 }
 .empty {
   padding: 36px 18px;
@@ -2097,19 +2135,19 @@ th {
     padding-right: 13px;
   }
   .table-scroll col.cert {
-    width: 17%;
+    width: 15%;
   }
   .table-scroll col.domains {
-    width: 21%;
+    width: 19%;
   }
   .table-scroll col.bindings {
-    width: 20%;
+    width: 18%;
   }
   .table-scroll col.expiry {
-    width: 12%;
+    width: 10.5%;
   }
   .table-scroll col.probe {
-    width: 14%;
+    width: 11.5%;
   }
   .table-scroll col.status {
     width: 16%;
@@ -2371,6 +2409,11 @@ th {
     width: 14px;
     height: 14px;
     color: var(--quiet);
+  }
+  .cert-card-alias {
+    font-size: 10px;
+    color: var(--quiet);
+    overflow-wrap: anywhere;
   }
   .cert-card-domain {
     font-size: 12px;
@@ -2824,4 +2867,246 @@ th {
 .noscript {
   padding: 20px;
   color: var(--muted);
+}
+
+/* ── Renew: the row action and its panel ─────────────────────────────────────────────────────
+   The page is otherwise read-only, so the one control that changes something has to look like it
+   and say what it does: a bordered button at the end of the row, and a panel that separates what
+   will be written (the domain set) from what is only being read (the certificate as it is now). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.row-actions {
+  white-space: nowrap;
+}
+/* The row action must survive a table that scrolls: pinned to the right edge of the
+   scroller (the table keeps a 980px min-width below 1100px, so narrow windows scroll
+   horizontally), with an opaque background so the data columns pass underneath rather
+   than through the button. Backgrounds mirror .row:hover / .row.selected so the hover
+   tint stays continuous across the pinned cell. */
+.table-scroll th:last-child,
+.table-scroll td.row-actions {
+  position: sticky;
+  right: 0;
+  /* Narrower gutters than the data cells: the 78px button has to fit inside a 10%
+     column once the 13px data-cell padding is subtracted (10% of 1014px = 101px,
+     minus 18px = 83px). */
+  padding-left: 8px;
+  padding-right: 10px;
+  background: var(--surface);
+  box-shadow: -1px 0 var(--line);
+}
+.table-scroll th:last-child {
+  z-index: 3;
+  background: var(--soft);
+}
+.table-scroll tr.row:hover td.row-actions,
+.table-scroll tr.row.selected td.row-actions {
+  background: var(--row-hover);
+}
+.renew-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+.renew-btn .icon {
+  width: 13px;
+  height: 13px;
+}
+.renew-btn:hover {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: var(--shadow);
+}
+.renew-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mobile-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: -6px 0 10px;
+}
+.pill-write {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--amber);
+  background: var(--amber-bg);
+  border: 1px solid var(--amber);
+  border-radius: 999px;
+}
+.pill-write .icon {
+  width: 12px;
+  height: 12px;
+}
+.renew-domains {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.renew-domain {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.renew-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--strong-line);
+  border-radius: 6px;
+}
+.renew-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+.renew-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.renew-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.renew-chip {
+  padding: 2px 8px;
+  font-size: 11.5px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+.renew-chip.add {
+  color: var(--accent);
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+.renew-chip.remove {
+  color: var(--red);
+  background: var(--red-bg);
+  border-color: var(--red);
+}
+.renew-warn,
+.renew-notice {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  border-radius: 8px;
+  border: 1px solid transparent;
+}
+.renew-warn {
+  color: var(--red);
+  background: var(--red-bg);
+  border-color: var(--red);
+}
+.renew-notice {
+  color: var(--accent);
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+.renew-warn .icon,
+.renew-notice .icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+.renew-confirm {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.renew-confirm .renew-input {
+  max-width: 260px;
+}
+.renew-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  border-left: 3px solid var(--strong-line);
+  background: var(--soft);
+  border-radius: 0 8px 8px 0;
+}
+.renew-progress[data-state="reissuing"] {
+  border-left-color: var(--blue);
+}
+.renew-progress[data-state="issued"] {
+  border-left-color: var(--accent);
+}
+.renew-progress[data-state="failed"],
+.renew-progress[data-state="rejected"] {
+  border-left-color: var(--red);
+}
+.renew-error {
+  margin: 4px 0 0;
+  color: var(--red);
+  word-break: break-word;
+}
+.renew-audit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.renew-audit-row {
+  display: grid;
+  grid-template-columns: 150px 120px 80px 1fr;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.renew-audit-result[data-result="filed"] {
+  color: var(--accent);
+}
+.renew-audit-result[data-result="rejected"],
+.renew-audit-result[data-result="error"] {
+  color: var(--red);
+}
+@media (max-width: 860px) {
+  .renew-audit-row {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+  .renew-confirm {
+    flex-direction: column;
+  }
+  .renew-confirm .renew-input {
+    max-width: none;
+  }
 }

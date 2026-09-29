@@ -1,6 +1,13 @@
 package inventory
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"testing"
 	"time"
 
@@ -8,6 +15,31 @@ import (
 	"github.com/susunola/wecert/internal/spec"
 	"github.com/susunola/wecert/internal/state"
 )
+
+// selfSignedPEM builds a certificate in the shape the inventory parses.
+//
+// Generated rather than pasted as a fixture on purpose: the serial the page shows has to come out
+// of the DER of the certificate that is actually stored, and a hard-coded PEM would keep passing
+// after the parse path stopped reading it.
+func selfSignedPEM(t *testing.T, serial *big.Int, names ...string) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating a key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: names[0]},
+		DNSNames:     names,
+		NotBefore:    time.Unix(1790000000, 0),
+		NotAfter:     time.Unix(1893456000, 0),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("creating a certificate: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
 
 func TestStatusTokens(t *testing.T) {
 	t.Parallel()
@@ -264,6 +296,147 @@ func TestAssembleCopiesUIN(t *testing.T) {
 	}
 	if byName["b"].UIN != "100098765432" {
 		t.Fatalf("cert-level uin must win: got %q", byName["b"].UIN)
+	}
+}
+
+// The Tencent Cloud SSL console identifies a certificate by its remark, not by anything
+// wecert-side, so every row has to carry the remark it was uploaded under
+// ("wecert/<name>"). Without it an operator can see a name in this page and a different
+// string in the console and has no way to tell that they are the same certificate.
+func TestAssembleCarriesTheUploadAlias(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now: now, Names: []string{"joontest-xyz"},
+		Desired: &spec.Result{
+			Certificates: []config.Certificate{
+				{Name: "joontest-xyz", Domains: []string{"joontest.xyz"}},
+			},
+		},
+		Certs: map[string]*state.CertState{
+			"joontest-xyz": {
+				Name: "joontest-xyz", NotAfter: now.Add(80 * 24 * time.Hour),
+				DeployedCertID: "b9PFzILI", DeployConfirmed: true,
+			},
+		},
+	})
+	if len(snap.Certificates) != 1 {
+		t.Fatalf("got %d rows", len(snap.Certificates))
+	}
+	row := snap.Certificates[0]
+	if row.Alias != "wecert/joontest-xyz" {
+		t.Fatalf("alias = %q, want wecert/joontest-xyz (the remark the uploader writes)", row.Alias)
+	}
+	if row.DeployedCertID != "b9PFzILI" {
+		t.Fatalf("deployedCertId = %q", row.DeployedCertID)
+	}
+}
+
+// A row has to state the certificate's own identity, not only what wecert and the cloud call it.
+//
+// The wecert name and the cloud certificate id both stop existing the moment a customer changes
+// DNS provider, cloud account, or deployment target; the serial number is on the certificate
+// itself, and it is what a browser, an auditor, or a CA support ticket will ask for. The previous
+// certificate and the rollback window travel with it for the same reason: "which certificate did
+// this name serve before" is a question asked exactly when something is wrong with the current one.
+func TestAssembleCarriesTheCertificateIdentity(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC)
+	swappedAt := time.Unix(1790000000, 0).UTC()
+	retiredAt := time.Unix(1790003600, 0).UTC()
+	serial := new(big.Int).SetBytes([]byte{0x04, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0xa7})
+
+	snap := Assemble(Input{
+		Now: now, Names: []string{"joontest-xyz"},
+		Desired: &spec.Result{
+			Certificates: []config.Certificate{
+				{Name: "joontest-xyz", Domains: []string{"joontest.xyz", "renew-test.joontest.xyz"}},
+			},
+		},
+		Certs: map[string]*state.CertState{
+			"joontest-xyz": {
+				Name:            "joontest-xyz",
+				NotAfter:        now.Add(80 * 24 * time.Hour),
+				CertURL:         "https://acme-v02.api.letsencrypt.org/acme/cert/04a1b2c3d4e5f6a7",
+				CertPEM:         selfSignedPEM(t, serial, "joontest.xyz", "renew-test.joontest.xyz"),
+				ARICertID:       "YWtp.04a1b2c3d4e5f6a7",
+				IssuedAt:        now.Add(-time.Hour),
+				DeployedCertID:  "b9PFzILI",
+				DeployConfirmed: true,
+				PreviousCertID:  "b9Previous",
+				SwappedAt:       swappedAt,
+			},
+		},
+		Retired: map[string][]RetiredRef{
+			"joontest-xyz": {
+				{CertID: "b9Previous", RetiredAt: retiredAt.Format(time.RFC3339)},
+				// The orphan path records an upload with no material and no usable time; it still
+				// has to appear, because the cloud certificate it names counts against the quota.
+				{CertID: "b9Orphan"},
+			},
+		},
+	})
+	if len(snap.Certificates) != 1 {
+		t.Fatalf("got %d rows", len(snap.Certificates))
+	}
+	row := snap.Certificates[0]
+
+	if row.Serial != "4A1B2C3D4E5F6A7" {
+		t.Errorf("serial = %q, want the certificate's own serial in upper-case hex", row.Serial)
+	}
+	if row.ACMECertURL != "https://acme-v02.api.letsencrypt.org/acme/cert/04a1b2c3d4e5f6a7" {
+		t.Errorf("acmeCertUrl = %q", row.ACMECertURL)
+	}
+	if row.ARICertID != "YWtp.04a1b2c3d4e5f6a7" {
+		t.Errorf("ariCertId = %q", row.ARICertID)
+	}
+	if row.Previous == nil {
+		t.Fatal("previous is missing: the row must say which certificate this name served before")
+	}
+	if row.Previous.CertID != "b9Previous" || row.Previous.SwappedAt != swappedAt.Format(time.RFC3339) {
+		t.Errorf("previous = %+v, want b9Previous at %s", row.Previous, swappedAt.Format(time.RFC3339))
+	}
+	if len(row.Retired) != 2 {
+		t.Fatalf("retired = %+v, want both rows inside the rollback window", row.Retired)
+	}
+	if row.Retired[0].CertID != "b9Previous" || row.Retired[0].RetiredAt != retiredAt.Format(time.RFC3339) {
+		t.Errorf("retired[0] = %+v", row.Retired[0])
+	}
+	if row.Retired[1].CertID != "b9Orphan" || row.Retired[1].RetiredAt != "" {
+		t.Errorf("retired[1] = %+v, want the material-less orphan row with no time", row.Retired[1])
+	}
+}
+
+// A certificate that predates the swap columns states no previous certificate rather than an
+// invented one, and its serial still comes from the material it holds.
+func TestAssembleWithoutASwapRecord(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now: now, Names: []string{"first-bind"},
+		Desired: &spec.Result{
+			Certificates: []config.Certificate{{Name: "first-bind", Domains: []string{"first.example"}}},
+		},
+		Certs: map[string]*state.CertState{
+			"first-bind": {
+				Name: "first-bind", NotAfter: now.Add(80 * 24 * time.Hour),
+				CertPEM:        selfSignedPEM(t, big.NewInt(0x1234), "first.example"),
+				DeployedCertID: "b9First", DeployConfirmed: true,
+			},
+		},
+	})
+	if len(snap.Certificates) != 1 {
+		t.Fatalf("got %d rows", len(snap.Certificates))
+	}
+	row := snap.Certificates[0]
+	if row.Previous != nil {
+		t.Errorf("previous = %+v, want none for a name that has never been swapped", row.Previous)
+	}
+	if row.Serial != "1234" {
+		t.Errorf("serial = %q, want 1234", row.Serial)
+	}
+	if len(row.Retired) != 0 {
+		t.Errorf("retired = %+v, want empty", row.Retired)
 	}
 }
 

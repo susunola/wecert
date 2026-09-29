@@ -30,6 +30,18 @@ CREATE TABLE IF NOT EXISTS certificates (
     -- has actually swapped it over; otherwise the first upload is treated as
     -- "deployed" and metrics go green before a human has bound anything.
     deploy_confirmed       INTEGER NOT NULL DEFAULT 0,
+    -- Which certificate this name served before the current one, and when the current one
+    -- replaced it. Both are written at the swap only (RecordSwap, called from the promotion
+    -- epilogue) and are deliberately absent from putCertExec's column list -- the same rule
+    -- as orphan_cleaned_at below: PutCert is a whole-row upsert that the failure paths use
+    -- too, so a full-column write would erase the previous certificate's identity on the
+    -- next unrelated state change.
+    --
+    -- retired_certificates cannot stand in for this: it also holds uploads that were never
+    -- bound to anything, so "the newest retired row" can name a certificate that never served
+    -- a request. This pair is the durable answer; the retired table is the rollback window.
+    previous_cert_id       TEXT    NOT NULL DEFAULT '',
+    swapped_at             INTEGER NOT NULL DEFAULT 0,
     -- When this name's orphan teardown finished (unix seconds). 0 means never.
     --
     -- The row of a certificate that left the desired state is kept on purpose -- that is what

@@ -62,6 +62,45 @@ type KnownCert struct {
 // It is read-only. Nothing here unbinds, deletes or re-uploads -- a manual console
 // change is reported so a human decides, which is the only safe response to "someone
 // swapped the certificate behind my back".
+// patrolContract is the account-wide audit contract, declared here so both deployers state it at
+// compile time.
+//
+// The caller (internal/acme's binding patrol) can only assert it at run time, and there the
+// failure mode is silence: a deployer without the method makes PatrolBindings return "no
+// findings" instead of an error. Nothing logs, the metric stays at zero, and the binding memo the
+// console reads is never filled -- the page drops back to "Deployment record only" while every
+// other signal stays green. That is exactly what enforce mode did while its deployer was
+// *LazyTencentCLB, and a compile-time assertion is the only place that mistake is loud.
+type patrolContract interface {
+	PatrolBindings(ctx context.Context, known []KnownCert) ([]PatrolFinding, error)
+}
+
+var (
+	_ Deployer          = (*TencentCLB)(nil)
+	_ RetryableDeployer = (*TencentCLB)(nil)
+	_ StagedDeployer    = (*TencentCLB)(nil)
+	_ patrolContract    = (*TencentCLB)(nil)
+
+	_ Deployer          = (*LazyTencentCLB)(nil)
+	_ RetryableDeployer = (*LazyTencentCLB)(nil)
+	_ StagedDeployer    = (*LazyTencentCLB)(nil)
+	_ patrolContract    = (*LazyTencentCLB)(nil)
+)
+
+// PatrolBindings forwards the account-wide audit to the lazily created cloud client.
+//
+// Enforce mode builds the deployer from the document rather than from the config's certificate
+// list, so it gets *LazyTencentCLB (see buildDeployer in cmd/wecert). Everything the lazy wrapper
+// forgets to forward stops existing for its callers -- and for this one that means the binding
+// details of every already-confirmed certificate.
+func (d *LazyTencentCLB) PatrolBindings(ctx context.Context, known []KnownCert) ([]PatrolFinding, error) {
+	c, err := d.client()
+	if err != nil {
+		return nil, err
+	}
+	return c.PatrolBindings(ctx, known)
+}
+
 func (d *TencentCLB) PatrolBindings(ctx context.Context, known []KnownCert) ([]PatrolFinding, error) {
 	client, err := d.client(ctx)
 	if err != nil {

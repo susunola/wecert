@@ -103,6 +103,31 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 		}
 		if rec != nil {
 			in.Certs[name] = rec
+
+			// The rollback window, read as ids and times only: the inventory has no business
+			// decrypting archived private keys to draw a list, and ListRetiredCertRefs deliberately
+			// keeps the material-less rows (the orphan path records an upload wecert never held a
+			// copy of -- a cloud certificate that still counts against the account's quota).
+			//
+			// A read failure here is not fatal to the page: the row still states everything else,
+			// and saying nothing about the rollback window is the honest degraded answer.
+			refs, err := s.store.ListRetiredCertRefs(name)
+			if err != nil {
+				s.log.Warn("failed to read the retired certificates", "cert", name, "err", err)
+			} else if len(refs) > 0 {
+				if in.Retired == nil {
+					in.Retired = map[string][]inventory.RetiredRef{}
+				}
+				out := make([]inventory.RetiredRef, 0, len(refs))
+				for _, ref := range refs {
+					row := inventory.RetiredRef{CertID: ref.CertID}
+					if !ref.RetiredAt.IsZero() {
+						row.RetiredAt = ref.RetiredAt.UTC().Format(time.RFC3339)
+					}
+					out = append(out, row)
+				}
+				in.Retired[name] = out
+			}
 		}
 	}
 

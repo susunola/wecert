@@ -24,9 +24,19 @@ type bindingMemo struct {
 }
 
 // bindingMemoTTL bounds how long a parse is reused without a fresh TaskDetail read.
-// Past it the next lookup misses and the caller re-queries, so a certificate whose
-// bindings were deleted out-of-band does not report a stale answer forever.
-const bindingMemoTTL = 10 * time.Minute
+//
+// It is a DISPLAY cache: the deployment decisions never read it -- the per-certificate
+// binding check calls Bindings() (which enumerates) and the binding patrol re-enumerates
+// every certificate with cached=false, both regardless of this TTL. Only the read-only
+// inventory (LookupCachedBindings) reads it.
+//
+// It used to be 10 minutes while the patrol runs every 6 hours, so by the time an operator
+// opened the page the cache had always expired: the page fell back to the state store and
+// showed "Deployment record only" with no CLB / listener rows -- the very question the
+// inventory exists to answer ("which certificate is bound where"). Keeping it just above
+// the patrol interval means the last patrol's rows are still visible, timestamped with
+// when they were observed, and a console change is at worst one patrol interval old.
+const bindingMemoTTL = 7 * time.Hour
 
 // bindingMemoMaxEntries is the hard ceiling on cached certificate IDs.
 //
@@ -199,6 +209,28 @@ func (d *TencentCLB) bindingsWith(ctx context.Context, client sslAPI, certID str
 						"certId", certID, "taskId", taskID, "boundResources", n.count)
 				}
 				d.rememberTaskDetail(ctx, client, certID, taskID)
+				if n.count > 0 {
+					return n, nil
+				}
+				// The SSL enumeration anchors on the certificate's PRIMARY slot and reports
+				// nothing at all for a certificate bound only as an SNI extension
+				// (Listener.Certificate.ExtCertIds). Ask CLB directly before answering
+				// "bound nowhere": a false zero keeps the certificate at
+				// waiting_manual_bind for its whole lifetime and hides it from the
+				// inventory. See listenerBindingsForCert for the measurement.
+				snap, fbErr := d.listenerBindingsForCert(ctx, certID)
+				if fbErr != nil {
+					d.logger().Warn("the CLB listener fallback could not run; the SSL enumeration's answer stands",
+						"certId", certID, "err", fbErr)
+					return n, nil
+				}
+				if snap.Count > 0 {
+					d.logger().Info("the SSL bind-resource enumeration reported no binding, but the certificate is "+
+						"bound in a CLB listener (SNI extension or rule); using the listener rows",
+						"certId", certID, "resources", snap.Count, "complete", snap.Complete)
+					rememberBindings(certID, snap)
+					return bindingCount{count: snap.Count, complete: snap.Complete}, nil
+				}
 				return n, nil
 			}
 		}

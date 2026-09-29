@@ -446,6 +446,14 @@ func (m *Manager) download(
 			if err := tx.AddRetiredCert(oldDeployedID, c.Name, oldCertPEM, oldKeyPEM); err != nil {
 				return fmt.Errorf("retire the previous certificate: %w", err)
 			}
+			// The reclaim row is deleted once the rollback window closes, but "which certificate
+			// did this name serve before, and since when" is a question the inventory keeps asking
+			// long after that, so the answer is written into the certificate row itself. Same
+			// transaction as the promotion: a swap that is remembered without the state that made
+			// it true would point at a certificate this name never served.
+			if err := tx.RecordSwap(c.Name, oldDeployedID, m.now()); err != nil {
+				return fmt.Errorf("record the previous certificate: %w", err)
+			}
 		}
 		if orphanID != "" {
 			if err := tx.AddRetiredCert(orphanID, c.Name, orphanPEM, orphanKey); err != nil {

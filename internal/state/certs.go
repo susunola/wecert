@@ -143,6 +143,46 @@ func (s *Store) ClearOrphanCleaned(name string) error {
 	return nil
 }
 
+// RecordSwap notes which certificate a name served before the current one, and when the current
+// one replaced it.
+//
+// A dedicated statement rather than a column on putCertExec, for the reason spelled out on
+// CertState.OrphanCleanedAt: PutCert is a whole-row upsert that the failure paths share, so a
+// full-column write would erase the previous certificate's identity on the next unrelated state
+// change -- which is exactly when someone is looking at the inventory.
+//
+// A missing row is an error, not a silent no-op: the only production caller records the swap in
+// the same transaction that writes the new state, so no row means the caller's assumption about
+// ordering is wrong and the swap would otherwise vanish without a trace.
+func (s *Store) RecordSwap(name, previousCertID string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return recordSwapExec(s.db, name, previousCertID, at)
+}
+
+func recordSwapExec(e execer, name, previousCertID string, at time.Time) error {
+	if name == "" {
+		return fmt.Errorf("record swap: empty certificate name")
+	}
+	if previousCertID == "" {
+		return fmt.Errorf("record swap for %s: empty previous certificate id", name)
+	}
+	res, err := e.Exec(
+		`UPDATE certificates SET previous_cert_id = ?, swapped_at = ? WHERE name = ?`,
+		previousCertID, toUnix(at), name)
+	if err != nil {
+		return fmt.Errorf("record swap for %s: %w", name, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("record swap for %s: %w", name, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("record swap for %s: no certificate row", name)
+	}
+	return nil
+}
+
 // UpdateCert applies fn to one certificate's state and writes the result back, all while
 // holding the store lock.
 //
@@ -181,12 +221,13 @@ func (s *Store) getCertLocked(name string) (*CertState, error) {
 		SELECT name, not_after, cert_url, cert_pem, key_pem, issued_at,
 		       ari_cert_id, ari_window_start, ari_window_end, ari_checked_at, ari_retry_after_ns,
 		       consecutive_failures, next_attempt_at, last_error, deployed_cert_id,
-		       deploy_confirmed, orphan_cleaned_at, updated_at
+		       deploy_confirmed, previous_cert_id, swapped_at, orphan_cleaned_at, updated_at
 		FROM certificates WHERE name = ?`, name)
 
 	c := &CertState{}
 	var notAfter, issuedAt, ariStart, ariEnd, ariChecked, nextAttempt, updatedAt int64
 	var retryAfterNS int64
+	var swappedAt int64
 	var orphanCleanedAt int64
 	var deployConfirmed bool
 
@@ -194,7 +235,7 @@ func (s *Store) getCertLocked(name string) (*CertState, error) {
 		&c.Name, &notAfter, &c.CertURL, &c.CertPEM, &c.KeyPEM, &issuedAt,
 		&c.ARICertID, &ariStart, &ariEnd, &ariChecked, &retryAfterNS,
 		&c.ConsecutiveFailures, &nextAttempt, &c.LastError, &c.DeployedCertID,
-		&deployConfirmed, &orphanCleanedAt, &updatedAt)
+		&deployConfirmed, &c.PreviousCertID, &swappedAt, &orphanCleanedAt, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -210,6 +251,7 @@ func (s *Store) getCertLocked(name string) (*CertState, error) {
 	c.ARIRetryAfter = time.Duration(retryAfterNS)
 	c.NextAttemptAt = fromUnix(nextAttempt)
 	c.DeployConfirmed = deployConfirmed
+	c.SwappedAt = fromUnix(swappedAt)
 	c.OrphanCleanedAt = fromUnix(orphanCleanedAt)
 	c.UpdatedAt = fromUnix(updatedAt)
 	if s.sealer != nil {

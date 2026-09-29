@@ -7,6 +7,8 @@ import (
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 func (d *TencentCLB) Deploy(ctx context.Context, certName, oldID string, certPEM, keyPEM []byte) (string, error) {
@@ -147,7 +149,9 @@ func (d *TencentCLB) upload(ctx context.Context, client sslAPI, certName string,
 	req.CertificatePublicKey = common.StringPtr(string(certPEM))
 	req.CertificatePrivateKey = common.StringPtr(string(keyPEM))
 	req.CertificateType = common.StringPtr("SVR")
-	req.Alias = common.StringPtr("wecert/" + certName)
+	// The remark is the only identity the SSL console shows, and the read-only inventory
+	// renders the same string (config.UploadAlias), so both call sites share one function.
+	req.Alias = common.StringPtr(config.UploadAlias(certName))
 	req.Repeatable = common.BoolPtr(true)
 
 	resp, err := client.UploadCertificateWithContext(ctx, req)

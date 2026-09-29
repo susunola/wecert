@@ -157,6 +157,21 @@ type CertState struct {
 	// alert sees deployed=1 and assumes everything is fine.
 	DeployConfirmed bool
 
+	// PreviousCertID is the certificate this name served before the current one, and
+	// SwappedAt is when the current one replaced it.
+	//
+	// Recorded at the swap itself (the promotion epilogue) instead of being derived later from
+	// retired_certificates: that table also holds certificates wecert merely uploaded and never
+	// bound, so "the newest retired row under this name" can name something that never served a
+	// request. Zero values mean no swap has been recorded since this column existed, which for a
+	// name that was deploying all along is a first issuance.
+	//
+	// Like OrphanCleanedAt, PutCert does NOT write these: it is a whole-row upsert the failure
+	// paths share, so a full-column write would erase the only durable record of the previous
+	// certificate. RecordSwap is the sole writer.
+	PreviousCertID string
+	SwappedAt      time.Time
+
 	// OrphanCleanedAt is when this name's orphan teardown finished; zero means never (or that the
 	// row came back into the desired state since, which clears it).
 	//
@@ -174,6 +189,17 @@ type CertState struct {
 	OrphanCleanedAt time.Time
 
 	UpdatedAt time.Time
+}
+
+// RetiredCertRef names a retired certificate without its archived material.
+//
+// The read-only inventory answers "what is still inside the rollback window" and has no
+// business decrypting archived private keys to do it -- and ListRetiredCertMaterial's
+// cert_pem IS NOT NULL filter would hide the orphan-path rows anyway, which are exactly the
+// ones an operator asking "is this name still holding a cloud certificate" needs to see.
+type RetiredCertRef struct {
+	CertID    string
+	RetiredAt time.Time
 }
 
 // Order is an in-flight ACME order.
