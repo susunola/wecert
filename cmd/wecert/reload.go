@@ -35,6 +35,9 @@ type runtimeController struct {
 	store    *state.Store
 }
 
+// The webhook inventory page type-asserts its Reconciler for BindingReader.
+// A missing method here is a silent fallback to the store-side count (items
+// always blank), so pin the assertion at compile time.
 var _ webhook.BindingReader = (*runtimeController)(nil)
 
 func newRuntimeController(cfg *config.Config, rec *reconcile.Reconciler, notifier reconcile.Notifier, store *state.Store) *runtimeController {
@@ -82,15 +85,22 @@ func (c *runtimeController) ProbeEnabled() bool {
 	defer c.mu.RUnlock()
 	return c.rec.ProbeEnabled()
 }
-func (c *runtimeController) ProbeAnswers(name string) []probe.Answer {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.rec.ProbeAnswers(name)
-}
+
+// BindingSnapshot exposes the bind-resource cache to the webhook inventory page.
+// Without it the type assertion in webhook.Snapshot misses, LiveBindings stays
+// empty, and every certificate falls back to the store-side count (items always
+// blank). The cache is package-global on the deploy side; the lock is only kept
+// for consistency with the other forwarded reads.
 func (c *runtimeController) BindingSnapshot(certID string) (inventory.Bindings, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.rec.BindingSnapshot(certID)
+}
+
+func (c *runtimeController) ProbeAnswers(name string) []probe.Answer {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rec.ProbeAnswers(name)
 }
 func (c *runtimeController) ResourceTypes() []string {
 	c.mu.RLock()

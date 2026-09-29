@@ -18,6 +18,18 @@ import (
 func (c *Config) resolveSecretFiles() ([]string, error) {
 	var warns []string
 	resolve := func(field, value, file string, envs []string, target *string) error {
+		// Operators write ${TENCENTCLOUD_SECRET_ID} in the YAML the same way they write
+		// ${CREDENTIALS_DIRECTORY} in a file path. Expand the literal before deciding
+		// whether a value is present, otherwise the raw "${...}" string is sent to the
+		// provider as the credential and fails far from the cause (SecretIdNotFound).
+		if value != "" {
+			expanded := os.ExpandEnv(value)
+			// Write the expanded form back so a ${VAR} reference never leaks to the
+			// provider as a literal. An unresolvable ${VAR} becomes "" and falls
+			// through to the file / environment fallbacks below.
+			*target = expanded
+			value = expanded
+		}
 		if value != "" && file != "" {
 			return fmt.Errorf("%s and its file variant are both set; keep one of them so it is "+
 				"unambiguous which one is in use", field)

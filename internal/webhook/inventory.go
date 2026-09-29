@@ -1,7 +1,11 @@
 package webhook
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -60,6 +64,44 @@ func (s *Server) handleInventoryPage(w http.ResponseWriter, r *http.Request) {
 	if err := inventory.WritePage(w, s.assembleInventory()); err != nil {
 		s.log.Warn("failed to render the inventory page", "err", err)
 	}
+}
+
+// mergeConsoleCertificates appends rows the web console created that are not yet
+// in the desired state, so a newly created certificate is visible in inventory
+// immediately instead of disappearing until the next config edit.
+func mergeConsoleCertificates(snap inventory.Snapshot, statePath string) inventory.Snapshot {
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(statePath), "console-certificates.json"))
+	if err != nil {
+		return snap
+	}
+	var list []map[string]any
+	if json.Unmarshal(b, &list) != nil {
+		return snap
+	}
+	have := map[string]bool{}
+	for _, c := range snap.Certificates {
+		have[c.Name] = true
+	}
+	for _, rec := range list {
+		name, _ := rec["name"].(string)
+		if name == "" || have[name] {
+			continue
+		}
+		domains, _ := rec["domains"].([]any)
+		row := inventory.Certificate{
+			Name:    name,
+			Status:  "not_issued",
+			Profile: strOrEmpty(rec["profile"]),
+			KeyType: strOrEmpty(rec["keyType"]),
+			UIN:     strOrEmpty(rec["uin"]),
+		}
+		for _, d := range domains {
+			row.Domains = append(row.Domains, fmt.Sprint(d))
+		}
+		snap.Certificates = append(snap.Certificates, row)
+		have[name] = true
+	}
+	return snap
 }
 
 func (s *Server) assembleInventory() inventory.Snapshot {
@@ -170,7 +212,7 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 		quotas = qr.QuotaStatus()
 		in.RateLimited = blockedCertificates(in.Desired, quotas)
 	}
-	snap := inventory.Assemble(in)
+	snap := mergeConsoleCertificates(inventory.Assemble(in), s.store.Path())
 	snap.Quotas = quotaViews(quotas)
 	return snap
 }
@@ -284,4 +326,17 @@ func storedHostSamples(samples []state.ProbeSample) []inventory.HostSample {
 		out = append(out, row)
 	}
 	return out
+}
+
+// strOrEmpty renders a JSON value as a string, treating nil/empty as "".
+// fmt.Sprint(nil) is "<nil>", which then shows up as a literal UIN in the console.
+func strOrEmpty(v any) string {
+	if v == nil {
+		return ""
+	}
+	s := fmt.Sprint(v)
+	if s == "<nil>" {
+		return ""
+	}
+	return s
 }

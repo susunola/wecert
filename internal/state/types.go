@@ -291,3 +291,9 @@ type RetiredCert struct {
 // certPEM and keyPEM may be nil when there is nothing to archive (the orphan path records a
 // certificate wecert never held a copy of). The row is still useful then: the reaper must
 // delete it from the cloud either way.
+
+// Path returns the state database path. Used by callers that keep sidecars
+// (console registry, generation marker) in the same directory.
+func (s *Store) Path() string {
+	return s.path
+}

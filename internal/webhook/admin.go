@@ -31,6 +31,16 @@ type AdminOps struct {
 	RecoveryDrill func(ctx context.Context, source string) (any, error)
 	// Restore actually replaces the state database. Requires a confirm challenge.
 	Restore func(ctx context.Context, source string) (any, error)
+
+	// Certificate management for the web console. Each is optional; nil is not mounted.
+	ListAccounts      func(ctx context.Context) (any, error)
+	AddAccount        func(ctx context.Context, body map[string]any) (any, error)
+	RemoveAccount     func(ctx context.Context, uin string) (any, error)
+	ListBindings      func(ctx context.Context) (any, error)
+	CreateCertificate func(ctx context.Context, body map[string]any) (any, error)
+	DeleteCertificate func(ctx context.Context, name string) (any, error)
+	BindCertificate   func(ctx context.Context, name string, body map[string]any) (any, error)
+	UnbindCertificate func(ctx context.Context, name string) (any, error)
 }
 
 // confirmGrant is a one-shot restore ticket. Source, when non-empty, is the only

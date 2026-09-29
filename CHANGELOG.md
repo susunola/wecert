@@ -21,6 +21,11 @@
 
 ### Fixed
 
+- **`secretId: ${TENCENTCLOUD_SECRET_ID}` in the YAML is expanded before use.** A
+  literal `${...}` was sent to the provider as the SecretId and failed as
+  `AuthFailure.SecretIdNotFound`, far from the cause. Unresolvable references
+  become empty and fall through to the environment fallback, matching the
+  file-path expansion the same block already had.
 - **The production Console receives cached cloud bindings.** The stable runtime
   controller now forwards `BindingSnapshot` under its reload read lock, with an
   interface assertion and an integration test through the real controller. The
@@ -38,6 +43,32 @@
   updates retain scroll and keyboard focus. Closing a removed certificate restores
   focus to a connected control. A real-browser regression gate runs in CI via
   `make check-console` using isolated fixtures and no cloud access.
+- **Console registries serialize as `[]`, never `null`.** `json.MarshalIndent` of
+  an empty slice is `null`, which the next Unmarshal leaves as a nil list.
+- **Console Bind uploads a certificate that was never deployed.** A certificate
+  issued with `deploy.enabled: false` had no cloud id, so Bind bounced with "no
+  cloud certificate id yet". The admin bind path now uploads the state-store
+  material to Tencent Cloud SSL, records the CertificateId, then attaches it.
+  SNI listeners get a forwarding rule created when the domain is missing
+  (`Certificate.SSLMode` is required on CreateRule); the async `AddQLBLocation`
+  task is no longer raced by an immediate ModifyDomainAttributes.
+
+### Added
+
+- **Web console certificate and account management.** `/admin/certificates`
+  creates, binds, and deletes certificates against live state (config.yaml +
+  SIGHUP on create); `/admin/accounts` stores AK/SK as 0600 on the daemon host.
+  Read-only `/api/accounts` and `/api/bindings` feed the console panels.
+- **Console Delete also clears the state store.** `DeleteCert` drops the
+  certificate row and its orders / authorizations / probe samples, so a deleted
+  name no longer logs "no longer in the desired state" forever or resurfaces in
+  inventory from leftover state.
+- **`renewBefore` accepts the console's day values.** The create API maps
+  `30d`/`14d`/`7d` onto Go durations (`720h`/`336h`/`168h`) before writing
+  config.yaml; the parser still rejects day units with "use hours".
+- **`deploy: clb|nginx` on create writes `deploy.enabled: true`.** Issue-only
+  (`deploy: none`) keeps `enabled: false`. The console no longer invents
+  post-create status: it refreshes `/api/inventory` and requests a reconcile.
 
 - **Remote retention and download honour the local clock-drift rules.** A
   future-stamped snapshot name sorts as newest forever and used to hold a Keep slot

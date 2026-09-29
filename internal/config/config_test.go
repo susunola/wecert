@@ -1377,3 +1377,52 @@ func TestIdentifiersThatCannotBeIssuedAreRejected(t *testing.T) {
 		}
 	}
 }
+
+
+
+// A ${TENCENTCLOUD_SECRET_ID} reference in the YAML must be expanded before use.
+// Sending the literal "${...}" to the provider fails as SecretIdNotFound, far from
+// the cause. Unresolvable references become empty and fall through to the env.
+func TestSecretValueEnvironmentReferencesExpand(t *testing.T) {
+	t.Setenv("WECERT_TEST_SECRET_ID", "AKIDfrom-env")
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "")
+	base := `
+statePath: /tmp/wecert-test.db
+acme:
+  directory: https://acme-staging-v02.api.letsencrypt.org/directory
+  email: ops@atomwangnus.com
+dns:
+  provider: dnspod
+  loginToken: token
+tencent:
+  credentialMode: static
+  secretId: ${WECERT_TEST_SECRET_ID}
+  secretKey: plain-key
+  regions: [ap-guangzhou]
+certificates:
+  - name: example-com
+    domains: ["example.com"]
+`
+	path := writeConfig(t, base)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Tencent.SecretID != "AKIDfrom-env" {
+		t.Errorf("secretId must expand the environment reference, got %q", c.Tencent.SecretID)
+	}
+	if c.Tencent.SecretKey != "plain-key" {
+		t.Errorf("secretKey without a reference must stay literal, got %q", c.Tencent.SecretKey)
+	}
+
+	t.Setenv("WECERT_TEST_SECRET_ID", "")
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "AKIDfrom-ambient")
+	path = writeConfig(t, base)
+	c, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Tencent.SecretID != "AKIDfrom-ambient" {
+		t.Errorf("an unresolvable reference must fall through to the environment, got %q", c.Tencent.SecretID)
+	}
+}

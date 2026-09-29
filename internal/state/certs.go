@@ -369,3 +369,34 @@ func (s *Store) RecordFailure(name, lastErr string, consecutiveFailures int, nex
 // ---------- Order ----------
 
 // GetOrder reads the in-flight order; returns (nil, nil) when it does not exist.
+
+
+// DeleteCert removes a certificate and everything that hangs off it (orders,
+// authorizations, probe samples). Called when the console or config drops a
+// name for good: leaving the row behind makes every later pass log "no longer
+// in the desired state" and keep serving it from inventory forever.
+//
+// Retired certificates are kept: those are cloud uploads awaiting reclaim and
+// are owned by ReapRetired, not by the name that used to hold them.
+func (s *Store) DeleteCert(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("delete cert %s: %w", name, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, q := range []string{
+		`DELETE FROM probe_samples WHERE cert_name = ?`,
+		`DELETE FROM authorizations WHERE cert_name = ?`,
+		`DELETE FROM orders WHERE cert_name = ?`,
+		`DELETE FROM identifier_failures WHERE cert_name = ?`,
+		`DELETE FROM cert_fallback WHERE cert_name = ?`,
+		`DELETE FROM certificates WHERE name = ?`,
+	} {
+		if _, err := tx.Exec(q, name); err != nil {
+			return fmt.Errorf("delete cert %s (%s): %w", name, q, err)
+		}
+	}
+	return tx.Commit()
+}

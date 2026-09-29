@@ -35,6 +35,7 @@ import (
 // "cannot even validate the config because the daemon is up" pushes people into
 // blindly editing the config. That path only reads the existing ACME account.
 func openRuntime(f *flags, log *slog.Logger) (*config.Config, *state.Store, error) {
+	configPathForAdmin = f.configPath
 	cfg, err := config.Load(f.configPath)
 	if err != nil {
 		return nil, nil, err
@@ -70,6 +71,7 @@ func openRuntime(f *flags, log *slog.Logger) (*config.Config, *state.Store, erro
 	if err != nil {
 		return nil, nil, err
 	}
+	openStateStore = store
 
 	// The first run creates a new ACME account. If it is also the production directory,
 	// say this plainly up front: accounts are a finite resource (at most 10 per IP per
@@ -414,7 +416,7 @@ func adminAuditPath(statePath string) string {
 // adminOps wires the guarded /admin surface to the same code paths the CLI uses.
 // nil fields simply are not mounted (see webhook.AdminOps).
 func adminOps(cfg *config.Config, log *slog.Logger) webhook.AdminOps {
-	return webhook.AdminOps{
+	ops := webhook.AdminOps{
 		BackupHealth: func(ctx context.Context) (any, error) {
 			return backupHealth(cfg)
 		},
@@ -428,6 +430,9 @@ func adminOps(cfg *config.Config, log *slog.Logger) webhook.AdminOps {
 			return adminRestore(cfg, source, log)
 		},
 	}
+	// Certificate/account management for the web console (see cert_admin.go).
+	registerCertAdminOps(&ops, cfg, log)
+	return ops
 }
 
 // backupHealth is the read-only snapshot posture (local + remote).
