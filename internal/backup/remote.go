@@ -883,6 +883,11 @@ func pruneSFTP(client *sftp.Client, t Target, current string) error {
 	// pass it is the sidecar's name ("...db.hmac"), whose prefix is still the snapshot's. Do not
 	// "simplify" this into the sidecar name without checking the split still lands in the same place.
 	base := strings.Split(current, ".backup-")[0] + ".backup-"
+	// On the signed path's second pass current is the .hmac sidecar: strip it so
+	// protect covers the snapshot that sidecar signs. Without this the second
+	// prune treated the snapshot as "an old sibling" and deleted it (keep=1
+	// emptied the remote).
+	currentBase := strings.TrimSuffix(filepath.Base(current), ".hmac")
 	var names []string
 	for _, entry := range entries {
 		name := entry.Name()
@@ -896,24 +901,17 @@ func pruneSFTP(client *sftp.Client, t Target, current string) error {
 			names = append(names, name)
 		}
 	}
-	if len(names) <= t.Keep {
-		// Still clear future-dated names: they sort as "newest" forever and would
-		// keep replacing the honest recovery point on the next download.
-		var onlyFuture []string
-		for _, name := range names {
-			if futureDatedSnapshot(name) {
-				onlyFuture = append(onlyFuture, name)
-			}
-		}
-		for _, name := range onlyFuture {
-			_ = client.Remove(path.Join(t.RemoteDir, name))
-			_ = client.Remove(path.Join(t.RemoteDir, name+".hmac"))
-		}
-		return nil
-	}
 	sort.Strings(names)
+	// protect current: after a backward step its name is the oldest while its content is
+	// the newest, and a forward step can stamp it in the future. Deleting it here is the
+	// upload destroying the recovery point it just published -- the same bug pruneS3's
+	// currentBase skip prevents. On the signed path's second pass current is the .hmac
+	// sidecar, which is not in `names`, so the skip is a no-op there.
 	var future, honest []string
 	for _, name := range names {
+		if name == currentBase {
+			continue
+		}
 		if futureDatedSnapshot(name) {
 			future = append(future, name)
 		} else {
@@ -921,8 +919,11 @@ func pruneSFTP(client *sftp.Client, t Target, current string) error {
 		}
 	}
 	victims := append([]string(nil), future...)
-	if extra := len(honest) - t.Keep; extra > 0 {
-		victims = append(victims, honest[:extra]...)
+	if t.Keep > 0 {
+		// +1 because current itself occupies one Keep slot and is not in honest.
+		if extra := len(honest) - t.Keep + 1; extra > 0 {
+			victims = append(victims, honest[:extra]...)
+		}
 	}
 	for _, name := range victims {
 		if err := client.Remove(path.Join(t.RemoteDir, name)); err != nil {

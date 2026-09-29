@@ -73,17 +73,13 @@ func (s *DNSSolver) Present(ctx context.Context, domain, token, keyAuth string) 
 		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
 	}
 
-	// The lego resolver slot is taken BEFORE the bounded call, in this goroutine, so a
-	// timeout path still releases it via the deferred Unlock below. Taking it inside
-	// callProviderBounded's helper goroutine meant a wedged network call kept the package
-	// mutex until it returned: every later Present/CleanUp for every name queued behind
-	// one black-holed Route 53 request -- the fleet-wide stall callProviderBounded exists
-	// to prevent.
-	if err := acquireLegoResolver(dnsAPITimeout); err != nil {
-		return DNSRecord{}, fmt.Errorf("present TXT: %w", err)
-	}
-	defer legoResolverMu.Unlock()
-
+	// callProviderBounded bounds how long this name's lease is held. The lego
+	// resolver slot is taken inside the bounded call (see callLegoProviderResolvers)
+	// and is released only after the provider call has really finished -- not on
+	// this function's timeout. lego's dns01.recursiveNameservers is a package-level
+	// variable that FindZoneByFqdn / lookupNameservers / dnsQuery read repeatedly
+	// during Present/CleanUp: unlocking while the detached call is still running
+	// would let the next caller overwrite those nameservers mid-lookup.
 	if err := callProviderBounded("present TXT", func() error {
 		return s.callLegoProviderResolvers(func() error { return provider.Present(domain, token, keyAuth) })
 	}); err != nil {
@@ -101,36 +97,43 @@ func (s *DNSSolver) findZoneWithResolvers(ctx context.Context, fqdn string, reso
 
 var legoResolverMu sync.Mutex
 
-// acquireLegoResolver takes the global lego resolver slot within timeout, or fails
-// fast as "busy".
+// acquireLegoResolver takes the global lego resolver slot, or fails immediately
+// as "busy" when another call still holds it.
 //
-// lego's dns01 package keeps the recursive nameserver list in one mutable place, so
-// concurrent provider calls have to be serialised. That is not the same as queueing
-// unboundedly: when the holder is a wedged network call, waiters would inherit its
-// stall. Failing after the timeout with a distinct "busy" error keeps the outage
-// proportional to the one stuck call instead of the whole fleet, and the caller
-// (Present/CleanUp) releases its per-name lease as usual.
-func acquireLegoResolver(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		if legoResolverMu.TryLock() {
-			return nil
-		}
-		if !time.Now().Before(deadline) {
-			return fmt.Errorf("DNS provider busy: another Present/CleanUp is still inside lego " +
-				"and holds the global resolver slot (a wedged Route 53/Cloudflare call cannot be " +
-				"cancelled); this name will be retried after the lease is dropped")
-		}
-		time.Sleep(20 * time.Millisecond)
+// lego's dns01.recursiveNameservers is one mutable package-level slice
+// (challenge/dns01/nameserver.go), and FindZoneByFqdn / lookupNameservers /
+// dnsQuery read it repeatedly for the whole duration of a provider
+// Present/CleanUp. The slot therefore has to be held until that call has really
+// returned -- including the restore of the caller's own nameservers -- not
+// merely until the outer deadline expires. Otherwise the next caller overwrites
+// the list while a detached lookup is still using it.
+//
+// Waiting is not the right failure mode either: a wedged Route 53 request would
+// queue every other name behind it. TryLock fails fast so the outage stays
+// proportional to the one stuck call, which keeps the slot until it finishes.
+func acquireLegoResolver() error {
+	if legoResolverMu.TryLock() {
+		return nil
 	}
+	return fmt.Errorf("DNS provider busy: another Present/CleanUp is still inside lego " +
+		"and holds the global resolver slot (a wedged Route 53/Cloudflare call cannot be " +
+		"cancelled); this name will be retried after the lease is dropped")
 }
 
 // callLegoProviderResolvers keeps lego's provider-side zone lookup on the host
 // resolver. Verification may use public resolvers, but lego's Cloudflare
 // provider performs its own UDP-only lookup before writing a record.
 //
-// The caller must already hold legoResolverMu (see acquireLegoResolver).
+// The slot is taken here and released only after fn has returned and the
+// previous nameservers are restored. Callers wrap this in callProviderBounded:
+// that bound returns early so the per-name lease is dropped, while this
+// function keeps holding the global slot until the detached call is done.
 func (s *DNSSolver) callLegoProviderResolvers(fn func() error) error {
+	if err := acquireLegoResolver(); err != nil {
+		return err
+	}
+	// LIFO: restore runs first, then Unlock -- the slot outlives the restore.
+	defer legoResolverMu.Unlock()
 	defer dns01.AddRecursiveNameservers(s.recursiveNameservers)(&dns01.Challenge{})
 	if err := dns01.AddRecursiveNameservers(s.providerResolvers)(&dns01.Challenge{}); err != nil {
 		return err

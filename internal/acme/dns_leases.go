@@ -86,13 +86,9 @@ func (s *DNSSolver) CleanUp(ctx context.Context, domain, token, keyAuth string) 
 	if err != nil {
 		return fmt.Errorf("get the DNS provider: %w", err)
 	}
-	// Same bound as Present, and the same rule about who holds the lego resolver
-	// slot: acquire it here so a timeout still releases it, instead of queueing the
-	// whole fleet behind one wedged call.
-	if err := acquireLegoResolver(dnsAPITimeout); err != nil {
-		return fmt.Errorf("cleanup TXT: %w", err)
-	}
-	defer legoResolverMu.Unlock()
+	// Same bound as Present. The lego resolver slot is taken inside
+	// callLegoProviderResolvers and held until the provider call really returns
+	// (see the note there on dns01.recursiveNameservers).
 	err = callProviderBounded("cleanup TXT", func() error {
 		return s.callLegoProviderResolvers(func() error { return provider.CleanUp(domain, token, keyAuth) })
 	})

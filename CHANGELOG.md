@@ -8,8 +8,13 @@
   package-global `legoResolverMu` was taken inside `callProviderBounded`'s helper
   goroutine: the caller timed out and dropped its per-name lease, but the mutex stayed
   held until the hung Route 53/Cloudflare call returned, so every later name queued
-  behind it. The slot is acquired in the caller now and fails fast as "busy" after
-  `dnsAPITimeout`, which keeps the outage proportional to the one stuck call.
+  behind it. The slot is now TryLock'd with a fast "busy" answer -- and it is released
+  only after the provider call has **really** returned and lego's nameservers are
+  restored. That last part is load-bearing: `dns01.recursiveNameservers` is a
+  package-level variable that `FindZoneByFqdn` / `lookupNameservers` / `dnsQuery` read
+  repeatedly during Present/CleanUp, so unlocking on the outer timeout would let the
+  next caller overwrite the list mid-lookup (verified in lego v4.35.2
+  `challenge/dns01/nameserver.go`).
 - **`LastError` is redacted before it is written.** It is served verbatim by
   `/hook/status` and `/api/inventory` to whoever holds the read-only token; the notify
   path already redacted its copy. Shared `internal/redact` covers both faces.
@@ -19,10 +24,13 @@
 - **Remote retention and download honour the local clock-drift rules.** A
   future-stamped snapshot name sorts as newest forever and used to hold a Keep slot
   forever on S3/COS/SFTP; it is now never the download "newest" and is always a prune
-  victim. The object just uploaded is protected from prune (`pruneS3`), matching the
-  local `protect` rule -- after a backward step its name is the oldest while its
-  content is the newest. Victim count stays `len-Keep` so the signed path's second
-  prune (where `current` is the `.hmac` sidecar) does not retain Keep+1.
+  victim. The object just uploaded is protected from prune on **both** S3 and SFTP
+  (`pruneSFTP` previously deleted it: a future-stamped `current` was cleaned up as
+  "future", and after a backward step it was the oldest name in `honest[:extra]`).
+  On the signed path the second prune's `current` is the `.hmac` sidecar, so protect
+  strips that suffix to cover the snapshot it signs -- without that, keep=1 emptied
+  the remote. Victim count stays `len-Keep` semantics so the second pass does not
+  retain Keep+1.
 - **A TXT record is not declared absent when some authoritative NS simply did not
   answer.** `LookupTXT` required only "some denied, none confirmed", which a single
   unreachable NS next to one deny satisfied -- and the cleanup path then deleted the
