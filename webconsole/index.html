@@ -1,0 +1,3082 @@
+<!-- AI生成 -->
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>wecert · Certificate inventory</title>
+        <script>
+      // Kill native token dialogs before any bundle runs (incl. stale caches).
+      try {
+        window.prompt = function () { return null; };
+        Object.defineProperty(window, "prompt", {
+          value: function () { return null; },
+          writable: false,
+          configurable: false
+        });
+      } catch (e) {}
+    </script>
+    <style>
+/* Preview hosts may inject an AI watermark; never show it. */
+[data-aigc-mark],
+[aigc-mark] {
+  display: none !important;
+}
+
+/* wecert control console — refined on the original inventory visual system
+   tokens and proportions from internal/inventory/console.css */
+
+:root {
+  color-scheme: light;
+  --bg: #f5f7f8;
+  --surface: #fff;
+  --soft: #f8fafb;
+  --text: #19282c;
+  --muted: #617379;
+  --quiet: #63767d;
+  --line: #e5eaec;
+  --strong-line: #cfd9dc;
+  --accent: #0c7d70;
+  --accent-bg: #eaf6f2;
+  --red: #bc464c;
+  --red-bg: #fff0f0;
+  --amber: #966018;
+  --amber-bg: #fff7e8;
+  --blue: #456ba0;
+  --blue-bg: #edf3fb;
+  --neutral-bg: #eff2f4;
+  --shadow: 0 12px 40px #1c383b0d;
+  --row-hover: #f5faf9;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #10191d;
+  --surface: #152126;
+  --soft: #19272d;
+  --text: #e3eeee;
+  --muted: #a0b3b9;
+  --quiet: #8a9ea5;
+  --line: #2a3a40;
+  --strong-line: #43555d;
+  --accent: #77d7bc;
+  --accent-bg: #1c3b34;
+  --red: #f69499;
+  --red-bg: #41292e;
+  --amber: #e6bd7b;
+  --amber-bg: #3b3426;
+  --blue: #9fbfe9;
+  --blue-bg: #263547;
+  --neutral-bg: #2b393f;
+  --shadow: 0 12px 40px #0002;
+  --row-hover: #20312f;
+}
+
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  color: var(--text);
+  background: var(--bg);
+  font:
+    14px/1.5 -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a {
+  color: inherit;
+  text-decoration: none;
+}
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+button {
+  border: 0;
+  cursor: pointer;
+  background: none;
+}
+button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid #66b8aa;
+  outline-offset: 3px;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.91em;
+  letter-spacing: -0.02em;
+}
+.muted {
+  color: var(--muted);
+}
+.hidden {
+  display: none !important;
+}
+.spacer {
+  flex: 1;
+}
+
+/* ── topbar ─────────────────────────────────────── */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 28px;
+  height: 58px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.brand-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: linear-gradient(160deg, var(--accent), #0a655c);
+  position: relative;
+  box-shadow: inset 0 1px 0 #ffffff33;
+  flex: none;
+}
+.brand-mark::after {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border: 2px solid #fff;
+  border-radius: 999px;
+  border-left-color: transparent;
+  transform: rotate(-25deg);
+  opacity: 0.95;
+}
+:root[data-theme="dark"] .brand-mark {
+  background: linear-gradient(160deg, var(--accent), #2f9a82);
+}
+/* WeCert wordmark — tight geometric logotype */
+.wordmark {
+  font-family:
+    "SF Pro Display",
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.045em;
+  line-height: 1;
+  display: inline-flex;
+  align-items: baseline;
+}
+.wm-we {
+  color: var(--text);
+}
+.wm-cert {
+  color: var(--accent);
+  font-weight: 750;
+}
+.wordmark::after {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-left: 3px;
+  border-radius: 1.5px;
+  background: var(--accent);
+  align-self: center;
+  transform: translateY(-1px);
+}
+.brand-tag {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: var(--accent-bg);
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+.topnav {
+  display: flex;
+  gap: 2px;
+  margin-left: 6px;
+}
+.nav-item {
+  padding: 7px 12px;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 550;
+}
+.nav-item:hover {
+  color: var(--text);
+  background: var(--soft);
+}
+.nav-item.active {
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 550;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: var(--soft);
+}
+.pill .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 3px var(--amber-bg);
+}
+.pill .dot.staging {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px var(--amber-bg);
+}
+.pill .dot.prod {
+  background: var(--red);
+  box-shadow: 0 0 0 3px var(--red-bg);
+}
+.env-switch {
+  display: inline-flex;
+  gap: 2px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 3px;
+}
+.env-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 550;
+}
+.env-btn:hover {
+  color: var(--text);
+}
+.env-btn.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 2px #1c383b14;
+}
+.env-btn .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+.env-btn .dot.prod {
+  background: var(--red);
+}
+.env-btn.active .dot.prod {
+  box-shadow: 0 0 0 3px var(--red-bg);
+}
+.env-btn.active .dot.staging {
+  box-shadow: 0 0 0 3px var(--amber-bg);
+}
+.env-pill.production {
+  border-color: color-mix(in srgb, var(--red) 35%, var(--line));
+  color: var(--red);
+  background: var(--red-bg);
+}
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 14px;
+}
+.icon-btn:hover {
+  color: var(--text);
+  border-color: var(--strong-line);
+  background: var(--soft);
+}
+
+/* ── buttons ────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: var(--surface);
+  padding: 8px 13px;
+  border: 1px solid var(--strong-line);
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 550;
+  white-space: nowrap;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease,
+    transform 0.08s ease;
+}
+.btn:hover {
+  background: var(--soft);
+  border-color: var(--strong-line);
+  color: var(--text);
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.btn-primary:hover {
+  opacity: 0.92;
+  background: var(--accent);
+  color: #fff;
+}
+:root[data-theme="dark"] .btn-primary {
+  color: #0c2420;
+}
+.btn-danger {
+  background: var(--red);
+  border-color: var(--red);
+  color: #fff;
+}
+:root[data-theme="dark"] .btn-danger {
+  color: #2a1214;
+}
+.btn-danger:hover {
+  opacity: 0.92;
+  color: #fff;
+}
+.btn-xs {
+  padding: 5px 9px;
+  font-size: 11px;
+  border-radius: 6px;
+}
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.btn-ghost:hover {
+  color: var(--accent);
+  background: var(--accent-bg);
+  border-color: transparent;
+}
+
+/* ── page ───────────────────────────────────────── */
+main {
+  width: 100%;
+  padding: 26px 28px 64px;
+}
+.heading {
+  display: flex;
+  align-items: flex-end;
+  gap: 24px;
+  margin-bottom: 22px;
+}
+.heading-text {
+  min-width: 0;
+}
+.eyebrow {
+  display: block;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 10px;
+}
+.heading h1 {
+  margin: 0 0 8px;
+  font-size: 28px;
+  letter-spacing: -1px;
+  font-weight: 700;
+  line-height: 1.12;
+}
+.subheading {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 450;
+  letter-spacing: 0.01em;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-left: auto;
+  padding-bottom: 2px;
+}
+.heading-buttons {
+  display: flex;
+  gap: 8px;
+}
+.snapshot-meta {
+  text-align: right;
+  font-size: 11px;
+  color: var(--quiet);
+  line-height: 1.35;
+}
+.snapshot-meta span {
+  display: block;
+}
+.snapshot-meta b {
+  display: block;
+  color: var(--text);
+  font-weight: 550;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* ── summary (original metric strip) ────────────── */
+.summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 20px 0;
+  margin-bottom: 22px;
+  box-shadow: 0 2px 2px #17353602;
+}
+.metric {
+  padding: 2px 27px;
+  border-right: 1px solid var(--line);
+  background: none;
+  text-align: left;
+}
+.metric:last-child {
+  border: 0;
+}
+.metric-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.metric-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.metric-value {
+  font-size: 34px;
+  font-weight: 580;
+  line-height: 1.15;
+  letter-spacing: -1.2px;
+  font-variant-numeric: tabular-nums;
+}
+.metric-value.accent {
+  color: var(--accent);
+}
+.metric-note {
+  display: block;
+  font-size: 11px;
+  color: var(--quiet);
+  margin-top: 8px;
+}
+.metric.warn .metric-value {
+  color: var(--amber);
+}
+.metric.bad .metric-value {
+  color: var(--red);
+}
+.metric:hover .metric-label {
+  color: var(--accent);
+}
+
+/* ── panel / toolbar ────────────────────────────── */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 2px 2px #17353602;
+}
+.panel-head {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 18px 22px 0;
+  border-bottom: 1px solid var(--line);
+}
+.panel-head h2 {
+  margin: 0 0 14px;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.2px;
+}
+.small-count {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--neutral-bg);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-weight: 550;
+}
+.toolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-bottom: 0;
+}
+.toolbar .tabs {
+  margin-bottom: -1px;
+  border-bottom: 1px solid transparent;
+}
+.toolbar .searchbox,
+.toolbar .select {
+  margin-bottom: 10px;
+}
+.toolbar .tabs + .searchbox {
+  margin-left: 8px;
+}
+.tabs {
+  display: flex;
+  gap: 2px;
+  align-items: stretch;
+}
+.tab {
+  position: relative;
+  padding: 8px 14px;
+  border-radius: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 550;
+  background: none;
+}
+.tab:hover {
+  color: var(--text);
+}
+.tab::after {
+  content: "";
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: transparent;
+}
+.tab[aria-pressed="true"] {
+  color: var(--text);
+  box-shadow: none;
+}
+.tab[aria-pressed="true"]::after {
+  background: var(--accent);
+}
+.searchbox-right {
+  flex: 0 1 320px;
+  min-width: 200px;
+  max-width: 360px;
+  margin-left: auto;
+}
+.searchbox {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 11px;
+  height: 36px;
+}
+.searchbox input {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  padding: 9px 0;
+  outline: none;
+  font-size: 12px;
+}
+.searchbox kbd {
+  font-size: 10px;
+  color: var(--quiet);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 5px;
+  background: var(--surface);
+}
+.select {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 10px;
+  height: 36px;
+  outline: none;
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* ── table (original density) ───────────────────── */
+.table-scroll {
+  overflow-x: auto;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+col.status {
+  width: 13%;
+}
+col.cert {
+  width: 17%;
+}
+col.domains {
+  width: 22%;
+}
+col.bindings {
+  width: 19%;
+}
+col.expiry {
+  width: 10%;
+}
+col.actions {
+  width: 19%;
+}
+th {
+  padding: 10px 18px;
+  text-align: left;
+  font-size: 10px;
+  letter-spacing: 0.065em;
+  color: var(--quiet);
+  background: var(--soft);
+  font-weight: 600;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+td {
+  padding: 11px 18px;
+  border-bottom: 1px solid var(--line);
+  height: 62px;
+  vertical-align: middle;
+  font-size: 12px;
+}
+tbody tr:hover td {
+  background: var(--row-hover);
+}
+tbody tr:last-child td {
+  border-bottom: 0;
+}
+tr.group td {
+  padding: 9px 18px;
+  height: 35px;
+  background: var(--soft);
+  font-size: 11px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.group-content {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.group-content b {
+  font-weight: 550;
+  color: var(--text);
+  font-size: 11px;
+}
+.group-content .certcount {
+  color: var(--quiet);
+  font-size: 10px;
+}
+.group-content .group-alert {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--muted);
+}
+.row {
+  transition: background 0.12s;
+}
+.cert-name {
+  display: block;
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: -0.12px;
+  padding: 0;
+  text-align: left;
+  color: var(--text);
+}
+.cert-name:hover {
+  color: var(--accent);
+}
+.name-sub {
+  font-size: 10px;
+  color: var(--quiet);
+  margin-top: 3px;
+}
+.domains {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.more {
+  display: inline-block;
+  padding: 1px 5px;
+  margin-left: 6px;
+  border-radius: 4px;
+  background: var(--neutral-bg);
+  color: var(--muted);
+  font-size: 9px;
+  font-family: inherit;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 5px;
+  padding: 3px 7px;
+  font-size: 10px;
+  font-weight: 550;
+  white-space: nowrap;
+}
+.badge-green {
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+.badge-amber {
+  color: var(--amber);
+  background: var(--amber-bg);
+}
+.badge-red {
+  color: var(--red);
+  background: var(--red-bg);
+}
+.badge-blue {
+  color: var(--blue);
+  background: var(--blue-bg);
+}
+.badge-neutral {
+  color: var(--muted);
+  background: var(--neutral-bg);
+}
+.cell-main {
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cell-sub {
+  font-size: 10px;
+  color: var(--quiet);
+  margin-top: 3px;
+}
+.row-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+.days {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.3px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+.days-unit {
+  display: block;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--quiet);
+  margin-top: 1px;
+}
+.expiry.soon .days {
+  color: var(--amber);
+}
+.table-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 22px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--quiet);
+}
+.empty {
+  padding: 52px 20px;
+  text-align: center;
+  color: var(--muted);
+}
+.empty strong {
+  display: block;
+  font-size: 14px;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.empty p {
+  margin: 0;
+  font-size: 12px;
+}
+
+/* ── drawer ─────────────────────────────────────── */
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: #1c383b55;
+  z-index: 50;
+  animation: fade 0.15s ease;
+}
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: min(520px, 94vw);
+  height: 100%;
+  background: var(--surface);
+  border-left: 1px solid var(--line);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow);
+  animation: slide 0.18s ease;
+}
+@keyframes slide {
+  from {
+    transform: translateX(16px);
+    opacity: 0.6;
+  }
+}
+.drawer-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+.drawer-heading {
+  padding: 18px 18px 6px;
+}
+.drawer-title-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.drawer h2 {
+  margin: 10px 0 4px;
+  font-size: 22px;
+  letter-spacing: -0.6px;
+  font-weight: 650;
+}
+.drawer-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.drawer-scroll {
+  padding: 12px 18px 32px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.section h3 {
+  margin: 0 0 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.065em;
+  text-transform: uppercase;
+  color: var(--quiet);
+}
+.facts {
+  display: grid;
+  grid-template-columns: 118px 1fr;
+  gap: 8px 12px;
+  margin: 0;
+  font-size: 12px;
+}
+.facts dt {
+  color: var(--muted);
+}
+.facts dd {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chip {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  background: var(--neutral-bg);
+}
+.drawer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.callout {
+  padding: 11px 12px;
+  border-radius: 8px;
+  background: var(--accent-bg);
+  color: var(--text);
+  font-size: 12px;
+  border: 1px solid var(--line);
+  line-height: 1.55;
+}
+.callout.warn {
+  background: var(--amber-bg);
+}
+
+/* ── modal ──────────────────────────────────────── */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1c383b66;
+  padding: 20px;
+  animation: fade 0.15s ease;
+}
+.modal-card {
+  width: min(560px, 100%);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  animation: pop 0.16s ease;
+}
+@keyframes pop {
+  from {
+    transform: translateY(8px) scale(0.98);
+    opacity: 0.5;
+  }
+}
+.modal-card.narrow {
+  width: min(420px, 100%);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.modal-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.2px;
+}
+.modal-body {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+.modal-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--line);
+  background: var(--soft);
+}
+.steps {
+  display: flex;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 14px 18px 0;
+}
+.step {
+  flex: 1;
+  text-align: center;
+  font-size: 11px;
+  color: var(--quiet);
+  padding: 7px;
+  border-radius: 6px;
+  background: var(--soft);
+  font-weight: 550;
+}
+.step.active {
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+.step.done {
+  color: var(--accent);
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.field > span {
+  font-size: 11px;
+  font-weight: 550;
+  color: var(--muted);
+}
+.field input,
+.field select,
+.field textarea {
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 11px;
+  outline: none;
+  font-size: 12px;
+}
+.field textarea {
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+.clb-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.clb-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  background: var(--soft);
+  text-align: left;
+  width: 100%;
+}
+.clb-item:hover,
+.clb-item.selected {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+.clb-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* toast */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  background: var(--surface);
+  border: 1px solid var(--strong-line);
+  color: var(--text);
+  padding: 11px 16px;
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  z-index: 100;
+  font-size: 12px;
+  font-weight: 550;
+  animation: pop 0.16s ease;
+}
+
+/* activity */
+.activity-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.activity-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.activity-list li:last-child {
+  border-bottom: 0;
+}
+.activity-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-top: 5px;
+  flex: none;
+}
+.activity-time {
+  color: var(--quiet);
+  font-variant-numeric: tabular-nums;
+  min-width: 72px;
+}
+.activity-text {
+  color: var(--text);
+}
+
+@media (max-width: 960px) {
+  .subheading {
+    white-space: normal;
+  }
+  .summary {
+    grid-template-columns: 1fr 1fr;
+  }
+  .metric {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 14px 22px;
+  }
+  .heading {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .heading-actions {
+    margin-left: 0;
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .topnav {
+    display: none;
+  }
+  .snapshot-meta {
+    text-align: left;
+  }
+}
+
+.checkline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+    </style>
+  </head>
+  <body>
+<p data-aigc-mark="1" style="margin:0 0 8px;font-size:10px;line-height:1.3;color:#6b6560;font-weight:400;">AI生成</p>
+
+<header class="topbar">
+      <div class="topbar-inner">
+      <a class="brand" href="#" aria-label="wecert">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="wordmark" aria-hidden="true">
+          <span class="wm-we">We</span><span class="wm-cert">Cert</span>
+        </span>
+      </a>
+      <nav class="topnav" aria-label="Primary">
+        <button class="nav-item active" data-view="inventory">Inventory</button>
+        <button class="nav-item" data-view="accounts">Accounts</button>
+        <button class="nav-item" data-view="bindings">Bindings</button>
+        <button class="nav-item" data-view="activity">Activity</button>
+      </nav>
+      <span class="spacer"></span>
+      <div class="env-switch" role="group" aria-label="ACME environment">
+        <button class="env-btn active" data-env="staging" title="acme-staging-v02.api.letsencrypt.org">
+          <span class="dot staging"></span>Staging
+        </button>
+        <button class="env-btn" data-env="production" title="acme-v02.api.letsencrypt.org">
+          <span class="dot prod"></span>Production
+        </button>
+      </div>
+      <span class="pill env-pill" id="env-pill"><span class="dot staging"></span>Let’s Encrypt · staging</span>
+      <button class="icon-btn" id="btn-connect" title="Connection settings" aria-label="Connection settings">⚙</button>
+      <button class="icon-btn" id="theme" aria-label="Switch color theme">◐</button>
+      <button class="btn btn-primary" id="btn-create">New certificate</button>
+      </div>
+    </header>
+
+    <main>
+      <div class="heading">
+        <div class="heading-text">
+          <span class="eyebrow">Certificate control</span>
+          <h1>Certificate inventory</h1>
+          <p class="subheading">Issue, bind to CLB, renew, retire.</p>
+        </div>
+        <div class="heading-actions">
+          <div class="snapshot-meta">
+            <span>Snapshot</span>
+            <b class="mono" id="snapshot-time">just now</b>
+          </div>
+          <div class="heading-buttons">
+            <button class="btn" id="btn-renew-all">Renew expiring</button>
+            <button class="btn" id="btn-refresh">Refresh</button>
+          </div>
+        </div>
+      </div>
+
+      <section class="summary" aria-label="Inventory summary">
+        <div class="metric">
+          <div class="metric-top">
+            <span class="metric-label">Total certificates</span>
+            <strong class="metric-value" id="m-total">0</strong>
+          </div>
+          <span class="metric-note" id="m-total-note">—</span>
+        </div>
+        <div class="metric warn">
+          <div class="metric-top">
+            <span class="metric-label">Requires attention</span>
+            <strong class="metric-value" id="m-attention">0</strong>
+          </div>
+          <span class="metric-note">Unbound · failing · expiring</span>
+        </div>
+        <div class="metric">
+          <div class="metric-top">
+            <span class="metric-label">Bound to CLB</span>
+            <strong class="metric-value accent" id="m-bound">0</strong>
+          </div>
+          <span class="metric-note">Confirmed as serving</span>
+        </div>
+        <div class="metric">
+          <div class="metric-top">
+            <span class="metric-label">Issuance quota</span>
+            <strong class="metric-value" id="m-quota">—</strong>
+          </div>
+          <span class="metric-note">exact-set remaining · 7-day window</span>
+        </div>
+      </section>
+
+      <section class="panel" id="view-inventory" aria-label="Certificate inventory">
+        <div class="panel-head">
+          <h2>Certificates <span class="small-count" id="list-count">0</span></h2>
+          <div class="toolbar">
+            <div class="tabs" id="tabs" aria-label="Filter certificates">
+              <button class="tab" data-filter="all" aria-pressed="true">All</button>
+              <button class="tab" data-filter="attention" aria-pressed="false">Attention</button>
+              <button class="tab" data-filter="expiring" aria-pressed="false">Expiring</button>
+              <button class="tab" data-filter="healthy" aria-pressed="false">Healthy</button>
+            </div>
+            <select id="account" class="select" aria-label="Filter by cloud account">
+              <option value="all">All accounts</option>
+            </select>
+            <select id="sort" class="select" aria-label="Sort">
+              <option value="attention">Attention first</option>
+              <option value="expiry">Expires soonest</option>
+              <option value="name">Name (A–Z)</option>
+            </select>
+            <span class="spacer"></span>
+            <label class="searchbox searchbox-right">
+              <input id="search" type="search" placeholder="Search certificates, domains, CLBs…" aria-label="Search" />
+              <kbd>/</kbd>
+            </label>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <colgroup>
+              <col class="status" />
+              <col class="cert" />
+              <col class="domains" />
+              <col class="bindings" />
+              <col class="expiry" />
+              <col class="actions" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Certificate</th>
+                <th>Domains</th>
+                <th>CLB bindings</th>
+                <th>Expires in</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+          <div id="empty" class="empty hidden">
+            <strong>No matching certificates</strong>
+            <p>Adjust the account, status, or search term — or create a certificate.</p>
+          </div>
+        </div>
+        <div class="table-footer">
+          <span id="result-count">Loading inventory</span>
+          <span class="spacer"></span>
+          <span>Admin actions are audited · read-only tokens cannot write</span>
+        </div>
+      </section>
+
+      <section class="panel hidden" id="view-accounts" aria-label="Cloud accounts">
+        <div class="panel-head">
+          <h2>Cloud accounts <span class="small-count" id="account-count">0</span></h2>
+          <div class="toolbar">
+            <p class="hint" style="margin:0 0 10px">Add an account first. Certificates, CLB bindings, and issuance quota hang off it.</p>
+            <span class="spacer"></span>
+            <button class="btn btn-primary" id="btn-add-account" style="margin-bottom:10px">Add account</button>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Account</th>
+                <th>UIN</th>
+                <th>Role / credential</th>
+                <th>Certificates</th>
+                <th>CLBs</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="account-rows"></tbody>
+          </table>
+          <div id="account-empty" class="empty hidden">
+            <strong>No cloud accounts yet</strong>
+            <p>Add a Tencent Cloud account to issue certificates and bind them to CLBs.</p>
+            <p style="margin-top:12px"><button class="btn btn-primary" data-act="add-account">Add account</button></p>
+          </div>
+        </div>
+        <div class="table-footer">
+          <span id="account-count-note">—</span>
+          <span class="spacer"></span>
+          <span>Credentials stay on the host · never in the browser</span>
+        </div>
+      </section>
+
+      <section class="panel hidden" id="view-bindings" aria-label="CLB bindings">
+        <div class="panel-head">
+          <h2>CLB bindings <span class="small-count" id="binding-count">0</span></h2>
+          <div class="toolbar">
+            <p class="hint" style="margin:0 0 10px">Load balancers and listeners that can receive a certificate.</p>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <colgroup>
+              <col class="status" />
+              <col class="cert" />
+              <col class="domains" />
+              <col class="bindings" />
+              <col class="expiry" />
+              <col class="actions" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Load balancer</th>
+                <th>Name</th>
+                <th>Region</th>
+                <th>Listeners</th>
+                <th>Attached cert</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="binding-rows"></tbody>
+          </table>
+        </div>
+        <div class="table-footer">
+          <span id="binding-count-note">—</span>
+          <span class="spacer"></span>
+          <span>Binding changes are recorded in Activity</span>
+        </div>
+      </section>
+
+      <section class="panel hidden" id="view-activity" aria-label="Activity">
+        <div class="panel-head">
+          <h2>Activity</h2>
+          <div class="toolbar">
+            <p class="hint" style="margin:0 0 10px">Recent issuance, binding, and renewal events.</p>
+          </div>
+        </div>
+        <ul class="activity-list" id="activity-list"></ul>
+        <div class="table-footer">
+          <span id="activity-count">—</span>
+          <span class="spacer"></span>
+          <span>Audited actions also appear in the daemon journal</span>
+        </div>
+      </section>
+    </main>
+
+    <div class="backdrop hidden" id="backdrop"></div>
+    <aside class="drawer hidden" id="drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title"></aside>
+
+    <!-- Create wizard -->
+    <div class="modal hidden" id="modal-create" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <header class="modal-head">
+          <h2>New certificate</h2>
+          <span class="spacer"></span>
+          <button class="icon-btn" data-close aria-label="Close">×</button>
+        </header>
+        <ol class="steps" id="create-steps">
+          <li class="step active">1 · Domains</li>
+          <li class="step">2 · DNS</li>
+          <li class="step">3 · Policy</li>
+          <li class="step">4 · Deploy</li>
+        </ol>
+        <div class="modal-body">
+          <div class="wizard-pane" data-pane="0">
+            <label class="field">
+              <span>Certificate name</span>
+              <input id="c-name" placeholder="edge-api" />
+            </label>
+            <label class="field">
+              <span>Domains (one per line; wildcards allowed)</span>
+              <textarea id="c-domains" rows="5" placeholder="api.example.com&#10;api2.example.com"></textarea>
+            </label>
+            <p class="hint">DNS-01. A wildcard and its apex share one TXT name; wecert merges them.</p>
+          </div>
+          <div class="wizard-pane hidden" data-pane="1">
+            <p class="hint">DNS-01 needs to write a TXT record. Where is this domain’s DNS hosted?</p>
+            <label class="field">
+              <span>DNS provider</span>
+              <select id="c-dns">
+                <option value="cloudflare">Cloudflare</option>
+                <option value="dnspod">DNSPod</option>
+                <option value="tencentcloud">Tencent Cloud DNS</option>
+                <option value="route53">AWS Route 53</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Credential</span>
+              <select id="c-dns-cred">
+                <option value="reused">Reuse account credential</option>
+                <option value="token">API token (this certificate)</option>
+                <option value="file">Key file on the daemon host</option>
+              </select>
+            </label>
+            <div id="c-dns-token-wrap" class="hidden">
+              <label class="field">
+                <span>API token</span>
+                <input id="c-dns-token" type="password" autocomplete="new-password" spellcheck="false" placeholder="cf_token / DNSPod token" />
+              </label>
+              <p class="hint">Token is sent once to the daemon and written as a 0600 file. Never echoed back.</p>
+            </div>
+            <div id="c-dns-file-wrap" class="hidden">
+              <label class="field">
+                <span>Key file path (daemon host)</span>
+                <input id="c-dns-file" class="mono" placeholder="/etc/wecert/dns-token" />
+              </label>
+            </div>
+            <div class="callout warn" id="c-dns-zone">
+              Cloudflare needs <b>Zone:Read + DNS:Edit</b> on the zone that holds the domain.
+            </div>
+          </div>
+          <div class="wizard-pane hidden" data-pane="2">
+            <label class="field">
+              <span>ACME profile</span>
+              <select id="c-profile">
+                <option value="classic">classic · 90 days</option>
+                <option value="tlsserver">tlsserver · 45 days</option>
+                <option value="shortlived">shortlived · 6.5 days</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Key type</span>
+              <select id="c-key">
+                <option value="ecdsa-p256">ECDSA P-256</option>
+                <option value="ecdsa-p384">ECDSA P-384</option>
+                <option value="rsa2048">RSA 2048</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Renew before expiry</span>
+              <select id="c-renew">
+                <option value="30d">30 days</option>
+                <option value="14d">14 days</option>
+                <option value="7d">7 days</option>
+              </select>
+            </label>
+          </div>
+          <div class="wizard-pane hidden" data-pane="3">
+            <label class="field">
+              <span>Deploy target</span>
+              <select id="c-deploy">
+                <option value="clb">Tencent CLB / SSL</option>
+                <option value="nginx">Local nginx</option>
+                <option value="none">Issue only, do not deploy</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Cloud account</span>
+              <select id="c-account"></select>
+            </label>
+            <div class="callout" id="c-env-note">
+              Issues against <b class="mono" id="c-env-dir">acme-staging-v02.api.letsencrypt.org</b>.
+              After issuance, use <b>Bind to CLB</b> on the row. The first bind is confirmed once in
+              the Tencent console; later renewals switch automatically.
+            </div>
+          </div>
+        </div>
+        <footer class="modal-foot">
+          <button class="btn" data-close>Cancel</button>
+          <span class="spacer"></span>
+          <button class="btn hidden" id="c-prev">Back</button>
+          <button class="btn btn-primary" id="c-next">Next</button>
+          <button class="btn btn-primary hidden" id="c-submit">Create and issue</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Bind to CLB -->
+    <div class="modal hidden" id="modal-bind" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <header class="modal-head">
+          <h2>Bind to CLB</h2>
+          <span class="spacer"></span>
+          <button class="icon-btn" data-close aria-label="Close">×</button>
+        </header>
+        <div class="modal-body">
+          <p class="hint" id="bind-cert-label"></p>
+          <div class="clb-list" id="clb-list"></div>
+          <label class="field">
+            <span>Listener</span>
+            <select id="bind-listener"></select>
+          </label>
+          <label class="field">
+            <span>SNI hostname</span>
+            <input id="bind-sni" class="mono" autocomplete="off" spellcheck="false" placeholder="app.example.com" />
+          </label>
+          <details id="bind-new-listener">
+            <summary style="cursor:pointer;font-size:13px;color:var(--accent,#0c7d70)">Create a new HTTPS listener…</summary>
+            <div style="display:flex;flex-direction:column;gap:12px;margin-top:12px">
+              <label class="field">
+                <span>Port</span>
+                <input id="bind-new-port" class="mono" type="number" min="1" max="65535" value="443" />
+              </label>
+              <label class="field">
+                <span>Listener name (optional)</span>
+                <input id="bind-new-name" autocomplete="off" placeholder="https-443" />
+              </label>
+              <label class="field" style="flex-direction:row;align-items:center;gap:8px">
+                <input type="checkbox" id="bind-new-sni" checked />
+                <span>SNI mode (per-hostname certificates)</span>
+              </label>
+              <p class="hint">
+                Uncheck SNI to make this certificate the listener default. Leave
+                <b>Listener</b> on “— create new —” to use these settings.
+              </p>
+            </div>
+          </details>
+          <div class="callout warn">
+            The first bind needs a one-time confirmation in the Tencent Cloud console. After that,
+            renewals use UpdateCertificateInstance automatically.
+          </div>
+        </div>
+        <footer class="modal-foot">
+          <button class="btn" data-close>Cancel</button>
+          <span class="spacer"></span>
+          <button class="btn btn-primary" id="bind-submit">Confirm binding</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Add account -->
+    <div class="modal hidden" id="modal-account" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <header class="modal-head">
+          <h2>Add cloud account</h2>
+          <span class="spacer"></span>
+          <button class="icon-btn" data-close aria-label="Close">×</button>
+        </header>
+        <div class="modal-body">
+          <label class="field">
+            <span>Display name</span>
+            <input id="a-name" placeholder="production" />
+          </label>
+          <label class="field">
+            <span>Tencent Cloud UIN <span class="muted">(optional — filled from AK/SK)</span></span>
+            <input id="a-uin" class="mono" placeholder="auto-detect (Intl accounts may leave this empty)" />
+          </label>
+          <label class="field">
+            <span>Cloud</span>
+            <select id="a-cloud">
+              <option value="china">Tencent Cloud (China) · cloud.tencentcloudapi.com</option>
+              <option value="intl">Tencent Cloud (International) · intl.tencentcloudapi.com</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Credential</span>
+            <select id="a-cred">
+              <option value="cvm-role">CVM role (recommended — no key on disk)</option>
+              <option value="static">Static SecretId / SecretKey</option>
+              <option value="env">Environment variables</option>
+            </select>
+          </label>
+          <div id="a-aks" class="hidden" style="display:flex;flex-direction:column;gap:12px">
+            <label class="field">
+              <span>SecretId</span>
+              <input id="a-secret-id" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="AKID..." />
+            </label>
+            <label class="field">
+              <span>SecretKey</span>
+              <input id="a-secret-key" type="password" autocomplete="new-password" spellcheck="false" autocapitalize="off" placeholder="••••••••" />
+            </label>
+            <label class="field">
+              <span>Store as (daemon host, 0600)</span>
+              <input id="a-key-path" class="mono" placeholder="/etc/wecert/accounts/production.key" />
+            </label>
+          </div>
+          <div class="callout warn">
+            AK/SK are sent once to the daemon and written as a 0600 file on the host.
+            They are never echoed back to this browser or stored in localStorage.
+          </div>
+        </div>
+        <footer class="modal-foot">
+          <button class="btn" data-close>Cancel</button>
+          <span class="spacer"></span>
+          <button class="btn btn-primary" id="account-submit">Add account</button>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Destructive confirm -->
+    <div class="modal hidden" id="modal-confirm" role="dialog" aria-modal="true">
+      <div class="modal-card narrow">
+        <header class="modal-head">
+          <h2 id="confirm-title">Confirm</h2>
+          <span class="spacer"></span>
+          <button class="icon-btn" data-close aria-label="Close">×</button>
+        </header>
+        <div class="modal-body">
+          <p id="confirm-body"></p>
+          <label class="field hidden" id="confirm-input-wrap">
+            <span id="confirm-input-label">Type the certificate name to confirm</span>
+            <input id="confirm-input" autocomplete="off" />
+          </label>
+        </div>
+        <footer class="modal-foot">
+          <button class="btn" data-close>Cancel</button>
+          <span class="spacer"></span>
+          <button class="btn btn-danger" id="confirm-submit" disabled>Confirm</button>
+        </footer>
+      </div>
+    </div>
+
+
+    <!-- Connection / tokens -->
+    <div class="modal hidden" id="modal-connect" role="dialog" aria-modal="true">
+      <div class="modal-card">
+        <header class="modal-head">
+          <h2>Connect to wecert</h2>
+          <span class="spacer"></span>
+          <button class="icon-btn" data-close aria-label="Close">×</button>
+        </header>
+        <div class="modal-body">
+          <p class="hint">
+            The console talks to the wecert daemon on this machine. Tokens live in
+            <span class="mono">/etc/wecert/config.yaml</span> → <span class="mono">webhook.token</span>
+            (read-only) and <span class="mono">webhook.adminToken</span> (management).
+          </p>
+          <label class="field">
+            <span>Daemon base URL</span>
+            <input id="k-base" class="mono" placeholder="http://127.0.0.1:9801" value="http://127.0.0.1:9801" />
+          </label>
+          <label class="field">
+            <span>Read-only token</span>
+            <input id="k-token" type="password" autocomplete="new-password" spellcheck="false" placeholder="webhook.token" />
+          </label>
+          <label class="field">
+            <span>Admin token <span class="muted">(for create / bind / delete)</span></span>
+            <input id="k-admin" type="password" autocomplete="new-password" spellcheck="false" placeholder="webhook.adminToken" />
+          </label>
+          <div class="callout">
+            <b>Where to find them:</b> SSH to the host → <span class="mono">sudo grep -E &quot;token&quot; /etc/wecert/config.yaml</span>
+            or <span class="mono">systemctl cat wecert</span>. Generate with
+            <span class="mono">openssl rand -hex 32</span>.
+          </div>
+          <label class="checkline">
+            <input type="checkbox" id="k-save" checked />
+            Remember on this browser (session storage; admin token kept in memory only)
+          </label>
+        </div>
+        <footer class="modal-foot">
+          <button class="btn" data-close>Cancel</button>
+          <span class="spacer"></span>
+          <button class="btn btn-primary" id="connect-submit">Connect &amp; load</button>
+        </footer>
+      </div>
+    </div>
+
+    <div class="toast hidden" id="toast" role="status"></div>
+    <script>
+try{Object.defineProperty(window,'prompt',{value:function(){return null},writable:false,configurable:false})}catch(e){}
+(function () {
+  try {
+    Object.defineProperty(window, "prompt", {
+      value: function () { return null; },
+      writable: false,
+      configurable: false
+    });
+  } catch (e) {
+    try { window.prompt = function () { return null; }; } catch (e2) {}
+  }
+})();
+
+/* wecert console — real HTTP API (no mock data). */
+(function (global) {
+  // Stale bundles must not fall back to window.prompt for tokens.
+  function disableNativePrompts() {
+    try {
+      global.prompt = function () { return null; };
+    } catch {}
+  }
+  disableNativePrompts();
+
+  const TOKEN_KEY = "wecert.token";
+  const ADMIN_KEY = "wecert.adminToken";
+
+  function token() {
+    return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY) || "";
+  }
+  function adminToken() {
+    return sessionStorage.getItem(ADMIN_KEY) || localStorage.getItem(ADMIN_KEY) || token();
+  }
+  function setTokens(read, admin) {
+    try {
+      if (read != null) {
+        sessionStorage.setItem(TOKEN_KEY, read);
+        localStorage.setItem(TOKEN_KEY, read);
+      }
+      if (admin != null) {
+        sessionStorage.setItem(ADMIN_KEY, admin);
+        localStorage.setItem(ADMIN_KEY, admin);
+      }
+    } catch {}
+  }
+
+  // Secrets (AK/SK) only ever travel in a POST body to the same origin.
+  // Refuse plaintext transports except loopback: a LAN/HTTP console would
+  // put Tencent keys on the wire in the clear.
+  function assertSecureTransport() {
+    const loc = location;
+    const loop = loc.hostname === "127.0.0.1" || loc.hostname === "localhost" || loc.hostname === "::1";
+    if (loc.protocol === "https:" || loop) return;
+    const err = new Error("Refusing to send credentials over non-TLS " + loc.origin + " — use HTTPS or localhost");
+    err.kind = "security";
+    throw err;
+  }
+
+  async function req(method, path, body, opts = {}) {
+    if (opts.hasSecret) assertSecureTransport();
+    const headers = { Accept: "application/json" };
+    const tok = opts.admin ? adminToken() : token();
+    if (tok) headers.Authorization = "Bearer " + tok;
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    let res;
+    try {
+      res = await fetch(url(path), {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        cache: "no-store",
+      });
+    } catch (e) {
+      const err = new Error("Cannot reach wecert at " + path + " — is the daemon running?");
+      err.cause = e;
+      err.kind = "network";
+      throw err;
+    }
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { raw: text };
+    }
+    if (!res.ok) {
+      const err = new Error((data && data.error) || res.statusText || "request failed");
+      err.status = res.status;
+      err.data = data;
+      err.kind = res.status === 401 || res.status === 403 ? "auth" : "api";
+      throw err;
+    }
+    return data;
+  }
+
+  let BASE = "";
+  function setBase(b) { BASE = (b || "").replace(/\/+$/, ""); }
+  function base() { return BASE; }
+  function url(path) { return (BASE ? BASE + "/" : "") + path.replace(/^\//, ""); }
+  const api = {
+    setBase,
+    base,
+    token,
+    adminToken,
+    setTokens,
+    inventory: () => req("GET", "api/inventory"),
+    status: () => req("GET", "hook/status"),
+    bindings: () => req("GET", "api/bindings"),
+    accounts: () => req("GET", "api/accounts"),
+    renew: (name) => req("POST", "hook/reconcile", { cert: name }),
+    renewMany: (names) => req("POST", "hook/reconcile", { certs: names }),
+    createCertificate: (payload) => req("POST", "admin/certificates", payload, { admin: true }),
+    deleteCertificate: (name) => req("DELETE", "admin/certificates/" + encodeURIComponent(name), undefined, { admin: true }),
+    bindCertificate: (name, payload) => req("POST", "admin/certificates/" + encodeURIComponent(name) + "/bind", payload, { admin: true }),
+    unbindCertificate: (name) => req("POST", "admin/certificates/" + encodeURIComponent(name) + "/unbind", {}, { admin: true }),
+    addAccount: (payload) => {
+      const hasSecret = !!(payload && (payload.secretId || payload.secretKey));
+      return req("POST", "admin/accounts", payload, { admin: true, hasSecret });
+    },
+    removeAccount: (uin) => req("DELETE", "admin/accounts/" + encodeURIComponent(uin), undefined, { admin: true }),
+  };
+  global.wecertAPI = api;
+})(window);
+
+/* wecert control console — demo logic + mock fleet
+   Actions: create (wizard), bind CLB, renew, delete. All optimistic with audit toasts. */
+
+const now = Date.now();
+const day = 86400000;
+
+const state = {
+  view: "inventory",
+  env: "staging",
+  accounts: [],
+  filter: "all",
+  q: "",
+  account: "all",
+  sort: "attention",
+  selected: null,
+  createStep: 0,
+  bindCert: null,
+  confirm: null,
+  certs: [],
+  clbs: [],
+  activity: [],
+  live: false,
+  inventory: null,
+};
+
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+
+const esc = (v) =>
+  String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+function daysLeft(c) {
+  if (c.notAfter == null) return null;
+  return Math.round((c.notAfter - Date.now()) / day);
+}
+
+function statusMeta(s) {
+  return (
+    {
+      ok: ["Healthy", "green"],
+      expiring: ["Expiring", "amber"],
+      waiting_manual_bind: ["Awaiting binding", "amber"],
+      pending_deploy: ["Deploy pending", "amber"],
+      probe_mismatch: ["TLS check failed", "red"],
+      probe_unreachable: ["TLS unreachable", "red"],
+      failing: ["Reconcile failed", "red"],
+      not_issued: ["Not issued", "blue"],
+      probe_unknown: ["TLS unverified", "neutral"],
+      revoked: ["Revoked", "neutral"],
+    }[s] || ["Unknown", "neutral"]
+  );
+}
+
+function attention(c) {
+  return !["ok", "expiring"].includes(c.status);
+}
+
+function toast(msg) {
+  const el = $("#toast");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.add("hidden"), 3200);
+}
+
+function logActivity(text) {
+  state.activity.unshift({ at: Date.now(), text });
+}
+
+/* ── render ─────────────────────────────────────────── */
+
+function filtered() {
+  let list = state.certs.filter((c) => {
+    if (state.account !== "all" && (c.uin || "") !== state.account) return false;
+    if (state.q) {
+      const hay = [c.name, c.uin, c.deployedCertId, c.status, ...(c.domains || []), c.clb?.id, c.clb?.sni]
+        .join(" ")
+        .toLowerCase();
+      if (!hay.includes(state.q)) return false;
+    }
+    if (state.filter === "attention" && !attention(c)) return false;
+    if (state.filter === "expiring" && c.status !== "expiring") return false;
+    if (state.filter === "healthy" && c.status !== "ok") return false;
+    return true;
+  });
+  const order = [
+    "failing",
+    "waiting_manual_bind",
+    "probe_mismatch",
+    "probe_unreachable",
+    "pending_deploy",
+    "not_issued",
+    "expiring",
+    "ok",
+  ];
+  list.sort((a, b) => {
+    if (state.sort === "name") return a.name.localeCompare(b.name);
+    const ea = daysLeft(a) ?? 9999;
+    const eb = daysLeft(b) ?? 9999;
+    if (state.sort === "expiry") return ea - eb || a.name.localeCompare(b.name);
+    return order.indexOf(a.status) - order.indexOf(b.status) || ea - eb || a.name.localeCompare(b.name);
+  });
+  return list;
+}
+
+function renderMetrics() {
+  const cs = state.certs;
+  const s = (state.inventory && state.inventory.summary) || {};
+  $("#m-total").textContent = s.certificates != null ? s.certificates : cs.length;
+  $("#m-total-note").textContent = `Across ${new Set(cs.map((c) => c.uin || "")).size} account(s)`;
+  const attentionN = (s.waitingManualBind || 0) + (s.pendingDeploy || 0) + (s.failing || 0) +
+    (s.probeMismatch || 0) + (s.probeUnreachable || 0) + (s.notIssued || 0);
+  $("#m-attention").textContent = s.certificates != null ? attentionN : cs.filter(attention).length;
+  $("#m-bound").textContent = cs.filter((c) => c.deployConfirmed).length;
+  $("#m-quota").textContent = quotaFromSnapshot(state.inventory || {});
+}
+
+function renderAccounts() {
+  const sel = $("#account");
+  if (sel) {
+    sel.innerHTML =
+      `<option value="all">All accounts</option>` +
+      state.accounts.map((a) => `<option value="${esc(a.uin)}">${esc(a.name)} · ${esc(a.uin)}</option>`).join("") +
+      `<option value="">Unspecified</option>`;
+    sel.value = state.account;
+  }
+  const pick = $("#c-account");
+  if (pick) {
+    pick.innerHTML = state.accounts
+      .map((a) => `<option value="${esc(a.uin)}">${esc(a.name)} · ${esc(a.uin)}</option>`)
+      .join("");
+    if (!state.accounts.length) {
+      pick.innerHTML = `<option value="">Add an account first</option>`;
+    }
+  }
+}
+
+function accountLabel(uin) {
+  const a = state.accounts.find((x) => x.uin === uin);
+  return a ? `${a.name}` : uin || "Unspecified";
+}
+
+function renderAccountTable() {
+  const tbody = $("#account-rows");
+  if (!tbody) return;
+  tbody.innerHTML = state.accounts
+    .map((a) => {
+      const nCerts = state.certs.filter((c) => c.uin === a.uin).length;
+      const nClb = state.clbs.filter((b) => b.account === a.uin).length;
+      return `<tr>
+        <td><div class="cell-main">${esc(a.name)}</div><div class="cell-sub">Tencent Cloud</div></td>
+        <td class="mono">${esc(a.uin)}</td>
+        <td><span class="badge badge-${a.cred === "cvm-role" ? "green" : "neutral"}">${esc(a.cred)}</span></td>
+        <td>${nCerts}</td>
+        <td>${nClb}</td>
+        <td><div class="row-actions">
+          <button class="btn btn-xs btn-primary" data-act="new-cert-in" data-id="${a.uin}">New certificate</button>
+          <button class="btn btn-xs btn-ghost" data-act="delete-account" data-id="${a.uin}">Remove</button>
+        </div></td>
+      </tr>`;
+    })
+    .join("");
+  $("#account-count").textContent = state.accounts.length;
+  $("#account-count-note").textContent = `${state.accounts.length} accounts · ${state.certs.length} certificates · ${state.clbs.length} load balancers`;
+  $("#account-empty")?.classList.toggle("hidden", state.accounts.length > 0);
+}
+
+function openAccountModal() {
+  $("#a-name").value = "";
+  $("#a-uin").value = "";
+  $("#a-secret-id").value = "";
+  $("#a-secret-key").value = "";
+  $("#a-key-path").value = "";
+  $("#a-cred").value = "cvm-role";
+  if ($("#a-cloud")) $("#a-cloud").value = "china";
+  toggleAks();
+  $("#modal-account").classList.remove("hidden");
+}
+
+function toggleAks() {
+  const box = $("#a-aks");
+  if (!box) return;
+  box.classList.toggle("hidden", $("#a-cred").value !== "static");
+}
+
+$("#a-cred") && ($("#a-cred").onchange = toggleAks);
+
+async function submitAccount() {
+  const name = $("#a-name").value.trim() || "account-" + (state.accounts.length + 1);
+  const cred = $("#a-cred").value;
+  const cloud = $("#a-cloud") ? $("#a-cloud").value : "china";
+  let uin = $("#a-uin").value.trim();
+  // UIN is optional. Tencent Cloud International accounts often cannot resolve
+  // a UIN via the same GetUserAppId path as China; never block on that.
+  if (!uin) uin = "";
+  if (state.accounts.some((a) => a.uin === uin)) {
+    toast("That UIN is already on the list");
+    return;
+  }
+  const payload = {
+    name,
+    uin,
+    cred,
+    cloud,
+    // resolveUin is best-effort: Intl (intl.tencentcloudapi.com) may not answer
+    // GetUserAppId the same way as China. Failure is non-fatal.
+    resolveUin: !uin,
+  };
+  if (cred === "static") {
+    payload.secretId = $("#a-secret-id").value.trim();
+    payload.secretKey = $("#a-secret-key").value;
+    payload.keyPath = $("#a-key-path").value.trim();
+    if (!payload.secretId || !payload.secretKey) {
+      toast("Enter SecretId and SecretKey for a static credential");
+      return;
+    }
+  }
+  try {
+    await wecertAPI.addAccount(payload);
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  // never keep AK/SK in the DOM, history, or logs after submit
+  $("#a-secret-id").value = "";
+  $("#a-secret-key").value = "";
+  $("#a-key-path").value = "";
+  state.accounts.push({ id: uin, name, uin, cred: $("#a-cred").value });
+  logActivity(`Added cloud account ${name} (${uin})`);
+  closeModals();
+  renderAccounts();
+  renderAccountTable();
+  render();
+  toast(`Account ${name} added — now create certificates under it`);
+  setView("accounts");
+}
+
+function renderRows() {
+  const list = filtered();
+  const tbody = $("#rows");
+  tbody.innerHTML = list
+    .map((c) => {
+      const [label, tone] = statusMeta(c.status);
+      const d = daysLeft(c);
+      const expiry =
+        d == null
+          ? '<span class="muted">—</span>'
+          : `<div class="days">${d}</div><div class="days-unit">days</div>`;
+      const bind = c.clb
+        ? `<div class="cell-main"><span class="mono">${esc(c.clb.id)}</span><span class="more">${esc(c.clb.listener)}</span></div>
+           <div class="cell-sub">${c.deployConfirmed ? "Confirmed serving" : "Pending confirmation"}</div>`
+        : `<div class="cell-sub">Unbound</div>`;
+      const actions = [];
+      actions.push(`<button class="btn btn-xs btn-ghost" data-act="detail" data-id="${c.id}">Details</button>`);
+      if (c.status === "not_issued") {
+        actions.push(`<button class="btn btn-xs btn-primary" data-act="issue" data-id="${c.id}">Issue</button>`);
+      } else {
+        if (!c.clb) {
+          actions.push(`<button class="btn btn-xs btn-primary" data-act="bind" data-id="${c.id}">Bind CLB</button>`);
+        }
+        if (c.status === "expiring" || c.status === "failing" || (d != null && d <= 14)) {
+          actions.push(`<button class="btn btn-xs" data-act="renew" data-id="${c.id}">Renew</button>`);
+        }
+      }
+      actions.push(`<button class="btn btn-xs" data-act="delete" data-id="${c.id}">Delete</button>`);
+      return `<tr>
+        <td><span class="badge badge-${tone}">${label}</span></td>
+        <td><button class="cert-name" data-act="detail" data-id="${c.id}">${esc(c.name)}</button>
+            <div class="name-sub">${esc(accountLabel(c.uin))} · ${esc(c.profile)} · ${esc(c.keyType)}</div></td>
+        <td class="domains">${esc(c.domains[0] || "—")}${c.domains.length > 1 ? `<span class="more">+${c.domains.length - 1}</span>` : ""}</td>
+        <td>${bind}</td>
+        <td class="expiry ${d != null && d <= 14 ? "soon" : ""}">${expiry}</td>
+        <td><div class="row-actions">${actions.join("")}</div></td>
+      </tr>`;
+    })
+    .join("");
+  $("#empty").classList.toggle("hidden", list.length > 0);
+  $("#result-count").textContent = `Showing ${list.length} / ${state.certs.length} certificates`;
+  const lc = $("#list-count");
+  if (lc) lc.textContent = list.length;
+}
+
+function render() {
+  renderMetrics();
+  renderRows();
+  renderAccounts();
+  if (state.view === "accounts") renderAccountTable();
+  if (state.view === "bindings") renderBindings();
+  if (state.view === "activity") renderActivity();
+  const el = document.getElementById("snapshot-time");
+  if (el) el.textContent = new Date().toISOString().slice(11, 16) + " UTC";
+}
+
+/* ── drawer ─────────────────────────────────────────── */
+
+function openDetail(id) {
+  const c = state.certs.find((x) => x.id === id);
+  if (!c) return;
+  state.selected = id;
+  const [label, tone] = statusMeta(c.status);
+  const d = daysLeft(c);
+  $("#drawer").innerHTML = `
+    <div class="drawer-top">
+      <span>Certificate details</span>
+      <div class="spacer"></div>
+      <button class="icon-btn" id="drawer-close" aria-label="Close details">×</button>
+    </div>
+    <div class="drawer-heading">
+      <div class="drawer-title-line">
+        <span class="badge badge-${tone}">${label}</span>
+      </div>
+      <h2 id="detail-title">${esc(c.name)}</h2>
+      <div class="drawer-sub"><span class="mono">${esc(c.uin || "Account unspecified")}</span><span>·</span><span>${c.domains.length} domains</span></div>
+    </div>
+    <div class="drawer-scroll">
+      <section class="section">
+        <h3>Actions</h3>
+        <div class="drawer-actions">
+          ${c.clb ? "" : `<button class="btn btn-primary" data-act="bind" data-id="${c.id}">Bind to CLB</button>`}
+          <button class="btn" data-act="renew" data-id="${c.id}">Renew now</button>
+          ${c.clb ? `<button class="btn" data-act="rebind" data-id="${c.id}">Change binding</button>` : ""}
+          <button class="btn" data-act="issue" data-id="${c.id}">Re-issue</button>
+          <button class="btn btn-danger" data-act="delete" data-id="${c.id}">Delete certificate</button>
+        </div>
+      </section>
+      <section class="section">
+        <h3>Certificate</h3>
+        <dl class="facts">
+          <dt>Name</dt><dd>${esc(c.name)}</dd>
+          <dt>CertId</dt><dd>${esc(c.deployedCertId || "—")}</dd>
+          <dt>Account UIN</dt><dd>${esc(c.uin || "Unspecified")}</dd>
+          <dt>Profile</dt><dd>${esc(c.profile)} / ${esc(c.keyType)}</dd>
+          <dt>Expires in</dt><dd>${d == null ? "Not issued" : `${new Date(c.notAfter).toISOString().slice(0, 10)} (${d} days）`}</dd>
+          <dt>Deploy status</dt><dd>${c.deployConfirmed ? "Confirmed" : c.deployedCertId ? "Uploaded, unconfirmed" : "—"}</dd>
+        </dl>
+        <div class="chips" style="margin-top:10px">${c.domains.map((x) => `<span class="chip">${esc(x)}</span>`).join("")}</div>
+      </section>
+      <section class="section">
+        <h3>CLB bindings</h3>
+        ${
+          c.clb
+            ? `<dl class="facts">
+                <dt>Load balancer</dt><dd>${esc(c.clb.id)}</dd>
+                <dt>Region</dt><dd>${esc(c.clb.region)}</dd>
+                <dt>Listener</dt><dd>${esc(c.clb.listener)}</dd>
+                <dt>SNI</dt><dd>${esc(c.clb.sni)}</dd>
+               </dl>`
+            : `<p class="hint">Not bound yet. After issuance, pick a CLB listener to put it into service.</p>`
+        }
+      </section>
+      <section class="section">
+        <h3>ACME renewal window</h3>
+        ${
+          c.ari
+            ? `<dl class="facts">
+                <dt>Window starts</dt><dd>${new Date(c.ari.start).toISOString().slice(0, 10)}</dd>
+                <dt>Window ends</dt><dd>${new Date(c.ari.end).toISOString().slice(0, 10)}</dd>
+               </dl>`
+            : `<p class="hint">No ARI window yet.</p>`
+        }
+      </section>
+      ${
+        c.lastError
+          ? `<section class="section"><h3>Last failure</h3><div class="callout warn">${esc(c.lastError)}</div></section>`
+          : ""
+      }
+    </div>`;
+  $("#drawer").classList.remove("hidden");
+  $("#backdrop").classList.remove("hidden");
+  $("#drawer-close").onclick = closeDrawer;
+}
+
+function closeDrawer() {
+  state.selected = null;
+  $("#drawer").classList.add("hidden");
+  $("#backdrop").classList.add("hidden");
+}
+
+/* ── create wizard ──────────────────────────────────── */
+
+function openCreate() {
+  state.createStep = 0;
+  renderAccounts();
+  $("#c-name").value = "";
+  $("#c-domains").value = "";
+  $("#c-account").selectedIndex = 0;
+  if ($("#c-dns-token")) $("#c-dns-token").value = "";
+  syncWizard();
+  $("#modal-create").classList.remove("hidden");
+}
+
+function syncWizard() {
+  $$("#create-steps .step").forEach((el, i) => {
+    el.classList.toggle("active", i === state.createStep);
+    el.classList.toggle("done", i < state.createStep);
+  });
+  $$(".wizard-pane").forEach((p) => p.classList.toggle("hidden", Number(p.dataset.pane) !== state.createStep));
+  $("#c-prev").classList.toggle("hidden", state.createStep === 0);
+  $("#c-next").classList.toggle("hidden", state.createStep === 2);
+  $("#c-submit").classList.toggle("hidden", state.createStep !== 2);
+}
+
+async function toggleDnsCred() {
+  const v = $("#c-dns-cred") ? $("#c-dns-cred").value : "reused";
+  $("#c-dns-token-wrap")?.classList.toggle("hidden", v !== "token");
+  $("#c-dns-file-wrap")?.classList.toggle("hidden", v !== "file");
+}
+$("#c-dns-cred") && ($("#c-dns-cred").onchange = toggleDnsCred);
+$("#c-dns") && ($("#c-dns").onchange = () => {
+  const p = $("#c-dns").value;
+  const note = $("#c-dns-zone");
+  if (note) {
+    note.innerHTML = p === "cloudflare"
+      ? "Cloudflare needs <b>Zone:Read + DNS:Edit</b> on the zone that holds the domain."
+      : p === "dnspod"
+        ? "DNSPod needs an API token with <b>Domain + Record</b> edit rights."
+        : p === "route53"
+          ? "Route 53 needs <b>route53:ChangeResourceRecordSets</b> on the zone."
+          : "Tencent Cloud DNS needs CAM rights for the domain’s zone.";
+  }
+});
+
+async function submitCreate() {
+  const name = $("#c-name").value.trim();
+  const domains = $("#c-domains")
+    .value.split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!name || !domains.length) {
+    toast("Enter a certificate name and at least one domain");
+    return;
+  }
+  const uin = $("#c-account").value;
+  const deploy = $("#c-deploy").value;
+  const dnsProvider = $("#c-dns") ? $("#c-dns").value : "";
+  const dnsCred = $("#c-dns-cred") ? $("#c-dns-cred").value : "reused";
+  const dnsPayload = { provider: dnsProvider, cred: dnsCred };
+  if (dnsCred === "token") dnsPayload.token = $("#c-dns-token") ? $("#c-dns-token").value : "";
+  if (dnsCred === "file") dnsPayload.file = $("#c-dns-file") ? $("#c-dns-file").value : "";
+
+  // Go durations have no day unit — the daemon rejects "30d". Convert here so
+  // the config parser sees "720h" / "336h" / "168h".
+  const renewMap = { "30d": "720h", "14d": "336h", "7d": "168h" };
+  const renewRaw = ($("#c-renew") ? $("#c-renew").value : "").trim();
+  const renewBefore = renewMap[renewRaw] || renewRaw || "720h";
+
+  let created;
+  try {
+    created = await wecertAPI.createCertificate({
+      name,
+      domains,
+      profile: $("#c-profile").value,
+      keyType: $("#c-key").value,
+      renewBefore,
+      deploy,
+      uin,
+      dns: dnsPayload,
+    });
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  logActivity(`Created certificate ${name} (${domains.length} domains) — ${(created && created.note) || "staged for issuance"}`);
+  closeModals();
+  toast(`${name} staged — reconciling…`);
+  // Pull the daemon's real inventory; do not invent status locally.
+  try {
+    await loadRealData();
+    render();
+  } catch (e) {
+    toast("Created, but inventory refresh failed: " + e.message);
+    return;
+  }
+  // Kick a reconcile pass so DNS-01 starts now instead of on the next hourly tick.
+  try {
+    await wecertAPI.renew(name);
+    logActivity(`Reconcile requested for ${name}`);
+  } catch (e) {
+    /* reconcile is best-effort; the daemon will retry on its own schedule */
+  }
+  setTimeout(async () => {
+    try {
+      await loadRealData();
+      render();
+    } catch (e) {
+      /* keep quiet; the user can hit Refresh */
+    }
+  }, 2500);
+}
+
+/* ── bind CLB ───────────────────────────────────────── */
+
+function openBind(id) {
+  const c = state.certs.find((x) => x.id === id);
+  if (!c) return;
+  state.bindCert = id;
+  $("#bind-cert-label").textContent = `Bind ${c.name} (${c.domains.join(", ")}) to a load balancer`;
+  const list = $("#clb-list");
+  list.innerHTML = state.clbs
+    .map(
+      (b) => `<div class="clb-item" data-clb="${b.id}">
+        <div>
+          <div style="font-weight:600">${esc(b.name)}</div>
+          <div class="clb-id">${esc(b.id)} · ${esc(b.region)}</div>
+        </div>
+      </div>`,
+    )
+    .join("");
+  if (!state.clbs.length) {
+    toast("No load balancers in inventory yet — bind after CLB data appears");
+    return;
+  }
+  const first = state.clbs[0];
+  if ($("#bind-sni")) {
+    $("#bind-sni").value = "";
+    $("#bind-sni").readOnly = false;
+  }
+  if ($("#bind-new-port")) $("#bind-new-port").value = "443";
+  if ($("#bind-new-name")) $("#bind-new-name").value = "";
+  if ($("#bind-new-sni")) $("#bind-new-sni").checked = true;
+  selectClb(first.id);
+  $("#modal-bind").classList.remove("hidden");
+}
+
+function selectClb(clbId) {
+  $$("#clb-list .clb-item").forEach((el) => el.classList.toggle("selected", el.dataset.clb === clbId));
+  const b = state.clbs.find((x) => x.id === clbId);
+  const existing = (b?.listeners || [])
+    .map((l) => `<option value="${l.id}">${esc(l.id)} · ${esc(l.proto)}/${l.port} · ${esc(l.sni)}</option>`)
+    .join("");
+  $("#bind-listener").innerHTML =
+    existing + `<option value="">— create new HTTPS listener —</option>`;
+  $("#modal-bind").dataset.clb = clbId;
+  syncBindSniDefault();
+}
+
+function syncBindSniDefault() {
+  const c = state.certs.find((x) => x.id === state.bindCert);
+  const lid = $("#bind-listener").value;
+  const b = state.clbs.find((x) => x.id === $("#modal-bind").dataset.clb);
+  const l = (b?.listeners || []).find((x) => x.id === lid);
+  const sniInput = $("#bind-sni");
+  if (!sniInput) return;
+  if (l && l.sni) {
+    sniInput.value = l.sni;
+    sniInput.readOnly = true;
+    sniInput.title = "Fixed to the listener's existing SNI domain. Pick “create new” for a different hostname.";
+  } else {
+    sniInput.readOnly = false;
+    sniInput.title = "";
+    if (!sniInput.value && c && c.domains && c.domains[0]) sniInput.value = c.domains[0];
+  }
+}
+
+async function submitBind() {
+  const c = state.certs.find((x) => x.id === state.bindCert);
+  const clbId = $("#modal-bind").dataset.clb;
+  const b = state.clbs.find((x) => x.id === clbId);
+  const lid = $("#bind-listener").value;
+  const l = (b?.listeners || []).find((x) => x.id === lid);
+  const sni = ($("#bind-sni") ? $("#bind-sni").value : "").trim();
+  if (!c || !b) return;
+  const payload = {
+    loadBalancerId: b.id,
+    region: b.region,
+    sniDomain: (l && l.sni) || sni,
+  };
+  if (lid) {
+    payload.listenerId = lid;
+    if (l && l.sni) payload.sniDomain = l.sni;
+  } else {
+    const port = parseInt(($("#bind-new-port") ? $("#bind-new-port").value : "443") || "443", 10);
+    const lname = ($("#bind-new-name") ? $("#bind-new-name").value : "").trim();
+    const sniOn = $("#bind-new-sni") ? $("#bind-new-sni").checked : true;
+    if (!(port >= 1 && port <= 65535)) {
+      toast("Port must be 1-65535");
+      return;
+    }
+    payload.sniDomain = sni;
+    payload.createListener = { port, name: lname, sni: sniOn };
+  }
+  try {
+    await wecertAPI.bindCertificate(c.name, payload);
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  logActivity(`${c.name} bind accepted for ${b.id}/${lid || "new listener"}`);
+  closeModals();
+  toast(`${c.name} bind accepted · ${b.id}`);
+  try {
+    await loadRealData();
+    render();
+  } catch (e) {
+    toast("Bound, but inventory refresh failed: " + e.message);
+  }
+}
+
+/* ── renew / delete ─────────────────────────────────── */
+
+function openConfirm(kind, id) {
+  let c = null;
+  let acct = null;
+  if (kind === "renewAll") {
+    state.confirm = { kind, id };
+  } else if (kind === "delete-account") {
+    acct = state.accounts.find((x) => x.uin === id) || null;
+    if (!acct) return;
+    state.confirm = { kind, id };
+  } else {
+    c = state.certs.find((x) => x.id === id) || null;
+    if (!c) return;
+    state.confirm = { kind, id };
+  }
+  const name = c ? c.name : "";
+  const titles = {
+    renew: "Renew now",
+    issue: "Re-issue",
+    delete: "Delete certificate",
+    renewAll: "Renew expiring",
+    "delete-account": "Remove account",
+    unbind: "Detach certificate",
+  };
+  const bodies = {
+    renew: `This will renew ${name} through DNS-01 and switch the deployment. Costs 1 exact-set token (5 / 7 days).`,
+    issue: `Discard the current certificate and re-issue ${name}. Watch the exact-set quota and ARI exemption rules.`,
+    delete: `Delete ${name}'s local state and binding records. Material moves to the retired archive; CLB mounts are not detached automatically.`,
+    renewAll: `Trigger renewal for every certificate inside its renewal window (≤14 days).`,
+    "delete-account": acct
+      ? `Remove ${acct.name} (${acct.uin}). ${state.certs.filter((x) => x.uin === acct.uin).length} certificate(s) and its CLBs will be unlinked from this console.`
+      : "Remove this account.",
+    unbind: `Detach ${name} from its CLB listener. The certificate stays in inventory.`,
+  };
+  $("#confirm-title").textContent = titles[kind] || "Confirm";
+  $("#confirm-body").textContent = bodies[kind] || "";
+  const wrap = $("#confirm-input-wrap");
+  const needType = kind === "delete" || kind === "delete-account";
+  if (needType) {
+    wrap.classList.remove("hidden");
+    const label = kind === "delete-account" ? (acct ? acct.name : "account") : (c ? c.name : "");
+    $("#confirm-input-label").textContent = `Type ${label} to confirm`;
+    $("#confirm-input").value = "";
+  } else {
+    wrap.classList.add("hidden");
+  }
+  $("#confirm-submit").disabled = needType;
+  $("#modal-confirm").classList.remove("hidden");
+}
+
+async function runConfirm() {
+  const { kind, id } = state.confirm || {};
+  const c = state.certs.find((x) => x.id === id);
+  if (kind === "renewAll") {
+    closeModals();
+    const targets = state.certs
+      .filter((x) => (daysLeft(x) ?? 999) <= 14 && x.status !== "not_issued")
+      .map((x) => x.name);
+    if (!targets.length) {
+      toast("Nothing in the renewal window");
+      return;
+    }
+    try {
+      await wecertAPI.renewMany(targets);
+      logActivity(`Reconcile accepted for ${targets.length} certificates`);
+      toast(`Queued ${targets.length} renewal(s)`);
+      setTimeout(refreshLive, 2000);
+    } catch (e) {
+      toast(e.message);
+    }
+    return;
+  }
+  if (kind === "delete-account") {
+    const a = state.accounts.find((x) => x.uin === id);
+    if (!a) return closeModals();
+    if ($("#confirm-input").value.trim() !== a.name && $("#confirm-input").value.trim() !== a.uin) return;
+    try {
+      await wecertAPI.removeAccount(a.uin);
+    } catch (e) {
+      toast(e.message);
+      return;
+    }
+    try {
+      const raw = JSON.parse(sessionStorage.getItem("wecert.removedAccounts") || "[]");
+      raw.push(a.uin);
+      sessionStorage.setItem("wecert.removedAccounts", JSON.stringify(raw));
+    } catch {}
+    logActivity(`Removed cloud account ${a.name} (${a.uin})`);
+    closeModals();
+    await loadAccounts();
+  await loadActivityFromStatus();
+    render();
+    toast(`Account ${a.name} removed`);
+    return;
+  }
+  if (kind === "unbind") {
+    if (!c) return closeModals();
+    try {
+      await wecertAPI.unbindCertificate(c.name);
+    } catch (e) {
+      toast(e.message);
+      return;
+    }
+    const prev = c.clb?.id;
+    c.clb = null;
+    c.deployConfirmed = false;
+    if (c.status === "ok") c.status = "waiting_manual_bind";
+    logActivity(`${c.name} detached from ${prev || "CLB"}`);
+    closeModals();
+    render();
+    toast(`${c.name} detached`);
+    return;
+  }
+  if (!c) return closeModals();
+  if (kind === "renew" || kind === "issue") {
+    closeModals();
+    await renewLive(c.name);
+    return;
+  }
+  if (false) {
+    c.status = "pending_deploy";
+    logActivity(`${c.name}  renewal accepted`);
+    closeModals();
+    render();
+    toast(`${c.name} renewing…`);
+    setTimeout(() => {
+      c.status = c.clb ? "ok" : "waiting_manual_bind";
+      c.notAfter = Date.now() + 89 * day;
+      c.consecutiveFailures = 0;
+      c.lastError = "";
+      if (c.clb) c.deployConfirmed = true;
+      logActivity(`${c.name} renewal finished`);
+      render();
+      toast(`${c.name}  renewed`);
+    }, 1100);
+    return;
+  }
+  if (kind === "delete") {
+    if ($("#confirm-input").value.trim() !== c.name) return;
+    closeModals();
+    try {
+      await wecertAPI.deleteCertificate(c.name);
+    } catch (e) {
+      toast(e.message);
+      return;
+    }
+    logActivity(`Deleted certificate ${c.name}`);
+    closeDrawer();
+    // daemon reloads + Prime after SIGHUP; wait a beat so inventory is fresh
+    await new Promise((r) => setTimeout(r, 800));
+    await refreshLive();
+    toast(`${c.name} deleted`);
+    return;
+  }
+}
+
+function closeModals() {
+  $$(".modal").forEach((m) => m.classList.add("hidden"));
+  state.confirm = null;
+  state.bindCert = null;
+  const cs = $("#confirm-submit");
+  if (cs) cs.disabled = true;
+  const ci = $("#confirm-input");
+  if (ci) ci.value = "";
+  const cw = $("#confirm-input-wrap");
+  if (cw) cw.classList.add("hidden");
+}
+
+/* ── events ─────────────────────────────────────────── */
+
+$("#btn-create").onclick = () => {
+  if (!state.accounts.length) {
+    toast("Add a cloud account first");
+    setView("accounts");
+    openAccountModal();
+    return;
+  }
+  openCreate();
+};
+$("#btn-add-account") && ($("#btn-add-account").onclick = openAccountModal);
+$("#account-submit").onclick = submitAccount;
+$("#btn-refresh").onclick = refreshLive;
+$("#btn-renew-all").onclick = () => openConfirm("renewAll");
+$("#theme").onclick = () => {
+  const el = document.documentElement;
+  el.dataset.theme = el.dataset.theme === "dark" ? "light" : "dark";
+};
+$("#search").oninput = (e) => {
+  state.q = e.target.value.trim().toLowerCase();
+  render();
+};
+$("#account").onchange = (e) => {
+  state.account = e.target.value;
+  render();
+};
+$("#sort").onchange = (e) => {
+  state.sort = e.target.value;
+  render();
+};
+$$("#tabs .tab").forEach((b) => {
+  b.onclick = () => {
+    $$("#tabs .tab").forEach((x) => x.setAttribute("aria-pressed", "false"));
+    b.setAttribute("aria-pressed", "true");
+    state.filter = b.dataset.filter;
+    render();
+  };
+});
+
+document.body.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-act]");
+  if (btn) {
+    const { act, id } = btn.dataset;
+    if (act === "detail") openDetail(id);
+    if (act === "bind" || act === "rebind") openBind(id);
+    if (act === "bind-first") {
+      const c = state.certs.find((x) => !x.clb);
+      if (!c) {
+        toast("Every certificate is already bound — create one first");
+        return;
+      }
+      openBind(c.id);
+    }
+    if (act === "renew") openConfirm("renew", id);
+    if (act === "issue") openConfirm("issue", id);
+    if (act === "delete") openConfirm("delete", id);
+    if (act === "add-account") openAccountModal();
+    if (act === "delete-account") openConfirm("delete-account", id);
+    if (act === "unbind") openConfirm("unbind", id);
+    if (act === "new-cert-in") {
+      if (!state.accounts.length) return openAccountModal();
+      openCreate();
+      const pick = $("#c-account");
+      if (pick) pick.value = id;
+    }
+    return;
+  }
+  const clb = e.target.closest("[data-clb]");
+  if (clb) selectClb(clb.dataset.clb);
+  if (e.target.matches("[data-close]") || e.target.id === "backdrop") {
+    closeModals();
+    closeDrawer();
+  }
+});
+
+$("#c-next").onclick = () => {
+  if (state.createStep === 0 && (!$("#c-name").value.trim() || !$("#c-domains").value.trim())) {
+    toast("Enter a name and at least one domain");
+    return;
+  }
+  state.createStep = Math.min(3, state.createStep + 1);
+  syncWizard();
+};
+$("#c-prev").onclick = () => {
+  state.createStep = Math.max(0, state.createStep - 1);
+  syncWizard();
+};
+$("#c-submit").onclick = submitCreate;
+$("#bind-submit").onclick = submitBind;
+$("#confirm-submit").onclick = runConfirm;
+$("#confirm-input").oninput = () => {
+  const conf = state.confirm || {};
+  const v = $("#confirm-input").value.trim();
+  if (conf.kind === "delete-account") {
+    const a = state.accounts.find((x) => x.uin === conf.id);
+    $("#confirm-submit").disabled = !a || (v !== a.name && v !== a.uin);
+    return;
+  }
+  const c = state.certs.find((x) => x.id === conf.id);
+  $("#confirm-submit").disabled = !c || v !== c.name;
+};
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    closeModals();
+    closeDrawer();
+  }
+});
+
+const ACME_DIR = {
+  staging: "acme-staging-v02.api.letsencrypt.org",
+  production: "acme-v02.api.letsencrypt.org",
+};
+
+function setEnv(env) {
+  state.env = env;
+  $$(".env-btn").forEach((b) => b.classList.toggle("active", b.dataset.env === env));
+  const pill = $("#env-pill");
+  pill.classList.toggle("production", env === "production");
+  pill.innerHTML =
+    `<span class="dot ${env === "production" ? "prod" : "staging"}"></span>Let’s Encrypt · ${env === "production" ? "production" : "staging"}`;
+  const dir = $("#c-env-dir");
+  if (dir) dir.textContent = ACME_DIR[env];
+  const note = $("#c-env-note");
+  if (note && env === "production") {
+    note.classList.add("warn");
+  } else if (note) {
+    note.classList.remove("warn");
+  }
+}
+
+$$(".env-btn").forEach((b) => {
+  b.onclick = () => {
+    setEnv(b.dataset.env);
+    toast(
+      b.dataset.env === "production"
+        ? "Switched to Let’s Encrypt production — real certificates, real rate limits"
+        : "Switched to Let’s Encrypt staging — untrusted certs, relaxed rate limits",
+    );
+  };
+});
+
+function renderBindings() {
+  const tbody = $("#binding-rows");
+  if (!tbody) return;
+  const rows = state.clbs.map((b) => {
+    const attached = state.certs.filter((c) => c.clb && c.clb.id === b.id);
+    const listeners = b.listeners
+      .map((l) => `<div class="cell-main"><span class="mono">${esc(l.id)}</span><span class="more">${esc(l.proto)}/${l.port}</span></div><div class="cell-sub">${esc(l.sni)}</div>`)
+      .join("");
+    const certs = attached.length
+      ? attached.map((c) => `<div class="cell-main"><button class="cert-name" data-act="detail" data-id="${c.id}">${esc(c.name)}</button></div>`).join("")
+      : `<div class="cell-sub">—</div>`;
+    return `<tr>
+      <td><span class="badge badge-${attached.length ? "green" : "neutral"}">${attached.length ? "In use" : "Free"}</span></td>
+      <td><div class="cell-main">${esc(b.name)}</div><div class="cell-sub mono">${esc(b.id)}</div></td>
+      <td class="domains">${esc(b.region)}</td>
+      <td>${listeners}</td>
+      <td>${certs}</td>
+      <td><div class="row-actions">
+        <button class="btn btn-xs" data-act="bind-first" data-clb="${b.id}">Attach</button>
+        ${attached.map((c) => `<button class="btn btn-xs btn-ghost" data-act="unbind" data-id="${c.id}">Detach ${esc(c.name)}</button>`).join("")}
+      </div></td>
+    </tr>`;
+  }).join("");
+  tbody.innerHTML = rows;
+  $("#binding-count").textContent = state.clbs.length;
+  $("#binding-count-note").textContent = `${state.clbs.length} load balancers · ${state.clbs.reduce((n, b) => n + b.listeners.length, 0)} listeners`;
+}
+
+function renderActivity() {
+  const ul = $("#activity-list");
+  if (!ul) return;
+  ul.innerHTML = state.activity
+    .map((a) => {
+      const t = new Date(a.at);
+      const hh = String(t.getHours()).padStart(2, "0");
+      const mm = String(t.getMinutes()).padStart(2, "0");
+      return `<li><span class="activity-dot"></span><span class="activity-time">${hh}:${mm}</span><span class="activity-text">${esc(a.text)}</span></li>`;
+    })
+    .join("");
+  $("#activity-count").textContent = `${state.activity.length} events`;
+}
+
+function setView(view) {
+  state.view = view;
+  $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+  $("#view-inventory")?.classList.toggle("hidden", view !== "inventory");
+  $("#view-accounts")?.classList.toggle("hidden", view !== "accounts");
+  $("#view-bindings")?.classList.toggle("hidden", view !== "bindings");
+  $("#view-activity")?.classList.toggle("hidden", view !== "activity");
+  if (view === "accounts") renderAccountTable();
+  if (view === "bindings") renderBindings();
+  if (view === "activity") renderActivity();
+}
+
+$$(".nav-item").forEach((b) => {
+  b.onclick = () => setView(b.dataset.view);
+});
+
+
+/* ── real data ─────────────────────────────────────── */
+
+function mapInventory(snap) {
+  state.inventory = snap;
+  const certs = (snap.certificates || []).map((c) => {
+    const items = (c.bindings && c.bindings.items) || [];
+    const b = items[0] || null;
+    return {
+      id: c.name,
+      name: c.name,
+      uin: (c.uin && c.uin !== "<nil>" ? c.uin : ""),
+      status: c.status,
+      profile: c.profile || "",
+      keyType: c.keyType || "",
+      domains: c.domains || [],
+      notAfter: c.notAfter ? Date.parse(c.notAfter) : null,
+      daysLeft: c.daysLeft,
+      deployedCertId: c.deployedCertId || "",
+      deployConfirmed: !!c.deployConfirmed,
+      uploaded: !!c.uploaded,
+      clb: b
+        ? {
+            id: b.loadBalancerId || "",
+            region: b.region || "",
+            listener: b.listenerId || "",
+            sni: b.sniDomain || "",
+          }
+        : null,
+      ari: c.ari
+        ? {
+            start: c.ari.windowStart ? Date.parse(c.ari.windowStart) : null,
+            end: c.ari.windowEnd ? Date.parse(c.ari.windowEnd) : null,
+          }
+        : null,
+      lastError: c.lastError || c.error || "",
+      consecutiveFailures: c.consecutiveFailures || 0,
+      bindingsCount: c.bindings ? c.bindings.count : 0,
+      bindingsComplete: c.bindings ? !!c.bindings.complete : true,
+    };
+  });
+  state.certs = certs;
+
+  // Derive CLB view from real binding rows (grouped by load balancer).
+  const byLb = new Map();
+  for (const c of certs) {
+    const items = (state.inventory.certificates || []).find((x) => x.name === c.name)?.bindings?.items || [];
+    for (const it of items) {
+      const id = it.loadBalancerId || "unknown";
+      if (!byLb.has(id)) {
+        byLb.set(id, {
+          id,
+          name: id,
+          region: it.region || "",
+          listeners: [],
+          account: c.uin,
+        });
+      }
+      const lb = byLb.get(id);
+      if (it.listenerId && !lb.listeners.some((l) => l.id === it.listenerId)) {
+        lb.listeners.push({
+          id: it.listenerId,
+          proto: it.protocol || "HTTPS",
+          port: it.port || 443,
+          sni: it.sniDomain || "",
+        });
+      }
+    }
+  }
+  state.clbs = [...byLb.values()];
+
+  state.live = true;
+}
+
+// mergeAccounts keeps console-registered accounts (from /api/accounts) and
+// any UIN seen on certificates. Never replace the registry with cert rows only.
+function mergeAccounts(fromApi) {
+  let removed = [];
+  try { removed = JSON.parse(sessionStorage.getItem("wecert.removedAccounts") || "[]"); } catch {}
+  const by = new Map();
+  for (const a of fromApi || []) {
+    const key = a.uin || a.id || a.name;
+    if (removed.includes(key)) continue;
+    by.set(key, { id: key, name: a.name || key, uin: a.uin || key, cred: a.cred || "—" });
+  }
+  for (const c of state.certs) {
+    if (!c.uin) continue;
+    if (removed.includes(c.uin)) continue;
+    if (!by.has(c.uin)) {
+      by.set(c.uin, { id: c.uin, name: "account-" + String(c.uin).slice(-4), uin: c.uin, cred: "—" });
+    }
+  }
+  state.accounts = [...by.values()];
+}
+
+async function loadActivityFromStatus() {
+  try {
+    const st = await wecertAPI.status();
+    const rows = (st.certificates || []).map((c) => {
+      const bits = [];
+      if (c.lastError) bits.push("failed: " + String(c.lastError).slice(0, 120));
+      if (c.nextAttemptAt) bits.push("next attempt " + c.nextAttemptAt);
+      if (c.deployConfirmed) bits.push("deploy confirmed");
+      return {
+        at: Date.parse(st.time || "") || Date.now(),
+        text: `${c.name}: ${bits.join(" · ") || "idle"}`,
+      };
+    });
+    state.activity = [...rows, ...state.activity].slice(0, 50);
+    if (state.view === "activity") renderActivity();
+  } catch (e) {
+    /* keep local activity */
+  }
+}
+
+async function loadAccounts() {
+  try {
+    const out = await wecertAPI.accounts();
+    mergeAccounts(out && out.accounts);
+  } catch (e) {
+    // fall back to whatever is already in state (cert-derived)
+    mergeAccounts([]);
+  }
+}
+
+function quotaFromSnapshot(snap) {
+  const qs = snap.quotas || [];
+  const exact = qs.find((q) => q.limit === "certs-per-exact-identifier-set");
+  if (exact && !exact.unreadable && !exact.spentByCA) {
+    return `${Math.floor(exact.remaining)} / ${exact.capacity}`;
+  }
+  if (exact && exact.blocked) return "blocked";
+  return qs.length ? "—" : "n/a";
+}
+
+async function loadRealData() {
+  const snap = await wecertAPI.inventory();
+  mapInventory(snap);
+  await loadAccounts();
+  await loadActivityFromStatus();
+  $("#m-quota").textContent = quotaFromSnapshot(snap);
+  const env = (snap.desired && snap.desired.revision) || "live";
+  $("#env-pill").title = "desired revision " + env;
+  logActivity(`Inventory refreshed from live daemon (${(snap.certificates || []).length} certificates)`);
+}
+
+async function bootstrap() {
+  // token from ?token= for shared links
+  try {
+    const u = new URL(location.href);
+    const t = u.searchParams.get("token");
+    const at = u.searchParams.get("adminToken");
+    if (t || at) wecertAPI.setTokens(t || null, at || null);
+  } catch {}
+  if (!wecertAPI.token()) {
+    openConnect();
+    $("#result-count").textContent = "Connect to a wecert daemon to load live inventory";
+    return;
+  }
+  try {
+    await loadRealData();
+    render();
+    toast("Live inventory loaded");
+  } catch (e) {
+    if (e.kind === "auth") {
+      toast("Token rejected — check webhook.token");
+      $("#result-count").textContent = "Unauthorized: " + e.message;
+    } else {
+      toast(e.message);
+      $("#result-count").textContent = e.message;
+    }
+    console.error(e);
+  }
+}
+
+async function refreshLive() {
+  try {
+    await loadRealData();
+    render();
+    toast("Refreshed from daemon");
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function renewLive(name) {
+  try {
+    await wecertAPI.renew(name);
+    logActivity(`Reconcile accepted for ${name}`);
+    toast(`${name} renewal queued`);
+    setTimeout(refreshLive, 1500);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+
+/* ── connection settings (never use window.prompt) ── */
+
+function openConnect() {
+  const box = $("#modal-connect");
+  if (!box) return;
+  $("#k-base").value = (wecertAPI.base && wecertAPI.base()) || location.origin;
+  $("#k-token").value = wecertAPI.token() ? "••••••••" : "";
+  const adm = wecertAPI.adminToken();
+  $("#k-admin").value = adm && adm !== wecertAPI.token() ? "••••••••" : "";
+  box.classList.remove("hidden");
+}
+
+async function submitConnect() {
+  const base = ($("#k-base").value || "").trim().replace(/\/+$/, "") || location.origin;
+  const tok = ($("#k-token").value || "").trim();
+  const adm = ($("#k-admin").value || "").trim();
+  const keep = $("#k-save") ? $("#k-save").checked : true;
+  if (tok && tok !== "••••••••") {
+    wecertAPI.setTokens(tok, adm && adm !== "••••••••" ? adm : null);
+    if (!keep) {
+      try {
+        localStorage.removeItem("wecert.token");
+        localStorage.removeItem("wecert.adminToken");
+      } catch {}
+    }
+  } else if (adm && adm !== "••••••••") {
+    wecertAPI.setTokens(null, adm);
+  }
+  if (wecertAPI.setBase) wecertAPI.setBase(base);
+  closeModals();
+  try {
+    await loadRealData();
+    render();
+    toast("Connected to " + base);
+  } catch (e) {
+    toast(e.message);
+    const rc = $("#result-count");
+    if (rc) rc.textContent = e.message;
+    openConnect();
+  }
+}
+
+$("#bind-listener") && ($("#bind-listener").onchange = syncBindSniDefault);
+$("#btn-connect") && ($("#btn-connect").onclick = openConnect);
+$("#connect-submit") && ($("#connect-submit").onclick = submitConnect);
+
+renderAccounts();
+render();
+setEnv("staging");
+setView("inventory");
+bootstrap();
+
+  </script>
+  </body>
+</html>

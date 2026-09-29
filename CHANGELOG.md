@@ -55,6 +55,9 @@
 
 ### Added
 
+- **Standalone web console ships in-tree (`webconsole/`).** The self-contained
+  management UI (create / bind / renew / delete, accounts, bindings) now lives
+  in the repository instead of only on the operator's workstation.
 - **Web console certificate and account management.** `/admin/certificates`
   creates, binds, and deletes certificates against live state (config.yaml +
   SIGHUP on create); `/admin/accounts` stores AK/SK as 0600 on the daemon host.
