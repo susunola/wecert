@@ -110,6 +110,22 @@ jobs:
       - name: cross build
         run: make release
 
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: isolated browser dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/console-venv"
+          "$RUNNER_TEMP/console-venv/bin/python" -m pip install playwright==1.62.0
+          "$RUNNER_TEMP/console-venv/bin/python" -m playwright install --with-deps chromium
+      - name: console state transitions and accessibility
+        run: make check-console PYTHON="$RUNNER_TEMP/console-venv/bin/python"
+
   # `install.sh` is the documented way onto a CVM, and no machine ran it: the round-11
   # verification found it aborting on every `make release` + install with "SUMS: unbound
   # variable" -- a merge left a reference to a local that verify_checksum had replaced, and

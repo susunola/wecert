@@ -63,13 +63,16 @@ func (s *Server) handleInventoryPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) assembleInventory() inventory.Snapshot {
+	s.uinMu.RLock()
+	uin := s.uin
+	s.uinMu.RUnlock()
 	in := inventory.Input{
 		Now:           s.now(),
 		Names:         s.rec.CertNames(),
 		Certs:         map[string]*state.CertState{},
 		CertErrors:    map[string]string{},
 		RevokePending: map[string]bool{},
-		UIN:           s.uin,
+		UIN:           uin,
 	}
 	facts, haveFacts := s.rec.(DaemonFacts)
 	if haveFacts {
@@ -132,9 +135,19 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 			}
 		}
 	}
-	if haveFacts {
+	if haveFacts && in.ProbeEnabled {
 		in.Probes = map[string][]inventory.HostSample{}
-		for name := range in.Certs {
+		for name, cert := range in.Certs {
+			if !cert.DeployConfirmed {
+				continue
+			}
+			// Match ProbeAnswers' deployment gate when desired context is known.
+			// Optional readers without that context retain the restart fallback.
+			if in.Desired != nil {
+				if desired := in.Desired.Find(name); desired != nil && !desired.Deploy.Enabled {
+					continue
+				}
+			}
 			answers := facts.ProbeAnswers(name)
 			if len(answers) > 0 {
 				in.Probes[name] = hostSamples(answers)

@@ -161,6 +161,8 @@ const quotaNames = {
   "new-orders": "New orders",
   "certs-per-registered-domain": "Certificates per registered domain",
   "certs-per-exact-identifier-set": "Certificates per exact identifier set",
+  "authz-failures-per-identifier": "Authorization failures per identifier",
+  "consecutive-authz-failures-per-identifier": "Consecutive authorization failures",
 };
 const quotaOrder = Object.keys(quotaNames);
 const quotaRecovery = (seconds) => {
@@ -170,7 +172,7 @@ const quotaRecovery = (seconds) => {
 };
 function quotaClass(q) {
   if (q.blocked) return "bad";
-  if (q.unreadable || q.spentByCA) return "";
+  if (q.unreadable || q.spentByCA) return "unknown";
   return q.remaining <= Math.max(1, q.capacity * 0.2) ? "warn" : "";
 }
 function quotaNote(q) {
@@ -184,27 +186,39 @@ function quotaNote(q) {
 }
 function renderQuotas() {
   const panel = $("quota-panel");
-  const families = quotaOrder
+  // Keep unfamiliar reportable families visible too, rather than silently
+  // dropping a future backend limit from both the summary and the evidence.
+  const limits = [...new Set([...quotaOrder, ...quotas.map((q) => q.limit)])];
+  const families = limits
     .map((limit) => quotas.filter((q) => q.limit === limit))
     .filter((rows) => rows.length);
+  const priority = (q) => q.blocked ? 0 : q.unreadable ? 1 : q.spentByCA ? 2 : 3;
   const relevant = families.map((rows) =>
-    rows.reduce(
-      (worst, row) =>
-        !worst || row.blocked || row.remaining < worst.remaining ? row : worst,
-      null,
-    ),
+    [...rows].sort((a, b) => priority(a) - priority(b) || a.remaining - b.remaining)[0],
   );
-  if (!relevant.length) return;
-  panel.hidden = false;
-  const blocked = relevant.filter((q) => q.blocked).length;
-  const warning = relevant.filter((q) => quotaClass(q) === "warn").length;
+  panel.hidden = !relevant.length;
+  if (panel.hidden) {
+    $("quota-grid").replaceChildren();
+    $("quota-rows").replaceChildren();
+    $("quota-state").textContent = "";
+    return;
+  }
+  // Aggregate every scope independently of the representative card. Unknown
+  // capacity must never become an all-clear, even beside a known CA block.
+  const blocked = quotas.filter((q) => q.blocked).length;
+  const warning = quotas.filter((q) => quotaClass(q) === "warn").length;
+  const unreadable = quotas.filter((q) => q.unreadable).length;
+  const caOnly = quotas.filter((q) => q.spentByCA && !q.unreadable && !q.blocked).length;
+  const notes = [];
+  if (blocked) notes.push(`${blocked} blocked by CA`);
+  if (warning) notes.push(`${warning} near limit`);
+  if (unreadable) notes.push(`${unreadable} quota ${unreadable === 1 ? "scope" : "scopes"} unreadable`);
+  if (caOnly) notes.push(`${caOnly} CA-only ${caOnly === 1 ? "scope" : "scopes"}; capacity unknown`);
   $("quota-state").className =
-    `quota-state ${blocked ? "bad" : warning ? "warn" : ""}`;
-  $("quota-state").innerHTML = blocked
-    ? `${icon("warning-circle")}${blocked} blocked by CA`
-    : warning
-      ? `${icon("warning-circle")}${warning} near limit`
-      : `${icon("check-circle")}Within local estimate`;
+    `quota-state ${blocked ? "bad" : warning ? "warn" : notes.length ? "unknown" : ""}`;
+  $("quota-state").innerHTML = notes.length
+    ? `${icon(blocked || warning ? "warning-circle" : "info")}${esc(notes.join(" · "))}`
+    : `${icon("check-circle")}Within local estimate`;
   $("quota-grid").innerHTML = relevant
     .map((q, index) => {
       const cls = quotaClass(q);
@@ -465,7 +479,7 @@ function readURLState() {
     const p = new URLSearchParams(location.search);
     const q = (p.get("q") || "").trim().toLowerCase();
     const filter = p.get("status") || "all";
-    const account = p.get("account") || "all";
+    const account = p.get("account") ?? "all";
     const sort = p.get("sort") || "attention";
     if (q) {
       state.q = q;
@@ -473,7 +487,7 @@ function readURLState() {
     }
     if (["all", "attention", "expiring", "healthy"].includes(filter))
       state.filter = filter;
-    if (account) state.account = account;
+    state.account = account;
     if (["attention", "expiry", "name"].includes(sort)) state.sort = sort;
     $("account").value = state.account;
     $("sort").value = state.sort;
@@ -509,8 +523,8 @@ function bindingDetails(r) {
             `<div class="binding-item"><div class="binding-item-head"><span class="mono">${esc(item.loadBalancerId || "Resource ID unavailable")}</span><span>${esc(item.region || "Region unavailable")}</span></div><dl class="facts">${field("Resource type", item.resourceType)}${field("Listener ID", item.listenerId, true)}${field("Protocol / port", [item.protocol, item.port || ""].filter(Boolean).join(" / "), true)}${field("SNI hostname", item.sniDomain, true)}${field("Certificate role", { primary: "Primary", ext: "Extended (SNI)" }[item.role] || item.role)}</dl></div>`,
         )
         .join("")
-    : `<div class="binding-empty"><div class="binding-empty-title">${icon("cloud")}${bindingCount(b)}</div><p>${b.complete ? "The complete cloud inventory contains no binding resources." : b.count ? "The local deployment record provides a minimum binding count. Resource IDs require cloud enumeration." : "No complete binding inventory is available. A missing count does not mean the certificate is unbound."}</p></div>`;
-  return `<section class="detail-section"><h3 class="section-heading">${icon("cloud")}Cloud bindings<span class="right-label">${b.complete ? "Complete inventory" : "Incomplete inventory"}</span></h3>${r.regions.length ? `<div class="section-heading muted" style="font-size:12px">Regions: ${esc(r.regions.map(regionLabel).join(", "))}</div>` : ""}${items}<div class="source-line">${icon("info")}Source: ${bindingSource(b)}${b.observedAt ? " · observed " + esc(formatDate(b.observedAt, true)) : " · observation time unavailable"}${b.resourceTypes.length ? " · scope: " + esc(b.resourceTypes.join(", ")) : ""}</div></section>`;
+    : `<div class="binding-empty"><div class="binding-empty-title">${icon("cloud")}${bindingCount(b)}</div><p>${b.complete ? "The complete inventory contains no binding resources within the observed scope." : b.count ? "The local deployment record provides a minimum binding count. Resource IDs require cloud enumeration." : "No complete binding inventory is available. A missing count does not mean the certificate is unbound."}</p></div>`;
+  return `<section class="detail-section"><h3 class="section-heading">${icon("cloud")}Cloud bindings<span class="right-label">${b.complete ? "Complete within scope" : "Incomplete inventory"}</span></h3>${r.regions.length ? `<div class="section-heading muted" style="font-size:12px">Regions: ${esc(r.regions.map(regionLabel).join(", "))}</div>` : ""}${items}<div class="source-line">${icon("info")}Source: ${bindingSource(b)}${b.observedAt ? " · observed " + esc(formatDate(b.observedAt, true)) : " · observation time unavailable"}${b.resourceTypes.length ? " · scope: " + esc(b.resourceTypes.join(", ")) : ""}</div></section>`;
 }
 const problems = {
   names_missing: "Configured domains are missing from the served certificate",
@@ -551,10 +565,22 @@ function probeDetails(r) {
       .join("");
   return `<section class="detail-section"><h3 class="section-heading">${icon("shield-check")}TLS verification<span class="right-label">Last recorded result</span></h3>${body}</section>`;
 }
-function openDetail(index) {
+function openDetail(index, { preservePosition = false } = {}) {
   const r = records[index];
   if (!r) return;
-  if (state.selected == null) previousFocus = document.activeElement;
+  const drawer = $("drawer");
+  const scrollTop = preservePosition ? drawer.querySelector(".drawer-scroll")?.scrollTop || 0 : 0;
+  const active = document.activeElement;
+  const restoreFocus = preservePosition && drawer.contains(active);
+  // Only use attributes of our own controls as selectors. Do not retain the
+  // old DOM node: the content below is replaced on every snapshot.
+  const focusSelector = restoreFocus
+    ? active.matches("[data-copy]") ? "[data-copy]"
+      : active.matches("[data-step='-1']") ? "[data-step='-1']"
+        : active.matches("[data-step='1']") ? "[data-step='1']"
+          : "#drawer-close"
+    : null;
+  if (state.selected == null) previousFocus = active;
   state.selected = index;
   syncURL();
   render();
@@ -583,7 +609,15 @@ function openDetail(index) {
   document.querySelector("main").inert = true;
   document.querySelector(".topbar").inert = true;
   document.body.style.overflow = "hidden";
-  $("drawer-close").focus({ preventScroll: true });
+  if (preservePosition) {
+    drawer.querySelector(".drawer-scroll").scrollTop = scrollTop;
+    if (restoreFocus) {
+      const control = drawer.querySelector(focusSelector);
+      (control && !control.disabled ? control : $("drawer-close")).focus({ preventScroll: true });
+    }
+  } else {
+    $("drawer-close").focus({ preventScroll: true });
+  }
 }
 function closeDetail() {
   const index = state.selected;
@@ -598,7 +632,7 @@ function closeDetail() {
   const button = [
     ...document.querySelectorAll(`button[data-open="${index}"]`),
   ].find((el) => el.getClientRects().length);
-  (button || previousFocus)?.focus({ preventScroll: true });
+  (button || (previousFocus?.isConnected ? previousFocus : $("search"))).focus({ preventScroll: true });
 }
 let toastTimer;
 function toast(message) {
@@ -695,6 +729,18 @@ $("theme").addEventListener("click", () => {
     localStorage.setItem("wecert-theme", theme);
   } catch {}
 });
+function refreshAccountOptions() {
+  const accounts = [...new Set(records.map((r) => r.uin || ""))];
+  const picker = $("account");
+  picker.replaceChildren(
+    new Option(`All accounts (${accounts.length})`, "all"),
+    ...accounts.map((uin) => new Option(accountLabel(uin), uin)),
+  );
+  if (state.account !== "all" && !accounts.includes(state.account)) {
+    state.account = "all";
+  }
+  picker.value = state.account;
+}
 function refreshSnapshotMeta() {
   $("snapshot-time").textContent = formatDate(snapshot.time, true);
   $("revision").textContent =
@@ -741,27 +787,37 @@ function applySnapshot(next, { silent } = {}) {
   snapshot = next;
   records = normalizeRecords(next.certificates);
   quotas = next.quotas || [];
+  refreshAccountOptions();
   refreshSnapshotMeta();
   if (selectedName) {
     const again = records.find((r) => r.name === selectedName);
     state.selected = again ? again.index : null;
     if (!again && !$("drawer").classList.contains("hidden")) closeDetail();
     else if (again && !$("drawer").classList.contains("hidden"))
-      openDetail(again.index);
+      openDetail(again.index, { preservePosition: true });
     else render();
   } else {
     render();
   }
+  syncURL();
   if (!silent) toast("Inventory refreshed");
 }
 // Live refresh: pull the JSON the page is already built over, instead of a full
 // navigation. A saved console.html (file://) has no API to call -- say so rather
 // than pretending the refresh landed.
+let refreshPending = false;
 async function refreshInventory({ silent } = {}) {
+  if (refreshPending) return;
+  refreshPending = true;
   const button = $("refresh");
   button.disabled = true;
+  const controller = new AbortController();
+  // Bound both the connection and response body: a stalled proxy must not
+  // keep the single-flight guard locked until the page is reloaded.
+  const deadline = setTimeout(() => controller.abort(), 15_000);
   try {
     const res = await fetch("api/inventory", {
+      signal: controller.signal,
       cache: "no-store",
       headers: { Accept: "application/json" },
     });
@@ -772,6 +828,8 @@ async function refreshInventory({ silent } = {}) {
       toast("Live refresh unavailable — this copy is a saved snapshot or the API is unreachable");
     updateSnapshotAge();
   } finally {
+    clearTimeout(deadline);
+    refreshPending = false;
     button.disabled = false;
   }
 }
@@ -829,6 +887,7 @@ $("freeze-state").title = snapshot.desired.freezeReason || "";
 $("account").options[0].textContent =
   `All accounts (${new Set(records.map((r) => r.uin || "")).size})`;
 const deepLink = readURLState();
+refreshAccountOptions();
 refreshSnapshotMeta();
 setTheme(initialTheme());
 render();

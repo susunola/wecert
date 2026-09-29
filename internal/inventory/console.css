@@ -402,9 +402,13 @@ h1 {
 .quota-state.bad {
   color: var(--red);
 }
+.quota-state.unknown,
+.quota-item.unknown .quota-value strong {
+  color: var(--muted);
+}
 .quota-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
   border-top: 1px solid var(--line);
 }
 .quota-item {
@@ -600,6 +604,13 @@ h1 {
   align-items: center;
   gap: 9px;
   padding: 10px 22px;
+}
+.quota-item .quota-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.quota-item .quota-value {
+  flex-shrink: 0;
 }
 .quota-label {
   display: block;
@@ -2149,6 +2160,26 @@ th {
   }
 }
 @media (max-width: 760px) {
+  .quota-grid {
+    grid-template-columns: 1fr;
+  }
+  .quota-item {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding-inline: 16px;
+  }
+  .quota-heading {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-inline: 16px;
+  }
+  .quota-state {
+    white-space: normal;
+  }
+  .quota-details summary {
+    padding-inline: 16px;
+    overflow-wrap: anywhere;
+  }
   .topbar {
     padding: 0 20px;
     gap: 15px;

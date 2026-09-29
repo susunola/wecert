@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,6 +205,46 @@ func TestInventoryRoutesAreMounted(t *testing.T) {
 	}
 	if !strings.Contains(page.Body.String(), "example-com") {
 		t.Fatalf("page missing cert name: %s", page.Body.String())
+	}
+}
+
+func TestInventoryAccountUINConcurrentReload(t *testing.T) {
+	srv, _ := newTestServer(t, &fakeReconciler{names: []string{"example-com", "other-com"}})
+	if got := srv.assembleInventory().Certificates[0].UIN; got != "" {
+		t.Fatalf("unset account UIN = %q, want empty", got)
+	}
+	uins := []string{"", "100012345678", "100098765432"}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for writer := 0; writer < 2; writer++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 2000; i++ {
+				srv.SetAccountUIN(" \t" + uins[i%len(uins)] + "\n")
+			}
+		}()
+	}
+	close(start)
+	for i := 0; i < 100; i++ {
+		snap := srv.assembleInventory()
+		first := snap.Certificates[0].UIN
+		for _, row := range snap.Certificates {
+			if row.UIN != "" && row.UIN != uins[1] && row.UIN != uins[2] {
+				t.Errorf("inventory observed a torn or untrimmed UIN: %q", row.UIN)
+			}
+			if row.UIN != first {
+				t.Errorf("inventory used different account UINs in one snapshot: %+v", snap.Certificates)
+			}
+		}
+	}
+	wg.Wait()
+	for _, uin := range uins {
+		srv.SetAccountUIN(" " + uin + "\n")
+		if got := srv.assembleInventory().Certificates[0].UIN; got != uin {
+			t.Errorf("UIN after reload = %q, want %q", got, uin)
+		}
 	}
 }
 

@@ -1,4 +1,5 @@
 GO ?= go
+PYTHON ?= python3
 BIN := bin/wecert
 # The onboarding component. Like wecert it is part of the product (it runs in the
 # scheduled job), but it is deliberately a separate binary: the inference logic
@@ -191,6 +192,12 @@ check-english:
 console-preview:
 	WECERT_PREVIEW=/tmp/wecert-console.html $(GO) test ./internal/inventory -run '^TestWritePreviewPage$$' -count=1
 	@echo "Open file:///tmp/wecert-console.html"
+
+# Isolated browser tests over the production renderer; no daemon or cloud calls.
+# See docs/console.md for the pinned Python Playwright dependency.
+.PHONY: check-console
+check-console:
+	$(PYTHON) scripts/check-console.py
 
 test:
 	$(GO) test ./...
