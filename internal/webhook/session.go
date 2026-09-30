@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"strconv"
 	"crypto/subtle"
 	"encoding/json"
 	"net/http"
@@ -19,8 +20,24 @@ const (
 
 func (s *Server) handleSession() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// This endpoint is an oracle for whether a token is valid: GET reports
+		// which credential matched and POST answers 200 vs 401. It therefore has
+		// to count failed guesses exactly like /hook/* and /admin/*, or the
+		// lockout there can be walked around from here.
+		addr := clientIP(r)
 		switch r.Method {
 		case http.MethodGet:
+			ok := s.tokenMatches(r) || s.adminTokenMatches(r)
+			if !ok {
+				if blocked, retryAfter := s.limiter.fail(addr, s.now()); blocked {
+					w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+					writeJSON(w, http.StatusTooManyRequests,
+						map[string]string{"error": "too many failed authentication attempts"})
+					return
+				}
+			} else {
+				s.limiter.recordSuccess(addr, s.now())
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"read":  s.tokenMatches(r),
 				"admin": s.adminTokenMatches(r),
@@ -54,9 +71,16 @@ func (s *Server) handleSession() http.HandlerFunc {
 				okRead = true
 			}
 			if !okRead && !okAdmin {
+				if blocked, retryAfter := s.limiter.fail(addr, s.now()); blocked {
+					w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+					writeJSON(w, http.StatusTooManyRequests,
+						map[string]string{"error": "too many failed authentication attempts"})
+					return
+				}
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "token rejected"})
 				return
 			}
+			s.limiter.recordSuccess(addr, s.now())
 			if okRead {
 				tok := body.Token
 				if tok == "" {
@@ -77,7 +101,8 @@ func (s *Server) handleSession() http.HandlerFunc {
 			for _, name := range []string{cookieRead, cookieAdmin} {
 				http.SetCookie(w, &http.Cookie{
 					Name: name, Value: "", Path: "/",
-					MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil,
+					MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+					Secure:   r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
 				})
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -93,10 +118,12 @@ func sessionCookie(name, value string, r *http.Request) *http.Cookie {
 		Name:     name,
 		Value:    value,
 		Path:     "/",
-		MaxAge:   int((30 * 24 * time.Hour).Seconds()),
+		MaxAge:   int((7 * 24 * time.Hour).Seconds()),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		// Behind a TLS terminator r.TLS is nil, so the raw token cookie would go
+		// out unmarked and be sent over plain HTTP. Honour the standard header.
+		Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
 	}
 }
 

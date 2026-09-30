@@ -1,7 +1,11 @@
 package webhook
 
 import (
+	"time"
+	"encoding/json"
 	"fmt"
+	"net/http/httptest"
+	"strings"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -78,5 +82,63 @@ func TestStatusForErrorSplitsClientAndServer(t *testing.T) {
 	wrapped := fmt.Errorf("stage: %w", InvalidRequestf("nope"))
 	if got := statusForError(wrapped); got != http.StatusBadRequest {
 		t.Errorf("wrapped client error must be 400, got %d", got)
+	}
+}
+
+// The session endpoint is a token oracle; it must consume the same lockout
+// budget as /hook/* and /admin/*, or those can be walked around from here.
+func TestSessionEndpointCountsFailedGuesses(t *testing.T) {
+	s := newTestSessionServer(t)
+	for i := 0; i < 12; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/session",
+			strings.NewReader(`{"token":"wrong","adminToken":"wrong"}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.handleSession()(rec, req)
+		if rec.Code == http.StatusTooManyRequests {
+			if i < 10 {
+				t.Fatalf("lockout fired too early at attempt %d", i+1)
+			}
+			return
+		}
+	}
+	t.Fatal("repeated wrong tokens on /api/session must lock out")
+}
+
+// An unconfigured admin surface must not report a match for a missing token:
+// ConstantTimeCompare of two empty strings is a match.
+func TestEmptyTokensNeverAuthenticate(t *testing.T) {
+	s := &Server{now: time.Now, limiter: newAuthLimiter()}
+	if s.tokenMatches(httptest.NewRequest(http.MethodGet, "/x", nil)) {
+		t.Error("empty read token must not authenticate")
+	}
+	if s.adminTokenMatches(httptest.NewRequest(http.MethodGet, "/x", nil)) {
+		t.Error("empty admin token must not authenticate")
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/session", nil)
+	rec := httptest.NewRecorder()
+	s.handleSession()(rec, req)
+	var body map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["read"] == true || body["admin"] == true {
+		t.Errorf("empty-token server must report no credentials, got %v", body)
+	}
+}
+
+func TestSetTokenRejectsEmpty(t *testing.T) {
+	s := &Server{token: "keep-me", now: time.Now, limiter: newAuthLimiter()}
+	s.SetToken("")
+	if s.token != "keep-me" {
+		t.Error("SetToken must refuse to clear the secret")
+	}
+}
+
+func newTestSessionServer(t *testing.T) *Server {
+	t.Helper()
+	return &Server{
+		token:     "read-token-value",
+		adminToken: "admin-token-value-long-enough",
+		now:       time.Now,
+		limiter:   newAuthLimiter(),
 	}
 }

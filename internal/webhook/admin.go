@@ -83,6 +83,14 @@ func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) adminTokenMatches(r *http.Request) bool {
+	s.tokenMu.RLock()
+	token := s.adminToken
+	s.tokenMu.RUnlock()
+	// Same empty-token hazard as tokenMatches: compare of two empty strings
+	// succeeds, so an unconfigured admin surface must not report a match.
+	if token == "" {
+		return false
+	}
 	presented := ""
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		presented = strings.TrimPrefix(h, "Bearer ")
@@ -91,9 +99,6 @@ func (s *Server) adminTokenMatches(r *http.Request) bool {
 	} else if c, err := r.Cookie(cookieAdmin); err == nil {
 		presented = c.Value
 	}
-	s.tokenMu.RLock()
-	token := s.adminToken
-	s.tokenMu.RUnlock()
 	return subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1
 }
 

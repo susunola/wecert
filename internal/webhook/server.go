@@ -207,6 +207,15 @@ func clientIP(r *http.Request) string {
 }
 
 func (s *Server) tokenMatches(r *http.Request) bool {
+	// An empty configured token must never authenticate: ConstantTimeCompare
+	// reports a match of two empty strings, which would open /hook/* to anyone
+	// if a reload path ever cleared the token.
+	s.tokenMu.RLock()
+	token := s.token
+	s.tokenMu.RUnlock()
+	if token == "" {
+		return false
+	}
 	presented := presentedToken(r, cookieRead)
 	if presented == "" {
 		if h := r.Header.Get("X-Wecert-Token"); h != "" {
@@ -217,9 +226,6 @@ func (s *Server) tokenMatches(r *http.Request) bool {
 	// Constant-time comparison: a byte-by-byte compare returns at the first
 	// differing character, leaking the token prefix. This endpoint is valuable
 	// enough for someone to probe it bit by bit.
-	s.tokenMu.RLock()
-	token := s.token
-	s.tokenMu.RUnlock()
 	return subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1
 }
 
@@ -227,6 +233,11 @@ func (s *Server) tokenMatches(r *http.Request) bool {
 // intentionally narrow: callers have already fully validated the replacement
 // configuration before this method is reached.
 func (s *Server) SetToken(token string) {
+	// Refuse to clear the secret on reload: an empty token would otherwise make
+	// tokenMatches accept every request (see that function).
+	if token == "" {
+		return
+	}
 	s.tokenMu.Lock()
 	s.token = token
 	s.tokenMu.Unlock()
