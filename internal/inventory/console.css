@@ -2865,3 +2865,155 @@ th {
   padding: 20px;
   color: var(--muted);
 }
+
+/* Light inventory refresh: preserve the existing controls and evidence model, but make the
+   table the primary surface and give each operational summary its own readable boundary. */
+:root {
+  --bg: #f6f7fb;
+  --surface: #ffffff;
+  --soft: #f8f9fc;
+  --text: #17213a;
+  --muted: #64718a;
+  --quiet: #8290a7;
+  --line: #e5e9f1;
+  --strong-line: #ccd5e2;
+  --accent: #315ee8;
+  --accent-bg: #eef2ff;
+  --red: #c63c4f;
+  --red-bg: #fff0f2;
+  --amber: #a86608;
+  --amber-bg: #fff6e7;
+  --blue: #315ee8;
+  --blue-bg: #eef2ff;
+  --neutral-bg: #eff2f7;
+  --row-hover: #f5f7ff;
+  --shadow: 0 10px 28px rgb(35 53 92 / 0.06);
+}
+body {
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+}
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline-color: #315ee8;
+}
+.topbar {
+  height: 62px;
+  padding-inline: 32px;
+  gap: 20px;
+  box-shadow: 0 1px 0 rgb(23 33 58 / 0.02);
+}
+.brand { color: var(--text); }
+.brand-wordmark { font-size: 20px; font-weight: 680; }
+.topnav {
+  margin-left: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.topnav:after { display: none; }
+.header-link:hover,
+.text-button:hover { color: var(--accent); }
+.pill-ro { color: var(--accent); background: var(--accent-bg); }
+.icon-btn { border-radius: 8px; }
+main { padding: 30px 32px 28px; }
+.heading { margin-bottom: 22px; }
+h1 {
+  font-size: 30px;
+  font-weight: 680;
+  letter-spacing: -0.85px;
+  margin-bottom: 6px;
+}
+.subheading { font-size: 13px; }
+.snapshot-text { font-size: 11px; }
+.btn {
+  min-height: 36px;
+  border-radius: 8px;
+  border-color: var(--strong-line);
+  font-weight: 620;
+}
+.btn:active,
+.icon-btn:active,
+.metric:active,
+.tab:active { transform: translateY(1px); }
+.summary {
+  gap: 12px;
+  padding: 0;
+  margin-bottom: 22px;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+.metric {
+  min-height: 110px;
+  padding: 20px 20px 16px;
+  border: 1px solid var(--line) !important;
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 3px 10px rgb(35 53 92 / 0.025);
+}
+.metric:hover { border-color: #cbd6f8 !important; }
+.metric-label { color: var(--muted); font-weight: 600; }
+.metric-symbol { color: var(--accent); }
+.metric.warn .metric-symbol { color: var(--amber); }
+.metric-value { font-size: 30px; font-weight: 680; letter-spacing: -0.8px; }
+.metric-note { color: var(--quiet); }
+.quota-panel,
+.inventory {
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+.inventory { border-color: var(--line); }
+.list-top { padding: 20px 22px 4px; }
+.list-top h2 { font-size: 16px; font-weight: 680; }
+.small-count { background: var(--accent-bg); color: var(--accent); border-radius: 999px; }
+.toolbar { padding: 14px 22px 18px; gap: 10px; }
+.tabs { padding: 3px; border-radius: 8px; }
+.tab { border-radius: 6px; font-weight: 550; }
+.tab[aria-pressed="true"] { color: var(--accent); box-shadow: 0 1px 3px rgb(35 53 92 / 0.09); }
+.searchbox { max-width: 360px; }
+.searchbox input,
+.select-wrap select { height: 38px; border-radius: 8px; }
+.searchbox input:focus,
+.select-wrap select:focus { border-color: #9fb3f4; }
+th {
+  padding-block: 11px;
+  background: #fafbfe;
+  color: #67748b;
+  letter-spacing: 0.04em;
+}
+td { padding-block: 13px; }
+tr.group td { background: #f7f8fc; }
+.group-content b { font-weight: 650; }
+.row { transition: background 0.14s ease; }
+.row.selected td:first-child { box-shadow: inset 3px 0 var(--accent); }
+.name-button { font-weight: 650; color: var(--text); }
+.badge { border-radius: 999px; padding: 4px 8px; font-weight: 620; }
+.badge-green { color: #087a52; background: #e9f8f0; }
+.probe-result.good { color: #087a52; }
+.days { font-weight: 650; }
+.drawer {
+  width: 520px;
+  box-shadow: -12px 0 36px rgb(35 53 92 / 0.12);
+}
+.drawer-top { height: 62px; min-height: 62px; }
+.drawer-heading { padding: 22px 24px 0; }
+.drawer-scroll { padding: 22px 24px; }
+.drawer-bottom { padding: 13px 24px; }
+.drawer-tab.active { color: var(--accent); }
+.drawer-tab.active:after { background: var(--accent); }
+@media (max-width: 1100px) {
+  .summary { gap: 10px; }
+  .metric { padding-inline: 16px; }
+}
+@media (max-width: 760px) {
+  .topbar { padding-inline: 20px; }
+  main { padding: 22px 20px; }
+  .summary { gap: 0; border: 1px solid var(--line); box-shadow: var(--shadow); }
+  .metric { min-height: 0; border: 0 !important; border-radius: 0; box-shadow: none; }
+  .metric:nth-child(1) { border-radius: 10px 0 0 0; }
+  .metric:nth-child(2) { border-radius: 0 10px 0 0; }
+  .metric:nth-child(3) { border-radius: 0 0 0 10px; }
+  .metric:nth-child(4) { border-radius: 0 0 10px 0; }
+  .inventory { border-radius: 10px; }
+}

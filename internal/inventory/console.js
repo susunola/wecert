@@ -704,31 +704,6 @@ $("drawer").addEventListener("click", async (e) => {
   }
 });
 $("backdrop").addEventListener("click", closeDetail);
-function setTheme(theme) {
-  document.documentElement.dataset.theme = theme;
-  $("theme").innerHTML = icon(theme === "dark" ? "sun" : "moon");
-  $("theme").setAttribute(
-    "aria-label",
-    theme === "dark" ? "Switch to light theme" : "Switch to dark theme",
-  );
-}
-function initialTheme() {
-  try {
-    const saved = localStorage.getItem("wecert-theme");
-    if (saved === "dark" || saved === "light") return saved;
-  } catch {}
-  return window.matchMedia?.("(prefers-color-scheme: dark)").matches
-    ? "dark"
-    : "light";
-}
-$("theme").addEventListener("click", () => {
-  const theme =
-    document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-  setTheme(theme);
-  try {
-    localStorage.setItem("wecert-theme", theme);
-  } catch {}
-});
 function refreshAccountOptions() {
   const accounts = [...new Set(records.map((r) => r.uin || ""))];
   const picker = $("account");
@@ -889,7 +864,6 @@ $("account").options[0].textContent =
 const deepLink = readURLState();
 refreshAccountOptions();
 refreshSnapshotMeta();
-setTheme(initialTheme());
 render();
 if (deepLink) {
   const target = records.find((r) => r.name === deepLink);

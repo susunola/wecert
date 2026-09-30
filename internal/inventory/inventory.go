@@ -159,12 +159,14 @@ type Summary struct {
 
 // Certificate is one row. No PEM, no keys.
 type Certificate struct {
-	Name    string   `json:"name"`
-	UIN     string   `json:"uin,omitempty"`
-	Status  string   `json:"status"`
-	Profile string   `json:"profile,omitempty"`
-	KeyType string   `json:"keyType,omitempty"`
-	Domains []string `json:"domains,omitempty"`
+	Issuer    string   `json:"issuer,omitempty"`
+	NotBefore string   `json:"notBefore,omitempty"`
+	Name      string   `json:"name"`
+	UIN       string   `json:"uin,omitempty"`
+	Status    string   `json:"status"`
+	Profile   string   `json:"profile,omitempty"`
+	KeyType   string   `json:"keyType,omitempty"`
+	Domains   []string `json:"domains,omitempty"`
 	// Regions is where this certificate was OBSERVED bound, taken from the live
 	// binding rows. Absent means unknown, which is not the same as "no region": the
 	// store cannot enumerate bindings, and one certificate can be bound in several
@@ -334,6 +336,10 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 	st := in.Certs[name]
 	var issued []string
 	if st != nil {
+		if leaf := certificateFromPEM(st.CertPEM); leaf != nil {
+			row.Issuer = leaf.Issuer.String()
+			row.NotBefore = leaf.NotBefore.UTC().Format(time.RFC3339)
+		}
 		if !st.NotAfter.IsZero() {
 			row.NotAfter = st.NotAfter.UTC().Format(time.RFC3339)
 			days := config.DaysUntil(st.NotAfter, now)
@@ -550,7 +556,7 @@ func liveIncomplete(b Bindings) bool {
 	return !b.Complete && b.Count == 0
 }
 
-func namesFromPEM(derPEM []byte) []string {
+func certificateFromPEM(derPEM []byte) *x509.Certificate {
 	if len(derPEM) == 0 {
 		return nil
 	}
@@ -560,6 +566,14 @@ func namesFromPEM(derPEM []byte) []string {
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
+		return nil
+	}
+	return cert
+}
+
+func namesFromPEM(derPEM []byte) []string {
+	cert := certificateFromPEM(derPEM)
+	if cert == nil {
 		return nil
 	}
 	names := append([]string(nil), cert.DNSNames...)
