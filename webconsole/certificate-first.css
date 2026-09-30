@@ -593,10 +593,10 @@ h2 { font-weight: 650; }
   background: var(--blue-soft); color: var(--blue);
 }
 .binding-mark .ui-icon { width: 16px; height: 16px; }
-/* The wordmark is now inline SVG; the old rules positioned a large PNG inside
-   an overflow:hidden crop box and pushed the SVG out of sight. */
+/* The wordmark is the real brand PNG (inlined). It is a large artwork cropped
+   by the brand box, so the absolute offset from the original design applies. */
 .brand .wordmark {
-  position: static; left: auto; top: auto;
-  width: 132px; height: 36px; max-width: none;
-  display: block; object-fit: contain;
+  position: absolute; left: -20px; top: -33px;
+  width: 184px; height: auto; max-width: none;
+  object-fit: fill; object-position: center; display: block;
 }
