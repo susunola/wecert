@@ -35,9 +35,14 @@ type CreateCertificateRequest struct {
 // AddAccountRequest is POST /admin/accounts.
 type AddAccountRequest struct {
 	Name      string `json:"name"`
+	// UIN is optional for static AK/SK: the daemon can leave it blank and the
+	// console groups the account by name instead.
 	UIN       string `json:"uin"`
 	Cred      string `json:"cred"`
 	Cloud     string `json:"cloud"`
+	// Site is "china", "international", or "" for auto-detect. Tencent Cloud
+	// runs two separate account systems with different API root domains.
+	Site      string `json:"site"`
 	SecretID  string `json:"secretId"`
 	SecretKey string `json:"secretKey"`
 	KeyPath   string `json:"keyPath"`

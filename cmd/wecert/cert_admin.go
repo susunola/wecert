@@ -203,9 +203,19 @@ func addCloudAccount(cfg *config.Config, body webhook.AddAccountRequest, log *sl
 	defer configMu.Unlock()
 	name, uin, cred := body.Name, body.UIN, body.Cred
 	cloud, secretID, secretKey := body.Cloud, body.SecretID, body.SecretKey
+	site := strings.ToLower(strings.TrimSpace(body.Site))
 	requestedKey := body.KeyPath
+	// UIN is optional for static AK/SK: it is a display/grouping label here, and
+	// forcing it made operators invent a number the API would have filled in.
+	if uin == "" && cred != "static" {
+		return nil, webhook.InvalidRequestf("uin is required for credential method %q", cred)
+	}
 	if name == "" {
-		name = "account-" + uin
+		if uin != "" {
+			name = "account-" + uin
+		} else {
+			name = "account"
+		}
 	}
 	keyPath, err := accountKeyPath(cfg.StatePath, name, requestedKey)
 	if err != nil {
@@ -229,7 +239,7 @@ func addCloudAccount(cfg *config.Config, body webhook.AddAccountRequest, log *sl
 		return nil, err
 	}
 	list = append(list, webhook.CloudAccount{
-		Name: name, UIN: uin, Cred: cred, Cloud: cloud, KeyPath: keyPath,
+		Name: name, UIN: uin, Cred: cred, Cloud: cloud, Site: site, KeyPath: keyPath,
 	})
 	if err := webhook.WriteCloudAccounts(cfg.StatePath, list); err != nil {
 		return nil, err
@@ -289,9 +299,10 @@ func listCloudBindings(cfg *config.Config) (any, error) {
 		Region    string     `json:"region"`
 		Listeners []listener `json:"listeners"`
 	}
+	site := resolveTencentSite(cred, regions[0], "")
 	out := make([]lb, 0, 8)
 	for _, region := range regions {
-		client, err := clb.NewClient(cred, region, profile.NewClientProfile())
+		client, err := clb.NewClient(cred, region, tencentProfile(site))
 		if err != nil {
 			return nil, fmt.Errorf("clb client for %s: %w", region, err)
 		}
@@ -345,7 +356,7 @@ func listCloudBindings(cfg *config.Config) (any, error) {
 			offset += int64(len(set))
 		}
 	}
-	return map[string]any{"bindings": out}, nil
+	return map[string]any{"bindings": out, "site": site}, nil
 }
 
 func createCertificateAdmin(cfg *config.Config, body webhook.CreateCertificateRequest, log *slog.Logger) (any, error) {
@@ -644,6 +655,7 @@ func bindCertificateAdmin(cfg *config.Config, name string, body webhook.BindCert
 	if err := verifyBindingAccount(expected, region); err != nil {
 		return nil, err
 	}
+	site := siteForAccount(cfg, expected)
 	// Use the daemon's already-open store: opening a second handle would hit the
 	// flock and fail with "already held by another wecert process".
 	st := openStateStore
@@ -661,7 +673,7 @@ func bindCertificateAdmin(cfg *config.Config, name string, body webhook.BindCert
 	// switched on) has no cloud id yet. Upload it here so the Bind button can
 	// complete the documented first-issuance flow instead of bouncing the operator.
 	if rec.DeployedCertID == "" {
-		uploadedID, uerr := tencentUploadCertificate(name, rec.CertPEM, rec.KeyPEM)
+		uploadedID, uerr := tencentUploadCertificate(name, rec.CertPEM, rec.KeyPEM, site)
 		if uerr != nil {
 			log.Error("CLB pre-bind upload failed", "cert", name, "err", uerr)
 			return nil, fmt.Errorf("upload %q to Tencent Cloud SSL first: %w", name, uerr)
@@ -693,7 +705,7 @@ func bindCertificateAdmin(cfg *config.Config, name string, body webhook.BindCert
 		// SNI is the default for a multi-name console flow; sni=false makes the
 		// certificate the listener's default (Certificate only applies then).
 		sniOn := createRaw.SNIMode()
-		newID, cerr := tencentCreateHTTPSListener(region, lb, port, lname, sniOn, rec.DeployedCertID)
+		newID, cerr := tencentCreateHTTPSListener(region, lb, port, lname, sniOn, rec.DeployedCertID, site)
 		if cerr != nil {
 			log.Error("CLB create listener failed", "cert", name, "lb", lb, "port", port, "err", cerr)
 			return nil, fmt.Errorf("create HTTPS listener on %s: %w", lb, cerr)
@@ -705,7 +717,7 @@ func bindCertificateAdmin(cfg *config.Config, name string, body webhook.BindCert
 	if lis == "" {
 		return nil, fmt.Errorf("listenerId is required")
 	}
-	if err := tencentBindListener(region, lb, lis, rec.DeployedCertID, sni); err != nil {
+	if err := tencentBindListener(region, lb, lis, rec.DeployedCertID, sni, site); err != nil {
 		log.Error("CLB bind failed", "cert", name, "lb", lb, "listener", lis, "err", err)
 		return nil, err
 	}
@@ -748,12 +760,12 @@ func verifyBindingAccount(expected, region string) error {
 // tencentCreateHTTPSListener opens a new HTTPS listener. With sniOn the
 // certificate is attached per-domain (CreateRule later); without SNI it becomes
 // the listener default, which is the only place Certificate is accepted.
-func tencentCreateHTTPSListener(region, lb string, port int64, name string, sniOn bool, certID string) (string, error) {
+func tencentCreateHTTPSListener(region, lb string, port int64, name string, sniOn bool, certID, site string) (string, error) {
 	cred, err := adminCred()
 	if err != nil {
 		return "", err
 	}
-	client, err := clb.NewClient(cred, region, profile.NewClientProfile())
+	client, err := clb.NewClient(cred, region, tencentProfile(site))
 	if err != nil {
 		return "", err
 	}
@@ -797,12 +809,12 @@ func unbindCertificateAdmin(cfg *config.Config, name string, log *slog.Logger) (
 // tencentUploadCertificate pushes the local full chain + key into Tencent Cloud
 // SSL and returns the new CertificateId. Used by the console Bind path when a
 // certificate was issued but never uploaded (deploy was off at issue time).
-func tencentUploadCertificate(name string, certPEM, keyPEM []byte) (string, error) {
+func tencentUploadCertificate(name string, certPEM, keyPEM []byte, site string) (string, error) {
 	cred, err := adminCred()
 	if err != nil {
 		return "", err
 	}
-	client, err := ssl.NewClient(cred, "", profile.NewClientProfile())
+	client, err := ssl.NewClient(cred, "", tencentProfile(site))
 	if err != nil {
 		return "", err
 	}
@@ -826,12 +838,12 @@ func tencentUploadCertificate(name string, certPEM, keyPEM []byte) (string, erro
 	return "", fmt.Errorf("UploadCertificate returned neither a CertificateId nor a RepeatCertId")
 }
 
-func tencentBindListener(region, lb, listener, certID, sni string) error {
+func tencentBindListener(region, lb, listener, certID, sni, site string) error {
 	cred, err := adminCred()
 	if err != nil {
 		return err
 	}
-	client, err := clb.NewClient(cred, region, profile.NewClientProfile())
+	client, err := clb.NewClient(cred, region, tencentProfile(site))
 	if err != nil {
 		return err
 	}
@@ -874,6 +886,74 @@ func tencentBindListener(region, lb, listener, certID, sni string) error {
 	req.Certificate = &clb.CertificateInput{CertId: &certID, SSLMode: common.StringPtr("UNIDIRECTIONAL")}
 	_, err = client.ModifyListener(req)
 	return err
+}
+
+// tencentRootDomain maps the account's site onto the API root domain. Tencent
+// Cloud runs two separate account systems: the domestic one answers on
+// tencentcloudapi.com, the international one on intl.tencentcloudapi.com. A
+// wrong site looks exactly like bad credentials.
+func tencentRootDomain(site string) string {
+	switch strings.ToLower(strings.TrimSpace(site)) {
+	case "international", "intl":
+		return "intl.tencentcloudapi.com"
+	default:
+		// "" (auto) and "china" both use the domestic root domain.
+		return "tencentcloudapi.com"
+	}
+}
+
+// siteForAccount returns the site recorded with a stored account, or "".
+func siteForAccount(cfg *config.Config, uin string) string {
+	if uin == "" {
+		return ""
+	}
+	accounts, err := webhook.ReadCloudAccounts(cfg.StatePath)
+	if err != nil {
+		return ""
+	}
+	for _, a := range accounts {
+		if a.UIN == uin {
+			return a.Site
+		}
+	}
+	return ""
+}
+
+// tencentProfile builds the client profile for one site. The root domain is the
+// whole difference between the two Tencent Cloud account systems.
+func tencentProfile(site string) *profile.ClientProfile {
+	p := profile.NewClientProfile()
+	p.HttpProfile.RootDomain = tencentRootDomain(site)
+	return p
+}
+
+// resolveTencentSite answers which of the two Tencent Cloud sites these
+// credentials belong to. "" means auto: try the domestic root domain first and
+// fall back to the international one. A wrong site surfaces as an auth error,
+// which is indistinguishable from bad keys without this probe.
+func resolveTencentSite(cred common.CredentialIface, region, site string) string {
+	if site != "" {
+		return site
+	}
+	probe := func(root string) bool {
+		p := profile.NewClientProfile()
+		p.HttpProfile.RootDomain = root
+		client, err := clb.NewClient(cred, region, p)
+		if err != nil {
+			return false
+		}
+		req := clb.NewDescribeLoadBalancersRequest()
+		req.Limit = common.Int64Ptr(1)
+		_, err = client.DescribeLoadBalancers(req)
+		return err == nil
+	}
+	if probe("tencentcloudapi.com") {
+		return "china"
+	}
+	if probe("intl.tencentcloudapi.com") {
+		return "international"
+	}
+	return "china"
 }
 
 func adminCred() (common.CredentialIface, error) {

@@ -28,6 +28,8 @@ type CloudAccount struct {
 	UIN     string `json:"uin"`
 	Cred    string `json:"cred"`
 	Cloud   string `json:"cloud"`
+	// Site is "china", "international", or "" (auto).
+	Site    string `json:"site,omitempty"`
 	KeyPath string `json:"keyPath"`
 }
 

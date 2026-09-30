@@ -518,18 +518,35 @@ $('#connect-backend').onclick = () => {
   $('#backend-modal').classList.add('open');
 };
 $('.inventory-heading').insertAdjacentHTML('afterend', '<p id="sync-warning" class="sync-warning" role="alert" hidden></p>');
-$('#notification-modal').innerHTML = `<form class="modal-card" id="notification-form"><header class="modal-head"><h2>Alert notifications</h2><span class="spacer"></span><button type="button" class="icon-close" data-close-notifications aria-label="Close">×</button></header><p>Renewal success and failure notifications. Expiry and CLB events are not yet emitted.</p><label class="field">Channel<select id="notify-format"><option value="wecom">WeCom</option><option value="feishu">Feishu</option><option value="dingtalk">DingTalk</option></select></label><label class="field">Robot Webhook URL<input id="notify-url" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved URL"></label><p class="security-note">Only official HTTPS robot endpoints are accepted. Signed Feishu / DingTalk robots are not supported by this form. Saving requires a daemon reload to activate.</p><p id="notify-result" role="status"></p><div class="modal-actions"><button type="button" class="small-btn" id="notify-test">Send test</button><button class="primary">Save</button></div></form>`;
+$('#notification-modal').innerHTML = `<form class="modal-card" id="notification-form"><header class="modal-head"><h2>Alert notifications</h2><span class="spacer"></span><button type="button" class="icon-close" data-close-notifications aria-label="Close">×</button></header><p>Renewal success and failure notifications. Expiry and CLB events are not yet emitted.</p><label class="field">Channel<select id="notify-format"><option value="wecom">WeCom</option><option value="feishu">Feishu</option><option value="dingtalk">DingTalk</option></select></label><label class="field">Robot Webhook URL<input id="notify-url" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved URL"></label><div class="security-note"><strong>Accepted robot URLs</strong>
+<p>WeCom · <code>https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…</code></p>
+<p>Feishu · <code>https://open.feishu.cn/open-apis/bot/v2/hook/…</code> (unsigned only)</p>
+<p>DingTalk · <code>https://oapi.dingtalk.com/robot/send?access_token=…</code></p>
+<p>Must be HTTPS, the exact official host and path, no port, credentials or #fragment. Signed Feishu / DingTalk robots and custom webhooks are rejected.</p></div><p id="notify-result" role="status"></p><div class="modal-actions"><button type="button" class="small-btn" id="notify-test">Send test</button><button class="primary">Save</button></div></form>`;
 async function notificationAction(method) {
   const result = $('#notify-result');
   const buttons = document.querySelectorAll('#notification-form button');
   buttons.forEach(button => button.disabled = true);
+  result.className = 'form-error';
   result.textContent = method === 'POST' ? 'Sending test…' : 'Saving…';
   try {
     const data = await request(method, '/admin/notifications', { format: $('#notify-format').value, url: $('#notify-url').value.trim() }, true);
-    result.textContent = data.delivered ? `Test delivered at ${data.time}` : data.note;
-    if (method === 'PUT') $('#notify-url').value = '';
-  } catch (error) { result.textContent = error.message; }
-  finally { buttons.forEach(button => button.disabled = false); }
+    // Success must be unmistakable: the field is cleared on purpose (the secret
+    // is never echoed back) and that reads as "nothing happened" otherwise.
+    result.className = 'form-ok';
+    if (method === 'PUT') {
+      result.textContent = 'Saved. The URL is stored on the daemon and is never shown here again. Reload or restart to activate.';
+      $('#notify-url').value = '';
+      $('#notify-url').placeholder = 'Saved — leave blank to keep it';
+    } else {
+      result.textContent = data.delivered ? `Test delivered at ${data.time}` : (data.note || 'Test sent.');
+    }
+  } catch (error) {
+    result.className = 'form-error';
+    result.textContent = error.message;
+  } finally {
+    buttons.forEach(button => button.disabled = false);
+  }
 }
 $('#notification-form').onsubmit = event => { event.preventDefault(); notificationAction('PUT'); };
 $('#notify-test').onclick = () => notificationAction('POST');
@@ -599,16 +616,18 @@ function explainConnectError(err) {
 
 $('#save-uin').onclick = async () => {
   const uin = $('#new-uin').value.trim();
-  const name = $('#new-uin-name').value.trim() || `account-${uin}`;
+  const name = $('#new-uin-name').value.trim() || (uin ? `account-${uin}` : 'account');
   const credential = $('#new-uin-cred').value;
+  const site = ($('#new-uin-site') && $('#new-uin-site').value) || '';
   const secretId = $('#new-uin-secret-id').value.trim();
   const secretKey = $('#new-uin-secret-key').value;
-  if (!uin) throw new Error('Enter a UIN.');
+  // AK/SK identifies the account on its own: UIN is only a grouping label.
+  if (credential !== 'static' && !uin) throw new Error('Enter a UIN for role credentials.');
   if (credential === 'static' && (!secretId || !secretKey)) throw new Error('Enter both SecretId and SecretKey.');
   const hostname = new URL(state.base).hostname;
   if (credential === 'static' && !state.base.startsWith('https:') && !['localhost', '127.0.0.1', '[::1]'].includes(hostname)) throw new Error('Use HTTPS when sending cloud credentials.');
   try {
-    await request('POST', '/admin/accounts', { uin, name, cred: credential, secretId, secretKey }, true);
+    await request('POST', '/admin/accounts', { uin, name, cred: credential, site, secretId, secretKey }, true);
     $('#new-uin-secret-id').value = '';
     $('#new-uin-secret-key').value = '';
     closeDrawer();
