@@ -807,6 +807,9 @@ $('#certificate-form').onsubmit = async (event) => {
       console.warn('wecert: auto-connect to', base, 'failed:', err);
     }
   }
+  // No live daemon answered: show the sample inventory as an explicit fallback
+  // rather than leaving an empty page.
+  setInventory(preview.certificates, preview.accounts, false);
   const w = $('#sync-warning');
   if (w) {
     w.hidden = false;
@@ -945,7 +948,11 @@ document.addEventListener('keydown', (event) => {
   document.getElementById('certificate-action')?.classList.remove('open');
 });
 
-setInventory(preview.certificates, preview.accounts, false);
+// Sample data is only shown when auto-connect has already failed. Painting it
+// first made every refresh look like the certificates had changed: the built-in
+// 9-row sample raced the real inventory and won whenever the session probe
+// failed.
+
 
 
 function paintEnv(inventory) {
