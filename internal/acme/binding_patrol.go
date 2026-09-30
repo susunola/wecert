@@ -2,6 +2,8 @@ package acme
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/susunola/wecert/internal/deploy"
@@ -12,6 +14,15 @@ import (
 type binderPatroller interface {
 	PatrolBindings(ctx context.Context, known []deploy.KnownCert) ([]deploy.PatrolFinding, error)
 }
+
+// The daemon builds *deploy.LazyTencentCLB and hands it over as a plain Deployer; this capability
+// is reached by assertion. Asserting it here, at compile time, is what keeps a missing forward from
+// disabling the patrol silently -- it did exactly that once, and the only visible symptom was a
+// binding column that showed a count and nothing else.
+var _ binderPatroller = (*deploy.LazyTencentCLB)(nil)
+
+// warnUnsupportedPatrolOnce keeps the "this deployer cannot patrol" warning to one line per process.
+var warnUnsupportedPatrolOnce sync.Once
 
 // bindingPatrolEvery bounds how often the account-wide enumeration runs.
 // DescribeCertificates plus one bind-resource task per certificate is an API
@@ -35,6 +46,13 @@ func (m *Manager) PatrolBindings(ctx context.Context) (map[string]int, error) {
 
 	p, ok := m.deployer.(binderPatroller)
 	if !ok {
+		// Loud once. A deployer that cannot patrol leaves every binding row in the read-only
+		// inventory degraded to the state store's count -- which an operator cannot tell apart
+		// from "not bound", the exact question that column exists to answer.
+		warnUnsupportedPatrolOnce.Do(func() {
+			m.log.Warn("the configured deployer does not support the binding patrol: binding details "+
+				"in the inventory will stay store-side", "deployer", fmt.Sprintf("%T", m.deployer))
+		})
 		return nil, nil
 	}
 	known, err := m.store.ListCertNames()

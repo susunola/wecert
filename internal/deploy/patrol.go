@@ -62,6 +62,35 @@ type KnownCert struct {
 // It is read-only. Nothing here unbinds, deletes or re-uploads -- a manual console
 // change is reported so a human decides, which is the only safe response to "someone
 // swapped the certificate behind my back".
+// The daemon holds the lazy wrapper, never *TencentCLB, and it reaches the optional capabilities
+// (staged deploy, retryable deploy, the binding patrol) by runtime type assertion. A method the
+// wrapper does not forward is therefore not a compile error but a silently disabled feature: the
+// account-wide binding patrol answered "not supported" for as long as it existed, so every binding
+// row in the read-only inventory fell back to the state store's deployment count -- no load
+// balancer, no region, no listener, and nothing in the log to say why. These assertions make the
+// wrapper's method set a compile-time property of the capabilities it is going to be asked for.
+var (
+	_ Deployer          = (*LazyTencentCLB)(nil)
+	_ RetryableDeployer = (*LazyTencentCLB)(nil)
+	_ StagedDeployer    = (*LazyTencentCLB)(nil)
+	_ binder            = (*LazyTencentCLB)(nil)
+)
+
+// binder is the read-only binding capability: one certificate's live bindings, and the account-wide
+// audit. Both are reads; neither unbinds, deletes or re-uploads anything.
+type binder interface {
+	Bindings(ctx context.Context, certID string) (int, bool, error)
+	PatrolBindings(ctx context.Context, known []KnownCert) ([]PatrolFinding, error)
+}
+
+func (d *LazyTencentCLB) PatrolBindings(ctx context.Context, known []KnownCert) ([]PatrolFinding, error) {
+	inner, err := d.client()
+	if err != nil {
+		return nil, err
+	}
+	return inner.PatrolBindings(ctx, known)
+}
+
 func (d *TencentCLB) PatrolBindings(ctx context.Context, known []KnownCert) ([]PatrolFinding, error) {
 	client, err := d.client(ctx)
 	if err != nil {
