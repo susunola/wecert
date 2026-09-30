@@ -581,6 +581,7 @@ $('#backend-form').onsubmit = async (event) => {
     if (!['http:', 'https:'].includes(base.protocol)) throw new Error('Enter an HTTP or HTTPS daemon URL.');
     if (base.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(base.hostname)) throw new Error('Use HTTPS for remote API access to protect tokens.');
     state.base = base.href.replace(/\/+$/, '');
+    try { localStorage.setItem('wecert.base', state.base); } catch {}
     state.token = ($('#backend-token')?.value || '').trim();
     state.adminToken = ($('#backend-admin-token')?.value || '').trim();
     // Exchange tokens for HttpOnly session cookies so later reloads need no paste.
@@ -771,13 +772,19 @@ $('#certificate-form').onsubmit = async (event) => {
 })();
 
 // Auto-connect: same-origin daemon already issues session cookies, so a
-// reload should not demand the tokens again.
+// reload should not demand the tokens again. The last base is remembered so a
+// reload knows where to look even before the first probe answers.
 (async function autoConnect() {
   if (typeof location === 'undefined' || typeof fetch !== 'function') return;
   const bases = [];
+  try {
+    const remembered = localStorage.getItem('wecert.base');
+    if (remembered) bases.push(remembered);
+  } catch { /* sandbox without localStorage */ }
   if (location.protocol === 'http:' || location.protocol === 'https:') {
-    bases.push(location.origin);
-    if (location.port !== '9801') bases.push(`${location.protocol}//${location.hostname}:9801`);
+    if (!bases.includes(location.origin)) bases.push(location.origin);
+    const alt = `${location.protocol}//${location.hostname}:9801`;
+    if (!bases.includes(alt)) bases.push(alt);
   }
   for (const base of bases) {
     try {
@@ -787,12 +794,23 @@ $('#certificate-form').onsubmit = async (event) => {
       if (!data.read && !data.admin) continue;
       state.base = base;
       state.sessionOK = true;
-      state.live = true;
+      // Remember where the live daemon is. Without this a reload falls back to
+      // the built-in sample inventory and looks like the certificates changed.
+      try { localStorage.setItem('wecert.base', base); } catch {}
       await loadLive();
       const status = $('#connection-status');
       if (status) { status.classList.add('live'); status.innerHTML = '<i></i>Live inventory'; }
       return;
-    } catch { /* try next */ }
+    } catch (err) {
+      // Swallowing this here is what made a refresh silently land on the
+      // preview data with no explanation.
+      console.warn('wecert: auto-connect to', base, 'failed:', err);
+    }
+  }
+  const w = $('#sync-warning');
+  if (w) {
+    w.hidden = false;
+    w.textContent = 'Showing sample data. Connect in System settings — the session cookie is not present for this origin.';
   }
 })();
 
