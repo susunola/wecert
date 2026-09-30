@@ -1,6 +1,7 @@
 package main
 
 import (
+	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,6 +79,15 @@ webhook:
 	}
 	if idxTencent >= 0 && idxNew > idxTencent {
 		t.Fatalf("new certificate landed after tencent: — YAML would not parse:\n%s", text)
+	}
+	// A column-0 "- name:" is not a list item under certificates:, it is a
+	// second top-level fragment. The document must still parse as one.
+	var doc map[string]any
+	if err := yaml.Unmarshal(got, &doc); err != nil {
+		t.Fatalf("config no longer parses after create: %v\n%s", err, text)
+	}
+	if certs, ok := doc["certificates"].([]any); !ok || len(certs) != 2 {
+		t.Fatalf("want 2 certificates in the list, got %#v", doc["certificates"])
 	}
 	if !strings.Contains(text, "renewBefore: 720h") {
 		t.Error("renewBefore missing")

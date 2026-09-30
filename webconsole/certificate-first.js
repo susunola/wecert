@@ -25,7 +25,7 @@ function icon(name) {
 
 const state = {
   base: '', token: '', adminToken: '', live: false, sessionOK: false,
-  accounts: [], certificates: [], uin: 'all', status: 'all',
+  accounts: [], certificates: [], clbs: [], uin: 'all', status: 'all',
   sort: 'expiry', search: '', selected: '', detailOpen: false, collapsed: new Set()
 };
 let toastTimer;
@@ -192,7 +192,7 @@ function renderRows() {
       return `<tr data-name="${escapeHTML(cert.name)}" class="${state.detailOpen && state.selected === cert.name ? 'selected' : ''}">
         <td class="cert"><div class="certificate-cell"><span class="certificate-mark">${icon('certificate')}</span><div><button class="cert-link" data-action="view" data-name="${escapeHTML(cert.name)}">${escapeHTML(cert.name)}</button><span class="sub certificate-domain">${escapeHTML(cert.domains?.[0] || '—')}${domainCount > 1 ? ` <span>+${domainCount - 1} domains</span>` : ''}</span></div></div></td>
         <td class="status"><span class="status-pill status-${cert.status === 'not_issued' ? 'neutral' : status.dot}">${icon(status.dot === 'ok' ? 'certificate' : cert.status === 'not_issued' ? 'clock' : 'alert')}${status.label === 'Active' ? 'Healthy' : status.label}</span></td>
-        <td>${bindings ? `<span class="binding"><img src="binding-logo.png" alt=""><span>${escapeHTML(bindingSummary(cert))}<small>${bindings} bindings · ${escapeHTML(cert.bindings.freshness || 'Freshness not reported')}</small></span></span>` : '<span class="unbound">— <span>No bindings reported</span></span>'}</td>
+        <td>${bindings ? `<span class="binding"><span class="binding-mark" aria-hidden="true">${icon('link')}</span><span>${escapeHTML(bindingSummary(cert))}<small>${bindings} bindings · ${escapeHTML(cert.bindings.freshness || 'Freshness not reported')}</small></span></span>` : '<span class="unbound">— <span>No bindings reported</span></span>'}</td>
         <td class="expiry-cell ${cert.daysLeft != null && cert.daysLeft <= 30 ? 'expiry-attention' : ''} ${cert.daysLeft != null && cert.daysLeft < 0 ? 'expiry-expired' : ''}" title="${escapeHTML(expiry(cert))}">${cert.daysLeft == null ? '—' : cert.daysLeft < 0 ? `${Math.abs(cert.daysLeft)} days ago<span class="sub">Expired</span>` : `${cert.daysLeft} days`}</td>
         <td class="row-actions"><button class="menu-trigger" data-menu="${escapeHTML(cert.name)}" aria-label="Actions for ${escapeHTML(cert.name)}" aria-haspopup="true">•••</button></td>
       </tr>`;
@@ -204,7 +204,7 @@ function domainRows(cert) {
 }
 
 function bindingRows(cert) {
-  return (cert.bindings?.items || []).map((binding) => `<div class="binding-row"><img src="binding-logo.png" alt=""><div><strong>${escapeHTML(binding.protocol || 'Protocol not reported')}${binding.port ? ` :${binding.port}` : ' · port not reported'}</strong><small>${escapeHTML(binding.region || 'Region not reported')}</small><small>Load balancer</small>${binding.loadBalancerId ? copyButton(binding.loadBalancerId) : '<span>Not reported</span>'}<small>Listener</small>${binding.listenerId ? copyButton(binding.listenerId) : '<span>Not reported</span>'}</div></div>`).join('') || '<p class="empty-detail">No CLB bindings recorded.</p>';
+  return (cert.bindings?.items || []).map((binding) => `<div class="binding-row"><span class="binding-mark" aria-hidden="true">${icon('link')}</span><div><strong>${escapeHTML(binding.protocol || 'Protocol not reported')}${binding.port ? ` :${binding.port}` : ' · port not reported'}</strong><small>${escapeHTML(binding.region || 'Region not reported')}</small><small>Load balancer</small>${binding.loadBalancerId ? copyButton(binding.loadBalancerId) : '<span>Not reported</span>'}<small>Listener</small>${binding.listenerId ? copyButton(binding.listenerId) : '<span>Not reported</span>'}</div></div>`).join('') || '<p class="empty-detail">No CLB bindings recorded.</p>';
 }
 
 function validityLabel(cert) {
@@ -268,9 +268,11 @@ function setInventory(certificates, accounts, live) {
 
 async function loadLive() {
  try {
-  const [inventory, accounts] = await Promise.all([
-    request('GET', '/api/inventory'), request('GET', '/api/accounts')
+  const [inventory, accounts, bindings] = await Promise.all([
+    request('GET', '/api/inventory'), request('GET', '/api/accounts'),
+    request('GET', '/api/bindings').catch(() => ({ bindings: [] }))
   ]);
+  state.clbs = bindings.bindings || bindings.clbs || [];
   setInventory(inventory.certificates || [], accounts.accounts || [], true);
   paintEnv(inventory);
   $('#sync-warning').hidden = true;
@@ -319,8 +321,21 @@ function closeDetail() {
 }
 
 function collectCLBs() {
-  // Derive CLB / listener options from live binding rows and any inventory hints.
+  // The daemon enumerates the account's load balancers (GET /api/bindings).
+  // Fall back to what the binding rows show, then -- only in preview -- to a
+  // sample, so the create-listener path can be exercised offline.
   const byLb = new Map();
+  for (const b of state.clbs || []) {
+    if (!b || !b.id) continue;
+    byLb.set(b.id, {
+      id: b.id,
+      region: b.region || 'ap-guangzhou',
+      name: b.name || '',
+      listeners: (b.listeners || []).map((l) => ({
+        id: l.id, proto: l.proto || 'HTTPS', port: l.port || '', sni: l.sni ? (l.sniDomain || l.sni || '') : ''
+      }))
+    });
+  }
   for (const cert of state.certificates) {
     for (const item of (cert.bindings?.items || [])) {
       const id = item.loadBalancerId || 'unknown';
@@ -331,9 +346,6 @@ function collectCLBs() {
     }
   }
   if (!byLb.size && !state.live) {
-    // Preview only: a sample CLB so the create-listener path can be exercised offline.
-    // Against a real daemon this stays empty — offering a foreign load balancer id
-    // there would let an operator bind into someone else's account by accident.
     byLb.set('lb-4z28ujji', {
       id: 'lb-4z28ujji', region: 'ap-guangzhou',
       listeners: [{ id: 'lbl-dr1sy3l0', proto: 'HTTPS', port: 443, sni: '' }]

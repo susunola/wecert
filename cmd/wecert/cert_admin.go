@@ -125,7 +125,15 @@ func renderCertificateEntry(name string, domains []string, profile, keyType, ren
 	for i, line := range lines {
 		lines[i] = "  " + line
 	}
-	return "- " + strings.TrimPrefix(lines[0], "  ") + "\n" + strings.Join(lines[1:], "\n"), nil
+	item := "- " + strings.TrimPrefix(lines[0], "  ") + "\n" + strings.Join(lines[1:], "\n")
+	// Indent the whole item so it lands INSIDE the certificates: sequence.
+	// A column-0 "- name:" after `  - name: demo` is not a list item, it is a
+	// second top-level document fragment and the file no longer parses.
+	body := strings.Split(item, "\n")
+	for i, line := range body {
+		body[i] = "  " + line
+	}
+	return strings.Join(body, "\n"), nil
 }
 
 // registerCertAdminOps fills the certificate/account management seams the web
@@ -257,8 +265,87 @@ func removeCloudAccount(cfg *config.Config, uin string, log *slog.Logger) (any, 
 // from the state store and the live bind-resource enumeration, so this stays an
 // empty placeholder for the console's bindings panel rather than a second
 // enumeration path.
-func listCloudBindings(_ *config.Config) (any, error) {
-	return map[string]any{"bindings": []any{}}, nil
+// listCloudBindings enumerates the account's load balancers and their listeners
+// so the console's Bind dialog can offer a real choice instead of asking the
+// operator to paste an id.
+func listCloudBindings(cfg *config.Config) (any, error) {
+	cred, err := adminCred()
+	if err != nil {
+		return nil, err
+	}
+	regions := cfg.Tencent.Regions
+	if len(regions) == 0 {
+		regions = []string{"ap-guangzhou"}
+	}
+	type listener struct {
+		ID    string `json:"id"`
+		Proto string `json:"proto"`
+		Port  int    `json:"port"`
+		SNI   bool   `json:"sni"`
+	}
+	type lb struct {
+		ID        string     `json:"id"`
+		Name      string     `json:"name"`
+		Region    string     `json:"region"`
+		Listeners []listener `json:"listeners"`
+	}
+	out := make([]lb, 0, 8)
+	for _, region := range regions {
+		client, err := clb.NewClient(cred, region, profile.NewClientProfile())
+		if err != nil {
+			return nil, fmt.Errorf("clb client for %s: %w", region, err)
+		}
+		var offset int64
+		for {
+			req := clb.NewDescribeLoadBalancersRequest()
+			req.Offset = common.Int64Ptr(offset)
+			req.Limit = common.Int64Ptr(20)
+			resp, err := client.DescribeLoadBalancers(req)
+			if err != nil {
+				return nil, fmt.Errorf("describe load balancers in %s: %w", region, err)
+			}
+			if resp == nil || resp.Response == nil {
+				break
+			}
+			set := resp.Response.LoadBalancerSet
+			for _, b := range set {
+				if b == nil || b.LoadBalancerId == nil {
+					continue
+				}
+				entry := lb{ID: *b.LoadBalancerId, Region: region}
+				if b.LoadBalancerName != nil {
+					entry.Name = *b.LoadBalancerName
+				}
+				lreq := clb.NewDescribeListenersRequest()
+				lreq.LoadBalancerId = b.LoadBalancerId
+				lresp, err := client.DescribeListeners(lreq)
+				if err == nil && lresp != nil && lresp.Response != nil {
+					for _, l := range lresp.Response.Listeners {
+						if l == nil || l.ListenerId == nil {
+							continue
+						}
+						item := listener{ID: *l.ListenerId}
+						if l.Protocol != nil {
+							item.Proto = *l.Protocol
+						}
+						if l.Port != nil {
+							item.Port = int(*l.Port)
+						}
+						if l.SniSwitch != nil && *l.SniSwitch == 1 {
+							item.SNI = true
+						}
+						entry.Listeners = append(entry.Listeners, item)
+					}
+				}
+				out = append(out, entry)
+			}
+			if len(set) < 20 {
+				break
+			}
+			offset += int64(len(set))
+		}
+	}
+	return map[string]any{"bindings": out}, nil
 }
 
 func createCertificateAdmin(cfg *config.Config, body webhook.CreateCertificateRequest, log *slog.Logger) (any, error) {

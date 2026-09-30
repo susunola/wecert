@@ -586,3 +586,11 @@ h2 { font-weight: 650; }
 .inline-field select { flex: 1; min-width: 0; }
 .inline-field .small-btn { flex: none; height: 36px; }
 .field-label { display: block; font-size: 11px; font-weight: 650; letter-spacing: .02em; color: var(--muted); margin-bottom: 6px; }
+
+.binding-mark {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: none; width: 28px; height: 28px; border-radius: 8px;
+  background: var(--blue-soft); color: var(--blue);
+}
+.binding-mark .ui-icon { width: 16px; height: 16px; }
+.brand .wordmark { width: 132px; height: 36px; display: block; }
