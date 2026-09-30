@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/susunola/wecert/internal/config"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
 )
@@ -147,7 +148,9 @@ func (d *TencentCLB) upload(ctx context.Context, client sslAPI, certName string,
 	req.CertificatePublicKey = common.StringPtr(string(certPEM))
 	req.CertificatePrivateKey = common.StringPtr(string(keyPEM))
 	req.CertificateType = common.StringPtr("SVR")
-	req.Alias = common.StringPtr("wecert/" + certName)
+	// One definition, shared with the inventory: the remark shown next to a row must be the
+	// remark the certificate was uploaded with.
+	req.Alias = common.StringPtr(config.UploadAlias(certName))
 	req.Repeatable = common.BoolPtr(true)
 
 	resp, err := client.UploadCertificateWithContext(ctx, req)

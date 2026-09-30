@@ -172,13 +172,22 @@ type Certificate struct {
 	// store cannot enumerate bindings, and one certificate can be bound in several
 	// regions. A Tencent Cloud SSL certificate is not itself regional -- the regions
 	// are the load balancers it is attached to.
-	Regions             []string  `json:"regions,omitempty"`
-	NotAfter            string    `json:"notAfter,omitempty"`
-	DaysLeft            *int      `json:"daysLeft,omitempty"`
-	IssuedAt            string    `json:"issuedAt,omitempty"`
-	Uploaded            bool      `json:"uploaded"`
-	DeployConfirmed     bool      `json:"deployConfirmed"`
-	DeployedCertID      string    `json:"deployedCertId,omitempty"`
+	Regions         []string `json:"regions,omitempty"`
+	NotAfter        string   `json:"notAfter,omitempty"`
+	DaysLeft        *int     `json:"daysLeft,omitempty"`
+	IssuedAt        string   `json:"issuedAt,omitempty"`
+	Uploaded        bool     `json:"uploaded"`
+	DeployConfirmed bool     `json:"deployConfirmed"`
+	DeployedCertID  string   `json:"deployedCertId,omitempty"`
+	// Alias is the SSL remark ("备注") the uploaded certificate carries -- "wecert/<name>". The
+	// Tencent Cloud SSL console identifies a certificate by this string, so a row that shows the
+	// certificate ID without it cannot be matched against that console line by line.
+	Alias string `json:"alias,omitempty"`
+	// Serial is the serial number of the certificate that is currently in effect, upper-case hex.
+	// It is carried by the certificate itself, so unlike the cloud-side ID and the remark it
+	// survives a change of cloud account, deployment target or DNS provider -- and it is the
+	// identity a browser, an auditor or the CA prints.
+	Serial              string    `json:"serial,omitempty"`
 	Bindings            Bindings  `json:"bindings"`
 	Probe               ProbeView `json:"probe"`
 	ARI                 *ARIView  `json:"ari,omitempty"`
@@ -339,6 +348,10 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 		if leaf := certificateFromPEM(st.CertPEM); leaf != nil {
 			row.Issuer = leaf.Issuer.String()
 			row.NotBefore = leaf.NotBefore.UTC().Format(time.RFC3339)
+			// Same parse, the identity the certificate itself carries: the serial number the
+			// CA, a browser or an auditor prints, and the only one that survives a change of
+			// cloud account, deployment target or DNS provider.
+			row.Serial = serialOf(leaf)
 		}
 		if !st.NotAfter.IsZero() {
 			row.NotAfter = st.NotAfter.UTC().Format(time.RFC3339)
@@ -351,6 +364,12 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 		row.Uploaded = st.DeployedCertID != ""
 		row.DeployConfirmed = st.DeployConfirmed
 		row.DeployedCertID = st.DeployedCertID
+		if st.DeployedCertID != "" {
+			// The remark exists as soon as the certificate is uploaded, before the deploy is
+			// confirmed: it is the string the SSL console lists the certificate by, so a row
+			// without it cannot be matched against that console line by line.
+			row.Alias = config.UploadAlias(name)
+		}
 		row.ConsecutiveFailures = st.ConsecutiveFailures
 		row.LastError = st.LastError
 		if !st.NextAttemptAt.IsZero() {
@@ -569,6 +588,16 @@ func certificateFromPEM(derPEM []byte) *x509.Certificate {
 		return nil
 	}
 	return cert
+}
+
+// serialOf renders a certificate's serial number the way the certificate itself states it:
+// upper-case hex, no separators, no padding. The inventory shows it next to the cloud-side
+// certificate id rather than instead of it, because neither can be derived from the other.
+func serialOf(cert *x509.Certificate) string {
+	if cert == nil || cert.SerialNumber == nil {
+		return ""
+	}
+	return strings.ToUpper(cert.SerialNumber.Text(16))
 }
 
 func namesFromPEM(derPEM []byte) []string {
