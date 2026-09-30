@@ -34,6 +34,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/accounts", s.adminAuth(s.handleAdminAccounts()))
 	mux.HandleFunc("/admin/accounts/", s.adminAuth(s.handleAdminAccountOne()))
 	mux.HandleFunc("/admin/certificates", s.adminAuth(s.handleAdminCertificates()))
+	mux.HandleFunc("/admin/notifications", s.adminAuth(s.handleNotifications))
 	mux.HandleFunc("/admin/certificates/", s.adminAuth(s.handleAdminCertificateOne()))
 	mux.HandleFunc("/admin/backup-health", s.adminAuth(s.handleAdminBackupHealth()))
 	mux.HandleFunc("/admin/recovery-plan", s.adminAuth(s.handleAdminRecoveryPlan()))

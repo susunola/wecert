@@ -54,3 +54,7 @@ tfplan-*
 # would fail the gate simply by being committed.
 /.workbuddy/
 /outputs/
+
+# local preview only
+webconsole-preview.html
+console-preview.html

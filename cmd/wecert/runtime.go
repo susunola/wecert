@@ -176,7 +176,7 @@ func buildManager(
 	// Note the shape: a nil interface and an interface holding a nil pointer differ, and
 	// stuffing (*webhook.Notifier)(nil) into one defeats the != nil check below.
 	var notifier reconcile.Notifier
-	if n := webhook.NewNotifier(cfg.Webhook.NotifyURL, cfg.Webhook.NotifySecret, log); n != nil {
+	if n := webhook.NewNotifierJira(cfg.Webhook.NotifyURL, cfg.Webhook.NotifySecret, cfg.Webhook.NotifyFormat, cfg.Webhook.PagerDuty.RoutingKey, webhook.JiraTarget{BaseURL: cfg.Webhook.Jira.BaseURL, ProjectKey: cfg.Webhook.Jira.ProjectKey, IssueType: cfg.Webhook.Jira.IssueType, Email: cfg.Webhook.Jira.Email, APIToken: cfg.Webhook.Jira.APIToken, Auth: cfg.Webhook.Jira.Auth, Labels: cfg.Webhook.Jira.Labels, ReuseOpenIssue: cfg.Webhook.Jira.ReuseOpenIssue == nil || *cfg.Webhook.Jira.ReuseOpenIssue}, log); n != nil {
 		notifier = n
 		// The target is logged redacted: a chat/CI notification URL carries its secret in the path
 		// (Slack, Feishu, DingTalk) or in the query, and the journal has a wider audience than the

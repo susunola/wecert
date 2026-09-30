@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/susunola/wecert/internal/atomicfile"
+	"gopkg.in/yaml.v3"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 
 	clb "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
+	tchttp "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/http"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
 
@@ -43,6 +46,7 @@ func marshalRegistry(v []map[string]any) []byte {
 // registerCertAdminOps fills the certificate/account management seams the web
 // console calls. Called from adminOps so the wiring lives in one place.
 func registerCertAdminOps(ops *webhook.AdminOps, cfg *config.Config, log *slog.Logger) {
+	ops.Notifications = notificationSettings
 	ops.ListAccounts = func(ctx context.Context) (any, error) {
 		return listCloudAccounts(cfg)
 	}
@@ -367,10 +371,16 @@ func stageCertificateInConfig(path, name string, domains []string, profile, keyT
 }
 
 func deleteCertificateAdmin(cfg *config.Config, name string, log *slog.Logger) (any, error) {
+	notificationMu.Lock()
+	defer notificationMu.Unlock()
 	regPath := filepath.Join(filepath.Dir(cfg.StatePath), "console-certificates.json")
 	var list []map[string]any
 	if b, err := os.ReadFile(regPath); err == nil {
-		_ = json.Unmarshal(b, &list)
+		if err := json.Unmarshal(b, &list); err != nil {
+			return nil, fmt.Errorf("invalid certificate registry")
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 	var kept []map[string]any
 	for _, c := range list {
@@ -380,21 +390,23 @@ func deleteCertificateAdmin(cfg *config.Config, name string, log *slog.Logger) (
 		kept = append(kept, c)
 	}
 	b := marshalRegistry(kept)
-	_ = os.WriteFile(regPath, b, 0o600)
 	if err := removeCertificateFromConfig(configPathForAdmin, name); err != nil {
-		log.Warn("could not remove the certificate from the config", "cert", name, "err", err)
-	} else {
-		log.Info("certificate removed from the config", "cert", name)
-		_ = signalSelf(syscall.SIGHUP)
+		return nil, err
+	}
+	if err := atomicfile.Write(regPath, b, 0600); err != nil {
+		return nil, fmt.Errorf("removed from config, but registry cleanup failed: %w", err)
 	}
 	// Drop the state row too. Leaving it makes every later pass log "no longer in
 	// the desired state" and keeps the certificate in inventory after Delete.
 	if openStateStore != nil {
 		if err := openStateStore.DeleteCert(name); err != nil {
-			log.Warn("could not remove the certificate from the state store", "cert", name, "err", err)
+			return nil, fmt.Errorf("removed from config, but state cleanup failed: %w", err)
 		} else {
 			log.Info("certificate removed from the state store", "cert", name)
 		}
+	}
+	if err := signalSelf(syscall.SIGHUP); err != nil {
+		return nil, fmt.Errorf("removed, but daemon reload failed: %w", err)
 	}
 	return map[string]any{"ok": true, "name": name,
 		"note": "removed from console registry, config.yaml and state store; daemon reloads"}, nil
@@ -408,29 +420,29 @@ func removeCertificateFromConfig(path, name string) error {
 	if err != nil {
 		return err
 	}
-	lines := strings.Split(string(raw), "\n")
-	var out []string
-	skip := false
-	for i := 0; i < len(lines); i++ {
-		line := lines[i]
-		trimmed := strings.TrimSpace(line)
-		if !skip && strings.HasPrefix(trimmed, "- name:") {
-			got := strings.TrimSpace(strings.TrimPrefix(trimmed, "- name:"))
-			if got == name {
-				skip = true
-				continue
-			}
-		}
-		if skip {
-			if strings.HasPrefix(trimmed, "- name:") {
-				skip = false
-				out = append(out, line)
-			}
-			continue
-		}
-		out = append(out, line)
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("invalid configuration")
 	}
-	return os.WriteFile(path, []byte(strings.Join(out, "\n")), 0o600)
+	certs := yamlField(doc.Content[0], "certificates")
+	if certs.Kind != yaml.SequenceNode {
+		return fmt.Errorf("configuration has no certificate list")
+	}
+	kept := make([]*yaml.Node, 0, len(certs.Content))
+	for _, item := range certs.Content {
+		if item.Kind != yaml.MappingNode {
+			return fmt.Errorf("invalid certificate entry")
+		}
+		if yamlField(item, "name").Value != name {
+			kept = append(kept, item)
+		}
+	}
+	certs.Content = kept
+	updated, err := yaml.Marshal(&doc)
+	if err != nil {
+		return err
+	}
+	return atomicfile.Write(path, updated, 0600)
 }
 
 func bindCertificateAdmin(cfg *config.Config, name string, body map[string]any, log *slog.Logger) (any, error) {
@@ -439,11 +451,31 @@ func bindCertificateAdmin(cfg *config.Config, name string, body map[string]any, 
 	region, _ := body["region"].(string)
 	sni, _ := body["sniDomain"].(string)
 	createRaw, _ := body["createListener"].(map[string]any)
+	if lis == "" && createRaw == nil {
+		return nil, fmt.Errorf("listenerId is required")
+	}
 	if lb == "" {
 		return nil, fmt.Errorf("loadBalancerId is required")
 	}
 	if region == "" {
-		region = "ap-guangzhou"
+		return nil, fmt.Errorf("region is required")
+	}
+	current, err := config.Load(configPathForAdmin)
+	if err != nil {
+		return nil, fmt.Errorf("cannot verify certificate account from configuration")
+	}
+	expected := ""
+	for _, cert := range current.Certificates {
+		if cert.Name == name {
+			expected = cert.UIN
+			if expected == "" {
+				expected = current.Tencent.UIN
+			}
+			break
+		}
+	}
+	if err := verifyBindingAccount(expected, region); err != nil {
+		return nil, err
 	}
 	// Use the daemon's already-open store: opening a second handle would hit the
 	// flock and fail with "already held by another wecert process".
@@ -527,6 +559,33 @@ func bindCertificateAdmin(cfg *config.Config, name string, body map[string]any, 
 		"deployedCertId":  rec.DeployedCertID, "sniDomain": sni,
 		"note": "certificate attached to the CLB listener via the cloud API",
 	}, nil
+}
+
+func verifyBindingAccount(expected, region string) error {
+	if expected == "" {
+		return fmt.Errorf("certificate UIN is unknown; binding refused")
+	}
+	cred, err := adminCred()
+	if err != nil {
+		return err
+	}
+	p := profile.NewClientProfile()
+	p.HttpProfile.Endpoint = "sts.tencentcloudapi.com"
+	p.HttpProfile.ReqTimeout = 10
+	client := new(common.Client).Init(region).WithCredential(cred).WithProfile(p)
+	response := tchttp.NewCommonResponse()
+	if err = client.Send(tchttp.NewCommonRequest("sts", "2018-08-13", "GetCallerIdentity"), response); err != nil {
+		return fmt.Errorf("cannot verify cloud credential ownership; binding refused")
+	}
+	var identity struct {
+		Response struct {
+			AccountID string `json:"AccountId"`
+		} `json:"Response"`
+	}
+	if json.Unmarshal(response.GetBody(), &identity) != nil || identity.Response.AccountID != expected {
+		return fmt.Errorf("daemon credentials do not belong to certificate UIN %s; binding refused", expected)
+	}
+	return nil
 }
 
 // tencentCreateHTTPSListener opens a new HTTPS listener. With sniOn the

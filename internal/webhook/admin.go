@@ -23,6 +23,7 @@ import (
 // All four are optional: a nil field simply is not mounted, so a deployment that
 // only wants backup-health cannot accidentally expose restore.
 type AdminOps struct {
+	Notifications func(context.Context, string, map[string]any) (any, error)
 	// BackupHealth reports local + remote snapshot posture (ages, last verify).
 	BackupHealth func(ctx context.Context) (any, error)
 	// RecoveryPlan is the non-destructive "what would a restore do" report.
