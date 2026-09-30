@@ -257,60 +257,6 @@ textarea:focus-visible {
   background: var(--amber);
   box-shadow: 0 0 0 3px var(--amber-bg);
 }
-.pill .dot.staging {
-  background: var(--amber);
-  box-shadow: 0 0 0 3px var(--amber-bg);
-}
-.pill .dot.prod {
-  background: var(--red);
-  box-shadow: 0 0 0 3px var(--red-bg);
-}
-.env-switch {
-  display: inline-flex;
-  gap: 2px;
-  background: var(--soft);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 3px;
-}
-.env-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 11px;
-  border-radius: 6px;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 550;
-}
-.env-btn:hover {
-  color: var(--text);
-}
-.env-btn.active {
-  background: var(--surface);
-  color: var(--text);
-  box-shadow: 0 1px 2px #1c383b14;
-}
-.env-btn .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--amber);
-}
-.env-btn .dot.prod {
-  background: var(--red);
-}
-.env-btn.active .dot.prod {
-  box-shadow: 0 0 0 3px var(--red-bg);
-}
-.env-btn.active .dot.staging {
-  box-shadow: 0 0 0 3px var(--amber-bg);
-}
-.env-pill.production {
-  border-color: color-mix(in srgb, var(--red) 35%, var(--line));
-  color: var(--red);
-  background: var(--red-bg);
-}
 .icon-btn {
   width: 34px;
   height: 34px;
@@ -1221,15 +1167,6 @@ tr.group td {
         <button class="nav-item" data-view="activity">Activity</button>
       </nav>
       <span class="spacer"></span>
-      <div class="env-switch" role="group" aria-label="ACME environment">
-        <button class="env-btn active" data-env="staging" title="acme-staging-v02.api.letsencrypt.org">
-          <span class="dot staging"></span>Staging
-        </button>
-        <button class="env-btn" data-env="production" title="acme-v02.api.letsencrypt.org">
-          <span class="dot prod"></span>Production
-        </button>
-      </div>
-      <span class="pill env-pill" id="env-pill"><span class="dot staging"></span>Let’s Encrypt · staging</span>
       <button class="icon-btn" id="btn-connect" title="Connection settings" aria-label="Connection settings">⚙</button>
       <button class="icon-btn" id="theme" aria-label="Switch color theme">◐</button>
       <button class="btn btn-primary" id="btn-create">New certificate</button>
@@ -1538,8 +1475,8 @@ tr.group td {
               <span>Cloud account</span>
               <select id="c-account"></select>
             </label>
-            <div class="callout" id="c-env-note">
-              Issues against <b class="mono" id="c-env-dir">acme-staging-v02.api.letsencrypt.org</b>.
+            <div class="callout">
+              Certificate issuance follows the daemon configuration.
               After issuance, use <b>Bind to CLB</b> on the row. The first bind is confirmed once in
               the Tencent console; later renewals switch automatically.
             </div>
@@ -1868,7 +1805,6 @@ const day = 86400000;
 
 const state = {
   view: "inventory",
-  env: "staging",
   accounts: [],
   filter: "all",
   q: "",
@@ -2737,39 +2673,6 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-const ACME_DIR = {
-  staging: "acme-staging-v02.api.letsencrypt.org",
-  production: "acme-v02.api.letsencrypt.org",
-};
-
-function setEnv(env) {
-  state.env = env;
-  $$(".env-btn").forEach((b) => b.classList.toggle("active", b.dataset.env === env));
-  const pill = $("#env-pill");
-  pill.classList.toggle("production", env === "production");
-  pill.innerHTML =
-    `<span class="dot ${env === "production" ? "prod" : "staging"}"></span>Let’s Encrypt · ${env === "production" ? "production" : "staging"}`;
-  const dir = $("#c-env-dir");
-  if (dir) dir.textContent = ACME_DIR[env];
-  const note = $("#c-env-note");
-  if (note && env === "production") {
-    note.classList.add("warn");
-  } else if (note) {
-    note.classList.remove("warn");
-  }
-}
-
-$$(".env-btn").forEach((b) => {
-  b.onclick = () => {
-    setEnv(b.dataset.env);
-    toast(
-      b.dataset.env === "production"
-        ? "Switched to Let’s Encrypt production — real certificates, real rate limits"
-        : "Switched to Let’s Encrypt staging — untrusted certs, relaxed rate limits",
-    );
-  };
-});
-
 function renderBindings() {
   const tbody = $("#binding-rows");
   if (!tbody) return;
@@ -2969,8 +2872,6 @@ async function loadRealData() {
   await loadAccounts();
   await loadActivityFromStatus();
   $("#m-quota").textContent = quotaFromSnapshot(snap);
-  const env = (snap.desired && snap.desired.revision) || "live";
-  $("#env-pill").title = "desired revision " + env;
   logActivity(`Inventory refreshed from live daemon (${(snap.certificates || []).length} certificates)`);
 }
 
@@ -3073,7 +2974,6 @@ $("#connect-submit") && ($("#connect-submit").onclick = submitConnect);
 
 renderAccounts();
 render();
-setEnv("staging");
 setView("inventory");
 bootstrap();
 

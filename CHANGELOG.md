@@ -21,6 +21,13 @@
 
 ### Fixed
 
+- **The standalone management console removes its browser-only ACME switch.**
+  The original management layout is retained without the Staging/Production
+  selector, environment badge, or hardcoded issuance-directory claim. Certificate
+  issuance still follows the daemon configuration; no backend setting changes.
+  Refresh no longer references the removed badge. Isolated interaction, API
+  contract, and removal regressions run alongside the embedded-console suite via
+  `make check-console` (or alone via `make check-webconsole`).
 - **`secretId: ${TENCENTCLOUD_SECRET_ID}` in the YAML is expanded before use.** A
   literal `${...}` was sent to the provider as the SecretId and failed as
   `AuthFailure.SecretIdNotFound`, far from the cause. Unresolvable references

@@ -7,6 +7,25 @@ renew / delete, cloud accounts, bindings, and activity.
 it as static files and point the browser at the same origin as the daemon's
 HTTP surface, or set the base URL in the Connect panel.
 
+The inventory keeps the original management layout: title/count above a toolbar
+with status, account, sort, and search controls. The browser-only ACME environment
+switch and badge have been removed. Issuance follows the connected daemon's
+configuration; this frontend does not select an ACME directory or change the
+server configuration. Existing management API contracts remain unchanged.
+
+Run the isolated browser regressions with `make check-webconsole PYTHON=/path/to/python`.
+Use the same Playwright 1.62.0 environment and Chromium setup documented in
+[`docs/console.md`](../docs/console.md). The suite blocks network access and tests
+synthetic data at 320, 390, 768, and 1440px in light/dark themes. It also checks
+initialization, removal of environment controls, mocked inventory refresh, and
+the existing create-request contract. `make check-console` runs both frontends.
+
+This scoped restoration does not repair the existing cramped mobile table,
+narrow-screen/long-account-label overflow, or the creation wizard's unreachable
+Deploy step. The suite reports
+those baseline limitations separately; passing checks are not a claim that all
+management flows or responsive layouts are fixed.
+
 Typical nginx layout (TLS terminator in front):
 
 ```

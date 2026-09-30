@@ -193,11 +193,15 @@ console-preview:
 	WECERT_PREVIEW=/tmp/wecert-console.html $(GO) test ./internal/inventory -run '^TestWritePreviewPage$$' -count=1
 	@echo "Open file:///tmp/wecert-console.html"
 
-# Isolated browser tests over the production renderer; no daemon or cloud calls.
+# Isolated browser tests for both consoles; no daemon or cloud calls.
 # See docs/console.md for the pinned Python Playwright dependency.
-.PHONY: check-console
+.PHONY: check-console check-webconsole
 check-console:
 	$(PYTHON) scripts/check-console.py
+	$(PYTHON) scripts/check-webconsole.py
+
+check-webconsole:
+	$(PYTHON) scripts/check-webconsole.py
 
 test:
 	$(GO) test ./...
