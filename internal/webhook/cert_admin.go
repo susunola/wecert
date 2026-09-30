@@ -25,7 +25,7 @@ func (s *Server) handleListAccounts() http.HandlerFunc {
 		}
 		out, err := s.ops.ListAccounts(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			writeOpError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -45,7 +45,7 @@ func (s *Server) handleListBindings() http.HandlerFunc {
 		}
 		out, err := s.ops.ListBindings(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			writeOpError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -63,16 +63,16 @@ func (s *Server) handleAdminAccounts() http.HandlerFunc {
 			writeOpsMissing(w, "account management")
 			return
 		}
-		var body map[string]any
+		var body AddAccountRequest
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be JSON"})
 			return
 		}
-		s.audit(r, "admin_add_account", map[string]any{"name": body["name"], "uin": body["uin"]})
+		s.audit(r, "admin_add_account", map[string]any{"name": body.Name, "uin": body.UIN})
 		out, err := s.ops.AddAccount(r.Context(), body)
 		if err != nil {
 			s.audit(r, "admin_add_account_failed", map[string]any{"err": err.Error()})
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			writeOpError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -98,7 +98,7 @@ func (s *Server) handleAdminAccountOne() http.HandlerFunc {
 		s.audit(r, "admin_remove_account", map[string]any{"uin": uin})
 		out, err := s.ops.RemoveAccount(r.Context(), uin)
 		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			writeOpError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -116,16 +116,16 @@ func (s *Server) handleAdminCertificates() http.HandlerFunc {
 			writeOpsMissing(w, "certificate management")
 			return
 		}
-		var body map[string]any
+		var body CreateCertificateRequest
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be JSON"})
 			return
 		}
-		s.audit(r, "admin_create_certificate", map[string]any{"name": body["name"]})
+		s.audit(r, "admin_create_certificate", map[string]any{"name": body.Name})
 		out, err := s.ops.CreateCertificate(r.Context(), body)
 		if err != nil {
 			s.audit(r, "admin_create_certificate_failed", map[string]any{"err": err.Error()})
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			writeOpError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -153,7 +153,7 @@ func (s *Server) handleAdminCertificateOne() http.HandlerFunc {
 			s.audit(r, "admin_delete_certificate", map[string]any{"name": name})
 			out, err := s.ops.DeleteCertificate(r.Context(), name)
 			if err != nil {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				writeOpError(w, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, out)
@@ -162,12 +162,15 @@ func (s *Server) handleAdminCertificateOne() http.HandlerFunc {
 				writeOpsMissing(w, "certificate binding")
 				return
 			}
-			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			var body BindCertificateRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be JSON"})
+				return
+			}
 			s.audit(r, "admin_bind_certificate", map[string]any{"name": name, "body": body})
 			out, err := s.ops.BindCertificate(r.Context(), name, body)
 			if err != nil {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				writeOpError(w, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, out)
@@ -179,7 +182,7 @@ func (s *Server) handleAdminCertificateOne() http.HandlerFunc {
 			s.audit(r, "admin_unbind_certificate", map[string]any{"name": name})
 			out, err := s.ops.UnbindCertificate(r.Context(), name)
 			if err != nil {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				writeOpError(w, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, out)

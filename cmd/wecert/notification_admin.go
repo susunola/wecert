@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,7 +18,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var notificationMu sync.Mutex
+// configMu serialises every writer of config.yaml and its registry sidecars:
+// certificate create/delete, DNS credential wiring, account add/remove, and
+// notification settings. One mutex, one file family, no lost updates.
+var configMu sync.Mutex
 
 // Only documented robot endpoints are accepted here, not arbitrary SSRF targets.
 func validateRobot(format, raw string) error {
@@ -43,11 +47,25 @@ func validateRobot(format, raw string) error {
 	return nil
 }
 
-func yamlField(n *yaml.Node, key string) *yaml.Node {
+// yamlFind returns the value node for key in a mapping, or nil when absent.
+// Read-only: it never mutates the document.
+func yamlFind(n *yaml.Node, key string) *yaml.Node {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return nil
+	}
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		if n.Content[i].Value == key {
 			return n.Content[i+1]
 		}
+	}
+	return nil
+}
+
+// yamlGetOrCreate returns the value node for key, inserting an empty scalar when
+// it is missing. Only writers that are about to fill the node use this.
+func yamlGetOrCreate(n *yaml.Node, key string) *yaml.Node {
+	if found := yamlFind(n, key); found != nil {
+		return found
 	}
 	value := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str"}
 	n.Content = append(n.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, value)
@@ -55,8 +73,8 @@ func yamlField(n *yaml.Node, key string) *yaml.Node {
 }
 
 func notificationSettings(ctx context.Context, method string, body map[string]any) (any, error) {
-	notificationMu.Lock()
-	defer notificationMu.Unlock()
+	configMu.Lock()
+	defer configMu.Unlock()
 	raw, err := os.ReadFile(configPathForAdmin)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read daemon configuration")
@@ -65,7 +83,7 @@ func notificationSettings(ctx context.Context, method string, body map[string]an
 	if err = yaml.Unmarshal(raw, &doc); err != nil || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("invalid daemon configuration")
 	}
-	section := yamlField(doc.Content[0], "webhook")
+	section := yamlGetOrCreate(doc.Content[0], "webhook")
 	if section.Kind == yaml.ScalarNode && section.Value == "" {
 		section.Kind = yaml.MappingNode
 		section.Tag = "!!map"
@@ -73,8 +91,8 @@ func notificationSettings(ctx context.Context, method string, body map[string]an
 	if section.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("webhook must be a mapping")
 	}
-	target := yamlField(section, "notifyURL")
-	format := yamlField(section, "notifyFormat")
+	target := yamlGetOrCreate(section, "notifyURL")
+	format := yamlGetOrCreate(section, "notifyFormat")
 	if method == http.MethodGet {
 		return map[string]any{"configured": target.Value != "", "format": format.Value, "target": webhook.RedactNotifyURL(target.Value)}, nil
 	}
@@ -94,7 +112,7 @@ func notificationSettings(ctx context.Context, method string, body map[string]an
 	target.Tag = "!!str"
 	format.Value = nextFormat
 	format.Tag = "!!str"
-	updated, err := yaml.Marshal(&doc)
+	updated, err := encodeYAML(&doc)
 	if err != nil {
 		return nil, fmt.Errorf("cannot encode configuration")
 	}
@@ -136,4 +154,20 @@ func testRobot(ctx context.Context, format, target string) (any, error) {
 		return nil, fmt.Errorf("robot rejected test delivery; check robot configuration")
 	}
 	return map[string]any{"delivered": true, "time": time.Now().UTC().Format(time.RFC3339)}, nil
+}
+
+// encodeYAML renders a document with the conventional 2-space indent.
+// yaml.Marshal's default is 4, so using it to round-trip a file rewrites every
+// nested block and hides real changes in a formatting diff.
+func encodeYAML(node *yaml.Node) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(node); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

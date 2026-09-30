@@ -1,11 +1,7 @@
 package webhook
 
 import (
-	"encoding/json"
-	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -70,12 +66,9 @@ func (s *Server) handleInventoryPage(w http.ResponseWriter, r *http.Request) {
 // in the desired state, so a newly created certificate is visible in inventory
 // immediately instead of disappearing until the next config edit.
 func mergeConsoleCertificates(snap inventory.Snapshot, statePath string) inventory.Snapshot {
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(statePath), "console-certificates.json"))
+	list, err := ReadConsoleCertificates(statePath)
 	if err != nil {
-		return snap
-	}
-	var list []map[string]any
-	if json.Unmarshal(b, &list) != nil {
+		// A corrupt sidecar must not hide live inventory; just skip the merge.
 		return snap
 	}
 	have := map[string]bool{}
@@ -83,23 +76,19 @@ func mergeConsoleCertificates(snap inventory.Snapshot, statePath string) invento
 		have[c.Name] = true
 	}
 	for _, rec := range list {
-		name, _ := rec["name"].(string)
-		if name == "" || have[name] {
+		if rec.Name == "" || have[rec.Name] {
 			continue
 		}
-		domains, _ := rec["domains"].([]any)
 		row := inventory.Certificate{
-			Name:    name,
+			Name:    rec.Name,
 			Status:  "not_issued",
-			Profile: strOrEmpty(rec["profile"]),
-			KeyType: strOrEmpty(rec["keyType"]),
-			UIN:     strOrEmpty(rec["uin"]),
-		}
-		for _, d := range domains {
-			row.Domains = append(row.Domains, fmt.Sprint(d))
+			Profile: rec.Profile,
+			KeyType: rec.KeyType,
+			UIN:     rec.UIN,
+			Domains: append([]string(nil), rec.Domains...),
 		}
 		snap.Certificates = append(snap.Certificates, row)
-		have[name] = true
+		have[rec.Name] = true
 	}
 	return snap
 }
@@ -328,15 +317,3 @@ func storedHostSamples(samples []state.ProbeSample) []inventory.HostSample {
 	return out
 }
 
-// strOrEmpty renders a JSON value as a string, treating nil/empty as "".
-// fmt.Sprint(nil) is "<nil>", which then shows up as a literal UIN in the console.
-func strOrEmpty(v any) string {
-	if v == nil {
-		return ""
-	}
-	s := fmt.Sprint(v)
-	if s == "<nil>" {
-		return ""
-	}
-	return s
-}

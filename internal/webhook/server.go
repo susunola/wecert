@@ -207,11 +207,11 @@ func clientIP(r *http.Request) string {
 }
 
 func (s *Server) tokenMatches(r *http.Request) bool {
-	presented := ""
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		presented = strings.TrimPrefix(h, "Bearer ")
-	} else if h := r.Header.Get("X-Wecert-Token"); h != "" {
-		presented = h
+	presented := presentedToken(r, cookieRead)
+	if presented == "" {
+		if h := r.Header.Get("X-Wecert-Token"); h != "" {
+			presented = h
+		}
 	}
 
 	// Constant-time comparison: a byte-by-byte compare returns at the first

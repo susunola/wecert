@@ -35,12 +35,12 @@ type AdminOps struct {
 
 	// Certificate management for the web console. Each is optional; nil is not mounted.
 	ListAccounts      func(ctx context.Context) (any, error)
-	AddAccount        func(ctx context.Context, body map[string]any) (any, error)
+	AddAccount        func(ctx context.Context, body AddAccountRequest) (any, error)
 	RemoveAccount     func(ctx context.Context, uin string) (any, error)
 	ListBindings      func(ctx context.Context) (any, error)
-	CreateCertificate func(ctx context.Context, body map[string]any) (any, error)
+	CreateCertificate func(ctx context.Context, body CreateCertificateRequest) (any, error)
 	DeleteCertificate func(ctx context.Context, name string) (any, error)
-	BindCertificate   func(ctx context.Context, name string, body map[string]any) (any, error)
+	BindCertificate   func(ctx context.Context, name string, body BindCertificateRequest) (any, error)
 	UnbindCertificate func(ctx context.Context, name string) (any, error)
 }
 
@@ -88,6 +88,8 @@ func (s *Server) adminTokenMatches(r *http.Request) bool {
 		presented = strings.TrimPrefix(h, "Bearer ")
 	} else if h := r.Header.Get("X-Wecert-Admin-Token"); h != "" {
 		presented = h
+	} else if c, err := r.Cookie(cookieAdmin); err == nil {
+		presented = c.Value
 	}
 	s.tokenMu.RLock()
 	token := s.adminToken
@@ -143,7 +145,12 @@ func (s *Server) handleAdminRecoveryPlan() http.HandlerFunc {
 		var body struct {
 			Source string `json:"source"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		// Empty body keeps the "latest" default; malformed JSON is a client
+		// error, not a reason to silently act on a different snapshot.
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be JSON"})
+			return
+		}
 		if body.Source == "" {
 			body.Source = "latest"
 		}
@@ -172,7 +179,12 @@ func (s *Server) handleAdminRecoveryDrill() http.HandlerFunc {
 		var body struct {
 			Source string `json:"source"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		// Empty body keeps the "latest" default; malformed JSON is a client
+		// error, not a reason to silently act on a different snapshot.
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be JSON"})
+			return
+		}
 		if body.Source == "" {
 			body.Source = "latest"
 		}

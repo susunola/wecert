@@ -58,3 +58,6 @@ tfplan-*
 # local preview only
 webconsole-preview.html
 console-preview.html
+
+# local playwright artifacts
+webconsole/.playwright-cli/

@@ -9,6 +9,7 @@ func (s *Server) Handler() http.Handler {
 	// Health checks need no auth: they leak nothing and liveness probes must reach
 	// them.
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/api/session", s.handleSession())
 
 	mux.HandleFunc("/hook/reconcile", s.auth(s.handleReconcile))
 	mux.HandleFunc("/hook/status", s.auth(s.handleStatus))

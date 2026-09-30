@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -32,15 +31,101 @@ var openStateStore *state.Store
 
 var configPathForAdmin string
 
-// marshalRegistry always emits a JSON array. json.MarshalIndent(nil) is "null",
-// and the next Unmarshal into a []map leaves the reader with a nil slice and a
-// console that cannot show the registry until something else rewrites it.
-func marshalRegistry(v []map[string]any) []byte {
-	if v == nil {
-		v = []map[string]any{}
+// safePathComponent rejects names that would escape a directory when joined
+// into a file path. A console-supplied name is not a trusted path element.
+func safePathComponent(what, s string) error {
+	if s == "" {
+		return webhook.InvalidRequestf("%s is required", what)
 	}
-	b, _ := json.MarshalIndent(v, "", "  ")
-	return b
+	if strings.ContainsAny(s, "/\\\x00\n\r") {
+		return webhook.InvalidRequestf("%s must not contain path separators or control characters", what)
+	}
+	if s == "." || s == ".." {
+		return webhook.InvalidRequestf("%s is reserved", what)
+	}
+	if filepath.Base(s) != s {
+		return webhook.InvalidRequestf("%s must be a single path element", what)
+	}
+	return nil
+}
+
+// accountKeyPath derives where an account's AK/SK file lives. The request may
+// name a path, but it is confined to the accounts directory: a caller that
+// could pick any absolute path would have arbitrary file write as root.
+func accountKeyPath(statePath, name, requested string) (string, error) {
+	if err := safePathComponent("name", name); err != nil {
+		return "", err
+	}
+	root := filepath.Join(filepath.Dir(statePath), "accounts")
+	derived := filepath.Join(root, name+".key")
+	if requested == "" {
+		return derived, nil
+	}
+	clean := filepath.Clean(requested)
+	if !filepath.IsAbs(clean) {
+		return "", webhook.InvalidRequestf("keyPath must be an absolute path")
+	}
+	if clean != derived && !strings.HasPrefix(clean, root+string(filepath.Separator)) {
+		return "", webhook.InvalidRequestf("keyPath must live under %s", root)
+	}
+	return clean, nil
+}
+
+// certificateEntry is the YAML shape written into config.yaml. Marshalling it
+// with gopkg.in/yaml.v3 (rather than string concatenation) is what stops a
+// name or domain carrying a newline from injecting new config keys.
+type certificateEntry struct {
+	Name        string   `yaml:"name"`
+	Domains     []string `yaml:"domains"`
+	Profile     string   `yaml:"profile"`
+	KeyType     string   `yaml:"keyType"`
+	RenewBefore string   `yaml:"renewBefore,omitempty"`
+	UIN         string   `yaml:"uin,omitempty"`
+	Deploy      struct {
+		Enabled bool   `yaml:"enabled"`
+		Target  string `yaml:"target,omitempty"`
+	} `yaml:"deploy"`
+}
+
+// renderCertificateEntry returns one YAML list item, indented two spaces to sit
+// inside the certificates: sequence.
+func renderCertificateEntry(name string, domains []string, profile, keyType, renewBefore, uin, deploy string) (string, error) {
+	if err := safePathComponent("name", name); err != nil {
+		return "", err
+	}
+	if len(domains) == 0 {
+		return "", webhook.InvalidRequestf("at least one domain is required")
+	}
+	for _, d := range domains {
+		if d == "" {
+			return "", webhook.InvalidRequestf("domains must not contain empty entries")
+		}
+	}
+	var e certificateEntry
+	e.Name = name
+	e.Domains = domains
+	e.Profile = profile
+	e.KeyType = keyType
+	e.RenewBefore = renewBefore
+	e.UIN = uin
+	switch deploy {
+	case "clb", "nginx":
+		e.Deploy.Enabled = true
+		if deploy == "nginx" {
+			e.Deploy.Target = "nginx"
+		}
+	default:
+		e.Deploy.Enabled = false
+	}
+	raw, err := yaml.Marshal(e)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = "  " + line
+	}
+	return "- " + strings.TrimPrefix(lines[0], "  ") + "\n" + strings.Join(lines[1:], "\n"), nil
 }
 
 // registerCertAdminOps fills the certificate/account management seams the web
@@ -50,7 +135,7 @@ func registerCertAdminOps(ops *webhook.AdminOps, cfg *config.Config, log *slog.L
 	ops.ListAccounts = func(ctx context.Context) (any, error) {
 		return listCloudAccounts(cfg)
 	}
-	ops.AddAccount = func(ctx context.Context, body map[string]any) (any, error) {
+	ops.AddAccount = func(ctx context.Context, body webhook.AddAccountRequest) (any, error) {
 		return addCloudAccount(cfg, body, log)
 	}
 	ops.RemoveAccount = func(ctx context.Context, uin string) (any, error) {
@@ -59,13 +144,13 @@ func registerCertAdminOps(ops *webhook.AdminOps, cfg *config.Config, log *slog.L
 	ops.ListBindings = func(ctx context.Context) (any, error) {
 		return listCloudBindings(cfg)
 	}
-	ops.CreateCertificate = func(ctx context.Context, body map[string]any) (any, error) {
+	ops.CreateCertificate = func(ctx context.Context, body webhook.CreateCertificateRequest) (any, error) {
 		return createCertificateAdmin(cfg, body, log)
 	}
 	ops.DeleteCertificate = func(ctx context.Context, name string) (any, error) {
 		return deleteCertificateAdmin(cfg, name, log)
 	}
-	ops.BindCertificate = func(ctx context.Context, name string, body map[string]any) (any, error) {
+	ops.BindCertificate = func(ctx context.Context, name string, body webhook.BindCertificateRequest) (any, error) {
 		return bindCertificateAdmin(cfg, name, body, log)
 	}
 	ops.UnbindCertificate = func(ctx context.Context, name string) (any, error) {
@@ -105,26 +190,25 @@ func listCloudAccounts(cfg *config.Config) (any, error) {
 	return map[string]any{"accounts": out}, nil
 }
 
-func addCloudAccount(cfg *config.Config, body map[string]any, log *slog.Logger) (any, error) {
-	name, _ := body["name"].(string)
-	uin, _ := body["uin"].(string)
-	cred, _ := body["cred"].(string)
-	cloud, _ := body["cloud"].(string)
-	secretID, _ := body["secretId"].(string)
-	secretKey, _ := body["secretKey"].(string)
-	keyPath, _ := body["keyPath"].(string)
+func addCloudAccount(cfg *config.Config, body webhook.AddAccountRequest, log *slog.Logger) (any, error) {
+	configMu.Lock()
+	defer configMu.Unlock()
+	name, uin, cred := body.Name, body.UIN, body.Cred
+	cloud, secretID, secretKey := body.Cloud, body.SecretID, body.SecretKey
+	requestedKey := body.KeyPath
 	if name == "" {
 		name = "account-" + uin
 	}
-	if keyPath == "" {
-		keyPath = filepath.Join(filepath.Dir(cfg.StatePath), "accounts", name+".key")
+	keyPath, err := accountKeyPath(cfg.StatePath, name, requestedKey)
+	if err != nil {
+		return nil, err
 	}
 	if cred == "static" && secretID != "" {
 		if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
 			return nil, err
 		}
 		payload := "TENCENTCLOUD_SECRET_ID=" + secretID + "\nTENCENTCLOUD_SECRET_KEY=" + secretKey + "\n"
-		if err := os.WriteFile(keyPath, []byte(payload), 0o600); err != nil {
+		if err := atomicfile.Write(keyPath, []byte(payload), 0o600); err != nil {
 			return nil, err
 		}
 		log.Info("wrote cloud account credentials", "path", keyPath, "uin", uin, "cloud", cloud)
@@ -132,16 +216,14 @@ func addCloudAccount(cfg *config.Config, body map[string]any, log *slog.Logger) 
 	if uin == "" {
 		uin = "auto:" + name
 	}
-	regPath := cloudAccountsPath(cfg)
-	var list []map[string]any
-	if b, err := os.ReadFile(regPath); err == nil {
-		_ = json.Unmarshal(b, &list)
+	list, err := webhook.ReadCloudAccounts(cfg.StatePath)
+	if err != nil {
+		return nil, err
 	}
-	list = append(list, map[string]any{
-		"name": name, "uin": uin, "cred": cred, "cloud": cloud, "keyPath": keyPath,
+	list = append(list, webhook.CloudAccount{
+		Name: name, UIN: uin, Cred: cred, Cloud: cloud, KeyPath: keyPath,
 	})
-	b := marshalRegistry(list)
-	if err := os.WriteFile(regPath, b, 0o600); err != nil {
+	if err := webhook.WriteCloudAccounts(cfg.StatePath, list); err != nil {
 		return nil, err
 	}
 	return map[string]any{"ok": true, "name": name, "uin": uin, "cloud": cloud, "keyPath": keyPath,
@@ -149,124 +231,105 @@ func addCloudAccount(cfg *config.Config, body map[string]any, log *slog.Logger) 
 }
 
 func removeCloudAccount(cfg *config.Config, uin string, log *slog.Logger) (any, error) {
-	regPath := cloudAccountsPath(cfg)
-	var list []map[string]any
-	b, err := os.ReadFile(regPath)
+	configMu.Lock()
+	defer configMu.Unlock()
+	list, err := webhook.ReadCloudAccounts(cfg.StatePath)
 	if err != nil {
-		return map[string]any{"ok": true, "removed": 0}, nil
+		return nil, err
 	}
-	_ = json.Unmarshal(b, &list)
-	var kept []map[string]any
+	kept := make([]webhook.CloudAccount, 0, len(list))
 	removed := 0
 	for _, a := range list {
-		if fmt.Sprint(a["uin"]) == uin {
+		if a.UIN == uin {
 			removed++
 			continue
 		}
 		kept = append(kept, a)
 	}
-	out := marshalRegistry(kept)
-	_ = os.WriteFile(regPath, out, 0o600)
+	if err := webhook.WriteCloudAccounts(cfg.StatePath, kept); err != nil {
+		return nil, err
+	}
 	log.Info("removed cloud account", "uin", uin, "removed", removed)
 	return map[string]any{"ok": true, "removed": removed}, nil
 }
 
-func listCloudBindings(cfg *config.Config) (any, error) {
-	type listener struct {
-		ID    string `json:"id"`
-		Proto string `json:"proto"`
-		Port  int    `json:"port"`
-		SNI   string `json:"sni"`
-	}
-	type lb struct {
-		ID        string     `json:"id"`
-		Name      string     `json:"name"`
-		Region    string     `json:"region"`
-		Account   string     `json:"account"`
-		Listeners []listener `json:"listeners"`
-	}
-	_ = lb{}
+// listCloudBindings reports CLB bindings. The inventory already derives them
+// from the state store and the live bind-resource enumeration, so this stays an
+// empty placeholder for the console's bindings panel rather than a second
+// enumeration path.
+func listCloudBindings(_ *config.Config) (any, error) {
 	return map[string]any{"bindings": []any{}}, nil
 }
 
-func createCertificateAdmin(cfg *config.Config, body map[string]any, log *slog.Logger) (any, error) {
-	name, _ := body["name"].(string)
-	if name == "" {
-		return nil, fmt.Errorf("name is required")
+func createCertificateAdmin(cfg *config.Config, body webhook.CreateCertificateRequest, log *slog.Logger) (any, error) {
+	configMu.Lock()
+	defer configMu.Unlock()
+	name := body.Name
+	// Validate before the name reaches a file path or a YAML block.
+	if err := safePathComponent("name", name); err != nil {
+		return nil, err
 	}
-	domains := []string{}
-	if raw, ok := body["domains"].([]any); ok {
-		for _, d := range raw {
-			domains = append(domains, fmt.Sprint(d))
-		}
-	}
+	domains := body.Domains
 	if len(domains) == 0 {
-		return nil, fmt.Errorf("at least one domain is required")
+		return nil, webhook.InvalidRequestf("at least one domain is required")
 	}
-	profile := fmt.Sprint(body["profile"])
-	if profile == "" || profile == "<nil>" {
+	profile := body.Profile
+	if profile == "" {
 		profile = "classic"
 	}
-	keyType := fmt.Sprint(body["keyType"])
-	if keyType == "" || keyType == "<nil>" {
+	keyType := body.KeyType
+	if keyType == "" {
 		keyType = "ecdsa-p256"
 	}
-	uin := ""
-	if v, ok := body["uin"].(string); ok {
-		uin = v
-	}
-	renewBefore := renewBeforeToGoDuration(fmt.Sprint(body["renewBefore"]))
-	deploy, _ := body["deploy"].(string)
-	dnsCfg, _ := body["dns"].(map[string]any)
+	uin := body.UIN
+	renewBefore := renewBeforeToGoDuration(body.RenewBefore)
+	deploy := body.Deploy
+	dnsCfg := body.DNS
 
 	// DNS token / file → 0600 file + config wiring so DNS-01 can run.
 	// cred=reused leaves the daemon's existing dns block untouched.
 	if dnsCfg != nil {
-		provider, _ := dnsCfg["provider"].(string)
-		cred, _ := dnsCfg["cred"].(string)
-		switch cred {
+		switch dnsCfg.Cred {
 		case "reused", "":
 			// keep whatever dns.* the daemon already has
 		case "token":
-			tok, _ := dnsCfg["token"].(string)
-			if tok == "" {
-				return nil, fmt.Errorf("dns.cred=token requires dns.token")
+			if dnsCfg.Token == "" {
+				return nil, webhook.InvalidRequestf("dns.cred=token requires dns.token")
 			}
 			tokPath := filepath.Join(filepath.Dir(cfg.StatePath), "dns", name+".token")
 			if err := os.MkdirAll(filepath.Dir(tokPath), 0o700); err != nil {
 				return nil, fmt.Errorf("create dns credential dir: %w", err)
 			}
-			if err := os.WriteFile(tokPath, []byte(tok), 0o600); err != nil {
+			if err := atomicfile.Write(tokPath, []byte(dnsCfg.Token), 0o600); err != nil {
 				return nil, fmt.Errorf("store DNS token: %w", err)
 			}
 			log.Info("stored DNS token", "cert", name, "path", tokPath)
-			if err := wireDNSCredentials(configPathForAdmin, provider, tokPath); err != nil {
+			if err := wireDNSCredentials(configPathForAdmin, dnsCfg.Provider, tokPath); err != nil {
 				log.Warn("could not wire DNS credentials", "err", err)
 			}
 		case "file":
-			filePath, _ := dnsCfg["file"].(string)
-			if filePath == "" {
-				return nil, fmt.Errorf("dns.cred=file requires dns.file")
+			if dnsCfg.File == "" {
+				return nil, webhook.InvalidRequestf("dns.cred=file requires dns.file")
 			}
-			if err := wireDNSCredentials(configPathForAdmin, provider, filePath); err != nil {
+			if err := wireDNSCredentials(configPathForAdmin, dnsCfg.Provider, dnsCfg.File); err != nil {
 				log.Warn("could not wire DNS credentials", "err", err)
 			}
 		default:
-			return nil, fmt.Errorf("unknown dns.cred %q (use reused, token, or file)", cred)
+			return nil, webhook.InvalidRequestf("unknown dns.cred %q (use reused, token, or file)", dnsCfg.Cred)
 		}
 	}
 
-	recPath := filepath.Join(filepath.Dir(cfg.StatePath), "console-certificates.json")
-	var list []map[string]any
-	if b, err := os.ReadFile(recPath); err == nil {
-		_ = json.Unmarshal(b, &list)
+	list, err := webhook.ReadConsoleCertificates(cfg.StatePath)
+	if err != nil {
+		// A corrupt registry must not be rewritten as a shorter list: that is how
+		// every previously recorded certificate disappears.
+		return nil, err
 	}
-	list = append(list, map[string]any{
-		"name": name, "domains": domains, "profile": profile, "keyType": keyType, "uin": uin,
-		"dns": dnsCfg,
+	list = append(list, webhook.ConsoleCertificate{
+		Name: name, Domains: domains, Profile: profile, KeyType: keyType, UIN: uin,
+		DNS: dnsCfg,
 	})
-	b := marshalRegistry(list)
-	if err := os.WriteFile(recPath, b, 0o600); err != nil {
+	if err := webhook.WriteConsoleCertificates(cfg.StatePath, list); err != nil {
 		return nil, err
 	}
 
@@ -300,7 +363,7 @@ func renewBeforeToGoDuration(s string) string {
 		return "720h"
 	case "720h", "336h", "168h":
 		return s
-	case "", "<nil>":
+	case "":
 		return ""
 	default:
 		// already a Go duration, or something the config parser will name
@@ -324,76 +387,87 @@ func stageCertificateInConfig(path, name string, domains []string, profile, keyT
 	if strings.Contains(text, "\n  - name: "+name+"\n") {
 		return "already-present", nil
 	}
-	var sb strings.Builder
-	sb.WriteString("\n  - name: ")
-	sb.WriteString(name)
-	sb.WriteString("\n    domains: [")
-	for i, d := range domains {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(d)
+	block, err := renderCertificateEntry(name, domains, profile, keyType, renewBefore, uin, deploy)
+	if err != nil {
+		return "", err
 	}
-	sb.WriteString("]\n    profile: ")
-	sb.WriteString(profile)
-	sb.WriteString("\n    keyType: ")
-	sb.WriteString(keyType)
-	if renewBefore != "" {
-		sb.WriteString("\n    renewBefore: ")
-		sb.WriteString(renewBefore)
+	text, err = insertCertificateBlock(text, block)
+	if err != nil {
+		return "", err
 	}
-	if uin != "" {
-		sb.WriteString("\n    uin: ")
-		sb.WriteString(uin)
-	}
-	// deploy=clb|nginx means "upload and let a human/agent bind"; deploy=none is
-	// issue-only. The daemon's Deployer owns the Tencent SSL upload when enabled.
-	sb.WriteString("\n    deploy:\n")
-	switch deploy {
-	case "clb", "nginx":
-		sb.WriteString("      enabled: true\n")
-		if deploy == "nginx" {
-			sb.WriteString("      target: nginx\n")
-		}
-	default:
-		sb.WriteString("      enabled: false\n")
-	}
-	block := sb.String()
-	if strings.Contains(text, "certificates: []") {
-		text = strings.Replace(text, "certificates: []", "certificates:\n"+block, 1)
-	} else {
-		text = text + block
-	}
-	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+	if err := atomicfile.Write(path, []byte(text), 0o600); err != nil {
 		return "", err
 	}
 	return "added-to-config", nil
 }
 
-func deleteCertificateAdmin(cfg *config.Config, name string, log *slog.Logger) (any, error) {
-	notificationMu.Lock()
-	defer notificationMu.Unlock()
-	regPath := filepath.Join(filepath.Dir(cfg.StatePath), "console-certificates.json")
-	var list []map[string]any
-	if b, err := os.ReadFile(regPath); err == nil {
-		if err := json.Unmarshal(b, &list); err != nil {
-			return nil, fmt.Errorf("invalid certificate registry")
-		}
-	} else if !os.IsNotExist(err) {
-		return nil, err
+// insertCertificateBlock appends a certificate entry to the certificates list.
+//
+// The block must land INSIDE that list: appending it to the end of the file
+// puts the entry after whatever follows (tencent:, webhook:, ...) and produces
+// unparseable YAML. The insertion point is the first line after the list that is
+// not blank and not indented -- i.e. the next top-level key, or EOF.
+func insertCertificateBlock(text, block string) (string, error) {
+	if strings.Contains(text, "certificates: []") {
+		return strings.Replace(text, "certificates: []", "certificates:\n"+block, 1), nil
 	}
-	var kept []map[string]any
+	lines := strings.Split(text, "\n")
+	start := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "certificates:" || trimmed == "certificates: []" || strings.HasPrefix(trimmed, "certificates: [") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		// No list to extend: append a new one at the end of the document.
+		return text + "\ncertificates:" + block, nil
+	}
+	// Walk to the end of the list body: blank lines and any indented line belong to it.
+	end := start + 1
+	for end < len(lines) {
+		trimmed := strings.TrimRight(lines[end], " \t")
+		if trimmed == "" {
+			end++
+			continue
+		}
+		if trimmed[0] == ' ' || trimmed[0] == '\t' {
+			end++
+			continue
+		}
+		break
+	}
+	// Trim trailing blank lines inside the list so the block sits flush.
+	for end > start+1 && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:end]...)
+	// block starts with a newline and ends without one; normalise to one entry.
+	out = append(out, strings.TrimPrefix(block, "\n"))
+	out = append(out, lines[end:]...)
+	return strings.Join(out, "\n"), nil
+}
+
+func deleteCertificateAdmin(cfg *config.Config, name string, log *slog.Logger) (any, error) {
+	configMu.Lock()
+	defer configMu.Unlock()
+	list, err := webhook.ReadConsoleCertificates(cfg.StatePath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid certificate registry: %w", err)
+	}
+	kept := make([]webhook.ConsoleCertificate, 0, len(list))
 	for _, c := range list {
-		if fmt.Sprint(c["name"]) == name {
+		if c.Name == name {
 			continue
 		}
 		kept = append(kept, c)
 	}
-	b := marshalRegistry(kept)
 	if err := removeCertificateFromConfig(configPathForAdmin, name); err != nil {
 		return nil, err
 	}
-	if err := atomicfile.Write(regPath, b, 0600); err != nil {
+	if err := webhook.WriteConsoleCertificates(cfg.StatePath, kept); err != nil {
 		return nil, fmt.Errorf("removed from config, but registry cleanup failed: %w", err)
 	}
 	// Drop the state row too. Leaving it makes every later pass log "no longer in
@@ -424,7 +498,7 @@ func removeCertificateFromConfig(path, name string) error {
 	if err := yaml.Unmarshal(raw, &doc); err != nil || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
 		return fmt.Errorf("invalid configuration")
 	}
-	certs := yamlField(doc.Content[0], "certificates")
+	certs := yamlFind(doc.Content[0], "certificates")
 	if certs.Kind != yaml.SequenceNode {
 		return fmt.Errorf("configuration has no certificate list")
 	}
@@ -433,32 +507,32 @@ func removeCertificateFromConfig(path, name string) error {
 		if item.Kind != yaml.MappingNode {
 			return fmt.Errorf("invalid certificate entry")
 		}
-		if yamlField(item, "name").Value != name {
+		if got := yamlFind(item, "name"); got == nil || got.Value != name {
 			kept = append(kept, item)
 		}
 	}
 	certs.Content = kept
-	updated, err := yaml.Marshal(&doc)
+	updated, err := encodeYAML(&doc)
 	if err != nil {
 		return err
 	}
 	return atomicfile.Write(path, updated, 0600)
 }
 
-func bindCertificateAdmin(cfg *config.Config, name string, body map[string]any, log *slog.Logger) (any, error) {
-	lb, _ := body["loadBalancerId"].(string)
-	lis, _ := body["listenerId"].(string)
-	region, _ := body["region"].(string)
-	sni, _ := body["sniDomain"].(string)
-	createRaw, _ := body["createListener"].(map[string]any)
+func bindCertificateAdmin(cfg *config.Config, name string, body webhook.BindCertificateRequest, log *slog.Logger) (any, error) {
+	lb := body.LoadBalancerID
+	lis := body.ListenerID
+	region := body.Region
+	sni := body.SNIDomain
+	createRaw := body.CreateListener
 	if lis == "" && createRaw == nil {
-		return nil, fmt.Errorf("listenerId is required")
+		return nil, webhook.InvalidRequestf("listenerId is required")
 	}
 	if lb == "" {
-		return nil, fmt.Errorf("loadBalancerId is required")
+		return nil, webhook.InvalidRequestf("loadBalancerId is required")
 	}
 	if region == "" {
-		return nil, fmt.Errorf("region is required")
+		return nil, webhook.InvalidRequestf("region is required")
 	}
 	current, err := config.Load(configPathForAdmin)
 	if err != nil {
@@ -485,10 +559,10 @@ func bindCertificateAdmin(cfg *config.Config, name string, body map[string]any, 
 	}
 	rec, err := st.GetCert(name)
 	if err != nil || rec == nil {
-		return nil, fmt.Errorf("certificate %q is not in the state store; issue it first", name)
+		return nil, webhook.InvalidRequestf("certificate %q is not in the state store; issue it first", name)
 	}
 	if len(rec.CertPEM) == 0 || len(rec.KeyPEM) == 0 {
-		return nil, fmt.Errorf("certificate %q has no material in the state store yet — wait for issuance", name)
+		return nil, webhook.InvalidRequestf("certificate %q has no material in the state store yet — wait for issuance", name)
 	}
 	// A certificate that was issued with deploy disabled (or before deploy was
 	// switched on) has no cloud id yet. Upload it here so the Bind button can
@@ -513,29 +587,19 @@ func bindCertificateAdmin(cfg *config.Config, name string, body map[string]any, 
 	createdListener := ""
 	if lis == "" {
 		if createRaw == nil {
-			return nil, fmt.Errorf("listenerId is required unless createListener is set")
+			return nil, webhook.InvalidRequestf("listenerId is required unless createListener is set")
 		}
-		port := int64(443)
-		switch v := createRaw["port"].(type) {
-		case float64:
-			port = int64(v)
-		case string:
-			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-				port = n
-			}
-		case int64:
-			port = v
+		port := int64(createRaw.Port)
+		if port == 0 {
+			port = 443
 		}
 		if port < 1 || port > 65535 {
-			return nil, fmt.Errorf("createListener.port must be 1-65535, got %d", port)
+			return nil, webhook.InvalidRequestf("createListener.port must be 1-65535, got %d", port)
 		}
-		lname, _ := createRaw["name"].(string)
+		lname := createRaw.Name
 		// SNI is the default for a multi-name console flow; sni=false makes the
 		// certificate the listener's default (Certificate only applies then).
-		sniOn := true
-		if b, ok := createRaw["sni"].(bool); ok {
-			sniOn = b
-		}
+		sniOn := createRaw.SNIMode()
 		newID, cerr := tencentCreateHTTPSListener(region, lb, port, lname, sniOn, rec.DeployedCertID)
 		if cerr != nil {
 			log.Error("CLB create listener failed", "cert", name, "lb", lb, "port", port, "err", cerr)
@@ -775,7 +839,7 @@ func wireDNSCredentials(path, provider, tokenFile string) error {
 	if provider != "" {
 		text = setYAMLScalar(text, "provider", provider)
 	}
-	return os.WriteFile(path, []byte(text), 0o600)
+	return atomicfile.Write(path, []byte(text), 0o600)
 }
 
 // setYAMLScalar replaces a top-level-looking `key: value` line (first match at
@@ -794,7 +858,9 @@ func setYAMLScalar(text, key, value string) string {
 	return text
 }
 
-func signalSelf(sig os.Signal) error {
+// signalSelf is a variable so tests can stub the reload signal: the real one
+// sends SIGHUP to this process, which under `go test` is the test binary.
+var signalSelf = func(sig os.Signal) error {
 	proc, err := os.FindProcess(os.Getpid())
 	if err != nil {
 		return err
