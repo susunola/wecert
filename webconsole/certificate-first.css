@@ -582,9 +582,23 @@ tbody tr[data-name].selected { background: #ecf6f4; }
 h1 { font-weight: 680; letter-spacing: -.02em; }
 h2 { font-weight: 650; }
 .inventory-heading h2 { font-weight: 650; letter-spacing: -.01em; }
-.inline-field { display: flex; gap: 8px; align-items: center; }
-.inline-field select { flex: 1; min-width: 0; }
-.inline-field .small-btn { flex: none; height: 36px; }
+.inline-field { display: flex; gap: 8px; align-items: stretch; }
+/* Beat .wizard-pane .field select (0,2,1) so the two controls share one box. */
+.wizard-pane .inline-field select,
+.inline-field select {
+  flex: 1; min-width: 0;
+  height: 38px; padding: 0 11px; margin: 0;
+  border: 1px solid #d8e1e3; border-radius: 7px;
+  background: var(--card); color: var(--ink);
+  font-size: 13px; line-height: 36px;
+}
+.wizard-pane .inline-field .small-btn,
+.inline-field .small-btn {
+  flex: none; height: 38px; padding: 0 14px;
+  border: 1px solid #d8e1e3; border-radius: 7px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 13px; line-height: 1;
+}
 .field-label { display: block; font-size: 11px; font-weight: 650; letter-spacing: .02em; color: var(--muted); margin-bottom: 6px; }
 
 .binding-mark {
@@ -600,3 +614,6 @@ h2 { font-weight: 650; }
   width: 184px; height: auto; max-width: none;
   object-fit: fill; object-position: center; display: block;
 }
+
+.form-ok { color: var(--green); font-size: 12px; }
+.form-error:empty { display: none; }
