@@ -593,4 +593,10 @@ h2 { font-weight: 650; }
   background: var(--blue-soft); color: var(--blue);
 }
 .binding-mark .ui-icon { width: 16px; height: 16px; }
-.brand .wordmark { width: 132px; height: 36px; display: block; }
+/* The wordmark is now inline SVG; the old rules positioned a large PNG inside
+   an overflow:hidden crop box and pushed the SVG out of sight. */
+.brand .wordmark {
+  position: static; left: auto; top: auto;
+  width: 132px; height: 36px; max-width: none;
+  display: block; object-fit: contain;
+}
