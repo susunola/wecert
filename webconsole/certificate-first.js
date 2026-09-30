@@ -24,7 +24,7 @@ function icon(name) {
 }
 
 const state = {
-  base: '', token: '', adminToken: '', live: false,
+  base: '', token: '', adminToken: '', live: false, sessionOK: false,
   accounts: [], certificates: [], uin: 'all', status: 'all',
   sort: 'expiry', search: '', selected: '', detailOpen: false, collapsed: new Set()
 };
@@ -89,11 +89,15 @@ const preview = {
 };
 
 async function request(method, path, body, admin = false) {
-  if (!state.base || !(admin ? state.adminToken : state.token)) throw new Error('Connect in System settings with the required token first.');
-  const headers = { Accept: 'application/json', Authorization: `Bearer ${admin ? state.adminToken : state.token}` };
+  if (!state.base) throw new Error('Connect in System settings with the daemon URL first.');
+  const tok = admin ? state.adminToken : state.token;
+  if (!state.sessionOK && !tok) throw new Error('Connect in System settings once — the session is then remembered.');
+  const headers = { Accept: 'application/json' };
+  if (tok) headers.Authorization = `Bearer ${tok}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const response = await fetch(`${state.base}${path}`, {
-    method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store'
+    method, headers, credentials: 'include',
+    body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store'
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `${response.status} ${response.statusText}`);
@@ -237,7 +241,17 @@ function renderAll() {
   renderUINMenu();
   renderRows();
   renderDetail();
-  $('#certificate-uin').innerHTML = accountOptions().map((account) => `<option value="${escapeHTML(account.uin)}">UIN ${escapeHTML(account.uin)}</option>`).join('') || '<option value="">Connect a UIN first</option>';
+  const uinOptions = accountOptions().map((account) => `<option value="${escapeHTML(account.uin)}">UIN ${escapeHTML(account.uin)}</option>`).join('');
+  const uinSelect = $('#certificate-uin');
+  if (uinSelect) {
+    const chosen = uinSelect.value;
+    uinSelect.innerHTML = uinOptions || '<option value="">No accounts yet</option>';
+    uinSelect.disabled = !uinOptions;
+    // Re-rendering must not undo a selection the operator already made.
+    if (chosen && [...uinSelect.options].some((option) => option.value === chosen)) {
+      uinSelect.value = chosen;
+    }
+  }
 }
 
 function setInventory(certificates, accounts, live) {
@@ -258,6 +272,7 @@ async function loadLive() {
     request('GET', '/api/inventory'), request('GET', '/api/accounts')
   ]);
   setInventory(inventory.certificates || [], accounts.accounts || [], true);
+  paintEnv(inventory);
   $('#sync-warning').hidden = true;
  } catch (error) {
   $('#sync-warning').hidden = false;
@@ -272,7 +287,6 @@ function closeDrawer() {
 }
 
 function openDrawer() {
-  if (!state.live) { $('#backend-modal').classList.add('open'); return; }
   $('#connect-drawer').classList.add('open');
   $('#drawer-scrim').classList.add('open');
   $('#uin-control').classList.remove('open');
@@ -304,6 +318,30 @@ function closeDetail() {
   }
 }
 
+function collectCLBs() {
+  // Derive CLB / listener options from live binding rows and any inventory hints.
+  const byLb = new Map();
+  for (const cert of state.certificates) {
+    for (const item of (cert.bindings?.items || [])) {
+      const id = item.loadBalancerId || 'unknown';
+      if (!byLb.has(id)) byLb.set(id, { id, region: item.region || 'ap-guangzhou', listeners: [] });
+      if (item.listenerId && !byLb.get(id).listeners.some((l) => l.id === item.listenerId)) {
+        byLb.get(id).listeners.push({ id: item.listenerId, proto: item.protocol || 'HTTPS', port: item.port || '', sni: item.sniDomain || item.sni || '' });
+      }
+    }
+  }
+  if (!byLb.size && !state.live) {
+    // Preview only: a sample CLB so the create-listener path can be exercised offline.
+    // Against a real daemon this stays empty — offering a foreign load balancer id
+    // there would let an operator bind into someone else's account by accident.
+    byLb.set('lb-4z28ujji', {
+      id: 'lb-4z28ujji', region: 'ap-guangzhou',
+      listeners: [{ id: 'lbl-dr1sy3l0', proto: 'HTTPS', port: 443, sni: '' }]
+    });
+  }
+  return [...byLb.values()];
+}
+
 function openCertificateAction(name, action) {
   const cert = state.certificates.find(item => item.name === name);
   if (!cert) return;
@@ -311,26 +349,101 @@ function openCertificateAction(name, action) {
   let modal = document.getElementById('certificate-action');
   if (!modal) { modal = document.createElement('div'); modal.id = 'certificate-action'; modal.className = 'modal'; document.body.append(modal); }
   const deletion = action === 'delete';
-  modal.innerHTML = `<form class="modal-card"><header class="modal-head"><h2>${deletion ? 'Delete certificate' : 'Bind CLB listener'}</h2></header><p>${escapeHTML(name)} · UIN ${escapeHTML(cert.uin || 'Unknown')}</p><p class="security-note">${deletion ? `This removes WeCert management and local certificate state. It does not detach cloud listeners or revoke the certificate. ${cert.bindings?.count || 0} bindings are reported; verify their impact before continuing.` : 'This changes the certificate served by an existing listener. Verify the UIN, region and resource IDs. The server must verify account ownership before any write.'}</p>${deletion ? `<label class="field">Type the certificate name to confirm<input name="confirmation" required autocomplete="off"></label>` : '<label class="field">Region<input name="region" required placeholder="ap-guangzhou"></label><label class="field">Load balancer ID<input name="loadBalancerId" required placeholder="lb-…"></label><label class="field">Listener ID<input name="listenerId" required placeholder="lbl-…"></label><label class="field">SNI domain (optional)<input name="sniDomain" placeholder="api.example.com"></label>'}<p class="form-error" role="alert"></p><div class="modal-actions"><button type="button" class="small-btn">Cancel</button><button class="primary">${deletion ? 'Delete' : 'Confirm binding'}</button></div></form>`;
+  const unbind = action === 'unbind';
+  const title = deletion ? 'Delete certificate' : unbind ? 'Detach bindings' : 'Bind CLB listener';
+  const clbs = collectCLBs();
+  const lbOptions = clbs.map((b) => `<option value="${escapeHTML(b.id)}" data-region="${escapeHTML(b.region)}">${escapeHTML(b.id)} · ${escapeHTML(b.region)}</option>`).join('');
+  const listenerOptions = (clbs[0]?.listeners || []).map((l) =>
+    `<option value="${escapeHTML(l.id)}">${escapeHTML(l.id)} · ${escapeHTML(l.proto)}/${escapeHTML(l.port || '?')}${l.sni ? ' · ' + escapeHTML(l.sni) : ''}</option>`
+  ).join('');
+
+  modal.innerHTML = `<form class="modal-card">
+    <header class="modal-head"><h2>${title}</h2></header>
+    <p>${escapeHTML(name)} · UIN ${escapeHTML(cert.uin || 'Unknown')}</p>
+    <p class="security-note">${
+      deletion
+        ? `This removes WeCert management and local certificate state. It does not detach cloud listeners or revoke the certificate. ${cert.bindings?.count || 0} bindings are reported; verify their impact before continuing.`
+        : unbind
+          ? 'Leave the certificate in inventory and drop its binding bookkeeping. Detach listeners in the cloud console if you need traffic to stop using it.'
+          : 'This attaches the certificate to a CLB listener. The first bind may need a one-time confirmation in the Tencent Cloud console; later renewals switch automatically.'
+    }</p>
+    ${
+      deletion
+        ? `<label class="field">Type the certificate name to confirm<input name="confirmation" required autocomplete="off"></label>`
+        : unbind
+          ? ''
+          : `${clbs.length
+              ? `<label class="field">Load balancer<select name="loadBalancerId" id="bind-lb">${lbOptions}</select></label>`
+              : `<label class="field">Load balancer ID <span class="field-hint">(no known load balancer — paste the id)</span><input name="loadBalancerId" class="mono" required placeholder="lb-…" autocomplete="off"></label>
+                 <label class="field">Region<input name="region" class="mono" placeholder="ap-guangzhou" autocomplete="off"></label>`}
+             <label class="field">Listener<select name="listenerId" id="bind-listener"><option value="">— create new HTTPS listener —</option>${listenerOptions}</select></label>
+             <label class="field">SNI hostname<input name="sniDomain" id="bind-sni" class="mono" placeholder="${escapeHTML((cert.domains && cert.domains[0]) || 'app.example.com')}"></label>
+             <details class="bind-new"><summary>Create a new HTTPS listener…</summary>
+               <div class="field-row"><label class="field">Port<input name="newPort" type="number" min="1" max="65535" value="443"></label>
+               <label class="field">Name<input name="newName" placeholder="https-443"></label></div>
+               <label class="field"><input type="checkbox" name="newSni" checked> SNI mode (per-hostname certificates)</label>
+               <p class="field-hint">Uncheck SNI to make this certificate the listener default. Leave Listener on “create new” to use these settings.</p>
+             </details>`
+    }
+    <p class="form-error" role="alert"></p>
+    <div class="modal-actions"><button type="button" class="small-btn">Cancel</button><button class="primary">${
+      deletion ? 'Delete' : unbind ? 'Detach' : 'Confirm binding'
+    }</button></div></form>`;
   modal.classList.add('open');
   const form = modal.querySelector('form');
   const cancel = form.querySelector('button[type="button"]');
   cancel.onclick = () => { modal.classList.remove('open'); $('#certificate-search').focus(); };
-  form.querySelector('input').focus();
+  form.querySelector('input, select')?.focus();
+
+  const lbSel = form.querySelector('#bind-lb');
+  const lisSel = form.querySelector('#bind-listener');
+  if (lbSel && lisSel) {
+    const refreshListeners = () => {
+      const b = clbs.find((x) => x.id === lbSel.value);
+      lisSel.innerHTML = `<option value="">— create new HTTPS listener —</option>` + (b?.listeners || []).map((l) =>
+        `<option value="${escapeHTML(l.id)}">${escapeHTML(l.id)} · ${escapeHTML(l.proto)}/${escapeHTML(l.port || '?')}${l.sni ? ' · ' + escapeHTML(l.sni) : ''}</option>`
+      ).join('');
+    };
+    lbSel.onchange = refreshListeners;
+  }
+
   form.onsubmit = async event => {
     event.preventDefault();
     const button = form.querySelector('.primary');
     if (button.disabled) return;
-    const body = Object.fromEntries(new FormData(form));
+    const data = Object.fromEntries(new FormData(form));
     const error = form.querySelector('.form-error');
-    if (deletion && body.confirmation !== name) { error.textContent = 'Certificate name does not match.'; return; }
+    if (deletion && data.confirmation !== name) { error.textContent = 'Certificate name does not match.'; return; }
     button.disabled = true; cancel.disabled = true; error.textContent = '';
-    recordOperation(name, deletion ? 'Deletion requested' : 'Binding requested');
+    recordOperation(name, deletion ? 'Deletion requested' : unbind ? 'Unbind requested' : 'Binding requested');
     try {
-      await request(deletion ? 'DELETE' : 'POST', `/admin/certificates/${encodeURIComponent(name)}${deletion ? '' : '/bind'}`, deletion ? undefined : body, true);
-      recordOperation(name, deletion ? 'Deletion completed' : 'Cloud binding API completed; inventory refresh required');
+      if (deletion) {
+        await request('DELETE', `/admin/certificates/${encodeURIComponent(name)}`, undefined, true);
+        recordOperation(name, 'Deletion completed');
+        toast('Certificate management record deleted; cloud resources were not removed.');
+      } else if (unbind) {
+        await request('POST', `/admin/certificates/${encodeURIComponent(name)}/unbind`, {}, true);
+        recordOperation(name, 'Unbind requested');
+        toast('Unbind recorded; detach cloud listeners in the cloud console if needed.');
+      } else {
+        const selectedLB = form.querySelector('#bind-lb option:checked');
+        const body = {
+          loadBalancerId: (data.loadBalancerId || '').trim(),
+          region: (selectedLB?.dataset.region || data.region || 'ap-guangzhou').trim(),
+          sniDomain: (data.sniDomain || '').trim()
+        };
+        if (!body.loadBalancerId) throw new Error('Enter a load balancer ID.');
+        if (data.listenerId) body.listenerId = data.listenerId;
+        else {
+          const port = parseInt(data.newPort || '443', 10);
+          if (!(port >= 1 && port <= 65535)) throw new Error('Port must be 1-65535');
+          body.createListener = { port, name: (data.newName || '').trim(), sni: data.newSni !== undefined };
+        }
+        await request('POST', `/admin/certificates/${encodeURIComponent(name)}/bind`, body, true);
+        recordOperation(name, 'Cloud binding API completed; inventory refresh required');
+        toast('Binding request completed');
+      }
       modal.classList.remove('open');
-      toast(deletion ? 'Certificate management record deleted; cloud resources were not removed.' : 'Binding request completed');
       try { await loadLive(); } catch { /* Persistent sync warning explains stale data. */ }
     } catch (failure) { error.textContent = failure.message; recordOperation(name, `Failed: ${failure.message}`); }
     finally { button.disabled = false; cancel.disabled = false; }
@@ -386,7 +499,7 @@ $('#sort-order').onchange = (event) => { state.sort = event.target.value; update
 $('#refresh-inventory').onclick = async () => { try { await loadLive(); toast('Inventory updated'); } catch (error) { toast(error.message); } };
 $('#connect-backend').onclick = () => $('#backend-modal').classList.add('open');
 $('.inventory-heading').insertAdjacentHTML('afterend', '<p id="sync-warning" class="sync-warning" role="alert" hidden></p>');
-$('#notification-modal').innerHTML = `<form class="modal-card" id="notification-form"><header class="modal-head"><h2>Alert notifications</h2><span class="spacer"></span><button type="button" class="icon-close" data-close-notifications aria-label="Close">×</button></header><p>Renewal success and failure notifications. Expiry and CLB events are not yet emitted.</p><label class="field">Channel<select id="notify-format"><option value="wecom">企业微信 · WeCom</option><option value="feishu">飞书 · Feishu</option><option value="dingtalk">钉钉 · DingTalk</option></select></label><label class="field">Robot Webhook URL<input id="notify-url" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved URL"></label><p class="security-note">Only official HTTPS robot endpoints are accepted. Signed Feishu / DingTalk robots are not supported by this form. Saving requires a daemon reload to activate.</p><p id="notify-result" role="status"></p><div class="modal-actions"><button type="button" class="small-btn" id="notify-test">Send test</button><button class="primary">Save</button></div></form>`;
+$('#notification-modal').innerHTML = `<form class="modal-card" id="notification-form"><header class="modal-head"><h2>Alert notifications</h2><span class="spacer"></span><button type="button" class="icon-close" data-close-notifications aria-label="Close">×</button></header><p>Renewal success and failure notifications. Expiry and CLB events are not yet emitted.</p><label class="field">Channel<select id="notify-format"><option value="wecom">WeCom</option><option value="feishu">Feishu</option><option value="dingtalk">DingTalk</option></select></label><label class="field">Robot Webhook URL<input id="notify-url" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved URL"></label><p class="security-note">Only official HTTPS robot endpoints are accepted. Signed Feishu / DingTalk robots are not supported by this form. Saving requires a daemon reload to activate.</p><p id="notify-result" role="status"></p><div class="modal-actions"><button type="button" class="small-btn" id="notify-test">Send test</button><button class="primary">Save</button></div></form>`;
 async function notificationAction(method) {
   const result = $('#notify-result');
   const buttons = document.querySelectorAll('#notification-form button');
@@ -413,7 +526,8 @@ $('#notifications').onclick = async () => {
   } catch (error) { $('#notify-result').textContent = error.message; }
 };
 document.querySelectorAll('[data-close-notifications]').forEach((button) => button.onclick = () => $('#notification-modal').classList.remove('open'));
-$('#new-certificate').onclick = () => state.live ? $('#certificate-modal').classList.add('open') : $('#backend-modal').classList.add('open');
+$('#new-certificate').onclick = () => $('#certificate-modal').classList.add('open');
+$('#certificate-uin-add') && ($('#certificate-uin-add').onclick = (event) => { event.stopPropagation(); openDrawer(); });
 $('#close-connect').onclick = closeDrawer;
 $('#cancel-uin').onclick = closeDrawer;
 $('#drawer-scrim').onclick = closeDrawer;
@@ -431,11 +545,23 @@ $('#backend-form').onsubmit = async (event) => {
     if (!['http:', 'https:'].includes(base.protocol)) throw new Error('Enter an HTTP or HTTPS daemon URL.');
     if (base.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(base.hostname)) throw new Error('Use HTTPS for remote API access to protect tokens.');
     state.base = base.href.replace(/\/+$/, '');
-    state.token = $('#backend-token').value.trim();
-    state.adminToken = $('#backend-admin-token').value.trim();
+    state.token = ($('#backend-token')?.value || '').trim();
+    state.adminToken = ($('#backend-admin-token')?.value || '').trim();
+    // Exchange tokens for HttpOnly session cookies so later reloads need no paste.
+    try {
+      const exchange = await fetch(`${state.base}/api/session`, {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ token: state.token, adminToken: state.adminToken })
+      });
+      // fetch resolves on 4xx too, so only trust it when the daemon actually minted a session.
+      state.sessionOK = exchange.ok;
+    } catch { /* cross-origin without CORS: fall back to in-memory tokens */ }
     await loadLive();
     $('#backend-modal').classList.remove('open');
-    toast('Live inventory loaded');
+    $('#backend-token').value = '';
+    $('#backend-admin-token').value = '';
+    toast('Connected — session remembered');
   } catch (failure) {
     error.textContent = `Could not connect: ${failure.message}`;
   }
@@ -461,17 +587,116 @@ $('#save-uin').onclick = async () => {
   } catch (error) { if ($('#connect-drawer').classList.contains('open')) throw error; toast(`Account saved; refresh failed: ${error.message}`); }
 };
 
+function syncDnsCredFields() {
+  const cred = $('#certificate-dns-cred')?.value || 'reused';
+  $('#dns-token-wrap')?.classList.toggle('is-hidden', cred !== 'token');
+  $('#dns-file-wrap')?.classList.toggle('is-hidden', cred !== 'file');
+}
+$('#certificate-dns-cred') && ($('#certificate-dns-cred').onchange = syncDnsCredFields);
+
+/* ── create wizard ─────────────────────────────────────── */
+const wizard = {
+  step: 0,
+  total: 4,
+  labels: ['Identity', 'Policy', 'DNS', 'Deploy']
+};
+
+function wizardShow(step) {
+  wizard.step = step;
+  document.querySelectorAll('#wizard-steps li').forEach((li, index) => {
+    li.classList.toggle('is-current', index === step);
+    li.classList.toggle('is-done', index < step);
+  });
+  document.querySelectorAll('#certificate-form .wizard-pane').forEach((pane) => {
+    const on = Number(pane.dataset.pane) === step;
+    pane.hidden = !on;
+    pane.classList.toggle('is-current', on);
+  });
+  const back = $('#wizard-back');
+  const next = $('#wizard-next');
+  const submit = $('#wizard-submit');
+  if (back) back.hidden = step === 0;
+  if (next) next.hidden = step >= wizard.total - 1;
+  if (submit) submit.hidden = step < wizard.total - 1;
+  const progress = $('#wizard-progress');
+  if (progress) progress.textContent = `Step ${step + 1} of ${wizard.total} · ${wizard.labels[step] || ''}`;
+  if (step === wizard.total - 1) wizardReview();
+}
+
+function wizardValidate(step) {
+  if (step === 0) {
+    const name = $('#certificate-name')?.value.trim();
+    const domains = ($('#certificate-domains')?.value || '').split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
+    if (!name) return 'Enter a certificate name.';
+    if (!domains.length) return 'Enter at least one domain.';
+    if (!$('#certificate-uin')?.value) return 'Connect a UIN first.';
+  }
+  return '';
+}
+
+function wizardReview() {
+  const box = $('#wizard-review');
+  if (!box) return;
+  const domains = ($('#certificate-domains')?.value || '').split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
+  const cred = $('#certificate-dns-cred')?.value || 'reused';
+  const credLabel = { reused: 'Reuse daemon credential', token: 'Per-cert API token', file: 'Host key file' }[cred] || cred;
+  box.innerHTML = `<dl>
+    <dt>Name</dt><dd>${escapeHTML($('#certificate-name')?.value.trim() || '—')}</dd>
+    <dt>Domains</dt><dd>${escapeHTML(domains.join(', ') || '—')}</dd>
+    <dt>Profile</dt><dd>${escapeHTML($('#certificate-profile')?.value || 'classic')}</dd>
+    <dt>Key</dt><dd>${escapeHTML($('#certificate-key')?.value || 'ecdsa-p256')}</dd>
+    <dt>DNS</dt><dd>${escapeHTML($('#certificate-dns-provider')?.value || 'cloudflare')} · ${escapeHTML(credLabel)}</dd>
+    <dt>Deploy</dt><dd>${escapeHTML($('#certificate-deploy')?.value || 'clb')}</dd>
+  </dl>`;
+}
+
+$('#wizard-back') && ($('#wizard-back').onclick = () => {
+  if (wizard.step > 0) wizardShow(wizard.step - 1);
+});
+$('#wizard-next') && ($('#wizard-next').onclick = () => {
+  const err = wizardValidate(wizard.step);
+  const box = $('#certificate-form .form-error');
+  if (err) { if (box) box.textContent = err; return; }
+  if (box) box.textContent = '';
+  if (wizard.step < wizard.total - 1) wizardShow(wizard.step + 1);
+});
+document.querySelectorAll('#wizard-steps li').forEach((li) => {
+  li.addEventListener('click', () => {
+    const target = Number(li.dataset.step);
+    if (Number.isNaN(target) || target === wizard.step) return;
+    if (target < wizard.step) { wizardShow(target); return; }
+    // only advance when intermediate steps validate
+    for (let i = wizard.step; i < target; i += 1) {
+      const err = wizardValidate(i);
+      if (err) {
+        const box = $('#certificate-form .form-error');
+        if (box) box.textContent = err;
+        wizardShow(i);
+        return;
+      }
+    }
+    wizardShow(target);
+  });
+});
+
 $('#certificate-form').onsubmit = async (event) => {
   event.preventDefault();
   const name = $('#certificate-name').value.trim();
-  const domains = $('#certificate-domains').value.split(',').map((domain) => domain.trim()).filter(Boolean);
+  const domains = $('#certificate-domains').value.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
   if (!$('#certificate-uin').value) throw new Error('Connect a UIN first.');
   if (!name || !domains.length) throw new Error('Enter a certificate name and at least one domain.');
+  const dnsCred = $('#certificate-dns-cred')?.value || 'reused';
+  const dns = { provider: $('#certificate-dns-provider')?.value || 'cloudflare', cred: dnsCred };
+  if (dnsCred === 'token') dns.token = $('#certificate-dns-token')?.value || '';
+  if (dnsCred === 'file') dns.file = $('#certificate-dns-file')?.value || '';
   try {
     const created = await request('POST', '/admin/certificates', {
       name, uin: $('#certificate-uin').value, domains,
-      renewBefore: $('#certificate-renew').value, profile: 'classic', keyType: 'ecdsa-p256',
-      dns: { cred: 'reused' }
+      renewBefore: $('#certificate-renew').value,
+      profile: $('#certificate-profile')?.value || 'classic',
+      keyType: $('#certificate-key')?.value || 'ecdsa-p256',
+      deploy: $('#certificate-deploy')?.value || 'clb',
+      dns
     }, true);
     $('#certificate-modal').classList.remove('open');
     await loadLive();
@@ -483,14 +708,54 @@ $('#certificate-form').onsubmit = async (event) => {
   } catch (error) { if ($('#certificate-modal').classList.contains('open')) throw error; toast(`Certificate created; refresh failed: ${error.message}`); }
 };
 
+// reset wizard when the create modal opens
+(function hookCreateOpen() {
+  const btn = $('#new-certificate');
+  if (!btn) return;
+  const prev = btn.onclick;
+  btn.onclick = (event) => {
+    if (typeof prev === 'function') prev(event);
+    wizardShow(0);
+    const box = $('#certificate-form .form-error');
+    if (box) box.textContent = '';
+  };
+})();
+
+// Auto-connect: same-origin daemon already issues session cookies, so a
+// reload should not demand the tokens again.
+(async function autoConnect() {
+  if (typeof location === 'undefined' || typeof fetch !== 'function') return;
+  const bases = [];
+  if (location.protocol === 'http:' || location.protocol === 'https:') {
+    bases.push(location.origin);
+    if (location.port !== '9801') bases.push(`${location.protocol}//${location.hostname}:9801`);
+  }
+  for (const base of bases) {
+    try {
+      const res = await fetch(`${base}/api/session`, { credentials: 'include', cache: 'no-store' });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (!data.read && !data.admin) continue;
+      state.base = base;
+      state.sessionOK = true;
+      state.live = true;
+      await loadLive();
+      const status = $('#connection-status');
+      if (status) { status.classList.add('live'); status.innerHTML = '<i></i>Live inventory'; }
+      return;
+    } catch { /* try next */ }
+  }
+})();
+
 // Keep errors beside the form and guard the full asynchronous operation.
 for (const [container, buttonSelector, eventName] of [
   ['#connect-drawer', '#save-uin', 'onclick'],
-  ['#certificate-form', '#certificate-form .primary', 'onsubmit'],
+  ['#certificate-form', '#wizard-submit', 'onsubmit'],
   ['#backend-form', '#backend-form .primary', 'onsubmit']
 ]) {
   const form = $(container);
   const button = $(buttonSelector);
+  if (!form || !button) continue;
   const target = eventName === 'onclick' ? button : form;
   const handler = target[eventName];
   const error = document.createElement('p');
@@ -525,7 +790,7 @@ document.addEventListener('click', async (event) => {
     if (!cert) return;
     const [action, label] = primaryAction(cert);
     const menu = $('#row-menu');
-    menu.innerHTML = `<button data-action="view" data-name="${escapeHTML(cert.name)}">View details</button><button data-action="${cert.status === 'not_issued' ? 'issue' : 'renew'}" data-name="${escapeHTML(cert.name)}">${cert.status === 'not_issued' ? 'Issue' : 'Check renewal'}</button><button data-action="bind" data-name="${escapeHTML(cert.name)}">Bind CLB</button><button class="danger-action" data-action="delete" data-name="${escapeHTML(cert.name)}">Delete certificate</button>`;
+    menu.innerHTML = `<button data-action="view" data-name="${escapeHTML(cert.name)}">View details</button><button data-action="${cert.status === 'not_issued' ? 'issue' : 'renew'}" data-name="${escapeHTML(cert.name)}">${cert.status === 'not_issued' ? 'Issue' : 'Check renewal'}</button><button data-action="bind" data-name="${escapeHTML(cert.name)}">Bind CLB</button><button data-action="unbind" data-name="${escapeHTML(cert.name)}">Detach bindings</button><button class="danger-action" data-action="delete" data-name="${escapeHTML(cert.name)}">Delete certificate</button>`;
     menu.showPopover();
     const rect = trigger.getBoundingClientRect();
     menu.style.left = `${Math.max(8, Math.min(rect.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8))}px`;
@@ -561,20 +826,23 @@ document.addEventListener('click', async (event) => {
     updateFilteredView();
     return;
   }
-  if (event.target.closest('#connect-uin')) return openDrawer();
+  if (event.target.closest('#connect-uin') || event.target.closest('#certificate-uin-add')) return openDrawer();
   if (!event.target.closest('#uin-control')) $('#uin-control').classList.remove('open');
   if (event.target.closest('[data-close-detail]')) return closeDetail();
   const button = event.target.closest('[data-action]');
   if (button) {
     $('#row-menu').hidePopover();
     const name = button.dataset.name;
-    if (['bind', 'delete'].includes(button.dataset.action)) { openCertificateAction(name, button.dataset.action); return; }
+    if (['bind', 'delete', 'unbind'].includes(button.dataset.action)) { openCertificateAction(name, button.dataset.action); return; }
     if (['view', 'bindings'].includes(button.dataset.action)) {
       selectCertificate(name);
       if (button.dataset.action === 'bindings') $('#detail-bindings').scrollIntoView({ block: 'nearest' });
       return;
     }
-    if (!state.live) { $('#backend-modal').classList.add('open'); return; }
+    if (!state.live) {
+      toast('Preview data — connect in Settings to send this request.');
+      return;
+    }
     button.disabled = true;
     try {
       const result = await request('POST', '/hook/reconcile', { cert: name });
@@ -611,3 +879,14 @@ document.addEventListener('keydown', (event) => {
 });
 
 setInventory(preview.certificates, preview.accounts, false);
+
+
+function paintEnv(inventory) {
+  const pill = $('#env-pill');
+  if (!pill) return;
+  const rev = inventory?.desired?.revision || '';
+  const text = String(inventory?.acme?.directory || inventory?.directory || rev || '');
+  const prod = /acme-v02\.api\.letsencrypt\.org/.test(text) || inventory?.production === true;
+  pill.textContent = prod ? 'production' : text.includes('staging') ? 'staging' : rev ? rev.slice(0, 18) : 'live';
+  pill.dataset.env = prod ? 'production' : 'staging';
+}
