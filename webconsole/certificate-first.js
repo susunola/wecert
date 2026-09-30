@@ -23,8 +23,10 @@ function icon(name) {
   return `<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.certificate}</svg>`;
 }
 
+const RETRY_SECONDS = 15;
 const state = {
-  base: '', token: '', adminToken: '', live: false,
+  base: '', token: '', adminToken: '', live: false, preview: false,
+  lastSync: null, retryTimer: null,
   accounts: [], certificates: [], uin: 'all', status: 'all',
   sort: 'expiry', search: '', selected: '', detailOpen: false, collapsed: new Set()
 };
@@ -36,11 +38,46 @@ function recordOperation(name, message) {
   operationLog.splice(30);
   if (state.detailOpen) renderDetail();
 }
+/* Cloud bindings. The count is what the last enumeration saw -- a store-side count is what wecert
+   deployed, not what exists, which is why the completeness marker and the freshness line are part
+   of the cell rather than footnotes: "1 binding" and "≥1 binding, local record" are different
+   claims about the world. */
+const REGION_LABELS = {
+  'ap-guangzhou': 'Guangzhou', 'ap-shanghai': 'Shanghai', 'ap-beijing': 'Beijing',
+  'ap-chengdu': 'Chengdu', 'ap-chongqing': 'Chongqing', 'ap-hongkong': 'Hong Kong',
+  'ap-singapore': 'Singapore', 'ap-tokyo': 'Tokyo', 'ap-seoul': 'Seoul', 'ap-bangkok': 'Bangkok',
+  'ap-jakarta': 'Jakarta', 'na-siliconvalley': 'Silicon Valley', 'na-ashburn': 'Ashburn',
+  'eu-frankfurt': 'Frankfurt', 'eu-moscow': 'Moscow'
+};
+function regionLabel(region) {
+  return REGION_LABELS[region] || region;
+}
+
+function bindingCount(cert) {
+  const b = cert.bindings;
+  if (!b || (!b.complete && !b.count)) return 'Bindings unknown';
+  const n = b.count || 0;
+  return (b.complete ? '' : '≥') + `${n} binding${n === 1 ? '' : 's'}`;
+}
+
 function bindingSummary(cert) {
-  const items = cert.bindings?.items || [];
-  if (!items.length) return cert.bindings?.count ? `${cert.bindings.count} bindings · details not reported` : 'No bindings reported';
-  const item = items[0];
-  return [item.loadBalancerId || 'CLB ID not reported', item.region || 'Region not reported', item.port ? `${item.protocol || 'TLS'} :${item.port}` : 'Port not reported'].join(' · ');
+  const b = cert.bindings || {};
+  const item = (b.items || [])[0];
+  const regions = (cert.regions || []).map(regionLabel);
+  const where = regions.length ? regions[0] : item && item.region ? regionLabel(item.region) : '';
+  const count = bindingCount(cert);
+  return where ? `${count} · ${where}` : count;
+}
+
+function freshnessCaption(cert) {
+  const b = cert.bindings || {};
+  if (b.observedAt) {
+    const parsed = new Date(b.observedAt);
+    const at = Number.isNaN(parsed.getTime()) ? '' : ` ${parsed.toISOString().slice(11, 16)} UTC`;
+    return `${b.freshness === 'cached' ? 'Cached' : 'Observed'}${at}`;
+  }
+  if (b.freshness === 'store') return 'Local record';
+  return 'Never enumerated';
 }
 
 function toast(message) {
@@ -88,10 +125,21 @@ const preview = {
   ]
 };
 
-async function request(method, path, body, admin = false) {
-  if (!state.base || !(admin ? state.adminToken : state.token)) throw new Error('Connect in System settings with the required token first.');
-  const headers = { Accept: 'application/json', Authorization: `Bearer ${admin ? state.adminToken : state.token}` };
+async function request(method, path, body, admin = false, intent = false) {
+  // Same-origin reads need no token here: the host serving this page fronts the daemon and injects
+  // the read-only token on /api/*, so an operator never has to paste a secret into a browser.
+  // A cross-origin base, and anything that needs the admin token, still has to be connected
+  // explicitly in System settings.
+  const sameOriginRead = !admin && (!state.base || state.base === location.origin);
+  const token = admin ? state.adminToken : state.token;
+  if (!sameOriginRead && !token) throw new Error('Connect in System settings with the required token first.');
+  if (admin && !token) throw new Error('Connect in System settings with the required admin token first.');
+  const headers = { Accept: 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
+  // The renew agent refuses anything a plain HTML form could have produced: it requires this
+  // custom header (plus a same-origin Origin) on every request, reads included.
+  if (intent) headers['X-Wecert-Intent'] = 'renew';
   const response = await fetch(`${state.base}${path}`, {
     method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store'
   });
@@ -146,7 +194,7 @@ function renderUINMenu() {
   $('.uin-menu').innerHTML = `
     <button data-uin="all">All UINs <span class="count">${state.certificates.length}</span></button>
     ${accountOptions().map((account) => `<button data-uin="${escapeHTML(account.uin)}">UIN ${escapeHTML(account.uin)}<span class="count">${counts.get(account.uin) || 0}</span></button>`).join('')}
-    <hr><button class="connect" id="connect-uin">＋ Connect UIN</button>`;
+    `;
   $('#uin-label').textContent = state.uin === 'all' ? 'All UINs' : state.uin;
 }
 
@@ -172,7 +220,7 @@ function renderRows() {
   const visible = filteredCertificates();
   $('#inventory-count').textContent = visible.length;
   $('#clear-filter').hidden = state.uin === 'all' && state.status === 'all' && !state.search;
-  $('#inventory-footer').textContent = `${state.live ? 'Live inventory' : 'Preview data'} · ${visible.length} of ${state.certificates.length} certificates across ${accountOptions().length} UINs`;
+  $('#inventory-footer').textContent = `${state.live ? 'Live inventory' : state.preview ? 'Preview data' : 'Not connected'} · ${visible.length} of ${state.certificates.length} certificates across ${accountOptions().length} UINs${state.live && state.lastSync ? ` · read ${state.lastSync.toLocaleTimeString()}` : ''}`;
   const grouped = new Map();
   visible.forEach((cert) => {
     const uin = cert.uin || 'unassigned';
@@ -180,19 +228,58 @@ function renderRows() {
     grouped.get(uin).push(cert);
   });
   $('#certificate-rows').innerHTML = [...grouped].map(([uin, certs]) => `
-    <tr class="group"><td colspan="5"><button class="group-toggle" data-group="${escapeHTML(uin)}" aria-expanded="${!state.collapsed.has(uin)}"><span class="group-chevron">${state.collapsed.has(uin) ? '›' : '⌄'}</span><span>${uin === 'unassigned' ? 'Unassigned UIN' : `UIN ${escapeHTML(uin)}`}</span><span class="group-count">${certs.length} certificates</span></button></td></tr>
+    <tr class="group"><td colspan="6"><button class="group-toggle" data-group="${escapeHTML(uin)}" aria-expanded="${!state.collapsed.has(uin)}"><span class="group-chevron">${state.collapsed.has(uin) ? '›' : '⌄'}</span><span>${uin === 'unassigned' ? 'Unassigned UIN' : `UIN ${escapeHTML(uin)}`}</span><span class="group-count">${certs.length} certificates</span></button></td></tr>
     ${(state.collapsed.has(uin) ? [] : certs).map((cert) => {
       const status = statusInfo(cert);
-      const bindings = cert.bindings?.count || 0;
-      const domainCount = cert.domains?.length || 0;
+      const bindingCountValue = cert.bindings?.count || 0;
+      const bindingCell = bindingCountValue || !cert.bindings?.complete
+        ? `<span class="binding"><img src="binding-logo.png" alt=""><span>${escapeHTML(bindingSummary(cert))}<small>${escapeHTML(freshnessCaption(cert))}</small></span></span>`
+        : '<span class="unbound">— <span>No bindings reported</span></span>';
       return `<tr data-name="${escapeHTML(cert.name)}" class="${state.detailOpen && state.selected === cert.name ? 'selected' : ''}">
-        <td class="cert"><div class="certificate-cell"><span class="certificate-mark">${icon('certificate')}</span><div><button class="cert-link" data-action="view" data-name="${escapeHTML(cert.name)}">${escapeHTML(cert.name)}</button><span class="sub certificate-domain">${escapeHTML(cert.domains?.[0] || '—')}${domainCount > 1 ? ` <span>+${domainCount - 1} domains</span>` : ''}</span></div></div></td>
+        <td class="cert"><div class="certificate-cell"><span class="certificate-mark">${icon('certificate')}</span><div><button class="cert-link" data-action="view" data-name="${escapeHTML(cert.name)}">${escapeHTML(cert.name)}</button>${sslIdentityLine(cert)}</div></div></td>
+        <td class="domains">${domainCell(cert)}</td>
         <td class="status"><span class="status-pill status-${cert.status === 'not_issued' ? 'neutral' : status.dot}">${icon(status.dot === 'ok' ? 'certificate' : cert.status === 'not_issued' ? 'clock' : 'alert')}${status.label === 'Active' ? 'Healthy' : status.label}</span></td>
-        <td>${bindings ? `<span class="binding"><img src="binding-logo.png" alt=""><span>${escapeHTML(bindingSummary(cert))}<small>${bindings} bindings · ${escapeHTML(cert.bindings.freshness || 'Freshness not reported')}</small></span></span>` : '<span class="unbound">— <span>No bindings reported</span></span>'}</td>
+        <td>${bindingCell}</td>
         <td class="expiry-cell ${cert.daysLeft != null && cert.daysLeft <= 30 ? 'expiry-attention' : ''} ${cert.daysLeft != null && cert.daysLeft < 0 ? 'expiry-expired' : ''}" title="${escapeHTML(expiry(cert))}">${cert.daysLeft == null ? '—' : cert.daysLeft < 0 ? `${Math.abs(cert.daysLeft)} days ago<span class="sub">Expired</span>` : `${cert.daysLeft} days`}</td>
         <td class="row-actions"><button class="menu-trigger" data-menu="${escapeHTML(cert.name)}" aria-label="Actions for ${escapeHTML(cert.name)}" aria-haspopup="true">•••</button></td>
       </tr>`;
-    }).join('')}`).join('') || `<tr><td colspan="5"><div class="empty-state"><strong>${state.certificates.length ? 'No matching certificates' : 'No certificates yet'}</strong><span>${state.certificates.length ? 'Try a different UIN, status, or search term.' : 'Create a certificate to start building your inventory.'}</span></div></td></tr>`;
+    }).join('')}`).join('') || `<tr><td colspan="6"><div class="empty-state"><strong>${state.certificates.length ? 'No matching certificates' : 'No certificates to show'}</strong><span>${state.certificates.length ? 'Try a different UIN, status, or search term.' : state.preview ? 'Sample mode: open the daemon-served page to read the real inventory.' : 'Waiting for the daemon — the page retries on its own, and the banner above says what it saw last.'}</span></div></td></tr>`;
+}
+
+/* Certificate identity, in the two vocabularies an operator has to move between.
+   Line one is the name wecert knows it by; line two is what the Tencent Cloud SSL console lists
+   it under -- the upload remark ("wecert/<name>") and the cloud certificate ID -- because that is
+   the pair that lets a row here be matched with a row there. The serial (which the certificate
+   itself carries, and which survives a change of account or deployment target) is the tooltip of
+   that line and a fact in the detail panel. Line three is the domain set: three names, then a
+   count, so a certificate with twenty SANs does not stretch the row. */
+const MAX_ROW_DOMAINS = 3;
+
+function shortSerial(serial) {
+  return serial.length > 16 ? `${serial.slice(0, 16)}…` : serial;
+}
+
+function sslIdentityLine(cert) {
+  const cloud = [cert.alias, cert.deployedCertId].filter(Boolean);
+  const serial = cert.serial ? shortSerial(cert.serial) : '';
+  if (!cloud.length && !serial) return '';
+  const title = [cert.serial ? `Serial ${cert.serial}` : '', cloud.join(' · ')].filter(Boolean).join(' — ');
+  if (!cloud.length) return `<span class="sub certificate-domain mono" title="${escapeHTML(title)}">Not uploaded to Tencent Cloud SSL</span>`;
+  return `<span class="sub certificate-domain mono" title="${escapeHTML(title)}">${escapeHTML(cloud.join(' · '))}</span>`;
+}
+
+/* The domain set gets its own column: three names stacked, then a count. The certificate column
+   answers "which certificate is this" (name, upload remark, cloud id); this one answers "what does
+   it cover". Stacked rather than joined by separators, because three names on one line is where a
+   fixed-layout table starts truncating the middle of a host name. */
+function domainCell(cert) {
+  const list = (cert.domains || []).filter(Boolean);
+  if (!list.length) return '<span class="unbound">—</span>';
+  const shown = list.slice(0, MAX_ROW_DOMAINS);
+  const hidden = list.length - shown.length;
+  return `<div class="domain-cell">${shown
+    .map((domain) => `<span class="domain-line" title="${escapeHTML(domain)}">${escapeHTML(domain)}</span>`)
+    .join('')}${hidden ? `<span class="domain-more">+${hidden} more</span>` : ''}</div>`;
 }
 
 function domainRows(cert) {
@@ -244,12 +331,64 @@ function setInventory(certificates, accounts, live) {
   state.certificates = certificates;
   state.accounts = accounts;
   state.live = live;
+  if (live) state.lastSync = new Date();
   if (state.detailOpen && !certificates.some((cert) => cert.name === state.selected)) closeDetail();
-  $('#connection-status').classList.toggle('live', live);
-  $('#connection-status').lastChild.textContent = live ? 'Live data' : 'Preview data';
-  $('#refresh-inventory').disabled = !live;
-  $('#connection-status').title = live ? `Last synced ${new Date().toLocaleString()}` : 'Sample inventory — no changes are sent to cloud accounts';
+  const chip = $('#connection-status');
+  chip.classList.toggle('live', live);
+  chip.lastChild.textContent = live ? 'Live data' : state.preview ? 'Preview data' : 'No data';
+  chip.title = live
+    ? `Last synced ${state.lastSync.toLocaleString()}`
+    : state.preview
+      ? 'Built-in sample inventory — this page is not talking to a daemon'
+      : 'The daemon has not answered yet';
+  $('#refresh-inventory').disabled = false;
   renderAll();
+}
+
+/* A failed read must never turn into plausible-looking certificates. A page that shows invented
+   rows (legacy, www-corp, ...) is worse than an empty one: the operator reads them as real, and
+   the one question this page exists to answer becomes unanswerable. So the page starts empty,
+   keeps the last successful reading across failures, and says out loud that it is retrying. */
+function showSyncProblem(message) {
+  const warning = $('#sync-warning');
+  if (!warning) return;
+  warning.hidden = false;
+  warning.innerHTML = `<b>Live data unavailable.</b> ${escapeHTML(message)}. ` +
+    (state.lastSync
+      ? `Showing the last reading, ${escapeHTML(state.lastSync.toLocaleTimeString())}. `
+      : 'Nothing has been read from the daemon yet. ') +
+    `Retrying every ${RETRY_SECONDS}s.`;
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'small-btn';
+  retry.textContent = 'Retry now';
+  retry.onclick = () => {
+    retry.disabled = true;
+    loadLive().catch(() => {}).finally(() => { retry.disabled = false; });
+  };
+  warning.appendChild(document.createTextNode(' '));
+  warning.appendChild(retry);
+  // The chip must not keep claiming "Live data" while the banner says the read failed: whatever
+  // is on screen is the last known answer, and the two labels have to agree.
+  const chip = $('#connection-status');
+  if (chip) {
+    chip.classList.remove('live');
+    chip.lastChild.textContent = 'Stale data';
+    chip.title = 'The last successful read is shown; the daemon is not answering right now';
+  }
+  }
+
+function clearSyncProblem() {
+  const warning = $('#sync-warning');
+  if (warning) warning.hidden = true;
+}
+
+function scheduleRetry() {
+  if (state.retryTimer) return;
+  state.retryTimer = setTimeout(() => {
+    state.retryTimer = null;
+    loadLive().catch(() => { /* the banner already says so */ });
+  }, RETRY_SECONDS * 1000);
 }
 
 async function loadLive() {
@@ -258,10 +397,14 @@ async function loadLive() {
     request('GET', '/api/inventory'), request('GET', '/api/accounts')
   ]);
   setInventory(inventory.certificates || [], accounts.accounts || [], true);
-  $('#sync-warning').hidden = true;
+  clearSyncProblem();
+  if (state.retryTimer) {
+    clearTimeout(state.retryTimer);
+    state.retryTimer = null;
+  }
  } catch (error) {
-  $('#sync-warning').hidden = false;
-  $('#sync-warning').textContent = `Sync failed: ${error.message}. Displayed data may be outdated; use Refresh to retry.`;
+  showSyncProblem(error.message);
+  scheduleRetry();
   throw error;
  }
 }
@@ -304,39 +447,6 @@ function closeDetail() {
   }
 }
 
-function openCertificateAction(name, action) {
-  const cert = state.certificates.find(item => item.name === name);
-  if (!cert) return;
-  if (!state.live) { toast('Preview data: connect to the backend before changing certificates.'); return; }
-  let modal = document.getElementById('certificate-action');
-  if (!modal) { modal = document.createElement('div'); modal.id = 'certificate-action'; modal.className = 'modal'; document.body.append(modal); }
-  const deletion = action === 'delete';
-  modal.innerHTML = `<form class="modal-card"><header class="modal-head"><h2>${deletion ? 'Delete certificate' : 'Bind CLB listener'}</h2></header><p>${escapeHTML(name)} · UIN ${escapeHTML(cert.uin || 'Unknown')}</p><p class="security-note">${deletion ? `This removes WeCert management and local certificate state. It does not detach cloud listeners or revoke the certificate. ${cert.bindings?.count || 0} bindings are reported; verify their impact before continuing.` : 'This changes the certificate served by an existing listener. Verify the UIN, region and resource IDs. The server must verify account ownership before any write.'}</p>${deletion ? `<label class="field">Type the certificate name to confirm<input name="confirmation" required autocomplete="off"></label>` : '<label class="field">Region<input name="region" required placeholder="ap-guangzhou"></label><label class="field">Load balancer ID<input name="loadBalancerId" required placeholder="lb-…"></label><label class="field">Listener ID<input name="listenerId" required placeholder="lbl-…"></label><label class="field">SNI domain (optional)<input name="sniDomain" placeholder="api.example.com"></label>'}<p class="form-error" role="alert"></p><div class="modal-actions"><button type="button" class="small-btn">Cancel</button><button class="primary">${deletion ? 'Delete' : 'Confirm binding'}</button></div></form>`;
-  modal.classList.add('open');
-  const form = modal.querySelector('form');
-  const cancel = form.querySelector('button[type="button"]');
-  cancel.onclick = () => { modal.classList.remove('open'); $('#certificate-search').focus(); };
-  form.querySelector('input').focus();
-  form.onsubmit = async event => {
-    event.preventDefault();
-    const button = form.querySelector('.primary');
-    if (button.disabled) return;
-    const body = Object.fromEntries(new FormData(form));
-    const error = form.querySelector('.form-error');
-    if (deletion && body.confirmation !== name) { error.textContent = 'Certificate name does not match.'; return; }
-    button.disabled = true; cancel.disabled = true; error.textContent = '';
-    recordOperation(name, deletion ? 'Deletion requested' : 'Binding requested');
-    try {
-      await request(deletion ? 'DELETE' : 'POST', `/admin/certificates/${encodeURIComponent(name)}${deletion ? '' : '/bind'}`, deletion ? undefined : body, true);
-      recordOperation(name, deletion ? 'Deletion completed' : 'Cloud binding API completed; inventory refresh required');
-      modal.classList.remove('open');
-      toast(deletion ? 'Certificate management record deleted; cloud resources were not removed.' : 'Binding request completed');
-      try { await loadLive(); } catch { /* Persistent sync warning explains stale data. */ }
-    } catch (failure) { error.textContent = failure.message; recordOperation(name, `Failed: ${failure.message}`); }
-    finally { button.disabled = false; cancel.disabled = false; }
-  };
-}
-
 $('#uin-trigger').onclick = () => $('#uin-control').classList.toggle('open');
 function updateFilteredView() {
   document.querySelectorAll('[data-metric]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.metric === state.status)));
@@ -353,9 +463,7 @@ document.querySelectorAll('.metric').forEach((metric, index) => {
   metric.replaceWith(button);
 });
 for (const [selector, symbol, label] of [
-  ['#notifications', 'bell', 'Notifications'],
   ['#connect-backend', 'settings', 'Settings'],
-  ['#new-certificate', 'plus', 'New certificate'],
   ['#refresh-inventory', 'refresh', 'Refresh']
 ]) $(selector).innerHTML = `${icon(symbol)}<span>${label}</span>`;
 document.querySelectorAll('.icon-close').forEach(button => button.innerHTML = icon('close'));
@@ -403,17 +511,8 @@ $('#notification-form').onsubmit = event => { event.preventDefault(); notificati
 $('#notify-test').onclick = () => notificationAction('POST');
 $('#backend-modal h2').textContent = 'System settings';
 $('#backend-modal p').textContent = 'Console API access only — this is separate from outgoing alert Webhooks. Tokens are held in memory for this session.';
-$('#notifications').onclick = async () => {
-  $('#notification-modal').classList.add('open');
-  $('#notify-format').focus();
-  try {
-    const data = await request('GET', '/admin/notifications', undefined, true);
-    if (['wecom','feishu','dingtalk'].includes(data.format)) $('#notify-format').value = data.format;
-    $('#notify-result').textContent = data.configured ? `Saved channel: ${data.format}. Secret URL hidden.` : 'No channel saved.';
-  } catch (error) { $('#notify-result').textContent = error.message; }
-};
+
 document.querySelectorAll('[data-close-notifications]').forEach((button) => button.onclick = () => $('#notification-modal').classList.remove('open'));
-$('#new-certificate').onclick = () => state.live ? $('#certificate-modal').classList.add('open') : $('#backend-modal').classList.add('open');
 $('#close-connect').onclick = closeDrawer;
 $('#cancel-uin').onclick = closeDrawer;
 $('#drawer-scrim').onclick = closeDrawer;
@@ -523,9 +622,12 @@ document.addEventListener('click', async (event) => {
   if (trigger) {
     const cert = state.certificates.find(item => item.name === trigger.dataset.menu);
     if (!cert) return;
-    const [action, label] = primaryAction(cert);
     const menu = $('#row-menu');
-    menu.innerHTML = `<button data-action="view" data-name="${escapeHTML(cert.name)}">View details</button><button data-action="${cert.status === 'not_issued' ? 'issue' : 'renew'}" data-name="${escapeHTML(cert.name)}">${cert.status === 'not_issued' ? 'Issue' : 'Check renewal'}</button><button data-action="bind" data-name="${escapeHTML(cert.name)}">Bind CLB</button><button class="danger-action" data-action="delete" data-name="${escapeHTML(cert.name)}">Delete certificate</button>`;
+    // Details and renewal only: creating, binding and deleting certificates is done in the
+    // Tencent Cloud console. This page manages what Let's Encrypt issued, and "renew" here means
+    // editing that certificate's declared domain set through the renew agent (openRenewPanel).
+    menu.innerHTML = `<button data-action="view" data-name="${escapeHTML(cert.name)}">View details</button>`
+      + (cert.status === 'not_issued' ? '' : `<button data-action="renew" data-name="${escapeHTML(cert.name)}">Renew (edit domains)</button>`);
     menu.showPopover();
     const rect = trigger.getBoundingClientRect();
     menu.style.left = `${Math.max(8, Math.min(rect.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8))}px`;
@@ -561,28 +663,18 @@ document.addEventListener('click', async (event) => {
     updateFilteredView();
     return;
   }
-  if (event.target.closest('#connect-uin')) return openDrawer();
   if (!event.target.closest('#uin-control')) $('#uin-control').classList.remove('open');
   if (event.target.closest('[data-close-detail]')) return closeDetail();
   const button = event.target.closest('[data-action]');
   if (button) {
     $('#row-menu').hidePopover();
     const name = button.dataset.name;
-    if (['bind', 'delete'].includes(button.dataset.action)) { openCertificateAction(name, button.dataset.action); return; }
+    if (button.dataset.action === 'renew') { openRenewPanel(name); return; }
     if (['view', 'bindings'].includes(button.dataset.action)) {
       selectCertificate(name);
       if (button.dataset.action === 'bindings') $('#detail-bindings').scrollIntoView({ block: 'nearest' });
       return;
     }
-    if (!state.live) { $('#backend-modal').classList.add('open'); return; }
-    button.disabled = true;
-    try {
-      const result = await request('POST', '/hook/reconcile', { cert: name });
-      const message = `Reconciliation response: ${JSON.stringify(result)}. This is not a confirmation of issuance; refresh inventory to check results.`;
-      recordOperation(name, message);
-      toast(`${name}: request accepted; refresh to check results`);
-    } catch (error) { toast(error.message); }
-    finally { button.disabled = false; }
     return;
   }
   const row = event.target.closest('tr[data-name]');
@@ -610,4 +702,202 @@ document.addEventListener('keydown', (event) => {
   document.getElementById('certificate-action')?.classList.remove('open');
 });
 
-setInventory(preview.certificates, preview.accounts, false);
+/* The sample inventory is for opening this file with no backend at all (a plain file:// view,
+   or a design review). A page served by the daemon never renders it -- see the bootstrap at the
+   end of this file. */
+if (location.protocol === 'file:') {
+  state.preview = true;
+  setInventory(preview.certificates, preview.accounts, false);
+}
+
+/* ── renew: edit one certificate's declared domains ───────────────────────────
+   Renewal here means editing the declaration, not re-running issuance with the same names: the
+   agent (GET/POST /renew/...) reads the certificate's declared names, validates the candidate
+   desired-state document with the daemon's own dry run, keeps a backup, writes it, and only then
+   reconciles that one certificate. This page never writes the document itself, never needs its
+   path, and never touches the cloud account -- binding and deletion stay Tencent Cloud console
+   operations. */
+let renewState = null;
+
+// The profile cap the agent enforces for one certificate (redundant wildcard names excluded).
+// The panel stops offering "Add" at the cap instead of letting the agent reject the whole write.
+const RENEW_MAX_DOMAINS = 100;
+
+function renewDraftDirty() {
+  const s = renewState;
+  if (!s || !s.snapshot) return false;
+  const before = (s.snapshot.desiredDomains || []).slice().sort();
+  const after = s.draft.slice().sort();
+  return before.length !== after.length || before.some((domain, index) => domain !== after[index]);
+}
+
+function renewRemovedBound() {
+  const s = renewState;
+  if (!s || !s.snapshot) return [];
+  return (s.snapshot.boundDomains || []).filter((domain) => !s.draft.includes(domain));
+}
+
+function addRenewDomain(raw) {
+  const s = renewState;
+  if (!s) return;
+  const value = String(raw || '').trim().toLowerCase().replace(/\.$/, '');
+  if (!value) return;
+  if (s.draft.length >= RENEW_MAX_DOMAINS) {
+    s.warn = `${RENEW_MAX_DOMAINS} names is the cap for a certificate; remove one before adding another.`;
+    renderRenewPanel();
+    return;
+  }
+  if (!/^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(value)) {
+    s.warn = `"${value}" is not a domain name. A wildcard has to be the left-most label: *.example.com`;
+  } else if (s.draft.includes(value)) {
+    s.warn = `${value} is already in the list.`;
+  } else {
+    s.draft.push(value);
+    s.warn = '';
+    s.result = null;
+  }
+  renderRenewPanel();
+  // Adding several names in a row is the common case: keep the caret in the field.
+  const field = $('#renew-add');
+  if (field) field.focus();
+}
+
+function removeRenewDomain(value) {
+  if (!renewState) return;
+  renewState.draft = renewState.draft.filter((domain) => domain !== value);
+  renewState.warn = '';
+  renewState.result = null;
+  renderRenewPanel();
+}
+
+async function openRenewPanel(name) {
+  renewState = { name, snapshot: null, draft: [], busy: true, error: '', warn: '', result: null, adding: false };
+  renderRenewPanel();
+  $('#renew-modal').classList.add('open');
+  try {
+    const snapshot = await request('GET', `/renew/cert/${encodeURIComponent(name)}`, undefined, false, true);
+    renewState.snapshot = snapshot;
+    renewState.draft = (snapshot.desiredDomains || []).slice();
+    renewState.busy = false;
+  } catch (error) {
+    renewState.busy = false;
+    renewState.error = error.message;
+  }
+  renderRenewPanel();
+}
+
+async function applyRenew() {
+  const s = renewState;
+  if (!s || !s.snapshot || !renewDraftDirty()) return;
+  const draft = s.draft.slice();
+  s.busy = true;
+  s.warn = '';
+  renderRenewPanel();
+  try {
+    // The agent's confirmation phrase is the certificate name; clicking "File change" in a panel
+    // that names the certificate is that confirmation.
+    const body = await request('POST', `/renew/cert/${encodeURIComponent(s.name)}`, { domains: draft, confirm: s.name }, false, true);
+    s.result = body;
+    // The write landed: the declaration now is the draft, so the panel stops offering to file it
+    // again (an identical set is refused by the agent anyway -- it would only spend quota).
+    s.snapshot.desiredDomains = draft.slice();
+    recordOperation(s.name, `Filed renewal (+${(body.added || []).length} / −${(body.removed || []).length}), revision ${String(body.revisionAfter || '').slice(0, 12)}`);
+    toast(`${s.name}: change filed`);
+    setTimeout(() => $('#refresh-inventory').click(), 1500);
+  } catch (error) {
+    s.warn = error.message;
+  }
+  s.busy = false;
+  renderRenewPanel();
+}
+
+function renderRenewPanel() {
+  const s = renewState;
+  if (!s) return;
+  const modal = $('#renew-modal');
+  const snapshot = s.snapshot;
+  const desired = (snapshot && snapshot.desiredDomains) || [];
+  const added = s.draft.filter((domain) => !desired.includes(domain));
+  const removed = desired.filter((domain) => !s.draft.includes(domain));
+  const boundRemoved = renewRemovedBound();
+  const dirty = renewDraftDirty();
+  const atCap = s.draft.length >= RENEW_MAX_DOMAINS;
+  // One row per name, numbered, in declaration order: the first name is the certificate's CN, so
+  // the order is meaning, not presentation. Nothing here sorts or re-flows the list -- re-rendering
+  // must never shuffle a set an operator just arranged.
+  const rows = s.draft.length
+    ? s.draft.map((domain, index) => `<div class="renew-domain-row${added.includes(domain) ? ' added' : ''}">
+        <span class="idx">${index + 1}</span>
+        <span class="name" title="${escapeHTML(domain)}">${escapeHTML(domain)}</span>
+        ${index === 0 ? '<span class="role primary">Primary (CN)</span>' : added.includes(domain) ? '<span class="role">new</span>' : ''}
+        <button type="button" class="renew-remove" data-renew-remove="${escapeHTML(domain)}" aria-label="Remove ${escapeHTML(domain)}" title="Remove this name">×</button>
+      </div>`).join('')
+    : '<div class="renew-empty">No names left — a certificate needs at least one.</div>';
+  const result = s.result
+    ? `<section class="renew-section"><h3>Filed</h3><div class="renew-box history">
+        <div class="renew-history-row"><span class="when">revision</span><span class="detail">${escapeHTML(String(s.result.revisionBefore || '').slice(0, 12))} → ${escapeHTML(String(s.result.revisionAfter || '').slice(0, 12))}</span></div>
+        <div class="renew-history-row"><span class="when">added</span><span class="detail">${escapeHTML((s.result.added || []).join(', ') || '—')}</span></div>
+        <div class="renew-history-row"><span class="when">removed</span><span class="detail">${escapeHTML((s.result.removed || []).join(', ') || '—')}</span></div>
+        <div class="renew-history-row"><span class="when">reconcile</span><span class="detail">HTTP ${escapeHTML(String((s.result.trigger && s.result.trigger.httpStatus) || '?'))} — the daemon converges this one certificate now; the row refreshes itself.</span></div>
+        ${(s.result.boundRemoved || []).length ? `<div class="renew-history-row"><span class="when">bound</span><span class="detail">still attached to a CLB: ${escapeHTML(s.result.boundRemoved.join(', '))}</span></div>` : ''}
+      </div></section>`
+    : '';
+  const body = s.busy && !snapshot
+    ? '<p class="renew-lead">Reading the current declaration…</p>'
+    : s.error
+      ? `<p class="renew-lead">${escapeHTML(s.error)}</p><div class="security-note">The renew agent may be down (systemctl status wecert-renew-agent), or this certificate is not declared in the desired-state document.</div>`
+      : `<p class="renew-lead">Edit the names this certificate covers, then file the change. The agent validates the candidate with the daemon's dry run, keeps a backup of the desired-state document, then reconciles this one certificate.</p>
+      <section class="renew-section">
+        <h3>Domains <span class="count">${s.draft.length}</span> <span class="muted">· ordered, first name is the CN · up to ${RENEW_MAX_DOMAINS}</span></h3>
+        <div class="renew-box domains">${rows}</div>
+        ${s.adding
+          ? `<div class="renew-add-row">
+              <input id="renew-add" placeholder="www.example.com or *.example.com" autocomplete="off" spellcheck="false" ${atCap ? 'disabled' : ''}>
+              <button class="small-btn" id="renew-add-btn" type="button" ${atCap ? 'disabled' : ''}>Add</button>
+              <button class="small-btn" id="renew-add-cancel" type="button">Cancel</button>
+            </div>`
+          : `<div class="renew-add-row">
+              <button class="small-btn" id="renew-add-open" type="button" ${atCap ? 'disabled' : ''}>＋ Add domain</button>
+              ${atCap ? `<span class="field-hint">${RENEW_MAX_DOMAINS} names is the profile cap.</span>` : ''}
+            </div>`}
+      </section>
+      ${s.warn ? `<div class="renew-warn">${escapeHTML(s.warn)}</div>` : ''}
+      ${boundRemoved.length ? `<div class="renew-warn">Still bound to a CLB: <b>${escapeHTML(boundRemoved.join(', '))}</b>. Removing a name from the declaration does not detach it from the listener.</div>` : ''}
+      ${snapshot.canRenew === false ? `<div class="renew-warn">The agent is holding writes for another ${escapeHTML(String(snapshot.cooldownSeconds || 0))}s.</div>` : ''}
+      ${result}`;
+  modal.innerHTML = `<div class="modal-card wide" role="document">
+    <header class="modal-head"><h2 id="renew-title">Renew ${escapeHTML(s.name)}</h2><span class="spacer"></span><button class="icon-close" data-close-renew aria-label="Close">×</button></header>
+    <div class="renew-body">${body}</div>
+    ${snapshot && !s.error ? `<footer class="modal-actions renew-foot">
+      <span class="field-hint">${dirty ? `declaration now: ${s.draft.length} names (${added.length ? `+${added.length}` : ''}${added.length && removed.length ? ' ' : ''}${removed.length ? `−${removed.length}` : ''})` : 'no change yet'}</span>
+      <span class="spacer"></span>
+      <button class="small-btn" data-close-renew>Cancel</button>
+      <button class="primary" id="renew-apply" ${dirty ? '' : 'disabled'}>${dirty ? `File change (${added.length ? `+${added.length}` : ''}${added.length && removed.length ? ' ' : ''}${removed.length ? `−${removed.length}` : ''})` : 'No change yet'}</button>
+    </footer>` : ''}
+  </div>`;
+  modal.querySelectorAll('[data-close-renew]').forEach((button) => {
+    button.onclick = () => { modal.classList.remove('open'); renewState = null; };
+  });
+  modal.querySelectorAll('[data-renew-remove]').forEach((button) => {
+    button.onclick = () => removeRenewDomain(button.dataset.renewRemove);
+  });
+  const open = $('#renew-add-open');
+  if (open) open.onclick = () => { s.adding = true; renderRenewPanel(); };
+  const cancel = $('#renew-add-cancel');
+  if (cancel) cancel.onclick = () => { s.adding = false; renderRenewPanel(); };
+  const input = $('#renew-add');
+  if (input) {
+    input.onkeydown = (event) => { if (event.key === 'Enter') { event.preventDefault(); addRenewDomain(input.value); } };
+    input.focus();
+  }
+  const addButton = $('#renew-add-btn');
+  if (addButton) addButton.onclick = () => { const field = $('#renew-add'); addRenewDomain(field.value); };
+  const apply = $('#renew-apply');
+  if (apply) apply.onclick = applyRenew;
+}
+
+// Same-origin deployment: read through the daemon that serves this page. There is no sample
+// fallback -- a failed read keeps the last real answer on screen and turns on the banner above
+// the table. "I cannot reach the daemon" and "these are your certificates" must never look the
+// same, and the one question this page exists to answer is which certificates exist.
+if (!state.base && !state.token) loadLive().catch(() => { /* the banner already says so */ });

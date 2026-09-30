@@ -25,12 +25,21 @@ p { margin: 4px 0; color: var(--muted); }
 .table-wrap { width: 100%; }
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 th, td { border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
-th:nth-child(1) { width: 34%; }
-th:nth-child(2) { width: 17%; }
-th:nth-child(3) { width: 29%; }
-th:nth-child(4) { width: 16%; }
-th:nth-child(5) { width: 4%; }
-.sync-warning { padding: 10px 16px; background: #fff6e6; color: #94600e; font-size: 12px; }
+/* Six columns now that domains stand on their own: "which certificate is this" (name, upload
+   remark, cloud id) and "what names does it cover" are different questions and deserve different
+   widths. Sized so that at ~1080px -- the narrowest window this console is actually used in -- the
+   domain column fits three host names without truncating them. */
+th:nth-child(1) { width: 24%; }
+th:nth-child(2) { width: 22%; }
+th:nth-child(3) { width: 13%; }
+th:nth-child(4) { width: 23%; }
+th:nth-child(5) { width: 13%; }
+th:nth-child(6) { width: 5%; }
+/* Failure banner. It sits above the table and is the only thing on screen that says the rows are
+   last-known rather than current, so it carries its own "Retry now" button. */
+.sync-warning { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 12px; padding: 10px 14px; border-left: 3px solid #d98a00; border-radius: 6px; background: #fff6e6; color: #94600e; font-size: 12px; line-height: 1.6; }
+.sync-warning[hidden] { display: none; }
+.sync-warning .small-btn { flex: none; }
 .operation-log { padding: 0; list-style: none; }
 .operation-log li { padding: 8px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .danger-action { color: var(--red) !important; }
@@ -57,6 +66,42 @@ th:nth-child(5) { width: 4%; }
 .modal-card { width: min(560px, calc(100% - 32px)); padding: 24px; border-radius: 12px; background: #fff; }
 .modal-head, .modal-actions { display: flex; align-items: center; }
 .modal-actions { justify-content: flex-end; gap: 10px; margin-top: 24px; }
+/* Renew panel. Wider than the other dialogs because what it edits is a list: a certificate may
+   carry up to a hundred names, so the domain box and the history box scroll on their own. The
+   dialog itself scrolls nothing (only .renew-body does) and the footer stays put, which is what
+   keeps "File change" reachable at a hundred domains. */
+#renew-modal .modal-card.wide { display: flex; flex-direction: column; width: min(920px, calc(100vw - 48px)); max-height: calc(100dvh - 48px); overflow: hidden; }
+.renew-body { overflow-y: auto; }
+.renew-lead { margin: 10px 0 18px; font-size: 12px; line-height: 1.7; }
+.renew-section { margin: 0 0 18px; }
+.renew-section h3 { display: flex; align-items: baseline; gap: 7px; margin: 0 0 8px; color: #263941; font-size: 12px; font-weight: 670; }
+.renew-section h3 .count { padding: 1px 7px; border-radius: 999px; background: #eef3f3; color: #5d6f74; font-size: 11px; font-weight: 600; }
+.renew-section h3 .muted { color: #8b989d; font-size: 11px; font-weight: 400; }
+.renew-box { border: 1px solid #e2e9e9; border-radius: 8px; background: #fff; }
+.renew-box.domains { max-height: 300px; overflow-y: auto; }
+.renew-box.history { max-height: 150px; overflow-y: auto; }
+.renew-domain-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #f0f4f4; font-size: 12px; }
+.renew-domain-row:last-child { border-bottom: 0; }
+.renew-domain-row .idx { flex: none; width: 24px; color: #a3b0b4; font-variant-numeric: tabular-nums; text-align: right; }
+.renew-domain-row .name { flex: 1; overflow: hidden; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.renew-domain-row.added .name { color: #0f7d72; font-weight: 600; }
+.renew-domain-row .role { flex: none; padding: 1px 6px; border-radius: 999px; background: #eef3f3; color: #6a7c81; font-size: 10px; }
+.renew-domain-row .role.primary { background: #e5f5f2; color: #0f7d72; }
+.renew-remove { flex: none; padding: 0 2px; border: 0; background: none; color: #9aa8ac; font-size: 15px; line-height: 1; cursor: pointer; }
+.renew-remove:hover { color: #c0392b; }
+.renew-empty { padding: 14px 12px; color: #8b989d; font-size: 12px; }
+.renew-add-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.renew-add-row input { flex: 1; height: 36px; padding: 0 10px; border: 1px solid #d5e0e1; border-radius: 7px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+.renew-history-row { display: flex; align-items: baseline; gap: 10px; padding: 7px 12px; border-bottom: 1px solid #f0f4f4; font-size: 11.5px; line-height: 1.6; }
+.renew-history-row:last-child { border-bottom: 0; }
+.renew-history-row .when { flex: none; width: 78px; color: #8b989d; font-variant-numeric: tabular-nums; }
+.renew-history-row .result { flex: none; padding: 1px 6px; border-radius: 999px; background: #eef3f3; color: #5d6f74; font-size: 10.5px; }
+.renew-history-row .result-filed { background: #e5f5f2; color: #0f7d72; }
+.renew-history-row .result-rejected, .renew-history-row .result-error { background: #fbeef0; color: #ab5258; }
+.renew-history-row .detail { flex: 1; overflow-wrap: anywhere; color: #43545c; }
+.renew-history-row .detail em { color: #8b989d; font-style: normal; }
+.renew-foot { border-top: 1px solid #eef2f2; background: #fff; }
+.renew-warn { margin: 0 0 14px; padding: 9px 11px; border-left: 3px solid #c0392b; background: rgba(192, 57, 43, .07); color: #6c4a45; font-size: 11.5px; line-height: 1.6; }
 .toast { position: fixed; z-index: 8; right: 24px; bottom: 24px; padding: 11px 14px; border-radius: 8px; color: #fff; opacity: 0; pointer-events: none; transform: translateY(12px); transition: opacity .18s, transform .18s; }
 .toast.show { opacity: 1; transform: none; }
 
@@ -188,6 +233,12 @@ h1 { font-size: 24px; line-height: 1.3; letter-spacing: -.5px; font-weight: 650;
 .certificate-mark .ui-icon { width: 19px; height: 19px; }
 .certificate-domain { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
 .certificate-domain > span { margin-left: 5px; font-family: inherit; }
+/* Domains column: up to three names stacked, then a count. Stacked rather than joined by
+   separators, because three names on one line is where a fixed-layout table starts cutting host
+   names in the middle. */
+.domain-cell { display: grid; gap: 2px; }
+.domain-cell .domain-line { overflow: hidden; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11.5px; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; }
+.domain-cell .domain-more { color: #77888e; font-size: 11px; }
 .account-cell { font-variant-numeric: tabular-nums; }
 .unbound { display: flex; gap: 16px; color: var(--muted); font-size: 12px; }
 .status-neutral { color: #6f7e82; background: #f0f3f3; }
