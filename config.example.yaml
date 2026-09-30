@@ -40,7 +40,10 @@ stateBackup:
   # localDirs:
   #   - /mnt/backup-disk/wecert
   # Off-host destinations. S3 credentials use the standard AWS environment/profile chain;
-  # COS uses its S3-compatible endpoint and the same credential chain.
+  # COS uses an S3-compatible endpoint but NOT the AWS credential chain: it
+  # requires static credentials in TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY
+  # (or the env names in secretIdEnv / secretKeyEnv). A CVM instance role is not
+  # consulted; on a role-only host COS backups will not start.
   #
   # Read this before pointing a target at a bucket: a snapshot is a copy of state.db, so unless
   # stateEncryption.keyFile above is set it carries the ACME account key and every certificate

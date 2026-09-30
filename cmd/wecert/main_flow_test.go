@@ -1287,6 +1287,15 @@ func TestDrainNotifierWaitsOnlyForDrainers(t *testing.T) {
 	if !strings.Contains(buf.String(), "waited for in-flight notifications") {
 		t.Errorf("the evidence that accepted notifications were flushed must be logged, got:\n%s", buf.String())
 	}
+
+	buf.Reset()
+	drainNotifier(timedOutNotifier{}, log)
+	if strings.Contains(buf.String(), "waited for in-flight notifications") {
+		t.Errorf("a drain that gave up must not claim it waited, got:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "timed out waiting for in-flight notifications") {
+		t.Errorf("a dropped notification must be reported, got:\n%s", buf.String())
+	}
 }
 
 type plainNotifier struct{}
@@ -1297,7 +1306,17 @@ type drainingNotifier struct{ drains atomic.Int32 }
 
 func (d *drainingNotifier) Renewal(context.Context, string, error) {}
 
-func (d *drainingNotifier) Drain(context.Context) { d.drains.Add(1) }
+func (d *drainingNotifier) Drain(context.Context) bool {
+	d.drains.Add(1)
+	return true
+}
+
+// timedOutNotifier models a drain that gave up: the log must not claim it waited.
+type timedOutNotifier struct{}
+
+func (timedOutNotifier) Renewal(context.Context, string, error) {}
+
+func (timedOutNotifier) Drain(context.Context) bool { return false }
 
 // drainRuntimeBackground must return quietly when nothing is in flight.
 //

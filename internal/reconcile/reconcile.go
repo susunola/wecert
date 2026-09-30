@@ -64,7 +64,9 @@ type Notifier interface {
 // keeping is the "result":"error" one. Optional because a test double should not have to
 // implement a lifecycle it does not have; callers type-assert.
 type Drainer interface {
-	Drain(ctx context.Context)
+	// Drain reports whether every accepted send finished (false means the
+	// deadline or ctx gave up and some were dropped).
+	Drain(ctx context.Context) bool
 }
 
 // CertManager is the capability Reconciler needs.

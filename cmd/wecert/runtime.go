@@ -640,8 +640,12 @@ func recoveryPlan(cfg *config.Config, source string) (any, error) {
 		"snapshotAge":     time.Since(fi.ModTime()).Round(time.Second).String(),
 		"certificates":    info.Certificates,
 		"account":         info.Account,
-		"liveStatePath":   cfg.StatePath,
-		"note":            "read-only; POST /admin/recovery-drill to test the snapshot, or /admin/challenge then /admin/restore to apply it (applied on next start if the daemon holds the lock)",
+		// Sealed is why this field exists in SnapshotInfo: without it the
+		// operator verifies here, restores, and only then finds out the material
+		// needs the state key.
+		"sealed":        info.Sealed,
+		"liveStatePath": cfg.StatePath,
+		"note":          "read-only; POST /admin/recovery-drill to test the snapshot, or /admin/challenge then /admin/restore to apply it (staged now, applied on the next start)",
 	}, nil
 }
 
@@ -673,6 +677,7 @@ func recoveryDrill(cfg *config.Config, source string) (any, error) {
 		"snapshotAge":     time.Since(fi.ModTime()).Round(time.Second).String(),
 		"certificates":    info.Certificates,
 		"account":         info.Account,
+		"sealed":          info.Sealed,
 		"passed":          true,
 		"note":            "no live state was changed",
 	}, nil

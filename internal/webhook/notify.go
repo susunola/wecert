@@ -233,9 +233,13 @@ func (n *Notifier) send(ctx context.Context, ev RenewalEvent) {
 // The wait is expressed through the semaphore rather than a WaitGroup because the
 // semaphore already exists and is held for exactly the duration of a send: filling it means
 // every holder has released, that is, every send has finished.
-func (n *Notifier) Drain(ctx context.Context) {
+// Drain waits for in-flight sends. It reports whether they all finished: a
+// caller that logs "waited for notifications" unconditionally is lying when the
+// deadline or ctx gave up first, and a dropped "result: error" notice then
+// leaves no trace.
+func (n *Notifier) Drain(ctx context.Context) bool {
 	if n == nil {
-		return
+		return true
 	}
 	n.mu.Lock()
 	n.draining = true
@@ -254,10 +258,10 @@ func (n *Notifier) Drain(ctx context.Context) {
 		left := n.inFlight
 		n.mu.Unlock()
 		if left == 0 {
-			return
+			return true
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return
+			return false
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

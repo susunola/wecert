@@ -129,10 +129,16 @@ func drainNotifier(n reconcile.Notifier, log *slog.Logger) {
 	if !ok {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// The notifier's own budget is 40s (find-open + create-or-comment); give it
+	// room to actually use it. 15s here made the 40s unreachable and cut Jira
+	// tickets in half.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	d.Drain(ctx)
-	log.Info("waited for in-flight notifications before exiting")
+	if d.Drain(ctx) {
+		log.Info("waited for in-flight notifications before exiting")
+	} else {
+		log.Warn("timed out waiting for in-flight notifications; some were dropped on exit")
+	}
 }
 
 // newProvider assembles the desired-state source according to desiredState.mode.

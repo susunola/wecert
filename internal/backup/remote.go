@@ -31,7 +31,8 @@ const (
 	TypeSFTP = "sftp"
 )
 
-// Target contains no secret value. S3/COS use the AWS credential chain; SFTP
+// Target contains no secret value. S3 uses the AWS credential chain; COS takes
+// static TENCENTCLOUD_SECRET_ID/KEY (no instance-role fallback); SFTP
 // reads a password from PasswordEnv or a private key from PrivateKeyFile.
 type Target struct {
 	// HMACKey, when non-empty, makes Upload write a <object>.hmac sidecar and

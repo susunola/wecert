@@ -28,9 +28,9 @@ func (n *Notifier) deliverJira(ctx context.Context, ev RenewalEvent) error {
 	if n.jira.BaseURL == "" {
 		return fmt.Errorf("jira: baseURL is empty")
 	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
+	// No single timeout around the whole delivery: Jira's find-open and
+	// create-or-comment each get their own budget, which is what the Drain
+	// comment and the CHANGELOG describe. One shared 15s cut a ticket in half.
 	if ev.Result != "error" {
 		// Close the loop: comment on the open issue (if any) that this certificate
 		// recovered. Without it the ticket stays open after the fix, like PagerDuty
@@ -39,24 +39,27 @@ func (n *Notifier) deliverJira(ctx context.Context, ev RenewalEvent) error {
 			return nil
 		}
 		labels := jiraLabels(n.jira.Labels, ev.Cert)
-		key, err := n.jiraFindOpen(ctx, labels)
+		key, err := n.jiraFindOpenBudget(ctx, labels)
 		if err != nil || key == "" {
 			return err
 		}
-		return n.jiraComment(ctx, key, "wecert: "+ev.Cert+" renewed OK at "+ev.Timestamp+".")
+		return n.jiraCommentBudget(ctx, key, "wecert: "+ev.Cert+" renewed OK at "+ev.Timestamp+".")
 	}
 
 	labels := jiraLabels(n.jira.Labels, ev.Cert)
 	if n.jira.ReuseOpenIssue {
-		key, err := n.jiraFindOpen(ctx, labels)
+		key, err := n.jiraFindOpenBudget(ctx, labels)
 		if err != nil {
-			return err
-		}
-		if key != "" {
-			return n.jiraComment(ctx, key, jiraDescription(ev))
+			// A failed search must not swallow the ticket. "Retry next event" is
+			// not a thing -- Renewal is fire-and-forget -- so the failure alert
+			// would simply never exist. Open a new issue instead.
+			n.log.Warn("jira: could not search for an open issue; creating a new one",
+				"cert", ev.Cert, "err", err)
+		} else if key != "" {
+			return n.jiraCommentBudget(ctx, key, jiraDescription(ev))
 		}
 	}
-	return n.jiraCreate(ctx, ev, labels)
+	return n.jiraCreateBudget(ctx, ev, labels)
 }
 
 func jiraLabels(extra []string, certName string) []string {
@@ -224,4 +227,25 @@ func (n *Notifier) jiraDo(ctx context.Context, method, path string, body []byte)
 		return nil, withoutURL(err)
 	}
 	return resp, nil
+}
+
+// Each Jira API call gets its own 15s budget so a slow find-open cannot eat the
+// time the create or comment needs. Drain's 40s window is sized for exactly
+// this pair (15+15 plus slack).
+func (n *Notifier) jiraFindOpenBudget(ctx context.Context, labels []string) (string, error) {
+	c, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return n.jiraFindOpen(c, labels)
+}
+
+func (n *Notifier) jiraCreateBudget(ctx context.Context, ev RenewalEvent, labels []string) error {
+	c, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return n.jiraCreate(c, ev, labels)
+}
+
+func (n *Notifier) jiraCommentBudget(ctx context.Context, key, body string) error {
+	c, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return n.jiraComment(c, key, body)
 }
