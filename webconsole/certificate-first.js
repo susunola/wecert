@@ -509,7 +509,14 @@ $('#certificate-search').oninput = (event) => { state.search = event.target.valu
 $('#status-filter').onchange = (event) => { state.status = event.target.value; updateFilteredView(); };
 $('#sort-order').onchange = (event) => { state.sort = event.target.value; updateFilteredView(); };
 $('#refresh-inventory').onclick = async () => { try { await loadLive(); toast('Inventory updated'); } catch (error) { toast(error.message); } };
-$('#connect-backend').onclick = () => $('#backend-modal').classList.add('open');
+$('#connect-backend').onclick = () => {
+  const url = $('#backend-url');
+  // Same-origin is the right default: the daemon is usually behind the same
+  // nginx as this page. A literal http://127.0.0.1:9801 is the *browser's*
+  // loopback, not the server's, and mixed content blocks it from HTTPS anyway.
+  if (url && !url.value.trim()) url.value = location.origin;
+  $('#backend-modal').classList.add('open');
+};
 $('.inventory-heading').insertAdjacentHTML('afterend', '<p id="sync-warning" class="sync-warning" role="alert" hidden></p>');
 $('#notification-modal').innerHTML = `<form class="modal-card" id="notification-form"><header class="modal-head"><h2>Alert notifications</h2><span class="spacer"></span><button type="button" class="icon-close" data-close-notifications aria-label="Close">×</button></header><p>Renewal success and failure notifications. Expiry and CLB events are not yet emitted.</p><label class="field">Channel<select id="notify-format"><option value="wecom">WeCom</option><option value="feishu">Feishu</option><option value="dingtalk">DingTalk</option></select></label><label class="field">Robot Webhook URL<input id="notify-url" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved URL"></label><p class="security-note">Only official HTTPS robot endpoints are accepted. Signed Feishu / DingTalk robots are not supported by this form. Saving requires a daemon reload to activate.</p><p id="notify-result" role="status"></p><div class="modal-actions"><button type="button" class="small-btn" id="notify-test">Send test</button><button class="primary">Save</button></div></form>`;
 async function notificationAction(method) {
@@ -575,9 +582,20 @@ $('#backend-form').onsubmit = async (event) => {
     $('#backend-admin-token').value = '';
     toast('Connected — session remembered');
   } catch (failure) {
-    error.textContent = `Could not connect: ${failure.message}`;
+    error.textContent = 'Could not connect: ' + explainConnectError(failure);
   }
 };
+
+// "Failed to fetch" is a browser network error, not a daemon reply: the usual
+// causes are pointing at 127.0.0.1 from another machine, HTTP from an HTTPS
+// page, or a CORS-rejected cross-origin call. Say which.
+function explainConnectError(err) {
+  const msg = String((err && err.message) || err);
+  if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+    return 'Failed to reach the daemon. Use this page\'s own origin when nginx proxies /api. 127.0.0.1 is the browser\'s machine, and an HTTP URL cannot be called from an HTTPS page.';
+  }
+  return msg;
+}
 
 $('#save-uin').onclick = async () => {
   const uin = $('#new-uin').value.trim();
