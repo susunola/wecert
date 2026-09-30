@@ -26,7 +26,19 @@ type bindingMemo struct {
 // bindingMemoTTL bounds how long a parse is reused without a fresh TaskDetail read.
 // Past it the next lookup misses and the caller re-queries, so a certificate whose
 // bindings were deleted out-of-band does not report a stale answer forever.
-const bindingMemoTTL = 10 * time.Minute
+//
+// This is a DISPLAY cache: the deployment decisions never read it. The per-certificate
+// binding check calls Bindings() (which enumerates) and the binding patrol re-enumerates
+// every certificate with a deployed ID, both regardless of this TTL. Only the read-only
+// inventory reads it.
+//
+// It used to be 10 minutes while the patrol runs every 6 hours, so by the time an
+// operator opened the page the cache had always expired: the row fell back to the state
+// store and printed the count wecert deployed, with no region and no observation time --
+// the very question the inventory exists to answer. Keeping it just above the patrol
+// interval means the last patrol's rows stay visible, timestamped with when they were
+// observed, and a console-side change is at worst one patrol old.
+const bindingMemoTTL = 7 * time.Hour
 
 // bindingMemoMaxEntries is the hard ceiling on cached certificate IDs.
 //
