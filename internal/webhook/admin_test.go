@@ -25,6 +25,11 @@ func adminServer(t *testing.T, ops AdminOps) *Server {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Tests that exercise the confirm flow need a fingerprint or the token is
+	// minted for content it cannot describe and restore refuses it.
+	if ops.FingerprintSource == nil {
+		ops.FingerprintSource = func(string) (string, error) { return "test-digest", nil }
+	}
 	s, err := NewWithAdmin(rec, store, testToken,
 		AdminOptions{Token: adminTok, AuditPath: t.TempDir() + "/audit.jsonl", Ops: ops},
 		context.Background(), log)
