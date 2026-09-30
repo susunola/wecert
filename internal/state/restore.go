@@ -241,9 +241,20 @@ func restore(dest, source string, master []byte) (RestoreResult, error) {
 // actually go to. The restore notice lives beside the CONFIGURED path, because that
 // is where the next start looks for it.
 func restoreLocked(res RestoreResult, dest, realDest, source string) (RestoreResult, error) {
-	srcInfo, err := os.Stat(source)
+	// Lstat, not Stat: the pending file a restart is about to apply is as
+	// attacker-controlled as the one Restore() takes, and that entry point
+	// refuses symlinks. Following one here would let a replaced
+	// state.db.restore-pending point at any readable database.
+	srcInfo, err := os.Lstat(source)
 	if err != nil {
 		return res, fmt.Errorf("restore: read the snapshot %s: %w", source, err)
+	}
+	if srcInfo.Mode()&os.ModeSymlink != 0 {
+		return res, fmt.Errorf("restore: %s is a symlink; point at the real snapshot file so it is "+
+			"clear which bytes are being restored", source)
+	}
+	if !srcInfo.Mode().IsRegular() {
+		return res, fmt.Errorf("restore: %s is not a regular file (%s)", source, srcInfo.Mode().Type())
 	}
 	dir := filepath.Dir(realDest)
 	staged := realDest + restoreStagedSuffix

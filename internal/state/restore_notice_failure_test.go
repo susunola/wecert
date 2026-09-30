@@ -1,6 +1,7 @@
 package state
 
 import (
+	"strings"
 	"os"
 	"path/filepath"
 	"testing"
@@ -44,5 +45,29 @@ func TestRestoreSucceedsWhenNoticeCannotBeWritten(t *testing.T) {
 	account, err := installed.GetAccount("https://acme.example/d")
 	if err != nil || string(account.PrivateKeyPEM) != "KEY" {
 		t.Fatalf("restored account = %#v, %v", account, err)
+	}
+}
+
+// The pending file a restart applies is as attacker-controlled as the source
+// Restore() takes, and that entry point refuses symlinks.
+func TestRestoreLockedRejectsASymlinkedSource(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "state.db.backup-20260101T000000.000Z.db")
+	snap, err := OpenSealed(real, []byte("master"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = snap.Close()
+	link := filepath.Join(dir, "state.db.restore-pending")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	_, err = restoreLocked(RestoreResult{}, filepath.Join(dir, "state.db"),
+		filepath.Join(dir, "state.db"), link)
+	if err == nil {
+		t.Fatal("a symlinked pending restore must be refused")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error should name the symlink, got %v", err)
 	}
 }

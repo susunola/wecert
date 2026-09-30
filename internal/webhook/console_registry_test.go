@@ -142,3 +142,30 @@ func newTestSessionServer(t *testing.T) *Server {
 		limiter:   newAuthLimiter(),
 	}
 }
+
+// The DNS token already lives in a 0600 file; the registry must not carry a
+// second plain-text copy beside the state database.
+func TestConsoleRegistryDoesNotStoreTheDNSToken(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state.db")
+	dns := &DNSCredential{Provider: "cloudflare", Cred: "token", Token: "super-secret", File: "/etc/wecert/x"}
+	rec := ConsoleCertificate{Name: "c", Domains: []string{"a.example.com"}}
+	san := dns.Sanitized()
+	rec.DNS = &san
+	if err := WriteConsoleCertificates(state, [][]ConsoleCertificate{{rec}}[0]); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "console-certificates.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "super-secret") {
+		t.Fatalf("registry leaked the DNS token:\n%s", raw)
+	}
+	if strings.Contains(string(raw), "/etc/wecert/x") {
+		t.Fatalf("registry leaked the credential path:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), "cloudflare") {
+		t.Fatalf("registry should keep the provider name:\n%s", raw)
+	}
+}

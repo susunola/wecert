@@ -319,6 +319,7 @@ func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
 	if len(t.HMACKey) > 0 {
 		if err := verifySFTPSignature(ctx, t, src); err != nil {
 			_ = os.Remove(src)
+			_ = os.Remove(src + ".remotekey")
 			return "", err
 		}
 	}
@@ -468,7 +469,11 @@ func downloadS3(ctx context.Context, t Target, dir string) (string, error) {
 		return "", err
 	}
 	if err := verifyAgainstSidecar(ctx, t, src); err != nil {
+		// Drop the bookkeeping sidecar too: a failed verify leaves nothing useful
+		// behind, and the .remotekey file otherwise accumulates in the state
+		// directory on every rejected download.
 		_ = os.Remove(src)
+		_ = os.Remove(src + ".remotekey")
 		return "", err
 	}
 	return src, nil
@@ -653,11 +658,15 @@ func pruneS3(ctx context.Context, client *s3.Client, t Target, current string) e
 	//   - a future-stamped name is always a victim and never the download "newest",
 	//     so it cannot hold a Keep slot forever.
 	//
-	// Victim count is len-Keep (the local rule), not "everything except the newest
-	// Keep names": on the signed path prune runs twice and the second pass's
-	// `current` is the .hmac sidecar, which is not in `snapshots` at all. Protecting
-	// a name and then keeping `Keep` of the rest would retain Keep+1 on that pass.
-	currentBase := filepath.Base(current)
+	// Victim count is len-Keep of the CURRENT list, so protecting one name does
+	// not inflate the keep: after the first pass the list is already shorter.
+	//
+	// On the signed path prune runs twice and the second pass's `current` is the
+	// .hmac sidecar. That name is not in `snapshots`, so the protect used to be a
+	// no-op there and the "future-dated" pass could delete the object that was
+	// uploaded moments ago. Strip the suffix so protect covers the snapshot the
+	// sidecar signs -- the same rule pruneSFTP follows.
+	currentBase := strings.TrimSuffix(filepath.Base(current), ".hmac")
 	sort.Slice(snapshots, func(i, j int) bool {
 		a, b := snapshots[i].Key, snapshots[j].Key
 		if a == nil {
@@ -726,9 +735,27 @@ func pruneS3(ctx context.Context, client *s3.Client, t Target, current string) e
 		}
 		return nil
 	}
-	_, err = client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: &t.Bucket, Delete: &types.Delete{Objects: victims, Quiet: ptr(true)}})
+	// Quiet:false so a per-key refusal comes back in Errors. Quiet swallows them
+	// and err==nil would report a retention pass that silently left the victims
+	// (and their .hmac sidecars) in place.
+	resp, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: &t.Bucket, Delete: &types.Delete{Objects: victims}})
 	if err != nil {
 		return fmt.Errorf("prune remote snapshots: %w", err)
+	}
+	if resp != nil && len(resp.Errors) > 0 {
+		var parts []string
+		for _, e := range resp.Errors {
+			key, code := "", ""
+			if e.Key != nil {
+				key = *e.Key
+			}
+			if e.Code != nil {
+				code = *e.Code
+			}
+			parts = append(parts, key+": "+code)
+		}
+		return fmt.Errorf("prune remote snapshots: %d object(s) were not deleted: %s",
+			len(resp.Errors), strings.Join(parts, "; "))
 	}
 	return nil
 }

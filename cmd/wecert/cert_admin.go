@@ -325,10 +325,16 @@ func createCertificateAdmin(cfg *config.Config, body webhook.CreateCertificateRe
 		// every previously recorded certificate disappears.
 		return nil, err
 	}
-	list = append(list, webhook.ConsoleCertificate{
+	// Persist the credential kind, never the secret: the token is already in a
+	// 0600 file under dns/.
+	rec := webhook.ConsoleCertificate{
 		Name: name, Domains: domains, Profile: profile, KeyType: keyType, UIN: uin,
-		DNS: dnsCfg,
-	})
+	}
+	if dnsCfg != nil {
+		san := dnsCfg.Sanitized()
+		rec.DNS = &san
+	}
+	list = append(list, rec)
 	if err := webhook.WriteConsoleCertificates(cfg.StatePath, list); err != nil {
 		return nil, err
 	}

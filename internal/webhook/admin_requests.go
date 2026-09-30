@@ -51,6 +51,16 @@ type CreateListenerRequest struct {
 	SNI *bool `json:"sni"`
 }
 
+// Sanitized returns a copy without the secret material. The console registry
+// keeps the provider and the credential *kind* for display; the token itself
+// already lives in a 0600 file on the daemon host and must not be duplicated
+// in plain text beside the state database.
+func (d DNSCredential) Sanitized() DNSCredential {
+	d.Token = ""
+	d.File = ""
+	return d
+}
+
 // SNIMode reports whether this listener should use SNI (default on).
 func (c *CreateListenerRequest) SNIMode() bool {
 	if c == nil || c.SNI == nil {
