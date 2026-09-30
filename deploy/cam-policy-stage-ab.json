@@ -43,6 +43,8 @@
         "clb:DescribeLoadBalancerListeners",
         "clb:ModifyListener",
         "clb:DeleteListener",
+        "clb:CreateRule",
+        "clb:ModifyDomainAttributes",
         "clb:DescribeResources",
         "clb:DescribeQuota"
       ],

@@ -21,6 +21,18 @@
 
 ### Fixed
 
+- **The shipped CAM policies grant the CLB calls the console bind makes.**
+  `cert_admin.go` creates an HTTPS listener, creates an SNI rule, and modifies
+  listeners and domain attributes, but no shipped policy granted
+  `clb:CreateListener`, `clb:CreateRule`, `clb:ModifyListener`, or
+  `clb:ModifyDomainAttributes`, so a bind could fail on authorization in every
+  environment that follows these policies. All three policies now grant them.
+- **CI gates pass again on `main.`** `internal/state/certs.go` and
+  `internal/config/config_test.go` kept stray blank lines that failed `gofmt`
+  since the management-console commits; the page also carried a Chinese
+  AI-generation label and a full-width parenthesis that failed the
+  English-source scan. Both are fixed, and `/.workbuddy/` and `/outputs/` are
+  ignored so local review exports can never fail that scan.
 - **The standalone management console removes its browser-only ACME switch.**
   The original management layout is retained without the Staging/Production
   selector, environment badge, or hardcoded issuance-directory claim. Certificate

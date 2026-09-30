@@ -24,7 +24,11 @@
       "effect": "allow",
       "action": [
         "clb:DescribeLoadBalancers",
-        "clb:DescribeListeners"
+        "clb:DescribeListeners",
+        "clb:CreateListener",
+        "clb:ModifyListener",
+        "clb:CreateRule",
+        "clb:ModifyDomainAttributes"
       ],
       "resource": [
         "*"
