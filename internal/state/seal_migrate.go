@@ -48,6 +48,36 @@ func (s *Store) migrateSealedMaterial() error {
 				return err
 			}
 			if bytes.HasPrefix(blob, sealedPrefixV2) {
+				// A v2 blob is usually already current, so it is skipped. It must
+				// still be opened once: an earlier buggy migration stored
+				// v2(v1(plain)) and open peels only the v2 layer, so a bare
+				// prefix check would leave the row unreadable forever -- nothing
+				// else revisits it, and the failure surfaces much later as a PEM
+				// parse error in the business path.
+				opened, err := s.sealer.open(blob, []byte(spec.aad+id))
+				if err != nil {
+					// Cannot open: the master key is not the one this row was
+					// sealed with. That is not a migration failure -- the row is
+					// left alone and the read path reports the mismatch, exactly
+					// as it did before this check existed. Failing here would
+					// make a wrong key refuse to open the store at all.
+					continue
+				}
+				if !isSealed(opened) {
+					continue // genuinely v2(plain): already current
+				}
+				plain, err := s.sealer.open(opened, []byte(spec.aad+id))
+				if err != nil {
+					rows.Close()
+					return fmt.Errorf("open the inner layer of double-sealed %s.%s %q: %w",
+						spec.table, spec.column, id, err)
+				}
+				sealed, err := s.sealer.seal(plain, []byte(spec.aad+id))
+				if err != nil {
+					rows.Close()
+					return err
+				}
+				todo = append(todo, pending{id: id, sealed: sealed})
 				continue
 			}
 			// Plaintext or v1: seal (or re-seal) with the current KDF.

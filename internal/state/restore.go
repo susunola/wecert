@@ -92,6 +92,11 @@ type RestoreResult struct {
 	// "did I restore the right file?" without a second command.
 	Certificates int
 	Account      bool
+	// NoticeWarning is set when the snapshot installed but the .restored notice could not be
+	// written. That is a warning, not a failed restore: the database is already in place, and
+	// returning an error there kept the pending file and made open() refuse to start, so a disk
+	// that filled up during the install looped the restore forever and piled up .replaced-* copies.
+	NoticeWarning string
 }
 
 // RestoreNotice is the record a restore leaves behind, and the input to the warning that a later
@@ -289,9 +294,13 @@ func restoreLocked(res RestoreResult, dest, realDest, source string) (RestoreRes
 		SourceWrittenAt: srcInfo.ModTime().UTC(),
 		Replaced:        replaced,
 	}
+	// The snapshot is already installed. A notice that cannot be written is a
+	// warning the operator must see, not a failed restore: returning an error
+	// here kept the pending file and made open() refuse to start, so a disk that
+	// filled during the install looped the restore forever.
 	if err := writeRestoreNotice(dest, notice); err != nil {
-		return res, fmt.Errorf("restore: the snapshot is in place, but recording it failed, so the "+
-			"next start will not warn about the rate-limit ledger: %w", err)
+		res.NoticeWarning = "the snapshot is in place, but recording it failed, so the " +
+			"next start will not warn about the rate-limit ledger: " + err.Error()
 	}
 	return res, nil
 }
@@ -453,8 +462,18 @@ func checkSnapshotPayload(db *sql.DB, path string, seal *sealer) (sealed bool, e
 			if seal == nil {
 				return nil
 			}
-			if _, err := seal.open(blob, []byte(aad)); err != nil {
+			opened, err := seal.open(blob, []byte(aad))
+			if err != nil {
 				return fmt.Errorf("restore: the %s of %s in %s cannot be opened with the configured state key: %w", kind, subject, path, err)
+			}
+			// A single open peels one layer. An earlier buggy migration stored
+			// v2(v1(plain)); without this check the outer layer comes off cleanly
+			// and a double-sealed row passes validation as if it were fine.
+			if isSealed(opened) {
+				return fmt.Errorf("restore: the %s of %s in %s is sealed twice (v2 over v1); "+
+					"this database was written by a build with a broken seal migration. "+
+					"Start the current daemon once against it to repair, or use an older snapshot",
+					kind, subject, path)
 			}
 			return nil
 		}

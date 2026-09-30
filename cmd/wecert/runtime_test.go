@@ -929,3 +929,47 @@ func TestOncePassClosesTheListenersBeforeItDrains(t *testing.T) {
 		t.Errorf("stopListeners called %d time(s) on the snapshot-failure path, want 1", stopped)
 	}
 }
+
+// The whitelist and the source must be normalised the same way. When they were
+// not (Abs for the allowed dirs, EvalSymlinks for the source), any state path
+// that crosses a symlink -- macOS /var -> /private/var, or a symlinked backup
+// mount -- refused every named snapshot, while "latest" still worked.
+func TestAdminRestoreSourceAllowedThroughSymlinkedDir(t *testing.T) {
+	real := t.TempDir()
+	base := t.TempDir()
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	backupDir := filepath.Join(real, "backup")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{StatePath: filepath.Join(link, "state.db")}
+	cfg.StateBackup.Dir = filepath.Join(link, "backup")
+
+	name := "state.db.backup-20260101T000000.000Z.db"
+	if err := os.WriteFile(filepath.Join(backupDir, name), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Named through the symlink: must be allowed.
+	if err := adminRestoreSourceAllowed(cfg, filepath.Join(link, "backup", name)); err != nil {
+		t.Errorf("named snapshot through a symlinked directory must be allowed, got %v", err)
+	}
+	// And through the real path too.
+	if err := adminRestoreSourceAllowed(cfg, filepath.Join(backupDir, name)); err != nil {
+		t.Errorf("named snapshot through the real directory must be allowed, got %v", err)
+	}
+	// A symlink pointing outside must still be refused.
+	outside := filepath.Join(base, "outside.db")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	smuggle := filepath.Join(backupDir, "state.db.backup-20260101T000000.000Z.db.link")
+	if err := os.Symlink(outside, smuggle); err != nil {
+		t.Fatal(err)
+	}
+	if err := adminRestoreSourceAllowed(cfg, smuggle); err == nil {
+		t.Error("a symlink pointing outside the snapshot directories must be refused")
+	}
+}

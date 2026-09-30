@@ -554,22 +554,33 @@ func adminRestoreSourceAllowed(cfg *config.Config, source string) error {
 	if dir == "" {
 		dir = filepath.Dir(cfg.StatePath)
 	}
+	// Both sides must be normalised the same way. The whitelist used to be
+	// built with filepath.Abs while the source was EvalSymlinks'd, so on a host
+	// where the state path crosses a symlink (macOS: /var -> /private/var) the
+	// parent never matched and naming a snapshot file was always refused.
+	normalise := func(p string) string {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return real
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			return abs
+		}
+		return p
+	}
 	allowed := map[string]bool{}
 	for _, d := range []string{dir, filepath.Dir(cfg.StatePath)} {
 		if d == "" {
 			continue
 		}
-		if abs, err := filepath.Abs(d); err == nil {
-			allowed[abs] = true
-		}
+		allowed[normalise(d)] = true
 	}
 	for _, t := range cfg.StateBackup.LocalDirs {
-		if abs, err := filepath.Abs(t); err == nil {
-			allowed[abs] = true
+		if t != "" {
+			allowed[normalise(t)] = true
 		}
 	}
 	if fi, err := os.Stat(source); err == nil && fi.IsDir() {
-		if abs, err := filepath.Abs(source); err == nil && allowed[abs] {
+		if allowed[normalise(source)] {
 			return nil
 		}
 	}
@@ -579,9 +590,7 @@ func adminRestoreSourceAllowed(cfg *config.Config, source string) error {
 	}
 	// Resolve symlinks before the directory check and the name check: a link
 	// under an allowed directory must not smuggle in bytes from anywhere else.
-	if real, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = real
-	}
+	abs = normalise(abs)
 	parent := filepath.Dir(abs)
 	if !allowed[parent] {
 		return fmt.Errorf("admin restore source %s is outside the snapshot directories; "+
