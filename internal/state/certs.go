@@ -370,7 +370,6 @@ func (s *Store) RecordFailure(name, lastErr string, consecutiveFailures int, nex
 
 // GetOrder reads the in-flight order; returns (nil, nil) when it does not exist.
 
-
 // DeleteCert removes a certificate and everything that hangs off it (orders,
 // authorizations, probe samples). Called when the console or config drops a
 // name for good: leaving the row behind makes every later pass log "no longer

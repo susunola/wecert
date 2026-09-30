@@ -1,4 +1,3 @@
-<!-- AI生成 -->
 <!doctype html>
 <html lang="en" data-theme="light">
   <head>
@@ -1150,8 +1149,6 @@ tr.group td {
     </style>
   </head>
   <body>
-<p data-aigc-mark="1" style="margin:0 0 8px;font-size:10px;line-height:1.3;color:#6b6560;font-weight:400;">AI生成</p>
-
 <header class="topbar">
       <div class="topbar-inner">
       <a class="brand" href="#" aria-label="wecert">
@@ -2128,7 +2125,7 @@ function openDetail(id) {
           <dt>CertId</dt><dd>${esc(c.deployedCertId || "—")}</dd>
           <dt>Account UIN</dt><dd>${esc(c.uin || "Unspecified")}</dd>
           <dt>Profile</dt><dd>${esc(c.profile)} / ${esc(c.keyType)}</dd>
-          <dt>Expires in</dt><dd>${d == null ? "Not issued" : `${new Date(c.notAfter).toISOString().slice(0, 10)} (${d} days）`}</dd>
+          <dt>Expires in</dt><dd>${d == null ? "Not issued" : `${new Date(c.notAfter).toISOString().slice(0, 10)} (${d} days)`}</dd>
           <dt>Deploy status</dt><dd>${c.deployConfirmed ? "Confirmed" : c.deployedCertId ? "Uploaded, unconfirmed" : "—"}</dd>
         </dl>
         <div class="chips" style="margin-top:10px">${c.domains.map((x) => `<span class="chip">${esc(x)}</span>`).join("")}</div>

@@ -47,3 +47,10 @@ gomodcache/
 gopath/
 # Terraform plan files written by testenv runs with a name other than the ignored `tfplan`.
 tfplan-*
+
+# WorkBuddy working state and generated review artifacts (screenshots, concept
+# exports, inspection reports). They are local deliverables, not source, and
+# scripts/check-english.py scans by content -- a Chinese review report here
+# would fail the gate simply by being committed.
+/.workbuddy/
+/outputs/

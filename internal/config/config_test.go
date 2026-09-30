@@ -1378,8 +1378,6 @@ func TestIdentifiersThatCannotBeIssuedAreRejected(t *testing.T) {
 	}
 }
 
-
-
 // A ${TENCENTCLOUD_SECRET_ID} reference in the YAML must be expanded before use.
 // Sending the literal "${...}" to the provider fails as SecretIdNotFound, far from
 // the cause. Unresolvable references become empty and fall through to the env.
