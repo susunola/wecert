@@ -1000,8 +1000,12 @@
     const total = state.certs.length;
     const uins = state.uins.length;
     $("#foot-dot").classList.remove("hidden");
+    // A certificate that has not been assigned a UIN yet leaves the count at
+    // zero, and "across 0 UINs" reads like a broken counter. Drop the clause
+    // instead of printing a number that cannot be right.
+    const scope = uins > 0 ? " across " + uins + " UIN" + (uins === 1 ? "" : "s") : "";
     $("#foot-text").textContent = "Live inventory · " + cs.length + " of " + total +
-      " certificate" + (total === 1 ? "" : "s") + " across " + uins + " UIN" + (uins === 1 ? "" : "s");
+      " certificate" + (total === 1 ? "" : "s") + scope;
     const snap = state.snapshot;
     $("#foot-meta").textContent = snap && snap.time ? "Snapshot " + String(snap.time).replace("T", " ").slice(0, 16) + " UTC" : "";
   }

@@ -71,7 +71,9 @@ FIXTURE = {
 CREATED = []
 
 
-def route_handler(page, inventory, status_code=200):
+def route_handler(page, inventory, status_code=200, accounts=None):
+    acc = ACCOUNTS if accounts is None else accounts
+
     def handle(route):
         url = route.request.url
         method = route.request.method
@@ -81,7 +83,7 @@ def route_handler(page, inventory, status_code=200):
             route.fulfill(status=status_code, content_type="application/json",
                           body=json.dumps(inventory if status_code == 200 else {"error": "unauthorized"}))
         elif "/api/accounts" in url:
-            route.fulfill(status=200, content_type="application/json", body=json.dumps(ACCOUNTS))
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(acc))
         elif "/admin/certificates" in url and method == "POST":
             CREATED.append(json.loads(route.request.post_data or "{}"))
             route.fulfill(status=200, content_type="application/json",
@@ -118,9 +120,9 @@ class Console2Regression(unittest.TestCase):
         self.ctx.close()
 
     # -- helpers -----------------------------------------------------------
-    def load(self, inventory=None, status_code=200, tokens=None):
+    def load(self, inventory=None, status_code=200, tokens=None, accounts=None):
         inv = FIXTURE if inventory is None else inventory
-        self.page.route("**/*", route_handler(self.page, inv, status_code))
+        self.page.route("**/*", route_handler(self.page, inv, status_code, accounts))
         if tokens:
             readonly, admin = tokens
             script = "try{localStorage.setItem('wecert.token',%r);" % readonly
@@ -222,6 +224,18 @@ class Console2Regression(unittest.TestCase):
         foot = self.text("#foot-text")
         self.assertIn("Live inventory · 5 of 5 certificates across 2 UINs", foot)
         self.assertIn("Snapshot 2026-10-01 10:20 UTC", self.text("#foot-meta"))
+
+    def test_footer_omits_the_uin_clause_when_nothing_carries_one(self):
+        # A brand-new certificate has no UIN yet, so the UIN count is zero.
+        # "across 0 UINs" reads like a broken counter, so the clause is dropped.
+        inv = dict(FIXTURE,
+                   certificates=[cert("welcome", "<nil>", "not_issued", ["wecome.invalid"])])
+        self.load(inventory=inv, tokens=(READONLY, ""), accounts={"accounts": []})
+        foot = self.text("#foot-text")
+        self.assertIn("Live inventory · 1 of 1 certificate", foot,
+                      "singular certificate, no UIN clause")
+        self.assertNotIn("across", foot, "the UIN clause must not be printed at zero")
+        self.assertNotIn("0 UIN", foot)
 
     def test_row_menu_warns_without_a_distinct_admin_token(self):
         self.load(tokens=(READONLY, ""))
