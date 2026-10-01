@@ -964,7 +964,7 @@ body.detail-open { overflow: hidden; }
           <div class="field">
             <label class="field-label" for="certificate-dns-cred">DNS credential</label>
             <select id="certificate-dns-cred">
-              <option value="reused">Reuse saved credential</option>
+              <option value="reused">Saved credential</option>
               <option value="token">Scoped API token</option>
               <option value="file">Key file on host</option>
             </select>
@@ -1004,19 +1004,19 @@ body.detail-open { overflow: hidden; }
             <div class="field">
               <label class="field-label" for="certificate-profile">ACME profile</label>
               <select id="certificate-profile">
-                <option value="classic">Classic (90-day validity)</option>
-                <option value="shortlived">Short-lived (6-day validity)</option>
+                <option value="classic">Classic · 90 days</option>
+                <option value="shortlived">Short-lived · 6 days</option>
               </select>
               <span class="field-help">Classic is standard Let’s Encrypt.</span>
             </div>
             <div class="field">
               <label class="field-label" for="certificate-key">Key algorithm</label>
               <select id="certificate-key">
-                <option value="ecdsa-p256">ECDSA P-256 (recommended)</option>
+                <option value="ecdsa-p256">ECDSA P-256</option>
                 <option value="ecdsa-p384">ECDSA P-384</option>
                 <option value="rsa2048">RSA 2048</option>
               </select>
-              <span class="field-help">ECDSA is faster and smaller.</span>
+              <span class="field-help">Recommended. ECDSA is faster and smaller.</span>
             </div>
             <div class="field">
               <label class="field-label" for="certificate-renew">Renew before expiry</label>
