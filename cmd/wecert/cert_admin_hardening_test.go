@@ -8,26 +8,34 @@ import (
 
 	"github.com/susunola/wecert/internal/config"
 	"github.com/susunola/wecert/internal/webhook"
+	"gopkg.in/yaml.v3"
 )
 
 // A name containing a newline must not be able to inject new config keys.
-func TestRenderCertificateEntryRejectsYAMLInjection(t *testing.T) {
+func TestCertificateNodeRejectsYAMLInjection(t *testing.T) {
 	evil := "evil\n  attackerKey: pwned\n  keep: x"
-	if _, err := renderCertificateEntry(evil, []string{"a.example.com"},
+	if _, err := certificateNode(evil, []string{"a.example.com"},
 		"classic", "ecdsa-p256", "720h", "1000", "clb"); err == nil {
 		t.Fatal("a name with a newline must be rejected, not rendered")
 	}
 	// A quoted-safe name still renders.
-	out, err := renderCertificateEntry("ok-cert", []string{"a.example.com"},
+	node, err := certificateNode("ok-cert", []string{"a.example.com"},
 		"classic", "ecdsa-p256", "720h", "1000", "clb")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out, "attackerKey") {
-		t.Errorf("unexpected injected key:\n%s", out)
+	if node.Kind != yaml.MappingNode {
+		t.Fatalf("certificate node must be a mapping, got %d", node.Kind)
 	}
-	if !strings.Contains(out, "name: ok-cert") {
-		t.Errorf("entry missing name:\n%s", out)
+	if got := yamlFind(node, "name"); got == nil || got.Value != "ok-cert" {
+		t.Errorf("entry missing name: %+v", node)
+	}
+	out, err := yaml.Marshal(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "attackerKey") {
+		t.Errorf("unexpected injected key:\n%s", out)
 	}
 }
 

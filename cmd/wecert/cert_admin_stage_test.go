@@ -97,16 +97,71 @@ webhook:
 	}
 }
 
-func TestInsertCertificateBlockIntoEmptyList(t *testing.T) {
+func TestStageCertificateIntoEmptyList(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
 	config := "certificates: []\ntencent:\n  secretId: id\n"
-	got, err := insertCertificateBlock(config, "\n  - name: only\n")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stageCertificateInConfig(path, "only", []string{"only.example.com"},
+		"classic", "ecdsa-p256", "", "", "none"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(got, "certificates: []") {
-		t.Errorf("empty list placeholder should be replaced, got:\n%s", got)
+	text := string(got)
+	if strings.Contains(text, "certificates: []") {
+		t.Errorf("empty list placeholder should be replaced, got:\n%s", text)
 	}
-	if strings.Index(got, "- name: only") > strings.Index(got, "tencent:") {
-		t.Errorf("entry landed after tencent:\n%s", got)
+	if strings.Index(text, "- name: only") > strings.Index(text, "tencent:") {
+		t.Errorf("entry landed after tencent:\n%s", text)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(got, &doc); err != nil {
+		t.Fatalf("config no longer parses: %v\n%s", err, text)
+	}
+}
+
+func TestStageCertificateIntoInlineList(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	config := "certificates: [{name: a, domains: [a.example.com]}]\ntencent:\n  secretId: id\n"
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stageCertificateInConfig(path, "fresh", []string{"fresh.example.com"},
+		"classic", "ecdsa-p256", "", "", "none"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(got, &doc); err != nil {
+		t.Fatalf("inline certificates list must stay parseable after append: %v\n%s", err, got)
+	}
+	if certs, ok := doc["certificates"].([]any); !ok || len(certs) != 2 {
+		t.Fatalf("want 2 certificates, got %#v", doc["certificates"])
+	}
+}
+
+func TestStageCertificateDeduplicatesByParsedName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	config := "certificates:\n  - name: \"fresh\"\n    domains: [fresh.example.com]\n"
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := stageCertificateInConfig(path, "fresh", []string{"fresh.example.com"},
+		"classic", "ecdsa-p256", "", "", "none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "already-present" {
+		t.Fatalf("a quoted name: \"fresh\" must dedupe against the bare name, got %q", got)
 	}
 }

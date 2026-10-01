@@ -100,21 +100,23 @@ type certificateEntry struct {
 	} `yaml:"deploy"`
 }
 
-// renderCertificateEntry returns one YAML list item, indented two spaces to sit
-// inside the certificates: sequence.
-func renderCertificateEntry(name string, domains []string, profile, keyType, renewBefore, uin, deploy string) (string, error) {
+// certificateNode renders one certificate entry as a YAML mapping node. Building
+// the node from a typed struct (rather than splicing a string) is what stops a
+// name or domain carrying a newline from injecting new config keys, and what lets
+// the entry sit in the certificates sequence as a real node for the tree edit.
+func certificateNode(name string, domains []string, profile, keyType, renewBefore, uin, deploy string) (*yaml.Node, error) {
 	if err := safePathComponent("name", name); err != nil {
-		return "", err
+		return nil, err
 	}
 	if len(domains) == 0 {
-		return "", webhook.InvalidRequestf("at least one domain is required")
+		return nil, webhook.InvalidRequestf("at least one domain is required")
 	}
 	for _, d := range domains {
 		if d == "" {
-			return "", webhook.InvalidRequestf("domains must not contain empty entries")
+			return nil, webhook.InvalidRequestf("domains must not contain empty entries")
 		}
 		if err := config.ValidateDomain(d); err != nil {
-			return "", webhook.InvalidRequestf("invalid domain %q: %v", d, err)
+			return nil, webhook.InvalidRequestf("invalid domain %q: %v", d, err)
 		}
 	}
 	var e certificateEntry
@@ -135,21 +137,16 @@ func renderCertificateEntry(name string, domains []string, profile, keyType, ren
 	}
 	raw, err := yaml.Marshal(e)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-	for i, line := range lines {
-		lines[i] = "  " + line
+	var node yaml.Node
+	if err := yaml.Unmarshal(raw, &node); err != nil {
+		return nil, err
 	}
-	item := "- " + strings.TrimPrefix(lines[0], "  ") + "\n" + strings.Join(lines[1:], "\n")
-	// Indent the whole item so it lands INSIDE the certificates: sequence.
-	// A column-0 "- name:" after `  - name: demo` is not a list item, it is a
-	// second top-level document fragment and the file no longer parses.
-	body := strings.Split(item, "\n")
-	for i, line := range body {
-		body[i] = "  " + line
+	if len(node.Content) != 1 || node.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("certificate entry did not encode to a single mapping")
 	}
-	return strings.Join(body, "\n"), nil
+	return node.Content[0], nil
 }
 
 // registerCertAdminOps fills the certificate/account management seams the web
@@ -460,9 +457,11 @@ func createCertificateAdmin(cfg *config.Config, body webhook.CreateCertificateRe
 
 	staged, err := stageCertificateInConfig(configPathForAdmin, name, domains, profile, keyType, uin, renewBefore, deploy)
 	if err != nil {
-		log.Warn("could not write the certificate into the config; console record only", "cert", name, "err", err)
-		return map[string]any{"ok": true, "name": name, "status": "registered",
-			"note": "saved to the console registry only: " + err.Error()}, nil
+		// The registry row is already written, but the daemon config is not: the
+		// certificate will not be issued, so reporting ok:true would lie to the
+		// operator. Fail loudly instead.
+		log.Error("could not write the certificate into the config", "cert", name, "err", err)
+		return nil, fmt.Errorf("certificate recorded in the console registry, but writing the daemon config failed; fix the configuration and retry: %w", err)
 	}
 	log.Info("certificate written to the config", "cert", name, "config", configPathForAdmin)
 	if err := signalSelf(syscall.SIGHUP); err != nil {
@@ -499,7 +498,12 @@ func renewBeforeToGoDuration(s string) string {
 	}
 }
 
-// stageCertificateInConfig appends one certificate to config.yaml's certificates list.
+// stageCertificateInConfig appends one certificate to config.yaml's certificates
+// list by editing the YAML tree, exactly as removal does. Editing the tree
+// (rather than splicing text) keeps the document valid whether the list is
+// written inline (certificates: [{...}]) or with any indentation, and makes
+// "already present" compare parsed names instead of bytes -- so `name: "x"` and
+// `name: x` are the same certificate, not two.
 func stageCertificateInConfig(path, name string, domains []string, profile, keyType, uin, renewBefore, deploy string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("config path is unknown to this process")
@@ -508,71 +512,45 @@ func stageCertificateInConfig(path, name string, domains []string, profile, keyT
 	if err != nil {
 		return "", err
 	}
-	text := string(raw)
-	if strings.Contains(text, "\n  - name: "+name+"\n") {
-		return "already-present", nil
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return "", fmt.Errorf("invalid configuration")
 	}
-	block, err := renderCertificateEntry(name, domains, profile, keyType, renewBefore, uin, deploy)
+	root := doc.Content[0]
+	certs := yamlFind(root, "certificates")
+	if certs == nil {
+		certs = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "certificates"},
+			certs)
+	} else if certs.Kind != yaml.SequenceNode {
+		return "", fmt.Errorf("configuration certificates must be a list")
+	}
+	// Force block style so an inline certificates: [{...}] is rewritten as a
+	// block list before a new entry is appended -- splicing a block item into a
+	// flow sequence is what produced a document the parser rejected.
+	certs.Style = 0
+	for _, item := range certs.Content {
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		if got := yamlFind(item, "name"); got != nil && got.Value == name {
+			return "already-present", nil
+		}
+	}
+	entry, err := certificateNode(name, domains, profile, keyType, renewBefore, uin, deploy)
 	if err != nil {
 		return "", err
 	}
-	text, err = insertCertificateBlock(text, block)
+	certs.Content = append(certs.Content, entry)
+	updated, err := encodeYAML(&doc)
 	if err != nil {
 		return "", err
 	}
-	if err := atomicfile.Write(path, []byte(text), 0o600); err != nil {
+	if err := atomicfile.Write(path, updated, 0o600); err != nil {
 		return "", err
 	}
 	return "added-to-config", nil
-}
-
-// insertCertificateBlock appends a certificate entry to the certificates list.
-//
-// The block must land INSIDE that list: appending it to the end of the file
-// puts the entry after whatever follows (tencent:, webhook:, ...) and produces
-// unparseable YAML. The insertion point is the first line after the list that is
-// not blank and not indented -- i.e. the next top-level key, or EOF.
-func insertCertificateBlock(text, block string) (string, error) {
-	if strings.Contains(text, "certificates: []") {
-		return strings.Replace(text, "certificates: []", "certificates:\n"+block, 1), nil
-	}
-	lines := strings.Split(text, "\n")
-	start := -1
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "certificates:" || trimmed == "certificates: []" || strings.HasPrefix(trimmed, "certificates: [") {
-			start = i
-			break
-		}
-	}
-	if start < 0 {
-		// No list to extend: append a new one at the end of the document.
-		return text + "\ncertificates:" + block, nil
-	}
-	// Walk to the end of the list body: blank lines and any indented line belong to it.
-	end := start + 1
-	for end < len(lines) {
-		trimmed := strings.TrimRight(lines[end], " \t")
-		if trimmed == "" {
-			end++
-			continue
-		}
-		if trimmed[0] == ' ' || trimmed[0] == '\t' {
-			end++
-			continue
-		}
-		break
-	}
-	// Trim trailing blank lines inside the list so the block sits flush.
-	for end > start+1 && strings.TrimSpace(lines[end-1]) == "" {
-		end--
-	}
-	out := make([]string, 0, len(lines)+1)
-	out = append(out, lines[:end]...)
-	// block starts with a newline and ends without one; normalise to one entry.
-	out = append(out, strings.TrimPrefix(block, "\n"))
-	out = append(out, lines[end:]...)
-	return strings.Join(out, "\n"), nil
 }
 
 func deleteCertificateAdmin(cfg *config.Config, name string, log *slog.Logger) (any, error) {
