@@ -50,16 +50,50 @@ UIN grouping and collapse, search, the UIN and KPI filters, the detail drawer,
 the row menu, the four wizard steps and the payload it posts, the disconnected
 and 401 states, and the 390px layout. No daemon or credential is involved.
 
-Typical nginx layout (TLS terminator in front), with `console.html` as the
-landing page and `index.html` left reachable:
+TLS is not optional. The console refuses to send a secret — an AK/SK pair, a
+scoped DNS token, a webhook URL — over plain HTTP, so on an HTTP origin the
+"Connect UIN" drawer and the notification form fail with that message and
+nothing else. Serve the page over HTTPS; a self-signed certificate is enough
+for a test box:
 
 ```
-location /       { root /opt/wecert/console; index console.html;
-                   try_files $uri $uri/ /console.html; }
-location /api/   { proxy_pass http://127.0.0.1:9801; }
-location /hook/  { proxy_pass http://127.0.0.1:9801; }
-location /admin/ { proxy_pass http://127.0.0.1:9801; }
+openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+  -keyout /etc/nginx/tls/wecert.key -out /etc/nginx/tls/wecert.crt \
+  -subj "/CN=wecert-console" \
+  -addext "subjectAltName=IP:203.0.113.10" \
+  -addext "extendedKeyUsage=serverAuth"
 ```
+
+Typical nginx layout, with `console.html` as the landing page, `index.html`
+left reachable, and port 80 doing nothing but redirecting:
+
+```
+server {
+    listen 80 default_server;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2 default_server;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/tls/wecert.crt;
+    ssl_certificate_key /etc/nginx/tls/wecert.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    root /opt/wecert/console;
+    index console.html;
+
+    location /       { try_files $uri $uri/ /console.html; }
+    location /api/   { proxy_pass http://127.0.0.1:9801; }
+    location /hook/  { proxy_pass http://127.0.0.1:9801; }
+    location /admin/ { proxy_pass http://127.0.0.1:9801; }
+}
+```
+
+Opening inbound 443 is a separate step — a security group created through the
+API has no default rules at all, in either direction.
 
 The daemon's tokens come from `webhook.token` (read-only) and
 `webhook.adminToken` (management). AK/SK entered here are written as 0600
