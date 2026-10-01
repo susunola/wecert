@@ -75,6 +75,10 @@ type Input struct {
 	RevokePending map[string]bool
 	RateLimited   map[string]bool
 	ProbeEnabled  bool
+	// DeployTarget is the process-wide deploy backend (config deploy.target).
+	// A certificate's own deploy.target wins over it; the pair is what lets the
+	// console group the inventory by CLB / nginx instead of only by binding state.
+	DeployTarget string
 	// Probes holds the answers the prober recorded this process life, keyed by
 	// certificate name. Empty means "no answer yet", which is not "match".
 	Probes map[string][]HostSample
@@ -157,6 +161,14 @@ type Summary struct {
 	BindingUnknown    int `json:"bindingUnknown"`
 }
 
+// DeployView is where a certificate is pushed. Target is the resolved backend:
+// "tencent" (CLB) or "nginx". A certificate that is not deployed at all keeps
+// Enabled false, which is a different answer from "deployed to nginx".
+type DeployView struct {
+	Enabled bool   `json:"enabled"`
+	Target  string `json:"target"`
+}
+
 // Certificate is one row. No PEM, no keys.
 type Certificate struct {
 	Issuer    string   `json:"issuer,omitempty"`
@@ -172,21 +184,22 @@ type Certificate struct {
 	// store cannot enumerate bindings, and one certificate can be bound in several
 	// regions. A Tencent Cloud SSL certificate is not itself regional -- the regions
 	// are the load balancers it is attached to.
-	Regions             []string  `json:"regions,omitempty"`
-	NotAfter            string    `json:"notAfter,omitempty"`
-	DaysLeft            *int      `json:"daysLeft,omitempty"`
-	IssuedAt            string    `json:"issuedAt,omitempty"`
-	Uploaded            bool      `json:"uploaded"`
-	DeployConfirmed     bool      `json:"deployConfirmed"`
-	DeployedCertID      string    `json:"deployedCertId,omitempty"`
-	Bindings            Bindings  `json:"bindings"`
-	Probe               ProbeView `json:"probe"`
-	ARI                 *ARIView  `json:"ari,omitempty"`
-	ConsecutiveFailures int       `json:"consecutiveFailures"`
-	NextAttemptAt       string    `json:"nextAttemptAt,omitempty"`
-	LastError           string    `json:"lastError,omitempty"`
-	Error               string    `json:"error,omitempty"`
-	Drift               []string  `json:"drift,omitempty"`
+	Regions             []string    `json:"regions,omitempty"`
+	NotAfter            string      `json:"notAfter,omitempty"`
+	DaysLeft            *int        `json:"daysLeft,omitempty"`
+	IssuedAt            string      `json:"issuedAt,omitempty"`
+	Uploaded            bool        `json:"uploaded"`
+	DeployConfirmed     bool        `json:"deployConfirmed"`
+	DeployedCertID      string      `json:"deployedCertId,omitempty"`
+	Bindings            Bindings    `json:"bindings"`
+	Deploy              *DeployView `json:"deploy,omitempty"`
+	Probe               ProbeView   `json:"probe"`
+	ARI                 *ARIView    `json:"ari,omitempty"`
+	ConsecutiveFailures int         `json:"consecutiveFailures"`
+	NextAttemptAt       string      `json:"nextAttemptAt,omitempty"`
+	LastError           string      `json:"lastError,omitempty"`
+	Error               string      `json:"error,omitempty"`
+	Drift               []string    `json:"drift,omitempty"`
 }
 
 type Bindings struct {
@@ -321,6 +334,12 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 		row.Domains = append([]string(nil), desired.Domains...)
 		if desired.UIN != "" {
 			row.UIN = desired.UIN
+		}
+		// The certificate's own target overrides the process-wide one; either
+		// way the console gets a name it can group by, never an empty string.
+		row.Deploy = &DeployView{
+			Enabled: desired.Deploy.Enabled,
+			Target:  deployTarget(in.DeployTarget, desired.Deploy.Target),
 		}
 	}
 	if errText := in.CertErrors[name]; errText != "" {
@@ -543,6 +562,21 @@ func statusOf(in Input, name string, row *Certificate, st *state.CertState, samp
 		return StatusExpiring
 	}
 	return StatusOK
+}
+
+// deployTarget resolves the backend a certificate is pushed to: the
+// certificate's own target wins, then the process-wide one, then the default.
+//
+// It never returns "": an empty target would leave the console unable to group
+// the row, and config normalization guarantees the process-wide value is set.
+func deployTarget(processWide, certOverride string) string {
+	if certOverride != "" {
+		return certOverride
+	}
+	if processWide != "" {
+		return processWide
+	}
+	return config.DeployTargetTencent
 }
 
 // liveIncomplete reports whether a live enumeration came back incomplete with no

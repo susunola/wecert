@@ -108,6 +108,14 @@ func (c *runtimeController) ResourceTypes() []string {
 	return c.rec.ResourceTypes()
 }
 
+// DeployTarget forwards the process-wide deploy backend so the inventory keeps
+// naming each certificate's target after a reload, not only at startup.
+func (c *runtimeController) DeployTarget() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rec.DeployTarget()
+}
+
 // QuotaStatus is intentionally forwarded so the read-only inventory remains a
 // truthful view after a reload.  The concrete result type keeps it compatible
 // with webhook.QuotaReader without coupling that package back into main.

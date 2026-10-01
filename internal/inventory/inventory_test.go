@@ -307,6 +307,56 @@ func TestAssembleCopiesUIN(t *testing.T) {
 	}
 }
 
+// The console groups the inventory by deploy target (CLB vs nginx), so a row has
+// to say where it is pushed. A certificate can override the process-wide backend,
+// and "not deployed at all" is a different answer from either.
+func TestAssembleReportsTheDeployTargetPerCertificate(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now:          now,
+		Names:        []string{"clb-default", "nginx-override", "local-only"},
+		DeployTarget: "tencent",
+		Desired: &spec.Result{Certificates: []config.Certificate{
+			{Name: "clb-default", Domains: []string{"a.example"}, Deploy: config.Deploy{Enabled: true}},
+			{Name: "nginx-override", Domains: []string{"b.example"},
+				Deploy: config.Deploy{Enabled: true, Target: "nginx"}},
+			{Name: "local-only", Domains: []string{"c.example"},
+				Deploy: config.Deploy{Enabled: false}},
+		}},
+	})
+	byName := map[string]Certificate{}
+	for _, c := range snap.Certificates {
+		byName[c.Name] = c
+	}
+	if got := byName["clb-default"].Deploy; got == nil || got.Target != "tencent" || !got.Enabled {
+		t.Fatalf("a certificate with no override uses the process-wide target: got %+v", got)
+	}
+	if got := byName["nginx-override"].Deploy; got == nil || got.Target != "nginx" {
+		t.Fatalf("the certificate's own target must win: got %+v", got)
+	}
+	if got := byName["local-only"].Deploy; got == nil || got.Enabled {
+		t.Fatalf("a certificate that is not deployed says so: got %+v", got)
+	}
+}
+
+// Nothing tells Assemble the backend: the default must still be a name the
+// console can group by, never an empty string.
+func TestDeployTargetFallsBackToTheDefaultBackend(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	snap := Assemble(Input{
+		Now:   now,
+		Names: []string{"a"},
+		Desired: &spec.Result{Certificates: []config.Certificate{
+			{Name: "a", Domains: []string{"a.example"}, Deploy: config.Deploy{Enabled: true}},
+		}},
+	})
+	if got := snap.Certificates[0].Deploy; got == nil || got.Target != config.DeployTargetTencent {
+		t.Fatalf("expected the %q default, got %+v", config.DeployTargetTencent, got)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

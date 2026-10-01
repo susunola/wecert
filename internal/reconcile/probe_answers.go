@@ -72,3 +72,12 @@ func (r *Reconciler) ProbeAnswers(name string) []probe.Answer {
 func (r *Reconciler) ResourceTypes() []string {
 	return append([]string(nil), r.cfg.Tencent.ResourceTypes...)
 }
+
+// DeployTarget reports the process-wide deploy backend, so a certificate that
+// does not override it still tells the inventory where it lands.
+func (r *Reconciler) DeployTarget() string {
+	if r.cfg.Deploy.Target != "" {
+		return r.cfg.Deploy.Target
+	}
+	return config.DeployTargetTencent
+}

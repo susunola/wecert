@@ -32,6 +32,9 @@ type DaemonFacts interface {
 	ProbeEnabled() bool
 	ProbeAnswers(certName string) []probe.Answer
 	ResourceTypes() []string
+	// DeployTarget is the process-wide deploy backend, so a certificate that
+	// does not override it still reports where it is pushed.
+	DeployTarget() string
 }
 
 // QuotaReader is the optional, cached rate-limit diagnostic surface supplied
@@ -109,6 +112,7 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 	if haveFacts {
 		in.ProbeEnabled = facts.ProbeEnabled()
 		in.ResourceTypes = facts.ResourceTypes()
+		in.DeployTarget = facts.DeployTarget()
 	}
 	if dr, ok := s.rec.(DesiredReader); ok {
 		if res := dr.LastResult(); res != nil {

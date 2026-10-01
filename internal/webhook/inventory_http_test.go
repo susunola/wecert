@@ -212,6 +212,43 @@ func TestInventoryAddsTheDesiredDocumentWithoutDuplicateRows(t *testing.T) {
 	}
 }
 
+// TestInventoryReportsTheDeployTargetTheDaemonUses covers the path the console's
+// target filter reads: the process-wide backend reaches the row unless the
+// certificate overrides it, and a certificate that is not deployed at all must
+// say so instead of looking like a CLB certificate that failed to bind.
+func TestInventoryReportsTheDeployTargetTheDaemonUses(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC()
+	rec := &inventoryCapabilityFake{
+		daemonFake: &daemonFake{
+			fakeReconciler: &fakeReconciler{names: []string{"clb-cert", "nginx-cert", "local-cert"}},
+			deployTarget:   "nginx",
+		},
+		last: &spec.Result{Certificates: []config.Certificate{
+			{Name: "clb-cert", Domains: []string{"clb.example"},
+				Deploy: config.Deploy{Enabled: true, Target: "tencent"}},
+			{Name: "nginx-cert", Domains: []string{"nginx.example"},
+				Deploy: config.Deploy{Enabled: true}},
+			{Name: "local-cert", Domains: []string{"local.example"}},
+		}},
+	}
+	s, store := newTestServer(t, rec)
+	snap := inventorySnapshot(t, s, store,
+		&state.CertState{Name: "clb-cert", NotAfter: now.Add(60 * 24 * time.Hour)},
+		&state.CertState{Name: "nginx-cert", NotAfter: now.Add(60 * 24 * time.Hour)},
+		&state.CertState{Name: "local-cert", NotAfter: now.Add(60 * 24 * time.Hour)})
+
+	if got := rowNamed(t, snap, "clb-cert").Deploy; got == nil || got.Target != "tencent" || !got.Enabled {
+		t.Errorf("clb-cert deploy = %+v, want the certificate's own tencent target", got)
+	}
+	if got := rowNamed(t, snap, "nginx-cert").Deploy; got == nil || got.Target != "nginx" {
+		t.Errorf("nginx-cert deploy = %+v, want the daemon-wide target the console groups by", got)
+	}
+	if got := rowNamed(t, snap, "local-cert").Deploy; got == nil || got.Enabled {
+		t.Errorf("local-cert deploy = %+v, want enabled=false so it is not counted as a CLB row", got)
+	}
+}
+
 // TestInventoryReportsPendingRevocationsAndLiveBindings covers the two row inputs that come
 // from outside the state store: the operator's outstanding revocation requests, and the cached
 // bind-resource enumeration. An outstanding revocation must be visible rather than reported as

@@ -39,7 +39,7 @@ BINDINGS = {"bindings": [
 
 
 def cert(name, uin, status, domains, days=None, bindings=0, complete=True,
-         deploy=True, error=""):
+         deploy=True, target="tencent", error=""):
     """One inventory entry shaped like what the daemon actually sends."""
     out = {
         "name": name, "status": status, "domains": domains,
@@ -57,7 +57,9 @@ def cert(name, uin, status, domains, days=None, bindings=0, complete=True,
     if uin:
         out["uin"] = uin
     if deploy is not None:
-        out["deploy"] = {"enabled": deploy}
+        # The daemon reports the resolved deploy target per certificate ever
+        # since the console started grouping the inventory by it.
+        out["deploy"] = {"enabled": deploy, "target": target}
     if days is not None:
         out["notAfter"] = time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + days * 86400))
@@ -75,7 +77,9 @@ FIXTURE = {
     "desired": {"revision": "sha256:abc", "frozen": False},
     "summary": {},
     "certificates": [
-        cert("welcome", None, "not_issued", ["wecome.invalid"], complete=False),
+        # welcome has no UIN because it is deployed to local nginx, not a cloud.
+        cert("welcome", None, "not_issued", ["wecome.invalid"], complete=False,
+             target="nginx"),
         cert("no-complete-flag", None, "not_issued", ["bare.example.org"],
              complete=None, deploy=None),
         cert("api-example", "100012345678", "expiring", ["api.example.com"],
@@ -388,28 +392,36 @@ class Console2Regression(unittest.TestCase):
         self.assertIn("account", menu, "an AK/SK account without a UIN keeps its name")
         self.assertNotIn("auto:", menu, "the internal auto: placeholder is never shown")
 
-    def test_binding_filter_narrows_to_bound_and_unbound(self):
+    def test_binding_filter_groups_by_deploy_target(self):
         self.load(tokens=(READONLY, ""))
         self.page.click("#binding-trigger")
         self.page.wait_for_timeout(200)
         menu = self.text("#binding-control .uin-menu")
         self.assertIn("All bindings", menu)
-        self.assertIn("Bound", menu, "a binding filter offers the bound set")
-        self.assertIn("Not bound", menu, "and the unbound set")
-        self.assertIn("Needs binding", menu, "and the set the operator must act on")
+        self.assertIn("CLB", menu, "the CLB target is offered")
+        self.assertIn("Nginx", menu, "and the nginx target")
 
-        self.page.click("#binding-control [data-binding='bound']")
+        self.page.click("#binding-control [data-binding='nginx']")
         self.page.wait_for_timeout(200)
-        self.assertEqual(self.rows().count(), 2, "two certificates are bound")
-        self.assertEqual(self.text("#binding-label"), "Bound",
+        self.assertEqual(self.rows().count(), 1, "one certificate is deployed to nginx")
+        self.assertEqual(self.text("#binding-label"), "Nginx",
                          "the trigger names the active filter")
 
         self.page.click("#binding-trigger")
         self.page.wait_for_timeout(200)
-        self.page.click("#binding-control [data-binding='unbound']")
+        self.page.click("#binding-control [data-binding='tencent']")
         self.page.wait_for_timeout(200)
-        self.assertEqual(self.rows().count(), 3, "three certificates are not bound")
-        self.assertEqual(self.text("#binding-label"), "Not bound")
+        self.assertEqual(self.rows().count(), 4, "the rest go to the CLB path")
+        self.assertEqual(self.text("#binding-label"), "CLB")
+
+    def test_binding_filter_defaults_a_row_without_a_target_to_clb(self):
+        inv = dict(FIXTURE, certificates=[
+            cert("bare", "100012345678", "not_issued", ["bare.example.org"], deploy=None)])
+        self.load(inventory=inv, tokens=(READONLY, ""))
+        self.page.click("#binding-trigger")
+        self.page.wait_for_timeout(200)
+        self.assertIn("CLB", self.text("#binding-control .uin-menu"),
+                      "a row without a deploy target is grouped with the CLB default")
 
     def test_cloud_filter_lists_the_clouds_the_accounts_report(self):
         accounts = {"accounts": [
@@ -443,7 +455,7 @@ class Console2Regression(unittest.TestCase):
         self.load(tokens=(READONLY, ""))
         self.page.click("#binding-trigger")
         self.page.wait_for_timeout(200)
-        self.page.click("#binding-control [data-binding='bound']")
+        self.page.click("#binding-control [data-binding='nginx']")
         self.page.wait_for_timeout(200)
         self.assertTrue(self.page.is_visible("#clear-filter"),
                         "an active binding filter offers a way back")

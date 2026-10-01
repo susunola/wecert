@@ -24,6 +24,7 @@ type daemonFake struct {
 	probeEnabled  bool
 	answers       map[string][]probe.Answer
 	resourceTypes []string
+	deployTarget  string
 	bindings      map[string]inventory.Bindings
 }
 
@@ -32,6 +33,8 @@ func (d *daemonFake) ProbeEnabled() bool { return d.probeEnabled }
 func (d *daemonFake) ProbeAnswers(name string) []probe.Answer { return d.answers[name] }
 
 func (d *daemonFake) ResourceTypes() []string { return d.resourceTypes }
+
+func (d *daemonFake) DeployTarget() string { return d.deployTarget }
 
 func (d *daemonFake) BindingSnapshot(certID string) (inventory.Bindings, bool) {
 	b, ok := d.bindings[certID]

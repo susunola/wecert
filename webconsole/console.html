@@ -1105,16 +1105,25 @@ function cloudLabel(id) {
   return CLOUD_LABELS[id] || id;
 }
 
-// The binding filter's three answers, counted the same way everywhere:
-// bound -- at least one listener is attached and the set is complete;
-// unbound -- nothing is attached;
-// needs_bind -- the operator has something to do about it.
-function bindingMatches(cert, filter) {
-  const count = cert.bindings?.count || 0;
-  if (filter === 'bound') return count > 0 && cert.bindings?.complete !== false;
-  if (filter === 'unbound') return count === 0;
-  if (filter === 'needs_bind') return bindingIssue(cert);
-  return true;
+// The binding filter groups by deploy target, which is what the operator
+// chooses between: the Tencent Cloud CLB path or a local nginx directory.
+// The daemon reports the resolved target per certificate; a row that carries
+// none is pushed wherever this daemon points, the CLB default.
+const TARGET_LABELS = { tencent: 'CLB', nginx: 'Nginx' };
+const DEFAULT_TARGET = 'tencent';
+
+function targetOf(cert) {
+  if (cert.deploy && cert.deploy.enabled === false) return 'none';
+  return (cert.deploy && String(cert.deploy.target || '').trim()) || DEFAULT_TARGET;
+}
+
+function targetLabel(id) {
+  return TARGET_LABELS[id] || (id === 'none' ? 'Not deployed' : id);
+}
+
+function targetMatches(cert, filter) {
+  if (filter === 'all') return true;
+  return targetOf(cert) === filter;
 }
 let toastTimer;
 const operationLog = [];
@@ -1251,22 +1260,18 @@ function renderUINMenu() {
       : 'Unassigned UIN');
 }
 
-const BINDING_LABELS = {
-  all: 'All bindings', bound: 'Bound', unbound: 'Not bound', needs_bind: 'Needs binding'
-};
-
 function renderBindingMenu() {
-  const counts = { all: state.certificates.length, bound: 0, unbound: 0, needs_bind: 0 };
+  const counts = new Map();
   state.certificates.forEach((cert) => {
-    ['bound', 'unbound', 'needs_bind'].forEach((filter) => {
-      if (bindingMatches(cert, filter)) counts[filter] += 1;
-    });
+    const id = targetOf(cert);
+    counts.set(id, (counts.get(id) || 0) + 1);
   });
   const menu = $('#binding-control .uin-menu');
   if (!menu) return;
-  menu.innerHTML = ['all', 'bound', 'unbound', 'needs_bind'].map((filter) =>
-    `<button data-binding="${filter}">${escapeHTML(BINDING_LABELS[filter])}<span class="count">${counts[filter]}</span></button>`).join('');
-  $('#binding-label').textContent = BINDING_LABELS[state.binding] || BINDING_LABELS.all;
+  menu.innerHTML = `<button data-binding="all">All bindings <span class="count">${state.certificates.length}</span></button>`
+    + [...counts.keys()].sort().map((id) =>
+      `<button data-binding="${escapeHTML(id)}">${escapeHTML(targetLabel(id))}<span class="count">${counts.get(id)}</span></button>`).join('');
+  $('#binding-label').textContent = state.binding === 'all' ? 'All bindings' : targetLabel(state.binding);
 }
 
 function renderCloudMenu() {
@@ -1293,7 +1298,7 @@ function filteredCertificates() {
     if (state.status === 'not_issued' && cert.status !== 'not_issued') return false;
     if (state.status === 'expiring' && !(cert.daysLeft != null && cert.daysLeft >= 0 && cert.daysLeft <= 30)) return false;
     if (state.status === 'bindings' && !bindingIssue(cert)) return false;
-    if (state.binding !== 'all' && !bindingMatches(cert, state.binding)) return false;
+    if (state.binding !== 'all' && !targetMatches(cert, state.binding)) return false;
     if (state.cloud !== 'all' && cloudOf(cert) !== state.cloud) return false;
     return !query || [cert.name, cert.uin, ...(cert.domains || [])].some((value) => String(value || '').toLowerCase().includes(query));
   });
