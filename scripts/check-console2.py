@@ -3,7 +3,8 @@
 
 The page under test is the certificate-first console built from
 webconsole/certificate-first-prototype.html: a clickable KPI strip, a grouped
-inventory table, a certificate detail drawer and a four-step create wizard.
+inventory table, a certificate detail drawer and a single-page create form with
+a live request summary.
 Every test runs in a fresh browser context. The synthetic origin's main
 document is fulfilled from local bytes; every other request is either stubbed
 in memory or aborted, so no daemon, cloud account or real credential is
@@ -302,28 +303,31 @@ class Console2Regression(unittest.TestCase):
                   inventory={"certificates": [], "summary": {}})
         self.assertIn("Disconnected", self.text("#connection-status"))
 
-    def test_create_wizard_walks_four_steps_and_posts_the_payload(self):
+    def test_create_form_posts_the_payload_and_mirrors_the_summary(self):
         self.load(tokens=(READONLY, ADMIN))
         self.page.click("#new-certificate")
         self.page.wait_for_timeout(250)
-        self.assertTrue(self.page.is_visible("#certificate-modal"), "the wizard opens")
-        self.assertEqual(self.page.eval_on_selector_all(
-            ".wizard-pane", "els => els.filter(e => !e.hidden).map(e => e.dataset.pane)"), ["0"])
+        self.assertTrue(self.page.is_visible("#certificate-modal"), "the create form opens")
+        self.assertEqual(self.page.locator("#domain-list .domain-input").count(), 1,
+                         "the form starts with a single empty domain row")
 
         self.page.fill("#certificate-name", "prod-api-tls")
         self.page.select_option("#certificate-uin", "100012345678")
-        self.page.fill("#certificate-domains", "api.example.com\nwww.example.com")
-        for step in range(3):
-            self.page.click("#wizard-next")
-            self.page.wait_for_timeout(200)
-        self.assertEqual(self.page.eval_on_selector_all(
-            ".wizard-pane", "els => els.filter(e => !e.hidden).map(e => e.dataset.pane)"), ["3"],
-            "the fourth step is the review")
-        review = self.text("#wizard-review")
-        self.assertIn("prod-api-tls", review, "the review mirrors the identifier")
-        self.assertIn("www.example.com", review, "the review mirrors every domain")
+        self.page.fill("#domain-list .domain-input", "api.example.com")
+        self.page.click("#domain-add")
+        self.page.fill("#domain-list .domain-row:nth-child(2) .domain-input", "www.example.com")
+        self.page.wait_for_timeout(200)
 
-        self.page.click("#wizard-submit")
+        summary = self.text("#summary-rows")
+        self.assertIn("2 domains", summary, "the summary counts the domains live")
+        self.assertIn("www.example.com", summary, "the summary mirrors every domain")
+        self.assertIn("100012345678", summary, "the summary mirrors the cloud account")
+        self.assertIn("cloudflare", summary, "the summary mirrors the DNS provider")
+        self.assertIn("Tencent CLB", summary, "the summary mirrors the deploy target")
+        self.assertIn("Ready to create", self.text("#summary-state"),
+                      "a complete form reports itself ready")
+
+        self.page.click("#create-submit")
         self.page.wait_for_timeout(600)
         self.assertEqual(len(CREATED), 1, "exactly one create request is posted")
         body = CREATED[0]
@@ -335,18 +339,19 @@ class Console2Regression(unittest.TestCase):
         self.assertEqual(body["deploy"], "clb")
         self.assertEqual(body["dns"]["provider"], "cloudflare")
 
-    def test_create_wizard_refuses_an_unqualified_domain(self):
+    def test_create_form_refuses_an_unqualified_domain(self):
         self.load(tokens=(READONLY, ADMIN))
         self.page.click("#new-certificate")
         self.page.wait_for_timeout(250)
         self.page.fill("#certificate-name", "bad")
-        self.page.fill("#certificate-domains", "localhost")
-        self.page.click("#wizard-next")
+        self.page.fill("#domain-list .domain-input", "localhost")
         self.page.wait_for_timeout(200)
-        self.assertEqual(self.page.eval_on_selector_all(
-            ".wizard-pane", "els => els.filter(e => !e.hidden).map(e => e.dataset.pane)"), ["0"],
-            "step one does not advance")
+        self.assertIn("fully qualified", self.text("#summary-state"),
+                      "the summary names the blocking problem before submission")
+        self.page.click("#create-submit")
+        self.page.wait_for_timeout(300)
         self.assertIn("fully qualified", self.text("#certificate-form .form-error"))
+        self.assertEqual(len(CREATED), 0, "no create request is posted")
 
     def test_unauthorized_inventory_surfaces_an_error(self):
         self.load(status_code=401, tokens=(READONLY, ""))
