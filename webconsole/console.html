@@ -1189,16 +1189,33 @@ function accountOptions() {
   return [...byUIN.values()];
 }
 
+// A readable identity for an account: the display name the operator chose,
+// otherwise the UIN itself. The daemon stores "auto:<name>" as the UIN of an
+// AK/SK account connected without one, and the auto-generated defaults
+// ("account", "account-<uin>") are placeholders rather than chosen names --
+// show the bare value instead of internal placeholder syntax.
+function accountLabel(account) {
+  const name = String((account && account.name) || '').trim();
+  const uin = String((account && account.uin) || '').trim();
+  const autoUin = uin.startsWith('auto:');
+  const autoName = !name || name === 'account' || name === `account-${uin}`
+    || (autoUin && name === uin.slice(5));
+  if (!autoName) return name;
+  if (autoUin) return uin.slice(5) || name || 'account';
+  return `UIN ${uin}`;
+}
+
 function renderUINMenu() {
   const counts = new Map();
   state.certificates.forEach((cert) => counts.set(cert.uin, (counts.get(cert.uin) || 0) + 1));
   const unassigned = state.certificates.filter((cert) => !cert.uin).length;
   $('.uin-menu').innerHTML = `
     <button data-uin="all">All UINs <span class="count">${state.certificates.length}</span></button>
-    ${accountOptions().map((account) => `<button data-uin="${escapeHTML(account.uin)}">UIN ${escapeHTML(account.uin)}<span class="count">${counts.get(account.uin) || 0}</span></button>`).join('')}
-    ${unassigned ? `<button data-uin="">Unassigned UIN<span class="count">${unassigned}</span></button>` : ''}
-    <hr><button class="connect" id="connect-uin">+ Connect UIN</button>`;
-  $('#uin-label').textContent = state.uin === 'all' ? 'All UINs' : (state.uin || 'Unassigned UIN');
+    ${accountOptions().map((account) => `<button data-uin="${escapeHTML(account.uin)}">${escapeHTML(accountLabel(account))}<span class="count">${counts.get(account.uin) || 0}</span></button>`).join('')}
+    ${unassigned ? `<button data-uin="">Unassigned UIN<span class="count">${unassigned}</span></button>` : ''}`;
+  $('#uin-label').textContent = state.uin === 'all' ? 'All UINs'
+    : (state.uin ? accountLabel(accountOptions().find((account) => account.uin === state.uin) || { uin: state.uin })
+      : 'Unassigned UIN');
 }
 
 function filteredCertificates() {
@@ -1295,7 +1312,7 @@ function renderAll() {
   renderUINMenu();
   renderRows();
   renderDetail();
-  const uinOptions = accountOptions().map((account) => `<option value="${escapeHTML(account.uin)}">UIN ${escapeHTML(account.uin)}</option>`).join('');
+  const uinOptions = accountOptions().map((account) => `<option value="${escapeHTML(account.uin)}">${escapeHTML(accountLabel(account))}</option>`).join('');
   const uinSelect = $('#certificate-uin');
   if (uinSelect) {
     const chosen = uinSelect.value;
@@ -2041,9 +2058,6 @@ document.addEventListener('click', (event) => {
   }
 
   if (rowMenuFor && !target.closest('#row-menu')) closeRowMenu();
-
-  const connectUin = target.closest('#connect-uin');
-  if (connectUin) { $('#uin-control').classList.remove('open'); openDrawer(); return; }
 
   const uinButton = target.closest('.uin-menu [data-uin]');
   if (uinButton) {

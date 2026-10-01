@@ -92,8 +92,9 @@ FIXTURE = {
 CREATED = []
 
 
-def route_handler(page, inventory, status_code=200, session=None):
+def route_handler(page, inventory, status_code=200, session=None, accounts=None):
     sess = {"read": True, "admin": True} if session is None else session
+    accounts = ACCOUNTS if accounts is None else accounts
 
     def handle(route):
         url = route.request.url
@@ -106,7 +107,7 @@ def route_handler(page, inventory, status_code=200, session=None):
             route.fulfill(status=status_code, content_type="application/json",
                           body=json.dumps(inventory if status_code == 200 else {"error": "unauthorized"}))
         elif "/api/accounts" in url:
-            route.fulfill(status=200, content_type="application/json", body=json.dumps(ACCOUNTS))
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(accounts))
         elif "/api/bindings" in url:
             route.fulfill(status=200, content_type="application/json", body=json.dumps(BINDINGS))
         elif "/admin/certificates" in url and method == "POST":
@@ -146,9 +147,9 @@ class Console2Regression(unittest.TestCase):
         self.ctx.close()
 
     # -- helpers -----------------------------------------------------------
-    def load(self, inventory=None, status_code=200, tokens=None, session=None):
+    def load(self, inventory=None, status_code=200, tokens=None, session=None, accounts=None):
         inv = FIXTURE if inventory is None else inventory
-        self.page.route("**/*", route_handler(self.page, inv, status_code, session))
+        self.page.route("**/*", route_handler(self.page, inv, status_code, session, accounts))
         if tokens:
             readonly, admin = tokens
             script = "try{localStorage.setItem('wecert.token',%r);" % readonly
@@ -367,6 +368,25 @@ class Console2Regression(unittest.TestCase):
         self.page.wait_for_timeout(300)
         self.assertIn("fully qualified", self.text("#certificate-form .form-error"))
         self.assertEqual(len(CREATED), 0, "no create request is posted")
+
+    def test_uin_menu_prefers_names_and_drops_connect(self):
+        self.load(tokens=(READONLY, ""))
+        menu = self.text(".uin-menu")
+        self.assertIn("intl-prod", menu, "a chosen display name labels the account")
+        self.assertIn("staging", menu, "every named account keeps its name")
+        self.assertNotIn("UIN 100012345678", menu,
+                         "a chosen display name wins over the raw UIN")
+        self.assertNotIn("Connect UIN", menu,
+                         "account connection lives in the create modal, not this menu")
+
+    def test_auto_account_never_shows_the_auto_placeholder(self):
+        accounts = {"accounts": [{"uin": "auto:account", "name": "account"}]}
+        inv = dict(FIXTURE, certificates=[
+            cert("shop-example", "auto:account", "ok", ["shop.example.com"])])
+        self.load(inventory=inv, accounts=accounts, tokens=(READONLY, ""))
+        menu = self.text(".uin-menu")
+        self.assertIn("account", menu, "an AK/SK account without a UIN keeps its name")
+        self.assertNotIn("auto:", menu, "the internal auto: placeholder is never shown")
 
     def test_unauthorized_inventory_surfaces_an_error(self):
         self.load(status_code=401, tokens=(READONLY, ""))
