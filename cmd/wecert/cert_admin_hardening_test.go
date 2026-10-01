@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -219,5 +221,101 @@ func TestBindCertificateRejectsMissingListener(t *testing.T) {
 		CreateListener: &webhook.CreateListenerRequest{Port: 99999},
 	}, log); err == nil {
 		t.Fatal("out-of-range listener port must be rejected")
+	}
+}
+
+// Deleting the last certificate used to write the emptied config.yaml first and
+// let the reload admission gate reject it afterwards: the console was told "ok",
+// the file and the running state diverged, and the daemon could not start again
+// ("at least one certificate is required" fires at startup too, not only at
+// reload). The refusal must happen before the write, with the reason in the
+// error the modal shows.
+func TestDeleteCertificateAdminRefusesToRemoveTheLastCertificate(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{StatePath: filepath.Join(dir, "state.db")}
+	cfgPath := filepath.Join(dir, "config.yaml")
+	state := filepath.Join(dir, "state.db")
+	// The guard re-reads the config with config.Load, so the fixtures have to
+	// be loadable in full -- the same minimal shape the process-level tests use.
+	two := fmt.Sprintf(`statePath: %s
+acme:
+  directory: https://acme.invalid/directory
+  email: ops@atomwangnus.com
+dns:
+  provider: dnspod
+  loginToken: "12345,abcdef"
+desiredState:
+  mode: static
+certificates:
+  - name: demo
+    domains: [d.example.com]
+  - name: other
+    domains: [o.example.com]
+probe:
+  enabled: false
+tencent:
+  credentialMode: static
+  uin: "100012345678"
+  regions: [ap-guangzhou]
+`, state)
+	one := strings.Replace(two,
+		"  - name: demo\n    domains: [d.example.com]\n  - name: other\n    domains: [o.example.com]\n",
+		"  - name: demo\n    domains: [d.example.com]\n", 1)
+	enforce := strings.Replace(two, "mode: static", "mode: enforce", 1)
+	enforce = strings.Replace(enforce,
+		"mode: enforce", "mode: enforce\n  path: "+state+".desired.yaml", 1)
+	enforce = strings.Replace(enforce,
+		"certificates:\n  - name: demo\n    domains: [d.example.com]\n  - name: other\n    domains: [o.example.com]\n",
+		"certificates: []\n", 1)
+
+	oldPath := configPathForAdmin
+	oldSig := signalSelf
+	signalSelf = func(os.Signal) error { return nil }
+	defer func() { configPathForAdmin = oldPath; signalSelf = oldSig }()
+	log, _ := quietLog()
+
+	// One certificate, static mode: refused, and the file keeps the entry.
+	if err := os.WriteFile(cfgPath, []byte(one), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPathForAdmin = cfgPath
+	_, err := deleteCertificateAdmin(cfg, "demo", log)
+	if err == nil {
+		t.Fatal("deleting the last certificate must be refused")
+	}
+	var ir *webhook.InvalidRequestError
+	if !errors.As(err, &ir) {
+		t.Fatalf("refusal must be a client error, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "last certificate") {
+		t.Errorf("refusal must say why, got: %v", err)
+	}
+	got, _ := os.ReadFile(cfgPath)
+	if !strings.Contains(string(got), "name: demo") {
+		t.Fatalf("refused delete must not touch the config:\n%s", got)
+	}
+
+	// Two certificates: the delete goes through and the file loses one.
+	if err := os.WriteFile(cfgPath, []byte(two), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deleteCertificateAdmin(cfg, "demo", log); err != nil {
+		t.Fatalf("deleting one of two must succeed: %v", err)
+	}
+	got, _ = os.ReadFile(cfgPath)
+	if strings.Contains(string(got), "name: demo") || !strings.Contains(string(got), "name: other") {
+		t.Fatalf("two-cert delete wrote the wrong file:\n%s", got)
+	}
+
+	// Enforce mode takes its list from the desired-state document, so an empty
+	// certificates block is the normal shape there and the guard must not fire.
+	if err := os.WriteFile(cfgPath, []byte(enforce), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := webhook.WriteConsoleCertificates(cfg.StatePath, []webhook.ConsoleCertificate{{Name: "demo"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deleteCertificateAdmin(cfg, "demo", log); err != nil {
+		t.Fatalf("enforce mode must allow emptying the list: %v", err)
 	}
 }

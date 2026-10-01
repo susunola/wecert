@@ -960,7 +960,7 @@ sudo systemctl enable --now wecert-once.timer
 
 | Unit | Purpose |
 |---|---|
-| `wecert.service` | Long-running daemon, `Restart=on-failure`. `StateDirectory=wecert` (`0700`), `ProtectSystem=strict`. |
+| `wecert.service` | Long-running daemon, `Restart=on-failure`. `StateDirectory=wecert` (`0700`), `ProtectSystem=strict` with `ReadWritePaths=/etc/wecert`. |
 | `wecert-once.service` | `Type=oneshot`, `-once`, `TimeoutStartSec=45min`. The timeout allows for `propagationTimeout + authzWait + orderWait` **per certificate**, and reconcile is serial across certificates — raise it if you have many. |
 | `wecert-once.timer` | `OnBootSec=2min`, `OnUnitActiveSec=1h`, `RandomizedDelaySec=10min`, `Persistent=true`. Declares `Unit=wecert-once.service` explicitly. |
 

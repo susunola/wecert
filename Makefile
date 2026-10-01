@@ -286,6 +286,8 @@ check-scripts: check-cli
 	@bash scripts/test-run-stage-ab.sh
 	@python3 scripts/test-check-cam-policies.py
 	@python3 scripts/check-cam-policies.py
+	@python3 scripts/test-check-deploy-writes.py
+	@python3 scripts/check-deploy-writes.py
 
 # The documented command line is part of the delivery surface too, and nothing connected it to
 # the binaries. `wecert-clbverify -clb ...` was unusable for a whole round -- the flag was

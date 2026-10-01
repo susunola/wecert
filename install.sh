@@ -229,15 +229,23 @@ else
 fi
 
 echo "==> Preparing config directory ${CONFIG_DIR}"
+# The service user needs WRITE access here, not only read: every management
+# write (add a certificate, save a notification channel, delete one) rewrites
+# config.yaml atomically, which creates a ".atomic-*.tmp" file in this directory
+# and renames it. A root-owned 0750 directory made each of those writes fail
+# with "read-only file system" -- the sandbox was blamed, but the directory
+# permission refused the temp file before the sandbox was even consulted.
+# (Root-owned credentials.env inside stays unreadable to the service: 0600 root
+# survives a service-owned directory, because file mode governs reads.)
 mkdir -p "${CONFIG_DIR}"
-chown root:wecert "${CONFIG_DIR}"
+chown wecert:wecert "${CONFIG_DIR}"
 chmod 0750 "${CONFIG_DIR}"
 
 # The state directory, for the same reason as the config one.
 #
 # systemd's StateDirectory=wecert creates /var/lib/wecert, but only when the service
 # starts -- and the validation step printed below has to run BEFORE that, as the wecert
-# user (the config carries a DNS provider credential, so it is 0640 root:wecert). Without this the
+# user. Without this the
 # prescribed command fails with "create state dir /var/lib/wecert: permission denied".
 # The obvious workaround is worse than the failure: running it under sudo pre-creates
 # state.db as root:root 0600, and StateDirectory= only fixes the directory it owns, not
@@ -247,10 +255,15 @@ echo "==> Preparing state directory ${STATE_DIR}"
 install -d -o wecert -g wecert -m 0700 "${STATE_DIR}"
 
 if [[ -f "${CONFIG_FILE}" ]]; then
-	echo "    config already exists, keeping it as is"
+	echo "    config already exists, keeping its content"
+	# The daemon rewrites this file for every management write, so it must be
+	# owned by the service user. Installs before the config-write fix left it
+	# root:wecert 0640: readable, but every console save then failed.
+	chown wecert:wecert "${CONFIG_FILE}"
+	chmod 0600 "${CONFIG_FILE}"
 else
 	if [[ -f "${SCRIPT_DIR}/config.example.yaml" ]]; then
-		install -m 0640 -o root -g wecert "${SCRIPT_DIR}/config.example.yaml" "${CONFIG_FILE}"
+		install -m 0600 -o wecert -g wecert "${SCRIPT_DIR}/config.example.yaml" "${CONFIG_FILE}"
 		echo "    placed the example config; be sure to edit it before starting"
 	else
 		echo "    warning: config.example.yaml not found, create ${CONFIG_FILE} by hand"

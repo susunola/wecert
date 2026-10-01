@@ -35,11 +35,16 @@ ExecStart=/usr/local/bin/wecert -config /etc/wecert/config.yaml -once
 # many SANs.
 TimeoutStartSec=45min
 
+# ReadWritePaths for the same reason as wecert.service: the config file must be
+# rewritable, not merely readable. The oneshot pass itself only writes the state
+# database, but the same binary serves the same management routes when it runs,
+# and a config directory this sandbox makes read-only turns every one of those
+# writes into "read-only file system".
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-ReadOnlyPaths=/etc/wecert
+ReadWritePaths=/etc/wecert
 
 # ── Hardening beyond the baseline ────────────────────────────────────────────
 #

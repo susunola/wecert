@@ -856,7 +856,7 @@ sudo systemctl enable --now wecert-once.timer
 
 | 单元 | 用途 |
 |---|---|
-| `wecert.service` | 常驻守护进程，`Restart=on-failure`。`StateDirectory=wecert`（`0700`）、`ProtectSystem=strict`。 |
+| `wecert.service` | 常驻守护进程，`Restart=on-failure`。`StateDirectory=wecert`（`0700`）、`ProtectSystem=strict` 并以 `ReadWritePaths=/etc/wecert` 放行配置写入。 |
 | `wecert-once.service` | `Type=oneshot`、`-once`、`TimeoutStartSec=45min`。超时要按**每张证书**的 `propagationTimeout + 授权等待 + 订单等待` 留量，而 reconcile 是串行遍历证书的 —— 证书多时要相应上调。 |
 | `wecert-once.timer` | `OnBootSec=2min`、`OnUnitActiveSec=1h`、`RandomizedDelaySec=10min`、`Persistent=true`。显式声明 `Unit=wecert-once.service`。 |
 

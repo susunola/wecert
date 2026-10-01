@@ -18,13 +18,25 @@ ExecStart=/usr/local/bin/wecert -config /etc/wecert/config.yaml
 Restart=on-failure
 RestartSec=30s
 
-# The config file holds the DNSPod token, so ProtectSystem=strict bounds what
-# this process can write.
+# The whole filesystem is read-only except the write paths granted below.
+# /etc/wecert has to be among them: every management write -- adding a
+# certificate, saving a notification channel, deleting one -- rewrites
+# config.yaml atomically, which means creating a temp file in /etc/wecert and
+# renaming it. With the directory read-only the console reports
+# "write /etc/wecert/config.yaml: open /etc/wecert/.atomic-N.tmp: read-only
+# file system" for each of those buttons while the read-only pages keep
+# working, which reads like a broken button and is actually a sandbox one.
+# (This used to be ReadOnlyPaths=/etc/wecert, which made the refusal certain.)
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-ReadOnlyPaths=/etc/wecert
+ReadWritePaths=/etc/wecert
+# A local-nginx deploy target (deploy.target: nginx) writes the certificate and
+# key under nginx.dirTemplate -- /etc/nginx/ssl/%s by default -- which
+# ProtectSystem=strict also blocks. Uncomment when that target is in use; with
+# the cloud (CLB) target the daemon never touches /etc/nginx.
+#ReadWritePaths=/etc/nginx
 
 # ── Hardening beyond the baseline ────────────────────────────────────────────
 #
