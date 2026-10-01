@@ -96,7 +96,6 @@ func TestAccountKeyPathRefusesSymlinkedParent(t *testing.T) {
 	}
 }
 
-
 // --- coverage for the create / account / bind paths (were 0%) ---
 
 func TestCreateCertificateAdminWritesInsideTheListAndValidatesName(t *testing.T) {

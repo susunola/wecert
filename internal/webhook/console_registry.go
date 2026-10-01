@@ -24,10 +24,10 @@ type ConsoleCertificate struct {
 
 // CloudAccount is one row of cloud-accounts.json.
 type CloudAccount struct {
-	Name    string `json:"name"`
-	UIN     string `json:"uin"`
-	Cred    string `json:"cred"`
-	Cloud   string `json:"cloud"`
+	Name  string `json:"name"`
+	UIN   string `json:"uin"`
+	Cred  string `json:"cred"`
+	Cloud string `json:"cloud"`
 	// Site is "china", "international", or "" (auto).
 	Site    string `json:"site,omitempty"`
 	KeyPath string `json:"keyPath"`

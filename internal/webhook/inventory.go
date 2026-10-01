@@ -316,4 +316,3 @@ func storedHostSamples(samples []state.ProbeSample) []inventory.HostSample {
 	}
 	return out
 }
-

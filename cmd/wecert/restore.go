@@ -1,11 +1,11 @@
 package main
 
 import (
-	"crypto/sha256"
-	"io"
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"

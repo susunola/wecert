@@ -40,7 +40,6 @@ type Webhook struct {
 	// that can reach its URL.
 	NotifySecret string `yaml:"notifySecret"`
 
-
 	// AdminToken is a SECOND shared secret for the guarded write/diagnostic surface
 	// (/admin/...). Optional: without it the admin routes are not mounted, and the
 	// process stays read-only over the network.

@@ -1,10 +1,10 @@
 package webhook
 
 import (
-	"strconv"
 	"crypto/subtle"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -44,7 +44,7 @@ func (s *Server) handleSession() http.HandlerFunc {
 			})
 		case http.MethodPost:
 			var body struct {
-				Token     string `json:"token"`
+				Token      string `json:"token"`
 				AdminToken string `json:"adminToken"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -102,7 +102,7 @@ func (s *Server) handleSession() http.HandlerFunc {
 				http.SetCookie(w, &http.Cookie{
 					Name: name, Value: "", Path: "/",
 					MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode,
-					Secure:   r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
+					Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
 				})
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})

@@ -150,7 +150,7 @@ function renderUINMenu() {
   $('.uin-menu').innerHTML = `
     <button data-uin="all">All UINs <span class="count">${state.certificates.length}</span></button>
     ${accountOptions().map((account) => `<button data-uin="${escapeHTML(account.uin)}">UIN ${escapeHTML(account.uin)}<span class="count">${counts.get(account.uin) || 0}</span></button>`).join('')}
-    <hr><button class="connect" id="connect-uin">＋ Connect UIN</button>`;
+    <hr><button class="connect" id="connect-uin">+ Connect UIN</button>`;
   $('#uin-label').textContent = state.uin === 'all' ? 'All UINs' : state.uin;
 }
 

@@ -21,25 +21,25 @@ type DNSCredential struct {
 
 // CreateCertificateRequest is POST /admin/certificates.
 type CreateCertificateRequest struct {
-	Name        string         `json:"name"`
-	Domains     []string       `json:"domains"`
-	Profile     string         `json:"profile"`
-	KeyType     string         `json:"keyType"`
-	RenewBefore string         `json:"renewBefore"`
+	Name        string   `json:"name"`
+	Domains     []string `json:"domains"`
+	Profile     string   `json:"profile"`
+	KeyType     string   `json:"keyType"`
+	RenewBefore string   `json:"renewBefore"`
 	// Deploy is "clb", "nginx", or "none".
-	Deploy string        `json:"deploy"`
-	UIN    string        `json:"uin"`
+	Deploy string         `json:"deploy"`
+	UIN    string         `json:"uin"`
 	DNS    *DNSCredential `json:"dns"`
 }
 
 // AddAccountRequest is POST /admin/accounts.
 type AddAccountRequest struct {
-	Name      string `json:"name"`
+	Name string `json:"name"`
 	// UIN is optional for static AK/SK: the daemon can leave it blank and the
 	// console groups the account by name instead.
-	UIN       string `json:"uin"`
-	Cred      string `json:"cred"`
-	Cloud     string `json:"cloud"`
+	UIN   string `json:"uin"`
+	Cred  string `json:"cred"`
+	Cloud string `json:"cloud"`
 	// Site is "china", "international", or "" for auto-detect. Tencent Cloud
 	// runs two separate account systems with different API root domains.
 	Site      string `json:"site"`
@@ -50,7 +50,7 @@ type AddAccountRequest struct {
 
 // CreateListenerRequest opens a new HTTPS listener during a bind.
 type CreateListenerRequest struct {
-	Port int `json:"port"`
+	Port int    `json:"port"`
 	Name string `json:"name"`
 	// SNI is nil when absent, which means the default (on).
 	SNI *bool `json:"sni"`

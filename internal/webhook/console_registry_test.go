@@ -1,15 +1,15 @@
 package webhook
 
 import (
-	"time"
 	"encoding/json"
 	"fmt"
-	"net/http/httptest"
-	"strings"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestReadRegistryRefusesToWipeCorruptFile(t *testing.T) {
@@ -136,10 +136,10 @@ func TestSetTokenRejectsEmpty(t *testing.T) {
 func newTestSessionServer(t *testing.T) *Server {
 	t.Helper()
 	return &Server{
-		token:     "read-token-value",
+		token:      "read-token-value",
 		adminToken: "admin-token-value-long-enough",
-		now:       time.Now,
-		limiter:   newAuthLimiter(),
+		now:        time.Now,
+		limiter:    newAuthLimiter(),
 	}
 }
 
