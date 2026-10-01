@@ -126,15 +126,7 @@ func certificateNode(name string, domains []string, profile, keyType, renewBefor
 	e.KeyType = keyType
 	e.RenewBefore = renewBefore
 	e.UIN = uin
-	switch deploy {
-	case "clb", "nginx":
-		e.Deploy.Enabled = true
-		if deploy == "nginx" {
-			e.Deploy.Target = "nginx"
-		}
-	default:
-		e.Deploy.Enabled = false
-	}
+	e.Deploy.Enabled, e.Deploy.Target = webhook.ResolveDeploy(deploy)
 	raw, err := yaml.Marshal(e)
 	if err != nil {
 		return nil, err
@@ -445,6 +437,7 @@ func createCertificateAdmin(cfg *config.Config, body webhook.CreateCertificateRe
 	// 0600 file under dns/.
 	rec := webhook.ConsoleCertificate{
 		Name: name, Domains: domains, Profile: profile, KeyType: keyType, UIN: uin,
+		Deploy: strings.TrimSpace(deploy),
 	}
 	if dnsCfg != nil {
 		san := dnsCfg.Sanitized()

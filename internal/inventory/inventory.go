@@ -339,7 +339,7 @@ func assembleOne(in Input, name string, now time.Time) Certificate {
 		// way the console gets a name it can group by, never an empty string.
 		row.Deploy = &DeployView{
 			Enabled: desired.Deploy.Enabled,
-			Target:  deployTarget(in.DeployTarget, desired.Deploy.Target),
+			Target:  ResolveDeployTarget(in.DeployTarget, desired.Deploy.Target),
 		}
 	}
 	if errText := in.CertErrors[name]; errText != "" {
@@ -564,12 +564,14 @@ func statusOf(in Input, name string, row *Certificate, st *state.CertState, samp
 	return StatusOK
 }
 
-// deployTarget resolves the backend a certificate is pushed to: the
+// ResolveDeployTarget resolves the backend a certificate is pushed to: the
 // certificate's own target wins, then the process-wide one, then the default.
 //
 // It never returns "": an empty target would leave the console unable to group
 // the row, and config normalization guarantees the process-wide value is set.
-func deployTarget(processWide, certOverride string) string {
+// Exported because the console registry rows are merged outside this package
+// and must resolve the same way the configured rows do.
+func ResolveDeployTarget(processWide, certOverride string) string {
 	if certOverride != "" {
 		return certOverride
 	}

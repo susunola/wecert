@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 // Typed request bodies for the console admin surface. Decoding into structs
@@ -30,6 +33,23 @@ type CreateCertificateRequest struct {
 	Deploy string         `json:"deploy"`
 	UIN    string         `json:"uin"`
 	DNS    *DNSCredential `json:"dns"`
+}
+
+// ResolveDeploy maps the console's deploy choice onto the enabled flag and the
+// deploy target recorded for a certificate.
+//
+// "clb" deliberately leaves the target empty: it means "push this wherever the
+// daemon already points", so an operator who later reconfigures the process for
+// nginx does not find older rows pinned to a backend they stopped using.
+// "nginx" pins the row. Anything else (including "none") disables deployment.
+func ResolveDeploy(value string) (enabled bool, target string) {
+	switch strings.TrimSpace(value) {
+	case "clb":
+		return true, ""
+	case "nginx":
+		return true, config.DeployTargetNginx
+	}
+	return false, ""
 }
 
 // AddAccountRequest is POST /admin/accounts.

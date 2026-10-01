@@ -68,7 +68,12 @@ func (s *Server) handleInventoryPage(w http.ResponseWriter, r *http.Request) {
 // mergeConsoleCertificates appends rows the web console created that are not yet
 // in the desired state, so a newly created certificate is visible in inventory
 // immediately instead of disappearing until the next config edit.
-func mergeConsoleCertificates(snap inventory.Snapshot, statePath string) inventory.Snapshot {
+//
+// processTarget is the backend this daemon is configured to push to. A console
+// row records the operator's choice ("clb" means "wherever the daemon points"),
+// so it is resolved here exactly the way a configured row is: the certificate's
+// own target wins, otherwise the process-wide one.
+func mergeConsoleCertificates(snap inventory.Snapshot, statePath, processTarget string) inventory.Snapshot {
 	list, err := ReadConsoleCertificates(statePath)
 	if err != nil {
 		// A corrupt sidecar must not hide live inventory; just skip the merge.
@@ -82,6 +87,7 @@ func mergeConsoleCertificates(snap inventory.Snapshot, statePath string) invento
 		if rec.Name == "" || have[rec.Name] {
 			continue
 		}
+		enabled, target := ResolveDeploy(rec.Deploy)
 		row := inventory.Certificate{
 			Name:    rec.Name,
 			Status:  "not_issued",
@@ -89,6 +95,13 @@ func mergeConsoleCertificates(snap inventory.Snapshot, statePath string) invento
 			KeyType: rec.KeyType,
 			UIN:     rec.UIN,
 			Domains: append([]string(nil), rec.Domains...),
+			// Without this the console cannot tell a CLB certificate from an
+			// nginx one, and every console-created row would filter as the
+			// default -- which is most rows on a console-managed daemon.
+			Deploy: &inventory.DeployView{
+				Enabled: enabled,
+				Target:  inventory.ResolveDeployTarget(processTarget, target),
+			},
 		}
 		snap.Certificates = append(snap.Certificates, row)
 		have[rec.Name] = true
@@ -205,7 +218,7 @@ func (s *Server) assembleInventory() inventory.Snapshot {
 		quotas = qr.QuotaStatus()
 		in.RateLimited = blockedCertificates(in.Desired, quotas)
 	}
-	snap := mergeConsoleCertificates(inventory.Assemble(in), s.store.Path())
+	snap := mergeConsoleCertificates(inventory.Assemble(in), s.store.Path(), in.DeployTarget)
 	snap.Quotas = quotaViews(quotas)
 	return snap
 }

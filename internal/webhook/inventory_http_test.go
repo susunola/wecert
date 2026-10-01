@@ -249,6 +249,45 @@ func TestInventoryReportsTheDeployTargetTheDaemonUses(t *testing.T) {
 	}
 }
 
+// TestInventoryReportsTheDeployTargetOfACertificateTheConsoleCreated covers the
+// rows that never reach the desired document. A certificate created from the
+// console lives in the registry sidecar, and on a console-managed daemon that is
+// where most rows come from: if the merge dropped the deploy choice, every one
+// of them would filter as the default and the console's CLB/Nginx menu could
+// never show what the operator actually asked for.
+func TestInventoryReportsTheDeployTargetOfACertificateTheConsoleCreated(t *testing.T) {
+	t.Parallel()
+	rec := &inventoryCapabilityFake{daemonFake: &daemonFake{
+		fakeReconciler: &fakeReconciler{names: []string{}},
+		deployTarget:   "tencent",
+	}}
+	s, store := newTestServer(t, rec)
+	if err := WriteConsoleCertificates(store.Path(), []ConsoleCertificate{
+		{Name: "console-clb", Domains: []string{"clb.example"}, Deploy: "clb"},
+		{Name: "console-nginx", Domains: []string{"nginx.example"}, Deploy: "nginx"},
+		{Name: "console-local", Domains: []string{"local.example"}, Deploy: "none"},
+		// Written before the field existed: no target means "wherever the daemon
+		// points", not "unknown", or an upgrade would strand every old row.
+		{Name: "console-legacy", Domains: []string{"legacy.example"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap := inventorySnapshot(t, s, store)
+
+	if got := rowNamed(t, snap, "console-clb").Deploy; got == nil || !got.Enabled || got.Target != "tencent" {
+		t.Errorf("console-clb deploy = %+v, want enabled with the daemon's tencent target", got)
+	}
+	if got := rowNamed(t, snap, "console-nginx").Deploy; got == nil || !got.Enabled || got.Target != "nginx" {
+		t.Errorf("console-nginx deploy = %+v, want the nginx target the operator chose", got)
+	}
+	if got := rowNamed(t, snap, "console-local").Deploy; got == nil || got.Enabled {
+		t.Errorf("console-local deploy = %+v, want disabled so it is not counted as a deployed row", got)
+	}
+	if got := rowNamed(t, snap, "console-legacy").Deploy; got == nil || got.Target != "tencent" {
+		t.Errorf("console-legacy deploy = %+v, want the daemon's default rather than a missing target", got)
+	}
+}
+
 // TestInventoryReportsPendingRevocationsAndLiveBindings covers the two row inputs that come
 // from outside the state store: the operator's outstanding revocation requests, and the cached
 // bind-resource enumeration. An outstanding revocation must be visible rather than reported as

@@ -152,6 +152,52 @@ func TestCreateCertificateAdminWritesInsideTheListAndValidatesName(t *testing.T)
 	}
 }
 
+// The console's CLB/Nginx filter reads the deploy target back out of the
+// inventory, and a certificate created from the console only ever exists in the
+// registry sidecar until someone edits the config. If the create path dropped the
+// operator's choice there, the row would report the default backend instead of
+// the one that was asked for -- and the filter could never show "Nginx".
+func TestCreateCertificateAdminRecordsTheDeployChoiceInTheRegistry(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{StatePath: filepath.Join(dir, "state.db")}
+	cfgPath := filepath.Join(dir, "config.yaml")
+	base := "certificates:\n  - name: demo\n    domains: [d.example.com]\ntencent:\n  secretId: id\nwebhook:\n  token: t\n"
+	if err := os.WriteFile(cfgPath, []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := configPathForAdmin
+	configPathForAdmin = cfgPath
+	defer func() { configPathForAdmin = old }()
+	log, _ := quietLog()
+	oldSig := signalSelf
+	signalSelf = func(os.Signal) error { return nil }
+	defer func() { signalSelf = oldSig }()
+
+	if _, err := createCertificateAdmin(cfg, webhook.CreateCertificateRequest{
+		Name: "nginx-row", Domains: []string{"a.example.com"}, Profile: "classic",
+		KeyType: "ecdsa-p256", Deploy: "nginx",
+		DNS: &webhook.DNSCredential{Provider: "dnspod", Cred: "reused"},
+	}, log); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	list, err := webhook.ReadConsoleCertificates(cfg.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found string
+	for _, rec := range list {
+		if rec.Name == "nginx-row" {
+			found = rec.Deploy
+		}
+	}
+	if found == "" {
+		t.Fatalf("registry row for nginx-row missing its deploy choice: %+v", list)
+	}
+	if found != "nginx" {
+		t.Errorf("registry deploy = %q, want the operator's nginx choice so the inventory can report it", found)
+	}
+}
+
 func TestAccountAddRemoveRoundTripAndCorruptRefusal(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{StatePath: filepath.Join(dir, "state.db")}

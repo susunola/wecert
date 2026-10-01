@@ -14,12 +14,17 @@ import (
 // web console writes beside the state database. Typed so the reader never has
 // to coerce a JSON value through fmt.Sprint and special-case "<nil>".
 type ConsoleCertificate struct {
-	Name    string         `json:"name"`
-	Domains []string       `json:"domains"`
-	Profile string         `json:"profile"`
-	KeyType string         `json:"keyType"`
-	UIN     string         `json:"uin"`
-	DNS     *DNSCredential `json:"dns,omitempty"`
+	Name    string   `json:"name"`
+	Domains []string `json:"domains"`
+	Profile string   `json:"profile"`
+	KeyType string   `json:"keyType"`
+	UIN     string   `json:"uin"`
+	// Deploy is the operator's choice verbatim ("clb", "nginx", or "none").
+	// It is resolved against the process-wide backend when the inventory is
+	// assembled, so switching the daemon's backend re-labels existing rows the
+	// same way it re-labels the configured ones.
+	Deploy string         `json:"deploy,omitempty"`
+	DNS    *DNSCredential `json:"dns,omitempty"`
 }
 
 // CloudAccount is one row of cloud-accounts.json.

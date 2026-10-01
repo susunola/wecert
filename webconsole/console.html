@@ -1268,9 +1268,15 @@ function renderBindingMenu() {
   });
   const menu = $('#binding-control .uin-menu');
   if (!menu) return;
+  // The backends this daemon can push to are listed whether or not a row uses
+  // them: a menu that only lists what already exists cannot tell an operator
+  // what the other choice is, and "Nginx 0" is the honest answer on a fleet
+  // that has not moved yet. "Not deployed" is only the state of a row, so it
+  // appears when a row is actually in it.
+  const ids = [...new Set([...Object.keys(TARGET_LABELS), ...counts.keys()])];
   menu.innerHTML = `<button data-binding="all">All bindings <span class="count">${state.certificates.length}</span></button>`
-    + [...counts.keys()].sort().map((id) =>
-      `<button data-binding="${escapeHTML(id)}">${escapeHTML(targetLabel(id))}<span class="count">${counts.get(id)}</span></button>`).join('');
+    + ids.sort((a, b) => targetLabel(a).localeCompare(targetLabel(b))).map((id) =>
+      `<button data-binding="${escapeHTML(id)}">${escapeHTML(targetLabel(id))}<span class="count">${counts.get(id) || 0}</span></button>`).join('');
   $('#binding-label').textContent = state.binding === 'all' ? 'All bindings' : targetLabel(state.binding);
 }
 

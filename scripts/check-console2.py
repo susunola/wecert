@@ -423,6 +423,21 @@ class Console2Regression(unittest.TestCase):
         self.assertIn("CLB", self.text("#binding-control .uin-menu"),
                       "a row without a deploy target is grouped with the CLB default")
 
+    def test_binding_menu_offers_every_backend_not_only_the_used_ones(self):
+        inv = dict(FIXTURE, certificates=[
+            cert("only-clb", "100012345678", "ok", ["a.example.org"], target="tencent")])
+        self.load(inventory=inv, tokens=(READONLY, ""))
+        self.page.click("#binding-trigger")
+        self.page.wait_for_timeout(200)
+        menu = self.text("#binding-control .uin-menu")
+        self.assertIn("Nginx", menu,
+                      "a backend with no rows is still offered, or the menu cannot "
+                      "tell the operator the other choice exists")
+        self.assertIn("0", self.page.text_content("#binding-control [data-binding='nginx']"),
+                      "and it is counted honestly as zero")
+        self.assertNotIn("Not deployed", menu,
+                         "a state no row is in is not presented as a choice")
+
     def test_cloud_filter_lists_the_clouds_the_accounts_report(self):
         accounts = {"accounts": [
             {"uin": "100012345678", "name": "intl-prod", "cloud": "tencentcloud"},
