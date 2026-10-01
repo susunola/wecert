@@ -179,7 +179,7 @@ h1 { font-size: 24px; line-height: 1.3; letter-spacing: -.5px; font-weight: 650;
 
 .workspace { grid-template-columns: minmax(0, 1fr); gap: 0; align-items: start; }
 .panel { border-color: var(--line); border-radius: 8px; box-shadow: none; }
-.filters { grid-template-columns: minmax(240px, 350px) 180px 1fr; align-items: center; gap: 16px; padding: 14px 16px; }
+.filters { grid-template-columns: minmax(240px, 350px) 170px 170px 170px 1fr; align-items: center; gap: 16px; padding: 14px 16px; }
 .filters [hidden] { display: none; }
 .inventory-heading { min-height: 54px; padding: 15px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; }
 .inventory-heading h2 { font-size: 15px; font-weight: 600; }
@@ -383,7 +383,7 @@ body.detail-open { overflow: hidden; }
 .toast { background: #243b42; font-size: 12px; }
 
 @media (max-width: 1080px) {
-  .filters { grid-template-columns: minmax(200px, 1fr) 170px auto; }
+  .filters { grid-template-columns: minmax(200px, 1fr) 160px 160px 160px; }
   .sort-label { font-size: 0; gap: 0; }
 }
 @media (max-width: 760px) {
@@ -894,6 +894,8 @@ body.detail-open { overflow: hidden; }
       <div class="inventory-heading"><h2>Inventory <span id="inventory-count">—</span></h2><button class="clear-filter" id="clear-filter" hidden>Clear filters</button></div>
       <div class="filters">
         <div class="uin-control" id="uin-control"><button class="control" id="uin-trigger">UIN&nbsp;&nbsp; <span id="uin-label">All UINs</span> ⌄</button><div class="uin-menu"></div></div>
+        <div class="uin-control" id="binding-control"><button class="control" id="binding-trigger"><span id="binding-label">All bindings</span> ⌄</button><div class="uin-menu"></div></div>
+        <div class="uin-control" id="cloud-control"><button class="control" id="cloud-trigger"><span id="cloud-label">All clouds</span> ⌄</button><div class="uin-menu"></div></div>
         <select class="control" id="status-filter" aria-label="Filter by status"><option value="all">All statuses</option><option value="ok">Healthy</option><option value="attention">Needs attention</option><option value="not_issued">Not issued</option></select><select class="control" id="sort-order" aria-label="Sort certificates"><option value="expiry">Expiry soonest</option><option value="name">Name A–Z</option></select><input class="control" id="certificate-search" aria-label="Search certificates" placeholder="Search certificates">
       </div>
       <div class="table-wrap"><table><thead><tr><th>Certificate</th><th>Status</th><th>CLB bindings</th><th>Expires in</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="certificate-rows"></tbody></table></div>
@@ -1081,8 +1083,39 @@ function icon(name) {
 const state = {
   base: '', token: '', adminToken: '', live: false, sessionOK: false,
   accounts: [], certificates: [], clbs: [], uin: 'all', status: 'all',
+  binding: 'all', cloud: 'all',
   sort: 'expiry', search: '', selected: '', detailOpen: false, collapsed: new Set()
 };
+
+// Clouds are read from the accounts the daemon reports, so a cloud appears in
+// the filter as soon as wecert can deploy into it. Accounts saved without one
+// are Tencent Cloud: that is the only deployment target the daemon has today.
+const CLOUD_LABELS = {
+  tencentcloud: 'Tencent Cloud', aws: 'AWS', aliyun: 'Alibaba Cloud',
+  gcp: 'Google Cloud', azure: 'Azure'
+};
+const DEFAULT_CLOUD = 'tencentcloud';
+
+function cloudOf(cert) {
+  const account = state.accounts.find((item) => item.uin && item.uin === cert.uin);
+  return (account && String(account.cloud || '').trim()) || DEFAULT_CLOUD;
+}
+
+function cloudLabel(id) {
+  return CLOUD_LABELS[id] || id;
+}
+
+// The binding filter's three answers, counted the same way everywhere:
+// bound -- at least one listener is attached and the set is complete;
+// unbound -- nothing is attached;
+// needs_bind -- the operator has something to do about it.
+function bindingMatches(cert, filter) {
+  const count = cert.bindings?.count || 0;
+  if (filter === 'bound') return count > 0 && cert.bindings?.complete !== false;
+  if (filter === 'unbound') return count === 0;
+  if (filter === 'needs_bind') return bindingIssue(cert);
+  return true;
+}
 let toastTimer;
 const operationLog = [];
 let detailReturnFocus;
@@ -1218,6 +1251,38 @@ function renderUINMenu() {
       : 'Unassigned UIN');
 }
 
+const BINDING_LABELS = {
+  all: 'All bindings', bound: 'Bound', unbound: 'Not bound', needs_bind: 'Needs binding'
+};
+
+function renderBindingMenu() {
+  const counts = { all: state.certificates.length, bound: 0, unbound: 0, needs_bind: 0 };
+  state.certificates.forEach((cert) => {
+    ['bound', 'unbound', 'needs_bind'].forEach((filter) => {
+      if (bindingMatches(cert, filter)) counts[filter] += 1;
+    });
+  });
+  const menu = $('#binding-control .uin-menu');
+  if (!menu) return;
+  menu.innerHTML = ['all', 'bound', 'unbound', 'needs_bind'].map((filter) =>
+    `<button data-binding="${filter}">${escapeHTML(BINDING_LABELS[filter])}<span class="count">${counts[filter]}</span></button>`).join('');
+  $('#binding-label').textContent = BINDING_LABELS[state.binding] || BINDING_LABELS.all;
+}
+
+function renderCloudMenu() {
+  const counts = new Map();
+  state.certificates.forEach((cert) => {
+    const id = cloudOf(cert);
+    counts.set(id, (counts.get(id) || 0) + 1);
+  });
+  const menu = $('#cloud-control .uin-menu');
+  if (!menu) return;
+  menu.innerHTML = `<button data-cloud="all">All clouds <span class="count">${state.certificates.length}</span></button>`
+    + [...counts.keys()].sort().map((id) =>
+      `<button data-cloud="${escapeHTML(id)}">${escapeHTML(cloudLabel(id))}<span class="count">${counts.get(id)}</span></button>`).join('');
+  $('#cloud-label').textContent = state.cloud === 'all' ? 'All clouds' : cloudLabel(state.cloud);
+}
+
 function filteredCertificates() {
   const query = state.search.toLowerCase();
   const result = state.certificates.filter((cert) => {
@@ -1228,6 +1293,8 @@ function filteredCertificates() {
     if (state.status === 'not_issued' && cert.status !== 'not_issued') return false;
     if (state.status === 'expiring' && !(cert.daysLeft != null && cert.daysLeft >= 0 && cert.daysLeft <= 30)) return false;
     if (state.status === 'bindings' && !bindingIssue(cert)) return false;
+    if (state.binding !== 'all' && !bindingMatches(cert, state.binding)) return false;
+    if (state.cloud !== 'all' && cloudOf(cert) !== state.cloud) return false;
     return !query || [cert.name, cert.uin, ...(cert.domains || [])].some((value) => String(value || '').toLowerCase().includes(query));
   });
   result.sort((a, b) => state.sort === 'name'
@@ -1239,7 +1306,8 @@ function filteredCertificates() {
 function renderRows() {
   const visible = filteredCertificates();
   $('#inventory-count').textContent = visible.length;
-  $('#clear-filter').hidden = state.uin === 'all' && state.status === 'all' && !state.search;
+  $('#clear-filter').hidden = state.uin === 'all' && state.status === 'all'
+    && state.binding === 'all' && state.cloud === 'all' && !state.search;
   // A certificate that has no UIN yet leaves the account count at zero, and
   // "across 0 UINs" reads like a broken counter. Drop the clause instead.
   // Count the UINs that actually own a certificate. Counting connected
@@ -1267,7 +1335,7 @@ function renderRows() {
         <td class="expiry-cell ${cert.daysLeft != null && cert.daysLeft <= 30 ? 'expiry-attention' : ''} ${cert.daysLeft != null && cert.daysLeft < 0 ? 'expiry-expired' : ''}" title="${escapeHTML(expiry(cert))}">${cert.daysLeft == null ? '—' : cert.daysLeft < 0 ? `${Math.abs(cert.daysLeft)} days ago<span class="sub">Expired</span>` : `${cert.daysLeft} days`}</td>
         <td class="row-actions"><button class="menu-trigger" data-menu="${escapeHTML(cert.name)}" aria-label="Actions for ${escapeHTML(cert.name)}" aria-haspopup="true">•••</button></td>
       </tr>`;
-    }).join('')}`).join('') || `<tr><td colspan="5"><div class="empty-state"><strong>${state.certificates.length ? 'No matching certificates' : 'No certificates yet'}</strong><span>${state.certificates.length ? 'Try a different UIN, status, or search term.' : 'Create a certificate to start building your inventory.'}</span></div></td></tr>`;
+    }).join('')}`).join('') || `<tr><td colspan="5"><div class="empty-state"><strong>${state.certificates.length ? 'No matching certificates' : 'No certificates yet'}</strong><span>${state.certificates.length ? 'Try a different UIN, cloud, binding, status, or search term.' : 'Create a certificate to start building your inventory.'}</span></div></td></tr>`;
 }
 
 function domainRows(cert) {
@@ -1310,6 +1378,8 @@ function renderAll() {
   $('#metric-expiring').textContent = certs.filter((cert) => cert.daysLeft != null && cert.daysLeft >= 0 && cert.daysLeft <= 30).length;
   $('#metric-bindings').textContent = certs.filter(bindingIssue).length;
   renderUINMenu();
+  renderBindingMenu();
+  renderCloudMenu();
   renderRows();
   renderDetail();
   const uinOptions = accountOptions().map((account) => `<option value="${escapeHTML(account.uin)}">${escapeHTML(accountLabel(account))}</option>`).join('');
@@ -1526,7 +1596,20 @@ function openCertificateAction(name, action) {
   };
 }
 
-$('#uin-trigger').onclick = () => $('#uin-control').classList.toggle('open');
+function closeDropdowns(except) {
+  document.querySelectorAll('.uin-control.open').forEach((control) => {
+    if (!except || control !== except) control.classList.remove('open');
+  });
+}
+
+['#uin-trigger', '#binding-trigger', '#cloud-trigger'].forEach((selector) => {
+  $(selector).onclick = () => {
+    const control = $(selector).closest('.uin-control');
+    const open = control.classList.contains('open');
+    closeDropdowns(control);
+    control.classList.toggle('open', !open);
+  };
+});
 function updateFilteredView() {
   document.querySelectorAll('[data-metric]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.metric === state.status)));
   if (state.detailOpen && !filteredCertificates().some((cert) => cert.name === state.selected)) closeDetail();
@@ -1564,10 +1647,12 @@ sortLabel.textContent = 'Sort by';
 $('#sort-order').before(sortLabel);
 sortLabel.append($('#sort-order'));
 $('#uin-trigger').innerHTML = `<span id="uin-label">All UINs</span>${icon('down')}`;
+$('#binding-trigger').innerHTML = `<span id="binding-label">All bindings</span>${icon('down')}`;
+$('#cloud-trigger').innerHTML = `<span id="cloud-label">All clouds</span>${icon('down')}`;
 $('#clear-filter').onclick = () => {
-  state.uin = 'all'; state.status = 'all'; state.search = '';
+  state.uin = 'all'; state.status = 'all'; state.binding = 'all'; state.cloud = 'all'; state.search = '';
   $('#certificate-search').value = ''; $('#status-filter').value = 'all';
-  renderUINMenu(); updateFilteredView();
+  renderUINMenu(); renderBindingMenu(); renderCloudMenu(); updateFilteredView();
 };
 $('#certificate-search').oninput = (event) => { state.search = event.target.value.trim(); updateFilteredView(); };
 $('#status-filter').onchange = (event) => { state.status = event.target.value; updateFilteredView(); };
@@ -2062,11 +2147,33 @@ document.addEventListener('click', (event) => {
   const uinButton = target.closest('.uin-menu [data-uin]');
   if (uinButton) {
     state.uin = uinButton.dataset.uin;
-    $('#uin-control').classList.remove('open');
+    closeDropdowns();
     renderUINMenu();
     updateFilteredView();
     return;
   }
+
+  const bindingButton = target.closest('.uin-menu [data-binding]');
+  if (bindingButton) {
+    state.binding = bindingButton.dataset.binding;
+    closeDropdowns();
+    renderBindingMenu();
+    updateFilteredView();
+    return;
+  }
+
+  const cloudButton = target.closest('.uin-menu [data-cloud]');
+  if (cloudButton) {
+    state.cloud = cloudButton.dataset.cloud;
+    closeDropdowns();
+    renderCloudMenu();
+    updateFilteredView();
+    return;
+  }
+
+  // A click anywhere else closes an open filter dropdown; without it a second
+  // one stays open behind the list the operator just picked from.
+  if (!target.closest('.uin-control')) closeDropdowns();
 
   const group = target.closest('[data-group]');
   if (group) {
@@ -2100,6 +2207,7 @@ document.addEventListener('keydown', (event) => {
     return;
   }
   if (event.key !== 'Escape') return;
+  closeDropdowns();
   if (rowMenuFor) { closeRowMenu(); return; }
   if (state.detailOpen) { closeDetail(); return; }
   ['#certificate-modal', '#backend-modal', '#notification-modal'].forEach((sel) => $(sel).classList.remove('open'));

@@ -388,6 +388,71 @@ class Console2Regression(unittest.TestCase):
         self.assertIn("account", menu, "an AK/SK account without a UIN keeps its name")
         self.assertNotIn("auto:", menu, "the internal auto: placeholder is never shown")
 
+    def test_binding_filter_narrows_to_bound_and_unbound(self):
+        self.load(tokens=(READONLY, ""))
+        self.page.click("#binding-trigger")
+        self.page.wait_for_timeout(200)
+        menu = self.text("#binding-control .uin-menu")
+        self.assertIn("All bindings", menu)
+        self.assertIn("Bound", menu, "a binding filter offers the bound set")
+        self.assertIn("Not bound", menu, "and the unbound set")
+        self.assertIn("Needs binding", menu, "and the set the operator must act on")
+
+        self.page.click("#binding-control [data-binding='bound']")
+        self.page.wait_for_timeout(200)
+        self.assertEqual(self.rows().count(), 2, "two certificates are bound")
+        self.assertEqual(self.text("#binding-label"), "Bound",
+                         "the trigger names the active filter")
+
+        self.page.click("#binding-trigger")
+        self.page.wait_for_timeout(200)
+        self.page.click("#binding-control [data-binding='unbound']")
+        self.page.wait_for_timeout(200)
+        self.assertEqual(self.rows().count(), 3, "three certificates are not bound")
+        self.assertEqual(self.text("#binding-label"), "Not bound")
+
+    def test_cloud_filter_lists_the_clouds_the_accounts_report(self):
+        accounts = {"accounts": [
+            {"uin": "100012345678", "name": "intl-prod", "cloud": "tencentcloud"},
+            {"uin": "998877665544", "name": "staging", "cloud": "aws"},
+        ]}
+        self.load(accounts=accounts, tokens=(READONLY, ""))
+        self.page.click("#cloud-trigger")
+        self.page.wait_for_timeout(200)
+        menu = self.text("#cloud-control .uin-menu")
+        self.assertIn("All clouds", menu)
+        self.assertIn("Tencent Cloud", menu)
+        self.assertIn("AWS", menu,
+                      "a cloud the accounts report appears without a code change")
+        self.page.click("#cloud-control [data-cloud='aws']")
+        self.page.wait_for_timeout(200)
+        self.assertEqual(self.rows().count(), 1, "only the AWS account's certificate")
+        self.assertEqual(self.text("#cloud-label"), "AWS")
+
+    def test_cloud_filter_defaults_an_account_without_a_cloud_to_tencent(self):
+        accounts = {"accounts": [{"uin": "100012345678", "name": "intl-prod"}]}
+        self.load(accounts=accounts, tokens=(READONLY, ""))
+        self.page.click("#cloud-trigger")
+        self.page.wait_for_timeout(200)
+        menu = self.text("#cloud-control .uin-menu")
+        self.assertIn("Tencent Cloud", menu,
+                      "an account saved without a cloud is a Tencent Cloud account today")
+        self.assertNotIn("aws", menu, "no cloud is invented")
+
+    def test_clear_filters_resets_the_binding_and_cloud_filters(self):
+        self.load(tokens=(READONLY, ""))
+        self.page.click("#binding-trigger")
+        self.page.wait_for_timeout(200)
+        self.page.click("#binding-control [data-binding='bound']")
+        self.page.wait_for_timeout(200)
+        self.assertTrue(self.page.is_visible("#clear-filter"),
+                        "an active binding filter offers a way back")
+        self.page.click("#clear-filter")
+        self.page.wait_for_timeout(200)
+        self.assertEqual(self.rows().count(), 5, "clearing restores every certificate")
+        self.assertEqual(self.text("#binding-label"), "All bindings")
+        self.assertEqual(self.text("#cloud-label"), "All clouds")
+
     def test_unauthorized_inventory_surfaces_an_error(self):
         self.load(status_code=401, tokens=(READONLY, ""))
         self.assertIn("unauthorized", self.text("#sync-warning"),
