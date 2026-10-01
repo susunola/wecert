@@ -1343,6 +1343,18 @@ func TestPanicInOneCertificateIsContainedAndCounted(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// The fake manager records the certificate name before it panics, so "boom"
+	// can appear in reconciled() one step before the deferred recover has
+	// counted the panic. Wait for the recover to land before asserting the
+	// exact count, or the test flakes on a counter that is about to move.
+	deadline = time.Now().Add(5 * time.Second)
+	for testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues("boom"))-before < 1 {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	if got := testutil.ToFloat64(metrics.ReconcilePanics.WithLabelValues("boom")) - before; got != 1 {
 		t.Errorf("the panic must be counted exactly once, got %v", got)
 	}
