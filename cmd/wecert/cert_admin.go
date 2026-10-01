@@ -556,22 +556,22 @@ func stageCertificateInConfig(path, name string, domains []string, profile, keyT
 func deleteCertificateAdmin(cfg *config.Config, name string, log *slog.Logger) (any, error) {
 	configMu.Lock()
 	defer configMu.Unlock()
-	// Refuse to empty the list before anything is written. In every mode but
-	// enforce the configuration must keep at least one certificate, and the
-	// gate that rejects an empty one runs at reload time -- after this function
-	// has already rewritten config.yaml. Write first, reject later leaves the
-	// file and the running state diverged (the console keeps showing the
-	// "deleted" certificate) and a daemon that cannot start again after a
-	// restart. cfg is the snapshot the process started with, so re-read the
-	// file: earlier management writes may have changed the list since.
+	// Observe diffs reality against the configured list, so an empty one is
+	// meaningless there and the reload admission gate would reject it after
+	// this function had already written config.yaml -- leaving the file and the
+	// running state diverged. Static may end empty (console-first cold start:
+	// the first certificate is created from the browser afterwards), so only
+	// observe is refused here, before the write. cfg is the snapshot the
+	// process started with, so re-read the file: earlier management writes may
+	// have changed the list since.
 	current, err := config.Load(configPathForAdmin)
 	if err != nil {
 		return nil, fmt.Errorf("cannot re-read the current configuration: %w", err)
 	}
-	if current.DesiredState.Mode != config.ModeEnforce && len(current.Certificates) <= 1 {
+	if current.DesiredState.Mode == config.ModeObserve && len(current.Certificates) <= 1 {
 		return nil, webhook.InvalidRequestf(
-			"refusing to delete %s: it is the last certificate and desiredState.mode=%q requires at least one -- add the replacement first, or switch desiredState.mode to %q to take the list from the desired-state document",
-			name, current.DesiredState.Mode, config.ModeEnforce)
+			"refusing to delete %s: desiredState.mode=%q diffs reality against the configured list and needs at least one certificate",
+			name, current.DesiredState.Mode)
 	}
 	list, err := webhook.ReadConsoleCertificates(cfg.StatePath)
 	if err != nil {

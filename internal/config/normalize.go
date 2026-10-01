@@ -424,12 +424,19 @@ func (c *Config) normalizeSubsections() error {
 // normalizeCertificatesBlock checks the certificate list and the one cross-cutting
 // rule that needs both the list and a profile default filled in above (the probe floor).
 func (c *Config) normalizeCertificatesBlock() error {
-	// Both static and observe converge on certificates, so a non-empty list is a
-	// hard requirement. In enforce mode certificates must be empty (rejected
-	// above); the document is the only source.
-	if c.DesiredState.Mode != ModeEnforce && len(c.Certificates) == 0 {
+	// Observe converges on the list too -- it diffs reality against it, so an
+	// empty list has nothing to diff and the mode is not a "does nothing" mode.
+	// Static may start empty: the console-first flow installs the daemon,
+	// connects an account, and creates the first certificate from the browser,
+	// and a hand-written placeholder entry just to satisfy this check is what
+	// that flow used to require. The "config lost its certificates by accident"
+	// hazard is covered upstream: decoding rejects unknown and misspelled
+	// fields outright, so a silently empty list is a deliberate certificates: [].
+	// In enforce mode certificates must be empty (rejected above); the document
+	// is the only source.
+	if c.DesiredState.Mode == ModeObserve && len(c.Certificates) == 0 {
 		return fmt.Errorf("at least one certificate is required "+
-			"(desiredState.mode=%q still converges on this list; "+
+			"(desiredState.mode=%q diffs reality against this list; "+
 			"set desiredState.mode=%q to take the whole list from the desired-state document instead)",
 			c.DesiredState.Mode, ModeEnforce)
 	}

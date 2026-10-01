@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -230,7 +229,13 @@ func TestBindCertificateRejectsMissingListener(t *testing.T) {
 // ("at least one certificate is required" fires at startup too, not only at
 // reload). The refusal must happen before the write, with the reason in the
 // error the modal shows.
-func TestDeleteCertificateAdminRefusesToRemoveTheLastCertificate(t *testing.T) {
+// Deleting the last certificate used to write the emptied config.yaml first and
+// let the reload admission gate reject it afterwards: the console was told "ok",
+// the file and the running state diverged, and the daemon could not start again.
+// Static now legitimately ends empty (console-first cold start), so deleting the
+// last one must go through; observe still diffs against the list, so there the
+// refusal must happen before the write.
+func TestDeleteCertificateAdminLastCertificate(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{StatePath: filepath.Join(dir, "state.db")}
 	cfgPath := filepath.Join(dir, "config.yaml")
@@ -261,12 +266,9 @@ tencent:
 	one := strings.Replace(two,
 		"  - name: demo\n    domains: [d.example.com]\n  - name: other\n    domains: [o.example.com]\n",
 		"  - name: demo\n    domains: [d.example.com]\n", 1)
-	enforce := strings.Replace(two, "mode: static", "mode: enforce", 1)
-	enforce = strings.Replace(enforce,
-		"mode: enforce", "mode: enforce\n  path: "+state+".desired.yaml", 1)
-	enforce = strings.Replace(enforce,
-		"certificates:\n  - name: demo\n    domains: [d.example.com]\n  - name: other\n    domains: [o.example.com]\n",
-		"certificates: []\n", 1)
+	observe := strings.Replace(strings.Replace(one,
+		"mode: static", "mode: observe\n  path: "+state+".desired.yaml", 1),
+		"", "", 1)
 
 	oldPath := configPathForAdmin
 	oldSig := signalSelf
@@ -274,28 +276,23 @@ tencent:
 	defer func() { configPathForAdmin = oldPath; signalSelf = oldSig }()
 	log, _ := quietLog()
 
-	// One certificate, static mode: refused, and the file keeps the entry.
+	// Static, one certificate: the delete goes through and the file ends empty.
 	if err := os.WriteFile(cfgPath, []byte(one), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	configPathForAdmin = cfgPath
-	_, err := deleteCertificateAdmin(cfg, "demo", log)
-	if err == nil {
-		t.Fatal("deleting the last certificate must be refused")
-	}
-	var ir *webhook.InvalidRequestError
-	if !errors.As(err, &ir) {
-		t.Fatalf("refusal must be a client error, got %T: %v", err, err)
-	}
-	if !strings.Contains(err.Error(), "last certificate") {
-		t.Errorf("refusal must say why, got: %v", err)
+	if _, err := deleteCertificateAdmin(cfg, "demo", log); err != nil {
+		t.Fatalf("static mode must allow emptying the list: %v", err)
 	}
 	got, _ := os.ReadFile(cfgPath)
-	if !strings.Contains(string(got), "name: demo") {
-		t.Fatalf("refused delete must not touch the config:\n%s", got)
+	if strings.Contains(string(got), "name: demo") {
+		t.Fatalf("static delete-last still wrote the entry:\n%s", got)
+	}
+	if !strings.Contains(string(got), "certificates: []") {
+		t.Fatalf("expected an explicit empty list, got:\n%s", got)
 	}
 
-	// Two certificates: the delete goes through and the file loses one.
+	// Two certificates: same, nothing special.
 	if err := os.WriteFile(cfgPath, []byte(two), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -307,15 +304,15 @@ tencent:
 		t.Fatalf("two-cert delete wrote the wrong file:\n%s", got)
 	}
 
-	// Enforce mode takes its list from the desired-state document, so an empty
-	// certificates block is the normal shape there and the guard must not fire.
-	if err := os.WriteFile(cfgPath, []byte(enforce), 0o600); err != nil {
+	// Observe, one certificate: refused before the write, file keeps the entry.
+	if err := os.WriteFile(cfgPath, []byte(observe), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := webhook.WriteConsoleCertificates(cfg.StatePath, []webhook.ConsoleCertificate{{Name: "demo"}}); err != nil {
-		t.Fatal(err)
+	if _, err := deleteCertificateAdmin(cfg, "demo", log); err == nil {
+		t.Fatal("observe mode must refuse to empty the list")
 	}
-	if _, err := deleteCertificateAdmin(cfg, "demo", log); err != nil {
-		t.Fatalf("enforce mode must allow emptying the list: %v", err)
+	got, _ = os.ReadFile(cfgPath)
+	if !strings.Contains(string(got), "name: demo") {
+		t.Fatalf("refused observe delete must not touch the config:\n%s", got)
 	}
 }

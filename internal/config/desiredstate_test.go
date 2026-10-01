@@ -169,3 +169,31 @@ onboarding:
 		t.Fatalf("an invalid duration should error, got %v", err)
 	}
 }
+
+// Static may start empty: the console-first flow installs the daemon, connects
+// an account, and creates the first certificate from the browser. A hand-written
+// placeholder entry just to satisfy a non-empty check is what that used to
+// require. Observe keeps the requirement (it diffs against the list), and
+// decoding rejects unknown fields, so a silently empty list is a deliberate
+// `certificates: []`.
+func TestStaticAllowsAnEmptyCertificateList(t *testing.T) {
+	cfg, err := Load(writeConfig(t, minimalPrefix+`
+certificates: []
+`))
+	if err != nil {
+		t.Fatalf("static mode with an empty list should load, got %v", err)
+	}
+	if len(cfg.Certificates) != 0 {
+		t.Errorf("expected zero certificates, got %d", len(cfg.Certificates))
+	}
+
+	_, err = Load(writeConfig(t, minimalPrefix+`
+certificates: []
+desiredState:
+  mode: observe
+  path: /tmp/desired-state.yaml
+`))
+	if err == nil || !strings.Contains(err.Error(), "at least one certificate") {
+		t.Fatalf("observe mode without certificates should still error, got %v", err)
+	}
+}
