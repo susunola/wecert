@@ -413,18 +413,14 @@ func cutSnapshotStamp(name, prefix string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	// A collision suffix ("<stamp>~2") is not part of the timestamp. The '-' form is still
-	// accepted: snapshots written before the separator changed must keep counting as ours, or
-	// retention stops seeing them and they stay on disk forever.
-	if i := strings.IndexByte(rest, '~'); i >= 0 {
-		rest = rest[:i]
-	} else if i := strings.IndexByte(rest, '-'); i >= 0 {
-		rest = rest[:i]
-	}
-	if _, err := time.Parse(snapshotStamp, rest); err != nil {
+	stamp, ok := SplitCollisionSuffix(rest)
+	if !ok {
 		return "", false
 	}
-	return rest, true
+	if _, err := time.Parse(snapshotStamp, stamp); err != nil {
+		return "", false
+	}
+	return stamp, true
 }
 
 // IsSnapshotName reports whether name looks like a snapshot of the store whose
@@ -551,4 +547,30 @@ func (s *Store) HasRecoverableState() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// SplitCollisionSuffix drops a "~<n>" collision suffix, or the legacy "-<pid>"
+// form written before the separator changed. The tail must be digits: anything
+// else ("stamp-before-upgrade", "stamp-manual") is not a name this program
+// wrote, and accepting it let retention delete an operator's own copy.
+func SplitCollisionSuffix(stamp string) (string, bool) {
+	if i := strings.IndexByte(stamp, '~'); i >= 0 {
+		return stamp[:i], allDigits(stamp[i+1:])
+	}
+	if i := strings.IndexByte(stamp, '-'); i >= 0 {
+		return stamp[:i], allDigits(stamp[i+1:])
+	}
+	return stamp, true
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"io"
 	"bufio"
 	"context"
 	"fmt"
@@ -228,3 +230,32 @@ func logRestoreNotice(log *slog.Logger, statePath string, now time.Time) {
 // process exits 64 ("the command line is wrong") rather than 1 ("the program ran and failed").
 var errRestoreConflict = fmt.Errorf("%w: -restore replaces the state database and then exits, so it "+
 	"cannot be combined with -once, -dry-run or -revoke", errUsage)
+
+// fingerprintRestoreSource resolves a restore source and hashes its bytes so a
+// confirm token can be pinned to the content it was minted for. A "latest" (or
+// a named path) that is replaced between challenge and restore then no longer
+// matches, instead of restoring whatever arrived in the meantime.
+func fingerprintRestoreSource(cfg *config.Config, source string) (string, error) {
+	if err := adminRestoreSourceAllowed(cfg, source); err != nil {
+		return "", err
+	}
+	src, cleanup, err := resolveRestoreSnapshot(cfg, source)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	f, err := os.Open(src)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d:%d:%x", fi.Size(), fi.ModTime().UTC().Unix(), h.Sum(nil)), nil
+}

@@ -564,10 +564,15 @@ func TestAdminRestoreRefusesExpiredAndUnboundTickets(t *testing.T) {
 func TestAdminRestoreFailureIsAuditedAndNotStaged(t *testing.T) {
 	t.Parallel()
 	attempts := 0
-	s := adminServer(t, AdminOps{Restore: func(_ context.Context, src string) (any, error) {
-		attempts++
-		return nil, errors.New("state.db is not a wecert snapshot")
-	}})
+	s := adminServer(t, AdminOps{
+		// A stable fingerprint: this test is about the restore failure, not about
+		// the source changing between challenge and restore.
+		FingerprintSource: func(string) (string, error) { return "digest", nil },
+		Restore: func(_ context.Context, src string) (any, error) {
+			attempts++
+			return nil, errors.New("state.db is not a wecert snapshot")
+		},
+	})
 	auth := map[string]string{"Authorization": "Bearer " + adminTok}
 
 	w := do(t, s, http.MethodPost, "/admin/challenge", `{"source":"latest"}`, auth)

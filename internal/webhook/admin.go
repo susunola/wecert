@@ -32,6 +32,9 @@ type AdminOps struct {
 	RecoveryDrill func(ctx context.Context, source string) (any, error)
 	// Restore actually replaces the state database. Requires a confirm challenge.
 	Restore func(ctx context.Context, source string) (any, error)
+	// FingerprintSource resolves a restore source and hashes its bytes so a
+	// confirm token can be pinned to the content it was minted for.
+	FingerprintSource func(source string) (string, error)
 
 	// Certificate management for the web console. Each is optional; nil is not mounted.
 	ListAccounts      func(ctx context.Context) (any, error)
@@ -50,6 +53,10 @@ type AdminOps struct {
 type confirmGrant struct {
 	expires time.Time
 	source  string
+	// digest pins the bytes the token was minted for. Without it a "latest"
+	// (or a named path) can be replaced between challenge and restore and the
+	// token would still apply to whatever is there now.
+	digest string
 }
 
 // AdminTokenMinLen is re-exported for the config comment; see config.WebhookAdminTokenMinLen.
@@ -236,6 +243,16 @@ func (s *Server) handleAdminChallenge() http.HandlerFunc {
 			return
 		}
 
+		digest := ""
+		if s.ops.FingerprintSource != nil {
+			digest, err = s.ops.FingerprintSource(body.Source)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "cannot fingerprint the restore source: " + err.Error()})
+				return
+			}
+		}
+
 		s.confirmMu.Lock()
 		if s.confirms == nil {
 			s.confirms = map[string]confirmGrant{}
@@ -248,7 +265,7 @@ func (s *Server) handleAdminChallenge() http.HandlerFunc {
 			}
 		}
 		exp := now.Add(adminConfirmTTL)
-		s.confirms[tok] = confirmGrant{expires: exp, source: body.Source}
+		s.confirms[tok] = confirmGrant{expires: exp, source: body.Source, digest: digest}
 		s.confirmMu.Unlock()
 		s.audit(r, "admin_challenge_issued", map[string]any{"ttlSeconds": int(adminConfirmTTL.Seconds()), "source": body.Source})
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -272,11 +289,12 @@ const (
 	confirmExpired        confirmReject = "expired"
 	confirmSourceMismatch confirmReject = "source_mismatch"
 	confirmWildcardToken  confirmReject = "wildcard_token"
+	confirmContentChanged confirmReject = "content_changed"
 )
 
 // consumeConfirmToken burns a one-shot restore ticket. Empty return means the
 // ticket is good for exactly this source.
-func (s *Server) consumeConfirmToken(tok, source string) confirmReject {
+func (s *Server) consumeConfirmToken(tok, source, digest string) confirmReject {
 	if tok == "" {
 		return confirmMissing
 	}
@@ -298,6 +316,12 @@ func (s *Server) consumeConfirmToken(tok, source string) confirmReject {
 	}
 	if g.source != source {
 		return confirmSourceMismatch
+	}
+	// Both sides must have been fingerprinted the same way. An empty digest on
+	// the grant means the challenge could not resolve the source; refuse rather
+	// than restore whatever arrived in the meantime.
+	if g.digest == "" || g.digest != digest {
+		return confirmContentChanged
 	}
 	return confirmOK
 }
@@ -327,7 +351,11 @@ func (s *Server) handleAdminRestore() http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source is required (snapshot path, directory, or \"latest\")"})
 			return
 		}
-		if reason := s.consumeConfirmToken(body.ConfirmToken, body.Source); reason != confirmOK {
+		digest := ""
+		if s.ops.FingerprintSource != nil {
+			digest, _ = s.ops.FingerprintSource(body.Source)
+		}
+		if reason := s.consumeConfirmToken(body.ConfirmToken, body.Source, digest); reason != confirmOK {
 			s.audit(r, "admin_restore_refused", map[string]any{"source": body.Source, "reason": string(reason)})
 			msg := "a short-lived confirm token is required: POST /admin/challenge first, then retry with confirmToken"
 			if reason == confirmSourceMismatch {
@@ -336,6 +364,8 @@ func (s *Server) handleAdminRestore() http.HandlerFunc {
 				msg = "the confirm token has expired; issue a new challenge"
 			} else if reason == confirmWildcardToken {
 				msg = "the confirm token is not bound to a source and is refused; issue a new challenge with source"
+			} else if reason == confirmContentChanged {
+				msg = "the restore source changed after the challenge; issue a new one"
 			}
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": msg})
 			return

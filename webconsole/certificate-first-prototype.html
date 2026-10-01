@@ -31,61 +31,149 @@
 <option value="international">International (intlcloud.tencent.com)</option>
 </select></label><label class="field">Credential method<select id="new-uin-cred"><option value="static">SecretId / SecretKey</option><option value="cvm-role">Role credential</option></select></label><div id="credential-fields"><label class="field">SecretId<input id="new-uin-secret-id" placeholder="AKID..."></label><label class="field">SecretKey<input id="new-uin-secret-key" type="password" placeholder="••••••••"></label></div><p class="security-note">Credentials are sent to the daemon and never saved in this browser.</p><div class="drawer-actions"><button class="small-btn" id="cancel-uin">Cancel</button><button class="primary" id="save-uin">Save UIN</button></div></aside>
 <div class="modal" id="certificate-modal"><form class="modal-card wizard-card" id="certificate-form">
-  <header class="modal-head"><h2>New certificate</h2><span class="spacer"></span><button type="button" class="icon-close" data-close-modal aria-label="Close">×</button></header>
-  <div class="wizard-rail" aria-label="Create certificate steps">
-    <ol class="wizard-steps" id="wizard-steps">
-      <li class="is-current" data-step="0"><button type="button" class="step-dot">1</button><span class="step-label">Identity</span></li>
-      <li data-step="1"><button type="button" class="step-dot">2</button><span class="step-label">Policy</span></li>
-      <li data-step="2"><button type="button" class="step-dot">3</button><span class="step-label">DNS</span></li>
-      <li data-step="3"><button type="button" class="step-dot">4</button><span class="step-label">Deploy</span></li>
-    </ol>
-    <p class="wizard-progress" id="wizard-progress">Step 1 of 4</p>
-  </div>
-
-  <section class="wizard-pane is-current" data-pane="0">
-    <p class="wizard-lead">Name the certificate and list every hostname it must cover.</p>
-    <label class="field">Certificate name<input id="certificate-name" required placeholder="prod-api-tls"></label>
-    <div class="field">
-  <span class="field-label">UIN</span>
-  <span class="inline-field">
-    <select id="certificate-uin"></select>
-    <button type="button" class="small-btn" id="certificate-uin-add" title="Add a cloud account">＋ Add</button>
-  </span>
-</div>
-    <label class="field">Domains <span class="field-hint">(one per line)</span><textarea id="certificate-domains" required rows="4" placeholder="api.example.com&#10;www.example.com"></textarea></label>
-  </section>
-
-  <section class="wizard-pane" data-pane="1" hidden>
-    <p class="wizard-lead">Profile, key type, and when renewal should start.</p>
-    <div class="field-row">
-      <label class="field">ACME profile<select id="certificate-profile"><option value="classic">classic · 90 days</option><option value="shortlived">shortlived</option></select></label>
-      <label class="field">Key type<select id="certificate-key"><option value="ecdsa-p256">ECDSA P-256</option><option value="ecdsa-p384">ECDSA P-384</option><option value="rsa2048">RSA 2048</option></select></label>
+  <header class="modal-head">
+    <div class="modal-title-group">
+      <h2>New certificate</h2>
+      <span class="modal-subtitle">ACME automated issuance and deployment</span>
     </div>
-    <label class="field">Renew before<select id="certificate-renew"><option value="720h">30 days</option><option value="336h">14 days</option><option value="168h">7 days</option></select></label>
-  </section>
+    <button type="button" class="icon-close" data-close-modal aria-label="Close">×</button>
+  </header>
 
-  <section class="wizard-pane" data-pane="2" hidden>
-    <p class="wizard-lead">DNS-01 writes a TXT challenge. Select the DNS provider and credential.</p>
-    <label class="field">DNS provider<select id="certificate-dns-provider"><option value="cloudflare">Cloudflare</option><option value="dnspod">DNSPod</option><option value="tencentcloud">Tencent Cloud DNS</option><option value="route53">AWS Route 53</option></select></label>
-    <label class="field">DNS credential<select id="certificate-dns-cred"><option value="reused">Reuse daemon credential</option><option value="token">API token (this certificate)</option><option value="file">Key file on the daemon host</option></select></label>
-    <label class="field is-hidden" id="dns-token-wrap">API token<input id="certificate-dns-token" type="password" autocomplete="new-password" placeholder="Sent once to the daemon; never echoed back"></label>
-    <label class="field is-hidden" id="dns-file-wrap">Credential file path<input id="certificate-dns-file" class="mono" placeholder="/etc/wecert/dns-token"></label>
-    <p class="security-note">Cloudflare needs <strong>Zone:Read + DNS:Edit</strong> on the zone that holds the domain.</p>
-  </section>
+  <nav class="wizard-stepper" aria-label="Creation steps">
+    <button type="button" class="step-item is-current" data-step="0">
+      <span class="step-num">1</span>
+      <span class="step-text"><strong class="step-title">Identity</strong><small class="step-desc">Name &amp; domains</small></span>
+    </button>
+    <span class="step-arrow" aria-hidden="true">›</span>
+    <button type="button" class="step-item" data-step="1">
+      <span class="step-num">2</span>
+      <span class="step-text"><strong class="step-title">Policy</strong><small class="step-desc">Key &amp; renewal</small></span>
+    </button>
+    <span class="step-arrow" aria-hidden="true">›</span>
+    <button type="button" class="step-item" data-step="2">
+      <span class="step-num">3</span>
+      <span class="step-text"><strong class="step-title">DNS</strong><small class="step-desc">DNS-01 auth</small></span>
+    </button>
+    <span class="step-arrow" aria-hidden="true">›</span>
+    <button type="button" class="step-item" data-step="3">
+      <span class="step-num">4</span>
+      <span class="step-text"><strong class="step-title">Deploy</strong><small class="step-desc">Target &amp; review</small></span>
+    </button>
+  </nav>
 
-  <section class="wizard-pane" data-pane="3" hidden>
-    <p class="wizard-lead">Deployment target after issuance.</p>
-    <label class="field">Deploy target<select id="certificate-deploy"><option value="clb">Tencent CLB / SSL</option><option value="nginx">Local nginx</option><option value="none">Issue only, do not deploy</option></select></label>
-    <div class="wizard-review" id="wizard-review"></div>
-  </section>
+  <div class="wizard-body">
+    <section class="wizard-pane is-current" data-pane="0">
+      <div class="field">
+        <label class="field-label" for="certificate-name">Certificate identifier</label>
+        <input id="certificate-name" required placeholder="e.g. prod-api-tls" autocomplete="off" spellcheck="false">
+        <span class="field-help">Internal name used in daemon configuration and state storage.</span>
+      </div>
+      <div class="field">
+        <div class="field-label-row">
+          <label class="field-label" for="certificate-uin">Cloud account</label>
+          <button type="button" class="text-link" id="certificate-uin-add">＋ Connect account</button>
+        </div>
+        <select id="certificate-uin"></select>
+        <span class="field-help">Account used for certificate deployment and cloud resource lookup.</span>
+      </div>
+      <div class="field">
+        <div class="field-label-row">
+          <label class="field-label" for="certificate-domains">Domains (SANs)</label>
+          <span class="field-tag">One per line</span>
+        </div>
+        <textarea id="certificate-domains" required rows="3" placeholder="api.example.com&#10;www.example.com" spellcheck="false" class="mono"></textarea>
+        <span class="field-help">First domain is used as Subject Common Name (CN). Wildcards allowed (*.example.com).</span>
+      </div>
+    </section>
+
+    <section class="wizard-pane" data-pane="1" hidden>
+      <div class="field-grid-2">
+        <div class="field">
+          <label class="field-label" for="certificate-profile">ACME profile</label>
+          <select id="certificate-profile">
+            <option value="classic">Classic (90-day validity)</option>
+            <option value="shortlived">Short-lived (6-day validity)</option>
+          </select>
+          <span class="field-help">Classic is standard Let’s Encrypt.</span>
+        </div>
+        <div class="field">
+          <label class="field-label" for="certificate-key">Key algorithm</label>
+          <select id="certificate-key">
+            <option value="ecdsa-p256">ECDSA P-256 (recommended)</option>
+            <option value="ecdsa-p384">ECDSA P-384</option>
+            <option value="rsa2048">RSA 2048</option>
+          </select>
+          <span class="field-help">ECDSA is faster and smaller.</span>
+        </div>
+      </div>
+      <div class="field">
+        <label class="field-label" for="certificate-renew">Renew before expiry</label>
+        <select id="certificate-renew">
+          <option value="720h">30 days before</option>
+          <option value="336h">14 days before</option>
+          <option value="168h">7 days before</option>
+        </select>
+        <span class="field-help">Daemon initiates automatic renewal when this window opens.</span>
+      </div>
+    </section>
+
+    <section class="wizard-pane" data-pane="2" hidden>
+      <div class="field-grid-2">
+        <div class="field">
+          <label class="field-label" for="certificate-dns-provider">DNS provider</label>
+          <select id="certificate-dns-provider">
+            <option value="cloudflare">Cloudflare</option>
+            <option value="dnspod">DNSPod</option>
+            <option value="tencentcloud">Tencent Cloud DNS</option>
+            <option value="route53">AWS Route 53</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="field-label" for="certificate-dns-cred">Credential source</label>
+          <select id="certificate-dns-cred">
+            <option value="reused">Reuse daemon credential</option>
+            <option value="token">Scoped API token</option>
+            <option value="file">Key file on host</option>
+          </select>
+        </div>
+      </div>
+      <div class="field is-hidden" id="dns-token-wrap">
+        <label class="field-label" for="certificate-dns-token">API token</label>
+        <input id="certificate-dns-token" type="password" autocomplete="new-password" placeholder="Paste scoped API token">
+        <span class="field-help">Stored in <code>/var/lib/wecert/dns/</code> mode 0600. Never returned via API.</span>
+      </div>
+      <div class="field is-hidden" id="dns-file-wrap">
+        <label class="field-label" for="certificate-dns-file">Credential file path</label>
+        <input id="certificate-dns-file" class="mono" placeholder="/etc/wecert/dns-token">
+        <span class="field-help">Absolute path on the daemon host.</span>
+      </div>
+      <div class="callout-note">
+        <strong>DNS-01 Requirement</strong>
+        <span>Cloudflare tokens require <code>Zone:Read</code> + <code>DNS:Edit</code> scoped to the target zone.</span>
+      </div>
+    </section>
+
+    <section class="wizard-pane" data-pane="3" hidden>
+      <div class="field">
+        <label class="field-label" for="certificate-deploy">Deployment target</label>
+        <select id="certificate-deploy">
+          <option value="clb">Tencent Cloud CLB (auto-upload)</option>
+          <option value="nginx">Local Nginx</option>
+          <option value="none">None (issue &amp; store locally only)</option>
+        </select>
+        <span class="field-help">CLB target automatically uploads newly issued certificates to Tencent Cloud SSL.</span>
+      </div>
+      <div class="wizard-summary-card" id="wizard-review"></div>
+    </section>
+  </div>
 
   <p class="form-error" role="alert"></p>
   <footer class="wizard-foot">
     <button type="button" class="btn-ghost" data-close-modal>Cancel</button>
     <span class="spacer"></span>
     <button type="button" class="btn-secondary" id="wizard-back" hidden>Back</button>
-    <button type="button" class="btn-primary" id="wizard-next">Continue</button>
-    <button type="submit" class="btn-primary" id="wizard-submit" hidden>Create certificate</button>
+    <button type="button" class="btn-primary" id="wizard-next">Continue →</button>
+    <button type="submit" class="btn-primary" id="wizard-submit" hidden>Create &amp; issue</button>
   </footer>
 </form></div>
 <div class="modal" id="backend-modal"><form class="modal-card" id="backend-form"><header class="modal-head"><h2>Connect to wecert</h2><span class="spacer"></span><button type="button" class="icon-close" data-close-backend aria-label="Close">×</button></header><p>Use the daemon URL and tokens from <code>/etc/wecert/config.yaml</code>.</p><label class="field">Daemon base URL<input id="backend-url" required placeholder="Defaults to this page origin"></label><label class="field" id="backend-token-row">Read token<input id="backend-token" type="password" autocomplete="new-password" placeholder="From /etc/wecert/config.yaml"></label><label class="field" id="backend-admin-row">Admin token <span class="field-hint">(create / account management)</span><input id="backend-admin-token" type="password" autocomplete="new-password"></label><p class="form-error" id="backend-error" role="alert"></p><div class="modal-actions"><button type="button" class="small-btn" data-close-backend>Cancel</button><button class="primary">Connect &amp; load</button></div></form></div>

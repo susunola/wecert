@@ -23,6 +23,8 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+
+	"github.com/susunola/wecert/internal/state"
 )
 
 const (
@@ -623,9 +625,9 @@ func futureDatedSnapshot(name string) bool {
 	if i < 0 {
 		return false
 	}
-	stamp := strings.TrimSuffix(base[i+len(".backup-"):], ".db")
-	if j := strings.IndexByte(stamp, '~'); j >= 0 {
-		stamp = stamp[:j]
+	stamp, ok := state.SplitCollisionSuffix(strings.TrimSuffix(base[i+len(".backup-"):], ".db"))
+	if !ok {
+		return false
 	}
 	at, err := time.Parse(snapshotStamp, stamp)
 	if err != nil {

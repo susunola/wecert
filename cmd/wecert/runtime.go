@@ -426,6 +426,9 @@ func adminOps(cfg *config.Config, log *slog.Logger) webhook.AdminOps {
 		RecoveryDrill: func(ctx context.Context, source string) (any, error) {
 			return recoveryDrill(cfg, source)
 		},
+		FingerprintSource: func(source string) (string, error) {
+			return fingerprintRestoreSource(cfg, source)
+		},
 		Restore: func(ctx context.Context, source string) (any, error) {
 			return adminRestore(cfg, source, log)
 		},
