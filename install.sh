@@ -258,12 +258,13 @@ if [[ -f "${CONFIG_FILE}" ]]; then
 	echo "    config already exists, keeping its content"
 	# The daemon rewrites this file for every management write, so it must be
 	# owned by the service user. Installs before the config-write fix left it
-	# root:wecert 0640: readable, but every console save then failed.
+	# root:wecert 0640: readable, but every console save then failed. 0640 stays
+	# (the group is wecert alone); ownership is what the write path needs.
 	chown wecert:wecert "${CONFIG_FILE}"
-	chmod 0600 "${CONFIG_FILE}"
+	chmod 0640 "${CONFIG_FILE}"
 else
 	if [[ -f "${SCRIPT_DIR}/config.example.yaml" ]]; then
-		install -m 0600 -o wecert -g wecert "${SCRIPT_DIR}/config.example.yaml" "${CONFIG_FILE}"
+		install -m 0640 -o wecert -g wecert "${SCRIPT_DIR}/config.example.yaml" "${CONFIG_FILE}"
 		echo "    placed the example config; be sure to edit it before starting"
 	else
 		echo "    warning: config.example.yaml not found, create ${CONFIG_FILE} by hand"

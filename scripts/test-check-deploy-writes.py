@@ -49,7 +49,7 @@ install -d -o wecert -g wecert -m 0700 "${STATE_DIR}"
 if [[ -f "${CONFIG_FILE}" ]]; then
 \tchown wecert:wecert "${CONFIG_FILE}"
 else
-\tinstall -m 0600 -o wecert -g wecert "${SCRIPT_DIR}/config.example.yaml" "${CONFIG_FILE}"
+\tinstall -m 0640 -o wecert -g wecert "${SCRIPT_DIR}/config.example.yaml" "${CONFIG_FILE}"
 fi
 """
 
@@ -88,7 +88,7 @@ def main() -> int:
     case("install.sh fresh config root:wecert 0640",
          lambda t: (t / "install.sh")
          .write_text(GOOD_INSTALL.replace(
-             'install -m 0600 -o wecert -g wecert "${SCRIPT_DIR}/config.example.yaml"',
+             'install -m 0640 -o wecert -g wecert "${SCRIPT_DIR}/config.example.yaml"',
              'install -m 0640 -o root -g wecert "${SCRIPT_DIR}/config.example.yaml"')))
     case("install.sh leaves an existing config root-owned",
          lambda t: (t / "install.sh")
