@@ -63,6 +63,31 @@ func TestAccountKeyPathRefusesTraversal(t *testing.T) {
 	_ = absInside
 }
 
+// A symlinked directory under accounts/ passes the lexical prefix check but
+// redirects the AK/SK write outside the root; the resolved path must be refused.
+func TestAccountKeyPathRefusesSymlinkedParent(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state.db")
+	root := filepath.Join(dir, "accounts")
+	outside := filepath.Join(dir, "outside")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accountKeyPath(state, "good", filepath.Join(link, "stolen.key")); err == nil {
+		t.Fatal("keyPath through a symlinked directory under accounts/ must be rejected")
+	}
+	if _, err := accountKeyPath(state, "good", filepath.Join(root, "good.key")); err != nil {
+		t.Errorf("an in-root keyPath must still be allowed: %v", err)
+	}
+}
+
 
 // --- coverage for the create / account / bind paths (were 0%) ---
 

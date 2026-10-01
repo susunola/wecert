@@ -66,7 +66,20 @@ func accountKeyPath(statePath, name, requested string) (string, error) {
 		return "", webhook.InvalidRequestf("keyPath must be an absolute path")
 	}
 	if clean != derived && !strings.HasPrefix(clean, root+string(filepath.Separator)) {
-		return "", webhook.InvalidRequestf("keyPath must live under %s", root)
+		return "", webhook.InvalidRequestf("keyPath must live under the accounts directory")
+	}
+	// The lexical prefix check is not enough by itself: a symlinked directory
+	// under accounts/ still passes it while redirecting the AK/SK write outside
+	// the root. Resolve the ancestor chain that already exists; a directory that
+	// does not exist yet is created by MkdirAll and has no symlink to smuggle
+	// the write through.
+	if resolvedRoot, err := filepath.EvalSymlinks(root); err == nil {
+		if resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(clean)); err == nil {
+			if resolvedParent != resolvedRoot &&
+				!strings.HasPrefix(resolvedParent, resolvedRoot+string(filepath.Separator)) {
+				return "", webhook.InvalidRequestf("keyPath must resolve inside the accounts directory")
+			}
+		}
 	}
 	return clean, nil
 }
