@@ -199,9 +199,13 @@ console-preview:
 check-console:
 	$(PYTHON) scripts/check-console.py
 	$(PYTHON) scripts/check-webconsole.py
+	$(PYTHON) scripts/check-console2.py
 
 check-webconsole:
 	$(PYTHON) scripts/check-webconsole.py
+
+check-console2:
+	$(PYTHON) scripts/check-console2.py
 
 test:
 	$(GO) test ./...

@@ -3,9 +3,22 @@
 Standalone management UI for a wecert daemon: certificate create / bind /
 renew / delete, cloud accounts, bindings, and activity.
 
-`index.html` is self-contained (inline CSS + JS, no build step, no CDN). Serve
-it as static files and point the browser at the same origin as the daemon's
-HTTP surface, or set the base URL in the Connect panel.
+Two frontends live here:
+
+- `console.html` — the certificate-first console: a KPI strip (total, needs
+  attention, expiring, CLB binding issues) above a UIN-grouped inventory table,
+  plus a one-screen create form with a live request summary. Same API surface
+  and token storage keys as `index.html`, so both talk to the same daemon.
+- `index.html` — the original management layout.
+
+Both are self-contained (inline CSS + JS, no build step, no CDN). Serve them as
+static files and point the browser at the same origin as the daemon's HTTP
+surface, or set the base URL in the Connect panel.
+
+`console.html` never renders sample data: with no token it shows a connect
+panel, and a rejected token surfaces the daemon's error instead of a fake
+fleet. CLB binding issues count certificates that need a binding and have none,
+including not-issued ones whose payload carries no `deploy.enabled`.
 
 The inventory keeps the original management layout: title/count above a toolbar
 with status, account, sort, and search controls. The browser-only ACME environment
