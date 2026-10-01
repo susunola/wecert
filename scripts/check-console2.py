@@ -339,6 +339,21 @@ class Console2Regression(unittest.TestCase):
         self.assertEqual(body["deploy"], "clb")
         self.assertEqual(body["dns"]["provider"], "cloudflare")
 
+    def test_create_form_advanced_settings_collapse_and_expand(self):
+        self.load(tokens=(READONLY, ADMIN))
+        self.page.click("#new-certificate")
+        self.page.wait_for_timeout(250)
+        self.assertFalse(self.page.is_visible("#certificate-profile"),
+                         "advanced settings start collapsed")
+        self.page.click("#advanced-toggle")
+        self.page.wait_for_timeout(150)
+        self.assertTrue(self.page.is_visible("#certificate-profile"),
+                        "advanced settings expand")
+        self.page.click("#advanced-toggle")
+        self.page.wait_for_timeout(150)
+        self.assertFalse(self.page.is_visible("#certificate-profile"),
+                         "advanced settings collapse again")
+
     def test_create_form_refuses_an_unqualified_domain(self):
         self.load(tokens=(READONLY, ADMIN))
         self.page.click("#new-certificate")
