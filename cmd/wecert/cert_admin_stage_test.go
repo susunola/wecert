@@ -125,6 +125,55 @@ func TestStageCertificateIntoEmptyList(t *testing.T) {
 	}
 }
 
+// A freshly installed or hand-written config declares "no certificates yet"
+// with a bare "certificates:" key, which parses as null rather than as an empty
+// list. Refusing it would leave the console's create form permanently broken on
+// a daemon that is otherwise running fine.
+func TestStageCertificateIntoANullList(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	config := "certificates:\ntencent:\n  secretId: id\n"
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stageCertificateInConfig(path, "first", []string{"first.example.com"},
+		"classic", "ecdsa-p256", "", "", "clb"); err != nil {
+		t.Fatalf("a null certificates list must be usable, got: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(got, &doc); err != nil {
+		t.Fatalf("config no longer parses: %v\n%s", err, got)
+	}
+	certs, ok := doc["certificates"].([]any)
+	if !ok || len(certs) != 1 {
+		t.Fatalf("want one certificate in the list, got %#v", doc["certificates"])
+	}
+}
+
+// A certificate that exists only in the console registry must still be
+// removable: failing on the config here leaves a row the operator can see in the
+// inventory and cannot delete.
+func TestRemoveCertificateFromAnEmptyOrMissingListIsANoOp(t *testing.T) {
+	dir := t.TempDir()
+	for name, config := range map[string]string{
+		"null":    "certificates:\ntencent:\n  secretId: id\n",
+		"missing": "tencent:\n  secretId: id\n",
+		"empty":   "certificates: []\ntencent:\n  secretId: id\n",
+	} {
+		path := filepath.Join(dir, name+".yaml")
+		if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := removeCertificateFromConfig(path, "ghost"); err != nil {
+			t.Errorf("%s list: removing a certificate that is not there must be a no-op, got %v", name, err)
+		}
+	}
+}
+
 func TestStageCertificateIntoInlineList(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

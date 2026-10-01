@@ -491,6 +491,19 @@ func renewBeforeToGoDuration(s string) string {
 	}
 }
 
+// isEmptySequence reports whether a certificates: node holds no entries: either
+// the key was written with nothing under it (which parses as null) or it is an
+// explicitly empty list. Both mean "no certificates yet", never "malformed".
+func isEmptySequence(node *yaml.Node) bool {
+	if node == nil {
+		return true
+	}
+	if node.Kind == yaml.SequenceNode {
+		return len(node.Content) == 0
+	}
+	return node.Kind == yaml.ScalarNode && (node.Tag == "!!null" || strings.TrimSpace(node.Value) == "")
+}
+
 // stageCertificateInConfig appends one certificate to config.yaml's certificates
 // list by editing the YAML tree, exactly as removal does. Editing the tree
 // (rather than splicing text) keeps the document valid whether the list is
@@ -517,7 +530,17 @@ func stageCertificateInConfig(path, name string, domains []string, profile, keyT
 			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "certificates"},
 			certs)
 	} else if certs.Kind != yaml.SequenceNode {
-		return "", fmt.Errorf("configuration certificates must be a list")
+		// "certificates:" with nothing under it parses as null, and that is how
+		// a hand-written or freshly installed config says "no certificates yet".
+		// Refusing it would strand the console's create form on a daemon that is
+		// otherwise running fine (a null list is not an empty one).
+		if !isEmptySequence(certs) {
+			return "", fmt.Errorf("configuration certificates must be a list")
+		}
+		certs.Kind = yaml.SequenceNode
+		certs.Tag = "!!seq"
+		certs.Value = ""
+		certs.Content = nil
 	}
 	// Force block style so an inline certificates: [{...}] is rewritten as a
 	// block list before a new entry is appended -- splicing a block item into a
@@ -612,6 +635,13 @@ func removeCertificateFromConfig(path, name string) error {
 		return fmt.Errorf("invalid configuration")
 	}
 	certs := yamlFind(doc.Content[0], "certificates")
+	// A certificate that exists only in the console registry -- because the
+	// create that recorded it never reached the config, or because the list is
+	// empty -- must still be removable from the registry and the state store.
+	// Reporting an error here leaves a row the operator can see and not delete.
+	if certs == nil || isEmptySequence(certs) {
+		return nil
+	}
 	if certs.Kind != yaml.SequenceNode {
 		return fmt.Errorf("configuration has no certificate list")
 	}
