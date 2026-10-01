@@ -274,7 +274,6 @@ async function loadLive() {
   ]);
   state.clbs = bindings.bindings || bindings.clbs || [];
   setInventory(inventory.certificates || [], accounts.accounts || [], true);
-  paintEnv(inventory);
   $('#sync-warning').hidden = true;
  } catch (error) {
   $('#sync-warning').hidden = false;
@@ -575,32 +574,45 @@ document.querySelectorAll('[data-close-backend]').forEach((button) => button.onc
 $('#backend-form').onsubmit = async (event) => {
   event.preventDefault();
   const error = $('#backend-error');
-  error.textContent = '';
+  const btn = $('#backend-form button[type="submit"], #backend-form .primary');
+  if (error) error.textContent = '';
+  if (btn) btn.disabled = true;
+
   try {
-    const base = new URL($('#backend-url').value.trim());
-    if (!['http:', 'https:'].includes(base.protocol)) throw new Error('Enter an HTTP or HTTPS daemon URL.');
-    if (base.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(base.hostname)) throw new Error('Use HTTPS for remote API access to protect tokens.');
-    state.base = base.href.replace(/\/+$/, '');
-    try { localStorage.setItem('wecert.base', state.base); } catch {}
-    state.token = ($('#backend-token')?.value || '').trim();
-    state.adminToken = ($('#backend-admin-token')?.value || '').trim();
-    // Exchange tokens for HttpOnly session cookies so later reloads need no paste.
+    let rawUrl = ($('#backend-url')?.value || '').trim();
+    if (!rawUrl) rawUrl = location.origin;
+    if (!/^https?:\/\//i.test(rawUrl)) rawUrl = location.protocol + '//' + rawUrl;
+    const base = new URL(rawUrl);
+    state.base = base.origin;
+
+    const tok = ($('#backend-token')?.value || '').trim();
+    const adm = ($('#backend-admin-token')?.value || '').trim();
+    if (tok) state.token = tok;
+    if (adm) state.adminToken = adm;
+
+    try {
+      localStorage.setItem('wecert.base', state.base);
+      if (state.token) localStorage.setItem('wecert.token', state.token);
+      if (state.adminToken) localStorage.setItem('wecert.adminToken', state.adminToken);
+    } catch {}
+
+    // Exchange tokens for session cookie
     try {
       const exchange = await fetch(`${state.base}/api/session`, {
         method: 'POST', credentials: 'include',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({ token: state.token, adminToken: state.adminToken })
       });
-      // fetch resolves on 4xx too, so only trust it when the daemon actually minted a session.
       state.sessionOK = exchange.ok;
-    } catch { /* cross-origin without CORS: fall back to in-memory tokens */ }
+    } catch {}
+
     await loadLive();
     $('#backend-modal').classList.remove('open');
-    $('#backend-token').value = '';
-    $('#backend-admin-token').value = '';
-    toast('Connected — session remembered');
+    toast('Connected to ' + state.base);
   } catch (failure) {
-    error.textContent = 'Could not connect: ' + explainConnectError(failure);
+    if (error) error.textContent = 'Could not connect: ' + explainConnectError(failure);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 };
 
@@ -653,9 +665,10 @@ const wizard = {
 
 function wizardShow(step) {
   wizard.step = step;
-  document.querySelectorAll('#wizard-steps li').forEach((li, index) => {
-    li.classList.toggle('is-current', index === step);
-    li.classList.toggle('is-done', index < step);
+  document.querySelectorAll('.wizard-stepper .step-item').forEach((btn, index) => {
+    btn.classList.toggle('is-current', index === step);
+    btn.classList.toggle('is-done', index < step);
+    btn.setAttribute('aria-selected', String(index === step));
   });
   document.querySelectorAll('#certificate-form .wizard-pane').forEach((pane) => {
     const on = Number(pane.dataset.pane) === step;
@@ -668,8 +681,6 @@ function wizardShow(step) {
   if (back) back.hidden = step === 0;
   if (next) next.hidden = step >= wizard.total - 1;
   if (submit) submit.hidden = step < wizard.total - 1;
-  const progress = $('#wizard-progress');
-  if (progress) progress.textContent = `Step ${step + 1} of ${wizard.total} · ${wizard.labels[step] || ''}`;
   if (step === wizard.total - 1) wizardReview();
 }
 
@@ -689,15 +700,16 @@ function wizardReview() {
   if (!box) return;
   const domains = ($('#certificate-domains')?.value || '').split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
   const cred = $('#certificate-dns-cred')?.value || 'reused';
-  const credLabel = { reused: 'Reuse daemon credential', token: 'Per-cert API token', file: 'Host key file' }[cred] || cred;
-  box.innerHTML = `<dl>
-    <dt>Name</dt><dd>${escapeHTML($('#certificate-name')?.value.trim() || '—')}</dd>
-    <dt>Domains</dt><dd>${escapeHTML(domains.join(', ') || '—')}</dd>
-    <dt>Profile</dt><dd>${escapeHTML($('#certificate-profile')?.value || 'classic')}</dd>
-    <dt>Key</dt><dd>${escapeHTML($('#certificate-key')?.value || 'ecdsa-p256')}</dd>
-    <dt>DNS</dt><dd>${escapeHTML($('#certificate-dns-provider')?.value || 'cloudflare')} · ${escapeHTML(credLabel)}</dd>
-    <dt>Deploy</dt><dd>${escapeHTML($('#certificate-deploy')?.value || 'clb')}</dd>
-  </dl>`;
+  const credLabel = { reused: 'Daemon credential', token: 'Scoped token', file: 'Key file' }[cred] || cred;
+  const uin = $('#certificate-uin')?.value || '—';
+  box.innerHTML = `<table>
+    <tr><th>Identifier</th><td><code>${escapeHTML($('#certificate-name')?.value.trim() || '—')}</code></td></tr>
+    <tr><th>Domains</th><td>${domains.map(d => `<code>${escapeHTML(d)}</code>`).join(' ')}</td></tr>
+    <tr><th>Account</th><td>UIN ${escapeHTML(uin)}</td></tr>
+    <tr><th>Policy</th><td>${escapeHTML($('#certificate-profile')?.value || 'classic')} · ${escapeHTML($('#certificate-key')?.value || 'ecdsa-p256')} · renew ${escapeHTML($('#certificate-renew')?.value || '720h')}</td></tr>
+    <tr><th>DNS-01</th><td>${escapeHTML($('#certificate-dns-provider')?.value || 'cloudflare')} (${escapeHTML(credLabel)})</td></tr>
+    <tr><th>Deploy</th><td>${escapeHTML($('#certificate-deploy')?.value || 'clb')}</td></tr>
+  </table>`;
 }
 
 $('#wizard-back') && ($('#wizard-back').onclick = () => {
@@ -710,7 +722,7 @@ $('#wizard-next') && ($('#wizard-next').onclick = () => {
   if (box) box.textContent = '';
   if (wizard.step < wizard.total - 1) wizardShow(wizard.step + 1);
 });
-document.querySelectorAll('#wizard-steps li').forEach((li) => {
+document.querySelectorAll('.wizard-stepper .step-item').forEach((li) => {
   li.addEventListener('click', () => {
     const target = Number(li.dataset.step);
     if (Number.isNaN(target) || target === wizard.step) return;
@@ -776,24 +788,58 @@ $('#certificate-form').onsubmit = async (event) => {
 // reload knows where to look even before the first probe answers.
 (async function autoConnect() {
   if (typeof location === 'undefined' || typeof fetch !== 'function') return;
+
+  // URL search params take highest precedence (?token=...&adminToken=...)
+  try {
+    const params = new URLSearchParams(location.search);
+    const qTok = params.get('token');
+    const qAdm = params.get('adminToken') || params.get('admin');
+    if (qTok) { state.token = qTok; localStorage.setItem('wecert.token', qTok); }
+    if (qAdm) { state.adminToken = qAdm; localStorage.setItem('wecert.adminToken', qAdm); }
+  } catch {}
   const bases = [];
+  // Always prioritize current page origin!
+  if (location.protocol === 'http:' || location.protocol === 'https:') {
+    bases.push(location.origin);
+  }
   try {
     const remembered = localStorage.getItem('wecert.base');
-    if (remembered) bases.push(remembered);
+    if (remembered && !bases.includes(remembered)) bases.push(remembered);
+    const savedToken = localStorage.getItem('wecert.token');
+    const savedAdminToken = localStorage.getItem('wecert.adminToken');
+    if (savedToken) state.token = savedToken;
+    if (savedAdminToken) state.adminToken = savedAdminToken;
   } catch { /* sandbox without localStorage */ }
-  if (location.protocol === 'http:' || location.protocol === 'https:') {
-    if (!bases.includes(location.origin)) bases.push(location.origin);
-    const alt = `${location.protocol}//${location.hostname}:9801`;
-    if (!bases.includes(alt)) bases.push(alt);
-  }
   for (const base of bases) {
     try {
-      const res = await fetch(`${base}/api/session`, { credentials: 'include', cache: 'no-store' });
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (!data.read && !data.admin) continue;
+      let sessionActive = false;
+      try {
+        const res = await fetch(`${base}/api/session`, { credentials: 'include', cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.read || data.admin) sessionActive = true;
+        }
+      } catch {}
+
+      // If cookie session is not yet active but we have saved tokens, exchange them now!
+      if (!sessionActive && (state.token || state.adminToken)) {
+        try {
+          const res = await fetch(`${base}/api/session`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ token: state.token, adminToken: state.adminToken })
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.read || data.admin) sessionActive = true;
+          }
+        } catch {}
+      }
+
+      if (!sessionActive && !state.token) continue;
       state.base = base;
-      state.sessionOK = true;
+      state.sessionOK = sessionActive;
       // Remember where the live daemon is. Without this a reload falls back to
       // the built-in sample inventory and looks like the certificates changed.
       try { localStorage.setItem('wecert.base', base); } catch {}
@@ -807,160 +853,14 @@ $('#certificate-form').onsubmit = async (event) => {
       console.warn('wecert: auto-connect to', base, 'failed:', err);
     }
   }
-  // No live daemon answered: show the sample inventory as an explicit fallback
-  // rather than leaving an empty page.
-  setInventory(preview.certificates, preview.accounts, false);
+  // No live daemon session found: keep inventory honest (empty), never show fake sample data!
+  setInventory([], [], false);
   const w = $('#sync-warning');
   if (w) {
     w.hidden = false;
-    w.textContent = 'Showing sample data. Connect in System settings — the session cookie is not present for this origin.';
+    w.textContent = 'Disconnected. Open System settings to connect to the daemon.';
   }
 })();
 
-// Keep errors beside the form and guard the full asynchronous operation.
-for (const [container, buttonSelector, eventName] of [
-  ['#connect-drawer', '#save-uin', 'onclick'],
-  ['#certificate-form', '#wizard-submit', 'onsubmit'],
-  ['#backend-form', '#backend-form .primary', 'onsubmit']
-]) {
-  const form = $(container);
-  const button = $(buttonSelector);
-  if (!form || !button) continue;
-  const target = eventName === 'onclick' ? button : form;
-  const handler = target[eventName];
-  const error = document.createElement('p');
-  error.className = 'form-error';
-  error.setAttribute('role', 'alert');
-  button.parentElement.before(error);
-  let pending = false;
-  target[eventName] = async event => {
-    event.preventDefault();
-    if (pending) return;
-    pending = true;
-    button.disabled = true;
-    form.setAttribute('aria-busy', 'true');
-    error.textContent = '';
-    const label = button.textContent;
-    button.textContent = 'Working…';
-    try { await handler(event); }
-    catch (failure) { error.textContent = failure.message; }
-    finally {
-      pending = false;
-      button.disabled = false;
-      button.textContent = label;
-      form.removeAttribute('aria-busy');
-    }
-  };
-}
 
-document.addEventListener('click', async (event) => {
-  const trigger = event.target.closest('[data-menu]');
-  if (trigger) {
-    const cert = state.certificates.find(item => item.name === trigger.dataset.menu);
-    if (!cert) return;
-    const [action, label] = primaryAction(cert);
-    const menu = $('#row-menu');
-    menu.innerHTML = `<button data-action="view" data-name="${escapeHTML(cert.name)}">View details</button><button data-action="${cert.status === 'not_issued' ? 'issue' : 'renew'}" data-name="${escapeHTML(cert.name)}">${cert.status === 'not_issued' ? 'Issue' : 'Check renewal'}</button><button data-action="bind" data-name="${escapeHTML(cert.name)}">Bind CLB</button><button data-action="unbind" data-name="${escapeHTML(cert.name)}">Detach bindings</button><button class="danger-action" data-action="delete" data-name="${escapeHTML(cert.name)}">Delete certificate</button>`;
-    menu.showPopover();
-    const rect = trigger.getBoundingClientRect();
-    menu.style.left = `${Math.max(8, Math.min(rect.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8))}px`;
-    menu.style.top = `${Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - menu.offsetHeight - 8))}px`;
-    return;
-  }
-  const metric = event.target.closest('[data-metric]');
-  if (metric) {
-    state.status = metric.dataset.metric;
-    $('#status-filter').value = state.status;
-    state.collapsed.clear();
-    updateFilteredView();
-    return;
-  }
-  const copy = event.target.closest('[data-copy]');
-  if (copy) {
-    try { await navigator.clipboard.writeText(copy.dataset.copy); toast('Copied'); }
-    catch { toast('Clipboard unavailable. Select the value and copy it manually.'); }
-    return;
-  }
-  const group = event.target.closest('[data-group]');
-  if (group) {
-    const uin = group.dataset.group;
-    if (state.collapsed.has(uin)) state.collapsed.delete(uin); else state.collapsed.add(uin);
-    renderRows();
-    return;
-  }
-  const uin = event.target.closest('[data-uin]');
-  if (uin) {
-    state.uin = uin.dataset.uin;
-    $('#uin-control').classList.remove('open');
-    renderUINMenu();
-    updateFilteredView();
-    return;
-  }
-  if (event.target.closest('#connect-uin') || event.target.closest('#certificate-uin-add')) return openDrawer();
-  if (!event.target.closest('#uin-control')) $('#uin-control').classList.remove('open');
-  if (event.target.closest('[data-close-detail]')) return closeDetail();
-  const button = event.target.closest('[data-action]');
-  if (button) {
-    $('#row-menu').hidePopover();
-    const name = button.dataset.name;
-    if (['bind', 'delete', 'unbind'].includes(button.dataset.action)) { openCertificateAction(name, button.dataset.action); return; }
-    if (['view', 'bindings'].includes(button.dataset.action)) {
-      selectCertificate(name);
-      if (button.dataset.action === 'bindings') $('#detail-bindings').scrollIntoView({ block: 'nearest' });
-      return;
-    }
-    if (!state.live) {
-      toast('Preview data — connect in Settings to send this request.');
-      return;
-    }
-    button.disabled = true;
-    try {
-      const result = await request('POST', '/hook/reconcile', { cert: name });
-      const message = `Reconciliation response: ${JSON.stringify(result)}. This is not a confirmation of issuance; refresh inventory to check results.`;
-      recordOperation(name, message);
-      toast(`${name}: request accepted; refresh to check results`);
-    } catch (error) { toast(error.message); }
-    finally { button.disabled = false; }
-    return;
-  }
-  const row = event.target.closest('tr[data-name]');
-  if (row) selectCertificate(row.dataset.name);
-});
-
-document.addEventListener('keydown', (event) => {
-  const overlay = document.querySelector('.modal.open, .connect-drawer.open, .detail.open');
-  if (event.key === 'Tab' && overlay) {
-    const controls = [...overlay.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]')].filter(node => node.getClientRects().length);
-    if (controls.length && (!overlay.contains(document.activeElement) || event.shiftKey && document.activeElement === controls[0] || !event.shiftKey && document.activeElement === controls[controls.length - 1])) {
-      event.preventDefault(); controls[event.shiftKey ? controls.length - 1 : 0].focus();
-    }
-  }
-  if (event.key === '/' && !event.ctrlKey && !event.metaKey && !event.altKey && !event.target.closest('input, textarea, select, [contenteditable="true"]') && !document.querySelector('.modal.open, .connect-drawer.open, .detail.open')) {
-    event.preventDefault(); $('#certificate-search').focus(); return;
-  }
-  if (event.key !== 'Escape') return;
-  closeDrawer();
-  closeDetail();
-  $('#backend-modal').classList.remove('open');
-  $('#notification-modal').classList.remove('open');
-  $('#certificate-modal').classList.remove('open');
-  $('#uin-control').classList.remove('open');
-  document.getElementById('certificate-action')?.classList.remove('open');
-});
-
-// Sample data is only shown when auto-connect has already failed. Painting it
-// first made every refresh look like the certificates had changed: the built-in
-// 9-row sample raced the real inventory and won whenever the session probe
-// failed.
-
-
-
-function paintEnv(inventory) {
-  const pill = $('#env-pill');
-  if (!pill) return;
-  const rev = inventory?.desired?.revision || '';
-  const text = String(inventory?.acme?.directory || inventory?.directory || rev || '');
-  const prod = /acme-v02\.api\.letsencrypt\.org/.test(text) || inventory?.production === true;
-  pill.textContent = prod ? 'production' : text.includes('staging') ? 'staging' : rev ? rev.slice(0, 18) : 'live';
-  pill.dataset.env = prod ? 'production' : 'staging';
-}
+// End of initialization

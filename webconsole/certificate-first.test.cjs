@@ -52,7 +52,7 @@ function element() {
     lastChild: { textContent: '' },
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     setAttribute() {}, removeAttribute() {}, insertAdjacentHTML() {},
-    before() {}, append() {}, prepend() {}, replaceWith() {},
+    before() {}, append() {}, prepend() {}, replaceWith() {}, insertAdjacentHTML() {},
   };
   node.parentElement = { before() {} };
   return node;
