@@ -689,8 +689,13 @@ function wizardValidate(step) {
     const name = $('#certificate-name')?.value.trim();
     const domains = ($('#certificate-domains')?.value || '').split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
     if (!name) return 'Enter a certificate name.';
+    if (/[\/\\\x00\n\r]/.test(name) || name === '.' || name === '..') return 'Certificate name must not contain path separators or control characters.';
     if (!domains.length) return 'Enter at least one domain.';
-    if (!$('#certificate-uin')?.value) return 'Connect a UIN first.';
+    for (const d of domains) {
+      if (!d.includes('.')) return `Invalid domain "${d}": must be a fully qualified domain name (e.g. app.example.com).`;
+      if (/^[.-]|[.-]$/.test(d)) return `Invalid domain "${d}": cannot start or end with a dot or hyphen.`;
+    }
+    if (!$('#certificate-uin')?.value) return 'Connect an account first.';
   }
   return '';
 }

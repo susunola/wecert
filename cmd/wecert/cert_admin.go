@@ -100,6 +100,9 @@ func renderCertificateEntry(name string, domains []string, profile, keyType, ren
 		if d == "" {
 			return "", webhook.InvalidRequestf("domains must not contain empty entries")
 		}
+		if err := config.ValidateDomain(d); err != nil {
+			return "", webhook.InvalidRequestf("invalid domain %q: %v", d, err)
+		}
 	}
 	var e certificateEntry
 	e.Name = name
@@ -370,6 +373,11 @@ func createCertificateAdmin(cfg *config.Config, body webhook.CreateCertificateRe
 	domains := body.Domains
 	if len(domains) == 0 {
 		return nil, webhook.InvalidRequestf("at least one domain is required")
+	}
+	for _, d := range domains {
+		if err := config.ValidateDomain(d); err != nil {
+			return nil, webhook.InvalidRequestf("invalid domain %q: %v", d, err)
+		}
 	}
 	profile := body.Profile
 	if profile == "" {
