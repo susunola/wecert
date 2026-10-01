@@ -50,10 +50,40 @@ UIN grouping and collapse, search, the UIN and KPI filters, the detail drawer,
 the row menu, the four wizard steps and the payload it posts, the disconnected
 and 401 states, and the 390px layout. No daemon or credential is involved.
 
-TLS is not optional. The console refuses to send a secret — an AK/SK pair, a
-scoped DNS token, a webhook URL — over plain HTTP, so on an HTTP origin the
-"Connect UIN" drawer and the notification form fail with that message and
-nothing else. Serve the page over HTTPS.
+## How the console is reached
+
+There is no hostname baked into this project. Nothing here knows or needs a
+domain of its own; the address is whatever the operator puts in front of the
+daemon. Two shapes are supported, and the first one needs no domain and no
+certificate at all.
+
+**1. Loopback plus an SSH tunnel.** Serve `console.html` from a listener bound
+to `127.0.0.1` on the daemon host and reach it with
+`ssh -N -L 127.0.0.1:9802:127.0.0.1:9802 user@daemon-host`. No DNS record, no
+certificate, nothing exposed on a public interface. The transport check exempts
+`localhost`, `127.0.0.1` and `::1`, so secret entry works here over plain HTTP —
+there is no network between the browser and the daemon for anyone else to read.
+This is the same topology [`docs/console.md`](../docs/console.md) recommends for
+the daemon's own read-only page; that page is a different frontend served by
+`GET /status`, but the reasoning is identical.
+
+Note that opening `console.html` straight off the filesystem does not work: with
+a `file://` origin there is no daemon to talk to and no same-origin API to call.
+It has to be served, even if only from loopback.
+
+**2. A public hostname — only if the console has to be reachable by more than
+the person who can SSH to the host.** Then it does need a name and a
+certificate, because the same transport check refuses to send a secret over
+plain HTTP to anything that is not loopback. That is the case the rest of this
+section covers.
+
+Wherever `wecert.example.com` appears below, substitute the name you own. The
+name in `server_name` and the name in the port 80 redirect must be the one on
+the certificate — a redirect that names some other host sends visitors to an
+origin whose certificate will not match, and the browser will stop them there.
+
+If you need shared access but have no domain of your own, put the console behind
+your existing TLS and SSO gateway rather than inventing a public name.
 
 Serve it over a **hostname with a certificate a browser actually trusts**. A
 self-signed certificate is technically enough to satisfy the transport check,
