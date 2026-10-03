@@ -3,6 +3,7 @@ package webhook
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -47,7 +48,12 @@ func (s *Server) handleSession() http.HandlerFunc {
 				Token      string `json:"token"`
 				AdminToken string `json:"adminToken"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&body); err != nil {
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "session body is too large"})
+					return
+				}
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be JSON"})
 				return
 			}

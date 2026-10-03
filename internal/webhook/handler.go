@@ -31,6 +31,7 @@ func (s *Server) Handler() http.Handler {
 	// enables it without a restart. Mounting here on a one-shot adminEnabled() check
 	// made "add adminToken + SIGHUP" look like it worked while /admin/* stayed 404.
 	mux.HandleFunc("/api/bindings", s.auth(s.handleListBindings()))
+	mux.HandleFunc("/api/deployment", s.auth(s.handleDeploymentSettings()))
 	mux.HandleFunc("/api/accounts", s.auth(s.handleListAccounts()))
 	mux.HandleFunc("/admin/accounts", s.adminAuth(s.handleAdminAccounts()))
 	mux.HandleFunc("/admin/accounts/", s.adminAuth(s.handleAdminAccountOne()))
@@ -43,5 +44,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/challenge", s.adminAuth(s.handleAdminChallenge()))
 	mux.HandleFunc("/admin/restore", s.adminAuth(s.handleAdminRestore()))
 
-	return mux
+	// Reject browser cross-origin mutations, including requests from sibling subdomains.
+	// Non-browser clients without Origin/Fetch Metadata headers remain supported.
+	return http.NewCrossOriginProtection().Handler(mux)
 }

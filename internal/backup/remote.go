@@ -96,7 +96,10 @@ func uploadWithSignature(ctx context.Context, target Target, src string) error {
 		return fmt.Errorf("read snapshot to sign: %w", err)
 	}
 	sig := SignSnapshot(target.HMACKey, data)
-	if err := uploadOnce(ctx, target, src); err != nil {
+	// Publish the complete signed pair before retention can remove older recovery points.
+	withoutPrune := target
+	withoutPrune.Keep = 0
+	if err := uploadOnce(ctx, withoutPrune, src); err != nil {
 		return err
 	}
 	tmp := src + ".hmac"
@@ -256,11 +259,16 @@ func DownloadLatest(ctx context.Context, target Target, dir string) (string, err
 }
 
 type sftpSession struct {
-	client *sftp.Client
-	conn   *ssh.Client
+	client     *sftp.Client
+	conn       *ssh.Client
+	stopCancel func() bool
 }
 
-func (s *sftpSession) Close() { _ = s.client.Close(); _ = s.conn.Close() }
+func (s *sftpSession) Close() {
+	s.stopCancel()
+	_ = s.client.Close()
+	_ = s.conn.Close()
+}
 
 // openSFTP centralizes the credential and host-key checks shared by upload and restore.
 func openSFTP(ctx context.Context, t Target) (*sftpSession, error) {
@@ -298,19 +306,26 @@ func openSFTP(ctx context.Context, t Target) (*sftpSession, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = raw.SetDeadline(deadline)
 	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	keepCancel := false
+	defer func() {
+		if !keepCancel {
+			stopCancel()
+		}
+	}()
 	cc, channels, requests, err := ssh.NewClientConn(raw, t.Host, &ssh.ClientConfig{User: t.Username, Auth: []ssh.AuthMethod{auth}, HostKeyCallback: callback})
 	if err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("connect SFTP %s: %w", t.Host, err)
 	}
-	_ = raw.SetDeadline(time.Time{})
 	conn := ssh.NewClient(cc, channels, requests)
 	client, err := sftp.NewClient(conn)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("start SFTP: %w", err)
 	}
-	return &sftpSession{client: client, conn: conn}, nil
+	keepCancel = true
+	return &sftpSession{client: client, conn: conn, stopCancel: stopCancel}, nil
 }
 
 func downloadSFTP(ctx context.Context, t Target, dir string) (string, error) {
@@ -797,54 +812,12 @@ func listObjects(ctx context.Context, client *s3.Client, t Target, prefix string
 func ptr[T any](v T) *T { return &v }
 
 func uploadSFTP(ctx context.Context, t Target, src string) error {
-	callback, err := knownhosts.New(t.KnownHostsFile)
+	session, err := openSFTP(ctx, t)
 	if err != nil {
-		return fmt.Errorf("load SFTP known_hosts: %w", err)
+		return err
 	}
-	var auth ssh.AuthMethod
-	if t.PrivateKeyFile != "" {
-		key, err := os.ReadFile(t.PrivateKeyFile)
-		if err != nil {
-			return fmt.Errorf("read SFTP private key: %w", err)
-		}
-		var signer ssh.Signer
-		if t.PrivateKeyPassphraseEnv != "" {
-			signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(os.Getenv(t.PrivateKeyPassphraseEnv)))
-		} else {
-			signer, err = ssh.ParsePrivateKey(key)
-		}
-		if err != nil {
-			return fmt.Errorf("parse SFTP private key: %w", err)
-		}
-		auth = ssh.PublicKeys(signer)
-	} else {
-		password := os.Getenv(t.PasswordEnv)
-		if password == "" {
-			return fmt.Errorf("SFTP password environment variable %q is empty", t.PasswordEnv)
-		}
-		auth = ssh.Password(password)
-	}
-	dialer := net.Dialer{}
-	raw, err := dialer.DialContext(ctx, "tcp", t.Host)
-	if err != nil {
-		return fmt.Errorf("connect SFTP %s: %w", t.Host, err)
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = raw.SetDeadline(deadline)
-	}
-	cc, channels, requests, err := ssh.NewClientConn(raw, t.Host, &ssh.ClientConfig{User: t.Username, Auth: []ssh.AuthMethod{auth}, HostKeyCallback: callback})
-	if err != nil {
-		_ = raw.Close()
-		return fmt.Errorf("connect SFTP %s: %w", t.Host, err)
-	}
-	_ = raw.SetDeadline(time.Time{})
-	conn := ssh.NewClient(cc, channels, requests)
-	defer conn.Close()
-	client, err := sftp.NewClient(conn)
-	if err != nil {
-		return fmt.Errorf("start SFTP: %w", err)
-	}
-	defer client.Close()
+	defer session.Close()
+	client := session.client
 	if err := client.MkdirAll(t.RemoteDir); err != nil {
 		return fmt.Errorf("create SFTP backup directory: %w", err)
 	}
