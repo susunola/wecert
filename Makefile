@@ -196,7 +196,7 @@ console-preview:
 # Isolated browser tests for both consoles; no daemon or cloud calls.
 # See docs/console.md for the pinned Python Playwright dependency.
 .PHONY: check-console check-webconsole
-check-console:
+check-console: check-console-build
 	$(PYTHON) scripts/check-console.py
 	$(PYTHON) scripts/check-webconsole.py
 	$(PYTHON) scripts/check-console2.py
@@ -342,7 +342,15 @@ fuzz:
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzLimitWithDegenerateRefill -fuzztime $(FUZZTIME)
 	$(GO) test ./internal/ratelimit/ -run XXX -fuzz FuzzParseRetryAfter -fuzztime $(FUZZTIME)
 
-check: check-english fmt-check vet check-staticcheck test-race test-tags check-scripts check-alerts check-coverage
+check: check-console-build check-english fmt-check vet check-staticcheck test-race test-tags check-scripts check-alerts check-coverage
 
 clean:
 	rm -rf bin dist coverage.out
+
+# Canonical console sources produce the deployable standalone HTML.
+.PHONY: console-build check-console-build
+console-build:
+	$(PYTHON) scripts/build-webconsole.py
+
+check-console-build:
+	$(PYTHON) scripts/build-webconsole.py --check

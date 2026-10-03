@@ -89,6 +89,9 @@ func startWebhookServer(
 		AuditPath: adminAuditPath(cfg.StatePath),
 		Ops:       adminOps(cfg, log),
 	}
+	if runtime, ok := rec.(*runtimeController); ok {
+		wireDeploymentOps(&admin.Ops, runtime, log)
+	}
 	api, err := webhook.NewWithAdmin(rec, store, cfg.Webhook.Token, admin, processCtx, log)
 	if err != nil {
 		// The port is already bound above, and returning here used to leak it: this process
