@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Isolated unittest regressions for webconsole/console.html.
 
-The page under test is the certificate-first console built from
-webconsole/certificate-first-prototype.html: a clickable KPI strip, a grouped
+The page under test is the certificate-first console generated from
+webconsole/console.template.html, console.css and console.js: a clickable KPI strip, a grouped
 inventory table, a certificate detail drawer and a single-page create form with
 a live request summary.
 Every test runs in a fresh browser context. The synthetic origin's main
@@ -110,6 +110,8 @@ def route_handler(page, inventory, status_code=200, session=None, accounts=None)
         elif "/api/inventory" in url:
             route.fulfill(status=status_code, content_type="application/json",
                           body=json.dumps(inventory if status_code == 200 else {"error": "unauthorized"}))
+        elif "/api/deployment" in url:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"target":"tencent", "editable":True}))
         elif "/api/accounts" in url:
             route.fulfill(status=200, content_type="application/json", body=json.dumps(accounts))
         elif "/api/bindings" in url:
@@ -187,7 +189,7 @@ class Console2Regression(unittest.TestCase):
 
     def test_kpis_count_total_attention_expiring_and_binding_issues(self):
         self.load(tokens=(READONLY, ""))
-        self.assertEqual(self.kpis(), ["5", "4", "1", "3"],
+        self.assertEqual(self.kpis(), ["5", "4", "1", "2"],
                          "total / needs attention / expiring / binding issues")
 
     def test_binding_issues_counted_when_the_complete_flag_is_absent(self):
@@ -250,7 +252,7 @@ class Console2Regression(unittest.TestCase):
         self.load(tokens=(READONLY, ""))
         self.page.click('[data-metric="bindings"]')
         self.page.wait_for_timeout(250)
-        self.assertEqual(self.rows().count(), 3, "only binding issues remain")
+        self.assertEqual(self.rows().count(), 2, "only CLB binding issues remain")
         self.page.click('[data-metric="bindings"]')
         self.page.wait_for_timeout(250)
         self.assertEqual(self.rows().count(), 5, "clicking again restores the full list")
@@ -399,20 +401,11 @@ class Console2Regression(unittest.TestCase):
         menu = self.text("#binding-control .uin-menu")
         self.assertIn("All bindings", menu)
         self.assertIn("CLB", menu, "the CLB target is offered")
-        self.assertIn("Nginx", menu, "and the nginx target")
-
-        self.page.click("#binding-control [data-binding='nginx']")
-        self.page.wait_for_timeout(200)
-        self.assertEqual(self.rows().count(), 1, "one certificate is deployed to nginx")
-        self.assertEqual(self.text("#binding-label"), "Nginx",
-                         "the trigger names the active filter")
-
-        self.page.click("#binding-trigger")
-        self.page.wait_for_timeout(200)
+        self.assertNotIn("Nginx", menu)
         self.page.click("#binding-control [data-binding='tencent']")
         self.page.wait_for_timeout(200)
         self.assertEqual(self.rows().count(), 4, "the rest go to the CLB path")
-        self.assertEqual(self.text("#binding-label"), "CLB")
+        self.assertEqual(self.text("#binding-label"), "Tencent CLB")
 
     def test_binding_filter_defaults_a_row_without_a_target_to_clb(self):
         inv = dict(FIXTURE, certificates=[
@@ -423,20 +416,11 @@ class Console2Regression(unittest.TestCase):
         self.assertIn("CLB", self.text("#binding-control .uin-menu"),
                       "a row without a deploy target is grouped with the CLB default")
 
-    def test_binding_menu_offers_every_backend_not_only_the_used_ones(self):
-        inv = dict(FIXTURE, certificates=[
-            cert("only-clb", "100012345678", "ok", ["a.example.org"], target="tencent")])
-        self.load(inventory=inv, tokens=(READONLY, ""))
-        self.page.click("#binding-trigger")
-        self.page.wait_for_timeout(200)
-        menu = self.text("#binding-control .uin-menu")
-        self.assertIn("Nginx", menu,
-                      "a backend with no rows is still offered, or the menu cannot "
-                      "tell the operator the other choice exists")
-        self.assertIn("0", self.page.text_content("#binding-control [data-binding='nginx']"),
-                      "and it is counted honestly as zero")
-        self.assertNotIn("Not deployed", menu,
-                         "a state no row is in is not presented as a choice")
+    def test_binding_menu_only_offers_tencent_clb(self):
+        self.load()
+        self.page.click('#binding-trigger')
+        self.assertEqual(self.page.locator('#binding-control [data-binding="nginx"]').count(), 0)
+        self.assertIn('Tencent CLB', self.text('#binding-control .uin-menu'))
 
     def test_cloud_filter_lists_the_clouds_the_accounts_report(self):
         accounts = {"accounts": [
@@ -470,7 +454,7 @@ class Console2Regression(unittest.TestCase):
         self.load(tokens=(READONLY, ""))
         self.page.click("#binding-trigger")
         self.page.wait_for_timeout(200)
-        self.page.click("#binding-control [data-binding='nginx']")
+        self.page.click("#binding-control [data-binding='tencent']")
         self.page.wait_for_timeout(200)
         self.assertTrue(self.page.is_visible("#clear-filter"),
                         "an active binding filter offers a way back")
@@ -513,6 +497,248 @@ class Console2Regression(unittest.TestCase):
         overflow = self.page.evaluate(
             "document.documentElement.scrollWidth - document.documentElement.clientWidth")
         self.assertLessEqual(overflow, 0, "no horizontal overflow at 390px")
+
+
+    def test_api_request_timeout_leaves_retry_available(self):
+        self.load()
+        pending = []
+        self.page.route('**/api/inventory', lambda route: pending.append(route))
+        self.page.clock.install()
+        self.page.click('#refresh-inventory')
+        self.page.wait_for_timeout(100)
+        self.assertEqual(len(pending), 1)
+        self.page.clock.fast_forward(16000)
+        self.page.wait_for_timeout(100)
+        self.assertIn('timed out', self.text('#sync-warning'))
+        self.assertTrue(self.page.is_enabled('#refresh-inventory'))
+        self.assertEqual(self.rows().count(), 5)
+        pending[0].abort()
+        self.page.wait_for_timeout(50)
+
+    def test_non_loopback_http_cannot_start_a_session(self):
+        requests = []
+        def handle(route):
+            if route.request.resource_type == 'document':
+                route.fulfill(status=200, content_type='text/html', body=HTML)
+            else:
+                requests.append(route.request.url)
+                route.abort()
+        self.page.route('**/*', handle)
+        self.page.goto('http://wecert.test/console.html')
+        self.page.wait_for_timeout(150)
+        self.assertIn('Use HTTPS', self.text('#sync-warning'))
+        self.assertEqual(requests, [])
+
+    def prepare_create(self):
+        self.page.click('#new-certificate')
+        self.page.fill('#certificate-name', 'test-create')
+        self.page.fill('.domain-input', 'test.example.com')
+
+    def test_legacy_tokens_are_removed_and_never_sent_as_bearer(self):
+        headers = []
+        self.page.on('request', lambda request: headers.append(request.headers))
+        self.load(tokens=(READONLY, ADMIN))
+        self.assertIsNone(self.page.evaluate('localStorage.getItem("wecert.token")'))
+        self.assertIsNone(self.page.evaluate('localStorage.getItem("wecert.adminToken")'))
+        self.assertIsNone(self.page.evaluate('sessionStorage.getItem("wecert.token")'))
+        self.assertFalse(any('authorization' in h for h in headers))
+
+    def test_url_tokens_are_removed_without_being_exchanged(self):
+        posts = []
+        self.page.on('request', lambda request: posts.append(request.post_data) if request.method == 'POST' else None)
+        self.page.route('**/*', route_handler(self.page, FIXTURE, session={'read': False, 'admin': False}))
+        self.page.goto(DOCUMENT + '?token=secret&adminToken=admin-secret&filter=all')
+        self.page.wait_for_timeout(200)
+        self.assertNotIn('token=', self.page.url)
+        self.assertNotIn('adminToken=', self.page.url)
+        self.assertIn('filter=all', self.page.url)
+        self.assertEqual(posts, [])
+
+    def test_connection_refuses_other_origin_before_sending_tokens(self):
+        self.load()
+        sent = []
+        self.page.on('request', lambda request: sent.append(request.url) if request.url.startswith('http://192.0.2.1') else None)
+        self.page.click('#connect-backend')
+        self.page.fill('#backend-url', 'http://192.0.2.1')
+        self.page.fill('#backend-token', 'fake-read-token')
+        self.page.click('#backend-form .primary')
+        self.assertIn('Use this page', self.text('#backend-error'))
+        self.assertEqual(sent, [])
+
+    def test_connection_exchanges_tokens_without_persisting_them(self):
+        self.load(session={'read': False, 'admin': False})
+        self.page.route('**/api/session', lambda route: route.fulfill(status=200, content_type='application/json', body='{"read":true,"admin":true}'))
+        self.page.click('#connect-backend')
+        self.page.fill('#backend-token', READONLY)
+        self.page.fill('#backend-admin-token', ADMIN)
+        self.page.click('#backend-form .primary')
+        self.page.wait_for_timeout(200)
+        self.assertEqual(self.page.input_value('#backend-token'), '')
+        self.assertEqual(self.page.input_value('#backend-admin-token'), '')
+        self.assertIsNone(self.page.evaluate('localStorage.getItem("wecert.adminToken")'))
+        self.assertEqual(self.rows().count(), 5)
+
+    def test_create_backend_error_is_visible_and_button_can_retry(self):
+        self.load()
+        self.page.route('**/admin/certificates', lambda route: route.fulfill(status=400, content_type='application/json', body='{"error":"DNS credential is missing"}'))
+        self.prepare_create()
+        self.page.click('#create-submit')
+        self.page.wait_for_timeout(150)
+        self.assertIn('DNS credential is missing', self.text('#certificate-form .form-error'))
+        self.assertTrue(self.page.is_enabled('#create-submit'))
+        self.assertFalse(any(e.startswith("pageerror:") for e in self.errors), self.errors)
+
+    def test_create_cannot_submit_twice_while_request_is_pending(self):
+        self.load()
+        pending = []
+        self.page.route('**/admin/certificates', lambda route: pending.append(route))
+        self.prepare_create()
+        self.page.evaluate('document.querySelector("#certificate-form").requestSubmit(); document.querySelector("#certificate-form").requestSubmit();')
+        self.page.wait_for_timeout(150)
+        self.assertEqual(len(pending), 1)
+        self.page.evaluate('loadLive()')
+        self.assertFalse(self.page.is_enabled('#create-submit'))
+        pending[0].fulfill(status=400, content_type='application/json', body='{"error":"test rejection"}')
+        self.page.wait_for_timeout(100)
+        self.assertTrue(self.page.is_enabled('#create-submit'))
+
+    def test_account_validation_and_backend_errors_are_visible(self):
+        self.load()
+        self.page.click('#new-certificate')
+        self.page.click('#certificate-uin-add')
+        self.page.click('#save-uin')
+        self.assertIn('Enter both', self.text('#account-error'))
+        self.page.fill('#new-uin-secret-id', 'fake-id')
+        self.page.fill('#new-uin-secret-key', 'fake-key')
+        self.page.route('**/admin/accounts', lambda route: route.fulfill(status=400, content_type='application/json', body='{"error":"account access denied"}'))
+        self.page.click('#save-uin')
+        self.page.wait_for_timeout(100)
+        self.assertIn('account access denied', self.text('#account-error'))
+        self.assertFalse(any(e.startswith("pageerror:") for e in self.errors), self.errors)
+
+    def test_read_session_hides_management_actions(self):
+        self.load(session={'read': True, 'admin': False})
+        self.assertFalse(self.page.is_enabled('#new-certificate'))
+        self.page.click('[data-menu="shop-example"]')
+        self.assertNotIn('Delete certificate', self.text('#row-menu'))
+        self.assertNotIn('Bind CLB listener', self.text('#row-menu'))
+
+    def test_failed_refresh_marks_data_as_outdated_without_losing_rows(self):
+        self.load()
+        self.page.route('**/api/inventory', lambda route: route.fulfill(status=503, content_type='application/json', body='{"error":"database unavailable"}'))
+        self.page.click('#refresh-inventory')
+        self.page.wait_for_timeout(150)
+        self.assertIn('Data outdated', self.text('#connection-status'))
+        self.assertIn('Last synced', self.text('#last-sync'))
+        self.assertEqual(self.rows().count(), 5)
+        self.assertIn('database unavailable', self.text('#sync-warning'))
+        self.assertTrue(self.page.is_enabled('#refresh-inventory'))
+
+    def test_binding_lookup_failure_is_visible_and_does_not_allow_binding(self):
+        self.page.route('**/*', route_handler(self.page, FIXTURE))
+        self.page.route('**/api/bindings', lambda route: route.fulfill(status=503, content_type='application/json', body='{"error":"cloud unavailable"}'))
+        self.page.goto(DOCUMENT)
+        self.page.wait_for_timeout(200)
+        self.assertIn('Binding lookup failed', self.text('#sync-warning'))
+        self.page.click('[data-menu="shop-example"]')
+        self.page.click('[data-row-action="bind"]')
+        self.assertIn('unavailable binding inventory', self.text('#toast'))
+
+    def test_new_listener_checkbox_has_compact_geometry_and_inline_label(self):
+        self.load()
+        self.page.click('[data-menu="shop-example"]')
+        self.page.click('[data-row-action="bind"]')
+        self.assertEqual(self.page.input_value('#bind-listener'), 'lbl-fixture01')
+        self.assertFalse(self.page.is_visible('.bind-new'))
+        self.page.select_option('#bind-listener', '')
+        self.assertTrue(self.page.is_visible('.bind-new'))
+        box = self.page.locator('[name="newSni"]').bounding_box()
+        label = self.page.locator('.checkbox-field > span').bounding_box()
+        self.assertLessEqual(box['width'], 18)
+        self.assertLessEqual(box['height'], 18)
+        self.assertGreater(label['x'], box['x'] + box['width'])
+        self.assertLess(abs(label['y'] - box['y']), 5)
+        self.page.uncheck('[name="newSni"]')
+        self.assertFalse(self.page.is_checked('[name="newSni"]'))
+
+    def test_dialog_focus_stays_inside_and_escape_restores_trigger(self):
+        self.load()
+        self.page.click('#new-certificate')
+        self.page.wait_for_timeout(100)
+        self.assertEqual(self.page.get_attribute('#certificate-modal', 'role'), 'dialog')
+        self.page.focus('#create-submit')
+        self.page.keyboard.press('Tab')
+        self.assertTrue(self.page.evaluate('document.querySelector("#certificate-modal").contains(document.activeElement)'))
+        self.page.keyboard.press('Escape')
+        self.page.wait_for_timeout(100)
+        self.assertFalse(self.page.is_visible('#certificate-modal'))
+        self.assertEqual(self.page.evaluate('document.activeElement.id'), 'new-certificate')
+
+    def test_signout_clears_inventory_and_session_access(self):
+        self.load()
+        self.page.route('**/api/session', lambda route: route.fulfill(status=200, content_type='application/json', body='{"ok":true}'))
+        self.page.click('#connect-backend')
+        self.page.click('#disconnect-backend')
+        self.page.wait_for_timeout(150)
+        self.assertEqual(self.rows().count(), 0)
+        self.assertIn('Disconnected', self.text('#connection-status'))
+        self.assertFalse(self.page.is_enabled('#new-certificate'))
+
+    def test_older_refresh_cannot_overwrite_newer_data(self):
+        self.load()
+        pending = []
+        self.page.route('**/api/inventory', lambda route: pending.append(route))
+        self.page.evaluate('void loadLive(); void loadLive();')
+        self.page.wait_for_timeout(200)
+        self.assertEqual(len(pending), 2)
+        pending[1].fulfill(status=200, content_type='application/json', body=json.dumps(dict(FIXTURE, certificates=[FIXTURE['certificates'][2]])))
+        self.page.wait_for_timeout(100)
+        pending[0].fulfill(status=200, content_type='application/json', body=json.dumps(FIXTURE))
+        self.page.wait_for_timeout(100)
+        self.assertEqual(self.rows().count(), 1)
+        self.assertEqual(self.rows().first.get_attribute('data-name'), 'api-example')
+
+
+    def test_missing_deployment_capabilities_disable_unsupported_choices(self):
+        self.load()
+        self.page.route('**/api/deployment', lambda route: route.fulfill(status=503, content_type='application/json', body='{"error":"settings unavailable"}'))
+        self.page.click('#refresh-inventory'); self.page.wait_for_timeout(150)
+        self.page.click('#new-certificate')
+        self.assertEqual(self.page.input_value('#certificate-deploy'), 'none')
+        self.assertTrue(self.page.locator('#certificate-deploy option[value="clb"]').evaluate('(element) => element.disabled'))
+        self.assertEqual(self.page.locator('#certificate-deploy option[value="nginx"]').count(), 0)
+        self.assertIn('Deployment settings unavailable', self.text('#deployment-capability-note'))
+
+    def test_nginx_console_deployment_entry_and_creation_choice_are_removed(self):
+        self.load()
+        self.page.click('#new-certificate')
+        self.assertEqual(self.page.locator('#certificate-deploy option[value="nginx"]').count(), 0)
+        self.page.keyboard.press('Escape')
+        self.page.click('[data-menu="welcome"]')
+        self.assertNotIn('Bind CLB listener', self.text('#row-menu'))
+        self.assertNotIn('Configure deployment', self.text('#row-menu'))
+        self.assertEqual(self.page.locator('#nginx-deployment').count(), 0)
+
+    def test_existing_nginx_backend_allows_issuance_only_without_deployment_actions(self):
+        self.load()
+        self.page.route('**/api/deployment', lambda route: route.fulfill(status=200, content_type='application/json', body='{"target":"nginx","editable":true}'))
+        self.page.click('#refresh-inventory'); self.page.wait_for_timeout(150)
+        self.page.click('#new-certificate')
+        self.assertEqual(self.page.input_value('#certificate-deploy'), 'none')
+        self.assertIn('supports Tencent CLB bindings only', self.text('#deployment-capability-note'))
+        self.assertFalse(self.page.is_visible('#certificate-uin'))
+        self.page.keyboard.press('Escape')
+        self.page.click('[data-menu="api-example"]')
+        self.assertNotIn('Bind CLB listener', self.text('#row-menu'))
+
+    def test_binding_action_exists_only_in_certificate_row_menu(self):
+        self.load()
+        self.page.click('[data-action="view"][data-name="api-example"]')
+        self.assertEqual(self.page.locator('#certificate-detail [data-row-action="bind"]').count(), 0)
+        self.page.keyboard.press('Escape')
+        self.page.click('[data-menu="api-example"]')
+        self.assertEqual(self.page.locator('#row-menu [data-row-action="bind"]').count(), 1)
+        self.assertIn('Bind CLB listener', self.text('#row-menu'))
 
 
 if __name__ == "__main__":

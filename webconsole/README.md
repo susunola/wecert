@@ -3,22 +3,27 @@
 Standalone management UI for a wecert daemon: certificate create / bind /
 renew / delete, cloud accounts, bindings, and activity.
 
-Three frontends live here:
+The current management UI is `console.html`, served by nginx at `/`. It has a
+KPI strip, an account-grouped inventory, a details drawer and a single-page
+create form with a live request summary.
 
-- `console.html` — the certificate-first console, and the one nginx serves at
-  `/`. A clickable KPI strip (total, needs attention, expiring, CLB binding
-  issues) above a UIN-grouped inventory table, a certificate detail drawer, and
-  a four-step create wizard (Identity / Policy / DNS / Deploy) ending in a
-  review. Built from `certificate-first-prototype.html` + `.css` + `.js`,
-  inlined into one file.
-- `index.html` — the original management layout, kept at `/index.html` as a
-  rollback path.
-- `certificate-first-prototype.html` — the design source for `console.html`.
-  It is a three-file prototype and is not served.
+Edit `console.template.html`, `console.css` and `console.js`, then run
+`make console-build`. The generated `console.html` has inline CSS and JavaScript,
+so deployment needs no frontend runtime or CDN. `make check-console-build`
+rejects an out-of-date artifact in CI.
 
-All are self-contained (inline CSS + JS, no build step, no CDN). Serve them as
-static files and point the browser at the same origin as the daemon's HTTP
-surface, or set the base URL in System settings.
+`index.html` is the legacy management layout. The `certificate-first-prototype.*`
+files are historical design examples, not sources for the current console.
+Their Node checks cover the prototype only. Apply current fixes to the canonical
+`console.*` sources and validate with `make check-console2`.
+
+Serve the console on the same origin as the daemon's proxied HTTP routes.
+System settings accepts only this page's origin; a different-origin daemon
+requires a reverse proxy. TLS is required except on loopback. Login exchanges
+tokens for HttpOnly cookies, clears password fields and legacy stored tokens,
+and never reads tokens from URL parameters. Use **Sign out** in System settings
+to expire the cookies. A read session can inspect inventory; an admin session
+is also required for certificate and account management.
 
 `console.html` never renders sample data: with no session it reports
 "Disconnected" and shows an empty table, and a rejected token surfaces the
@@ -26,11 +31,6 @@ daemon's error instead of a fake fleet. CLB binding issues count certificates
 that need a binding and have none — including not-issued ones, and ones whose
 payload omits `bindings.complete` entirely, which the daemon does for
 certificates that never bound.
-
-The prototype shipped the markup for the inventory rows, the kebab menu, the
-UIN dropdown, the group headers and the copy buttons but none of the handlers,
-so it looked interactive and was not. `console.html` wires all of them; if you
-rebuild from the prototype, that wiring has to come with it.
 
 The inventory keeps the original management layout: title/count above a toolbar
 with status, account, sort, and search controls. The browser-only ACME environment
@@ -47,7 +47,7 @@ the existing create-request contract. `make check-console` runs all three.
 
 `scripts/check-console2.py` covers `console.html` on its own: KPI counting,
 UIN grouping and collapse, search, the UIN and KPI filters, the detail drawer,
-the row menu, the four wizard steps and the payload it posts, the disconnected
+the row menu, the create form and the payload it posts, the disconnected
 and 401 states, and the 390px layout. No daemon or credential is involved.
 
 ## How the console is reached
@@ -133,6 +133,13 @@ server {
     ssl_certificate_key /etc/nginx/tls/wecert.key.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
+    add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
     root /opt/wecert/console;
     index console.html;
 
@@ -149,3 +156,17 @@ API has no default rules at all, in either direction.
 The daemon's tokens come from `webhook.token` (read-only) and
 `webhook.adminToken` (management). AK/SK entered here are written as 0600
 files on the daemon host and are never echoed back to the browser.
+
+
+### Deployment choices
+
+The Web Console supports Tencent CLB deployment and **Issue only**.
+`GET /api/deployment` reports the running backend so unsupported choices are
+disabled. Nginx deployment cannot be created, edited or triggered through the
+Console. Existing daemon-side Nginx configuration remains supported and is
+shown as read-only inventory metadata.
+
+The binding UI exposes Tencent CLB only. Its sole management entry is the
+certificate row actions menu; certificate details show binding information
+without duplicating the action. Other deployment backends are not offered in
+the binding selector or rendered as cloud binding resources.

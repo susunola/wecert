@@ -152,49 +152,17 @@ func TestCreateCertificateAdminWritesInsideTheListAndValidatesName(t *testing.T)
 	}
 }
 
-// The console's CLB/Nginx filter reads the deploy target back out of the
-// inventory, and a certificate created from the console only ever exists in the
-// registry sidecar until someone edits the config. If the create path dropped the
-// operator's choice there, the row would report the default backend instead of
-// the one that was asked for -- and the filter could never show "Nginx".
-func TestCreateCertificateAdminRecordsTheDeployChoiceInTheRegistry(t *testing.T) {
+// Removing the console choice must also reject direct API requests before writes.
+func TestConsoleRejectsNginxDeploymentWithoutWriting(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &config.Config{StatePath: filepath.Join(dir, "state.db")}
-	cfgPath := filepath.Join(dir, "config.yaml")
-	base := "certificates:\n  - name: demo\n    domains: [d.example.com]\ntencent:\n  secretId: id\nwebhook:\n  token: t\n"
-	if err := os.WriteFile(cfgPath, []byte(base), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	old := configPathForAdmin
-	configPathForAdmin = cfgPath
-	defer func() { configPathForAdmin = old }()
+	cfg := &config.Config{StatePath: filepath.Join(dir, "state.db"), Deploy: config.DeploySettings{Target: config.DeployTargetNginx}}
 	log, _ := quietLog()
-	oldSig := signalSelf
-	signalSelf = func(os.Signal) error { return nil }
-	defer func() { signalSelf = oldSig }()
-
-	if _, err := createCertificateAdmin(cfg, webhook.CreateCertificateRequest{
-		Name: "nginx-row", Domains: []string{"a.example.com"}, Profile: "classic",
-		KeyType: "ecdsa-p256", Deploy: "nginx",
-		DNS: &webhook.DNSCredential{Provider: "dnspod", Cred: "reused"},
-	}, log); err != nil {
-		t.Fatalf("create: %v", err)
+	_, err := createCertificateAdmin(cfg, webhook.CreateCertificateRequest{Name: "nginx-row", Domains: []string{"a.example.com"}, Deploy: "nginx"}, log)
+	if err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("unsupported deployment accepted: %v", err)
 	}
-	list, err := webhook.ReadConsoleCertificates(cfg.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var found string
-	for _, rec := range list {
-		if rec.Name == "nginx-row" {
-			found = rec.Deploy
-		}
-	}
-	if found == "" {
-		t.Fatalf("registry row for nginx-row missing its deploy choice: %+v", list)
-	}
-	if found != "nginx" {
-		t.Errorf("registry deploy = %q, want the operator's nginx choice so the inventory can report it", found)
+	if _, err := os.Stat(filepath.Join(dir, "console-certificates.json")); !os.IsNotExist(err) {
+		t.Fatal("rejected request wrote registry")
 	}
 }
 

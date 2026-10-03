@@ -284,6 +284,9 @@ func removeCloudAccount(cfg *config.Config, uin string, log *slog.Logger) (any, 
 // so the console's Bind dialog can offer a real choice instead of asking the
 // operator to paste an id.
 func listCloudBindings(cfg *config.Config) (any, error) {
+	if cfg.Deploy.Target == config.DeployTargetNginx {
+		return map[string]any{"bindings": []any{}}, nil
+	}
 	cred, err := adminCred()
 	if err != nil {
 		return nil, err
@@ -392,6 +395,18 @@ func createCertificateAdmin(cfg *config.Config, body webhook.CreateCertificateRe
 	uin := body.UIN
 	renewBefore := renewBeforeToGoDuration(body.RenewBefore)
 	deploy := body.Deploy
+	if deploy == "nginx" {
+		return nil, webhook.InvalidRequestf("nginx deployment is not available in the Web Console")
+	}
+	if deploy != "none" && deploy != "" {
+		expected := "clb"
+		if cfg.Deploy.Target == config.DeployTargetNginx {
+			expected = "nginx"
+		}
+		if deploy != expected {
+			return nil, webhook.InvalidRequestf("this daemon supports %s deployment, not %s", expected, deploy)
+		}
+	}
 	dnsCfg := body.DNS
 
 	// DNS token / file → 0600 file + config wiring so DNS-01 can run.
