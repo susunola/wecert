@@ -31,6 +31,34 @@ var openStateStore *state.Store
 
 var configPathForAdmin string
 
+// clbAPI is the subset of *clb.Client the console's binding paths call, as a
+// seam: a real *clb.Client satisfies it and a test substitutes a fake, so the
+// request building and response parsing run without touching the cloud (the same
+// pattern internal/deploy uses for its sslAPI).
+type clbAPI interface {
+	DescribeLoadBalancers(*clb.DescribeLoadBalancersRequest) (*clb.DescribeLoadBalancersResponse, error)
+	DescribeListeners(*clb.DescribeListenersRequest) (*clb.DescribeListenersResponse, error)
+	CreateListener(*clb.CreateListenerRequest) (*clb.CreateListenerResponse, error)
+	ModifyDomainAttributes(*clb.ModifyDomainAttributesRequest) (*clb.ModifyDomainAttributesResponse, error)
+	CreateRule(*clb.CreateRuleRequest) (*clb.CreateRuleResponse, error)
+	ModifyListener(*clb.ModifyListenerRequest) (*clb.ModifyListenerResponse, error)
+}
+
+// sslAPI is the subset of *ssl.Client the console uses.
+type sslAPI interface {
+	UploadCertificate(*ssl.UploadCertificateRequest) (*ssl.UploadCertificateResponse, error)
+}
+
+// newCLBClient / newSSLClient are the factory seams: production builds the real
+// SDK client, a test swaps in a fake.
+var newCLBClient = func(cred common.CredentialIface, region string, prof *profile.ClientProfile) (clbAPI, error) {
+	return clb.NewClient(cred, region, prof)
+}
+
+var newSSLClient = func(cred common.CredentialIface, region string, prof *profile.ClientProfile) (sslAPI, error) {
+	return ssl.NewClient(cred, region, prof)
+}
+
 // safePathComponent rejects names that would escape a directory when joined
 // into a file path. A console-supplied name is not a trusted path element.
 func safePathComponent(what, s string) error {
@@ -310,7 +338,7 @@ func listCloudBindings(cfg *config.Config) (any, error) {
 	site := resolveTencentSite(cred, regions[0], "")
 	out := make([]lb, 0, 8)
 	for _, region := range regions {
-		client, err := clb.NewClient(cred, region, tencentProfile(site))
+		client, err := newCLBClient(cred, region, tencentProfile(site))
 		if err != nil {
 			return nil, fmt.Errorf("clb client for %s: %w", region, err)
 		}
@@ -819,7 +847,7 @@ func tencentCreateHTTPSListener(region, lb string, port int64, name string, sniO
 	if err != nil {
 		return "", err
 	}
-	client, err := clb.NewClient(cred, region, tencentProfile(site))
+	client, err := newCLBClient(cred, region, tencentProfile(site))
 	if err != nil {
 		return "", err
 	}
@@ -868,7 +896,7 @@ func tencentUploadCertificate(name string, certPEM, keyPEM []byte, site string) 
 	if err != nil {
 		return "", err
 	}
-	client, err := ssl.NewClient(cred, "", tencentProfile(site))
+	client, err := newSSLClient(cred, "", tencentProfile(site))
 	if err != nil {
 		return "", err
 	}
@@ -897,7 +925,7 @@ func tencentBindListener(region, lb, listener, certID, sni, site string) error {
 	if err != nil {
 		return err
 	}
-	client, err := clb.NewClient(cred, region, tencentProfile(site))
+	client, err := newCLBClient(cred, region, tencentProfile(site))
 	if err != nil {
 		return err
 	}
@@ -992,7 +1020,7 @@ func resolveTencentSite(cred common.CredentialIface, region, site string) string
 	probe := func(root string) bool {
 		p := profile.NewClientProfile()
 		p.HttpProfile.RootDomain = root
-		client, err := clb.NewClient(cred, region, p)
+		client, err := newCLBClient(cred, region, p)
 		if err != nil {
 			return false
 		}
