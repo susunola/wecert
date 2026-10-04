@@ -214,3 +214,50 @@ func TestStageCertificateDeduplicatesByParsedName(t *testing.T) {
 		t.Fatalf("a quoted name: \"fresh\" must dedupe against the bare name, got %q", got)
 	}
 }
+
+// wireDNSCredentials must edit the YAML tree, so an inline dns block, a quoted
+// value, or a missing dns block is handled correctly rather than missed by a
+// line-prefix match.
+func TestWireDNSCredentialsEditsTheTree(t *testing.T) {
+	cases := []struct {
+		name     string
+		config   string
+		provider string
+		token    string
+		wantKey  string
+	}{
+		{"block", "dns:\n  provider: dnspod\n  loginTokenFile: old\n", "dnspod", "/new/token", "loginTokenFile"},
+		{"inline", "dns: {provider: dnspod, loginTokenFile: old}\n", "dnspod", "/new/token", "loginTokenFile"},
+		{"missing", "tencent:\n  secretId: id\n", "cloudflare", "/cf/token", "apiTokenFile"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := wireDNSCredentials(path, tc.provider, tc.token); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc map[string]any
+			if err := yaml.Unmarshal(got, &doc); err != nil {
+				t.Fatalf("config no longer parses: %v\n%s", err, got)
+			}
+			dns, ok := doc["dns"].(map[string]any)
+			if !ok {
+				t.Fatalf("dns must be a mapping, got %#v", doc["dns"])
+			}
+			if dns[tc.wantKey] != tc.token {
+				t.Errorf("%s = %v, want %q", tc.wantKey, dns[tc.wantKey], tc.token)
+			}
+			if dns["provider"] != tc.provider {
+				t.Errorf("provider = %v, want %q", dns["provider"], tc.provider)
+			}
+		})
+	}
+}

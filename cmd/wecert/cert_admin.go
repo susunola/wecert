@@ -428,14 +428,14 @@ func createCertificateAdmin(cfg *config.Config, body webhook.CreateCertificateRe
 			}
 			log.Info("stored DNS token", "cert", name, "path", tokPath)
 			if err := wireDNSCredentials(configPathForAdmin, dnsCfg.Provider, tokPath); err != nil {
-				log.Warn("could not wire DNS credentials", "err", err)
+				return nil, fmt.Errorf("DNS token stored but could not be wired into the config: %w", err)
 			}
 		case "file":
 			if dnsCfg.File == "" {
 				return nil, webhook.InvalidRequestf("dns.cred=file requires dns.file")
 			}
 			if err := wireDNSCredentials(configPathForAdmin, dnsCfg.Provider, dnsCfg.File); err != nil {
-				log.Warn("could not wire DNS credentials", "err", err)
+				return nil, fmt.Errorf("could not wire the DNS credential file into the config: %w", err)
 			}
 		default:
 			return nil, webhook.InvalidRequestf("unknown dns.cred %q (use reused, token, or file)", dnsCfg.Cred)
@@ -1022,6 +1022,9 @@ func adminCred() (common.CredentialIface, error) {
 // wireDNSCredentials points the matching credential-file key at tokenFile and
 // sets dns.provider when one is named. Only the key that belongs to the selected
 // provider is touched — the other providers' credential blocks stay as they are.
+// It edits the YAML tree like every other config writer, so a dns block written
+// inline (dns: {provider: ...}) or with quoted values is handled correctly rather
+// than missed by a line-prefix match.
 func wireDNSCredentials(path, provider, tokenFile string) error {
 	if path == "" {
 		return fmt.Errorf("config path is unknown")
@@ -1030,59 +1033,41 @@ func wireDNSCredentials(path, provider, tokenFile string) error {
 	if err != nil {
 		return err
 	}
-	text := string(raw)
-
-	var key string
-	switch provider {
-	case "cloudflare", "":
-		key = "apiTokenFile"
-	case "dnspod":
-		key = "loginTokenFile"
-	case "tencentcloud":
-		// tencentcloud DNS uses the account SecretKey, not a dedicated token file;
-		// fall through to secretAccessKeyFile only when the operator named it.
-		key = "secretAccessKeyFile"
-	case "route53":
-		key = "secretAccessKeyFile"
-	default:
-		key = "apiTokenFile"
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("invalid configuration")
 	}
-
-	lines := strings.Split(text, "\n")
-	found := false
-	for i := range lines {
-		trimmed := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(trimmed, key+":") {
-			continue
-		}
-		indent := lines[i][:len(lines[i])-len(strings.TrimLeft(lines[i], " \t"))]
-		lines[i] = indent + key + ": " + tokenFile
-		found = true
-		break
+	root := doc.Content[0]
+	dns := yamlGetOrCreate(root, "dns")
+	if dns.Kind == yaml.ScalarNode && strings.TrimSpace(dns.Value) == "" {
+		dns.Kind = yaml.MappingNode
+		dns.Tag = "!!map"
 	}
-	if found {
-		text = strings.Join(lines, "\n")
+	if dns.Kind != yaml.MappingNode {
+		return fmt.Errorf("dns must be a mapping")
 	}
+	yamlGetOrCreate(dns, dnsCredentialKey(provider)).SetString(tokenFile)
 	if provider != "" {
-		text = setYAMLScalar(text, "provider", provider)
+		yamlGetOrCreate(dns, "provider").SetString(provider)
 	}
-	return atomicfile.Write(path, []byte(text), 0o600)
+	updated, err := encodeYAML(&doc)
+	if err != nil {
+		return err
+	}
+	return atomicfile.Write(path, updated, 0o600)
 }
 
-// setYAMLScalar replaces a top-level-looking `key: value` line (first match at
-// any indent under the dns block is not needed here: `provider` is unique enough
-// in wecert's config). Used only for dns.provider.
-func setYAMLScalar(text, key, value string) string {
-	lines := strings.Split(text, "\n")
-	for i := range lines {
-		trimmed := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(trimmed, key+":") {
-			indent := lines[i][:len(lines[i])-len(strings.TrimLeft(lines[i], " \t"))]
-			lines[i] = indent + key + ": " + value
-			return strings.Join(lines, "\n")
-		}
+// dnsCredentialKey maps a DNS provider onto the config key that holds its
+// credential file, matching the parser's dns block.
+func dnsCredentialKey(provider string) string {
+	switch provider {
+	case "dnspod":
+		return "loginTokenFile"
+	case "tencentcloud", "route53":
+		return "secretAccessKeyFile"
+	default:
+		return "apiTokenFile"
 	}
-	return text
 }
 
 // signalSelf is a variable so tests can stub the reload signal: the real one
