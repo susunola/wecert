@@ -502,3 +502,58 @@ func TestSiteForAccount(t *testing.T) {
 		t.Errorf("unknown uin = %q, want empty", got)
 	}
 }
+
+// listCloudAccounts is the default account plus the registry, deduplicated by
+// UIN: a registry row repeating the configured UIN must not appear twice.
+func TestListCloudAccountsMergesDefaultAndRegistry(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		StatePath: filepath.Join(dir, "state.db"),
+		Tencent:   config.Tencent{UIN: "1000", CredentialMode: "static"},
+	}
+	accounts := `[{"name":"dup","uin":"1000","cred":"static"},{"name":"intl","uin":"2000","cred":"static"}]`
+	if err := os.WriteFile(filepath.Join(dir, "cloud-accounts.json"), []byte(accounts), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := listCloudAccounts(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Accounts []struct {
+			Name string `json:"name"`
+			UIN  string `json:"uin"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Accounts) != 2 {
+		t.Fatalf("accounts = %+v, want the default plus intl only", parsed.Accounts)
+	}
+	if parsed.Accounts[0].Name != "default" || parsed.Accounts[0].UIN != "1000" {
+		t.Errorf("first account = %+v, want the default 1000", parsed.Accounts[0])
+	}
+	if parsed.Accounts[1].UIN != "2000" {
+		t.Errorf("second account = %+v, want the registry's 2000", parsed.Accounts[1])
+	}
+}
+
+// unbind reports success without touching the cloud: the certificate stays in
+// the inventory and the operator detaches the listener themselves.
+func TestUnbindCertificateAdminReturnsOK(t *testing.T) {
+	log, _ := quietLog()
+	cfg := &config.Config{StatePath: filepath.Join(t.TempDir(), "state.db")}
+	out, err := unbindCertificateAdmin(cfg, "my-cert", log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok := out.(map[string]any)
+	if !ok || m["ok"] != true || m["name"] != "my-cert" {
+		t.Fatalf("out = %#v", out)
+	}
+}
