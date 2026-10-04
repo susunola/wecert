@@ -812,6 +812,28 @@ func bindCertificateAdmin(cfg *config.Config, name string, body webhook.BindCert
 	}, nil
 }
 
+// fetchCallerAccountID asks STS which account these credentials belong to. It is
+// a seam so verifyBindingAccount's ownership check is testable without the cloud.
+var fetchCallerAccountID = func(cred common.CredentialIface, region string) (string, error) {
+	p := profile.NewClientProfile()
+	p.HttpProfile.Endpoint = "sts.tencentcloudapi.com"
+	p.HttpProfile.ReqTimeout = 10
+	client := new(common.Client).Init(region).WithCredential(cred).WithProfile(p)
+	response := tchttp.NewCommonResponse()
+	if err := client.Send(tchttp.NewCommonRequest("sts", "2018-08-13", "GetCallerIdentity"), response); err != nil {
+		return "", fmt.Errorf("cannot verify cloud credential ownership; binding refused")
+	}
+	var identity struct {
+		Response struct {
+			AccountID string `json:"AccountId"`
+		} `json:"Response"`
+	}
+	// A body that does not parse leaves AccountID empty, which the caller reads
+	// as "not this account" -- the same refusal as a mismatch.
+	_ = json.Unmarshal(response.GetBody(), &identity)
+	return identity.Response.AccountID, nil
+}
+
 func verifyBindingAccount(expected, region string) error {
 	if expected == "" {
 		return fmt.Errorf("certificate UIN is unknown; binding refused")
@@ -820,20 +842,11 @@ func verifyBindingAccount(expected, region string) error {
 	if err != nil {
 		return err
 	}
-	p := profile.NewClientProfile()
-	p.HttpProfile.Endpoint = "sts.tencentcloudapi.com"
-	p.HttpProfile.ReqTimeout = 10
-	client := new(common.Client).Init(region).WithCredential(cred).WithProfile(p)
-	response := tchttp.NewCommonResponse()
-	if err = client.Send(tchttp.NewCommonRequest("sts", "2018-08-13", "GetCallerIdentity"), response); err != nil {
-		return fmt.Errorf("cannot verify cloud credential ownership; binding refused")
+	accountID, err := fetchCallerAccountID(cred, region)
+	if err != nil {
+		return err
 	}
-	var identity struct {
-		Response struct {
-			AccountID string `json:"AccountId"`
-		} `json:"Response"`
-	}
-	if json.Unmarshal(response.GetBody(), &identity) != nil || identity.Response.AccountID != expected {
+	if accountID != expected {
 		return fmt.Errorf("daemon credentials do not belong to certificate UIN %s; binding refused", expected)
 	}
 	return nil

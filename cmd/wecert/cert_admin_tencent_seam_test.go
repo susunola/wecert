@@ -1,13 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	clb "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/clb/v20180317"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	ssl "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssl/v20191205"
+
+	"github.com/susunola/wecert/internal/config"
 )
 
 // The clb/ssl calls in cert_admin.go used to be reachable only against the real
@@ -357,4 +362,143 @@ func derefInt(p *int64) int64 {
 		return 0
 	}
 	return *p
+}
+
+// verifyBindingAccount must refuse an unknown UIN before reaching STS, pass a
+// matching account, and refuse both a mismatch and an STS error.
+func TestVerifyBindingAccount(t *testing.T) {
+	orig := fetchCallerAccountID
+	t.Cleanup(func() { fetchCallerAccountID = orig })
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "id")
+	t.Setenv("TENCENTCLOUD_SECRET_KEY", "key")
+
+	called := false
+	fetchCallerAccountID = func(common.CredentialIface, string) (string, error) {
+		called = true
+		return "1000", nil
+	}
+	if err := verifyBindingAccount("", "ap-guangzhou"); err == nil {
+		t.Error("an unknown UIN must be refused")
+	}
+	if called {
+		t.Error("an empty UIN must be refused without calling STS")
+	}
+
+	fetchCallerAccountID = func(common.CredentialIface, string) (string, error) { return "1000", nil }
+	if err := verifyBindingAccount("1000", "ap-guangzhou"); err != nil {
+		t.Errorf("a matching account must pass, got %v", err)
+	}
+
+	fetchCallerAccountID = func(common.CredentialIface, string) (string, error) { return "2000", nil }
+	if err := verifyBindingAccount("1000", "ap-guangzhou"); err == nil {
+		t.Error("a mismatched account must be refused")
+	}
+
+	fetchCallerAccountID = func(common.CredentialIface, string) (string, error) {
+		return "", errors.New("sts down")
+	}
+	if err := verifyBindingAccount("1000", "ap-guangzhou"); err == nil {
+		t.Error("an STS error must be refused")
+	}
+}
+
+// Without credentials the check must refuse without touching the cloud.
+func TestVerifyBindingAccountWithoutCredentials(t *testing.T) {
+	orig := fetchCallerAccountID
+	t.Cleanup(func() { fetchCallerAccountID = orig })
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "")
+	t.Setenv("TENCENTCLOUD_SECRET_KEY", "")
+	fetchCallerAccountID = func(common.CredentialIface, string) (string, error) {
+		t.Error("STS must not be reached without credentials")
+		return "", nil
+	}
+	if err := verifyBindingAccount("1000", "ap-guangzhou"); err == nil {
+		t.Error("missing credentials must be refused")
+	}
+}
+
+// listCloudBindings must enumerate load balancers and their listeners into the
+// shape the console's Bind dialog reads.
+func TestListCloudBindingsEnumeratesLBsAndListeners(t *testing.T) {
+	t.Setenv("TENCENTCLOUD_SECRET_ID", "id")
+	t.Setenv("TENCENTCLOUD_SECRET_KEY", "key")
+	withFakeCLB(t, &stubCLBAPI{
+		describeLBFn: func(*clb.DescribeLoadBalancersRequest) (*clb.DescribeLoadBalancersResponse, error) {
+			return &clb.DescribeLoadBalancersResponse{Response: &clb.DescribeLoadBalancersResponseParams{
+				LoadBalancerSet: []*clb.LoadBalancer{{
+					LoadBalancerId:   common.StringPtr("lb-1"),
+					LoadBalancerName: common.StringPtr("main"),
+				}},
+			}}, nil
+		},
+		describeLisFn: func(*clb.DescribeListenersRequest) (*clb.DescribeListenersResponse, error) {
+			return &clb.DescribeListenersResponse{Response: &clb.DescribeListenersResponseParams{
+				Listeners: []*clb.Listener{{
+					ListenerId: common.StringPtr("lbl-1"),
+					Protocol:   common.StringPtr("HTTPS"),
+					Port:       common.Int64Ptr(443),
+					SniSwitch:  common.Int64Ptr(1),
+				}},
+			}}, nil
+		},
+	})
+	dir := t.TempDir()
+	cfg := &config.Config{
+		StatePath: filepath.Join(dir, "state.db"),
+		Tencent:   config.Tencent{Regions: []string{"ap-guangzhou"}},
+	}
+	out, err := listCloudBindings(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Bindings []struct {
+			ID        string `json:"id"`
+			Name      string `json:"name"`
+			Region    string `json:"region"`
+			Listeners []struct {
+				ID    string `json:"id"`
+				Proto string `json:"proto"`
+				Port  int    `json:"port"`
+				SNI   bool   `json:"sni"`
+			} `json:"listeners"`
+		} `json:"bindings"`
+	}
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Bindings) != 1 || parsed.Bindings[0].ID != "lb-1" {
+		t.Fatalf("bindings = %+v", parsed.Bindings)
+	}
+	if len(parsed.Bindings[0].Listeners) != 1 {
+		t.Fatalf("listeners = %+v", parsed.Bindings[0].Listeners)
+	}
+	l := parsed.Bindings[0].Listeners[0]
+	if l.ID != "lbl-1" || l.Proto != "HTTPS" || l.Port != 443 || !l.SNI {
+		t.Errorf("listener = %+v", l)
+	}
+}
+
+// siteForAccount reads the site recorded with a stored account; an unknown UIN
+// must not silently inherit another account's site.
+func TestSiteForAccount(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{StatePath: filepath.Join(dir, "state.db")}
+	if got := siteForAccount(cfg, ""); got != "" {
+		t.Errorf("empty uin = %q, want empty", got)
+	}
+	accounts := `[{"name":"intl","uin":"1000","cred":"static","cloud":"tencent","site":"international","keyPath":"/x"}]`
+	if err := os.WriteFile(filepath.Join(dir, "cloud-accounts.json"), []byte(accounts), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := siteForAccount(cfg, "1000"); got != "international" {
+		t.Errorf("site = %q, want international", got)
+	}
+	if got := siteForAccount(cfg, "9999"); got != "" {
+		t.Errorf("unknown uin = %q, want empty", got)
+	}
 }
