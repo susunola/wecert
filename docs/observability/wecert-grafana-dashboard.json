@@ -1,0 +1,617 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Tencent Cloud Prometheus (datasource)",
+      "description": "腾讯云 Prometheus 实例数据源",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "总览",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "panels": [],
+      "id": 100
+    },
+    {
+      "type": "stat",
+      "title": "证书总数",
+      "description": "期望状态中已签发证书数（not_after 序列存在）。No data = 无证书或 remote_write 未打通，先查数据源连通。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 3, "x": 0, "y": 1},
+      "id": 1,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "count(wecert_certificate_not_after_timestamp_seconds > 0)", "legendFormat": "", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "最紧急到期 (天)",
+      "description": "全队列最小剩余天数。负值 = 已过期。阈值对齐告警：红 <11.25d（tlsserver/shortlived 告警区），黄 11.25-22.5d（classic 告警区 22.5d）。shortlived 40h ≈ 1.67d，见明细表。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 3, "x": 3, "y": 1},
+      "id": 2,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 11.25}, {"color": "green", "value": 22.5}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "min((wecert_certificate_not_after_timestamp_seconds - time()) / 86400)", "legendFormat": "", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "距上次收敛 (h)",
+      "description": "对应告警 WecertHasNotReconciledRecently（>2h critical）。daemon 默认每小时收敛一次。0 = 启动后尚未完成任何一次 pass。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 3, "x": 6, "y": 1},
+      "id": 3,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 2}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "(time() - wecert_last_reconcile_timestamp_seconds) / 3600", "legendFormat": "", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "连续失败≥5 的证书",
+      "description": "对应告警 WecertRenewalFailing（warning）：续期失败 5 次及以上（指数退避下 5 次已是数小时量级）。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 3, "x": 9, "y": 1},
+      "id": 4,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "count(wecert_certificate_consecutive_failures >= 5) or vector(0)", "legendFormat": "", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "未确认绑定",
+      "description": "已上传但尚未确认绑定到云资源的证书数（首次签发后等待人工/一键绑定期间）。正常稳态应为 0。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 3, "x": 12, "y": 1},
+      "id": 5,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "count(wecert_certificate_deployed == 0) or vector(0)", "legendFormat": "", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "待吊销",
+      "description": "对应告警 WecertRevocationPending（critical）：CA 尚未受理的吊销请求——安全动作悬而未决。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 3, "x": 15, "y": 1},
+      "id": 6,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_revocation_pending", "legendFormat": "", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "孤儿证书",
+      "description": "对应告警 WecertOrphanedCertificates（warning，持续 24h）：在状态库但不在期望状态，不会被续期。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 3, "x": 18, "y": 1},
+      "id": 7,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_orphaned_certificates", "legendFormat": "", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "限流阻断",
+      "description": "对应告警 WecertRateLimitBlocked（critical）：CA 拒绝签发并给出恢复期限的限流项数。正常为 0。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 3, "x": 21, "y": 1},
+      "id": 8,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "count(wecert_ratelimit_blocked == 1) or vector(0)", "legendFormat": "", "refId": "A"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "证书到期",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+      "panels": [],
+      "id": 101
+    },
+    {
+      "type": "table",
+      "title": "证书到期明细（剩余天数，升序）",
+      "description": "阈值对齐告警：classic <22.5d / tlsserver <11.25d / shortlived <40h（≈1.67d）。负值 = 已过期。列为证书名、Profile、剩余天数。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 7},
+      "id": 9,
+      "transformations": [
+        {"id": "sortBy", "options": {"fields": {}, "sortBy": [{"desc": false, "field": "Value"}]}},
+        {"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true}, "indexByName": {"cert": 0, "profile": 1, "Value": 2}, "renameByName": {"Value": "剩余天数", "cert": "证书", "profile": "Profile"}}}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"align": "auto"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0}, {"color": "green", "value": 11.25}]}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "剩余天数"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-text", "mode": "basic"}}]},
+          {"matcher": {"id": "byName", "options": "证书"}, "properties": [{"id": "custom.width", "value": 420}]}
+        ]
+      },
+      "options": {"showHeader": true, "cellHeight": "sm"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "(wecert_certificate_not_after_timestamp_seconds - time()) / 86400", "format": "table", "instant": true, "legendFormat": "", "refId": "A"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "线上验证（probe：域名实际出示的证书）",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 16},
+      "panels": [],
+      "id": 102
+    },
+    {
+      "type": "timeseries",
+      "title": "probe match（1=线上出示的就是部署的证书）",
+      "description": "对应告警 WecertServedCertificateIsNotTheDeployedOne（critical）。0 = 线上出示的不是可用副本：换绑未生效 / SNI 被别的证书抢占 / 链条不可验证。与探针错误图联看可区分环境问题。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 17},
+      "id": 10,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.5}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_certificate_probe_match", "legendFormat": "{{host}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "probe trusted（链可被公共根验证）",
+      "description": "0 不一定有问题（内部 CA 合法），但浏览器会告警。注意 absent 语义：序列消失 = 探针未能完成握手（“无答案”），不是 trusted=0。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 17},
+      "id": 11,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.5}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_certificate_probe_trusted", "legendFormat": "{{host}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "探针错误（6h 增量）",
+      "description": "对应告警 WecertProbeCannotReachTheEndpoints（warning，>3）：解析/拨号/握手失败。这是环境问题（网络/防火墙/死 AAAA），不是证书问题。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 25},
+      "id": 12,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 3}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "increase(wecert_certificate_probe_errors_total[6h])", "legendFormat": "{{host}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "线上证书剩余 (天)",
+      "description": "真实 TLS 握手读回的 notAfter 换算为剩余天数。与“证书到期明细”表（部署侧）对照：两者不一致 = 线上仍在出示旧证书。absent = 握手未完成，无答案。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 25},
+      "id": 13,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0}, {"color": "green", "value": 1.67}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "(wecert_certificate_probe_not_after_timestamp_seconds - time()) / 86400", "legendFormat": "{{host}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "续期健康",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 33},
+      "panels": [],
+      "id": 103
+    },
+    {
+      "type": "timeseries",
+      "title": "各证书连续失败次数",
+      "description": "对应告警 WecertRenewalFailing（warning，>=5）。成功一次即归零。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 34},
+      "id": 14,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_certificate_consecutive_failures", "legendFormat": "{{cert}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "reconcile 结果（1h 增量，按结果）",
+      "description": "ok=正常收敛，error=运行了但失败，skipped=在重试退避窗口内被跳过（设计行为）。error 持续出现 + skipped 居高 = 全队列在退避中。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 34},
+      "id": 15,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "off"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "sum by (result) (increase(wecert_reconcile_total[1h]))", "legendFormat": "{{result}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "recovered panic（7d 增量）",
+      "description": "对应告警 WecertReconcilePanicked（critical）。任何非零值都是 bug（pass 被 recover 撑过去了，栈在日志里）。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 34},
+      "id": 16,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.5}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "increase(wecert_reconcile_panics_total[7d])", "legendFormat": "{{cert}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "期望状态与降级",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 42},
+      "panels": [],
+      "id": 104
+    },
+    {
+      "type": "timeseries",
+      "title": "期望状态文档年龄 (天)",
+      "description": "对应告警 WecertDocumentsAreStale（warning，>48h=2d）。增长 = onboard 生成器停了：续期照旧但新名字永远不会被拾取。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 43},
+      "id": 17,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 2}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_desired_state_age_seconds / 86400", "legendFormat": "age (d)", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "期望状态：证书数 / frozen",
+      "description": "证书数 = 当前期望状态里的证书数。frozen=1 对应告警 WecertStateIsFrozen（warning，>2h）：配置变更不再生效。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 43},
+      "id": 18,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "off"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_desired_state_certificates", "legendFormat": "certificates", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_desired_state_frozen", "legendFormat": "frozen", "refId": "B"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "fallback 生效中（1=部分证书）",
+      "description": "对应告警 WecertFallbackIsDroppingNames（critical）：授权持续失败的域名已被裁掉，正在签发（或即将签发）部分证书。部分可用优于全灭，但不能放着不管。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 43},
+      "id": 19,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.5}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_certificate_fallback_active", "legendFormat": "{{cert}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "fallback 丢失域名数",
+      "description": "被裁掉的域名数（按证书）。决策生效即置位——此时签发可能仍在进行，线上服务的仍是上一张完整证书。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 43},
+      "id": 20,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_certificate_fallback_dropped_names", "legendFormat": "{{cert}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "基础保障（限流 / 备份 / DNS 清理 / 绑定巡逻）",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 51},
+      "panels": [],
+      "id": 105
+    },
+    {
+      "type": "timeseries",
+      "title": "CA 限流余量（token 上界）",
+      "description": "对应告警 WecertRateLimitNearlyExhausted（warning，<1）。上界估计：只计本程序消耗，per-domain / exact-set 限额是全账号共享的，真实余量只会更小。批量变更前看这里。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 52},
+      "id": 21,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_ratelimit_remaining_tokens", "legendFormat": "{{limit}} / {{scope}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "远程备份新鲜度 (h)",
+      "description": "距最近一次成功上传的小时数（按 target）。告警口径为 2× 各自 interval（interval 因 target 而异，见告警 WecertRemoteBackupIsStale）；此处画粗红线 24h 供概览。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 52},
+      "id": 22,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 24}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "(time() - wecert_backup_remote_last_success_timestamp_seconds) / 3600", "legendFormat": "{{target}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "TXT 清理积压（条数 / 最长积压 h）",
+      "description": "DNS 清理守护队列。条数 = 未确认回收的 _acme-challenge TXT；最长积压 >24h 对应告警 WecertTXTReclaimStuckTooLong（warning）——记录可能要人工去 DNS 控制台删。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 52},
+      "id": 23,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 24}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_txt_reclaim_stuck", "legendFormat": "stuck (count)", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_txt_reclaim_stuck_oldest_seconds / 3600", "legendFormat": "oldest (h)", "refId": "B"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "绑定巡逻（findings / 新鲜度 h）",
+      "description": "drift / orphan_upload / unmanaged >0（持续 2h）对应告警 WecertBindingPatrolDrift（warning）：云端绑定与状态库不一致，通常来自控制台手工改动。last_run >24h = 巡逻停摆，findings 不可信（对应 WecertBindingPatrolStale）。",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 52},
+      "id": 24,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 0, "lineInterpolation": "linear", "lineWidth": 1, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "mappings": [],
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "wecert_binding_patrol_findings", "legendFormat": "{{kind}}", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "(time() - wecert_binding_patrol_last_run_timestamp_seconds) / 3600", "legendFormat": "last_run age (h)", "refId": "B"}
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["wecert", "certificates", "tencent-cloud"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "wecert Overview",
+  "uid": "wecert-overview",
+  "version": 1,
+  "weekStart": ""
+}

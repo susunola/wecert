@@ -1,0 +1,470 @@
+{
+ "InstanceId": "<PROM_INSTANCE_ID>",
+ "GroupName": "wecert-alerts",
+ "GroupState": 2,
+ "AMPReceivers": [
+  "<NOTICE_ID>"
+ ],
+ "RepeatInterval": "3h",
+ "Rules": [
+  {
+   "RuleName": "WecertCertificateExpiringClassic",
+   "Expr": "(wecert_certificate_not_after_timestamp_seconds{profile=\"classic\"} > 0)\nand\n(wecert_certificate_not_after_timestamp_seconds{profile=\"classic\"} - time()) / 86400 < 22.5",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "certificate {{ $labels.cert }} expires in under 22.5 days"
+    },
+    {
+     "Key": "description",
+     "Value": "The classic profile renews 30 days ahead by default and this fires at 22.5 days, so with the default it means renewal is a week overdue. Check wecert_certificate_consecutive_failures: if that is climbing, renewal is failing; if it is 0, this certificate's renewBefore is shorter than 22.5 days and the alert is simply early."
+    }
+   ],
+   "State": 2,
+   "Duration": "15m"
+  },
+  {
+   "RuleName": "WecertCertificateExpiringTLSServer",
+   "Expr": "(wecert_certificate_not_after_timestamp_seconds{profile=\"tlsserver\"} > 0)\nand\n(wecert_certificate_not_after_timestamp_seconds{profile=\"tlsserver\"} - time()) / 86400 < 11.25",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "certificate {{ $labels.cert }} expires in under 11.25 days"
+    },
+    {
+     "Key": "description",
+     "Value": "The tlsserver profile renews 15 days ahead by default; this is a week past that. If wecert_certificate_consecutive_failures is 0 the renewal is merely not due yet."
+    }
+   ],
+   "State": 2,
+   "Duration": "15m"
+  },
+  {
+   "RuleName": "WecertCertificateExpiringShortLived",
+   "Expr": "(wecert_certificate_not_after_timestamp_seconds{profile=\"shortlived\"} > 0)\nand\n(wecert_certificate_not_after_timestamp_seconds{profile=\"shortlived\"} - time()) / 3600 < 40",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "critical"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "certificate {{ $labels.cert }} expires in under 40 hours"
+    },
+    {
+     "Key": "description",
+     "Value": "A short-lived certificate renews 48 hours ahead by default, so 40 hours left is past that. This profile is used precisely where a lapse is immediate, so treat it as urgent even if wecert_certificate_consecutive_failures is still 0."
+    }
+   ],
+   "State": 2,
+   "Duration": "10m"
+  },
+  {
+   "RuleName": "WecertServedCertificateIsNotTheDeployedOne",
+   "Expr": "wecert_certificate_probe_match == 0",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "critical"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "{{ $labels.host }} is not serving a usable copy of the certificate wecert deployed"
+    },
+    {
+     "Key": "description",
+     "Value": "Either the rebind did not take effect, another certificate is winning SNI, the certificate that is deployed is below probe.minValidFor (in which case it IS the deployed one and the log line says so), or its chain does not verify against the system roots -- probe.requireTrusted, on by default, counts \"the right certificate served without its intermediate\" as a mismatch too, because no client accepts it. Set probe.requireTrusted: false when the CA is internal and cannot chain to a public root. The journal carries the per-address reason: wecert_certificate_probe_match == 0 with wecert_certificate_probe_errors_total flat means every address answered. To compare expiries by hand, find the certificate whose SANs cover {{ $labels.host }} (the config, the desired-state document, or wecert_desired_state_certificates) and read wecert_certificate_not_after_timestamp_seconds{cert=\"...\"} -- the probe family is labelled by host and the desired-state family by cert, so there is no join."
+    }
+   ],
+   "State": 2,
+   "Duration": "15m"
+  },
+  {
+   "RuleName": "WecertProbeCannotReachTheEndpoints",
+   "Expr": "increase(wecert_certificate_probe_errors_total[6h]) > 3",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "the probe cannot reach {{ $labels.host }}"
+    },
+    {
+     "Key": "description",
+     "Value": "Resolve, dial or handshake failed repeatedly. If wecert runs where it cannot reach the VIP, either disable probe.enabled or run wecert-probe from a host that can; leaving it on produces this alert and no useful evidence."
+    }
+   ],
+   "State": 2,
+   "Duration": "30m"
+  },
+  {
+   "RuleName": "WecertRenewalFailing",
+   "Expr": "wecert_certificate_consecutive_failures >= 5",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "renewal for {{ $labels.cert }} has failed {{ $value }} times in a row"
+    },
+    {
+     "Key": "description",
+     "Value": "Check the daemon log and wecert_preflight -domain for this certificate. If the failure is a DNS authorization, the identifier ledger is what the pre-expiry fallback uses to decide which names to drop."
+    }
+   ],
+   "State": 2,
+   "Duration": "1h"
+  },
+  {
+   "RuleName": "WecertFallbackIsDroppingNames",
+   "Expr": "wecert_certificate_fallback_active == 1",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "critical"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "{{ $labels.cert }} is in failure fallback: a partial certificate is planned or serving"
+    },
+    {
+     "Key": "description",
+     "Value": "A degradation decision is in force for this certificate: the names whose authorizations keep failing have been dropped, so the certificate it serves (or is about to serve) is partial. The dropped count is wecert_certificate_fallback_dropped_names; the identifiers themselves are in the log and in wecert_desired_state_*."
+    }
+   ],
+   "State": 2,
+   "Duration": "5m"
+  },
+  {
+   "RuleName": "WecertHasNotReconciledRecently",
+   "Expr": "(wecert_last_reconcile_timestamp_seconds > 0) and (time() - wecert_last_reconcile_timestamp_seconds) > 7200",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "critical"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "no reconcile pass has finished in over 2 hours"
+    },
+    {
+     "Key": "description",
+     "Value": "The daemon converges hourly by default. Either it is not running, or it is running and stuck: wecert_last_reconcile_timestamp_seconds is stamped when a pass finishes and never when one starts, so a hung pass goes stale exactly like a dead process. 0 means no pass has finished since startup. This alert is deliberately not derived from an error counter: silence is the failure it is looking for."
+    }
+   ],
+   "State": 2,
+   "Duration": "30m"
+  },
+  {
+   "RuleName": "WecertDocumentsAreStale",
+   "Expr": "wecert_desired_state_age_seconds > 172800",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "the desired-state document has not been refreshed in over 48 hours"
+    },
+    {
+     "Key": "description",
+     "Value": "wecert keeps renewing from the old document, so nothing looks broken -- but no newly declared name will ever be picked up. The generator (wecert-onboard) has probably stopped running."
+    }
+   ],
+   "State": 2,
+   "Duration": "1h"
+  },
+  {
+   "RuleName": "WecertDocumentSourceIsFailing",
+   "Expr": "increase(wecert_desired_state_errors_total[1h]) > 0",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "the desired-state source could not be read"
+    },
+    {
+     "Key": "description",
+     "Value": "A source failure freezes the previous revision rather than emptying it, so this is safe but not healthy: no configuration change takes effect until it is readable again."
+    }
+   ],
+   "State": 2
+  },
+  {
+   "RuleName": "WecertStateIsFrozen",
+   "Expr": "wecert_desired_state_frozen == 1",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "the desired state has been frozen for over 2 hours"
+    },
+    {
+     "Key": "description",
+     "Value": "A freeze is deliberate -- an abrupt declaration drop, an over-cap group, an unreadable document -- and it means configuration changes are not being applied. Identify the reason from the log, fix it, and re-run the generator."
+    }
+   ],
+   "State": 2,
+   "Duration": "2h"
+  },
+  {
+   "RuleName": "WecertRemoteBackupIsStale",
+   "Expr": "((wecert_backup_remote_last_success_timestamp_seconds > 0)\n and (time() - wecert_backup_remote_last_success_timestamp_seconds > 2 * wecert_backup_remote_interval_seconds))\nor\n((wecert_backup_remote_last_success_timestamp_seconds == 0)\n and (time() - wecert_backup_remote_configured_timestamp_seconds > 2 * wecert_backup_remote_interval_seconds))",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "critical"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "remote backup target {{ $labels.target }} has not succeeded for two intervals"
+    },
+    {
+     "Key": "description",
+     "Value": "The target was configured but has either never accepted a snapshot or its last successful upload is older than twice its configured interval. Check the daemon log, credentials and reachability; use wecert_backup_remote_errors_total to distinguish repeated transport failures from a stopped snapshot loop."
+    }
+   ],
+   "State": 2,
+   "Duration": "15m"
+  },
+  {
+   "RuleName": "WecertReconcilePanicked",
+   "Expr": "increase(wecert_reconcile_panics_total[1h]) > 0",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "critical"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "a reconcile pass panicked for {{ $labels.cert }}"
+    },
+    {
+     "Key": "description",
+     "Value": "The panic was recovered so other certificates are unaffected, and the daemon logged a stack trace. This is a bug: report it with that trace. The affected pass was retried on its usual backoff."
+    }
+   ],
+   "State": 2
+  },
+  {
+   "RuleName": "WecertOrphanedCertificates",
+   "Expr": "wecert_orphaned_certificates > 0",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "{{ $value }} certificate(s) are in the state store but not the desired state"
+    },
+    {
+     "Key": "description",
+     "Value": "They will not be renewed and will expire, and their DNS challenge records were reclaimed. If that was not intended, restore the declaration and re-run wecert-onboard."
+    }
+   ],
+   "State": 2,
+   "Duration": "24h"
+  },
+  {
+   "RuleName": "WecertRateLimitBlocked",
+   "Expr": "wecert_ratelimit_blocked == 1",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "critical"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "{{ $labels.limit }} is refusing requests until the CA's deadline"
+    },
+    {
+     "Key": "description",
+     "Value": "Issuance for the affected scope is paused until the reported time. The exact-set limit (5 per 7 days) has no override; the per-account order and per-registered-domain limits can be raised through Let's Encrypt's rate-limit adjustment form, which takes weeks. One limit behaves differently: consecutive-authz-failures-per-identifier means the CA has PAUSED that identifier after repeated failed authorizations, its refusal names no instant, and the reported time is a one-day floor rather than the CA's answer -- waiting does not lift it, so unpause it in the CA's self-service portal (the journal line for the refusal has the link)."
+    }
+   ],
+   "State": 2
+  },
+  {
+   "RuleName": "WecertRateLimitNearlyExhausted",
+   "Expr": "wecert_ratelimit_remaining_tokens < 1",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "{{ $labels.limit }} has under 1 token left (upper bound on what is left)"
+    },
+    {
+     "Key": "description",
+     "Value": "This is an UPPER BOUND on what is left: it counts only this program's spend, while the per-domain and per-exact-set limits are global across accounts. The real remaining allowance can be smaller, never larger -- which is why the threshold is one token and not five. Stop configuration churn until it refills."
+    }
+   ],
+   "State": 2,
+   "Duration": "15m"
+  },
+  {
+   "RuleName": "WecertRevocationPending",
+   "Expr": "wecert_revocation_pending > 0",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "critical"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "{{ $value }} revocation(s) have not been accepted by the CA"
+    },
+    {
+     "Key": "description",
+     "Value": "The decision is durable and retried every pass, so this is a failing request rather than a lost one. Check the daemon log for the CA's response; a rejected reason code will never succeed on its own."
+    }
+   ],
+   "State": 2,
+   "Duration": "1h"
+  },
+  {
+   "RuleName": "WecertRevocationQueueUnreadable",
+   "Expr": "increase(wecert_revocation_query_errors_total[1h]) > 0",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "wecert cannot read its outstanding revocations; wecert_revocation_pending is stale"
+    },
+    {
+     "Key": "description",
+     "Value": "The reconciler could not list the outstanding revocation requests, so it skipped the retry for this pass and left wecert_revocation_pending at its previous value. Check state.db and the disk it lives on. If that gauge is non-zero it is still a real outstanding revocation; if it is zero it means \"unknown\", not \"clear\"."
+    }
+   ],
+   "State": 2
+  },
+  {
+   "RuleName": "WecertTXTReclaimStuckTooLong",
+   "Expr": "wecert_txt_reclaim_stuck_oldest_seconds > 86400",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "A leftover _acme-challenge TXT has been stuck for over a day"
+    },
+    {
+     "Key": "description",
+     "Value": "The DNS cleanup guardian is still retrying {{ $value }} seconds. GET /diagnostics/txt-reclaims (auth) for the names; if a record is stuck for hours the provider cannot delete it -- remove it in the DNS console."
+    }
+   ],
+   "State": 2,
+   "Duration": "30m"
+  },
+  {
+   "RuleName": "WecertBindingPatrolDrift",
+   "Expr": "sum(wecert_binding_patrol_findings{kind=~\"drift|orphan_upload|unmanaged\"}) > 0",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "Cloud bindings disagree with the state store"
+    },
+    {
+     "Key": "description",
+     "Value": "The full-binding patrol reported drift / orphan uploads / unmanaged certificates for 2h. Console shows confirmed / incomplete / drift; a manual console change is expected until the next deploy, and orphan_upload means an upload lost its resume anchor."
+    }
+   ],
+   "State": 2,
+   "Duration": "2h"
+  },
+  {
+   "RuleName": "WecertBindingPatrolStale",
+   "Expr": "(time() - wecert_binding_patrol_last_run_timestamp_seconds) > 86400",
+   "Labels": [
+    {
+     "Key": "severity",
+     "Value": "warning"
+    }
+   ],
+   "Annotations": [
+    {
+     "Key": "summary",
+     "Value": "The binding patrol has not finished in over a day"
+    },
+    {
+     "Key": "description",
+     "Value": "wecert_binding_patrol_last_run_timestamp_seconds is stale, so the findings gauge may be lying."
+    }
+   ],
+   "State": 2,
+   "Duration": "30m"
+  }
+ ],
+ "_README": "TEMPLATE ONLY: replace <PROM_INSTANCE_ID> with your Prometheus instance id and <NOTICE_ID> with your alarm-notice template id (notice-xxx), then: tccli monitor CreatePrometheusAlertGroup --region <region> --profile <profile> --cli-input-json file://<this file>"
+}

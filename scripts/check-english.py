@@ -45,6 +45,11 @@ ALLOWED = {
     # reason. Keeping them here rather than in a data file means the label and its use are read
     # together; the alternative was a one-entry lookup table existing only to satisfy this scan.
     "scripts/e2e-report.py",
+    # The paired Grafana export: its Chinese strings are the panel titles and
+    # descriptions an operator sees *inside Grafana* after importing it, not
+    # prose about the code, and the English twin is the -en.json beside it.
+    # Translating them would silently change what an imported dashboard shows.
+    "docs/observability/wecert-grafana-dashboard.json",
 }
 
 SKIP_DIRS = {
